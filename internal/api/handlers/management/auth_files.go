@@ -39,6 +39,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/watcher/synthesizer"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
@@ -800,6 +801,7 @@ func (h *Handler) registerAuthFromFile(ctx context.Context, path string, data []
 		"path":   path,
 		"source": path,
 	}
+	synthesizer.AddMetadataHeadersToAttrs(metadata, attr)
 	auth := &coreauth.Auth{
 		ID:         authID,
 		Provider:   provider,
@@ -826,6 +828,54 @@ func (h *Handler) registerAuthFromFile(ctx context.Context, path string, data []
 	}
 	_, err := h.authManager.Register(ctx, auth)
 	return err
+}
+
+func sanitizedHeaders(headers map[string]string) map[string]string {
+	if len(headers) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(headers))
+	for rawKey, rawValue := range headers {
+		key := strings.TrimSpace(rawKey)
+		value := strings.TrimSpace(rawValue)
+		if key == "" || value == "" {
+			continue
+		}
+		out[key] = value
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func replaceAuthMetadataHeaders(auth *coreauth.Auth, headers map[string]string) {
+	if auth == nil {
+		return
+	}
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	if auth.Attributes == nil {
+		auth.Attributes = make(map[string]string)
+	}
+	for key := range auth.Attributes {
+		if strings.HasPrefix(key, "header:") {
+			delete(auth.Attributes, key)
+		}
+	}
+	delete(auth.Metadata, "headers")
+
+	normalized := sanitizedHeaders(headers)
+	if len(normalized) == 0 {
+		return
+	}
+	stored := make(map[string]string, len(normalized))
+	for key, value := range normalized {
+		stored[key] = value
+	}
+	auth.Metadata["headers"] = stored
+	synthesizer.AddMetadataHeadersToAttrs(map[string]any{"headers": stored}, auth.Attributes)
 }
 
 // PatchAuthFileStatus toggles the disabled state of an auth file
@@ -894,7 +944,7 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "ok", "disabled": *req.Disabled})
 }
 
-// PatchAuthFileFields updates editable fields (prefix, proxy_url, priority, note) of an auth file.
+// PatchAuthFileFields updates editable fields (prefix, proxy_url, priority, note, headers) of an auth file.
 func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 	if h.authManager == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
@@ -907,6 +957,7 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 		ProxyURL *string `json:"proxy_url"`
 		Priority *int    `json:"priority"`
 		Note     *string `json:"note"`
+		Headers  map[string]string `json:"headers"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
@@ -949,7 +1000,7 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 		targetAuth.ProxyURL = *req.ProxyURL
 		changed = true
 	}
-	if req.Priority != nil || req.Note != nil {
+	if req.Priority != nil || req.Note != nil || req.Headers != nil {
 		if targetAuth.Metadata == nil {
 			targetAuth.Metadata = make(map[string]any)
 		}
@@ -975,6 +1026,9 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 				targetAuth.Metadata["note"] = trimmedNote
 				targetAuth.Attributes["note"] = trimmedNote
 			}
+		}
+		if req.Headers != nil {
+			replaceAuthMetadataHeaders(targetAuth, req.Headers)
 		}
 		changed = true
 	}

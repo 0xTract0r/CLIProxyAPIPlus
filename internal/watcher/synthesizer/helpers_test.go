@@ -287,3 +287,54 @@ func TestAddConfigHeadersToAttrs(t *testing.T) {
 		})
 	}
 }
+
+func TestAddMetadataHeadersToAttrs(t *testing.T) {
+	tests := []struct {
+		name     string
+		metadata map[string]any
+		want     map[string]string
+	}{
+		{
+			name: "headers from metadata map",
+			metadata: map[string]any{
+				"headers": map[string]any{
+					"User-Agent": "codex-test/1.0",
+					"X-Test":     " value ",
+					"Skip":       123,
+				},
+			},
+			want: map[string]string{
+				"header:User-Agent": "codex-test/1.0",
+				"header:X-Test":     "value",
+			},
+		},
+		{
+			name: "headers from string map",
+			metadata: map[string]any{
+				"headers": map[string]string{
+					"User-Agent": "claude-test/1.0",
+				},
+			},
+			want: map[string]string{
+				"header:User-Agent": "claude-test/1.0",
+			},
+		},
+		{
+			name: "missing headers",
+			metadata: map[string]any{
+				"type": "codex",
+			},
+			want: map[string]string{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			attrs := make(map[string]string)
+			AddMetadataHeadersToAttrs(tt.metadata, attrs)
+			if !reflect.DeepEqual(attrs, tt.want) {
+				t.Fatalf("expected %v, got %v", tt.want, attrs)
+			}
+		})
+	}
+}

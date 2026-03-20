@@ -2,10 +2,13 @@ package proxyutil
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 
 	"golang.org/x/net/proxy"
@@ -89,7 +92,9 @@ func BuildHTTPTransport(raw string) (*http.Transport, Mode, error) {
 	case ModeInherit:
 		return nil, setting.Mode, nil
 	case ModeDirect:
-		return NewDirectTransport(), setting.Mode, nil
+		transport := NewDirectTransport()
+		applyTestRootCA(transport)
+		return transport, setting.Mode, nil
 	case ModeProxy:
 		if setting.URL.Scheme == "socks5" {
 			var proxyAuth *proxy.Auth
@@ -102,17 +107,46 @@ func BuildHTTPTransport(raw string) (*http.Transport, Mode, error) {
 			if errSOCKS5 != nil {
 				return nil, setting.Mode, fmt.Errorf("create SOCKS5 dialer failed: %w", errSOCKS5)
 			}
-			return &http.Transport{
+			transport := &http.Transport{
 				Proxy: nil,
 				DialContext: func(_ context.Context, network, addr string) (net.Conn, error) {
 					return dialer.Dial(network, addr)
 				},
-			}, setting.Mode, nil
+			}
+			applyTestRootCA(transport)
+			return transport, setting.Mode, nil
 		}
-		return &http.Transport{Proxy: http.ProxyURL(setting.URL)}, setting.Mode, nil
+		transport := &http.Transport{Proxy: http.ProxyURL(setting.URL)}
+		applyTestRootCA(transport)
+		return transport, setting.Mode, nil
 	default:
 		return nil, setting.Mode, nil
 	}
+}
+
+func applyTestRootCA(transport *http.Transport) {
+	if transport == nil {
+		return
+	}
+	caFile := strings.TrimSpace(os.Getenv("QUOTIO_TEST_CA_FILE"))
+	if caFile == "" {
+		return
+	}
+	pemData, err := os.ReadFile(caFile)
+	if err != nil {
+		return
+	}
+	rootCAs, _ := x509.SystemCertPool()
+	if rootCAs == nil {
+		rootCAs = x509.NewCertPool()
+	}
+	if ok := rootCAs.AppendCertsFromPEM(pemData); !ok {
+		return
+	}
+	if transport.TLSClientConfig == nil {
+		transport.TLSClientConfig = &tls.Config{}
+	}
+	transport.TLSClientConfig.RootCAs = rootCAs
 }
 
 // BuildDialer constructs a proxy dialer for settings that operate at the connection layer.

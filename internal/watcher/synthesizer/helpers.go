@@ -118,3 +118,48 @@ func addConfigHeadersToAttrs(headers map[string]string, attrs map[string]string)
 		attrs["header:"+key] = val
 	}
 }
+
+// AddMetadataHeadersToAttrs reads auth-file metadata "headers" and converts it
+// into runtime auth attributes using the "header:" prefix convention.
+func AddMetadataHeadersToAttrs(metadata map[string]any, attrs map[string]string) {
+	if len(metadata) == 0 || attrs == nil {
+		return
+	}
+	rawHeaders, ok := metadata["headers"]
+	if !ok {
+		return
+	}
+	addConfigHeadersToAttrs(metadataHeaders(rawHeaders), attrs)
+}
+
+func metadataHeaders(raw any) map[string]string {
+	switch headers := raw.(type) {
+	case map[string]string:
+		if len(headers) == 0 {
+			return nil
+		}
+		out := make(map[string]string, len(headers))
+		for key, value := range headers {
+			out[key] = value
+		}
+		return out
+	case map[string]any:
+		if len(headers) == 0 {
+			return nil
+		}
+		out := make(map[string]string, len(headers))
+		for rawKey, rawValue := range headers {
+			value, ok := rawValue.(string)
+			if !ok {
+				continue
+			}
+			out[rawKey] = value
+		}
+		if len(out) == 0 {
+			return nil
+		}
+		return out
+	default:
+		return nil
+	}
+}
