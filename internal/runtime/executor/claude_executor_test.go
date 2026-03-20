@@ -352,6 +352,81 @@ func TestApplyClaudeToolPrefix_SkipsBuiltinToolReference(t *testing.T) {
 	}
 }
 
+func TestApplyClaudeHeaders_PrefersSavedManagedHeadersOverGinHeaders(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", nil)
+	req = req.WithContext(contextWithGinHeaders(map[string]string{
+		"User-Agent":                  "curl/8.1.2",
+		"X-App":                       "browser",
+		"X-Stainless-Package-Version": "9.9.9",
+		"X-Stainless-Runtime-Version": "v1.0.0",
+		"X-Stainless-Timeout":         "1",
+	}))
+
+	auth := &cliproxyauth.Auth{
+		Attributes: map[string]string{
+			"api_key":      "sk-ant-oat-test",
+			"header:X-App": "cli",
+		},
+		Metadata: map[string]any{
+			"headers": map[string]any{
+				"User-Agent":                  "claude-cli/2.1.63 (external, sdk-cli)",
+				"X-Stainless-Package-Version": "0.74.0",
+				"X-Stainless-Runtime-Version": "v22.20.0",
+				"X-Stainless-Timeout":         "600",
+			},
+		},
+	}
+
+	applyClaudeHeaders(req, auth, "sk-ant-oat-test", true, nil, nil)
+
+	if got := req.Header.Get("User-Agent"); got != "claude-cli/2.1.63 (external, sdk-cli)" {
+		t.Fatalf("User-Agent = %q, want %q", got, "claude-cli/2.1.63 (external, sdk-cli)")
+	}
+	if got := req.Header.Get("X-App"); got != "cli" {
+		t.Fatalf("X-App = %q, want %q", got, "cli")
+	}
+	if got := req.Header.Get("X-Stainless-Package-Version"); got != "0.74.0" {
+		t.Fatalf("X-Stainless-Package-Version = %q, want %q", got, "0.74.0")
+	}
+	if got := req.Header.Get("X-Stainless-Runtime-Version"); got != "v22.20.0" {
+		t.Fatalf("X-Stainless-Runtime-Version = %q, want %q", got, "v22.20.0")
+	}
+	if got := req.Header.Get("X-Stainless-Timeout"); got != "600" {
+		t.Fatalf("X-Stainless-Timeout = %q, want %q", got, "600")
+	}
+	if got := req.Header.Get("Accept-Encoding"); got != "identity" {
+		t.Fatalf("Accept-Encoding = %q, want %q", got, "identity")
+	}
+}
+
+func TestApplyClaudeHeaders_PreservesClaudeCloakingDefaultsWithoutSavedHeaders(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", nil)
+	req = req.WithContext(contextWithGinHeaders(map[string]string{
+		"User-Agent": "curl/8.1.2",
+	}))
+
+	auth := &cliproxyauth.Auth{
+		Attributes: map[string]string{
+			"api_key": "sk-ant-oat-test",
+		},
+	}
+
+	applyClaudeHeaders(req, auth, "sk-ant-oat-test", true, nil, nil)
+
+	if got := req.Header.Get("User-Agent"); got != "claude-cli/2.1.63 (external, cli)" {
+		t.Fatalf("User-Agent = %q, want %q", got, "claude-cli/2.1.63 (external, cli)")
+	}
+	if got := req.Header.Get("X-App"); got != "cli" {
+		t.Fatalf("X-App = %q, want %q", got, "cli")
+	}
+	if got := req.Header.Get("X-Stainless-Runtime-Version"); got != "v24.3.0" {
+		t.Fatalf("X-Stainless-Runtime-Version = %q, want %q", got, "v24.3.0")
+	}
+	if got := req.Header.Get("Accept-Encoding"); got != "identity" {
+		t.Fatalf("Accept-Encoding = %q, want %q", got, "identity")
+	}
+}
+
 func TestNormalizeCacheControlTTL_DowngradesLaterOneHourBlocks(t *testing.T) {
 	payload := []byte(`{
 		"tools": [{"name":"t1","cache_control":{"type":"ephemeral","ttl":"1h"}}],

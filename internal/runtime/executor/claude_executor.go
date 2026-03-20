@@ -67,11 +67,8 @@ func (e *ClaudeExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Au
 		req.Header.Del("x-api-key")
 		req.Header.Set("Authorization", "Bearer "+apiKey)
 	}
-	var attrs map[string]string
-	if auth != nil {
-		attrs = auth.Attributes
-	}
-	util.ApplyCustomHeadersFromAttrs(req, attrs)
+	util.ApplyCustomHeadersFromAttrs(req, authAttrs(auth))
+	applyClaudeManagedHeaders(req, auth)
 	return nil
 }
 
@@ -797,6 +794,89 @@ func mapStainlessArch() string {
 	}
 }
 
+func authAttrs(auth *cliproxyauth.Auth) map[string]string {
+	if auth == nil {
+		return nil
+	}
+	return auth.Attributes
+}
+
+var claudeManagedHeaderNames = []string{
+	"User-Agent",
+	"X-App",
+	"X-Stainless-Package-Version",
+	"X-Stainless-Runtime-Version",
+	"X-Stainless-Timeout",
+}
+
+func applyClaudeManagedHeaders(r *http.Request, auth *cliproxyauth.Auth) {
+	if r == nil || auth == nil {
+		return
+	}
+	for _, headerName := range claudeManagedHeaderNames {
+		if value := claudeManagedHeaderValue(auth, headerName); value != "" {
+			r.Header.Set(headerName, value)
+		}
+	}
+}
+
+func claudeManagedHeaderValue(auth *cliproxyauth.Auth, headerName string) string {
+	if auth == nil {
+		return ""
+	}
+	if value := claudeManagedHeaderValueFromMetadata(auth.Metadata, headerName); value != "" {
+		return value
+	}
+	return claudeManagedHeaderValueFromAttrs(auth.Attributes, headerName)
+}
+
+func claudeManagedHeaderValueFromMetadata(metadata map[string]any, headerName string) string {
+	if len(metadata) == 0 {
+		return ""
+	}
+	rawHeaders, ok := metadata["headers"]
+	if !ok {
+		return ""
+	}
+	switch headers := rawHeaders.(type) {
+	case map[string]string:
+		for key, value := range headers {
+			if strings.EqualFold(key, headerName) {
+				return strings.TrimSpace(value)
+			}
+		}
+		return ""
+	case map[string]any:
+		for key, rawValue := range headers {
+			if !strings.EqualFold(key, headerName) {
+				continue
+			}
+			if value, ok := rawValue.(string); ok {
+				return strings.TrimSpace(value)
+			}
+		}
+		return ""
+	default:
+		return ""
+	}
+}
+
+func claudeManagedHeaderValueFromAttrs(attrs map[string]string, headerName string) string {
+	if len(attrs) == 0 {
+		return ""
+	}
+	targetKey := "header:" + headerName
+	for key, value := range attrs {
+		if !strings.EqualFold(key, targetKey) {
+			continue
+		}
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
 func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string, stream bool, extraBetas []string, cfg *config.Config) {
 	hdrDefault := func(cfgVal, fallback string) string {
 		if cfgVal != "" {
@@ -899,11 +979,8 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 	}
 	// Keep OS/Arch mapping dynamic (not configurable).
 	// They intentionally continue to derive from runtime.GOOS/runtime.GOARCH.
-	var attrs map[string]string
-	if auth != nil {
-		attrs = auth.Attributes
-	}
-	util.ApplyCustomHeadersFromAttrs(r, attrs)
+	util.ApplyCustomHeadersFromAttrs(r, authAttrs(auth))
+	applyClaudeManagedHeaders(r, auth)
 	// Re-enforce Accept-Encoding: identity after ApplyCustomHeadersFromAttrs, which
 	// may override it with a user-configured value.  Compressed SSE breaks the line
 	// scanner regardless of user preference, so this is non-negotiable for streams.
