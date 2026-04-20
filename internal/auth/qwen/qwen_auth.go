@@ -225,20 +225,45 @@ func (qa *QwenAuth) InitiateDeviceFlow(ctx context.Context) (*DeviceFlow, error)
 
 // PollForToken polls the token endpoint with the device code to obtain an access token.
 func (qa *QwenAuth) PollForToken(deviceCode, codeVerifier string) (*QwenTokenData, error) {
+	return qa.PollForTokenContext(context.Background(), deviceCode, codeVerifier)
+}
+
+// PollForTokenContext polls the token endpoint with the device code to obtain an access token.
+func (qa *QwenAuth) PollForTokenContext(ctx context.Context, deviceCode, codeVerifier string) (*QwenTokenData, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	pollInterval := 5 * time.Second
 	maxAttempts := 60 // 5 minutes max
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("qwen: context cancelled: %w", ctx.Err())
+		default:
+		}
+
 		data := url.Values{}
 		data.Set("grant_type", QwenOAuthGrantType)
 		data.Set("client_id", QwenOAuthClientID)
 		data.Set("device_code", deviceCode)
 		data.Set("code_verifier", codeVerifier)
 
-		resp, err := http.PostForm(QwenOAuthTokenEndpoint, data)
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, QwenOAuthTokenEndpoint, strings.NewReader(data.Encode()))
+		if err != nil {
+			return nil, fmt.Errorf("failed to create token poll request: %w", err)
+		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Set("Accept", "application/json")
+
+		resp, err := qa.httpClient.Do(req)
 		if err != nil {
 			fmt.Printf("Polling attempt %d/%d failed: %v\n", attempt+1, maxAttempts, err)
-			time.Sleep(pollInterval)
+			select {
+			case <-ctx.Done():
+				return nil, fmt.Errorf("qwen: context cancelled: %w", ctx.Err())
+			case <-time.After(pollInterval):
+			}
 			continue
 		}
 
@@ -246,7 +271,11 @@ func (qa *QwenAuth) PollForToken(deviceCode, codeVerifier string) (*QwenTokenDat
 		_ = resp.Body.Close()
 		if err != nil {
 			fmt.Printf("Polling attempt %d/%d failed: %v\n", attempt+1, maxAttempts, err)
-			time.Sleep(pollInterval)
+			select {
+			case <-ctx.Done():
+				return nil, fmt.Errorf("qwen: context cancelled: %w", ctx.Err())
+			case <-time.After(pollInterval):
+			}
 			continue
 		}
 
@@ -261,7 +290,11 @@ func (qa *QwenAuth) PollForToken(deviceCode, codeVerifier string) (*QwenTokenDat
 					case "authorization_pending":
 						// User has not yet approved the authorization request. Continue polling.
 						fmt.Printf("Polling attempt %d/%d...\n\n", attempt+1, maxAttempts)
-						time.Sleep(pollInterval)
+						select {
+						case <-ctx.Done():
+							return nil, fmt.Errorf("qwen: context cancelled: %w", ctx.Err())
+						case <-time.After(pollInterval):
+						}
 						continue
 					case "slow_down":
 						// Client is polling too frequently. Increase poll interval.
@@ -270,7 +303,11 @@ func (qa *QwenAuth) PollForToken(deviceCode, codeVerifier string) (*QwenTokenDat
 							pollInterval = 10 * time.Second
 						}
 						fmt.Printf("Server requested to slow down, increasing poll interval to %v\n\n", pollInterval)
-						time.Sleep(pollInterval)
+						select {
+						case <-ctx.Done():
+							return nil, fmt.Errorf("qwen: context cancelled: %w", ctx.Err())
+						case <-time.After(pollInterval):
+						}
 						continue
 					case "expired_token":
 						return nil, fmt.Errorf("device code expired. Please restart the authentication process")

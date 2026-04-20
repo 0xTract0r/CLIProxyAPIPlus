@@ -2,6 +2,8 @@ package usage
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -29,6 +31,9 @@ func TestRequestStatisticsRecordIncludesLatency(t *testing.T) {
 	}
 	if details[0].LatencyMs != 1500 {
 		t.Fatalf("latency_ms = %d, want 1500", details[0].LatencyMs)
+	}
+	if got := snapshot.TotalCostUSD; got <= 0 {
+		t.Fatalf("total cost = %f, want > 0", got)
 	}
 }
 
@@ -93,4 +98,89 @@ func TestRequestStatisticsMergeSnapshotDedupIgnoresLatency(t *testing.T) {
 	if len(details) != 1 {
 		t.Fatalf("details len = %d, want 1", len(details))
 	}
+}
+
+func TestRequestStatisticsTracksUnfinalizedPricing(t *testing.T) {
+	stats := NewRequestStatistics()
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey: "test-key",
+		Model:  "gpt-5.3-codex-spark",
+		Detail: coreusage.Detail{
+			InputTokens:  100,
+			OutputTokens: 50,
+			TotalTokens:  150,
+		},
+	})
+
+	snapshot := stats.Snapshot()
+	if snapshot.TotalCostUSD != 0 {
+		t.Fatalf("TotalCostUSD = %f, want 0", snapshot.TotalCostUSD)
+	}
+	if snapshot.PricingStatus != string(pricingStateUnfinalized) {
+		t.Fatalf("PricingStatus = %q, want %q", snapshot.PricingStatus, pricingStateUnfinalized)
+	}
+	if snapshot.UnfinalizedRequestCount != 1 {
+		t.Fatalf("UnfinalizedRequestCount = %d, want 1", snapshot.UnfinalizedRequestCount)
+	}
+}
+
+func TestRequestStatisticsPersistenceRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "usage-statistics.json")
+	stats := NewRequestStatistics()
+	if err := stats.SetPersistencePath(path); err != nil {
+		t.Fatalf("SetPersistencePath() error = %v", err)
+	}
+
+	timestamp := time.Date(2026, 4, 17, 8, 30, 0, 0, time.UTC)
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey:      "test-key",
+		Model:       "gpt-5.4",
+		RequestedAt: timestamp,
+		Latency:     750 * time.Millisecond,
+		Detail: coreusage.Detail{
+			InputTokens:  11,
+			OutputTokens: 19,
+			TotalTokens:  30,
+		},
+	})
+
+	waitForUsageFile(t, path)
+
+	restored := NewRequestStatistics()
+	if err := restored.SetPersistencePath(path); err != nil {
+		t.Fatalf("restored.SetPersistencePath() error = %v", err)
+	}
+
+	snapshot := restored.Snapshot()
+	if snapshot.TotalRequests != 1 {
+		t.Fatalf("TotalRequests = %d, want 1", snapshot.TotalRequests)
+	}
+	if snapshot.TotalTokens != 30 {
+		t.Fatalf("TotalTokens = %d, want 30", snapshot.TotalTokens)
+	}
+	if snapshot.TotalCostUSD <= 0 {
+		t.Fatalf("TotalCostUSD = %f, want > 0", snapshot.TotalCostUSD)
+	}
+	details := snapshot.APIs["test-key"].Models["gpt-5.4"].Details
+	if len(details) != 1 {
+		t.Fatalf("details len = %d, want 1", len(details))
+	}
+	if details[0].LatencyMs != 750 {
+		t.Fatalf("latency_ms = %d, want 750", details[0].LatencyMs)
+	}
+}
+
+func waitForUsageFile(t *testing.T, path string) {
+	t.Helper()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		data, err := os.ReadFile(path)
+		if err == nil && len(data) > 0 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	t.Fatalf("timed out waiting for persisted usage snapshot at %s", path)
 }

@@ -1,6 +1,7 @@
 package management
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,21 +13,25 @@ import (
 )
 
 const (
-	oauthSessionTTL     = 10 * time.Minute
-	maxOAuthStateLength = 128
+	oauthSessionTTL             = 10 * time.Minute
+	maxOAuthStateLength         = 128
+	oauthSessionStatusCancelled = "cancelled"
 )
 
 var (
 	errInvalidOAuthState      = errors.New("invalid oauth state")
 	errUnsupportedOAuthFlow   = errors.New("unsupported oauth provider")
 	errOAuthSessionNotPending = errors.New("oauth session is not pending")
+	errOAuthSessionCancelled  = errors.New("oauth session cancelled")
 )
 
 type oauthSession struct {
-	Provider  string
-	Status    string
-	CreatedAt time.Time
-	ExpiresAt time.Time
+	Provider       string
+	Status         string
+	TargetAuthName string
+	CreatedAt      time.Time
+	ExpiresAt      time.Time
+	cancel         context.CancelFunc
 }
 
 type oauthSessionStore struct {
@@ -54,8 +59,13 @@ func (s *oauthSessionStore) purgeExpiredLocked(now time.Time) {
 }
 
 func (s *oauthSessionStore) Register(state, provider string) {
+	s.RegisterWithTarget(state, provider, "")
+}
+
+func (s *oauthSessionStore) RegisterWithTarget(state, provider, targetAuthName string) {
 	state = strings.TrimSpace(state)
 	provider = strings.ToLower(strings.TrimSpace(provider))
+	targetAuthName = strings.TrimSpace(targetAuthName)
 	if state == "" || provider == "" {
 		return
 	}
@@ -66,10 +76,11 @@ func (s *oauthSessionStore) Register(state, provider string) {
 
 	s.purgeExpiredLocked(now)
 	s.sessions[state] = oauthSession{
-		Provider:  provider,
-		Status:    "",
-		CreatedAt: now,
-		ExpiresAt: now.Add(s.ttl),
+		Provider:       provider,
+		Status:         "",
+		TargetAuthName: targetAuthName,
+		CreatedAt:      now,
+		ExpiresAt:      now.Add(s.ttl),
 	}
 }
 
@@ -92,6 +103,9 @@ func (s *oauthSessionStore) SetError(state, message string) {
 	if !ok {
 		return
 	}
+	if isOAuthSessionCancelledStatus(session.Status) {
+		return
+	}
 	session.Status = message
 	session.ExpiresAt = now.Add(s.ttl)
 	s.sessions[state] = session
@@ -111,6 +125,34 @@ func (s *oauthSessionStore) Complete(state string) {
 	delete(s.sessions, state)
 }
 
+func (s *oauthSessionStore) Cancel(state string) bool {
+	state = strings.TrimSpace(state)
+	if state == "" {
+		return false
+	}
+	now := time.Now()
+	var cancel context.CancelFunc
+
+	s.mu.Lock()
+	s.purgeExpiredLocked(now)
+	session, ok := s.sessions[state]
+	if !ok {
+		s.mu.Unlock()
+		return false
+	}
+	cancel = session.cancel
+	session.cancel = nil
+	session.Status = oauthSessionStatusCancelled
+	session.ExpiresAt = now.Add(s.ttl)
+	s.sessions[state] = session
+	s.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+	return true
+}
+
 func (s *oauthSessionStore) CompleteProvider(provider string) int {
 	provider = strings.ToLower(strings.TrimSpace(provider))
 	if provider == "" {
@@ -125,11 +167,40 @@ func (s *oauthSessionStore) CompleteProvider(provider string) int {
 	removed := 0
 	for state, session := range s.sessions {
 		if strings.EqualFold(session.Provider, provider) {
+			if isOAuthSessionCancelledStatus(session.Status) {
+				continue
+			}
 			delete(s.sessions, state)
 			removed++
 		}
 	}
 	return removed
+}
+
+func (s *oauthSessionStore) SetCancel(state string, cancel context.CancelFunc) bool {
+	state = strings.TrimSpace(state)
+	if state == "" || cancel == nil {
+		return false
+	}
+	now := time.Now()
+	cancelImmediately := false
+
+	s.mu.Lock()
+	s.purgeExpiredLocked(now)
+	session, ok := s.sessions[state]
+	if !ok || isOAuthSessionCancelledStatus(session.Status) {
+		cancelImmediately = true
+	} else {
+		session.cancel = cancel
+		s.sessions[state] = session
+	}
+	s.mu.Unlock()
+
+	if cancelImmediately {
+		cancel()
+		return false
+	}
+	return true
 }
 
 func (s *oauthSessionStore) Get(state string) (oauthSession, bool) {
@@ -175,12 +246,22 @@ var oauthSessions = newOAuthSessionStore(oauthSessionTTL)
 
 func RegisterOAuthSession(state, provider string) { oauthSessions.Register(state, provider) }
 
+func RegisterOAuthSessionWithTarget(state, provider, targetAuthName string) {
+	oauthSessions.RegisterWithTarget(state, provider, targetAuthName)
+}
+
 func SetOAuthSessionError(state, message string) { oauthSessions.SetError(state, message) }
 
 func CompleteOAuthSession(state string) { oauthSessions.Complete(state) }
 
+func CancelOAuthSessionState(state string) bool { return oauthSessions.Cancel(state) }
+
 func CompleteOAuthSessionsByProvider(provider string) int {
 	return oauthSessions.CompleteProvider(provider)
+}
+
+func SetOAuthSessionCancel(state string, cancel context.CancelFunc) bool {
+	return oauthSessions.SetCancel(state, cancel)
 }
 
 func GetOAuthSession(state string) (provider string, status string, ok bool) {
@@ -191,8 +272,20 @@ func GetOAuthSession(state string) (provider string, status string, ok bool) {
 	return session.Provider, session.Status, true
 }
 
+func GetOAuthSessionTargetAuthName(state string) string {
+	session, ok := oauthSessions.Get(state)
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(session.TargetAuthName)
+}
+
 func IsOAuthSessionPending(state, provider string) bool {
 	return oauthSessions.IsPending(state, provider)
+}
+
+func isOAuthSessionCancelledStatus(status string) bool {
+	return strings.EqualFold(strings.TrimSpace(status), oauthSessionStatusCancelled)
 }
 
 func ValidateOAuthState(state string) error {

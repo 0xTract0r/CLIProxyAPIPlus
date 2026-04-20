@@ -193,6 +193,7 @@ func ParseCodexUsage(data []byte) (usage.Detail, bool) {
 	}
 	if cached := usageNode.Get("input_tokens_details.cached_tokens"); cached.Exists() {
 		detail.CachedTokens = cached.Int()
+		detail.CacheReadTokens = cached.Int()
 	}
 	if reasoning := usageNode.Get("output_tokens_details.reasoning_tokens"); reasoning.Exists() {
 		detail.ReasoningTokens = reasoning.Int()
@@ -224,6 +225,7 @@ func ParseOpenAIUsage(data []byte) usage.Detail {
 	}
 	if cached.Exists() {
 		detail.CachedTokens = cached.Int()
+		detail.CacheReadTokens = cached.Int()
 	}
 	reasoning := usageNode.Get("completion_tokens_details.reasoning_tokens")
 	if !reasoning.Exists() {
@@ -265,6 +267,7 @@ func ParseOpenAIStreamUsage(line []byte) (usage.Detail, bool) {
 	}
 	if cached.Exists() {
 		detail.CachedTokens = cached.Int()
+		detail.CacheReadTokens = cached.Int()
 	}
 
 	reasoning := usageNode.Get("completion_tokens_details.reasoning_tokens")
@@ -283,15 +286,13 @@ func ParseClaudeUsage(data []byte) usage.Detail {
 		return usage.Detail{}
 	}
 	detail := usage.Detail{
-		InputTokens:  usageNode.Get("input_tokens").Int(),
-		OutputTokens: usageNode.Get("output_tokens").Int(),
-		CachedTokens: usageNode.Get("cache_read_input_tokens").Int(),
+		InputTokens:      usageNode.Get("input_tokens").Int(),
+		OutputTokens:     usageNode.Get("output_tokens").Int(),
+		CachedTokens:     usageNode.Get("cache_read_input_tokens").Int(),
+		CacheReadTokens:  usageNode.Get("cache_read_input_tokens").Int(),
+		CacheWriteTokens: usageNode.Get("cache_creation_input_tokens").Int(),
 	}
-	if detail.CachedTokens == 0 {
-		// fall back to creation tokens when read tokens are absent
-		detail.CachedTokens = usageNode.Get("cache_creation_input_tokens").Int()
-	}
-	detail.TotalTokens = detail.InputTokens + detail.OutputTokens
+	detail.TotalTokens = detail.InputTokens + detail.OutputTokens + detail.CacheReadTokens + detail.CacheWriteTokens
 	return detail
 }
 
@@ -305,14 +306,13 @@ func ParseClaudeStreamUsage(line []byte) (usage.Detail, bool) {
 		return usage.Detail{}, false
 	}
 	detail := usage.Detail{
-		InputTokens:  usageNode.Get("input_tokens").Int(),
-		OutputTokens: usageNode.Get("output_tokens").Int(),
-		CachedTokens: usageNode.Get("cache_read_input_tokens").Int(),
+		InputTokens:      usageNode.Get("input_tokens").Int(),
+		OutputTokens:     usageNode.Get("output_tokens").Int(),
+		CachedTokens:     usageNode.Get("cache_read_input_tokens").Int(),
+		CacheReadTokens:  usageNode.Get("cache_read_input_tokens").Int(),
+		CacheWriteTokens: usageNode.Get("cache_creation_input_tokens").Int(),
 	}
-	if detail.CachedTokens == 0 {
-		detail.CachedTokens = usageNode.Get("cache_creation_input_tokens").Int()
-	}
-	detail.TotalTokens = detail.InputTokens + detail.OutputTokens
+	detail.TotalTokens = detail.InputTokens + detail.OutputTokens + detail.CacheReadTokens + detail.CacheWriteTokens
 	return detail, true
 }
 

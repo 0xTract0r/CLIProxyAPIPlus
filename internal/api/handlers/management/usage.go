@@ -1,6 +1,7 @@
 package management
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"time"
@@ -18,6 +19,19 @@ type usageExportPayload struct {
 type usageImportPayload struct {
 	Version int                      `json:"version"`
 	Usage   usage.StatisticsSnapshot `json:"usage"`
+}
+
+type pricingPayload struct {
+	Pricing usage.PricingSnapshot `json:"pricing"`
+}
+
+type pricingOverridePayload struct {
+	Model                 string  `json:"model"`
+	DisplayName           string  `json:"display_name"`
+	InputUSDPerMTok       float64 `json:"input_usd_per_mtok"`
+	CachedInputUSDPerMTok float64 `json:"cached_input_usd_per_mtok"`
+	OutputUSDPerMTok      float64 `json:"output_usd_per_mtok"`
+	CacheWriteUSDPerMTok  float64 `json:"cache_write_usd_per_mtok"`
 }
 
 // GetUsageStatistics returns the in-memory request statistics snapshot.
@@ -39,7 +53,7 @@ func (h *Handler) ExportUsageStatistics(c *gin.Context) {
 		snapshot = h.usageStats.Snapshot()
 	}
 	c.JSON(http.StatusOK, usageExportPayload{
-		Version:    1,
+		Version:    2,
 		ExportedAt: time.Now().UTC(),
 		Usage:      snapshot,
 	})
@@ -63,7 +77,7 @@ func (h *Handler) ImportUsageStatistics(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid json"})
 		return
 	}
-	if payload.Version != 0 && payload.Version != 1 {
+	if payload.Version != 0 && payload.Version != 1 && payload.Version != 2 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "unsupported version"})
 		return
 	}
@@ -75,5 +89,83 @@ func (h *Handler) ImportUsageStatistics(c *gin.Context) {
 		"skipped":         result.Skipped,
 		"total_requests":  snapshot.TotalRequests,
 		"failed_requests": snapshot.FailureCount,
+	})
+}
+
+// GetUsagePricing returns the current pricing catalog and observed models.
+func (h *Handler) GetUsagePricing(c *gin.Context) {
+	if h == nil || h.usageStats == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "usage statistics unavailable"})
+		return
+	}
+	c.JSON(http.StatusOK, pricingPayload{
+		Pricing: h.usageStats.PricingSnapshot(),
+	})
+}
+
+// RefreshUsagePricing refreshes official pricing sources and recalculates historical costs.
+func (h *Handler) RefreshUsagePricing(c *gin.Context) {
+	if h == nil || h.usageStats == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "usage statistics unavailable"})
+		return
+	}
+	err := h.usageStats.RefreshPricingCatalog(context.Background())
+	payload := pricingPayload{Pricing: h.usageStats.PricingSnapshot()}
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"pricing": payload.Pricing,
+			"warning": err.Error(),
+		})
+		return
+	}
+	c.JSON(http.StatusOK, payload)
+}
+
+// PutUsagePricingOverride stores a manual pricing override and recalculates historical costs.
+func (h *Handler) PutUsagePricingOverride(c *gin.Context) {
+	if h == nil || h.usageStats == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "usage statistics unavailable"})
+		return
+	}
+
+	model := c.Param("model")
+	var payload pricingOverridePayload
+	if err := c.ShouldBindJSON(&payload); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid json"})
+		return
+	}
+	if payload.Model != "" && usage.NormalizeCanonicalModelID(payload.Model) != usage.NormalizeCanonicalModelID(model) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "body model does not match path model"})
+		return
+	}
+
+	if _, err := h.usageStats.PutPricingOverride(model, usage.PricingModel{
+		DisplayName:           payload.DisplayName,
+		InputUSDPerMTok:       payload.InputUSDPerMTok,
+		CachedInputUSDPerMTok: payload.CachedInputUSDPerMTok,
+		OutputUSDPerMTok:      payload.OutputUSDPerMTok,
+		CacheWriteUSDPerMTok:  payload.CacheWriteUSDPerMTok,
+	}); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, pricingPayload{
+		Pricing: h.usageStats.PricingSnapshot(),
+	})
+}
+
+// DeleteUsagePricingOverride removes a manual pricing override and recalculates historical costs.
+func (h *Handler) DeleteUsagePricingOverride(c *gin.Context) {
+	if h == nil || h.usageStats == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "usage statistics unavailable"})
+		return
+	}
+	if !h.usageStats.DeletePricingOverride(c.Param("model")) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "pricing override not found"})
+		return
+	}
+	c.JSON(http.StatusOK, pricingPayload{
+		Pricing: h.usageStats.PricingSnapshot(),
 	})
 }

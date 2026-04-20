@@ -22,6 +22,9 @@ func TestParseOpenAIUsageChatCompletions(t *testing.T) {
 	if detail.CachedTokens != 4 {
 		t.Fatalf("cached tokens = %d, want %d", detail.CachedTokens, 4)
 	}
+	if detail.CacheReadTokens != 4 {
+		t.Fatalf("cache read tokens = %d, want %d", detail.CacheReadTokens, 4)
+	}
 	if detail.ReasoningTokens != 5 {
 		t.Fatalf("reasoning tokens = %d, want %d", detail.ReasoningTokens, 5)
 	}
@@ -42,8 +45,34 @@ func TestParseOpenAIUsageResponses(t *testing.T) {
 	if detail.CachedTokens != 7 {
 		t.Fatalf("cached tokens = %d, want %d", detail.CachedTokens, 7)
 	}
+	if detail.CacheReadTokens != 7 {
+		t.Fatalf("cache read tokens = %d, want %d", detail.CacheReadTokens, 7)
+	}
 	if detail.ReasoningTokens != 9 {
 		t.Fatalf("reasoning tokens = %d, want %d", detail.ReasoningTokens, 9)
+	}
+}
+
+func TestParseClaudeUsageSeparatesCacheReadWrite(t *testing.T) {
+	data := []byte(`{"usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":7,"cache_creation_input_tokens":3}}`)
+	detail := ParseClaudeUsage(data)
+	if detail.InputTokens != 10 {
+		t.Fatalf("input tokens = %d, want %d", detail.InputTokens, 10)
+	}
+	if detail.OutputTokens != 20 {
+		t.Fatalf("output tokens = %d, want %d", detail.OutputTokens, 20)
+	}
+	if detail.CachedTokens != 7 {
+		t.Fatalf("cached tokens = %d, want %d", detail.CachedTokens, 7)
+	}
+	if detail.CacheReadTokens != 7 {
+		t.Fatalf("cache read tokens = %d, want %d", detail.CacheReadTokens, 7)
+	}
+	if detail.CacheWriteTokens != 3 {
+		t.Fatalf("cache write tokens = %d, want %d", detail.CacheWriteTokens, 3)
+	}
+	if detail.TotalTokens != 40 {
+		t.Fatalf("total tokens = %d, want %d", detail.TotalTokens, 40)
 	}
 }
 

@@ -64,6 +64,22 @@ func setKiroIncognitoMode(cfg *config.Config, useIncognito, noIncognito bool) {
 	}
 }
 
+func usageSnapshotPath(configFilePath string) string {
+	configFilePath = strings.TrimSpace(configFilePath)
+	if configFilePath == "" {
+		return ""
+	}
+	return filepath.Join(filepath.Dir(configFilePath), ".usage-statistics.json")
+}
+
+func usagePricingCatalogPath(configFilePath string) string {
+	configFilePath = strings.TrimSpace(configFilePath)
+	if configFilePath == "" {
+		return ""
+	}
+	return filepath.Join(filepath.Dir(configFilePath), ".usage-pricing-catalog.json")
+}
+
 // main is the entry point of the application.
 // It parses command-line flags, loads configuration, and starts the appropriate
 // service based on the provided flags (login, codex-login, or server mode).
@@ -589,6 +605,17 @@ func main() {
 		kiro.InitFingerprintConfig(cfg)
 		cmd.DoKiroIDCLogin(cfg, options, kiroIDCStartURL, kiroIDCRegion, kiroIDCFlow)
 	} else {
+		if snapshotPath := usageSnapshotPath(configFilePath); snapshotPath != "" {
+			if errPersist := usage.ConfigureDefaultPersistence(snapshotPath); errPersist != nil {
+				log.WithError(errPersist).Warnf("failed to restore usage statistics snapshot from %s", snapshotPath)
+			}
+		}
+		if pricingPath := usagePricingCatalogPath(configFilePath); pricingPath != "" {
+			if errPersist := usage.ConfigureDefaultPricingCatalogPersistence(pricingPath); errPersist != nil {
+				log.WithError(errPersist).Warnf("failed to restore pricing catalog from %s", pricingPath)
+			}
+		}
+
 		// In cloud deploy mode without config file, just wait for shutdown signals
 		if isCloudDeploy && !configFileExists {
 			// No config file available, just wait for shutdown

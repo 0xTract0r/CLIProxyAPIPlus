@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -69,6 +71,8 @@ const (
 )
 
 var quotaCooldownDisabled atomic.Bool
+
+var refreshFailureStatusPattern = regexp.MustCompile(`\b(?:status|code)\s*(?:=|:)?\s*(\d{3})\b`)
 
 // SetQuotaCooldownDisabled toggles quota cooldown scheduling globally.
 func SetQuotaCooldownDisabled(disable bool) {
@@ -3209,16 +3213,7 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 	log.Debugf("refreshed %s, %s, %v", auth.Provider, auth.ID, err)
 	now := time.Now()
 	if err != nil {
-		m.mu.Lock()
-		if current := m.auths[id]; current != nil {
-			current.NextRefreshAfter = now.Add(refreshFailureBackoff)
-			current.LastError = &Error{Message: err.Error()}
-			m.auths[id] = current
-			if m.scheduler != nil {
-				m.scheduler.upsertAuth(current.Clone())
-			}
-		}
-		m.mu.Unlock()
+		m.recordRefreshFailure(ctx, id, now, err)
 		return
 	}
 	if updated == nil {
@@ -3233,9 +3228,345 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 	// Preserve NextRefreshAfter set by the Authenticator
 	// If the Authenticator set a reasonable refresh time, it should not be overwritten
 	// If the Authenticator did not set it (zero value), shouldRefresh will use default logic
-	updated.LastError = nil
-	updated.UpdatedAt = now
+	clearAuthStateOnSuccess(updated, now)
 	_, _ = m.Update(ctx, updated)
+}
+
+func (m *Manager) commitAuthSnapshot(ctx context.Context, auth *Auth) (*Auth, error) {
+	if m == nil || auth == nil || auth.ID == "" {
+		return nil, nil
+	}
+	auth.EnsureIndex()
+	authClone := auth.Clone()
+
+	m.mu.Lock()
+	m.auths[auth.ID] = authClone
+	m.mu.Unlock()
+
+	m.rebuildAPIKeyModelAliasFromRuntimeConfig()
+	if m.scheduler != nil {
+		m.scheduler.upsertAuth(authClone)
+	}
+	if errPersist := m.persist(ctx, auth); errPersist != nil {
+		return auth.Clone(), errPersist
+	}
+	m.hook.OnAuthUpdated(ctx, auth.Clone())
+	return auth.Clone(), nil
+}
+
+func normalizeRefreshError(err error) *Error {
+	if err == nil {
+		return nil
+	}
+
+	message := strings.TrimSpace(err.Error())
+	var authErr *Error
+	if errors.As(err, &authErr) && authErr != nil {
+		normalized := cloneError(authErr)
+		if normalized == nil {
+			normalized = &Error{}
+		}
+		if normalized.Code == "" {
+			normalized.Code = "auth_refresh_failed"
+		}
+		if strings.TrimSpace(normalized.Message) == "" {
+			normalized.Message = message
+		}
+		if normalized.HTTPStatus == 0 {
+			normalized.HTTPStatus = inferRefreshFailureHTTPStatus(normalized.Message)
+		}
+		if !normalized.Retryable {
+			normalized.Retryable = isRetryableRefreshFailure(err, normalized.HTTPStatus, normalized.Message)
+		}
+		return normalized
+	}
+
+	status := statusCodeFromError(err)
+	if status == 0 {
+		status = inferRefreshFailureHTTPStatus(message)
+	}
+	return &Error{
+		Code:       "auth_refresh_failed",
+		Message:    message,
+		Retryable:  isRetryableRefreshFailure(err, status, message),
+		HTTPStatus: status,
+	}
+}
+
+func inferRefreshFailureHTTPStatus(message string) int {
+	matches := refreshFailureStatusPattern.FindStringSubmatch(strings.ToLower(strings.TrimSpace(message)))
+	if len(matches) < 2 {
+		return 0
+	}
+	status, err := strconv.Atoi(matches[1])
+	if err != nil {
+		return 0
+	}
+	if status < 100 || status > 599 {
+		return 0
+	}
+	return status
+}
+
+func isRetryableRefreshFailure(err error, status int, message string) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return true
+	}
+	switch status {
+	case http.StatusRequestTimeout,
+		http.StatusTooManyRequests,
+		http.StatusInternalServerError,
+		http.StatusBadGateway,
+		http.StatusServiceUnavailable,
+		http.StatusGatewayTimeout:
+		return true
+	}
+
+	lower := strings.ToLower(strings.TrimSpace(message))
+	if lower == "" {
+		return false
+	}
+	for _, hint := range [...]string{
+		"timeout",
+		"temporarily unavailable",
+		"temporary failure",
+		"temporary error",
+		"connection reset",
+		"connection refused",
+		"broken pipe",
+		"i/o timeout",
+		"tls handshake timeout",
+		"unexpected eof",
+		"eof",
+		"too many requests",
+		"rate limit",
+		"try again later",
+	} {
+		if strings.Contains(lower, hint) {
+			return true
+		}
+	}
+	return false
+}
+
+func shouldCommitRefreshFailureState(auth *Auth, refreshErr *Error, now time.Time) bool {
+	if auth == nil || refreshErr == nil {
+		return false
+	}
+	expiry, ok := auth.ExpirationTime()
+	if !ok || expiry.IsZero() {
+		return true
+	}
+	return !expiry.After(now)
+}
+
+func shouldPersistRefreshGraceState(auth *Auth, refreshErr *Error, now time.Time) bool {
+	if auth == nil || refreshErr == nil || refreshErr.Retryable {
+		return false
+	}
+	expiry, ok := auth.ExpirationTime()
+	if !ok || expiry.IsZero() {
+		return false
+	}
+	return expiry.After(now)
+}
+
+func isRefreshTokenReusedFailure(refreshErr *Error) bool {
+	if refreshErr == nil {
+		return false
+	}
+	raw := strings.ToLower(strings.TrimSpace(refreshErr.Message))
+	if raw == "" {
+		return false
+	}
+	return strings.Contains(raw, "refresh_token_reused") ||
+		strings.Contains(raw, "refresh token has already been used")
+}
+
+func refreshFailureGraceStatusMessage(refreshErr *Error, expiry time.Time) string {
+	base := "token refresh failed"
+	if isRefreshTokenReusedFailure(refreshErr) {
+		base = "refresh token was already rotated by a newer session"
+	} else if refreshErr != nil {
+		if msg := strings.TrimSpace(refreshErr.Message); msg != "" {
+			base = msg
+		}
+	}
+	return base + "; current access token remains usable until " + expiry.UTC().Format(time.RFC3339) + "; reauthenticate as soon as possible"
+}
+
+func applyRefreshFailureGraceState(auth *Auth, refreshErr *Error, now time.Time) {
+	if auth == nil || refreshErr == nil {
+		return
+	}
+	expiry, ok := auth.ExpirationTime()
+	if !ok || expiry.IsZero() || !expiry.After(now) {
+		return
+	}
+	auth.Unavailable = false
+	if !auth.Disabled && auth.Status != StatusDisabled {
+		auth.Status = StatusActive
+	}
+	auth.LastError = cloneError(refreshErr)
+	auth.StatusMessage = refreshFailureGraceStatusMessage(refreshErr, expiry)
+	auth.NextRetryAfter = time.Time{}
+	auth.UpdatedAt = now
+}
+
+func (m *Manager) recordRefreshFailure(ctx context.Context, id string, now time.Time, errRefresh error) {
+	if m == nil {
+		return
+	}
+	refreshErr := normalizeRefreshError(errRefresh)
+	if refreshErr == nil {
+		refreshErr = &Error{
+			Code:    "auth_refresh_failed",
+			Message: strings.TrimSpace(errRefresh.Error()),
+		}
+	}
+
+	var snapshot *Auth
+	m.mu.Lock()
+	current := m.auths[id]
+	if current != nil {
+		current.NextRefreshAfter = now.Add(refreshFailureBackoff)
+		current.LastError = cloneError(refreshErr)
+		m.auths[id] = current
+		if m.scheduler != nil {
+			snapshot = current.Clone()
+		}
+	}
+	m.mu.Unlock()
+
+	if snapshot != nil {
+		m.scheduler.upsertAuth(snapshot)
+	}
+	if current != nil && shouldPersistRefreshGraceState(current, refreshErr, now) {
+		updated := current.Clone()
+		applyRefreshFailureGraceState(updated, refreshErr, now)
+		updated.NextRefreshAfter = now.Add(refreshFailureBackoff)
+		if _, errPersist := m.commitAuthSnapshot(ctx, updated); errPersist != nil {
+			log.Warnf("failed to persist refresh grace state for %s: %v", id, errPersist)
+		}
+		return
+	}
+	if current == nil || !shouldCommitRefreshFailureState(current, refreshErr, now) {
+		return
+	}
+
+	updated := current.Clone()
+	applyAuthFailureState(updated, refreshErr, retryAfterFromError(errRefresh), now)
+	updated.NextRefreshAfter = now.Add(refreshFailureBackoff)
+	if msg := strings.TrimSpace(refreshErr.Message); msg != "" {
+		updated.StatusMessage = msg
+	}
+	if _, errPersist := m.commitAuthSnapshot(ctx, updated); errPersist != nil {
+		log.Warnf("failed to persist refresh failure state for %s: %v", id, errPersist)
+	}
+}
+
+// RefreshAuthStatus manually re-checks one auth by invoking its provider refresh flow.
+// On success it clears stale auth-level warning state and persists any refreshed tokens.
+func (m *Manager) RefreshAuthStatus(ctx context.Context, id string) (*Auth, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return nil, &Error{Code: "auth_not_found", Message: "auth not found"}
+	}
+
+	m.mu.RLock()
+	current := m.auths[id]
+	var exec ProviderExecutor
+	if current != nil {
+		exec = m.executors[current.Provider]
+	}
+	m.mu.RUnlock()
+
+	if current == nil {
+		return nil, &Error{Code: "auth_not_found", Message: "auth not found"}
+	}
+	if exec == nil {
+		return current.Clone(), &Error{Code: "refresh_not_supported", Message: "provider does not support status refresh"}
+	}
+
+	now := time.Now()
+	candidate := current.Clone()
+	updated, errRefresh := exec.Refresh(ctx, candidate)
+	if updated == nil {
+		updated = candidate
+	}
+	if updated == nil {
+		updated = current.Clone()
+	}
+
+	if updated.ID == "" {
+		updated.ID = current.ID
+	}
+	if updated.Provider == "" {
+		updated.Provider = current.Provider
+	}
+	if updated.FileName == "" {
+		updated.FileName = current.FileName
+	}
+	if updated.Runtime == nil {
+		updated.Runtime = current.Runtime
+	}
+	if updated.CreatedAt.IsZero() {
+		updated.CreatedAt = current.CreatedAt
+	}
+
+	if errRefresh != nil {
+		authErr := normalizeRefreshError(errRefresh)
+		updated.LastError = cloneError(authErr)
+		updated.NextRefreshAfter = now.Add(refreshFailureBackoff)
+		if shouldCommitRefreshFailureState(updated, authErr, now) {
+			applyAuthFailureState(updated, authErr, retryAfterFromError(errRefresh), now)
+			if msg := strings.TrimSpace(authErr.Message); msg != "" {
+				// 手动“刷新状态”时优先保留本次 refresh 的原始失败原因，避免卡片只剩通用 5xx 文案。
+				updated.StatusMessage = msg
+			}
+			saved, errPersist := m.commitAuthSnapshot(ctx, updated)
+			if errPersist != nil {
+				return saved, errPersist
+			}
+			return saved, authErr
+		}
+		if shouldPersistRefreshGraceState(updated, authErr, now) {
+			applyRefreshFailureGraceState(updated, authErr, now)
+			saved, errPersist := m.commitAuthSnapshot(ctx, updated)
+			if errPersist != nil {
+				return saved, errPersist
+			}
+			return saved, authErr
+		}
+
+		// 对未过期且可重试的瞬时失败，返回错误给调用方即可，不要把卡片持久化成红态。
+		updated.Status = current.Status
+		updated.StatusMessage = current.StatusMessage
+		updated.Unavailable = current.Unavailable
+		updated.Quota = current.Quota
+		updated.NextRetryAfter = current.NextRetryAfter
+		updated.UpdatedAt = current.UpdatedAt
+		return updated.Clone(), authErr
+	}
+
+	updated.LastRefreshedAt = now
+	clearAuthStateOnSuccess(updated, now)
+
+	saved, errPersist := m.commitAuthSnapshot(ctx, updated)
+	if errPersist != nil {
+		return saved, errPersist
+	}
+	return saved, nil
 }
 
 func (m *Manager) executorFor(provider string) ProviderExecutor {
