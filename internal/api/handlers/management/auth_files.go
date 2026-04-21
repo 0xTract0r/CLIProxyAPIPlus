@@ -548,6 +548,52 @@ func isRuntimeOnlyAuth(auth *coreauth.Auth) bool {
 	return strings.EqualFold(strings.TrimSpace(auth.Attributes["runtime_only"]), "true")
 }
 
+func isUnsafeAuthFileName(name string) bool {
+	if strings.TrimSpace(name) == "" {
+		return true
+	}
+	if strings.ContainsAny(name, "/\\") {
+		return true
+	}
+	return filepath.VolumeName(name) != ""
+}
+
+func (h *Handler) findAuthByNameOrID(name string) *coreauth.Auth {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return nil
+	}
+	if h != nil && h.authManager != nil {
+		if auth, ok := h.authManager.GetByID(name); ok && auth != nil {
+			return auth
+		}
+		for _, auth := range h.authManager.List() {
+			if auth == nil {
+				continue
+			}
+			if strings.TrimSpace(auth.FileName) == name {
+				return auth
+			}
+			if filepath.Base(strings.TrimSpace(authAttribute(auth, "path"))) == name {
+				return auth
+			}
+		}
+	}
+	if h == nil || h.cfg == nil || isUnsafeAuthFileName(name) {
+		return nil
+	}
+	path := filepath.Join(h.cfg.AuthDir, filepath.Base(name))
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	auth, err := h.buildAuthFromFileData(path, data)
+	if err != nil {
+		return nil
+	}
+	return auth
+}
+
 // Download single auth file by name
 func (h *Handler) DownloadAuthFile(c *gin.Context) {
 	name := c.Query("name")
@@ -765,6 +811,56 @@ func (h *Handler) authIDForPath(path string) string {
 	return id
 }
 
+func (h *Handler) buildAuthFromFileData(path string, data []byte) (*coreauth.Auth, error) {
+	if path == "" {
+		return nil, fmt.Errorf("auth path is empty")
+	}
+	if data == nil {
+		var err error
+		data, err = os.ReadFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read auth file: %w", err)
+		}
+	}
+	metadata := make(map[string]any)
+	if err := json.Unmarshal(data, &metadata); err != nil {
+		return nil, fmt.Errorf("invalid auth file: %w", err)
+	}
+	provider, _ := metadata["type"].(string)
+	if provider == "" {
+		provider = "unknown"
+	}
+	label := provider
+	if email, ok := metadata["email"].(string); ok && email != "" {
+		label = email
+	}
+	lastRefresh, hasLastRefresh := extractLastRefreshTimestamp(metadata)
+	authID := h.authIDForPath(path)
+	if authID == "" {
+		authID = path
+	}
+	attr := map[string]string{
+		"path":   path,
+		"source": path,
+	}
+	synthesizer.AddMetadataHeadersToAttrs(metadata, attr)
+	auth := &coreauth.Auth{
+		ID:         authID,
+		Provider:   provider,
+		FileName:   filepath.Base(path),
+		Label:      label,
+		Status:     coreauth.StatusActive,
+		Attributes: attr,
+		Metadata:   metadata,
+		CreatedAt:  time.Now(),
+		UpdatedAt:  time.Now(),
+	}
+	if hasLastRefresh {
+		auth.LastRefreshedAt = lastRefresh
+	}
+	return auth, nil
+}
+
 func (h *Handler) registerAuthFromFile(ctx context.Context, path string, data []byte) error {
 	if h.authManager == nil {
 		return nil
@@ -878,6 +974,185 @@ func replaceAuthMetadataHeaders(auth *coreauth.Auth, headers map[string]string) 
 	synthesizer.AddMetadataHeadersToAttrs(map[string]any{"headers": stored}, auth.Attributes)
 }
 
+type refreshAuthFileStatusRequest struct {
+	Name    string `json:"name"`
+	Trigger string `json:"trigger"`
+}
+
+const authStatusRefreshFailureBackoff = time.Minute
+
+// RefreshAuthFileStatus manually re-checks an auth entry by invoking the provider refresh flow.
+func (h *Handler) RefreshAuthFileStatus(c *gin.Context) {
+	if h.authManager == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
+		return
+	}
+
+	var req refreshAuthFileStatusRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
+		return
+	}
+
+	targetAuth := h.findAuthByNameOrID(name)
+	if targetAuth == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "auth file not found"})
+		return
+	}
+
+	trigger := normalizeAuthStatusHistoryTrigger(req.Trigger)
+	before := authStatusHistorySnapshotFromAuth(targetAuth)
+	updated, errRefresh := h.refreshAuthStatus(c.Request.Context(), targetAuth)
+	if updated == nil {
+		updated = targetAuth
+	}
+	after := authStatusHistorySnapshotFromAuth(updated)
+	entry := h.buildAuthFileEntry(updated)
+	if entry == nil {
+		entry = gin.H{
+			"name":     name,
+			"provider": after.Provider,
+			"status":   after.Status,
+		}
+	}
+
+	h.appendAuthStatusHistoryEvent(authStatusHistoryEvent{
+		EventType:       deriveAuthStatusHistoryEventType(before, after, errRefresh),
+		AuthName:        after.AuthName,
+		Provider:        after.Provider,
+		Trigger:         trigger,
+		PreviousStatus:  before.Status,
+		PreviousMessage: before.StatusMessage,
+		Status:          after.Status,
+		StatusMessage:   after.StatusMessage,
+		Error:           errorString(errRefresh),
+	})
+
+	resp := gin.H{
+		"status": "ok",
+		"file":   entry,
+	}
+	if errRefresh != nil {
+		resp["status"] = "warning"
+		resp["error"] = errRefresh.Error()
+	}
+	c.JSON(http.StatusOK, resp)
+}
+
+func (h *Handler) refreshAuthStatus(ctx context.Context, current *coreauth.Auth) (*coreauth.Auth, error) {
+	if h == nil || h.authManager == nil || current == nil {
+		return current, fmt.Errorf("core auth manager unavailable")
+	}
+	exec, ok := h.authManager.Executor(current.Provider)
+	if !ok || exec == nil {
+		return current.Clone(), fmt.Errorf("provider does not support status refresh")
+	}
+
+	now := time.Now()
+	candidate := current.Clone()
+	updated, errRefresh := exec.Refresh(ctx, candidate)
+	if updated == nil {
+		updated = candidate
+	}
+	if updated == nil {
+		updated = current.Clone()
+	}
+	preserveAuthIdentity(updated, current)
+
+	if errRefresh != nil {
+		authErr := normalizeAuthRefreshError(errRefresh)
+		updated.LastError = authErr
+		updated.Status = coreauth.StatusError
+		updated.StatusMessage = strings.TrimSpace(authErr.Message)
+		updated.Unavailable = true
+		updated.NextRefreshAfter = now.Add(authStatusRefreshFailureBackoff)
+		updated.UpdatedAt = now
+		if authErr.HTTPStatus == http.StatusTooManyRequests {
+			updated.Quota.Exceeded = true
+			updated.Quota.Reason = "quota"
+			updated.Quota.NextRecoverAt = now.Add(authStatusRefreshFailureBackoff)
+		}
+		saved, errUpdate := h.authManager.Update(ctx, updated)
+		if errUpdate != nil {
+			return saved, errUpdate
+		}
+		return saved, authErr
+	}
+
+	updated.LastError = nil
+	updated.Status = coreauth.StatusActive
+	updated.StatusMessage = ""
+	updated.Unavailable = false
+	updated.Quota.Exceeded = false
+	updated.Quota.Reason = ""
+	updated.Quota.NextRecoverAt = time.Time{}
+	updated.NextRetryAfter = time.Time{}
+	updated.NextRefreshAfter = time.Time{}
+	updated.LastRefreshedAt = now
+	updated.UpdatedAt = now
+
+	return h.authManager.Update(ctx, updated)
+}
+
+func preserveAuthIdentity(updated, current *coreauth.Auth) {
+	if updated == nil || current == nil {
+		return
+	}
+	if updated.ID == "" {
+		updated.ID = current.ID
+	}
+	if updated.Provider == "" {
+		updated.Provider = current.Provider
+	}
+	if updated.FileName == "" {
+		updated.FileName = current.FileName
+	}
+	if updated.Label == "" {
+		updated.Label = current.Label
+	}
+	if updated.Runtime == nil {
+		updated.Runtime = current.Runtime
+	}
+	if updated.CreatedAt.IsZero() {
+		updated.CreatedAt = current.CreatedAt
+	}
+	if updated.Attributes == nil {
+		updated.Attributes = current.Attributes
+	}
+}
+
+func normalizeAuthRefreshError(err error) *coreauth.Error {
+	if err == nil {
+		return nil
+	}
+	var authErr *coreauth.Error
+	if errors.As(err, &authErr) && authErr != nil {
+		return &coreauth.Error{
+			Code:       authErr.Code,
+			Message:    strings.TrimSpace(authErr.Message),
+			Retryable:  authErr.Retryable,
+			HTTPStatus: authErr.HTTPStatus,
+		}
+	}
+	return &coreauth.Error{
+		Code:    "refresh_failed",
+		Message: strings.TrimSpace(err.Error()),
+	}
+}
+
+func errorString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return strings.TrimSpace(err.Error())
+}
+
 // PatchAuthFileStatus toggles the disabled state of an auth file
 func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 	if h.authManager == nil {
@@ -952,11 +1227,11 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 	}
 
 	var req struct {
-		Name     string  `json:"name"`
-		Prefix   *string `json:"prefix"`
-		ProxyURL *string `json:"proxy_url"`
-		Priority *int    `json:"priority"`
-		Note     *string `json:"note"`
+		Name     string            `json:"name"`
+		Prefix   *string           `json:"prefix"`
+		ProxyURL *string           `json:"proxy_url"`
+		Priority *int              `json:"priority"`
+		Note     *string           `json:"note"`
 		Headers  map[string]string `json:"headers"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -3111,6 +3386,10 @@ func (h *Handler) GetAuthStatus(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
 		return
 	}
+	if isOAuthSessionCancelledStatus(status) {
+		c.JSON(http.StatusOK, gin.H{"status": oauthSessionStatusCancelled})
+		return
+	}
 	if status != "" {
 		if strings.HasPrefix(status, "device_code|") {
 			parts := strings.SplitN(status, "|", 3)
@@ -3135,6 +3414,24 @@ func (h *Handler) GetAuthStatus(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"status": "wait"})
+}
+
+func (h *Handler) CancelOAuthSession(c *gin.Context) {
+	state := strings.TrimSpace(c.Query("state"))
+	if state == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "state is required"})
+		return
+	}
+	if err := ValidateOAuthState(state); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "invalid state"})
+		return
+	}
+
+	cancelled := CancelOAuthSessionState(state)
+	c.JSON(http.StatusOK, gin.H{
+		"status":    "ok",
+		"cancelled": cancelled,
+	})
 }
 
 // PopulateAuthContext extracts request info and adds it to the context

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -107,6 +108,104 @@ func TestAmpProviderModelRoutes(t *testing.T) {
 			}
 			if body := rr.Body.String(); !strings.Contains(body, tc.wantContains) {
 				t.Fatalf("response body for %s missing %q: %s", tc.path, tc.wantContains, body)
+			}
+		})
+	}
+}
+
+func TestManagementFrontendOAuthRoutesRegistered(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "route-key")
+	gin.SetMode(gin.TestMode)
+
+	tmpDir := t.TempDir()
+	authDir := filepath.Join(tmpDir, "auth")
+	if err := os.MkdirAll(authDir, 0o700); err != nil {
+		t.Fatalf("failed to create auth dir: %v", err)
+	}
+
+	manager := auth.NewManager(nil, nil, nil)
+	if _, err := manager.Register(context.Background(), &auth.Auth{
+		ID:       "codex-route.json",
+		FileName: "codex-route.json",
+		Provider: "codex",
+		Status:   auth.StatusActive,
+		Metadata: map[string]any{
+			"type":  "codex",
+			"email": "route@example.com",
+		},
+	}); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+
+	cfg := &proxyconfig.Config{
+		SDKConfig: sdkconfig.SDKConfig{
+			APIKeys: []string{"test-key"},
+		},
+		Port:                   0,
+		AuthDir:                authDir,
+		Debug:                  true,
+		LoggingToFile:          false,
+		UsageStatisticsEnabled: false,
+	}
+	server := NewServer(cfg, manager, sdkaccess.NewManager(), filepath.Join(tmpDir, "config.yaml"))
+
+	testCases := []struct {
+		name       string
+		method     string
+		path       string
+		body       string
+		wantStatus int
+	}{
+		{
+			name:       "oauth reauth history",
+			method:     http.MethodGet,
+			path:       "/v0/management/oauth-reauth-history?limit=5",
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:       "auth status history",
+			method:     http.MethodGet,
+			path:       "/v0/management/auth-status-history?limit=5",
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:       "refresh auth status",
+			method:     http.MethodPost,
+			path:       "/v0/management/auth-files/refresh-status",
+			body:       `{"name":"codex-route.json"}`,
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:       "cancel oauth session",
+			method:     http.MethodDelete,
+			path:       "/v0/management/oauth-session?state=route-test-state",
+			wantStatus: http.StatusOK,
+		},
+	}
+
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			var body *strings.Reader
+			if tc.body != "" {
+				body = strings.NewReader(tc.body)
+			} else {
+				body = strings.NewReader("")
+			}
+			req := httptest.NewRequest(tc.method, tc.path, body)
+			req.Header.Set("X-Management-Key", "route-key")
+			if tc.body != "" {
+				req.Header.Set("Content-Type", "application/json")
+			}
+
+			rr := httptest.NewRecorder()
+			server.engine.ServeHTTP(rr, req)
+
+			if rr.Code != tc.wantStatus {
+				t.Fatalf("%s %s status = %d, want %d; body=%s", tc.method, tc.path, rr.Code, tc.wantStatus, rr.Body.String())
+			}
+			if rr.Code == http.StatusNotFound && strings.TrimSpace(rr.Body.String()) == "" {
+				t.Fatalf("%s %s still appears to be an unregistered route", tc.method, tc.path)
 			}
 		})
 	}
