@@ -57,6 +57,18 @@ func GetProviderName(modelName string) []string {
 		return providers
 	}
 
+	// Claude releases frequently add new numeric variants before the local registry
+	// or forked model catalog catches up. Prefix-based fallback keeps request routing
+	// working for new Claude IDs like claude-opus-4-7 instead of failing fast with
+	// "unknown provider" while still leaving provider-specific metadata optional.
+	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(modelName)), "claude-") {
+		appendProvider("claude")
+	}
+
+	if len(providers) > 0 {
+		return providers
+	}
+
 	// Fallback: if cursor provider has registered models, route unknown models to it.
 	// Cursor acts as a universal proxy supporting multiple model families (Claude, GPT, Gemini, etc.).
 	if models := registry.GetGlobalRegistry().GetAvailableModelsByProvider("cursor"); len(models) > 0 {
