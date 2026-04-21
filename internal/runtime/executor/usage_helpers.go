@@ -69,21 +69,8 @@ func (r *usageReporter) publishWithOutcome(ctx context.Context, detail usage.Det
 			detail.TotalTokens = total
 		}
 	}
-	if detail.InputTokens == 0 && detail.OutputTokens == 0 && detail.ReasoningTokens == 0 && detail.CachedTokens == 0 && detail.TotalTokens == 0 && !failed {
-		return
-	}
 	r.once.Do(func() {
-		usage.PublishRecord(ctx, usage.Record{
-			Provider:    r.provider,
-			Model:       r.model,
-			Source:      r.source,
-			APIKey:      r.apiKey,
-			AuthID:      r.authID,
-			AuthIndex:   r.authIndex,
-			RequestedAt: r.requestedAt,
-			Failed:      failed,
-			Detail:      detail,
-		})
+		usage.PublishRecord(ctx, r.buildRecord(detail, failed))
 	})
 }
 
@@ -96,18 +83,37 @@ func (r *usageReporter) ensurePublished(ctx context.Context) {
 		return
 	}
 	r.once.Do(func() {
-		usage.PublishRecord(ctx, usage.Record{
-			Provider:    r.provider,
-			Model:       r.model,
-			Source:      r.source,
-			APIKey:      r.apiKey,
-			AuthID:      r.authID,
-			AuthIndex:   r.authIndex,
-			RequestedAt: r.requestedAt,
-			Failed:      false,
-			Detail:      usage.Detail{},
-		})
+		usage.PublishRecord(ctx, r.buildRecord(usage.Detail{}, false))
 	})
+}
+
+func (r *usageReporter) buildRecord(detail usage.Detail, failed bool) usage.Record {
+	if r == nil {
+		return usage.Record{Detail: detail, Failed: failed}
+	}
+	return usage.Record{
+		Provider:    r.provider,
+		Model:       r.model,
+		Source:      r.source,
+		APIKey:      r.apiKey,
+		AuthID:      r.authID,
+		AuthIndex:   r.authIndex,
+		RequestedAt: r.requestedAt,
+		Latency:     r.latency(),
+		Failed:      failed,
+		Detail:      detail,
+	}
+}
+
+func (r *usageReporter) latency() time.Duration {
+	if r == nil || r.requestedAt.IsZero() {
+		return 0
+	}
+	latency := time.Since(r.requestedAt)
+	if latency < 0 {
+		return 0
+	}
+	return latency
 }
 
 func apiKeyFromContext(ctx context.Context) string {
@@ -187,6 +193,7 @@ func parseCodexUsage(data []byte) (usage.Detail, bool) {
 	}
 	if cached := usageNode.Get("input_tokens_details.cached_tokens"); cached.Exists() {
 		detail.CachedTokens = cached.Int()
+		detail.CacheReadTokens = cached.Int()
 	}
 	if reasoning := usageNode.Get("output_tokens_details.reasoning_tokens"); reasoning.Exists() {
 		detail.ReasoningTokens = reasoning.Int()
@@ -218,6 +225,7 @@ func parseOpenAIUsage(data []byte) usage.Detail {
 	}
 	if cached.Exists() {
 		detail.CachedTokens = cached.Int()
+		detail.CacheReadTokens = cached.Int()
 	}
 	reasoning := usageNode.Get("completion_tokens_details.reasoning_tokens")
 	if !reasoning.Exists() {
@@ -245,6 +253,7 @@ func parseOpenAIStreamUsage(line []byte) (usage.Detail, bool) {
 	}
 	if cached := usageNode.Get("prompt_tokens_details.cached_tokens"); cached.Exists() {
 		detail.CachedTokens = cached.Int()
+		detail.CacheReadTokens = cached.Int()
 	}
 	if reasoning := usageNode.Get("completion_tokens_details.reasoning_tokens"); reasoning.Exists() {
 		detail.ReasoningTokens = reasoning.Int()
@@ -263,6 +272,7 @@ func parseOpenAIResponsesUsageDetail(usageNode gjson.Result) usage.Detail {
 	}
 	if cached := usageNode.Get("input_tokens_details.cached_tokens"); cached.Exists() {
 		detail.CachedTokens = cached.Int()
+		detail.CacheReadTokens = cached.Int()
 	}
 	if reasoning := usageNode.Get("output_tokens_details.reasoning_tokens"); reasoning.Exists() {
 		detail.ReasoningTokens = reasoning.Int()
@@ -296,13 +306,14 @@ func parseClaudeUsage(data []byte) usage.Detail {
 		return usage.Detail{}
 	}
 	detail := usage.Detail{
-		InputTokens:  usageNode.Get("input_tokens").Int(),
-		OutputTokens: usageNode.Get("output_tokens").Int(),
-		CachedTokens: usageNode.Get("cache_read_input_tokens").Int(),
+		InputTokens:      usageNode.Get("input_tokens").Int(),
+		OutputTokens:     usageNode.Get("output_tokens").Int(),
+		CachedTokens:     usageNode.Get("cache_read_input_tokens").Int(),
+		CacheReadTokens:  usageNode.Get("cache_read_input_tokens").Int(),
+		CacheWriteTokens: usageNode.Get("cache_creation_input_tokens").Int(),
 	}
 	if detail.CachedTokens == 0 {
-		// fall back to creation tokens when read tokens are absent
-		detail.CachedTokens = usageNode.Get("cache_creation_input_tokens").Int()
+		detail.CachedTokens = detail.CacheWriteTokens
 	}
 	detail.TotalTokens = detail.InputTokens + detail.OutputTokens
 	return detail
@@ -318,12 +329,14 @@ func parseClaudeStreamUsage(line []byte) (usage.Detail, bool) {
 		return usage.Detail{}, false
 	}
 	detail := usage.Detail{
-		InputTokens:  usageNode.Get("input_tokens").Int(),
-		OutputTokens: usageNode.Get("output_tokens").Int(),
-		CachedTokens: usageNode.Get("cache_read_input_tokens").Int(),
+		InputTokens:      usageNode.Get("input_tokens").Int(),
+		OutputTokens:     usageNode.Get("output_tokens").Int(),
+		CachedTokens:     usageNode.Get("cache_read_input_tokens").Int(),
+		CacheReadTokens:  usageNode.Get("cache_read_input_tokens").Int(),
+		CacheWriteTokens: usageNode.Get("cache_creation_input_tokens").Int(),
 	}
 	if detail.CachedTokens == 0 {
-		detail.CachedTokens = usageNode.Get("cache_creation_input_tokens").Int()
+		detail.CachedTokens = detail.CacheWriteTokens
 	}
 	detail.TotalTokens = detail.InputTokens + detail.OutputTokens
 	return detail, true
@@ -336,6 +349,7 @@ func parseGeminiFamilyUsageDetail(node gjson.Result) usage.Detail {
 		ReasoningTokens: node.Get("thoughtsTokenCount").Int(),
 		TotalTokens:     node.Get("totalTokenCount").Int(),
 		CachedTokens:    node.Get("cachedContentTokenCount").Int(),
+		CacheReadTokens: node.Get("cachedContentTokenCount").Int(),
 	}
 	if detail.TotalTokens == 0 {
 		detail.TotalTokens = detail.InputTokens + detail.OutputTokens + detail.ReasoningTokens
