@@ -30,3 +30,25 @@ codex-header-defaults:
 		t.Fatalf("BetaFeatures = %q, want %q", got, "feature-a,feature-b")
 	}
 }
+
+func TestLoadConfigOptional_RemoteManagementDisableAutoUpdatePanel(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	configYAML := []byte(`
+remote-management:
+  allow-remote: false
+  disable-auto-update-panel: true
+`)
+	if err := os.WriteFile(configPath, configYAML, 0o600); err != nil {
+		t.Fatalf("failed to write config: %v", err)
+	}
+
+	cfg, err := LoadConfigOptional(configPath, false)
+	if err != nil {
+		t.Fatalf("LoadConfigOptional() error = %v", err)
+	}
+
+	if !cfg.RemoteManagement.DisableAutoUpdatePanel {
+		t.Fatal("DisableAutoUpdatePanel = false, want true")
+	}
+}

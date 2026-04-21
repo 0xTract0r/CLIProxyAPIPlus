@@ -20,10 +20,11 @@ func TestBuildConfigChangeDetails(t *testing.T) {
 			RestrictManagementToLocalhost: false,
 		},
 		RemoteManagement: config.RemoteManagement{
-			AllowRemote:           false,
-			SecretKey:             "old",
-			DisableControlPanel:   false,
-			PanelGitHubRepository: "repo-old",
+			AllowRemote:            false,
+			SecretKey:              "old",
+			DisableControlPanel:    false,
+			DisableAutoUpdatePanel: false,
+			PanelGitHubRepository:  "repo-old",
 		},
 		OAuthExcludedModels: map[string][]string{
 			"providerA": {"m1"},
@@ -54,10 +55,11 @@ func TestBuildConfigChangeDetails(t *testing.T) {
 			},
 		},
 		RemoteManagement: config.RemoteManagement{
-			AllowRemote:           true,
-			SecretKey:             "new",
-			DisableControlPanel:   true,
-			PanelGitHubRepository: "repo-new",
+			AllowRemote:            true,
+			SecretKey:              "new",
+			DisableControlPanel:    true,
+			DisableAutoUpdatePanel: true,
+			PanelGitHubRepository:  "repo-new",
 		},
 		OAuthExcludedModels: map[string][]string{
 			"providerA": {"m1", "m2"},
@@ -88,6 +90,7 @@ func TestBuildConfigChangeDetails(t *testing.T) {
 	expectContains(t, details, "ampcode.upstream-url: http://old-upstream -> http://new-upstream")
 	expectContains(t, details, "ampcode.model-mappings: updated (1 -> 2 entries)")
 	expectContains(t, details, "remote-management.allow-remote: false -> true")
+	expectContains(t, details, "remote-management.disable-auto-update-panel: false -> true")
 	expectContains(t, details, "remote-management.secret-key: updated")
 	expectContains(t, details, "oauth-excluded-models[providera]: updated (1 -> 2 entries)")
 	expectContains(t, details, "oauth-excluded-models[providerb]: added (1 entries)")
