@@ -144,8 +144,8 @@ func ResolveLogDirectory(cfg *config.Config) string {
 }
 
 // ConfigureLogOutput switches the global log destination between rotating files and stdout.
-// When logsMaxTotalSizeMB > 0, a background cleaner removes the oldest log files in the logs directory
-// until the total size is within the limit.
+// A background cleaner enforces age-based compression/deletion and optional total-size limits
+// for the logs directory.
 func ConfigureLogOutput(cfg *config.Config) error {
 	SetupBaseLogger()
 
@@ -154,7 +154,7 @@ func ConfigureLogOutput(cfg *config.Config) error {
 
 	logDir := ResolveLogDirectory(cfg)
 
-	protectedPath := ""
+	protectedPath := filepath.Join(logDir, "main.log")
 	if cfg.LoggingToFile {
 		if err := os.MkdirAll(logDir, 0o755); err != nil {
 			return fmt.Errorf("logging: failed to create log directory: %w", err)
@@ -162,7 +162,6 @@ func ConfigureLogOutput(cfg *config.Config) error {
 		if logWriter != nil {
 			_ = logWriter.Close()
 		}
-		protectedPath = filepath.Join(logDir, "main.log")
 		logWriter = &lumberjack.Logger{
 			Filename:   protectedPath,
 			MaxSize:    10,
@@ -179,7 +178,13 @@ func ConfigureLogOutput(cfg *config.Config) error {
 		log.SetOutput(os.Stdout)
 	}
 
-	configureLogDirCleanerLocked(logDir, cfg.LogsMaxTotalSizeMB, protectedPath)
+	configureLogDirCleanerLocked(
+		logDir,
+		cfg.LogsMaxTotalSizeMB,
+		cfg.LogsCompressAfterDays,
+		cfg.LogsDeleteAfterDays,
+		protectedPath,
+	)
 	return nil
 }
 

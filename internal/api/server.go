@@ -550,6 +550,14 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PUT("/logs-max-total-size-mb", s.mgmt.PutLogsMaxTotalSizeMB)
 		mgmt.PATCH("/logs-max-total-size-mb", s.mgmt.PutLogsMaxTotalSizeMB)
 
+		mgmt.GET("/logs-compress-after-days", s.mgmt.GetLogsCompressAfterDays)
+		mgmt.PUT("/logs-compress-after-days", s.mgmt.PutLogsCompressAfterDays)
+		mgmt.PATCH("/logs-compress-after-days", s.mgmt.PutLogsCompressAfterDays)
+
+		mgmt.GET("/logs-delete-after-days", s.mgmt.GetLogsDeleteAfterDays)
+		mgmt.PUT("/logs-delete-after-days", s.mgmt.PutLogsDeleteAfterDays)
+		mgmt.PATCH("/logs-delete-after-days", s.mgmt.PutLogsDeleteAfterDays)
+
 		mgmt.GET("/error-logs-max-files", s.mgmt.GetErrorLogsMaxFiles)
 		mgmt.PUT("/error-logs-max-files", s.mgmt.PutErrorLogsMaxFiles)
 		mgmt.PATCH("/error-logs-max-files", s.mgmt.PutErrorLogsMaxFiles)
@@ -951,7 +959,11 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 		}
 	}
 
-	if oldCfg == nil || oldCfg.LoggingToFile != cfg.LoggingToFile || oldCfg.LogsMaxTotalSizeMB != cfg.LogsMaxTotalSizeMB {
+	if oldCfg == nil ||
+		oldCfg.LoggingToFile != cfg.LoggingToFile ||
+		oldCfg.LogsMaxTotalSizeMB != cfg.LogsMaxTotalSizeMB ||
+		oldCfg.LogsCompressAfterDays != cfg.LogsCompressAfterDays ||
+		oldCfg.LogsDeleteAfterDays != cfg.LogsDeleteAfterDays {
 		if err := logging.ConfigureLogOutput(cfg); err != nil {
 			log.Errorf("failed to reconfigure log output: %v", err)
 		}

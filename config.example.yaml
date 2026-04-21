@@ -63,6 +63,14 @@ logging-to-file: false
 # files are deleted until within the limit. Set to 0 to disable.
 logs-max-total-size-mb: 0
 
+# Compress `.log` files older than this many days into `.log.gz`.
+# Set to 0 to disable age-based compression.
+logs-compress-after-days: 7
+
+# Delete `.log` and `.log.gz` files older than this many days.
+# Set to 0 to disable age-based deletion.
+logs-delete-after-days: 30
+
 # Maximum number of error log files retained when request logging is disabled.
 # When exceeded, the oldest error log files are deleted. Default is 10. Set to 0 to disable cleanup.
 error-logs-max-files: 10

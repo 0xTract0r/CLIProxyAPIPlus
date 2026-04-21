@@ -221,6 +221,46 @@ func (h *Handler) PutLogsMaxTotalSizeMB(c *gin.Context) {
 	h.persist(c)
 }
 
+// LogsCompressAfterDays
+func (h *Handler) GetLogsCompressAfterDays(c *gin.Context) {
+	c.JSON(200, gin.H{"logs-compress-after-days": h.cfg.LogsCompressAfterDays})
+}
+func (h *Handler) PutLogsCompressAfterDays(c *gin.Context) {
+	var body struct {
+		Value *int `json:"value"`
+	}
+	if errBindJSON := c.ShouldBindJSON(&body); errBindJSON != nil || body.Value == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+		return
+	}
+	value := *body.Value
+	if value < 0 {
+		value = config.DefaultLogsCompressAfterDays
+	}
+	h.cfg.LogsCompressAfterDays = value
+	h.persist(c)
+}
+
+// LogsDeleteAfterDays
+func (h *Handler) GetLogsDeleteAfterDays(c *gin.Context) {
+	c.JSON(200, gin.H{"logs-delete-after-days": h.cfg.LogsDeleteAfterDays})
+}
+func (h *Handler) PutLogsDeleteAfterDays(c *gin.Context) {
+	var body struct {
+		Value *int `json:"value"`
+	}
+	if errBindJSON := c.ShouldBindJSON(&body); errBindJSON != nil || body.Value == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+		return
+	}
+	value := *body.Value
+	if value < 0 {
+		value = config.DefaultLogsDeleteAfterDays
+	}
+	h.cfg.LogsDeleteAfterDays = value
+	h.persist(c)
+}
+
 // ErrorLogsMaxFiles
 func (h *Handler) GetErrorLogsMaxFiles(c *gin.Context) {
 	c.JSON(200, gin.H{"error-logs-max-files": h.cfg.ErrorLogsMaxFiles})

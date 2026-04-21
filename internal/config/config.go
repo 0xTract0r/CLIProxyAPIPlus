@@ -21,6 +21,9 @@ import (
 const (
 	DefaultPanelGitHubRepository = "https://github.com/router-for-me/Cli-Proxy-API-Management-Center"
 	DefaultPprofAddr             = "127.0.0.1:8316"
+	DefaultErrorLogsMaxFiles     = 10
+	DefaultLogsCompressAfterDays = 7
+	DefaultLogsDeleteAfterDays   = 30
 )
 
 // Config represents the application's configuration, loaded from a YAML file.
@@ -56,6 +59,14 @@ type Config struct {
 	// LogsMaxTotalSizeMB limits the total size (in MB) of log files under the logs directory.
 	// When exceeded, the oldest log files are deleted until within the limit. Set to 0 to disable.
 	LogsMaxTotalSizeMB int `yaml:"logs-max-total-size-mb" json:"logs-max-total-size-mb"`
+
+	// LogsCompressAfterDays compresses log files older than this many days using gzip.
+	// Set to 0 to disable age-based compression.
+	LogsCompressAfterDays int `yaml:"logs-compress-after-days" json:"logs-compress-after-days"`
+
+	// LogsDeleteAfterDays deletes log files older than this many days.
+	// Applies to both plain `.log` files and compressed `.log.gz` files. Set to 0 to disable age-based deletion.
+	LogsDeleteAfterDays int `yaml:"logs-delete-after-days" json:"logs-delete-after-days"`
 
 	// ErrorLogsMaxFiles limits the number of error log files retained when request logging is disabled.
 	// When exceeded, the oldest error log files are deleted. Default is 10. Set to 0 to disable cleanup.
@@ -616,7 +627,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.Host = "" // Default empty: binds to all interfaces (IPv4 + IPv6)
 	cfg.LoggingToFile = false
 	cfg.LogsMaxTotalSizeMB = 0
-	cfg.ErrorLogsMaxFiles = 10
+	cfg.LogsCompressAfterDays = DefaultLogsCompressAfterDays
+	cfg.LogsDeleteAfterDays = DefaultLogsDeleteAfterDays
+	cfg.ErrorLogsMaxFiles = DefaultErrorLogsMaxFiles
 	cfg.UsageStatisticsEnabled = false
 	cfg.DisableCooling = false
 	cfg.Pprof.Enable = false
@@ -676,8 +689,16 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 		cfg.LogsMaxTotalSizeMB = 0
 	}
 
+	if cfg.LogsCompressAfterDays < 0 {
+		cfg.LogsCompressAfterDays = DefaultLogsCompressAfterDays
+	}
+
+	if cfg.LogsDeleteAfterDays < 0 {
+		cfg.LogsDeleteAfterDays = DefaultLogsDeleteAfterDays
+	}
+
 	if cfg.ErrorLogsMaxFiles < 0 {
-		cfg.ErrorLogsMaxFiles = 10
+		cfg.ErrorLogsMaxFiles = DefaultErrorLogsMaxFiles
 	}
 
 	if cfg.MaxRetryCredentials < 0 {
@@ -1394,8 +1415,12 @@ func isKnownDefaultValue(path []string, node *yaml.Node) bool {
 	// Check integer defaults
 	if node.Kind == yaml.ScalarNode && node.Tag == "!!int" {
 		switch fullPath {
+		case "logs-compress-after-days":
+			return node.Value == fmt.Sprintf("%d", DefaultLogsCompressAfterDays)
+		case "logs-delete-after-days":
+			return node.Value == fmt.Sprintf("%d", DefaultLogsDeleteAfterDays)
 		case "error-logs-max-files":
-			return node.Value == "10"
+			return node.Value == fmt.Sprintf("%d", DefaultErrorLogsMaxFiles)
 		}
 	}
 
