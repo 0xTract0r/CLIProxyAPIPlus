@@ -8,8 +8,8 @@ import (
 	"sync"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -85,8 +85,10 @@ func (m *DefaultModelMapper) MapModel(requestedModel string) string {
 	// Check if target model already has a thinking suffix (config priority)
 	targetResult := thinking.ParseSuffix(targetModel)
 
-	// Verify target model has available providers (use base model for lookup)
-	providers := util.GetProviderName(targetResult.ModelName)
+	// Verify target model has registered local providers. Unlike request routing,
+	// model mapping should not fall back to provider-family heuristics because that
+	// would make an unavailable local target look routable.
+	providers := registry.GetGlobalRegistry().GetModelProviders(targetResult.ModelName)
 	if len(providers) == 0 {
 		log.Debugf("amp model mapping: target model %s has no available providers, skipping mapping", targetModel)
 		return ""

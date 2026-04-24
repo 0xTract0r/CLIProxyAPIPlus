@@ -32,6 +32,7 @@ const (
 	managementSyncMinInterval    = 30 * time.Second
 	updateCheckInterval          = 3 * time.Hour
 	releaseRateLimitCooldown     = time.Hour
+	maxAssetDownloadSize         = 50 << 20 // 50 MB safety limit for management asset downloads
 )
 
 // ManagementFileName exposes the control panel asset filename.
@@ -383,7 +384,8 @@ func EnsureLatestManagementHTML(ctx context.Context, staticDir string, proxyURL 
 		}
 
 		if remoteHash != "" && !strings.EqualFold(remoteHash, downloadedHash) {
-			log.Warnf("remote digest mismatch for management asset: expected %s got %s", remoteHash, downloadedHash)
+			log.Errorf("management asset digest mismatch: expected %s got %s; aborting update for safety", remoteHash, downloadedHash)
+			return nil, nil
 		}
 
 		if err = atomicWriteFile(localPath, data); err != nil {
@@ -411,6 +413,7 @@ func ensureFallbackManagementHTML(ctx context.Context, client *http.Client, loca
 		return false
 	}
 
+	log.Warnf("management asset downloaded from fallback URL without digest verification (hash=%s)", downloadedHash)
 	log.Infof("management asset updated from fallback page successfully (hash=%s)", downloadedHash)
 	return true
 }
@@ -522,9 +525,12 @@ func downloadAsset(ctx context.Context, client *http.Client, downloadURL string)
 		return nil, "", fmt.Errorf("unexpected download status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 
-	data, err := io.ReadAll(resp.Body)
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxAssetDownloadSize+1))
 	if err != nil {
 		return nil, "", fmt.Errorf("read download body: %w", err)
+	}
+	if int64(len(data)) > maxAssetDownloadSize {
+		return nil, "", fmt.Errorf("download exceeds maximum allowed size of %d bytes", maxAssetDownloadSize)
 	}
 
 	sum := sha256.Sum256(data)

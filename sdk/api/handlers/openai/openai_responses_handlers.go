@@ -9,18 +9,190 @@ package openai
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
 	. "github.com/router-for-me/CLIProxyAPI/v6/internal/constant"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
-	responsesconverter "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/openai/openai/responses"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
+
+func writeResponsesSSEChunk(w io.Writer, chunk []byte) {
+	if w == nil || len(chunk) == 0 {
+		return
+	}
+	if _, err := w.Write(chunk); err != nil {
+		return
+	}
+	if bytes.HasSuffix(chunk, []byte("\n\n")) || bytes.HasSuffix(chunk, []byte("\r\n\r\n")) {
+		return
+	}
+	suffix := []byte("\n\n")
+	if bytes.HasSuffix(chunk, []byte("\r\n")) {
+		suffix = []byte("\r\n")
+	} else if bytes.HasSuffix(chunk, []byte("\n")) {
+		suffix = []byte("\n")
+	}
+	if _, err := w.Write(suffix); err != nil {
+		return
+	}
+}
+
+type responsesSSEFramer struct {
+	pending []byte
+}
+
+func (f *responsesSSEFramer) WriteChunk(w io.Writer, chunk []byte) {
+	if len(chunk) == 0 {
+		return
+	}
+	if responsesSSENeedsLineBreak(f.pending, chunk) {
+		f.pending = append(f.pending, '\n')
+	}
+	f.pending = append(f.pending, chunk...)
+	for {
+		frameLen := responsesSSEFrameLen(f.pending)
+		if frameLen == 0 {
+			break
+		}
+		writeResponsesSSEChunk(w, f.pending[:frameLen])
+		copy(f.pending, f.pending[frameLen:])
+		f.pending = f.pending[:len(f.pending)-frameLen]
+	}
+	if len(bytes.TrimSpace(f.pending)) == 0 {
+		f.pending = f.pending[:0]
+		return
+	}
+	if len(f.pending) == 0 || !responsesSSECanEmitWithoutDelimiter(f.pending) {
+		return
+	}
+	writeResponsesSSEChunk(w, f.pending)
+	f.pending = f.pending[:0]
+}
+
+func (f *responsesSSEFramer) Flush(w io.Writer) {
+	if len(f.pending) == 0 {
+		return
+	}
+	if len(bytes.TrimSpace(f.pending)) == 0 {
+		f.pending = f.pending[:0]
+		return
+	}
+	if !responsesSSECanEmitWithoutDelimiter(f.pending) {
+		f.pending = f.pending[:0]
+		return
+	}
+	writeResponsesSSEChunk(w, f.pending)
+	f.pending = f.pending[:0]
+}
+
+func responsesSSEFrameLen(chunk []byte) int {
+	if len(chunk) == 0 {
+		return 0
+	}
+	lf := bytes.Index(chunk, []byte("\n\n"))
+	crlf := bytes.Index(chunk, []byte("\r\n\r\n"))
+	switch {
+	case lf < 0:
+		if crlf < 0 {
+			return 0
+		}
+		return crlf + 4
+	case crlf < 0:
+		return lf + 2
+	case lf < crlf:
+		return lf + 2
+	default:
+		return crlf + 4
+	}
+}
+
+func responsesSSENeedsMoreData(chunk []byte) bool {
+	trimmed := bytes.TrimSpace(chunk)
+	if len(trimmed) == 0 {
+		return false
+	}
+	return responsesSSEHasField(trimmed, []byte("event:")) && !responsesSSEHasField(trimmed, []byte("data:"))
+}
+
+func responsesSSEHasField(chunk []byte, prefix []byte) bool {
+	s := chunk
+	for len(s) > 0 {
+		line := s
+		if i := bytes.IndexByte(s, '\n'); i >= 0 {
+			line = s[:i]
+			s = s[i+1:]
+		} else {
+			s = nil
+		}
+		line = bytes.TrimSpace(line)
+		if bytes.HasPrefix(line, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func responsesSSECanEmitWithoutDelimiter(chunk []byte) bool {
+	trimmed := bytes.TrimSpace(chunk)
+	if len(trimmed) == 0 || responsesSSENeedsMoreData(trimmed) || !responsesSSEHasField(trimmed, []byte("data:")) {
+		return false
+	}
+	return responsesSSEDataLinesValid(trimmed)
+}
+
+func responsesSSEDataLinesValid(chunk []byte) bool {
+	s := chunk
+	for len(s) > 0 {
+		line := s
+		if i := bytes.IndexByte(s, '\n'); i >= 0 {
+			line = s[:i]
+			s = s[i+1:]
+		} else {
+			s = nil
+		}
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 || !bytes.HasPrefix(line, []byte("data:")) {
+			continue
+		}
+		data := bytes.TrimSpace(line[len("data:"):])
+		if len(data) == 0 || bytes.Equal(data, []byte("[DONE]")) {
+			continue
+		}
+		if !json.Valid(data) {
+			return false
+		}
+	}
+	return true
+}
+
+func responsesSSENeedsLineBreak(pending, chunk []byte) bool {
+	if len(pending) == 0 || len(chunk) == 0 {
+		return false
+	}
+	if bytes.HasSuffix(pending, []byte("\n")) || bytes.HasSuffix(pending, []byte("\r")) {
+		return false
+	}
+	if chunk[0] == '\n' || chunk[0] == '\r' {
+		return false
+	}
+	trimmed := bytes.TrimLeft(chunk, " \t")
+	if len(trimmed) == 0 {
+		return false
+	}
+	for _, prefix := range [][]byte{[]byte("data:"), []byte("event:"), []byte("id:"), []byte("retry:"), []byte(":")} {
+		if bytes.HasPrefix(trimmed, prefix) {
+			return true
+		}
+	}
+	return false
+}
 
 // OpenAIResponsesAPIHandler contains the handlers for OpenAIResponses API endpoints.
 // It holds a pool of clients to interact with the backend service.
@@ -85,21 +257,7 @@ func (h *OpenAIResponsesAPIHandler) Responses(c *gin.Context) {
 
 	// Check if the client requested a streaming response.
 	streamResult := gjson.GetBytes(rawJSON, "stream")
-	stream := streamResult.Type == gjson.True
-
-	modelName := gjson.GetBytes(rawJSON, "model").String()
-	if overrideEndpoint, ok := resolveEndpointOverride(modelName, openAIResponsesEndpoint); ok && overrideEndpoint == openAIChatEndpoint {
-		chatJSON := responsesconverter.ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName, rawJSON, stream)
-		stream = gjson.GetBytes(chatJSON, "stream").Bool()
-		if stream {
-			h.handleStreamingResponseViaChat(c, rawJSON, chatJSON)
-		} else {
-			h.handleNonStreamingResponseViaChat(c, rawJSON, chatJSON)
-		}
-		return
-	}
-
-	if stream {
+	if streamResult.Type == gjson.True {
 		h.handleStreamingResponse(c, rawJSON)
 	} else {
 		h.handleNonStreamingResponse(c, rawJSON)
@@ -177,32 +335,6 @@ func (h *OpenAIResponsesAPIHandler) handleNonStreamingResponse(c *gin.Context, r
 	cliCancel()
 }
 
-func (h *OpenAIResponsesAPIHandler) handleNonStreamingResponseViaChat(c *gin.Context, originalResponsesJSON, chatJSON []byte) {
-	c.Header("Content-Type", "application/json")
-
-	modelName := gjson.GetBytes(chatJSON, "model").String()
-	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
-	resp, upstreamHeaders, errMsg := h.ExecuteWithAuthManager(cliCtx, OpenAI, modelName, chatJSON, "")
-	if errMsg != nil {
-		h.WriteErrorResponse(c, errMsg)
-		cliCancel(errMsg.Error)
-		return
-	}
-	handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
-	var param any
-	converted := responsesconverter.ConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream(cliCtx, modelName, originalResponsesJSON, originalResponsesJSON, resp, &param)
-	if converted == "" {
-		h.WriteErrorResponse(c, &interfaces.ErrorMessage{
-			StatusCode: http.StatusInternalServerError,
-			Error:      fmt.Errorf("failed to convert chat completion response to responses format"),
-		})
-		cliCancel(fmt.Errorf("response conversion failed"))
-		return
-	}
-	_, _ = c.Writer.Write([]byte(converted))
-	cliCancel()
-}
-
 // handleStreamingResponse handles streaming responses for Gemini models.
 // It establishes a streaming connection with the backend service and forwards
 // the response chunks to the client in real-time using Server-Sent Events.
@@ -234,6 +366,7 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 		c.Header("Connection", "keep-alive")
 		c.Header("Access-Control-Allow-Origin", "*")
 	}
+	framer := &responsesSSEFramer{}
 
 	// Peek at the first chunk
 	for {
@@ -271,142 +404,26 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 			handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
 
 			// Write first chunk logic (matching forwardResponsesStream)
-			if bytes.HasPrefix(chunk, []byte("event:")) {
-				_, _ = c.Writer.Write([]byte("\n"))
-			}
-			_, _ = c.Writer.Write(chunk)
-			_, _ = c.Writer.Write([]byte("\n"))
+			framer.WriteChunk(c.Writer, chunk)
 			flusher.Flush()
 
 			// Continue
-			h.forwardResponsesStream(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan)
+			h.forwardResponsesStream(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan, framer)
 			return
 		}
 	}
 }
 
-func (h *OpenAIResponsesAPIHandler) handleStreamingResponseViaChat(c *gin.Context, originalResponsesJSON, chatJSON []byte) {
-	flusher, ok := c.Writer.(http.Flusher)
-	if !ok {
-		c.JSON(http.StatusInternalServerError, handlers.ErrorResponse{
-			Error: handlers.ErrorDetail{
-				Message: "Streaming not supported",
-				Type:    "server_error",
-			},
-		})
-		return
+func (h *OpenAIResponsesAPIHandler) forwardResponsesStream(c *gin.Context, flusher http.Flusher, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage, framer *responsesSSEFramer) {
+	if framer == nil {
+		framer = &responsesSSEFramer{}
 	}
-
-	modelName := gjson.GetBytes(chatJSON, "model").String()
-	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
-	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, OpenAI, modelName, chatJSON, "")
-	var param any
-
-	setSSEHeaders := func() {
-		c.Header("Content-Type", "text/event-stream")
-		c.Header("Cache-Control", "no-cache")
-		c.Header("Connection", "keep-alive")
-		c.Header("Access-Control-Allow-Origin", "*")
-	}
-
-	for {
-		select {
-		case <-c.Request.Context().Done():
-			cliCancel(c.Request.Context().Err())
-			return
-		case errMsg, ok := <-errChan:
-			if !ok {
-				errChan = nil
-				continue
-			}
-			h.WriteErrorResponse(c, errMsg)
-			if errMsg != nil {
-				cliCancel(errMsg.Error)
-			} else {
-				cliCancel(nil)
-			}
-			return
-		case chunk, ok := <-dataChan:
-			if !ok {
-				setSSEHeaders()
-				handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
-				_, _ = c.Writer.Write([]byte("\n"))
-				flusher.Flush()
-				cliCancel(nil)
-				return
-			}
-
-			setSSEHeaders()
-			handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
-			writeChatAsResponsesChunk(c, cliCtx, modelName, originalResponsesJSON, chunk, &param)
-			flusher.Flush()
-
-			h.forwardChatAsResponsesStream(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan, cliCtx, modelName, originalResponsesJSON, &param)
-			return
-		}
-	}
-}
-
-func writeChatAsResponsesChunk(c *gin.Context, ctx context.Context, modelName string, originalResponsesJSON, chunk []byte, param *any) {
-	outputs := responsesconverter.ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx, modelName, originalResponsesJSON, originalResponsesJSON, chunk, param)
-	for _, out := range outputs {
-		if out == "" {
-			continue
-		}
-		if bytes.HasPrefix([]byte(out), []byte("event:")) {
-			_, _ = c.Writer.Write([]byte("\n"))
-		}
-		_, _ = c.Writer.Write([]byte(out))
-		_, _ = c.Writer.Write([]byte("\n"))
-	}
-}
-
-func (h *OpenAIResponsesAPIHandler) forwardChatAsResponsesStream(c *gin.Context, flusher http.Flusher, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage, ctx context.Context, modelName string, originalResponsesJSON []byte, param *any) {
 	h.ForwardStream(c, flusher, cancel, data, errs, handlers.StreamForwardOptions{
 		WriteChunk: func(chunk []byte) {
-			outputs := responsesconverter.ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx, modelName, originalResponsesJSON, originalResponsesJSON, chunk, param)
-			for _, out := range outputs {
-				if out == "" {
-					continue
-				}
-				if bytes.HasPrefix([]byte(out), []byte("event:")) {
-					_, _ = c.Writer.Write([]byte("\n"))
-				}
-				_, _ = c.Writer.Write([]byte(out))
-				_, _ = c.Writer.Write([]byte("\n"))
-			}
+			framer.WriteChunk(c.Writer, chunk)
 		},
 		WriteTerminalError: func(errMsg *interfaces.ErrorMessage) {
-			if errMsg == nil {
-				return
-			}
-			status := http.StatusInternalServerError
-			if errMsg.StatusCode > 0 {
-				status = errMsg.StatusCode
-			}
-			errText := http.StatusText(status)
-			if errMsg.Error != nil && errMsg.Error.Error() != "" {
-				errText = errMsg.Error.Error()
-			}
-			body := handlers.BuildErrorResponseBody(status, errText)
-			_, _ = fmt.Fprintf(c.Writer, "\nevent: error\ndata: %s\n\n", string(body))
-		},
-		WriteDone: func() {
-			_, _ = c.Writer.Write([]byte("\n"))
-		},
-	})
-}
-
-func (h *OpenAIResponsesAPIHandler) forwardResponsesStream(c *gin.Context, flusher http.Flusher, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage) {
-	h.ForwardStream(c, flusher, cancel, data, errs, handlers.StreamForwardOptions{
-		WriteChunk: func(chunk []byte) {
-			if bytes.HasPrefix(chunk, []byte("event:")) {
-				_, _ = c.Writer.Write([]byte("\n"))
-			}
-			_, _ = c.Writer.Write(chunk)
-			_, _ = c.Writer.Write([]byte("\n"))
-		},
-		WriteTerminalError: func(errMsg *interfaces.ErrorMessage) {
+			framer.Flush(c.Writer)
 			if errMsg == nil {
 				return
 			}
@@ -422,6 +439,7 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesStream(c *gin.Context, flush
 			_, _ = fmt.Fprintf(c.Writer, "\nevent: error\ndata: %s\n\n", string(chunk))
 		},
 		WriteDone: func() {
+			framer.Flush(c.Writer)
 			_, _ = c.Writer.Write([]byte("\n"))
 		},
 	})
