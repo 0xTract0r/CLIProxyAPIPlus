@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/sdk/proxyutil"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -35,6 +36,11 @@ type modelStore struct {
 var modelsCatalogStore = &modelStore{}
 
 var updaterOnce sync.Once
+
+var modelsFetchConfig = struct {
+	mu       sync.RWMutex
+	proxyURL string
+}{}
 
 // ModelRefreshCallback is invoked when startup or periodic model refresh detects changes.
 // changedProviders contains the provider names whose model definitions changed.
@@ -69,6 +75,14 @@ func init() {
 	if err := loadModelsFromBytes(embeddedModelsJSON, "embed"); err != nil {
 		panic(fmt.Sprintf("registry: failed to parse embedded models.json: %v", err))
 	}
+}
+
+// SetModelsFetchProxy configures the proxy used by remote models catalog refreshes.
+// An empty value inherits environment proxy behavior; "direct"/"none" disables proxies.
+func SetModelsFetchProxy(proxyURL string) {
+	modelsFetchConfig.mu.Lock()
+	modelsFetchConfig.proxyURL = strings.TrimSpace(proxyURL)
+	modelsFetchConfig.mu.Unlock()
 }
 
 // StartModelsUpdater starts a background updater that fetches models
@@ -141,7 +155,7 @@ func tryRefreshModels(ctx context.Context, label string) {
 // fetchModelsFromRemote tries all remote URLs and returns the parsed model catalog
 // along with the URL it was fetched from. Returns (nil, "") if all fetches fail.
 func fetchModelsFromRemote(ctx context.Context) (*staticModelsJSON, string) {
-	client := &http.Client{Timeout: modelsFetchTimeout}
+	client := newModelsFetchClient()
 	for _, url := range modelsURLs {
 		reqCtx, cancel := context.WithTimeout(ctx, modelsFetchTimeout)
 		req, err := http.NewRequestWithContext(reqCtx, "GET", url, nil)
@@ -179,6 +193,10 @@ func fetchModelsFromRemote(ctx context.Context) (*staticModelsJSON, string) {
 			log.Warnf("models parse failed from %s: %v", url, err)
 			continue
 		}
+		merged := mergeMissingModelSections(&parsed, getModels())
+		if merged != nil {
+			parsed = *merged
+		}
 		if err := validateModelsCatalog(&parsed); err != nil {
 			log.Warnf("models validate failed from %s: %v", url, err)
 			continue
@@ -187,6 +205,75 @@ func fetchModelsFromRemote(ctx context.Context) (*staticModelsJSON, string) {
 		return &parsed, url
 	}
 	return nil, ""
+}
+
+func newModelsFetchClient() *http.Client {
+	client := &http.Client{Timeout: modelsFetchTimeout}
+
+	modelsFetchConfig.mu.RLock()
+	proxyURL := modelsFetchConfig.proxyURL
+	modelsFetchConfig.mu.RUnlock()
+
+	transport, _, errBuild := proxyutil.BuildHTTPTransport(proxyURL)
+	if errBuild != nil {
+		log.Warnf("models updater: failed to configure proxy %q: %v", proxyURL, errBuild)
+		return client
+	}
+	if transport != nil {
+		client.Transport = transport
+	}
+	return client
+}
+
+func mergeMissingModelSections(data, fallback *staticModelsJSON) *staticModelsJSON {
+	if data == nil {
+		return fallback
+	}
+	if fallback == nil {
+		return data
+	}
+
+	merged := *data
+	if len(merged.Claude) == 0 {
+		merged.Claude = cloneModelInfos(fallback.Claude)
+	}
+	if len(merged.Gemini) == 0 {
+		merged.Gemini = cloneModelInfos(fallback.Gemini)
+	}
+	if len(merged.Vertex) == 0 {
+		merged.Vertex = cloneModelInfos(fallback.Vertex)
+	}
+	if len(merged.GeminiCLI) == 0 {
+		merged.GeminiCLI = cloneModelInfos(fallback.GeminiCLI)
+	}
+	if len(merged.AIStudio) == 0 {
+		merged.AIStudio = cloneModelInfos(fallback.AIStudio)
+	}
+	if len(merged.CodexFree) == 0 {
+		merged.CodexFree = cloneModelInfos(fallback.CodexFree)
+	}
+	if len(merged.CodexTeam) == 0 {
+		merged.CodexTeam = cloneModelInfos(fallback.CodexTeam)
+	}
+	if len(merged.CodexPlus) == 0 {
+		merged.CodexPlus = cloneModelInfos(fallback.CodexPlus)
+	}
+	if len(merged.CodexPro) == 0 {
+		merged.CodexPro = cloneModelInfos(fallback.CodexPro)
+	}
+	if len(merged.Qwen) == 0 {
+		merged.Qwen = cloneModelInfos(fallback.Qwen)
+	}
+	if len(merged.IFlow) == 0 {
+		merged.IFlow = cloneModelInfos(fallback.IFlow)
+	}
+	if len(merged.Kimi) == 0 {
+		merged.Kimi = cloneModelInfos(fallback.Kimi)
+	}
+	if len(merged.Antigravity) == 0 {
+		merged.Antigravity = cloneModelInfos(fallback.Antigravity)
+	}
+	return &merged
 }
 
 // detectChangedProviders compares two model catalogs and returns provider names
