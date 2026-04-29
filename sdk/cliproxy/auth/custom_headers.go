@@ -66,3 +66,21 @@ func ApplyCustomHeadersFromMetadata(auth *Auth) {
 		auth.Attributes["header:"+name] = value
 	}
 }
+
+func HasStructuredAccountSettingsMetadata(auth *Auth) bool {
+	if auth == nil || len(auth.Metadata) == 0 {
+		return false
+	}
+	raw, ok := auth.Metadata["account_settings"]
+	if !ok || raw == nil {
+		return false
+	}
+	switch value := raw.(type) {
+	case map[string]any:
+		return len(value) > 0
+	case map[string]string:
+		return len(value) > 0
+	default:
+		return true
+	}
+}

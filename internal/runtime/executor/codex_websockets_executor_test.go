@@ -246,6 +246,72 @@ func TestApplyCodexHeadersPassesThroughClientIdentityHeaders(t *testing.T) {
 	}
 }
 
+func TestApplyCodexHeaders_StructuredAccountSettingsKeepsManagedHeadersAuthoritative(t *testing.T) {
+	req, err := http.NewRequest(http.MethodPost, "https://example.com/responses", nil)
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	cfg := &config.Config{
+		CodexHeaderDefaults: config.CodexHeaderDefaults{
+			UserAgent: "managed-codex-ua/9.9",
+		},
+	}
+	auth := &cliproxyauth.Auth{
+		Provider: "codex",
+		Attributes: map[string]string{
+			"header:User-Agent": "legacy-override/0.1",
+			"header:X-Trace-Id": "trace-123",
+		},
+		Metadata: map[string]any{
+			"account_settings": map[string]any{
+				"schema_version": 1,
+				"extra_headers": map[string]any{
+					"X-Trace-Id": "trace-123",
+				},
+			},
+		},
+	}
+
+	applyCodexHeaders(req, auth, "oauth-token", false, cfg)
+
+	if got := req.Header.Get("User-Agent"); got != "managed-codex-ua/9.9" {
+		t.Fatalf("User-Agent = %s, want %s", got, "managed-codex-ua/9.9")
+	}
+	if got := req.Header.Get("X-Trace-Id"); got != "trace-123" {
+		t.Fatalf("X-Trace-Id = %s, want %s", got, "trace-123")
+	}
+}
+
+func TestApplyCodexWebsocketHeaders_StructuredAccountSettingsKeepsManagedHeadersAuthoritative(t *testing.T) {
+	auth := &cliproxyauth.Auth{
+		Provider: "codex",
+		Attributes: map[string]string{
+			"header:Version":    "legacy-version",
+			"header:X-Trace-Id": "trace-456",
+		},
+		Metadata: map[string]any{
+			"account_settings": map[string]any{
+				"schema_version": 1,
+				"extra_headers": map[string]any{
+					"X-Trace-Id": "trace-456",
+				},
+			},
+		},
+	}
+	ctx := contextWithGinHeaders(map[string]string{
+		"Version": "0.120.0",
+	})
+
+	headers := applyCodexWebsocketHeaders(ctx, http.Header{}, auth, "", nil)
+
+	if got := headers.Get("Version"); got != "0.120.0" {
+		t.Fatalf("Version = %s, want %s", got, "0.120.0")
+	}
+	if got := headers.Get("X-Trace-Id"); got != "trace-456" {
+		t.Fatalf("X-Trace-Id = %s, want %s", got, "trace-456")
+	}
+}
+
 func TestApplyCodexHeadersDoesNotInjectClientOnlyHeadersByDefault(t *testing.T) {
 	req, err := http.NewRequest(http.MethodPost, "https://example.com/responses", nil)
 	if err != nil {

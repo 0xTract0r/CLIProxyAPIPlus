@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"sort"
 	"strconv"
@@ -36,9 +37,11 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/kimi"
 	kiroauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/kiro"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/qwen"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
+	runtimehelps "github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
@@ -51,14 +54,71 @@ import (
 var lastRefreshKeys = []string{"last_refresh", "lastRefresh", "last_refreshed_at", "lastRefreshedAt"}
 
 const (
-	anthropicCallbackPort = 54545
-	geminiCallbackPort    = 8085
-	codexCallbackPort     = 1455
-	geminiCLIEndpoint     = "https://cloudcode-pa.googleapis.com"
-	geminiCLIVersion      = "v1internal"
-	gitLabLoginModeOAuth  = "oauth"
-	gitLabLoginModePAT    = "pat"
+	anthropicCallbackPort        = 54545
+	geminiCallbackPort           = 8085
+	codexCallbackPort            = 1455
+	geminiCLIEndpoint            = "https://cloudcode-pa.googleapis.com"
+	geminiCLIVersion             = "v1internal"
+	gitLabLoginModeOAuth         = "oauth"
+	gitLabLoginModePAT           = "pat"
+	accountSettingsSchemaVersion = 1
 )
+
+type authFileManagedHeaderProjection struct {
+	GeneratedAt           string            `json:"generated_at,omitempty"`
+	SummaryHeaders        map[string]string `json:"summary_headers,omitempty"`
+	VersionedCapabilities map[string]string `json:"versioned_capabilities,omitempty"`
+	StableIdentity        map[string]string `json:"stable_identity,omitempty"`
+	RuntimeFingerprint    map[string]string `json:"runtime_fingerprint,omitempty"`
+}
+
+type authFileManagedHeaderHistoryEntry struct {
+	RecordedAt                    string            `json:"recorded_at,omitempty"`
+	PolicyVersion                 string            `json:"policy_version,omitempty"`
+	Reason                        string            `json:"reason,omitempty"`
+	ChangedFields                 []string          `json:"changed_fields,omitempty"`
+	PreviousVersionedCapabilities map[string]string `json:"previous_versioned_capabilities,omitempty"`
+	NextVersionedCapabilities     map[string]string `json:"next_versioned_capabilities,omitempty"`
+}
+
+type authFileManagedHeaderState struct {
+	PolicyVersion string                              `json:"policy_version,omitempty"`
+	Current       *authFileManagedHeaderProjection    `json:"current,omitempty"`
+	History       []authFileManagedHeaderHistoryEntry `json:"history,omitempty"`
+}
+
+type authFileAccountSettingsStored struct {
+	SchemaVersion      int                         `json:"schema_version"`
+	ExtraHeaders       map[string]string           `json:"extra_headers,omitempty"`
+	TransportProfile   any                         `json:"transport_profile,omitempty"`
+	TLSProfile         any                         `json:"tls_profile,omitempty"`
+	ManagedHeaderState *authFileManagedHeaderState `json:"managed_header_state,omitempty"`
+}
+
+type authFileAccountSettingsView struct {
+	ProxyURL           string                            `json:"proxy_url"`
+	Note               string                            `json:"note"`
+	Disabled           bool                              `json:"disabled"`
+	ManagedHeaders     map[string]string                 `json:"managed_headers"`
+	ExtraHeaders       map[string]string                 `json:"extra_headers"`
+	TransportProfile   any                               `json:"transport_profile"`
+	TLSProfile         any                               `json:"tls_profile"`
+	ManagedHeaderState *authFileManagedHeaderState       `json:"managed_header_state,omitempty"`
+	Activation         authFileAccountSettingsActivation `json:"activation"`
+	Warnings           []string                          `json:"warnings"`
+}
+
+type authFileAccountSettingsActivation struct {
+	Summary   string `json:"summary"`
+	State     string `json:"state,omitempty"`
+	Source    string `json:"source,omitempty"`
+	Effective bool   `json:"effective"`
+}
+
+type authFileAccountSettingsResponse struct {
+	Name            string                      `json:"name"`
+	AccountSettings authFileAccountSettingsView `json:"account_settings"`
+}
 
 type callbackForwarder struct {
 	provider string
@@ -258,6 +318,7 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 	auths := h.authManager.List()
 	files := make([]gin.H, 0, len(auths))
 	for _, auth := range auths {
+		auth = h.syncAuthManagedHeaderState(c.Request.Context(), auth)
 		if entry := h.buildAuthFileEntry(auth); entry != nil {
 			files = append(files, entry)
 		}
@@ -380,10 +441,7 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 	if path == "" && !runtimeOnly {
 		return nil
 	}
-	name := strings.TrimSpace(auth.FileName)
-	if name == "" {
-		name = auth.ID
-	}
+	name := authDisplayName(auth)
 	entry := gin.H{
 		"id":             auth.ID,
 		"auth_index":     auth.Index,
@@ -442,6 +500,12 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 	if claims := extractCodexIDTokenClaims(auth); claims != nil {
 		entry["id_token"] = claims
 	}
+	if proxyURL := authProxyURL(auth); proxyURL != "" {
+		entry["proxy_url"] = proxyURL
+	}
+	if headers := coreauth.ExtractCustomHeadersFromMetadata(auth.Metadata); len(headers) > 0 {
+		entry["headers"] = headers
+	}
 	// Expose priority from Attributes (set by synthesizer from JSON "priority" field).
 	// Fall back to Metadata for auths registered via UploadAuthFile (no synthesizer).
 	if p := strings.TrimSpace(authAttribute(auth, "priority")); p != "" {
@@ -473,6 +537,7 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 			}
 		}
 	}
+	entry["account_settings"] = buildAuthFileAccountSettingsView(auth, h.cfg)
 	return entry
 }
 
@@ -1138,6 +1203,607 @@ func replaceAuthMetadataHeaders(auth *coreauth.Auth, headers map[string]string) 
 	auth.Metadata["headers"] = metaHeaders
 }
 
+func overwriteAuthMetadataHeaders(auth *coreauth.Auth, headers map[string]string) {
+	if auth == nil {
+		return
+	}
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	if auth.Attributes == nil {
+		auth.Attributes = make(map[string]string)
+	}
+	for key := range auth.Attributes {
+		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(key)), "header:") {
+			delete(auth.Attributes, key)
+		}
+	}
+
+	normalized := normalizeHeaderMap(headers)
+	if len(normalized) == 0 {
+		delete(auth.Metadata, "headers")
+		return
+	}
+
+	metaHeaders := make(map[string]any, len(normalized))
+	for key, value := range normalized {
+		metaHeaders[key] = value
+		auth.Attributes["header:"+key] = value
+	}
+	auth.Metadata["headers"] = metaHeaders
+}
+
+func normalizeHeaderMap(headers map[string]string) map[string]string {
+	if len(headers) == 0 {
+		return nil
+	}
+	normalized := make(map[string]string)
+	for rawKey, rawValue := range headers {
+		key := strings.TrimSpace(rawKey)
+		value := strings.TrimSpace(rawValue)
+		if key == "" || value == "" {
+			continue
+		}
+		normalized[key] = value
+	}
+	if len(normalized) == 0 {
+		return nil
+	}
+	return normalized
+}
+
+func authProxyURL(auth *coreauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	if trimmed := strings.TrimSpace(auth.ProxyURL); trimmed != "" {
+		return trimmed
+	}
+	if auth.Metadata == nil {
+		return ""
+	}
+	if rawProxyURL, ok := auth.Metadata["proxy_url"].(string); ok {
+		return strings.TrimSpace(rawProxyURL)
+	}
+	return ""
+}
+
+func authDisplayName(auth *coreauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	if trimmed := strings.TrimSpace(auth.FileName); trimmed != "" {
+		return trimmed
+	}
+	if trimmed := strings.TrimSpace(auth.ID); trimmed != "" {
+		return trimmed
+	}
+	if path := strings.TrimSpace(authAttribute(auth, "path")); path != "" {
+		if base := strings.TrimSpace(filepath.Base(path)); base != "" && base != "." {
+			return base
+		}
+	}
+	return strings.TrimSpace(auth.Label)
+}
+
+func authNote(auth *coreauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	if trimmed := strings.TrimSpace(authAttribute(auth, "note")); trimmed != "" {
+		return trimmed
+	}
+	if auth.Metadata == nil {
+		return ""
+	}
+	if rawNote, ok := auth.Metadata["note"].(string); ok {
+		return strings.TrimSpace(rawNote)
+	}
+	return ""
+}
+
+func normalizeAccountProfileValue(raw any) any {
+	switch value := raw.(type) {
+	case nil:
+		return nil
+	case string:
+		trimmed := strings.TrimSpace(value)
+		if trimmed == "" {
+			return nil
+		}
+		return trimmed
+	case map[string]any:
+		if len(value) == 0 {
+			return nil
+		}
+		return value
+	case map[string]string:
+		if len(value) == 0 {
+			return nil
+		}
+		out := make(map[string]any, len(value))
+		for key, item := range value {
+			if trimmedKey := strings.TrimSpace(key); trimmedKey != "" {
+				out[trimmedKey] = strings.TrimSpace(item)
+			}
+		}
+		if len(out) == 0 {
+			return nil
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+func authManagedHeaderNames(provider string) map[string]struct{} {
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "claude":
+		return map[string]struct{}{
+			"user-agent":                  {},
+			"x-app":                       {},
+			"x-stainless-package-version": {},
+			"x-stainless-runtime-version": {},
+			"x-stainless-timeout":         {},
+		}
+	case "codex":
+		return map[string]struct{}{
+			"user-agent":            {},
+			"version":               {},
+			"originator":            {},
+			"x-codex-beta-features": {},
+		}
+	default:
+		return nil
+	}
+}
+
+func authHeaderReservedForExtras(provider string, headerName string) bool {
+	lowerName := strings.ToLower(strings.TrimSpace(headerName))
+	if lowerName == "" {
+		return false
+	}
+	if managedNames := authManagedHeaderNames(provider); managedNames != nil {
+		if _, ok := managedNames[lowerName]; ok {
+			return true
+		}
+	}
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "claude":
+		switch lowerName {
+		case "authorization", "x-api-key", "anthropic-version", "anthropic-beta", "content-type",
+			"accept", "accept-encoding", "connection", "x-client-request-id",
+			"x-claude-code-session-id", "x-stainless-retry-count", "x-stainless-runtime",
+			"x-stainless-lang", "x-stainless-os", "x-stainless-arch",
+			"anthropic-dangerous-direct-browser-access":
+			return true
+		}
+	case "codex":
+		switch lowerName {
+		case "authorization", "openai-beta", "originator", "session_id", "chatgpt-account-id",
+			"x-client-request-id", "x-codex-turn-state", "x-codex-turn-metadata",
+			"x-responsesapi-include-timing-metrics", "content-type", "accept", "connection":
+			return true
+		}
+		if strings.HasPrefix(lowerName, "x-stainless-") {
+			return true
+		}
+		if strings.HasPrefix(lowerName, "x-codex-") && lowerName != "x-codex-beta-features" {
+			return true
+		}
+	}
+	return false
+}
+
+func managedHeadersForAuth(auth *coreauth.Auth, cfg *config.Config) map[string]string {
+	return managedHeaderProjectionForAuth(auth, cfg).SummaryHeaders
+}
+
+func managedHeaderProjectionForAuth(auth *coreauth.Auth, cfg *config.Config) authFileManagedHeaderProjection {
+	if auth == nil {
+		return authFileManagedHeaderProjection{}
+	}
+	generatedAt := time.Now().UTC().Format(time.RFC3339)
+	switch strings.ToLower(strings.TrimSpace(auth.Provider)) {
+	case "claude":
+		profile := runtimehelps.ResolveClaudeDeviceProfile(auth, "", nil, cfg)
+		timeoutValue := "600"
+		if cfg != nil {
+			if trimmed := strings.TrimSpace(cfg.ClaudeHeaderDefaults.Timeout); trimmed != "" {
+				timeoutValue = trimmed
+			}
+		}
+		return authFileManagedHeaderProjection{
+			GeneratedAt: generatedAt,
+			SummaryHeaders: normalizeHeaderMap(map[string]string{
+				"User-Agent":                  profile.UserAgent,
+				"X-App":                       "cli",
+				"X-Stainless-Package-Version": profile.PackageVersion,
+				"X-Stainless-Runtime-Version": profile.RuntimeVersion,
+				"X-Stainless-Timeout":         timeoutValue,
+			}),
+			VersionedCapabilities: normalizeHeaderMap(map[string]string{
+				"User-Agent":                  profile.UserAgent,
+				"X-Stainless-Package-Version": profile.PackageVersion,
+				"X-Stainless-Runtime-Version": profile.RuntimeVersion,
+				"X-Stainless-Timeout":         timeoutValue,
+			}),
+			StableIdentity: normalizeHeaderMap(map[string]string{
+				"X-App": "cli",
+			}),
+			RuntimeFingerprint: normalizeHeaderMap(map[string]string{
+				"X-Stainless-Os":   profile.OS,
+				"X-Stainless-Arch": profile.Arch,
+			}),
+		}
+	case "codex":
+		profile := runtimehelps.ResolveCodexClientProfile(auth, nil, cfg)
+		return authFileManagedHeaderProjection{
+			GeneratedAt:           generatedAt,
+			SummaryHeaders:        runtimehelps.CodexManagedHeaders(profile),
+			VersionedCapabilities: runtimehelps.CodexManagedVersionedCapabilities(profile),
+			StableIdentity:        runtimehelps.CodexManagedStableIdentity(profile),
+			RuntimeFingerprint:    runtimehelps.CodexManagedRuntimeFingerprint(profile),
+		}
+	default:
+		return authFileManagedHeaderProjection{}
+	}
+}
+
+func mergeAccountHeaders(managedHeaders map[string]string, extraHeaders map[string]string) map[string]string {
+	merged := make(map[string]string, len(managedHeaders)+len(extraHeaders))
+	for key, value := range normalizeHeaderMap(managedHeaders) {
+		merged[key] = value
+	}
+	for key, value := range normalizeHeaderMap(extraHeaders) {
+		if _, exists := merged[key]; exists {
+			continue
+		}
+		merged[key] = value
+	}
+	if len(merged) == 0 {
+		return nil
+	}
+	return merged
+}
+
+func readAccountSettingsMetadata(auth *coreauth.Auth, cfg *config.Config) authFileAccountSettingsStored {
+	stored := authFileAccountSettingsStored{
+		SchemaVersion: accountSettingsSchemaVersion,
+	}
+	if auth == nil || auth.Metadata == nil {
+		stored.ExtraHeaders = legacyExtraHeaders(auth)
+		return stored
+	}
+	rawSettings, ok := auth.Metadata["account_settings"]
+	if !ok || rawSettings == nil {
+		stored.ExtraHeaders = legacyExtraHeaders(auth)
+		return stored
+	}
+
+	if data, errMarshal := json.Marshal(rawSettings); errMarshal == nil {
+		_ = json.Unmarshal(data, &stored)
+	}
+	if stored.SchemaVersion == 0 {
+		stored.SchemaVersion = accountSettingsSchemaVersion
+	}
+	stored.ExtraHeaders = normalizeHeaderMap(stored.ExtraHeaders)
+	stored.TransportProfile = normalizeAccountProfileValue(stored.TransportProfile)
+	stored.TLSProfile = normalizeAccountProfileValue(stored.TLSProfile)
+	stored.ManagedHeaderState = normalizeManagedHeaderState(stored.ManagedHeaderState)
+	return stored
+}
+
+func legacyExtraHeaders(auth *coreauth.Auth) map[string]string {
+	if auth == nil {
+		return nil
+	}
+	allHeaders := normalizeHeaderMap(coreauth.ExtractCustomHeadersFromMetadata(auth.Metadata))
+	if len(allHeaders) == 0 {
+		return nil
+	}
+	managedNames := authManagedHeaderNames(auth.Provider)
+	extraHeaders := make(map[string]string)
+	for key, value := range allHeaders {
+		lowerKey := strings.ToLower(strings.TrimSpace(key))
+		if _, ok := managedNames[lowerKey]; ok {
+			continue
+		}
+		if authHeaderReservedForExtras(auth.Provider, key) {
+			continue
+		}
+		extraHeaders[key] = value
+	}
+	return normalizeHeaderMap(extraHeaders)
+}
+
+func buildAuthFileAccountSettingsView(auth *coreauth.Auth, cfg *config.Config) authFileAccountSettingsView {
+	stored := readAccountSettingsMetadata(auth, cfg)
+	projection := managedHeaderProjectionForAuth(auth, cfg)
+	managedHeaders := projection.SummaryHeaders
+	extraHeaders := normalizeHeaderMap(stored.ExtraHeaders)
+	var managedHeaderState *authFileManagedHeaderState
+	if coreauth.HasStructuredAccountSettingsMetadata(auth) || stored.ManagedHeaderState != nil {
+		managedHeaderState = mergeManagedHeaderState(stored.ManagedHeaderState, projection, providerKey(auth))
+	}
+	warnings := make([]string, 0, 2)
+	transportRuntimeEnforced := runtimehelps.IsRuntimeTransportProfileEnforced(auth)
+	if stored.TransportProfile != nil && !transportRuntimeEnforced {
+		warnings = append(warnings, "transport_profile is reserved in schema/UI only and is not runtime-enforced yet")
+	} else if stored.TransportProfile != nil && strings.EqualFold(providerKey(auth), "codex") {
+		warnings = append(warnings, "codex transport_profile is runtime-enforced for account-scoped transport isolation only; it does not emulate the official Codex rustls TLS fingerprint yet")
+	}
+	if stored.TLSProfile != nil {
+		warnings = append(warnings, "tls_profile is reserved in schema/UI only and is not runtime-enforced yet")
+	}
+
+	return authFileAccountSettingsView{
+		ProxyURL:           authProxyURL(auth),
+		Note:               authNote(auth),
+		Disabled:           auth != nil && auth.Disabled,
+		ManagedHeaders:     managedHeaders,
+		ExtraHeaders:       extraHeaders,
+		TransportProfile:   stored.TransportProfile,
+		TLSProfile:         stored.TLSProfile,
+		ManagedHeaderState: managedHeaderState,
+		Activation: authFileAccountSettingsActivation{
+			Summary:   accountSettingsActivationSummary(auth, managedHeaders, extraHeaders, transportRuntimeEnforced),
+			State:     accountSettingsActivationState(auth, stored.TransportProfile, stored.TLSProfile, transportRuntimeEnforced),
+			Source:    "core",
+			Effective: auth != nil && !auth.Disabled,
+		},
+		Warnings: warnings,
+	}
+}
+
+func providerKey(auth *coreauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(auth.Provider))
+}
+
+func (h *Handler) syncAuthManagedHeaderState(ctx context.Context, auth *coreauth.Auth) *coreauth.Auth {
+	if h == nil || auth == nil {
+		return auth
+	}
+	stored := readAccountSettingsMetadata(auth, h.cfg)
+	if !coreauth.HasStructuredAccountSettingsMetadata(auth) && stored.ManagedHeaderState == nil {
+		return auth
+	}
+	projection := managedHeaderProjectionForAuth(auth, h.cfg)
+	if len(projection.SummaryHeaders) == 0 {
+		return auth
+	}
+
+	nextState := mergeManagedHeaderState(stored.ManagedHeaderState, projection, providerKey(auth))
+	extraHeaders := normalizeHeaderMap(stored.ExtraHeaders)
+	runtimeHeaders := mergeAccountHeaders(projection.SummaryHeaders, extraHeaders)
+	currentHeaders := normalizeHeaderMap(coreauth.ExtractCustomHeadersFromMetadata(auth.Metadata))
+	if managedHeaderStateEquivalent(nextState, normalizeManagedHeaderState(stored.ManagedHeaderState)) &&
+		reflect.DeepEqual(runtimeHeaders, currentHeaders) {
+		return auth
+	}
+
+	updated := auth.Clone()
+	if updated.Metadata == nil {
+		updated.Metadata = make(map[string]any)
+	}
+	if updated.Attributes == nil {
+		updated.Attributes = make(map[string]string)
+	}
+	stored.ManagedHeaderState = nextState
+	updated.Metadata["account_settings"] = stored
+	overwriteAuthMetadataHeaders(updated, runtimeHeaders)
+	updated.UpdatedAt = time.Now()
+	if h.authManager == nil {
+		return updated
+	}
+	persisted, errUpdate := h.authManager.Update(ctx, updated)
+	if errUpdate != nil {
+		log.WithError(errUpdate).WithField("auth_id", updated.ID).Warn("failed to persist managed header state sync")
+		return updated
+	}
+	if persisted != nil {
+		return persisted
+	}
+	return updated
+}
+
+func normalizeManagedHeaderState(state *authFileManagedHeaderState) *authFileManagedHeaderState {
+	if state == nil {
+		return nil
+	}
+	normalized := &authFileManagedHeaderState{
+		PolicyVersion: strings.TrimSpace(state.PolicyVersion),
+	}
+	if state.Current != nil {
+		normalized.Current = &authFileManagedHeaderProjection{
+			GeneratedAt:           strings.TrimSpace(state.Current.GeneratedAt),
+			SummaryHeaders:        normalizeHeaderMap(state.Current.SummaryHeaders),
+			VersionedCapabilities: normalizeHeaderMap(state.Current.VersionedCapabilities),
+			StableIdentity:        normalizeHeaderMap(state.Current.StableIdentity),
+			RuntimeFingerprint:    normalizeHeaderMap(state.Current.RuntimeFingerprint),
+		}
+		if normalized.Current.GeneratedAt == "" {
+			normalized.Current.GeneratedAt = time.Now().UTC().Format(time.RFC3339)
+		}
+	}
+	if len(state.History) > 0 {
+		normalized.History = make([]authFileManagedHeaderHistoryEntry, 0, len(state.History))
+		for _, entry := range state.History {
+			changedFields := append([]string(nil), entry.ChangedFields...)
+			sort.Strings(changedFields)
+			normalized.History = append(normalized.History, authFileManagedHeaderHistoryEntry{
+				RecordedAt:                    strings.TrimSpace(entry.RecordedAt),
+				PolicyVersion:                 strings.TrimSpace(entry.PolicyVersion),
+				Reason:                        strings.TrimSpace(entry.Reason),
+				ChangedFields:                 changedFields,
+				PreviousVersionedCapabilities: normalizeHeaderMap(entry.PreviousVersionedCapabilities),
+				NextVersionedCapabilities:     normalizeHeaderMap(entry.NextVersionedCapabilities),
+			})
+		}
+	}
+	if normalized.PolicyVersion == "" {
+		normalized.PolicyVersion = managedHeaderPolicyVersion("")
+	}
+	if normalized.Current == nil && len(normalized.History) == 0 {
+		return nil
+	}
+	return normalized
+}
+
+func managedHeaderPolicyVersion(provider string) string {
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "claude":
+		return "claude-managed/v2"
+	case "codex":
+		return "codex-managed/v2"
+	default:
+		return "managed/v2"
+	}
+}
+
+func mergeManagedHeaderState(previous *authFileManagedHeaderState, projection authFileManagedHeaderProjection, provider string) *authFileManagedHeaderState {
+	if len(projection.SummaryHeaders) == 0 &&
+		len(projection.VersionedCapabilities) == 0 &&
+		len(projection.StableIdentity) == 0 &&
+		len(projection.RuntimeFingerprint) == 0 {
+		return normalizeManagedHeaderState(previous)
+	}
+
+	normalizedPrev := normalizeManagedHeaderState(previous)
+	current := &authFileManagedHeaderProjection{
+		GeneratedAt:           projection.GeneratedAt,
+		SummaryHeaders:        normalizeHeaderMap(projection.SummaryHeaders),
+		VersionedCapabilities: normalizeHeaderMap(projection.VersionedCapabilities),
+		StableIdentity:        normalizeHeaderMap(projection.StableIdentity),
+		RuntimeFingerprint:    normalizeHeaderMap(projection.RuntimeFingerprint),
+	}
+	if strings.TrimSpace(current.GeneratedAt) == "" {
+		current.GeneratedAt = time.Now().UTC().Format(time.RFC3339)
+	}
+
+	if normalizedPrev != nil && managedHeaderProjectionEquivalent(normalizedPrev.Current, current) {
+		return normalizedPrev
+	}
+
+	state := &authFileManagedHeaderState{
+		PolicyVersion: managedHeaderPolicyVersion(provider),
+		Current:       current,
+	}
+	if normalizedPrev == nil {
+		return state
+	}
+
+	if state.PolicyVersion == "" {
+		state.PolicyVersion = normalizedPrev.PolicyVersion
+	}
+	state.History = append(state.History, normalizedPrev.History...)
+	if normalizedPrev.Current != nil && !managedHeaderProjectionEquivalent(normalizedPrev.Current, current) {
+		state.History = append(state.History, authFileManagedHeaderHistoryEntry{
+			RecordedAt:                    current.GeneratedAt,
+			PolicyVersion:                 state.PolicyVersion,
+			Reason:                        "managed-header-refresh",
+			ChangedFields:                 diffManagedHeaderFields(normalizedPrev.Current.SummaryHeaders, current.SummaryHeaders),
+			PreviousVersionedCapabilities: normalizeHeaderMap(normalizedPrev.Current.VersionedCapabilities),
+			NextVersionedCapabilities:     normalizeHeaderMap(current.VersionedCapabilities),
+		})
+	}
+	if len(state.History) > 12 {
+		state.History = append([]authFileManagedHeaderHistoryEntry(nil), state.History[len(state.History)-12:]...)
+	}
+	return state
+}
+
+func diffManagedHeaderFields(previous map[string]string, next map[string]string) []string {
+	seen := make(map[string]struct{}, len(previous)+len(next))
+	fields := make([]string, 0, len(previous)+len(next))
+	for key := range previous {
+		seen[key] = struct{}{}
+	}
+	for key := range next {
+		seen[key] = struct{}{}
+	}
+	for key := range seen {
+		if strings.TrimSpace(previous[key]) == strings.TrimSpace(next[key]) {
+			continue
+		}
+		fields = append(fields, key)
+	}
+	sort.Strings(fields)
+	return fields
+}
+
+func managedHeaderProjectionEquivalent(left *authFileManagedHeaderProjection, right *authFileManagedHeaderProjection) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return reflect.DeepEqual(left.SummaryHeaders, right.SummaryHeaders) &&
+		reflect.DeepEqual(left.VersionedCapabilities, right.VersionedCapabilities) &&
+		reflect.DeepEqual(left.StableIdentity, right.StableIdentity) &&
+		reflect.DeepEqual(left.RuntimeFingerprint, right.RuntimeFingerprint)
+}
+
+func managedHeaderStateEquivalent(left *authFileManagedHeaderState, right *authFileManagedHeaderState) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return strings.TrimSpace(left.PolicyVersion) == strings.TrimSpace(right.PolicyVersion) &&
+		managedHeaderProjectionEquivalent(left.Current, right.Current) &&
+		reflect.DeepEqual(left.History, right.History)
+}
+
+func accountSettingsActivationSummary(auth *coreauth.Auth, managedHeaders map[string]string, extraHeaders map[string]string, transportRuntimeEnforced bool) string {
+	if auth != nil && auth.Disabled {
+		return "disabled"
+	}
+	switch {
+	case authProxyURL(auth) != "":
+		return "proxy override active"
+	case transportRuntimeEnforced:
+		return "transport profile active"
+	case len(extraHeaders) > 0:
+		return "custom extra headers active"
+	case len(managedHeaders) > 0:
+		return "managed headers active"
+	default:
+		return "core defaults active"
+	}
+}
+
+func accountSettingsActivationState(auth *coreauth.Auth, transportProfile any, tlsProfile any, transportRuntimeEnforced bool) string {
+	if auth != nil && auth.Disabled {
+		return "disabled"
+	}
+	if transportRuntimeEnforced {
+		return "transport-profile-active"
+	}
+	if transportProfile != nil || tlsProfile != nil {
+		return "reserved-profiles-present"
+	}
+	return "active"
+}
+
+func findAuthByName(authManager *coreauth.Manager, name string) *coreauth.Auth {
+	if authManager == nil {
+		return nil
+	}
+	trimmedName := strings.TrimSpace(name)
+	if trimmedName == "" {
+		return nil
+	}
+	if auth, ok := authManager.GetByID(trimmedName); ok {
+		return auth
+	}
+	for _, auth := range authManager.List() {
+		if auth != nil && authDisplayName(auth) == trimmedName {
+			return auth
+		}
+	}
+	return nil
+}
+
 type refreshAuthFileStatusRequest struct {
 	Name    string `json:"name"`
 	Trigger string `json:"trigger"`
@@ -1510,6 +2176,142 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
+
+func (h *Handler) GetAuthFileAccountSettings(c *gin.Context) {
+	if h.authManager == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
+		return
+	}
+
+	name := strings.TrimSpace(c.Query("name"))
+	if name == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
+		return
+	}
+
+	targetAuth := findAuthByName(h.authManager, name)
+	if targetAuth == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "auth file not found"})
+		return
+	}
+	targetAuth = h.syncAuthManagedHeaderState(c.Request.Context(), targetAuth)
+
+	c.JSON(http.StatusOK, authFileAccountSettingsResponse{
+		Name:            authDisplayName(targetAuth),
+		AccountSettings: buildAuthFileAccountSettingsView(targetAuth, h.cfg),
+	})
+}
+
+func (h *Handler) PatchAuthFileAccountSettings(c *gin.Context) {
+	if h.authManager == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
+		return
+	}
+
+	var req struct {
+		Name             string            `json:"name"`
+		ProxyURL         *string           `json:"proxy_url"`
+		Note             *string           `json:"note"`
+		Disabled         *bool             `json:"disabled"`
+		ExtraHeaders     map[string]string `json:"extra_headers"`
+		TransportProfile any               `json:"transport_profile"`
+		TLSProfile       any               `json:"tls_profile"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
+		return
+	}
+	if req.Disabled == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "disabled is required"})
+		return
+	}
+
+	targetAuth := findAuthByName(h.authManager, name)
+	if targetAuth == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "auth file not found"})
+		return
+	}
+
+	extraHeaders := normalizeHeaderMap(req.ExtraHeaders)
+	for key := range extraHeaders {
+		if authHeaderReservedForExtras(targetAuth.Provider, key) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("extra header %q conflicts with managed or protocol-reserved headers", key)})
+			return
+		}
+	}
+
+	if targetAuth.Metadata == nil {
+		targetAuth.Metadata = make(map[string]any)
+	}
+	if targetAuth.Attributes == nil {
+		targetAuth.Attributes = make(map[string]string)
+	}
+
+	proxyURL := ""
+	if req.ProxyURL != nil {
+		proxyURL = strings.TrimSpace(*req.ProxyURL)
+	}
+	noteValue := ""
+	if req.Note != nil {
+		noteValue = strings.TrimSpace(*req.Note)
+	}
+	transportProfile := normalizeAccountProfileValue(req.TransportProfile)
+	tlsProfile := normalizeAccountProfileValue(req.TLSProfile)
+
+	targetAuth.Disabled = *req.Disabled
+	if *req.Disabled {
+		targetAuth.Status = coreauth.StatusDisabled
+		targetAuth.StatusMessage = "disabled via management API"
+	} else if targetAuth.Status == coreauth.StatusDisabled {
+		targetAuth.Status = coreauth.StatusActive
+		targetAuth.StatusMessage = ""
+	}
+
+	targetAuth.ProxyURL = proxyURL
+	if proxyURL == "" {
+		delete(targetAuth.Metadata, "proxy_url")
+	} else {
+		targetAuth.Metadata["proxy_url"] = proxyURL
+	}
+
+	if noteValue == "" {
+		delete(targetAuth.Metadata, "note")
+		delete(targetAuth.Attributes, "note")
+	} else {
+		targetAuth.Metadata["note"] = noteValue
+		targetAuth.Attributes["note"] = noteValue
+	}
+
+	targetAuth.Metadata["account_settings"] = authFileAccountSettingsStored{
+		SchemaVersion:      accountSettingsSchemaVersion,
+		ExtraHeaders:       extraHeaders,
+		TransportProfile:   transportProfile,
+		TLSProfile:         tlsProfile,
+		ManagedHeaderState: readAccountSettingsMetadata(targetAuth, h.cfg).ManagedHeaderState,
+	}
+
+	targetAuth = h.syncAuthManagedHeaderState(c.Request.Context(), targetAuth)
+	managedHeaders := managedHeadersForAuth(targetAuth, h.cfg)
+	runtimeHeaders := mergeAccountHeaders(managedHeaders, extraHeaders)
+	overwriteAuthMetadataHeaders(targetAuth, runtimeHeaders)
+
+	targetAuth.UpdatedAt = time.Now()
+	if _, err := h.authManager.Update(c.Request.Context(), targetAuth); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to update auth: %v", err)})
+		return
+	}
+
+	c.JSON(http.StatusOK, authFileAccountSettingsResponse{
+		Name:            authDisplayName(targetAuth),
+		AccountSettings: buildAuthFileAccountSettingsView(targetAuth, h.cfg),
+	})
 }
 
 func (h *Handler) disableAuth(ctx context.Context, id string) {

@@ -23,9 +23,10 @@ type utlsRoundTripper struct {
 	connections map[string]*http2.ClientConn
 	pending     map[string]*sync.Cond
 	dialer      proxy.Dialer
+	clientHello tls.ClientHelloID
 }
 
-func newUtlsRoundTripper(proxyURL string) *utlsRoundTripper {
+func newUtlsRoundTripper(proxyURL string, clientHello tls.ClientHelloID) *utlsRoundTripper {
 	var dialer proxy.Dialer = proxy.Direct
 	if proxyURL != "" {
 		proxyDialer, mode, errBuild := proxyutil.BuildDialer(proxyURL)
@@ -39,6 +40,7 @@ func newUtlsRoundTripper(proxyURL string) *utlsRoundTripper {
 		connections: make(map[string]*http2.ClientConn),
 		pending:     make(map[string]*sync.Cond),
 		dialer:      dialer,
+		clientHello: clientHello,
 	}
 }
 
@@ -85,7 +87,11 @@ func (t *utlsRoundTripper) createConnection(host, addr string) (*http2.ClientCon
 	}
 
 	tlsConfig := &tls.Config{ServerName: host}
-	tlsConn := tls.UClient(conn, tlsConfig, tls.HelloChrome_Auto)
+	clientHello := t.clientHello
+	if !clientHello.IsSet() {
+		clientHello = tls.HelloChrome_133
+	}
+	tlsConn := tls.UClient(conn, tlsConfig, clientHello)
 
 	if err := tlsConn.Handshake(); err != nil {
 		conn.Close()
@@ -153,6 +159,21 @@ func (f *fallbackRoundTripper) RoundTrip(req *http.Request) (*http.Response, err
 // Use this for Claude API requests to match real Claude Code's TLS behavior.
 // Falls back to standard transport for non-HTTPS requests.
 func NewUtlsHTTPClient(cfg *config.Config, auth *cliproxyauth.Auth, timeout time.Duration) *http.Client {
+	return NewUtlsHTTPClientForProfile(cfg, auth, timeout, "provider-default")
+}
+
+func NewUtlsRoundTripperForProfile(proxyURL string, profileID string) http.RoundTripper {
+	clientHello, ok := resolveClaudeClientHelloID(profileID)
+	if !ok {
+		clientHello, _ = resolveClaudeClientHelloID("provider-default")
+	}
+	return &fallbackRoundTripper{
+		utls:     newUtlsRoundTripper(proxyURL, clientHello),
+		fallback: standardTransportForProxy(proxyURL),
+	}
+}
+
+func NewUtlsHTTPClientForProfile(cfg *config.Config, auth *cliproxyauth.Auth, timeout time.Duration, profileID string) *http.Client {
 	var proxyURL string
 	if auth != nil {
 		proxyURL = strings.TrimSpace(auth.ProxyURL)
@@ -161,8 +182,16 @@ func NewUtlsHTTPClient(cfg *config.Config, auth *cliproxyauth.Auth, timeout time
 		proxyURL = strings.TrimSpace(cfg.ProxyURL)
 	}
 
-	utlsRT := newUtlsRoundTripper(proxyURL)
+	client := &http.Client{
+		Transport: NewUtlsRoundTripperForProfile(proxyURL, profileID),
+	}
+	if timeout > 0 {
+		client.Timeout = timeout
+	}
+	return client
+}
 
+func standardTransportForProxy(proxyURL string) http.RoundTripper {
 	var standardTransport http.RoundTripper = &http.Transport{
 		DialContext: (&net.Dialer{
 			Timeout:   30 * time.Second,
@@ -174,15 +203,18 @@ func NewUtlsHTTPClient(cfg *config.Config, auth *cliproxyauth.Auth, timeout time
 			standardTransport = transport
 		}
 	}
+	return standardTransport
+}
 
-	client := &http.Client{
-		Transport: &fallbackRoundTripper{
-			utls:     utlsRT,
-			fallback: standardTransport,
-		},
+func resolveClaudeClientHelloID(profileID string) (tls.ClientHelloID, bool) {
+	switch strings.ToLower(strings.TrimSpace(profileID)) {
+	case "", "provider-default", "claude_chrome_like_mac_v3", "chrome_133":
+		return tls.HelloChrome_133, true
+	case "claude_chrome_like_mac_v1", "chrome_120":
+		return tls.HelloChrome_120, true
+	case "claude_chrome_like_mac_v2", "chrome_131":
+		return tls.HelloChrome_131, true
+	default:
+		return tls.ClientHelloID{}, false
 	}
-	if timeout > 0 {
-		client.Timeout = timeout
-	}
-	return client
 }

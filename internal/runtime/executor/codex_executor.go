@@ -30,11 +30,38 @@ import (
 )
 
 const (
-	codexUserAgent  = "codex-tui/0.118.0 (Mac OS 26.3.1; arm64) iTerm.app/3.6.9 (codex-tui; 0.118.0)"
 	codexOriginator = "codex-tui"
 )
 
 var dataTag = []byte("data:")
+
+func captureManagedHeaderSnapshot(headers http.Header, names []string) map[string]string {
+	if headers == nil || len(names) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(names))
+	for _, name := range names {
+		if value := strings.TrimSpace(headers.Get(name)); value != "" {
+			out[name] = value
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func applyManagedHeaderSnapshot(headers http.Header, snapshot map[string]string) {
+	if headers == nil || len(snapshot) == 0 {
+		return
+	}
+	for name, value := range snapshot {
+		if strings.TrimSpace(name) == "" || strings.TrimSpace(value) == "" {
+			continue
+		}
+		headers.Set(name, value)
+	}
+}
 
 // Streamed Codex responses may emit response.output_item.done events while leaving
 // response.completed.response.output empty. Keep the stream path aligned with the
@@ -762,11 +789,27 @@ func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, s
 	if ginHeaders.Get("X-Codex-Beta-Features") != "" {
 		r.Header.Set("X-Codex-Beta-Features", ginHeaders.Get("X-Codex-Beta-Features"))
 	}
-	misc.EnsureHeader(r.Header, ginHeaders, "Version", "")
+	var profile helps.CodexClientProfile
+	if auth != nil {
+		profile = helps.ResolveCodexClientProfile(auth, ginHeaders, cfg)
+	}
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Codex-Turn-Metadata", "")
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Client-Request-Id", "")
-	cfgUserAgent, _ := codexHeaderDefaults(cfg, auth)
-	ensureHeaderWithConfigPrecedence(r.Header, ginHeaders, "User-Agent", cfgUserAgent, codexUserAgent)
+	if strings.TrimSpace(ginHeaders.Get("Version")) != "" {
+		misc.EnsureHeader(r.Header, ginHeaders, "Version", "")
+	} else if auth != nil && strings.TrimSpace(profile.Version) != "" {
+		version := strings.TrimSpace(profile.Version)
+		r.Header.Set("Version", version)
+	} else {
+		misc.EnsureHeader(r.Header, ginHeaders, "Version", "")
+	}
+	if auth != nil && strings.TrimSpace(profile.UserAgent) != "" {
+		userAgent := strings.TrimSpace(profile.UserAgent)
+		r.Header.Set("User-Agent", userAgent)
+	} else {
+		cfgUserAgent, _ := codexHeaderDefaults(cfg, auth)
+		ensureHeaderWithConfigPrecedence(r.Header, ginHeaders, "User-Agent", cfgUserAgent, helps.DefaultCodexManagedUserAgent())
+	}
 
 	if strings.Contains(r.Header.Get("User-Agent"), "Mac OS") {
 		misc.EnsureHeader(r.Header, ginHeaders, "Session_id", uuid.NewString())
@@ -787,6 +830,9 @@ func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, s
 	}
 	if originator := strings.TrimSpace(ginHeaders.Get("Originator")); originator != "" {
 		r.Header.Set("Originator", originator)
+	} else if auth != nil && !isAPIKey && strings.TrimSpace(profile.Originator) != "" {
+		originator := strings.TrimSpace(profile.Originator)
+		r.Header.Set("Originator", originator)
 	} else if !isAPIKey {
 		r.Header.Set("Originator", codexOriginator)
 	}
@@ -797,11 +843,15 @@ func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, s
 			}
 		}
 	}
+	managedHeaderSnapshot := captureManagedHeaderSnapshot(r.Header, []string{"User-Agent", "Version", "Originator", "X-Codex-Beta-Features"})
 	var attrs map[string]string
 	if auth != nil {
 		attrs = auth.Attributes
 	}
 	util.ApplyCustomHeadersFromAttrs(r, attrs)
+	if cliproxyauth.HasStructuredAccountSettingsMetadata(auth) {
+		applyManagedHeaderSnapshot(r.Header, managedHeaderSnapshot)
+	}
 }
 
 func newCodexStatusErr(statusCode int, body []byte) statusErr {

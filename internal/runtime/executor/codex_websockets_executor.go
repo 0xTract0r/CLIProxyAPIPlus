@@ -5,6 +5,7 @@ package executor
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -213,7 +214,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	executionSessionID := executionSessionIDFromOptions(opts)
 	var sess *codexWebsocketSession
 	if executionSessionID != "" {
-		sess = e.getOrCreateSession(executionSessionID)
+		sess = e.getOrCreateSession(executionSessionID, auth, wsURL)
 		sess.reqMu.Lock()
 		defer sess.reqMu.Unlock()
 	}
@@ -406,7 +407,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	executionSessionID := executionSessionIDFromOptions(opts)
 	var sess *codexWebsocketSession
 	if executionSessionID != "" {
-		sess = e.getOrCreateSession(executionSessionID)
+		sess = e.getOrCreateSession(executionSessionID, auth, wsURL)
 		if sess != nil {
 			sess.reqMu.Lock()
 		}
@@ -821,13 +822,24 @@ func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *
 		ginHeaders = ginCtx.Request.Header.Clone()
 	}
 
+	var profile helps.CodexClientProfile
+	if auth != nil {
+		profile = helps.ResolveCodexClientProfile(auth, ginHeaders, cfg)
+	}
 	_, cfgBetaFeatures := codexHeaderDefaults(cfg, auth)
 	ensureHeaderWithPriority(headers, ginHeaders, "x-codex-beta-features", cfgBetaFeatures, "")
 	misc.EnsureHeader(headers, ginHeaders, "x-codex-turn-state", "")
 	misc.EnsureHeader(headers, ginHeaders, "x-codex-turn-metadata", "")
 	misc.EnsureHeader(headers, ginHeaders, "x-client-request-id", "")
 	misc.EnsureHeader(headers, ginHeaders, "x-responsesapi-include-timing-metrics", "")
-	misc.EnsureHeader(headers, ginHeaders, "Version", "")
+	if strings.TrimSpace(ginHeaders.Get("Version")) != "" {
+		misc.EnsureHeader(headers, ginHeaders, "Version", "")
+	} else if auth != nil && strings.TrimSpace(profile.Version) != "" {
+		version := strings.TrimSpace(profile.Version)
+		headers.Set("Version", version)
+	} else {
+		misc.EnsureHeader(headers, ginHeaders, "Version", "")
+	}
 
 	betaHeader := strings.TrimSpace(headers.Get("OpenAI-Beta"))
 	if betaHeader == "" && ginHeaders != nil {
@@ -850,6 +862,9 @@ func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *
 	}
 	if originator := strings.TrimSpace(ginHeaders.Get("Originator")); originator != "" {
 		headers.Set("Originator", originator)
+	} else if auth != nil && !isAPIKey && strings.TrimSpace(profile.Originator) != "" {
+		originator := strings.TrimSpace(profile.Originator)
+		headers.Set("Originator", originator)
 	} else if !isAPIKey {
 		headers.Set("Originator", codexOriginator)
 	}
@@ -862,12 +877,15 @@ func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *
 			}
 		}
 	}
-
+	managedHeaderSnapshot := captureManagedHeaderSnapshot(headers, []string{"Version", "X-Codex-Beta-Features", "Originator", "OpenAI-Beta"})
 	var attrs map[string]string
 	if auth != nil {
 		attrs = auth.Attributes
 	}
 	util.ApplyCustomHeadersFromAttrs(&http.Request{Header: headers}, attrs)
+	if cliproxyauth.HasStructuredAccountSettingsMetadata(auth) {
+		applyManagedHeaderSnapshot(headers, managedHeaderSnapshot)
+	}
 
 	return headers
 }
@@ -1089,7 +1107,7 @@ func executionSessionIDFromOptions(opts cliproxyexecutor.Options) string {
 	}
 }
 
-func (e *CodexWebsocketsExecutor) getOrCreateSession(sessionID string) *codexWebsocketSession {
+func (e *CodexWebsocketsExecutor) getOrCreateSession(sessionID string, auth *cliproxyauth.Auth, wsURL string) *codexWebsocketSession {
 	sessionID = strings.TrimSpace(sessionID)
 	if sessionID == "" {
 		return nil
@@ -1106,11 +1124,12 @@ func (e *CodexWebsocketsExecutor) getOrCreateSession(sessionID string) *codexWeb
 	if store.sessions == nil {
 		store.sessions = make(map[string]*codexWebsocketSession)
 	}
-	if sess, ok := store.sessions[sessionID]; ok && sess != nil {
+	storeKey := codexWebsocketSessionStoreKey(sessionID, auth, wsURL)
+	if sess, ok := store.sessions[storeKey]; ok && sess != nil {
 		return sess
 	}
 	sess := &codexWebsocketSession{sessionID: sessionID}
-	store.sessions[sessionID] = sess
+	store.sessions[storeKey] = sess
 	return sess
 }
 
@@ -1267,11 +1286,19 @@ func (e *CodexWebsocketsExecutor) CloseExecutionSession(sessionID string) {
 		store = globalCodexWebsocketSessionStore
 	}
 	store.mu.Lock()
-	sess := store.sessions[sessionID]
-	delete(store.sessions, sessionID)
+	sessions := make([]*codexWebsocketSession, 0, 1)
+	for key, sess := range store.sessions {
+		if sess == nil || sess.sessionID != sessionID {
+			continue
+		}
+		delete(store.sessions, key)
+		sessions = append(sessions, sess)
+	}
 	store.mu.Unlock()
 
-	e.closeExecutionSession(sess, "session_closed")
+	for i := range sessions {
+		e.closeExecutionSession(sessions[i], "session_closed")
+	}
 }
 
 func (e *CodexWebsocketsExecutor) closeAllExecutionSessions(reason string) {
@@ -1329,6 +1356,59 @@ func closeCodexWebsocketSession(sess *codexWebsocketSession, reason string) {
 	if errClose := conn.Close(); errClose != nil {
 		log.Errorf("codex websockets executor: close websocket error: %v", errClose)
 	}
+}
+
+func codexWebsocketSessionStoreKey(sessionID string, auth *cliproxyauth.Auth, wsURL string) string {
+	baseSessionID := strings.TrimSpace(sessionID)
+	if baseSessionID == "" {
+		return ""
+	}
+	return fmt.Sprintf(
+		"%s|%s|%s|%s|%s",
+		baseSessionID,
+		codexWebsocketAuthKey(auth),
+		codexWebsocketProxyURL(auth),
+		strings.TrimSpace(wsURL),
+		codexWebsocketTransportProfileToken(auth),
+	)
+}
+
+func codexWebsocketAuthKey(auth *cliproxyauth.Auth) string {
+	if auth == nil {
+		return "anonymous"
+	}
+	for _, value := range []string{auth.ID, auth.FileName, auth.Label} {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return "anonymous"
+}
+
+func codexWebsocketTransportProfileToken(auth *cliproxyauth.Auth) string {
+	if auth == nil || len(auth.Metadata) == 0 {
+		return ""
+	}
+	accountSettings, ok := auth.Metadata["account_settings"].(map[string]any)
+	if !ok || len(accountSettings) == 0 {
+		return ""
+	}
+	profileRaw, ok := accountSettings["transport_profile"]
+	if !ok || profileRaw == nil {
+		return ""
+	}
+	data, errMarshal := json.Marshal(profileRaw)
+	if errMarshal != nil || len(data) == 0 {
+		return ""
+	}
+	return string(data)
+}
+
+func codexWebsocketProxyURL(auth *cliproxyauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	return strings.TrimSpace(auth.ProxyURL)
 }
 
 func logCodexWebsocketConnected(sessionID string, authID string, wsURL string) {

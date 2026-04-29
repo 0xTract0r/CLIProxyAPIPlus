@@ -704,6 +704,8 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.DELETE("/auth-files", s.mgmt.DeleteAuthFile)
 		mgmt.POST("/auth-files/refresh-status", s.mgmt.RefreshAuthFileStatus)
 		mgmt.PATCH("/auth-files/status", s.mgmt.PatchAuthFileStatus)
+		mgmt.GET("/auth-files/account-settings", s.mgmt.GetAuthFileAccountSettings)
+		mgmt.PATCH("/auth-files/account-settings", s.mgmt.PatchAuthFileAccountSettings)
 		mgmt.PATCH("/auth-files/fields", s.mgmt.PatchAuthFileFields)
 		mgmt.POST("/vertex/import", s.mgmt.ImportVertexCredential)
 

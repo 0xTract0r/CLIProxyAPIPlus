@@ -107,6 +107,56 @@ func TestApplyClaudeHeaders_UsesConfiguredBaselineFingerprint(t *testing.T) {
 	}
 }
 
+func TestApplyClaudeHeaders_StructuredAccountSettingsKeepsManagedHeadersAuthoritative(t *testing.T) {
+	resetClaudeDeviceProfileCache()
+	stabilize := true
+
+	cfg := &config.Config{
+		ClaudeHeaderDefaults: config.ClaudeHeaderDefaults{
+			UserAgent:              "claude-cli/2.9.9 (external, cli)",
+			PackageVersion:         "0.99.0",
+			RuntimeVersion:         "v30.0.0",
+			OS:                     "MacOS",
+			Arch:                   "arm64",
+			Timeout:                "777",
+			StabilizeDeviceProfile: &stabilize,
+		},
+	}
+	auth := &cliproxyauth.Auth{
+		ID: "auth-structured-account-settings",
+		Attributes: map[string]string{
+			"api_key":                            "key-structured-account-settings",
+			"header:User-Agent":                  "legacy-managed-override/0.1",
+			"header:X-Stainless-Package-Version": "legacy-package",
+			"header:X-Extra-Debug":               "enabled",
+		},
+		Metadata: map[string]any{
+			"account_settings": map[string]any{
+				"schema_version": 1,
+				"extra_headers": map[string]any{
+					"X-Extra-Debug": "enabled",
+				},
+			},
+		},
+	}
+
+	req := newClaudeHeaderTestRequest(t, http.Header{})
+	applyClaudeHeaders(req, auth, "key-structured-account-settings", false, nil, cfg)
+
+	if got := req.Header.Get("User-Agent"); got != "claude-cli/2.9.9 (external, cli)" {
+		t.Fatalf("User-Agent = %q, want %q", got, "claude-cli/2.9.9 (external, cli)")
+	}
+	if got := req.Header.Get("X-Stainless-Package-Version"); got != "0.99.0" {
+		t.Fatalf("X-Stainless-Package-Version = %q, want %q", got, "0.99.0")
+	}
+	if got := req.Header.Get("X-Stainless-Timeout"); got != "777" {
+		t.Fatalf("X-Stainless-Timeout = %q, want %q", got, "777")
+	}
+	if got := req.Header.Get("X-Extra-Debug"); got != "enabled" {
+		t.Fatalf("X-Extra-Debug = %q, want %q", got, "enabled")
+	}
+}
+
 func TestApplyClaudeHeaders_TracksHighestClaudeCLIFingerprint(t *testing.T) {
 	resetClaudeDeviceProfileCache()
 	stabilize := true

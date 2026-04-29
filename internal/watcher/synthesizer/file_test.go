@@ -260,6 +260,9 @@ func TestFileSynthesizer_Synthesize_RelativeID(t *testing.T) {
 	if auths[0].ID != "my-auth.json" {
 		t.Errorf("expected ID my-auth.json, got %s", auths[0].ID)
 	}
+	if auths[0].FileName != "my-auth.json" {
+		t.Errorf("expected FileName my-auth.json, got %s", auths[0].FileName)
+	}
 }
 
 func TestFileSynthesizer_Synthesize_PrefixValidation(t *testing.T) {

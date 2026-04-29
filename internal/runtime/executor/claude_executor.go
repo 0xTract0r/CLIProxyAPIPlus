@@ -105,8 +105,9 @@ func (e *ClaudeExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Au
 		req.Header.Del("x-api-key")
 		req.Header.Set("Authorization", "Bearer "+apiKey)
 	}
+	managedHeaderSnapshot := captureManagedHeaderSnapshot(req.Header, claudeManagedHeaderNames)
 	util.ApplyCustomHeadersFromAttrs(req, authAttrs(auth))
-	applyClaudeManagedHeaders(req, auth)
+	applyClaudeManagedHeaders(req, auth, managedHeaderSnapshot)
 	return nil
 }
 
@@ -900,8 +901,12 @@ var claudeManagedHeaderNames = []string{
 	"X-Stainless-Timeout",
 }
 
-func applyClaudeManagedHeaders(r *http.Request, auth *cliproxyauth.Auth) {
+func applyClaudeManagedHeaders(r *http.Request, auth *cliproxyauth.Auth, snapshot map[string]string) {
 	if r == nil || auth == nil {
+		return
+	}
+	if cliproxyauth.HasStructuredAccountSettingsMetadata(auth) {
+		applyManagedHeaderSnapshot(r.Header, snapshot)
 		return
 	}
 	for _, headerName := range claudeManagedHeaderNames {
@@ -1067,8 +1072,9 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 	} else {
 		helps.ApplyClaudeLegacyDeviceHeaders(r, ginHeaders, cfg)
 	}
+	managedHeaderSnapshot := captureManagedHeaderSnapshot(r.Header, claudeManagedHeaderNames)
 	util.ApplyCustomHeadersFromAttrs(r, authAttrs(auth))
-	applyClaudeManagedHeaders(r, auth)
+	applyClaudeManagedHeaders(r, auth, managedHeaderSnapshot)
 	if stream {
 		r.Header.Set("Accept-Encoding", "identity")
 	}
