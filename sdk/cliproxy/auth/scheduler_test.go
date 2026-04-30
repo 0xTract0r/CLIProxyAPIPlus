@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"testing"
 	"time"
@@ -525,5 +526,178 @@ func TestManager_SchedulerTracksMarkResultCooldownAndRecovery(t *testing.T) {
 	}
 	if len(seen) != 2 {
 		t.Fatalf("len(seen) = %d, want %d", len(seen), 2)
+	}
+}
+
+// TestManager_MarkResult_429_NoRetryAfter_TreatedAsTransient verifies that a 429
+// without an upstream RetryAfter hint is classified as a transient rate-limit
+// (model capacity / TPM burst) instead of a plan-level quota exhaustion: the
+// model state's Quota.Exceeded must remain false, and NextRetryAfter must fall
+// in a brief cooldown window around now+transientRateLimitCooldown.
+func TestManager_MarkResult_429_NoRetryAfter_TreatedAsTransient(t *testing.T) {
+	t.Parallel()
+
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient("transient-auth", "gemini", []*registry.ModelInfo{{ID: "transient-model"}})
+	t.Cleanup(func() {
+		reg.UnregisterClient("transient-auth")
+	})
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "transient-auth", Provider: "gemini"}); errRegister != nil {
+		t.Fatalf("Register(transient-auth) error = %v", errRegister)
+	}
+
+	before := time.Now()
+	manager.MarkResult(context.Background(), Result{
+		AuthID:   "transient-auth",
+		Provider: "gemini",
+		Model:    "transient-model",
+		Success:  false,
+		Error:    &Error{HTTPStatus: http.StatusTooManyRequests, Message: "rate_limit"},
+	})
+	after := time.Now()
+
+	got, ok := manager.GetByID("transient-auth")
+	if !ok || got == nil {
+		t.Fatalf("GetByID(transient-auth) = (%v, %v), want auth", got, ok)
+	}
+	state, exists := got.ModelStates["transient-model"]
+	if !exists || state == nil {
+		t.Fatalf("ModelStates[transient-model] = (%v, %v), want state", state, exists)
+	}
+	if state.Quota.Exceeded {
+		t.Fatalf("Quota.Exceeded = true, want false (transient 429 must not flip plan-level quota)")
+	}
+	expectedMin := before.Add(transientRateLimitCooldown).Add(-5 * time.Second)
+	expectedMax := after.Add(transientRateLimitCooldown).Add(5 * time.Second)
+	if state.NextRetryAfter.Before(expectedMin) || state.NextRetryAfter.After(expectedMax) {
+		t.Fatalf("NextRetryAfter = %v, want within [%v, %v]", state.NextRetryAfter, expectedMin, expectedMax)
+	}
+}
+
+// TestManager_AfterTransient429AllAuths_RecoversWithinShortWindow simulates the
+// production bug we just patched: a single client request fans out across N
+// auths under the same provider/model and every upstream call returns 429 with
+// no RetryAfter (the canonical transient signature).
+//
+// Pre-fix: each auth would be classified as plan-quota, Quota.Exceeded would
+// flip to true, and once all N were tagged, the selector raised
+// *modelCooldownError, surfacing 429 model_cooldown to the user even though
+// upstream had only exhibited a brief TPM/capacity burst.
+//
+// Post-fix: every state must keep Quota.Exceeded == false (no plan-quota
+// false-positive), and the pool must be merely "auth_unavailable" for a short
+// window (~transientRateLimitCooldown == 1 minute), recovering as soon as the
+// per-state NextRetryAfter elapses.
+func TestManager_AfterTransient429AllAuths_RecoversWithinShortWindow(t *testing.T) {
+	t.Parallel()
+
+	provider := "gemini"
+	model := "transient-pool-model"
+	authIDs := []string{"transient-pool-a", "transient-pool-b", "transient-pool-c"}
+
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	registerSchedulerModels(t, provider, model, authIDs...)
+	for _, id := range authIDs {
+		if _, errRegister := manager.Register(context.Background(), &Auth{ID: id, Provider: provider}); errRegister != nil {
+			t.Fatalf("Register(%s) error = %v", id, errRegister)
+		}
+	}
+
+	// Fan-out 429 with nil RetryAfter on every auth (mimics conductor's
+	// inner per-auth retry loop hitting transient rate-limits across the pool).
+	for _, id := range authIDs {
+		manager.MarkResult(context.Background(), Result{
+			AuthID:   id,
+			Provider: provider,
+			Model:    model,
+			Success:  false,
+			Error:    &Error{HTTPStatus: http.StatusTooManyRequests, Message: "rate_limit"},
+		})
+	}
+
+	// (a) plan-quota must NOT be flipped on any auth.
+	for _, id := range authIDs {
+		got, ok := manager.GetByID(id)
+		if !ok || got == nil {
+			t.Fatalf("GetByID(%s) = (%v, %v), want auth", id, got, ok)
+		}
+		state, exists := got.ModelStates[model]
+		if !exists || state == nil {
+			t.Fatalf("%s: ModelStates[%s] missing, want state", id, model)
+		}
+		if state.Quota.Exceeded {
+			t.Fatalf("%s: Quota.Exceeded = true, want false (transient must not flip plan-quota)", id)
+		}
+		if state.Quota.Reason != "transient" {
+			t.Fatalf("%s: Quota.Reason = %q, want %q", id, state.Quota.Reason, "transient")
+		}
+	}
+
+	// (b) within the cooldown window, the entire pool is unavailable but NOT
+	// classified as model_cooldown (because Quota.Exceeded is false on every
+	// state, so the cooldownCount path in getAvailableAuths is not triggered).
+	got, errPick := manager.scheduler.pickSingle(context.Background(), provider, model, cliproxyexecutor.Options{}, nil)
+	if got != nil {
+		t.Fatalf("pickSingle() during transient window auth = %v, want nil", got)
+	}
+	var cooldownErr *modelCooldownError
+	if errors.As(errPick, &cooldownErr) {
+		t.Fatalf("pickSingle() during transient window error = %T (model_cooldown), want non-cooldown auth_unavailable", errPick)
+	}
+	var authErr *Error
+	if !errors.As(errPick, &authErr) {
+		t.Fatalf("pickSingle() during transient window error = %v, want *Error", errPick)
+	}
+	if authErr.Code != "auth_unavailable" {
+		t.Fatalf("pickSingle() during transient window error.Code = %q, want %q", authErr.Code, "auth_unavailable")
+	}
+
+	// (c) simulate the transient cooldown elapsing by rewinding each state's
+	// NextRetryAfter into the past. We mutate the manager's internal auth
+	// pointers (same package access) and re-publish the snapshots into the
+	// scheduler so the scheduledAuth's cached nextRetryAt is also rewound;
+	// this mirrors how the conductor itself propagates state updates without
+	// sleeping in tests.
+	pastTime := time.Now().Add(-1 * time.Second)
+	manager.mu.Lock()
+	for _, id := range authIDs {
+		auth, ok := manager.auths[id]
+		if !ok || auth == nil {
+			manager.mu.Unlock()
+			t.Fatalf("manager.auths[%s] missing, want present", id)
+		}
+		state := auth.ModelStates[model]
+		state.NextRetryAfter = pastTime
+		state.Quota.NextRecoverAt = pastTime
+		auth.NextRetryAfter = pastTime
+		auth.Quota.NextRecoverAt = pastTime
+	}
+	snapshots := make([]*Auth, 0, len(authIDs))
+	for _, id := range authIDs {
+		snapshots = append(snapshots, manager.auths[id].Clone())
+	}
+	manager.mu.Unlock()
+	for _, snapshot := range snapshots {
+		manager.scheduler.upsertAuth(snapshot)
+	}
+
+	// After the window, the pool recovers without manual intervention.
+	got, errPick = manager.scheduler.pickSingle(context.Background(), provider, model, cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle() after transient window error = %v, want nil", errPick)
+	}
+	if got == nil {
+		t.Fatalf("pickSingle() after transient window auth = nil, want one of %v", authIDs)
+	}
+	matched := false
+	for _, id := range authIDs {
+		if got.ID == id {
+			matched = true
+			break
+		}
+	}
+	if !matched {
+		t.Fatalf("pickSingle() after transient window auth.ID = %q, want one of %v", got.ID, authIDs)
 	}
 }

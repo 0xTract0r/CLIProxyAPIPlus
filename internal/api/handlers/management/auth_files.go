@@ -1372,6 +1372,25 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 	} else {
 		targetAuth.Status = coreauth.StatusActive
 		targetAuth.StatusMessage = ""
+		// Re-enabling via management API must clear in-memory cooldown so the
+		// auth becomes immediately selectable; otherwise prior 429-driven
+		// ModelStates.Quota would keep the selector returning model_cooldown.
+		targetAuth.Unavailable = false
+		targetAuth.NextRetryAfter = time.Time{}
+		targetAuth.Quota = coreauth.QuotaState{}
+		targetAuth.LastError = nil
+		for _, ms := range targetAuth.ModelStates {
+			if ms == nil {
+				continue
+			}
+			ms.Unavailable = false
+			ms.NextRetryAfter = time.Time{}
+			ms.Quota = coreauth.QuotaState{}
+			ms.LastError = nil
+			if ms.Status == coreauth.StatusError {
+				ms.Status = coreauth.StatusActive
+			}
+		}
 	}
 	targetAuth.UpdatedAt = time.Now()
 
