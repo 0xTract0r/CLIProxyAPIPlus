@@ -5,7 +5,6 @@ package executor
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -840,6 +839,7 @@ func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *
 	} else {
 		misc.EnsureHeader(headers, ginHeaders, "Version", "")
 	}
+	applyCodexCommunityDesktopHeaders(headers, profile)
 
 	betaHeader := strings.TrimSpace(headers.Get("OpenAI-Beta"))
 	if betaHeader == "" && ginHeaders != nil {
@@ -866,7 +866,7 @@ func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *
 		originator := strings.TrimSpace(profile.Originator)
 		headers.Set("Originator", originator)
 	} else if !isAPIKey {
-		headers.Set("Originator", codexOriginator)
+		headers.Set("Originator", helps.DefaultCodexManagedOriginator())
 	}
 	if !isAPIKey {
 		if auth != nil && auth.Metadata != nil {
@@ -877,7 +877,20 @@ func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *
 			}
 		}
 	}
-	managedHeaderSnapshot := captureManagedHeaderSnapshot(headers, []string{"Version", "X-Codex-Beta-Features", "Originator", "OpenAI-Beta"})
+	managedHeaderSnapshot := captureManagedHeaderSnapshot(headers, []string{
+		"Version",
+		"X-Codex-Beta-Features",
+		"Originator",
+		"OpenAI-Beta",
+		"sec-ch-ua",
+		"sec-ch-ua-mobile",
+		"sec-ch-ua-platform",
+		"Accept-Encoding",
+		"Accept-Language",
+		"sec-fetch-site",
+		"sec-fetch-mode",
+		"sec-fetch-dest",
+	})
 	var attrs map[string]string
 	if auth != nil {
 		attrs = auth.Attributes
@@ -1124,7 +1137,7 @@ func (e *CodexWebsocketsExecutor) getOrCreateSession(sessionID string, auth *cli
 	if store.sessions == nil {
 		store.sessions = make(map[string]*codexWebsocketSession)
 	}
-	storeKey := codexWebsocketSessionStoreKey(sessionID, auth, wsURL)
+	storeKey := codexWebsocketSessionStoreKey(sessionID, auth, wsURL, codexWebsocketEffectiveProxyURL(e.cfg, auth))
 	if sess, ok := store.sessions[storeKey]; ok && sess != nil {
 		return sess
 	}
@@ -1358,16 +1371,22 @@ func closeCodexWebsocketSession(sess *codexWebsocketSession, reason string) {
 	}
 }
 
-func codexWebsocketSessionStoreKey(sessionID string, auth *cliproxyauth.Auth, wsURL string) string {
+func codexWebsocketSessionStoreKey(sessionID string, auth *cliproxyauth.Auth, wsURL string, proxyURLOverride ...string) string {
 	baseSessionID := strings.TrimSpace(sessionID)
 	if baseSessionID == "" {
 		return ""
+	}
+	proxyURL := ""
+	if len(proxyURLOverride) > 0 {
+		proxyURL = strings.TrimSpace(proxyURLOverride[0])
+	} else if auth != nil {
+		proxyURL = strings.TrimSpace(auth.ProxyURL)
 	}
 	return fmt.Sprintf(
 		"%s|%s|%s|%s|%s",
 		baseSessionID,
 		codexWebsocketAuthKey(auth),
-		codexWebsocketProxyURL(auth),
+		proxyURL,
 		strings.TrimSpace(wsURL),
 		codexWebsocketTransportProfileToken(auth),
 	)
@@ -1386,29 +1405,19 @@ func codexWebsocketAuthKey(auth *cliproxyauth.Auth) string {
 }
 
 func codexWebsocketTransportProfileToken(auth *cliproxyauth.Auth) string {
-	if auth == nil || len(auth.Metadata) == 0 {
-		return ""
-	}
-	accountSettings, ok := auth.Metadata["account_settings"].(map[string]any)
-	if !ok || len(accountSettings) == 0 {
-		return ""
-	}
-	profileRaw, ok := accountSettings["transport_profile"]
-	if !ok || profileRaw == nil {
-		return ""
-	}
-	data, errMarshal := json.Marshal(profileRaw)
-	if errMarshal != nil || len(data) == 0 {
-		return ""
-	}
-	return string(data)
+	return helps.RuntimeTransportProfileToken(auth)
 }
 
-func codexWebsocketProxyURL(auth *cliproxyauth.Auth) string {
-	if auth == nil {
-		return ""
+func codexWebsocketEffectiveProxyURL(cfg *config.Config, auth *cliproxyauth.Auth) string {
+	if auth != nil {
+		if proxyURL := strings.TrimSpace(auth.ProxyURL); proxyURL != "" {
+			return proxyURL
+		}
 	}
-	return strings.TrimSpace(auth.ProxyURL)
+	if cfg != nil {
+		return strings.TrimSpace(cfg.ProxyURL)
+	}
+	return ""
 }
 
 func logCodexWebsocketConnected(sessionID string, authID string, wsURL string) {

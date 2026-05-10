@@ -24,6 +24,7 @@ type utlsRoundTripper struct {
 	pending     map[string]*sync.Cond
 	dialer      proxy.Dialer
 	clientHello tls.ClientHelloID
+	insecure    bool
 }
 
 func newUtlsRoundTripper(proxyURL string, clientHello tls.ClientHelloID) *utlsRoundTripper {
@@ -41,6 +42,19 @@ func newUtlsRoundTripper(proxyURL string, clientHello tls.ClientHelloID) *utlsRo
 		pending:     make(map[string]*sync.Cond),
 		dialer:      dialer,
 		clientHello: clientHello,
+	}
+}
+
+func newDiagnosticUtlsRoundTripper(dialer proxy.Dialer, clientHello tls.ClientHelloID) *utlsRoundTripper {
+	if dialer == nil {
+		dialer = proxy.Direct
+	}
+	return &utlsRoundTripper{
+		connections: make(map[string]*http2.ClientConn),
+		pending:     make(map[string]*sync.Cond),
+		dialer:      dialer,
+		clientHello: clientHello,
+		insecure:    true,
 	}
 }
 
@@ -86,7 +100,7 @@ func (t *utlsRoundTripper) createConnection(host, addr string) (*http2.ClientCon
 		return nil, err
 	}
 
-	tlsConfig := &tls.Config{ServerName: host}
+	tlsConfig := &tls.Config{ServerName: host, InsecureSkipVerify: t.insecure}
 	clientHello := t.clientHello
 	if !clientHello.IsSet() {
 		clientHello = tls.HelloChrome_133
@@ -155,17 +169,18 @@ func (f *fallbackRoundTripper) RoundTrip(req *http.Request) (*http.Response, err
 	return f.fallback.RoundTrip(req)
 }
 
-// NewUtlsHTTPClient creates an HTTP client using utls Chrome TLS fingerprint.
-// Use this for Claude API requests to match real Claude Code's TLS behavior.
-// Falls back to standard transport for non-HTTPS requests.
+// NewUtlsHTTPClient creates an HTTP client using a Chrome-like uTLS preset for
+// Anthropic API hosts. This is a project-managed preset, not an official Claude
+// Code TLS fingerprint or provider-edge parity claim. Falls back to standard
+// transport for non-HTTPS requests.
 func NewUtlsHTTPClient(cfg *config.Config, auth *cliproxyauth.Auth, timeout time.Duration) *http.Client {
-	return NewUtlsHTTPClientForProfile(cfg, auth, timeout, "provider-default")
+	return NewUtlsHTTPClientForProfile(cfg, auth, timeout, "claude_utls_chrome_133")
 }
 
 func NewUtlsRoundTripperForProfile(proxyURL string, profileID string) http.RoundTripper {
 	clientHello, ok := resolveClaudeClientHelloID(profileID)
 	if !ok {
-		clientHello, _ = resolveClaudeClientHelloID("provider-default")
+		clientHello, _ = resolveClaudeClientHelloID("claude_utls_chrome_133")
 	}
 	return &fallbackRoundTripper{
 		utls:     newUtlsRoundTripper(proxyURL, clientHello),
@@ -208,7 +223,7 @@ func standardTransportForProxy(proxyURL string) http.RoundTripper {
 
 func resolveClaudeClientHelloID(profileID string) (tls.ClientHelloID, bool) {
 	switch strings.ToLower(strings.TrimSpace(profileID)) {
-	case "", "provider-default", "claude_chrome_like_mac_v3", "chrome_133":
+	case "claude_utls_chrome_133", "claude_chrome_like_mac_v3", "chrome_133":
 		return tls.HelloChrome_133, true
 	case "claude_chrome_like_mac_v1", "chrome_120":
 		return tls.HelloChrome_120, true

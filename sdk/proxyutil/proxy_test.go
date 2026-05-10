@@ -1,6 +1,8 @@
 package proxyutil
 
 import (
+	"context"
+	"errors"
 	"net/http"
 	"testing"
 )
@@ -13,6 +15,26 @@ func mustDefaultTransport(t *testing.T) *http.Transport {
 		t.Fatal("http.DefaultTransport is not an *http.Transport")
 	}
 	return transport
+}
+
+func TestBuildHTTPTransportSOCKS5DialContextHonorsCancelledContext(t *testing.T) {
+	transport, mode, err := BuildHTTPTransport("socks5://127.0.0.1:1")
+	if err != nil {
+		t.Fatalf("BuildHTTPTransport returned error: %v", err)
+	}
+	if mode != ModeProxy {
+		t.Fatalf("mode = %v, want %v", mode, ModeProxy)
+	}
+	if transport == nil || transport.DialContext == nil {
+		t.Fatalf("expected transport with DialContext")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err = transport.DialContext(ctx, "tcp", "api.anthropic.com:443")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("DialContext error = %v, want context canceled", err)
+	}
 }
 
 func TestParse(t *testing.T) {

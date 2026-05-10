@@ -12,17 +12,19 @@ import (
 )
 
 const (
-	defaultCodexManagedOriginator  = "codex-tui"
-	defaultCodexManagedVersion     = "0.124.0"
-	defaultCodexManagedPlatform    = "Mac OS 26.3.1; arm64"
-	defaultCodexManagedTerminal    = "iTerm.app/3.6.9"
+	defaultCodexManagedOriginator  = "Codex Desktop"
+	defaultCodexManagedVersion     = "26.318.11754"
+	defaultCodexManagedPlatform    = "darwin; arm64"
+	defaultCodexManagedTerminal    = ""
+	defaultCodexManagedChromium    = "144"
 	codexClientProfileCacheTTL     = 7 * 24 * time.Hour
 	codexClientProfileCleanupEvery = time.Hour
 )
 
 var (
-	codexUserAgentVersionPattern = regexp.MustCompile(`^([A-Za-z0-9_.:-]+)/([^\s]+)`)
+	codexUserAgentVersionPattern = regexp.MustCompile(`^([A-Za-z0-9_.: -]+)/([^\s]+)`)
 	codexNumericVersionPattern   = regexp.MustCompile(`\d+`)
+	codexTailVersionPattern      = regexp.MustCompile(`\(([^;()]+);\s*([^)]+)\)`)
 
 	codexClientProfileCache            = make(map[string]codexClientProfileCacheEntry)
 	codexClientProfileCacheMu          sync.RWMutex
@@ -44,6 +46,16 @@ type CodexClientProfile struct {
 	UserAgentVersion string
 	PlatformToken    string
 	TailToken        string
+	ChromiumVersion  string
+	SecCHUA          string
+	SecCHUAMobile    string
+	SecCHUAPlatform  string
+	AcceptEncoding   string
+	AcceptLanguage   string
+	SecFetchSite     string
+	SecFetchMode     string
+	SecFetchDest     string
+	Source           ManagedHeaderProfileSource
 	version          codexVersionMarker
 }
 
@@ -65,7 +77,7 @@ func DefaultCodexManagedUserAgent() string {
 		defaultCodexManagedOriginator,
 		defaultCodexManagedVersion,
 		defaultCodexManagedPlatform,
-		defaultCodexManagedTerminal+" ("+defaultCodexManagedOriginator+"; "+defaultCodexManagedVersion+")",
+		defaultCodexManagedTerminal,
 	)
 }
 
@@ -74,6 +86,9 @@ func ResolveCodexClientProfile(auth *cliproxyauth.Auth, headers http.Header, cfg
 
 	now := time.Now()
 	defaultProfile := defaultCodexClientProfile(cfg)
+	if defaultProfile.isCodexDesktopLike() && !codexHeaderDefaultsUserAgentOverridden(cfg) {
+		return defaultProfile
+	}
 	persistedProfile, hasPersisted := codexClientProfileFromAuth(auth, cfg)
 
 	current := defaultProfile
@@ -119,6 +134,21 @@ func ResolveCodexClientProfile(auth *cliproxyauth.Auth, headers http.Header, cfg
 		codexClientProfileCacheMu.Unlock()
 	}
 
+	if online, ok := resolveManagedHeaderOnlineVersion("codex", cfg); ok && !current.isCodexDesktopLike() {
+		candidate := current
+		candidate.Version = online.Version
+		candidate.UserAgentVersion = online.Version
+		candidate.Source = online.ManagedHeaderProfileSource
+		candidate.UserAgent = buildCodexUserAgent(
+			candidate.UserAgentProduct,
+			candidate.UserAgentVersion,
+			candidate.PlatformToken,
+			candidate.TailToken,
+		)
+		candidate.version = parseCodexVersion(candidate.Version)
+		current = bumpCodexVersionMarkers(candidate, current)
+	}
+
 	return normalizeCodexClientProfile(current, defaultProfile)
 }
 
@@ -133,6 +163,30 @@ func CodexManagedHeaders(profile CodexClientProfile) map[string]string {
 	if strings.TrimSpace(profile.BetaFeatures) != "" {
 		headers["X-Codex-Beta-Features"] = strings.TrimSpace(profile.BetaFeatures)
 	}
+	if strings.TrimSpace(profile.SecCHUA) != "" {
+		headers["sec-ch-ua"] = strings.TrimSpace(profile.SecCHUA)
+	}
+	if strings.TrimSpace(profile.SecCHUAMobile) != "" {
+		headers["sec-ch-ua-mobile"] = strings.TrimSpace(profile.SecCHUAMobile)
+	}
+	if strings.TrimSpace(profile.SecCHUAPlatform) != "" {
+		headers["sec-ch-ua-platform"] = strings.TrimSpace(profile.SecCHUAPlatform)
+	}
+	if strings.TrimSpace(profile.AcceptEncoding) != "" {
+		headers["Accept-Encoding"] = strings.TrimSpace(profile.AcceptEncoding)
+	}
+	if strings.TrimSpace(profile.AcceptLanguage) != "" {
+		headers["Accept-Language"] = strings.TrimSpace(profile.AcceptLanguage)
+	}
+	if strings.TrimSpace(profile.SecFetchSite) != "" {
+		headers["sec-fetch-site"] = strings.TrimSpace(profile.SecFetchSite)
+	}
+	if strings.TrimSpace(profile.SecFetchMode) != "" {
+		headers["sec-fetch-mode"] = strings.TrimSpace(profile.SecFetchMode)
+	}
+	if strings.TrimSpace(profile.SecFetchDest) != "" {
+		headers["sec-fetch-dest"] = strings.TrimSpace(profile.SecFetchDest)
+	}
 	return normalizeHeaderMap(headers)
 }
 
@@ -146,7 +200,13 @@ func CodexManagedVersionedCapabilities(profile CodexClientProfile) map[string]st
 
 func CodexManagedStableIdentity(profile CodexClientProfile) map[string]string {
 	return normalizeHeaderMap(map[string]string{
-		"Originator": profile.Originator,
+		"Originator":         profile.Originator,
+		"sec-ch-ua":          profile.SecCHUA,
+		"sec-ch-ua-mobile":   profile.SecCHUAMobile,
+		"sec-ch-ua-platform": profile.SecCHUAPlatform,
+		"sec-fetch-site":     profile.SecFetchSite,
+		"sec-fetch-mode":     profile.SecFetchMode,
+		"sec-fetch-dest":     profile.SecFetchDest,
 	})
 }
 
@@ -162,7 +222,10 @@ func codexClientProfileFromAuth(auth *cliproxyauth.Auth, cfg *config.Config) (Co
 		return CodexClientProfile{}, false
 	}
 
-	profile := defaultCodexClientProfile(cfg)
+	defaultProfile := defaultCodexClientProfile(cfg)
+	profile := CodexClientProfile{
+		BetaFeatures: cfgCodexBetaFeatures(cfg),
+	}
 	headers := normalizeHeaderMap(cliproxyauth.ExtractCustomHeadersFromMetadata(auth.Metadata))
 	if len(headers) == 0 && auth.Attributes != nil && !cliproxyauth.HasStructuredAccountSettingsMetadata(auth) {
 		headers = normalizeHeaderMap(map[string]string{
@@ -173,7 +236,7 @@ func codexClientProfileFromAuth(auth *cliproxyauth.Auth, cfg *config.Config) (Co
 		})
 	}
 	if len(headers) == 0 {
-		return profile, false
+		return defaultProfile, false
 	}
 	if userAgent := strings.TrimSpace(headers["User-Agent"]); userAgent != "" {
 		profile.UserAgent = userAgent
@@ -187,7 +250,7 @@ func codexClientProfileFromAuth(auth *cliproxyauth.Auth, cfg *config.Config) (Co
 	if betaFeatures := strings.TrimSpace(headers["X-Codex-Beta-Features"]); betaFeatures != "" {
 		profile.BetaFeatures = betaFeatures
 	}
-	return normalizeCodexClientProfile(profile, defaultCodexClientProfile(cfg)), true
+	return normalizeCodexClientProfile(profile, defaultProfile), true
 }
 
 func defaultCodexClientProfile(cfg *config.Config) CodexClientProfile {
@@ -203,8 +266,105 @@ func defaultCodexClientProfile(cfg *config.Config) CodexClientProfile {
 		UserAgent:    userAgent,
 		BetaFeatures: betaFeatures,
 		Originator:   defaultCodexManagedOriginator,
+		Source:       codexProxyManagedHeaderProfileSource(),
 	}
-	return normalizeCodexClientProfile(profile, CodexClientProfile{})
+	profile = normalizeCodexClientProfile(profile, CodexClientProfile{})
+	if online, ok := resolveManagedHeaderOnlineVersion("codex", cfg); ok {
+		if online.CodexProxyBundle != nil {
+			candidate := codexProfileFromProxyBundle(profile, *online.CodexProxyBundle, online.ManagedHeaderProfileSource)
+			if candidate.version.valid && (!profile.version.valid || candidate.version.Compare(profile.version) >= 0) {
+				profile = candidate
+			}
+		} else if !profile.isCodexDesktopLike() {
+			candidate := profile
+			candidate.Version = online.Version
+			candidate.UserAgentVersion = online.Version
+			candidate.Source = online.ManagedHeaderProfileSource
+			candidate.UserAgent = buildCodexUserAgent(
+				candidate.UserAgentProduct,
+				candidate.UserAgentVersion,
+				candidate.PlatformToken,
+				candidate.TailToken,
+			)
+			candidate.version = parseCodexVersion(candidate.Version)
+			if candidate.version.valid && (!profile.version.valid || candidate.version.Compare(profile.version) > 0) {
+				profile = candidate
+			}
+		}
+	}
+	return profile
+}
+
+func codexProfileFromProxyBundle(current CodexClientProfile, bundle CodexProxyManagedHeaderBundle, source ManagedHeaderProfileSource) CodexClientProfile {
+	profile := current
+	originator := firstNonEmptyString(bundle.Originator, profile.Originator, defaultCodexManagedOriginator)
+	version := firstNonEmptyString(bundle.AppVersion, profile.Version, defaultCodexManagedVersion)
+	platform := codexProxyPlatformToken(bundle, profile.PlatformToken)
+	chromium := firstNonEmptyString(bundle.ChromiumVersion, profile.ChromiumVersion, defaultCodexManagedChromium)
+
+	profile.Originator = originator
+	profile.UserAgentProduct = originator
+	profile.Version = version
+	profile.UserAgentVersion = version
+	profile.PlatformToken = platform
+	profile.TailToken = ""
+	profile.ChromiumVersion = chromium
+	profile.SecCHUA = firstNonEmptyString(bundle.DefaultHeaders["sec-ch-ua"], buildCodexSecCHUA(chromium))
+	profile.SecCHUAMobile = firstNonEmptyString(bundle.DefaultHeaders["sec-ch-ua-mobile"], "?0")
+	profile.SecCHUAPlatform = firstNonEmptyString(bundle.DefaultHeaders["sec-ch-ua-platform"], `"macOS"`)
+	profile.AcceptEncoding = firstNonEmptyString(bundle.DefaultHeaders["Accept-Encoding"], "gzip, deflate, br, zstd")
+	profile.AcceptLanguage = firstNonEmptyString(bundle.DefaultHeaders["Accept-Language"], "en-US,en;q=0.9")
+	profile.SecFetchSite = firstNonEmptyString(bundle.DefaultHeaders["sec-fetch-site"], "same-origin")
+	profile.SecFetchMode = firstNonEmptyString(bundle.DefaultHeaders["sec-fetch-mode"], "cors")
+	profile.SecFetchDest = firstNonEmptyString(bundle.DefaultHeaders["sec-fetch-dest"], "empty")
+	profile.Source = withManagedHeaderProfileSource(source, codexProxyManagedHeaderProfileSource())
+	profile.UserAgent = buildCodexProxyUserAgent(bundle, originator, version, platform)
+	profile.version = parseCodexVersion(version)
+	return normalizeCodexClientProfile(profile, current)
+}
+
+func codexProxyPlatformToken(bundle CodexProxyManagedHeaderBundle, fallback string) string {
+	platform := strings.TrimSpace(bundle.Platform)
+	arch := strings.TrimSpace(bundle.Arch)
+	switch {
+	case platform != "" && arch != "":
+		return platform + "; " + arch
+	case platform != "":
+		return platform
+	case fallback != "":
+		return fallback
+	default:
+		return defaultCodexManagedPlatform
+	}
+}
+
+func buildCodexProxyUserAgent(bundle CodexProxyManagedHeaderBundle, originator string, version string, platform string) string {
+	template := strings.TrimSpace(bundle.UserAgentTemplate)
+	if template == "" {
+		return buildCodexUserAgent(originator, version, platform, "")
+	}
+	replacements := map[string]string{
+		"{originator}":         originator,
+		"{app_version}":        version,
+		"{version}":            version,
+		"{platform}":           platform,
+		"{arch}":               strings.TrimSpace(bundle.Arch),
+		"{chromium_version}":   strings.TrimSpace(bundle.ChromiumVersion),
+		"{{originator}}":       originator,
+		"{{app_version}}":      version,
+		"{{version}}":          version,
+		"{{platform}}":         platform,
+		"{{arch}}":             strings.TrimSpace(bundle.Arch),
+		"{{chromium_version}}": strings.TrimSpace(bundle.ChromiumVersion),
+	}
+	userAgent := template
+	for key, value := range replacements {
+		userAgent = strings.ReplaceAll(userAgent, key, value)
+	}
+	if strings.Contains(userAgent, "{") || !strings.Contains(userAgent, "/") {
+		return buildCodexUserAgent(originator, version, platform, "")
+	}
+	return userAgent
 }
 
 func normalizeCodexClientProfile(profile CodexClientProfile, baseline CodexClientProfile) CodexClientProfile {
@@ -244,9 +404,41 @@ func normalizeCodexClientProfile(profile CodexClientProfile, baseline CodexClien
 	if strings.TrimSpace(profile.TailToken) == "" && originalUserAgent == "" {
 		profile.TailToken = firstNonEmptyString(baseline.TailToken, defaultCodexManagedTerminal)
 	}
+	profile = alignCodexFirstPartyIdentity(profile)
+	if profile.isCodexDesktopLike() {
+		if strings.TrimSpace(profile.ChromiumVersion) == "" {
+			profile.ChromiumVersion = firstNonEmptyString(baseline.ChromiumVersion, defaultCodexManagedChromium)
+		}
+		if strings.TrimSpace(profile.SecCHUA) == "" {
+			profile.SecCHUA = firstNonEmptyString(baseline.SecCHUA, buildCodexSecCHUA(profile.ChromiumVersion))
+		}
+		if strings.TrimSpace(profile.SecCHUAMobile) == "" {
+			profile.SecCHUAMobile = firstNonEmptyString(baseline.SecCHUAMobile, "?0")
+		}
+		if strings.TrimSpace(profile.SecCHUAPlatform) == "" {
+			profile.SecCHUAPlatform = firstNonEmptyString(baseline.SecCHUAPlatform, `"macOS"`)
+		}
+		if strings.TrimSpace(profile.AcceptEncoding) == "" {
+			profile.AcceptEncoding = firstNonEmptyString(baseline.AcceptEncoding, "gzip, deflate, br, zstd")
+		}
+		if strings.TrimSpace(profile.AcceptLanguage) == "" {
+			profile.AcceptLanguage = firstNonEmptyString(baseline.AcceptLanguage, "en-US,en;q=0.9")
+		}
+		if strings.TrimSpace(profile.SecFetchSite) == "" {
+			profile.SecFetchSite = firstNonEmptyString(baseline.SecFetchSite, "same-origin")
+		}
+		if strings.TrimSpace(profile.SecFetchMode) == "" {
+			profile.SecFetchMode = firstNonEmptyString(baseline.SecFetchMode, "cors")
+		}
+		if strings.TrimSpace(profile.SecFetchDest) == "" {
+			profile.SecFetchDest = firstNonEmptyString(baseline.SecFetchDest, "empty")
+		}
+	}
+	profile.TailToken = bumpCodexTailVersionMarker(profile.TailToken, profile.UserAgentProduct, profile.Version)
 	if strings.TrimSpace(profile.BetaFeatures) == "" {
 		profile.BetaFeatures = baseline.BetaFeatures
 	}
+	profile.Source = withManagedHeaderProfileSource(profile.Source, baseline.Source)
 
 	if originalUserAgent != "" && strings.TrimSpace(profile.PlatformToken) == "" && strings.TrimSpace(profile.TailToken) == "" {
 		profile.UserAgent = originalUserAgent
@@ -265,16 +457,66 @@ func normalizeCodexClientProfile(profile CodexClientProfile, baseline CodexClien
 	return profile
 }
 
+func (profile CodexClientProfile) isCodexDesktopLike() bool {
+	return strings.EqualFold(strings.TrimSpace(profile.Originator), "Codex Desktop") ||
+		strings.EqualFold(strings.TrimSpace(profile.UserAgentProduct), "Codex Desktop") ||
+		strings.HasPrefix(strings.TrimSpace(profile.UserAgent), "Codex Desktop/")
+}
+
+func alignCodexFirstPartyIdentity(profile CodexClientProfile) CodexClientProfile {
+	originator := strings.TrimSpace(profile.Originator)
+	product := strings.TrimSpace(profile.UserAgentProduct)
+	if !isFirstPartyCodexOriginator(originator) {
+		return profile
+	}
+	if product == "" || (isFirstPartyCodexOriginator(product) && product != originator) {
+		profile.UserAgentProduct = originator
+		profile.TailToken = alignCodexTailIdentity(profile.TailToken, originator)
+	}
+	return profile
+}
+
+func alignCodexTailIdentity(tail string, originator string) string {
+	tail = strings.TrimSpace(tail)
+	originator = strings.TrimSpace(originator)
+	if tail == "" || originator == "" {
+		return tail
+	}
+	return codexTailVersionPattern.ReplaceAllStringFunc(tail, func(match string) string {
+		parts := codexTailVersionPattern.FindStringSubmatch(match)
+		if len(parts) != 3 {
+			return match
+		}
+		identity := strings.TrimSpace(parts[1])
+		if !isFirstPartyCodexOriginator(identity) || identity == originator {
+			return match
+		}
+		return "(" + originator + "; " + strings.TrimSpace(parts[2]) + ")"
+	})
+}
+
 func bumpCodexVersionMarkers(candidate CodexClientProfile, current CodexClientProfile) CodexClientProfile {
 	candidate = normalizeCodexClientProfile(candidate, current)
 	current = normalizeCodexClientProfile(current, defaultCodexClientProfile(nil))
-	if !candidate.version.valid || (current.version.valid && candidate.version.Compare(current.version) <= 0) {
+	if !candidate.version.valid {
 		return current
+	}
+	if current.version.valid {
+		switch candidate.version.Compare(current.version) {
+		case -1:
+			return current
+		case 0:
+			next := current
+			next.Source = preferredManagedHeaderProfileSource(candidate.Source, current.Source)
+			return next
+		}
 	}
 
 	next := current
 	next.UserAgentVersion = candidate.UserAgentVersion
 	next.Version = candidate.Version
+	next.Source = preferredManagedHeaderProfileSource(candidate.Source, current.Source)
+	next.TailToken = bumpCodexTailVersionMarker(next.TailToken, next.UserAgentProduct, next.Version)
 	if strings.TrimSpace(next.BetaFeatures) == "" {
 		next.BetaFeatures = candidate.BetaFeatures
 	}
@@ -286,6 +528,25 @@ func bumpCodexVersionMarkers(candidate CodexClientProfile, current CodexClientPr
 	)
 	next.version = candidate.version
 	return next
+}
+
+func bumpCodexTailVersionMarker(tail string, product string, version string) string {
+	tail = strings.TrimSpace(tail)
+	version = strings.TrimSpace(version)
+	if tail == "" || version == "" {
+		return tail
+	}
+	return codexTailVersionPattern.ReplaceAllStringFunc(tail, func(match string) string {
+		parts := codexTailVersionPattern.FindStringSubmatch(match)
+		if len(parts) != 3 {
+			return match
+		}
+		identity := strings.TrimSpace(parts[1])
+		if !isFirstPartyCodexOriginator(identity) && identity != strings.TrimSpace(product) {
+			return match
+		}
+		return "(" + identity + "; " + version + ")"
+	})
 }
 
 func extractCodexClientProfile(headers http.Header, cfg *config.Config) (CodexClientProfile, bool) {
@@ -318,6 +579,7 @@ func extractCodexClientProfile(headers http.Header, cfg *config.Config) (CodexCl
 		UserAgentVersion: userAgentVersion,
 		PlatformToken:    platform,
 		TailToken:        tail,
+		Source:           observedManagedHeaderProfileSource(),
 	}
 	profile = normalizeCodexClientProfile(profile, defaultCodexClientProfile(cfg))
 	if !profile.version.valid {
@@ -331,6 +593,10 @@ func cfgCodexBetaFeatures(cfg *config.Config) string {
 		return ""
 	}
 	return cfg.CodexHeaderDefaults.BetaFeatures
+}
+
+func codexHeaderDefaultsUserAgentOverridden(cfg *config.Config) bool {
+	return cfg != nil && strings.TrimSpace(cfg.CodexHeaderDefaults.UserAgent) != ""
 }
 
 func parseCodexUserAgent(userAgent string) (product string, version string, platform string, tail string, ok bool) {
@@ -364,8 +630,15 @@ func buildCodexUserAgent(product string, version string, platform string, tail s
 		return strings.TrimSpace(product + "/" + version)
 	}
 	platform = firstNonEmptyString(platform, defaultCodexManagedPlatform)
-	tail = firstNonEmptyString(tail, defaultCodexManagedTerminal)
+	if strings.TrimSpace(tail) == "" {
+		return strings.TrimSpace(product + "/" + version + " (" + platform + ")")
+	}
 	return strings.TrimSpace(product + "/" + version + " (" + platform + ") " + tail)
+}
+
+func buildCodexSecCHUA(chromiumVersion string) string {
+	chromiumVersion = firstNonEmptyString(chromiumVersion, defaultCodexManagedChromium)
+	return `"Chromium";v="` + chromiumVersion + `", "Not:A-Brand";v="24"`
 }
 
 func isFirstPartyCodexOriginator(originator string) bool {
@@ -374,7 +647,7 @@ func isFirstPartyCodexOriginator(originator string) bool {
 		return false
 	}
 	switch normalized {
-	case "codex-tui", "codex_cli_rs", "codex_vscode":
+	case "codex-tui", "codex_cli_rs", "codex_vscode", "codex_exec":
 		return true
 	default:
 		return strings.HasPrefix(normalized, "Codex ")

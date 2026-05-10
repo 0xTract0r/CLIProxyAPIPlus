@@ -54,18 +54,24 @@ import (
 var lastRefreshKeys = []string{"last_refresh", "lastRefresh", "last_refreshed_at", "lastRefreshedAt"}
 
 const (
-	anthropicCallbackPort        = 54545
-	geminiCallbackPort           = 8085
-	codexCallbackPort            = 1455
-	geminiCLIEndpoint            = "https://cloudcode-pa.googleapis.com"
-	geminiCLIVersion             = "v1internal"
-	gitLabLoginModeOAuth         = "oauth"
-	gitLabLoginModePAT           = "pat"
-	accountSettingsSchemaVersion = 1
+	anthropicCallbackPort         = 54545
+	anthropicOAuthExchangeTimeout = 60 * time.Second
+	anthropicOAuthExchangeRetries = 3
+	geminiCallbackPort            = 8085
+	codexCallbackPort             = 1455
+	geminiCLIEndpoint             = "https://cloudcode-pa.googleapis.com"
+	geminiCLIVersion              = "v1internal"
+	gitLabLoginModeOAuth          = "oauth"
+	gitLabLoginModePAT            = "pat"
+	accountSettingsSchemaVersion  = 1
 )
 
 type authFileManagedHeaderProjection struct {
 	GeneratedAt           string            `json:"generated_at,omitempty"`
+	Source                string            `json:"source,omitempty"`
+	SourceURL             string            `json:"source_url,omitempty"`
+	CheckedAt             string            `json:"checked_at,omitempty"`
+	Completeness          string            `json:"completeness,omitempty"`
 	SummaryHeaders        map[string]string `json:"summary_headers,omitempty"`
 	VersionedCapabilities map[string]string `json:"versioned_capabilities,omitempty"`
 	StableIdentity        map[string]string `json:"stable_identity,omitempty"`
@@ -77,8 +83,18 @@ type authFileManagedHeaderHistoryEntry struct {
 	PolicyVersion                 string            `json:"policy_version,omitempty"`
 	Reason                        string            `json:"reason,omitempty"`
 	ChangedFields                 []string          `json:"changed_fields,omitempty"`
+	PreviousSource                string            `json:"previous_source,omitempty"`
+	PreviousSourceURL             string            `json:"previous_source_url,omitempty"`
+	NextSource                    string            `json:"next_source,omitempty"`
+	NextSourceURL                 string            `json:"next_source_url,omitempty"`
+	PreviousSummaryHeaders        map[string]string `json:"previous_summary_headers,omitempty"`
+	NextSummaryHeaders            map[string]string `json:"next_summary_headers,omitempty"`
 	PreviousVersionedCapabilities map[string]string `json:"previous_versioned_capabilities,omitempty"`
 	NextVersionedCapabilities     map[string]string `json:"next_versioned_capabilities,omitempty"`
+	PreviousStableIdentity        map[string]string `json:"previous_stable_identity,omitempty"`
+	NextStableIdentity            map[string]string `json:"next_stable_identity,omitempty"`
+	PreviousRuntimeFingerprint    map[string]string `json:"previous_runtime_fingerprint,omitempty"`
+	NextRuntimeFingerprint        map[string]string `json:"next_runtime_fingerprint,omitempty"`
 }
 
 type authFileManagedHeaderState struct {
@@ -87,25 +103,67 @@ type authFileManagedHeaderState struct {
 	History       []authFileManagedHeaderHistoryEntry `json:"history,omitempty"`
 }
 
+type authFileRuntimeIdentitySnapshot struct {
+	IdentityID       string            `json:"identity_id,omitempty"`
+	Provider         string            `json:"provider,omitempty"`
+	PolicyVersion    string            `json:"policy_version,omitempty"`
+	Source           string            `json:"source,omitempty"`
+	Revision         int               `json:"revision,omitempty"`
+	CreatedAt        string            `json:"created_at,omitempty"`
+	UpdatedAt        string            `json:"updated_at,omitempty"`
+	SeedHash         string            `json:"seed_hash,omitempty"`
+	AuthIDHash       string            `json:"auth_id_hash,omitempty"`
+	AccountHash      string            `json:"account_hash,omitempty"`
+	BaseURLHost      string            `json:"base_url_host,omitempty"`
+	ProxyHash        string            `json:"proxy_hash,omitempty"`
+	ProfileID        string            `json:"profile_id,omitempty"`
+	TLSProfileID     string            `json:"tls_profile_id,omitempty"`
+	Family           string            `json:"family,omitempty"`
+	TLSFamily        string            `json:"tls_family,omitempty"`
+	CoreManaged      bool              `json:"core_managed"`
+	RuntimeEnforced  bool              `json:"runtime_enforced"`
+	StableIdentity   map[string]string `json:"stable_identity,omitempty"`
+	RuntimeSemantics map[string]string `json:"runtime_semantics,omitempty"`
+}
+
+type authFileRuntimeIdentityHistoryEntry struct {
+	RecordedAt    string                           `json:"recorded_at,omitempty"`
+	Reason        string                           `json:"reason,omitempty"`
+	ChangedFields []string                         `json:"changed_fields,omitempty"`
+	Previous      *authFileRuntimeIdentitySnapshot `json:"previous,omitempty"`
+	Next          *authFileRuntimeIdentitySnapshot `json:"next,omitempty"`
+}
+
+type authFileRuntimeIdentityState struct {
+	PolicyVersion string                                `json:"policy_version,omitempty"`
+	Current       *authFileRuntimeIdentitySnapshot      `json:"current,omitempty"`
+	History       []authFileRuntimeIdentityHistoryEntry `json:"history,omitempty"`
+}
+
 type authFileAccountSettingsStored struct {
-	SchemaVersion      int                         `json:"schema_version"`
-	ExtraHeaders       map[string]string           `json:"extra_headers,omitempty"`
-	TransportProfile   any                         `json:"transport_profile,omitempty"`
-	TLSProfile         any                         `json:"tls_profile,omitempty"`
-	ManagedHeaderState *authFileManagedHeaderState `json:"managed_header_state,omitempty"`
+	SchemaVersion        int                           `json:"schema_version"`
+	ExtraHeaders         map[string]string             `json:"extra_headers,omitempty"`
+	RefreshEnabled       *bool                         `json:"refresh_enabled,omitempty"`
+	TransportProfile     any                           `json:"transport_profile,omitempty"`
+	TLSProfile           any                           `json:"tls_profile,omitempty"`
+	ManagedHeaderState   *authFileManagedHeaderState   `json:"managed_header_state,omitempty"`
+	RuntimeIdentityState *authFileRuntimeIdentityState `json:"runtime_identity_state,omitempty"`
 }
 
 type authFileAccountSettingsView struct {
-	ProxyURL           string                            `json:"proxy_url"`
-	Note               string                            `json:"note"`
-	Disabled           bool                              `json:"disabled"`
-	ManagedHeaders     map[string]string                 `json:"managed_headers"`
-	ExtraHeaders       map[string]string                 `json:"extra_headers"`
-	TransportProfile   any                               `json:"transport_profile"`
-	TLSProfile         any                               `json:"tls_profile"`
-	ManagedHeaderState *authFileManagedHeaderState       `json:"managed_header_state,omitempty"`
-	Activation         authFileAccountSettingsActivation `json:"activation"`
-	Warnings           []string                          `json:"warnings"`
+	ProxyURL           string                                `json:"proxy_url"`
+	Note               string                                `json:"note"`
+	Disabled           bool                                  `json:"disabled"`
+	ManagedHeaders     map[string]string                     `json:"managed_headers"`
+	ExtraHeaders       map[string]string                     `json:"extra_headers"`
+	RefreshEnabled     bool                                  `json:"refresh_enabled"`
+	TransportProfile   any                                   `json:"transport_profile"`
+	TLSProfile         any                                   `json:"tls_profile"`
+	RuntimeProfile     *runtimehelps.RuntimeTransportProfile `json:"runtime_profile,omitempty"`
+	RuntimeIdentity    *authFileRuntimeIdentityState         `json:"runtime_identity,omitempty"`
+	ManagedHeaderState *authFileManagedHeaderState           `json:"managed_header_state,omitempty"`
+	Activation         authFileAccountSettingsActivation     `json:"activation"`
+	Warnings           []string                              `json:"warnings"`
 }
 
 type authFileAccountSettingsActivation struct {
@@ -127,10 +185,11 @@ type callbackForwarder struct {
 }
 
 var (
-	callbackForwardersMu  sync.Mutex
-	callbackForwarders    = make(map[int]*callbackForwarder)
-	errAuthFileMustBeJSON = errors.New("auth file must be .json")
-	errAuthFileNotFound   = errors.New("auth file not found")
+	callbackForwardersMu   sync.Mutex
+	callbackForwarders     = make(map[int]*callbackForwarder)
+	errAuthFileMustBeJSON  = errors.New("auth file must be .json")
+	errAuthFileNotFound    = errors.New("auth file not found")
+	errAuthRefreshDisabled = errors.New("credential refresh is disabled for this account")
 )
 
 func extractLastRefreshTimestamp(meta map[string]any) (time.Time, bool) {
@@ -1435,6 +1494,10 @@ func managedHeaderProjectionForAuth(auth *coreauth.Auth, cfg *config.Config) aut
 				"X-Stainless-Os":   profile.OS,
 				"X-Stainless-Arch": profile.Arch,
 			}),
+			Source:       profile.Source.Source,
+			SourceURL:    profile.Source.SourceURL,
+			CheckedAt:    profile.Source.CheckedAt,
+			Completeness: profile.Source.Completeness,
 		}
 	case "codex":
 		profile := runtimehelps.ResolveCodexClientProfile(auth, nil, cfg)
@@ -1444,6 +1507,10 @@ func managedHeaderProjectionForAuth(auth *coreauth.Auth, cfg *config.Config) aut
 			VersionedCapabilities: runtimehelps.CodexManagedVersionedCapabilities(profile),
 			StableIdentity:        runtimehelps.CodexManagedStableIdentity(profile),
 			RuntimeFingerprint:    runtimehelps.CodexManagedRuntimeFingerprint(profile),
+			Source:                profile.Source.Source,
+			SourceURL:             profile.Source.SourceURL,
+			CheckedAt:             profile.Source.CheckedAt,
+			Completeness:          profile.Source.Completeness,
 		}
 	default:
 		return authFileManagedHeaderProjection{}
@@ -1491,6 +1558,7 @@ func readAccountSettingsMetadata(auth *coreauth.Auth, cfg *config.Config) authFi
 	stored.TransportProfile = normalizeAccountProfileValue(stored.TransportProfile)
 	stored.TLSProfile = normalizeAccountProfileValue(stored.TLSProfile)
 	stored.ManagedHeaderState = normalizeManagedHeaderState(stored.ManagedHeaderState)
+	stored.RuntimeIdentityState = normalizeRuntimeIdentityState(stored.RuntimeIdentityState)
 	return stored
 }
 
@@ -1517,24 +1585,76 @@ func legacyExtraHeaders(auth *coreauth.Auth) map[string]string {
 	return normalizeHeaderMap(extraHeaders)
 }
 
+func accountSettingsRefreshEnabled(auth *coreauth.Auth, stored authFileAccountSettingsStored) bool {
+	if stored.RefreshEnabled != nil {
+		return *stored.RefreshEnabled
+	}
+	if auth != nil && auth.RefreshDisabled() {
+		return false
+	}
+	return true
+}
+
+func refreshEnabledStorageValue(enabled bool) *bool {
+	if enabled {
+		return nil
+	}
+	value := false
+	return &value
+}
+
+func applyAuthRefreshEnabledMetadata(auth *coreauth.Auth, enabled bool) {
+	if auth == nil {
+		return
+	}
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	if enabled {
+		delete(auth.Metadata, "refresh_disabled")
+		delete(auth.Metadata, "disable_refresh")
+		delete(auth.Metadata, "auto_refresh_disabled")
+		delete(auth.Metadata, "refresh_enabled")
+		return
+	}
+	auth.Metadata["refresh_disabled"] = true
+	auth.Metadata["refresh_enabled"] = false
+	auth.NextRefreshAfter = time.Time{}
+}
+
 func buildAuthFileAccountSettingsView(auth *coreauth.Auth, cfg *config.Config) authFileAccountSettingsView {
 	stored := readAccountSettingsMetadata(auth, cfg)
 	projection := managedHeaderProjectionForAuth(auth, cfg)
 	managedHeaders := projection.SummaryHeaders
 	extraHeaders := normalizeHeaderMap(stored.ExtraHeaders)
+	refreshEnabled := accountSettingsRefreshEnabled(auth, stored)
 	var managedHeaderState *authFileManagedHeaderState
 	if coreauth.HasStructuredAccountSettingsMetadata(auth) || stored.ManagedHeaderState != nil {
 		managedHeaderState = mergeManagedHeaderState(stored.ManagedHeaderState, projection, providerKey(auth))
 	}
-	warnings := make([]string, 0, 2)
-	transportRuntimeEnforced := runtimehelps.IsRuntimeTransportProfileEnforced(auth)
+	warnings := make([]string, 0, 3)
+	runtimeProfile := runtimehelps.ResolveRuntimeTransportProfile(auth)
+	runtimeIdentity := mergeRuntimeIdentityState(stored.RuntimeIdentityState, auth, cfg, runtimeProfile)
+	transportRuntimeEnforced := runtimeProfile != nil && runtimeProfile.SupportsTransportRuntime()
+	tlsRuntimeEnforced := runtimeProfile != nil && runtimeProfile.SupportsTLSRuntime()
+	if !refreshEnabled {
+		warnings = append(warnings, "refresh_enabled is false: core will not use refresh tokens for this account; use access-token-only records only for short-lived testing or controlled migration")
+	}
 	if stored.TransportProfile != nil && !transportRuntimeEnforced {
-		warnings = append(warnings, "transport_profile is reserved in schema/UI only and is not runtime-enforced yet")
+		warnings = append(warnings, "transport_profile is not runtime-enforced for this provider/preset; core default transport remains active unless an explicit supported preset is selected")
 	} else if stored.TransportProfile != nil && strings.EqualFold(providerKey(auth), "codex") {
 		warnings = append(warnings, "codex transport_profile is runtime-enforced for account-scoped transport isolation only; it does not emulate the official Codex rustls TLS fingerprint yet")
 	}
-	if stored.TLSProfile != nil {
-		warnings = append(warnings, "tls_profile is reserved in schema/UI only and is not runtime-enforced yet")
+	if stored.TLSProfile != nil && !tlsRuntimeEnforced {
+		warnings = append(warnings, "tls_profile preset is not supported by this provider/runtime yet and is not enforced")
+	} else if stored.TLSProfile != nil && strings.EqualFold(providerKey(auth), "claude") {
+		if runtimeProfile != nil && strings.EqualFold(runtimeProfile.TLSProfileID, "claude_reqwest_rustls_compatible_v1") {
+			warnings = append(warnings, "claude tls_profile uses the Claude reqwest/rustls-compatible community profile and is runtime-enforced via Go approximation; exact Rust reqwest/rustls wire parity requires the future Rust sidecar")
+		} else {
+			warnings = append(warnings, "claude tls_profile is runtime-enforced with project-managed Chrome-like uTLS ClientHello presets for Anthropic API hosts; this is advanced explicit opt-in, not the default Claude Code CLI fingerprint or provider-edge parity claim")
+		}
+	} else if stored.TLSProfile != nil && strings.EqualFold(providerKey(auth), "codex") {
+		warnings = append(warnings, "codex tls_profile is runtime-enforced only for Go transport knobs such as account-scoped pooling, ALPN, and HTTP/1.1 forcing; it is not the Codex Desktop rustls native transport yet")
 	}
 
 	return authFileAccountSettingsView{
@@ -1543,12 +1663,15 @@ func buildAuthFileAccountSettingsView(auth *coreauth.Auth, cfg *config.Config) a
 		Disabled:           auth != nil && auth.Disabled,
 		ManagedHeaders:     managedHeaders,
 		ExtraHeaders:       extraHeaders,
+		RefreshEnabled:     refreshEnabled,
 		TransportProfile:   stored.TransportProfile,
 		TLSProfile:         stored.TLSProfile,
+		RuntimeProfile:     runtimeProfile,
+		RuntimeIdentity:    runtimeIdentity,
 		ManagedHeaderState: managedHeaderState,
 		Activation: authFileAccountSettingsActivation{
-			Summary:   accountSettingsActivationSummary(auth, managedHeaders, extraHeaders, transportRuntimeEnforced),
-			State:     accountSettingsActivationState(auth, stored.TransportProfile, stored.TLSProfile, transportRuntimeEnforced),
+			Summary:   accountSettingsActivationSummary(auth, managedHeaders, extraHeaders, refreshEnabled, transportRuntimeEnforced, tlsRuntimeEnforced),
+			State:     accountSettingsActivationState(auth, stored.TransportProfile, stored.TLSProfile, refreshEnabled, transportRuntimeEnforced, tlsRuntimeEnforced),
 			Source:    "core",
 			Effective: auth != nil && !auth.Disabled,
 		},
@@ -1568,20 +1691,29 @@ func (h *Handler) syncAuthManagedHeaderState(ctx context.Context, auth *coreauth
 		return auth
 	}
 	stored := readAccountSettingsMetadata(auth, h.cfg)
-	if !coreauth.HasStructuredAccountSettingsMetadata(auth) && stored.ManagedHeaderState == nil {
-		return auth
-	}
 	projection := managedHeaderProjectionForAuth(auth, h.cfg)
-	if len(projection.SummaryHeaders) == 0 {
-		return auth
+	var nextState *authFileManagedHeaderState
+	if len(projection.SummaryHeaders) > 0 ||
+		len(projection.VersionedCapabilities) > 0 ||
+		len(projection.StableIdentity) > 0 ||
+		len(projection.RuntimeFingerprint) > 0 {
+		nextState = mergeManagedHeaderState(stored.ManagedHeaderState, projection, providerKey(auth))
+	} else {
+		nextState = normalizeManagedHeaderState(stored.ManagedHeaderState)
 	}
-
-	nextState := mergeManagedHeaderState(stored.ManagedHeaderState, projection, providerKey(auth))
+	runtimeProfile := runtimehelps.ResolveRuntimeTransportProfile(auth)
+	nextRuntimeIdentity := mergeRuntimeIdentityState(stored.RuntimeIdentityState, auth, h.cfg, runtimeProfile)
 	extraHeaders := normalizeHeaderMap(stored.ExtraHeaders)
 	runtimeHeaders := mergeAccountHeaders(projection.SummaryHeaders, extraHeaders)
 	currentHeaders := normalizeHeaderMap(coreauth.ExtractCustomHeadersFromMetadata(auth.Metadata))
+	shouldSyncHeaders := len(projection.SummaryHeaders) > 0 || len(extraHeaders) > 0
+	headersEquivalent := true
+	if shouldSyncHeaders {
+		headersEquivalent = reflect.DeepEqual(runtimeHeaders, currentHeaders)
+	}
 	if managedHeaderStateEquivalent(nextState, normalizeManagedHeaderState(stored.ManagedHeaderState)) &&
-		reflect.DeepEqual(runtimeHeaders, currentHeaders) {
+		runtimeIdentityStateEquivalent(nextRuntimeIdentity, normalizeRuntimeIdentityState(stored.RuntimeIdentityState)) &&
+		headersEquivalent {
 		return auth
 	}
 
@@ -1593,8 +1725,11 @@ func (h *Handler) syncAuthManagedHeaderState(ctx context.Context, auth *coreauth
 		updated.Attributes = make(map[string]string)
 	}
 	stored.ManagedHeaderState = nextState
+	stored.RuntimeIdentityState = nextRuntimeIdentity
 	updated.Metadata["account_settings"] = stored
-	overwriteAuthMetadataHeaders(updated, runtimeHeaders)
+	if shouldSyncHeaders {
+		overwriteAuthMetadataHeaders(updated, runtimeHeaders)
+	}
 	updated.UpdatedAt = time.Now()
 	if h.authManager == nil {
 		return updated
@@ -1610,6 +1745,323 @@ func (h *Handler) syncAuthManagedHeaderState(ctx context.Context, auth *coreauth
 	return updated
 }
 
+func normalizeRuntimeIdentityState(state *authFileRuntimeIdentityState) *authFileRuntimeIdentityState {
+	if state == nil {
+		return nil
+	}
+	normalized := &authFileRuntimeIdentityState{
+		PolicyVersion: strings.TrimSpace(state.PolicyVersion),
+		Current:       normalizeRuntimeIdentitySnapshot(state.Current),
+	}
+	for _, entry := range state.History {
+		normalizedEntry := authFileRuntimeIdentityHistoryEntry{
+			RecordedAt:    strings.TrimSpace(entry.RecordedAt),
+			Reason:        strings.TrimSpace(entry.Reason),
+			ChangedFields: append([]string(nil), entry.ChangedFields...),
+			Previous:      normalizeRuntimeIdentitySnapshot(entry.Previous),
+			Next:          normalizeRuntimeIdentitySnapshot(entry.Next),
+		}
+		sort.Strings(normalizedEntry.ChangedFields)
+		normalized.History = append(normalized.History, normalizedEntry)
+	}
+	if normalized.PolicyVersion == "" && normalized.Current == nil && len(normalized.History) == 0 {
+		return nil
+	}
+	if normalized.PolicyVersion == "" {
+		normalized.PolicyVersion = runtimeIdentityPolicyVersion("")
+	}
+	return normalized
+}
+
+func normalizeRuntimeIdentitySnapshot(snapshot *authFileRuntimeIdentitySnapshot) *authFileRuntimeIdentitySnapshot {
+	if snapshot == nil {
+		return nil
+	}
+	normalized := *snapshot
+	normalized.IdentityID = strings.TrimSpace(normalized.IdentityID)
+	normalized.Provider = strings.ToLower(strings.TrimSpace(normalized.Provider))
+	normalized.PolicyVersion = strings.TrimSpace(normalized.PolicyVersion)
+	normalized.Source = strings.TrimSpace(normalized.Source)
+	normalized.CreatedAt = strings.TrimSpace(normalized.CreatedAt)
+	normalized.UpdatedAt = strings.TrimSpace(normalized.UpdatedAt)
+	normalized.SeedHash = strings.TrimSpace(normalized.SeedHash)
+	normalized.AuthIDHash = strings.TrimSpace(normalized.AuthIDHash)
+	normalized.AccountHash = strings.TrimSpace(normalized.AccountHash)
+	normalized.BaseURLHost = strings.TrimSpace(normalized.BaseURLHost)
+	normalized.ProxyHash = strings.TrimSpace(normalized.ProxyHash)
+	normalized.ProfileID = strings.TrimSpace(normalized.ProfileID)
+	normalized.TLSProfileID = strings.TrimSpace(normalized.TLSProfileID)
+	normalized.Family = strings.TrimSpace(normalized.Family)
+	normalized.TLSFamily = strings.TrimSpace(normalized.TLSFamily)
+	normalized.StableIdentity = normalizeHeaderMap(normalized.StableIdentity)
+	normalized.RuntimeSemantics = normalizeHeaderMap(normalized.RuntimeSemantics)
+	return &normalized
+}
+
+func mergeRuntimeIdentityState(previous *authFileRuntimeIdentityState, auth *coreauth.Auth, cfg *config.Config, profile *runtimehelps.RuntimeTransportProfile) *authFileRuntimeIdentityState {
+	if auth == nil || profile == nil || !profile.SupportsRuntime() {
+		return normalizeRuntimeIdentityState(previous)
+	}
+	normalizedPrev := normalizeRuntimeIdentityState(previous)
+	now := time.Now().UTC().Format(time.RFC3339)
+	next := buildRuntimeIdentitySnapshot(auth, cfg, profile, normalizedPrev, now)
+	if next == nil {
+		return normalizedPrev
+	}
+	if normalizedPrev != nil && runtimeIdentitySnapshotEquivalentForRevision(normalizedPrev.Current, next) {
+		return normalizedPrev
+	}
+
+	state := &authFileRuntimeIdentityState{
+		PolicyVersion: runtimeIdentityPolicyVersion(profile.Provider),
+		Current:       next,
+	}
+	if normalizedPrev == nil {
+		return state
+	}
+	if state.PolicyVersion == "" {
+		state.PolicyVersion = normalizedPrev.PolicyVersion
+	}
+	state.History = append(state.History, normalizedPrev.History...)
+	if normalizedPrev.Current != nil {
+		state.History = append(state.History, authFileRuntimeIdentityHistoryEntry{
+			RecordedAt:    next.UpdatedAt,
+			Reason:        "runtime-identity-refresh",
+			ChangedFields: diffRuntimeIdentitySnapshotFields(normalizedPrev.Current, next),
+			Previous:      normalizedPrev.Current,
+			Next:          next,
+		})
+	}
+	if len(state.History) > 12 {
+		state.History = append([]authFileRuntimeIdentityHistoryEntry(nil), state.History[len(state.History)-12:]...)
+	}
+	return state
+}
+
+func buildRuntimeIdentitySnapshot(auth *coreauth.Auth, cfg *config.Config, profile *runtimehelps.RuntimeTransportProfile, previous *authFileRuntimeIdentityState, now string) *authFileRuntimeIdentitySnapshot {
+	if auth == nil || profile == nil || !profile.SupportsRuntime() {
+		return nil
+	}
+	provider := strings.ToLower(strings.TrimSpace(profile.Provider))
+	authID := runtimeIdentityAuthID(auth)
+	accountKey := runtimeIdentityAccountKey(auth)
+	baseURLHost := runtimeIdentityBaseURLHost(auth, provider)
+	proxyURL := strings.TrimSpace(authProxyURL(auth))
+	if proxyURL == "" && cfg != nil {
+		proxyURL = strings.TrimSpace(cfg.ProxyURL)
+	}
+	seed := strings.Join([]string{
+		"account-runtime-identity/v2",
+		provider,
+		authID,
+		accountKey,
+		baseURLHost,
+		strings.TrimSpace(profile.ProfileID),
+		strings.TrimSpace(profile.TLSProfileID),
+	}, "|")
+	seedHash := sha256Hex(seed)
+	createdAt := now
+	revision := 1
+	identityID := "ari_" + shortHash(seedHash, 20)
+	if previous != nil && previous.Current != nil {
+		if strings.TrimSpace(previous.Current.IdentityID) == identityID {
+			createdAt = strings.TrimSpace(previous.Current.CreatedAt)
+			if createdAt == "" {
+				createdAt = now
+			}
+			revision = previous.Current.Revision + 1
+			if revision <= 1 {
+				revision = 2
+			}
+		}
+	}
+	return &authFileRuntimeIdentitySnapshot{
+		IdentityID:      identityID,
+		Provider:        provider,
+		PolicyVersion:   runtimeIdentityPolicyVersion(provider),
+		Source:          strings.TrimSpace(profile.Source),
+		Revision:        revision,
+		CreatedAt:       createdAt,
+		UpdatedAt:       now,
+		SeedHash:        "sha256:" + seedHash,
+		AuthIDHash:      "sha256:" + sha256Hex(authID),
+		AccountHash:     "sha256:" + sha256Hex(accountKey),
+		BaseURLHost:     baseURLHost,
+		ProxyHash:       optionalSHA256(proxyURL),
+		ProfileID:       strings.TrimSpace(profile.ProfileID),
+		TLSProfileID:    strings.TrimSpace(profile.TLSProfileID),
+		Family:          strings.TrimSpace(profile.Family),
+		TLSFamily:       strings.TrimSpace(profile.TLSFamily),
+		CoreManaged:     profile.CoreManaged,
+		RuntimeEnforced: profile.SupportsRuntime(),
+		StableIdentity: map[string]string{
+			"auth_id_hash":  "sha256:" + sha256Hex(authID),
+			"account_hash":  "sha256:" + sha256Hex(accountKey),
+			"base_url_host": baseURLHost,
+			"proxy_hash":    optionalSHA256(proxyURL),
+		},
+		RuntimeSemantics: map[string]string{
+			"transport": profile.TransportStatus,
+			"tls":       profile.TLSStatus,
+		},
+	}
+}
+
+func runtimeIdentityPolicyVersion(provider string) string {
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "claude":
+		return "claude-runtime-identity/v2"
+	case "codex":
+		return "codex-runtime-identity/v2"
+	case "gemini", "gemini-cli":
+		return "gemini-runtime-identity/v2"
+	default:
+		return "account-runtime-identity/v2"
+	}
+}
+
+func runtimeIdentityAuthID(auth *coreauth.Auth) string {
+	if auth == nil {
+		return "anonymous"
+	}
+	for _, value := range []string{auth.ID, auth.FileName, auth.Label, authDisplayName(auth)} {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return "anonymous"
+}
+
+func runtimeIdentityAccountKey(auth *coreauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	if accountType, accountValue := auth.AccountInfo(); strings.TrimSpace(accountValue) != "" {
+		if strings.TrimSpace(accountType) != "" {
+			return strings.TrimSpace(accountType) + ":" + strings.TrimSpace(accountValue)
+		}
+		return strings.TrimSpace(accountValue)
+	}
+	if auth.Metadata != nil {
+		for _, key := range []string{"email", "username", "name", "account_id", "subject", "user_id"} {
+			if value, ok := auth.Metadata[key].(string); ok {
+				if trimmed := strings.TrimSpace(value); trimmed != "" {
+					return key + ":" + trimmed
+				}
+			}
+		}
+	}
+	return ""
+}
+
+func runtimeIdentityBaseURLHost(auth *coreauth.Auth, provider string) string {
+	if auth != nil && auth.Attributes != nil {
+		if baseURL := strings.TrimSpace(auth.Attributes["base_url"]); baseURL != "" {
+			if parsed, err := url.Parse(baseURL); err == nil && parsed.Hostname() != "" {
+				return strings.ToLower(parsed.Hostname())
+			}
+			if parsed, err := url.Parse("https://" + strings.TrimLeft(baseURL, "/")); err == nil && parsed.Hostname() != "" {
+				return strings.ToLower(parsed.Hostname())
+			}
+		}
+	}
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "claude":
+		return "api.anthropic.com"
+	case "codex":
+		return "chatgpt.com"
+	case "gemini", "gemini-cli":
+		return "cloudcode-pa.googleapis.com"
+	default:
+		return ""
+	}
+}
+
+func runtimeIdentitySnapshotEquivalentForRevision(left *authFileRuntimeIdentitySnapshot, right *authFileRuntimeIdentitySnapshot) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	leftNormalized := *left
+	rightNormalized := *right
+	leftNormalized.Revision = 0
+	rightNormalized.Revision = 0
+	leftNormalized.CreatedAt = ""
+	rightNormalized.CreatedAt = ""
+	leftNormalized.UpdatedAt = ""
+	rightNormalized.UpdatedAt = ""
+	return reflect.DeepEqual(normalizeRuntimeIdentitySnapshot(&leftNormalized), normalizeRuntimeIdentitySnapshot(&rightNormalized))
+}
+
+func runtimeIdentityStateEquivalent(left *authFileRuntimeIdentityState, right *authFileRuntimeIdentityState) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return strings.TrimSpace(left.PolicyVersion) == strings.TrimSpace(right.PolicyVersion) &&
+		runtimeIdentitySnapshotEquivalentForRevision(left.Current, right.Current) &&
+		reflect.DeepEqual(left.History, right.History)
+}
+
+func diffRuntimeIdentitySnapshotFields(previous *authFileRuntimeIdentitySnapshot, next *authFileRuntimeIdentitySnapshot) []string {
+	if previous == nil || next == nil {
+		return nil
+	}
+	changed := make(map[string]struct{})
+	addRuntimeIdentityChange(changed, "identity_id", previous.IdentityID, next.IdentityID)
+	addRuntimeIdentityChange(changed, "provider", previous.Provider, next.Provider)
+	addRuntimeIdentityChange(changed, "policy_version", previous.PolicyVersion, next.PolicyVersion)
+	addRuntimeIdentityChange(changed, "source", previous.Source, next.Source)
+	addRuntimeIdentityChange(changed, "seed_hash", previous.SeedHash, next.SeedHash)
+	addRuntimeIdentityChange(changed, "auth_id_hash", previous.AuthIDHash, next.AuthIDHash)
+	addRuntimeIdentityChange(changed, "account_hash", previous.AccountHash, next.AccountHash)
+	addRuntimeIdentityChange(changed, "base_url_host", previous.BaseURLHost, next.BaseURLHost)
+	addRuntimeIdentityChange(changed, "proxy_hash", previous.ProxyHash, next.ProxyHash)
+	addRuntimeIdentityChange(changed, "profile_id", previous.ProfileID, next.ProfileID)
+	addRuntimeIdentityChange(changed, "tls_profile_id", previous.TLSProfileID, next.TLSProfileID)
+	addRuntimeIdentityChange(changed, "family", previous.Family, next.Family)
+	addRuntimeIdentityChange(changed, "tls_family", previous.TLSFamily, next.TLSFamily)
+	addRuntimeIdentityChange(changed, "core_managed", strconv.FormatBool(previous.CoreManaged), strconv.FormatBool(next.CoreManaged))
+	addRuntimeIdentityChange(changed, "runtime_enforced", strconv.FormatBool(previous.RuntimeEnforced), strconv.FormatBool(next.RuntimeEnforced))
+	for _, field := range diffManagedHeaderFields(previous.StableIdentity, next.StableIdentity) {
+		changed["stable_identity."+field] = struct{}{}
+	}
+	for _, field := range diffManagedHeaderFields(previous.RuntimeSemantics, next.RuntimeSemantics) {
+		changed["runtime_semantics."+field] = struct{}{}
+	}
+	fields := make([]string, 0, len(changed))
+	for field := range changed {
+		fields = append(fields, field)
+	}
+	sort.Strings(fields)
+	return fields
+}
+
+func addRuntimeIdentityChange(out map[string]struct{}, field string, previous string, next string) {
+	if strings.TrimSpace(previous) != strings.TrimSpace(next) {
+		out[field] = struct{}{}
+	}
+}
+
+func optionalSHA256(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	return "sha256:" + sha256Hex(value)
+}
+
+func sha256Hex(value string) string {
+	sum := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(sum[:])
+}
+
+func shortHash(value string, length int) string {
+	value = strings.TrimSpace(value)
+	if length <= 0 || len(value) <= length {
+		return value
+	}
+	return value[:length]
+}
+
 func normalizeManagedHeaderState(state *authFileManagedHeaderState) *authFileManagedHeaderState {
 	if state == nil {
 		return nil
@@ -1620,6 +2072,10 @@ func normalizeManagedHeaderState(state *authFileManagedHeaderState) *authFileMan
 	if state.Current != nil {
 		normalized.Current = &authFileManagedHeaderProjection{
 			GeneratedAt:           strings.TrimSpace(state.Current.GeneratedAt),
+			Source:                strings.TrimSpace(state.Current.Source),
+			SourceURL:             strings.TrimSpace(state.Current.SourceURL),
+			CheckedAt:             strings.TrimSpace(state.Current.CheckedAt),
+			Completeness:          strings.TrimSpace(state.Current.Completeness),
 			SummaryHeaders:        normalizeHeaderMap(state.Current.SummaryHeaders),
 			VersionedCapabilities: normalizeHeaderMap(state.Current.VersionedCapabilities),
 			StableIdentity:        normalizeHeaderMap(state.Current.StableIdentity),
@@ -1639,8 +2095,18 @@ func normalizeManagedHeaderState(state *authFileManagedHeaderState) *authFileMan
 				PolicyVersion:                 strings.TrimSpace(entry.PolicyVersion),
 				Reason:                        strings.TrimSpace(entry.Reason),
 				ChangedFields:                 changedFields,
+				PreviousSource:                strings.TrimSpace(entry.PreviousSource),
+				PreviousSourceURL:             strings.TrimSpace(entry.PreviousSourceURL),
+				NextSource:                    strings.TrimSpace(entry.NextSource),
+				NextSourceURL:                 strings.TrimSpace(entry.NextSourceURL),
+				PreviousSummaryHeaders:        normalizeHeaderMap(entry.PreviousSummaryHeaders),
+				NextSummaryHeaders:            normalizeHeaderMap(entry.NextSummaryHeaders),
 				PreviousVersionedCapabilities: normalizeHeaderMap(entry.PreviousVersionedCapabilities),
 				NextVersionedCapabilities:     normalizeHeaderMap(entry.NextVersionedCapabilities),
+				PreviousStableIdentity:        normalizeHeaderMap(entry.PreviousStableIdentity),
+				NextStableIdentity:            normalizeHeaderMap(entry.NextStableIdentity),
+				PreviousRuntimeFingerprint:    normalizeHeaderMap(entry.PreviousRuntimeFingerprint),
+				NextRuntimeFingerprint:        normalizeHeaderMap(entry.NextRuntimeFingerprint),
 			})
 		}
 	}
@@ -1675,6 +2141,10 @@ func mergeManagedHeaderState(previous *authFileManagedHeaderState, projection au
 	normalizedPrev := normalizeManagedHeaderState(previous)
 	current := &authFileManagedHeaderProjection{
 		GeneratedAt:           projection.GeneratedAt,
+		Source:                strings.TrimSpace(projection.Source),
+		SourceURL:             strings.TrimSpace(projection.SourceURL),
+		CheckedAt:             strings.TrimSpace(projection.CheckedAt),
+		Completeness:          strings.TrimSpace(projection.Completeness),
 		SummaryHeaders:        normalizeHeaderMap(projection.SummaryHeaders),
 		VersionedCapabilities: normalizeHeaderMap(projection.VersionedCapabilities),
 		StableIdentity:        normalizeHeaderMap(projection.StableIdentity),
@@ -1705,15 +2175,48 @@ func mergeManagedHeaderState(previous *authFileManagedHeaderState, projection au
 			RecordedAt:                    current.GeneratedAt,
 			PolicyVersion:                 state.PolicyVersion,
 			Reason:                        "managed-header-refresh",
-			ChangedFields:                 diffManagedHeaderFields(normalizedPrev.Current.SummaryHeaders, current.SummaryHeaders),
+			ChangedFields:                 diffManagedHeaderProjectionFields(normalizedPrev.Current, current),
+			PreviousSource:                strings.TrimSpace(normalizedPrev.Current.Source),
+			PreviousSourceURL:             strings.TrimSpace(normalizedPrev.Current.SourceURL),
+			NextSource:                    strings.TrimSpace(current.Source),
+			NextSourceURL:                 strings.TrimSpace(current.SourceURL),
+			PreviousSummaryHeaders:        normalizeHeaderMap(normalizedPrev.Current.SummaryHeaders),
+			NextSummaryHeaders:            normalizeHeaderMap(current.SummaryHeaders),
 			PreviousVersionedCapabilities: normalizeHeaderMap(normalizedPrev.Current.VersionedCapabilities),
 			NextVersionedCapabilities:     normalizeHeaderMap(current.VersionedCapabilities),
+			PreviousStableIdentity:        normalizeHeaderMap(normalizedPrev.Current.StableIdentity),
+			NextStableIdentity:            normalizeHeaderMap(current.StableIdentity),
+			PreviousRuntimeFingerprint:    normalizeHeaderMap(normalizedPrev.Current.RuntimeFingerprint),
+			NextRuntimeFingerprint:        normalizeHeaderMap(current.RuntimeFingerprint),
 		})
 	}
 	if len(state.History) > 12 {
 		state.History = append([]authFileManagedHeaderHistoryEntry(nil), state.History[len(state.History)-12:]...)
 	}
 	return state
+}
+
+func diffManagedHeaderProjectionFields(previous *authFileManagedHeaderProjection, next *authFileManagedHeaderProjection) []string {
+	if previous == nil || next == nil {
+		return nil
+	}
+	seen := make(map[string]struct{})
+	addChangedManagedHeaderFields(seen, previous.SummaryHeaders, next.SummaryHeaders)
+	addChangedManagedHeaderFields(seen, previous.StableIdentity, next.StableIdentity)
+	addChangedManagedHeaderFields(seen, previous.RuntimeFingerprint, next.RuntimeFingerprint)
+	addChangedManagedHeaderFields(seen, previous.VersionedCapabilities, next.VersionedCapabilities)
+	fields := make([]string, 0, len(seen))
+	for key := range seen {
+		fields = append(fields, key)
+	}
+	sort.Strings(fields)
+	return fields
+}
+
+func addChangedManagedHeaderFields(out map[string]struct{}, previous map[string]string, next map[string]string) {
+	for _, field := range diffManagedHeaderFields(previous, next) {
+		out[field] = struct{}{}
+	}
 }
 
 func diffManagedHeaderFields(previous map[string]string, next map[string]string) []string {
@@ -1742,7 +2245,9 @@ func managedHeaderProjectionEquivalent(left *authFileManagedHeaderProjection, ri
 	return reflect.DeepEqual(left.SummaryHeaders, right.SummaryHeaders) &&
 		reflect.DeepEqual(left.VersionedCapabilities, right.VersionedCapabilities) &&
 		reflect.DeepEqual(left.StableIdentity, right.StableIdentity) &&
-		reflect.DeepEqual(left.RuntimeFingerprint, right.RuntimeFingerprint)
+		reflect.DeepEqual(left.RuntimeFingerprint, right.RuntimeFingerprint) &&
+		strings.TrimSpace(left.Source) == strings.TrimSpace(right.Source) &&
+		strings.TrimSpace(left.SourceURL) == strings.TrimSpace(right.SourceURL)
 }
 
 func managedHeaderStateEquivalent(left *authFileManagedHeaderState, right *authFileManagedHeaderState) bool {
@@ -1754,7 +2259,7 @@ func managedHeaderStateEquivalent(left *authFileManagedHeaderState, right *authF
 		reflect.DeepEqual(left.History, right.History)
 }
 
-func accountSettingsActivationSummary(auth *coreauth.Auth, managedHeaders map[string]string, extraHeaders map[string]string, transportRuntimeEnforced bool) string {
+func accountSettingsActivationSummary(auth *coreauth.Auth, managedHeaders map[string]string, extraHeaders map[string]string, refreshEnabled bool, transportRuntimeEnforced bool, tlsRuntimeEnforced bool) string {
 	if auth != nil && auth.Disabled {
 		return "disabled"
 	}
@@ -1763,6 +2268,10 @@ func accountSettingsActivationSummary(auth *coreauth.Auth, managedHeaders map[st
 		return "proxy override active"
 	case transportRuntimeEnforced:
 		return "transport profile active"
+	case tlsRuntimeEnforced:
+		return "TLS profile active"
+	case !refreshEnabled:
+		return "refresh disabled"
 	case len(extraHeaders) > 0:
 		return "custom extra headers active"
 	case len(managedHeaders) > 0:
@@ -1772,12 +2281,18 @@ func accountSettingsActivationSummary(auth *coreauth.Auth, managedHeaders map[st
 	}
 }
 
-func accountSettingsActivationState(auth *coreauth.Auth, transportProfile any, tlsProfile any, transportRuntimeEnforced bool) string {
+func accountSettingsActivationState(auth *coreauth.Auth, transportProfile any, tlsProfile any, refreshEnabled bool, transportRuntimeEnforced bool, tlsRuntimeEnforced bool) string {
 	if auth != nil && auth.Disabled {
 		return "disabled"
 	}
+	if !refreshEnabled {
+		return "refresh-disabled"
+	}
 	if transportRuntimeEnforced {
 		return "transport-profile-active"
+	}
+	if tlsRuntimeEnforced {
+		return "tls-profile-active"
 	}
 	if transportProfile != nil || tlsProfile != nil {
 		return "reserved-profiles-present"
@@ -1878,6 +2393,16 @@ func (h *Handler) RefreshAuthFileStatus(c *gin.Context) {
 func (h *Handler) refreshAuthStatus(ctx context.Context, current *coreauth.Auth) (*coreauth.Auth, error) {
 	if h == nil || h.authManager == nil || current == nil {
 		return current, fmt.Errorf("core auth manager unavailable")
+	}
+	if current.RefreshDisabled() {
+		updated := current.Clone()
+		updated.NextRefreshAfter = time.Time{}
+		updated.UpdatedAt = time.Now()
+		saved, errUpdate := h.authManager.Update(ctx, updated)
+		if errUpdate != nil {
+			return saved, errUpdate
+		}
+		return saved, errAuthRefreshDisabled
 	}
 	exec, ok := h.authManager.Executor(current.Provider)
 	if !ok || exec == nil {
@@ -2038,6 +2563,25 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 	} else {
 		targetAuth.Status = coreauth.StatusActive
 		targetAuth.StatusMessage = ""
+		// Re-enabling via management API must clear in-memory cooldown so the
+		// auth becomes immediately selectable; otherwise prior 429-driven
+		// ModelStates.Quota would keep the selector returning model_cooldown.
+		targetAuth.Unavailable = false
+		targetAuth.NextRetryAfter = time.Time{}
+		targetAuth.Quota = coreauth.QuotaState{}
+		targetAuth.LastError = nil
+		for _, ms := range targetAuth.ModelStates {
+			if ms == nil {
+				continue
+			}
+			ms.Unavailable = false
+			ms.NextRetryAfter = time.Time{}
+			ms.Quota = coreauth.QuotaState{}
+			ms.LastError = nil
+			if ms.Status == coreauth.StatusError {
+				ms.Status = coreauth.StatusActive
+			}
+		}
 	}
 	targetAuth.UpdatedAt = time.Now()
 
@@ -2215,6 +2759,7 @@ func (h *Handler) PatchAuthFileAccountSettings(c *gin.Context) {
 		Note             *string           `json:"note"`
 		Disabled         *bool             `json:"disabled"`
 		ExtraHeaders     map[string]string `json:"extra_headers"`
+		RefreshEnabled   *bool             `json:"refresh_enabled"`
 		TransportProfile any               `json:"transport_profile"`
 		TLSProfile       any               `json:"tls_profile"`
 	}
@@ -2264,6 +2809,11 @@ func (h *Handler) PatchAuthFileAccountSettings(c *gin.Context) {
 	}
 	transportProfile := normalizeAccountProfileValue(req.TransportProfile)
 	tlsProfile := normalizeAccountProfileValue(req.TLSProfile)
+	existingStored := readAccountSettingsMetadata(targetAuth, h.cfg)
+	refreshEnabled := accountSettingsRefreshEnabled(targetAuth, existingStored)
+	if req.RefreshEnabled != nil {
+		refreshEnabled = *req.RefreshEnabled
+	}
 
 	targetAuth.Disabled = *req.Disabled
 	if *req.Disabled {
@@ -2290,12 +2840,15 @@ func (h *Handler) PatchAuthFileAccountSettings(c *gin.Context) {
 	}
 
 	targetAuth.Metadata["account_settings"] = authFileAccountSettingsStored{
-		SchemaVersion:      accountSettingsSchemaVersion,
-		ExtraHeaders:       extraHeaders,
-		TransportProfile:   transportProfile,
-		TLSProfile:         tlsProfile,
-		ManagedHeaderState: readAccountSettingsMetadata(targetAuth, h.cfg).ManagedHeaderState,
+		SchemaVersion:        accountSettingsSchemaVersion,
+		ExtraHeaders:         extraHeaders,
+		RefreshEnabled:       refreshEnabledStorageValue(refreshEnabled),
+		TransportProfile:     transportProfile,
+		TLSProfile:           tlsProfile,
+		ManagedHeaderState:   existingStored.ManagedHeaderState,
+		RuntimeIdentityState: existingStored.RuntimeIdentityState,
 	}
+	applyAuthRefreshEnabledMetadata(targetAuth, refreshEnabled)
 
 	targetAuth = h.syncAuthManagedHeaderState(c.Request.Context(), targetAuth)
 	managedHeaders := managedHeadersForAuth(targetAuth, h.cfg)
@@ -2546,11 +3099,243 @@ func maskGitLabToken(token string) string {
 	return trimmed[:4] + "..." + trimmed[len(trimmed)-4:]
 }
 
+func maskOAuthStateForLog(state string) string {
+	return maskGitLabToken(state)
+}
+
+func safeAuthNameForLog(name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return ""
+	}
+	if len(name) <= 16 {
+		return name
+	}
+	sum := sha256.Sum256([]byte(name))
+	return name[:8] + "..." + hex.EncodeToString(sum[:])[:8]
+}
+
+func cloneAuthStringMap(input map[string]string) map[string]string {
+	if len(input) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(input))
+	for key, value := range input {
+		out[key] = value
+	}
+	return out
+}
+
+func cloneClaudeReauthMetadata(target *coreauth.Auth, email string) map[string]any {
+	metadata := make(map[string]any)
+	if target != nil {
+		for key, value := range target.Metadata {
+			switch strings.ToLower(strings.TrimSpace(key)) {
+			case "access_token", "refresh_token", "id_token", "token", "expired", "expires_at", "last_refresh", "lastrefresh", "email", "type":
+				continue
+			default:
+				metadata[key] = value
+			}
+		}
+		metadata["disabled"] = target.Disabled
+	}
+	metadata["email"] = email
+	metadata["type"] = "claude"
+	return metadata
+}
+
+func buildClaudeOAuthTokenRecord(target *coreauth.Auth, tokenStorage *claude.ClaudeTokenStorage) *coreauth.Auth {
+	email := ""
+	if tokenStorage != nil {
+		email = strings.TrimSpace(tokenStorage.Email)
+	}
+	defaultName := fmt.Sprintf("claude-%s.json", email)
+	if email == "" {
+		defaultName = "claude-auth.json"
+	}
+	record := &coreauth.Auth{
+		ID:       defaultName,
+		Provider: "claude",
+		FileName: defaultName,
+		Storage:  tokenStorage,
+		Metadata: cloneClaudeReauthMetadata(nil, email),
+	}
+	if target == nil {
+		return record
+	}
+	record.ID = target.ID
+	record.FileName = authDisplayName(target)
+	record.Label = target.Label
+	record.Disabled = target.Disabled
+	record.Status = target.Status
+	record.StatusMessage = target.StatusMessage
+	record.ProxyURL = authProxyURL(target)
+	record.Attributes = cloneAuthStringMap(target.Attributes)
+	if record.Attributes == nil {
+		record.Attributes = make(map[string]string)
+	}
+	if path := strings.TrimSpace(authAttribute(target, "path")); path != "" {
+		record.Attributes["path"] = path
+	}
+	record.Metadata = cloneClaudeReauthMetadata(target, email)
+	if record.ProxyURL != "" {
+		record.Metadata["proxy_url"] = record.ProxyURL
+	}
+	return record
+}
+
+func (h *Handler) newClaudeOAuthAuth(ctx context.Context, target *coreauth.Auth) *claude.ClaudeAuth {
+	if target == nil {
+		return claude.NewClaudeAuth(h.cfg)
+	}
+	transportCtx := runtimehelps.WithRuntimeTransportHost(ctx, "api.anthropic.com")
+	client := runtimehelps.NewProxyAwareHTTPClient(transportCtx, h.cfg, target, anthropicOAuthExchangeTimeout)
+	return claude.NewClaudeAuthWithHTTPClient(client)
+}
+
+func (h *Handler) newClaudeOAuthAccountProxyFallbackAuth(target *coreauth.Auth) *claude.ClaudeAuth {
+	if target == nil {
+		return nil
+	}
+	proxyURL := authProxyURL(target)
+	if proxyURL == "" {
+		return nil
+	}
+	return claude.NewClaudeAuthWithProxyURL(h.cfg, proxyURL)
+}
+
+func (h *Handler) claudeOAuthTransportSummary(target *coreauth.Auth) map[string]string {
+	summary := map[string]string{
+		"proxy_source":       "core-global",
+		"transport_profile":  "",
+		"tls_profile":        "",
+		"runtime_profile_id": "",
+	}
+	if target == nil {
+		if h != nil && h.cfg != nil && strings.TrimSpace(h.cfg.ProxyURL) == "" {
+			summary["proxy_source"] = "direct"
+		}
+		return summary
+	}
+	if authProxyURL(target) != "" {
+		summary["proxy_source"] = "account"
+	} else if h != nil && h.cfg != nil && strings.TrimSpace(h.cfg.ProxyURL) != "" {
+		summary["proxy_source"] = "core-global"
+	} else {
+		summary["proxy_source"] = "direct"
+	}
+	if profile := runtimehelps.ResolveRuntimeTransportProfile(target); profile != nil {
+		summary["transport_profile"] = profile.ProfileID
+		summary["tls_profile"] = profile.TLSProfileID
+		summary["runtime_profile_id"] = profile.ProfileID
+	}
+	return summary
+}
+
+func exchangeClaudeOAuthWithRetry(ctx context.Context, auth *claude.ClaudeAuth, code string, state string, pkceCodes *claude.PKCECodes, safeState string, targetAuthName string) (*claude.ClaudeAuthBundle, error) {
+	if auth == nil {
+		return nil, fmt.Errorf("Claude OAuth service unavailable")
+	}
+	var lastErr error
+	for attempt := 1; attempt <= anthropicOAuthExchangeRetries; attempt++ {
+		bundle, err := auth.ExchangeCodeForTokens(ctx, code, state, pkceCodes)
+		if err == nil {
+			return bundle, nil
+		}
+		lastErr = err
+		if attempt >= anthropicOAuthExchangeRetries || !isRetriableClaudeOAuthExchangeError(err) {
+			return nil, err
+		}
+		delay := time.Duration(attempt) * time.Second
+		log.WithFields(log.Fields{
+			"state":     safeState,
+			"auth_name": safeAuthNameForLog(targetAuthName),
+			"attempt":   attempt,
+			"next_in":   delay.String(),
+			"error":     summarizeClaudeOAuthExchangeLogError(err),
+		}).Warn("Claude OAuth token exchange hit a transient network/proxy error; retrying")
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(delay):
+		}
+	}
+	return nil, lastErr
+}
+
+func isRetriableClaudeOAuthExchangeError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	lower := strings.ToLower(err.Error())
+	if !strings.Contains(lower, "token exchange request failed") {
+		return false
+	}
+	if strings.Contains(lower, "context canceled") || strings.Contains(lower, "context deadline exceeded") {
+		return false
+	}
+	for _, marker := range []string{
+		"socks connect",
+		"proxyconnect",
+		"connection not allowed",
+		"connection refused",
+		"connection reset",
+		"network is unreachable",
+		"no such host",
+		"i/o timeout",
+		"tls handshake timeout",
+		"timeout awaiting response headers",
+		"temporary failure",
+		"unexpected eof",
+	} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	if strings.HasSuffix(strings.TrimSpace(lower), ": eof") || strings.Contains(lower, ": eof\n") {
+		return true
+	}
+	return false
+}
+
+func summarizeClaudeOAuthExchangeLogError(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := err.Error()
+	if len(msg) > 240 {
+		msg = msg[:240] + "..."
+	}
+	return msg
+}
+
 func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 	ctx := context.Background()
 	ctx = PopulateAuthContext(ctx, c)
 
 	fmt.Println("Initializing Claude authentication...")
+
+	targetAuthName := strings.TrimSpace(c.Query("auth_name"))
+	var targetAuth *coreauth.Auth
+	if targetAuthName != "" {
+		if isUnsafeAuthFileName(targetAuthName) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid auth_name"})
+			return
+		}
+		targetAuth = h.findAuthByNameOrID(targetAuthName)
+		if targetAuth == nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": "auth file not found"})
+			return
+		}
+		if !strings.EqualFold(providerKey(targetAuth), "claude") {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "auth_name must reference a Claude auth file"})
+			return
+		}
+		targetAuth = h.syncAuthManagedHeaderState(c.Request.Context(), targetAuth)
+	}
 
 	// Generate PKCE codes
 	pkceCodes, err := claude.GeneratePKCECodes()
@@ -2568,8 +3353,11 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 		return
 	}
 
-	// Initialize Claude auth service
-	anthropicAuth := claude.NewClaudeAuth(h.cfg)
+	// Initialize Claude auth service. For account re-authentication, bind the
+	// OAuth token exchange to the selected account's proxy/runtime profile so
+	// it does not silently fall back to the global core proxy.
+	anthropicAuth := h.newClaudeOAuthAuth(ctx, targetAuth)
+	oauthTransportSummary := h.claudeOAuthTransportSummary(targetAuth)
 
 	// Generate authorization URL (then override redirect_uri to reuse server port)
 	authURL, state, err := anthropicAuth.GenerateAuthURL(state, pkceCodes)
@@ -2654,24 +3442,55 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 		rawCode := resultMap["code"]
 		code := strings.Split(rawCode, "#")[0]
 
-		// Exchange code for tokens using internal auth service
-		bundle, errExchange := anthropicAuth.ExchangeCodeForTokens(ctx, code, state, pkceCodes)
+		// Exchange code for tokens using internal auth service. This must be bounded:
+		// remote Management Center users paste callback URLs manually, so a stuck
+		// proxy/uTLS/token endpoint path otherwise leaves the UI in "wait" forever.
+		safeState := maskOAuthStateForLog(state)
+		log.WithFields(log.Fields{
+			"state":             safeState,
+			"auth_name":         safeAuthNameForLog(targetAuthName),
+			"proxy_source":      oauthTransportSummary["proxy_source"],
+			"transport_profile": oauthTransportSummary["transport_profile"],
+			"tls_profile":       oauthTransportSummary["tls_profile"],
+		}).Info("Claude OAuth callback received; starting token exchange")
+		exchangeCtx, exchangeCancel := context.WithTimeout(ctx, anthropicOAuthExchangeTimeout)
+		if !SetOAuthSessionCancel(state, exchangeCancel) {
+			exchangeCancel()
+			return
+		}
+		bundle, errExchange := exchangeClaudeOAuthWithRetry(exchangeCtx, anthropicAuth, code, state, pkceCodes, safeState, targetAuthName)
+		if errExchange != nil && targetAuth != nil && isRetriableClaudeOAuthExchangeError(errExchange) {
+			if fallbackAuth := h.newClaudeOAuthAccountProxyFallbackAuth(targetAuth); fallbackAuth != nil {
+				log.WithFields(log.Fields{
+					"state":        safeState,
+					"auth_name":    safeAuthNameForLog(targetAuthName),
+					"proxy_source": "account",
+				}).Warn("Claude OAuth runtime-profile transport failed before upstream response; retrying with standard OAuth transport over the same account proxy")
+				bundle, errExchange = exchangeClaudeOAuthWithRetry(exchangeCtx, fallbackAuth, code, state, pkceCodes, safeState, targetAuthName)
+			}
+		}
+		exchangeCtxErr := exchangeCtx.Err()
+		exchangeCancel()
 		if errExchange != nil {
 			authErr := claude.NewAuthenticationError(claude.ErrCodeExchangeFailed, errExchange)
 			log.Errorf("Failed to exchange authorization code for tokens: %v", authErr)
-			SetOAuthSessionError(state, "Failed to exchange authorization code for tokens")
+			if errors.Is(errExchange, context.DeadlineExceeded) || errors.Is(exchangeCtxErr, context.DeadlineExceeded) {
+				SetOAuthSessionError(state, fmt.Sprintf("Claude OAuth token exchange timed out after %s", anthropicOAuthExchangeTimeout))
+			} else if errors.Is(errExchange, context.Canceled) || errors.Is(exchangeCtxErr, context.Canceled) {
+				SetOAuthSessionError(state, "Claude OAuth token exchange was cancelled")
+			} else {
+				SetOAuthSessionError(state, fmt.Sprintf("Claude OAuth token exchange failed: %v", errExchange))
+			}
 			return
 		}
+		log.WithFields(log.Fields{
+			"state": safeState,
+			"email": tokenStorageEmailForLog(bundle),
+		}).Info("Claude OAuth token exchange completed")
 
 		// Create token storage
 		tokenStorage := anthropicAuth.CreateTokenStorage(bundle)
-		record := &coreauth.Auth{
-			ID:       fmt.Sprintf("claude-%s.json", tokenStorage.Email),
-			Provider: "claude",
-			FileName: fmt.Sprintf("claude-%s.json", tokenStorage.Email),
-			Storage:  tokenStorage,
-			Metadata: map[string]any{"email": tokenStorage.Email},
-		}
+		record := buildClaudeOAuthTokenRecord(targetAuth, tokenStorage)
 		savedPath, errSave := h.saveTokenRecord(ctx, record)
 		if errSave != nil {
 			log.Errorf("Failed to save authentication tokens: %v", errSave)
@@ -2689,6 +3508,13 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 	}()
 
 	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
+}
+
+func tokenStorageEmailForLog(bundle *claude.ClaudeAuthBundle) string {
+	if bundle == nil {
+		return ""
+	}
+	return strings.TrimSpace(bundle.TokenData.Email)
 }
 
 func (h *Handler) RequestGeminiCLIToken(c *gin.Context) {

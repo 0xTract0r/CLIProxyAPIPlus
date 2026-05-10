@@ -25,6 +25,8 @@ const (
 	RedirectURI = "http://localhost:54545/callback"
 )
 
+const maxOAuthErrorBodyBytes = 512
+
 // tokenResponse represents the response structure from Anthropic's OAuth token endpoint.
 // It contains access token, refresh token, and associated user/organization information.
 type tokenResponse struct {
@@ -50,8 +52,9 @@ type ClaudeAuth struct {
 }
 
 // NewClaudeAuth creates a new Anthropic authentication service.
-// It initializes the HTTP client with a custom TLS transport that uses Firefox
-// fingerprint to bypass Cloudflare's TLS fingerprinting on Anthropic domains.
+// It initializes the OAuth HTTP client with a bounded standard transport. OAuth
+// token exchange is a control-plane flow and should favor reliability and proxy
+// correctness over browser-like ClientHello impersonation.
 //
 // Parameters:
 //   - cfg: The application configuration containing proxy settings
@@ -79,11 +82,16 @@ func NewClaudeAuthWithProxyURL(cfg *config.Config, proxyURL string) *ClaudeAuth 
 		sdkCfg = &sdkCfgCopy
 	}
 
-	// Use custom HTTP client with Firefox TLS fingerprint to bypass
-	// Cloudflare's bot detection on Anthropic domains
 	return &ClaudeAuth{
 		httpClient: NewAnthropicHttpClient(sdkCfg),
 	}
+}
+
+func NewClaudeAuthWithHTTPClient(client *http.Client) *ClaudeAuth {
+	if client == nil {
+		client = NewAnthropicHttpClient(nil)
+	}
+	return &ClaudeAuth{httpClient: client}
 }
 
 // GenerateAuthURL creates the OAuth authorization URL with PKCE.
@@ -201,7 +209,7 @@ func (o *ClaudeAuth) ExchangeCodeForTokens(ctx context.Context, code, state stri
 	// log.Debugf("Token response: %s", string(body))
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("token exchange failed with status %d: %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("token exchange failed with status %d: %s", resp.StatusCode, summarizeOAuthErrorBody(body))
 	}
 	// log.Debugf("Token response: %s", string(body))
 
@@ -225,6 +233,19 @@ func (o *ClaudeAuth) ExchangeCodeForTokens(ctx context.Context, code, state stri
 	}
 
 	return bundle, nil
+}
+
+func summarizeOAuthErrorBody(body []byte) string {
+	summary := strings.TrimSpace(string(body))
+	if summary == "" {
+		return "<empty response body>"
+	}
+	summary = strings.ReplaceAll(summary, "\r", " ")
+	summary = strings.ReplaceAll(summary, "\n", " ")
+	if len(summary) > maxOAuthErrorBodyBytes {
+		return summary[:maxOAuthErrorBodyBytes] + "..."
+	}
+	return summary
 }
 
 // RefreshTokens refreshes the access token using the refresh token.

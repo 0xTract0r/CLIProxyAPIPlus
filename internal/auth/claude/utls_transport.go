@@ -3,9 +3,14 @@
 package claude
 
 import (
+	"context"
+	"errors"
+	"fmt"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	tls "github.com/refraction-networking/utls"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
@@ -28,6 +33,8 @@ type utlsRoundTripper struct {
 	dialer proxy.Dialer
 }
 
+const anthropicHTTPClientTimeout = 60 * time.Second
+
 // newUtlsRoundTripper creates a new utls-based round tripper with optional proxy support
 func newUtlsRoundTripper(cfg *config.SDKConfig) *utlsRoundTripper {
 	var dialer proxy.Dialer = proxy.Direct
@@ -47,10 +54,41 @@ func newUtlsRoundTripper(cfg *config.SDKConfig) *utlsRoundTripper {
 	}
 }
 
+func (t *utlsRoundTripper) waitForPendingConnection(ctx context.Context, host string, cond *sync.Cond) (*http2.ClientConn, error) {
+	wakeOnCancelDone := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			t.mu.Lock()
+			cond.Broadcast()
+			t.mu.Unlock()
+		case <-wakeOnCancelDone:
+		}
+	}()
+	defer close(wakeOnCancelDone)
+
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		cond.Wait()
+		if h2Conn, ok := t.connections[host]; ok && h2Conn.CanTakeNewRequest() {
+			return h2Conn, nil
+		}
+		if _, stillPending := t.pending[host]; !stillPending {
+			return nil, nil
+		}
+	}
+}
+
 // getOrCreateConnection gets an existing connection or creates a new one.
 // It uses a per-host locking mechanism to prevent multiple goroutines from
 // creating connections to the same host simultaneously.
-func (t *utlsRoundTripper) getOrCreateConnection(host, addr string) (*http2.ClientConn, error) {
+func (t *utlsRoundTripper) getOrCreateConnection(ctx context.Context, host, addr string) (*http2.ClientConn, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	t.mu.Lock()
 
 	// Check if connection exists and is usable
@@ -62,9 +100,12 @@ func (t *utlsRoundTripper) getOrCreateConnection(host, addr string) (*http2.Clie
 	// Check if another goroutine is already creating a connection
 	if cond, ok := t.pending[host]; ok {
 		// Wait for the other goroutine to finish
-		cond.Wait()
-		// Check if connection is now available
-		if h2Conn, ok := t.connections[host]; ok && h2Conn.CanTakeNewRequest() {
+		h2Conn, err := t.waitForPendingConnection(ctx, host, cond)
+		if err != nil {
+			t.mu.Unlock()
+			return nil, err
+		}
+		if h2Conn != nil {
 			t.mu.Unlock()
 			return h2Conn, nil
 		}
@@ -77,7 +118,7 @@ func (t *utlsRoundTripper) getOrCreateConnection(host, addr string) (*http2.Clie
 	t.mu.Unlock()
 
 	// Create connection outside the lock
-	h2Conn, err := t.createConnection(host, addr)
+	h2Conn, err := t.createConnection(ctx, host, addr)
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -95,14 +136,62 @@ func (t *utlsRoundTripper) getOrCreateConnection(host, addr string) (*http2.Clie
 	return h2Conn, nil
 }
 
+func (t *utlsRoundTripper) dialWithContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	type dialResult struct {
+		conn net.Conn
+		err  error
+	}
+	resultCh := make(chan dialResult, 1)
+	go func() {
+		conn, err := t.dialer.Dial(network, addr)
+		resultCh <- dialResult{conn: conn, err: err}
+	}()
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case result := <-resultCh:
+		return result.conn, result.err
+	}
+}
+
+func closeConnectionOnCancel(ctx context.Context, conn net.Conn) func() {
+	cancelWatchDone := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+		case <-cancelWatchDone:
+		}
+	}()
+	return func() { close(cancelWatchDone) }
+}
+
 // createConnection creates a new HTTP/2 connection with Chrome TLS fingerprint.
 // Chrome's TLS fingerprint is closer to Node.js/OpenSSL (which real Claude Code uses)
 // than Firefox, reducing the mismatch between TLS layer and HTTP headers.
-func (t *utlsRoundTripper) createConnection(host, addr string) (*http2.ClientConn, error) {
-	conn, err := t.dialer.Dial("tcp", addr)
+func (t *utlsRoundTripper) createConnection(ctx context.Context, host, addr string) (*http2.ClientConn, error) {
+	conn, err := t.dialWithContext(ctx, "tcp", addr)
 	if err != nil {
 		return nil, err
 	}
+	defer func() {
+		if err := conn.SetDeadline(time.Time{}); err != nil && !errors.Is(err, net.ErrClosed) {
+			log.Debugf("failed to clear utls connection deadline for %s: %v", host, err)
+		}
+	}()
+	if deadline, ok := ctx.Deadline(); ok {
+		if errDeadline := conn.SetDeadline(deadline); errDeadline != nil {
+			_ = conn.Close()
+			return nil, fmt.Errorf("failed to set connection deadline: %w", errDeadline)
+		}
+	}
+	stopCancelWatcher := closeConnectionOnCancel(ctx, conn)
+	defer stopCancelWatcher()
 
 	tlsConfig := &tls.Config{ServerName: host}
 	tlsConn := tls.UClient(conn, tlsConfig, tls.HelloChrome_Auto)
@@ -124,6 +213,11 @@ func (t *utlsRoundTripper) createConnection(host, addr string) (*http2.ClientCon
 
 // RoundTrip implements http.RoundTripper
 func (t *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	ctx := req.Context()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	host := req.URL.Host
 	addr := host
 	if !strings.Contains(addr, ":") {
@@ -133,7 +227,7 @@ func (t *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 	// Get hostname without port for TLS ServerName
 	hostname := req.URL.Hostname()
 
-	h2Conn, err := t.getOrCreateConnection(hostname, addr)
+	h2Conn, err := t.getOrCreateConnection(ctx, hostname, addr)
 	if err != nil {
 		return nil, err
 	}
@@ -152,11 +246,36 @@ func (t *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 	return resp, nil
 }
 
-// NewAnthropicHttpClient creates an HTTP client that bypasses TLS fingerprinting
-// for Anthropic domains by using utls with Chrome fingerprint.
+// NewAnthropicHttpClient creates the OAuth control-plane HTTP client. Runtime
+// Claude requests may use account transport profiles, but OAuth token exchange
+// must avoid the legacy uTLS-only HTTP/2 path because a proxy/TLS mismatch can
+// leave remote Management Center re-auth stuck after callback submission.
 // It accepts optional SDK configuration for proxy settings.
 func NewAnthropicHttpClient(cfg *config.SDKConfig) *http.Client {
+	proxyURL := ""
+	if cfg != nil {
+		proxyURL = strings.TrimSpace(cfg.ProxyURL)
+	}
+	transport, mode, errBuild := proxyutil.BuildHTTPTransport(proxyURL)
+	if errBuild != nil {
+		log.Errorf("failed to configure Claude OAuth HTTP transport for %q: %v", proxyURL, errBuild)
+	}
+	if transport == nil {
+		if mode == proxyutil.ModeDirect {
+			transport = proxyutil.NewDirectTransport()
+		} else if defaultTransport, ok := http.DefaultTransport.(*http.Transport); ok && defaultTransport != nil {
+			transport = defaultTransport.Clone()
+		} else {
+			transport = &http.Transport{}
+		}
+	}
+	transport.TLSHandshakeTimeout = 15 * time.Second
+	transport.ResponseHeaderTimeout = 45 * time.Second
+	transport.ExpectContinueTimeout = 1 * time.Second
+	transport.ForceAttemptHTTP2 = true
+
 	return &http.Client{
-		Transport: newUtlsRoundTripper(cfg),
+		Transport: transport,
+		Timeout:   anthropicHTTPClientTimeout,
 	}
 }

@@ -285,6 +285,86 @@ func (a *Auth) DisableCoolingOverride() (bool, bool) {
 	return false, false
 }
 
+// RefreshDisabled reports whether credential refresh is explicitly disabled for this auth.
+// It is intended for access-token-only test/migration records where using a refresh token
+// would conflict with another runtime holding the same account.
+func (a *Auth) RefreshDisabled() bool {
+	if a == nil {
+		return false
+	}
+	if refreshDisabledFromMetadata(a.Metadata) {
+		return true
+	}
+	if len(a.Attributes) > 0 {
+		for _, key := range []string{"refresh_disabled", "disable_refresh", "auto_refresh_disabled"} {
+			if parsed, ok := parseBoolAny(a.Attributes[key]); ok && parsed {
+				return true
+			}
+		}
+		for _, key := range []string{"refresh_enabled", "auto_refresh", "auto_refresh_enabled"} {
+			if parsed, ok := parseBoolAny(a.Attributes[key]); ok && !parsed {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func refreshDisabledFromMetadata(meta map[string]any) bool {
+	if len(meta) == 0 {
+		return false
+	}
+	for _, key := range []string{"refresh_disabled", "disable_refresh", "auto_refresh_disabled"} {
+		if parsed, ok := parseBoolAny(meta[key]); ok && parsed {
+			return true
+		}
+	}
+	for _, key := range []string{"refresh_enabled", "auto_refresh", "auto_refresh_enabled"} {
+		if parsed, ok := parseBoolAny(meta[key]); ok && !parsed {
+			return true
+		}
+	}
+	if settings, ok := metadataObject(meta["account_settings"]); ok {
+		for _, key := range []string{"refresh_disabled", "disable_refresh", "auto_refresh_disabled"} {
+			if parsed, okParse := parseBoolAny(settings[key]); okParse && parsed {
+				return true
+			}
+		}
+		for _, key := range []string{"refresh_enabled", "auto_refresh", "auto_refresh_enabled"} {
+			if parsed, okParse := parseBoolAny(settings[key]); okParse && !parsed {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func metadataObject(raw any) (map[string]any, bool) {
+	if raw == nil {
+		return nil, false
+	}
+	switch value := raw.(type) {
+	case map[string]any:
+		return value, len(value) > 0
+	case map[string]string:
+		out := make(map[string]any, len(value))
+		for key, val := range value {
+			out[key] = val
+		}
+		return out, len(out) > 0
+	default:
+		data, err := json.Marshal(raw)
+		if err != nil {
+			return nil, false
+		}
+		var out map[string]any
+		if err = json.Unmarshal(data, &out); err != nil {
+			return nil, false
+		}
+		return out, len(out) > 0
+	}
+}
+
 // ToolPrefixDisabled returns whether the proxy_ tool name prefix should be
 // skipped for this auth. When true, tool names are sent to Anthropic unchanged.
 // The value is read from metadata key "tool_prefix_disabled" (or "tool-prefix-disabled").

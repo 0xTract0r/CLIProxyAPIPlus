@@ -69,6 +69,10 @@ const (
 	refreshIneffectiveBackoff = 30 * time.Second
 	quotaBackoffBase          = time.Second
 	quotaBackoffMax           = 30 * time.Minute
+	// transientRateLimitCooldown is the brief cooldown applied to non-plan-quota
+	// 429 responses (e.g. model capacity, TPM bursts) so other auths can be tried
+	// while this one recovers within a short window.
+	transientRateLimitCooldown = time.Minute
 )
 
 var quotaCooldownDisabled atomic.Bool
@@ -2035,30 +2039,45 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 								shouldSuspendModel = true
 							}
 						case 429:
+							// Plan-level quota signal: codex executor's parseCodexRetryAfter
+							// only returns a non-nil RetryAfter when the upstream payload
+							// declares error.type == "usage_limit_reached"; other 429s
+							// (model_capacity / TPM bursts / context_length) leave it nil
+							// and should be treated as transient so the auth recovers fast.
+							isPlanQuota := result.RetryAfter != nil && *result.RetryAfter > 0
 							var next time.Time
 							backoffLevel := state.Quota.BackoffLevel
 							if !disableCooling {
-								if result.RetryAfter != nil {
+								if isPlanQuota {
 									next = now.Add(*result.RetryAfter)
 								} else {
-									cooldown, nextLevel := nextQuotaCooldown(backoffLevel, disableCooling)
-									if cooldown > 0 {
-										next = now.Add(cooldown)
-									}
-									backoffLevel = nextLevel
+									next = now.Add(transientRateLimitCooldown)
 								}
 							}
 							state.NextRetryAfter = next
-							state.Quota = QuotaState{
-								Exceeded:      true,
-								Reason:        "quota",
-								NextRecoverAt: next,
-								BackoffLevel:  backoffLevel,
-							}
-							if !disableCooling {
-								suspendReason = "quota"
-								shouldSuspendModel = true
-								setModelQuota = true
+							if isPlanQuota {
+								state.Quota = QuotaState{
+									Exceeded:      true,
+									Reason:        "quota",
+									NextRecoverAt: next,
+									BackoffLevel:  backoffLevel,
+								}
+								if !disableCooling {
+									suspendReason = "quota"
+									shouldSuspendModel = true
+									setModelQuota = true
+								}
+							} else {
+								state.Quota = QuotaState{
+									Exceeded:      false,
+									Reason:        "transient",
+									NextRecoverAt: next,
+									BackoffLevel:  backoffLevel,
+								}
+								if !disableCooling {
+									suspendReason = "transient"
+									shouldSuspendModel = true
+								}
 							}
 						case 408, 500, 502, 503, 504:
 							if disableCooling {
@@ -2976,6 +2995,9 @@ func (m *Manager) shouldRefresh(a *Auth, now time.Time) bool {
 	if a == nil || a.Disabled {
 		return false
 	}
+	if a.RefreshDisabled() {
+		return false
+	}
 	if !a.NextRefreshAfter.IsZero() && now.Before(a.NextRefreshAfter) {
 		return false
 	}
@@ -3210,6 +3232,19 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 	}
 	m.mu.RUnlock()
 	if auth == nil || exec == nil {
+		return
+	}
+	if cloned != nil && cloned.RefreshDisabled() {
+		m.mu.Lock()
+		if current := m.auths[id]; current != nil {
+			current.NextRefreshAfter = time.Time{}
+			m.auths[id] = current
+			if m.scheduler != nil {
+				m.scheduler.upsertAuth(current.Clone())
+			}
+		}
+		m.mu.Unlock()
+		m.queueRefreshReschedule(id)
 		return
 	}
 	updated, err := exec.Refresh(ctx, cloned)

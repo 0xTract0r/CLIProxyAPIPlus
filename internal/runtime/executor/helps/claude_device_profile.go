@@ -69,6 +69,7 @@ type ClaudeDeviceProfile struct {
 	RuntimeVersion string
 	OS             string
 	Arch           string
+	Source         ManagedHeaderProfileSource
 	version        claudeCLIVersion
 	hasVersion     bool
 }
@@ -118,10 +119,24 @@ func defaultClaudeDeviceProfile(cfg *config.Config) ClaudeDeviceProfile {
 		RuntimeVersion: hdrDefault(hd.RuntimeVersion, defaultClaudeFingerprintRuntimeVersion),
 		OS:             hdrDefault(hd.OS, defaultClaudeFingerprintOS),
 		Arch:           hdrDefault(hd.Arch, defaultClaudeFingerprintArch),
+		Source:         defaultManagedHeaderProfileSource(),
 	}
 	if version, ok := parseClaudeCLIVersion(profile.UserAgent); ok {
 		profile.version = version
 		profile.hasVersion = true
+	}
+	if online, ok := resolveManagedHeaderOnlineVersion("claude", cfg); ok {
+		candidateUA := "claude-cli/" + online.Version + " (external, cli)"
+		if candidateVersion, candidateOK := parseClaudeCLIVersion(candidateUA); candidateOK {
+			candidate := profile
+			candidate.UserAgent = candidateUA
+			candidate.version = candidateVersion
+			candidate.hasVersion = true
+			candidate.Source = online.ManagedHeaderProfileSource
+			if shouldUpgradeClaudeDeviceProfile(candidate, profile) {
+				profile = candidate
+			}
+		}
 	}
 	return profile
 }
@@ -200,9 +215,11 @@ func normalizeClaudeDeviceProfile(profile, baseline ClaudeDeviceProfile) ClaudeD
 		profile.UserAgent = baseline.UserAgent
 		profile.PackageVersion = baseline.PackageVersion
 		profile.RuntimeVersion = baseline.RuntimeVersion
+		profile.Source = baseline.Source
 		profile.version = baseline.version
 		profile.hasVersion = baseline.hasVersion
 	}
+	profile.Source = withManagedHeaderProfileSource(profile.Source, baseline.Source)
 	return profile
 }
 
@@ -224,6 +241,7 @@ func extractClaudeDeviceProfile(headers http.Header, cfg *config.Config) (Claude
 		RuntimeVersion: firstNonEmptyHeader(headers, "X-Stainless-Runtime-Version", baseline.RuntimeVersion),
 		OS:             firstNonEmptyHeader(headers, "X-Stainless-Os", baseline.OS),
 		Arch:           firstNonEmptyHeader(headers, "X-Stainless-Arch", baseline.Arch),
+		Source:         observedManagedHeaderProfileSource(),
 		version:        version,
 		hasVersion:     true,
 	}

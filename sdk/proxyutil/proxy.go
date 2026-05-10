@@ -113,8 +113,25 @@ func BuildHTTPTransport(raw string) (*http.Transport, Mode, error) {
 			}
 			transport := cloneDefaultTransport()
 			transport.Proxy = nil
-			transport.DialContext = func(_ context.Context, network, addr string) (net.Conn, error) {
-				return dialer.Dial(network, addr)
+			transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+				type dialResult struct {
+					conn net.Conn
+					err  error
+				}
+				resultCh := make(chan dialResult, 1)
+				go func() {
+					conn, err := dialer.Dial(network, addr)
+					resultCh <- dialResult{conn: conn, err: err}
+				}()
+				select {
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				case result := <-resultCh:
+					return result.conn, result.err
+				}
 			}
 			applyTestRootCA(transport)
 			return transport, setting.Mode, nil

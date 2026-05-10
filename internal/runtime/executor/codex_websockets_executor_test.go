@@ -355,3 +355,71 @@ func TestNewProxyAwareWebsocketDialerDirectDisablesProxy(t *testing.T) {
 		t.Fatal("expected websocket proxy function to be nil for direct mode")
 	}
 }
+
+func TestCodexWebsocketSessionStoreKeyIncludesTLSProfile(t *testing.T) {
+	authA := &cliproxyauth.Auth{
+		ID:       "codex-session-auth",
+		Provider: "codex",
+		ProxyURL: "http://shared-proxy.example.com:8080",
+		Metadata: map[string]any{
+			"account_settings": map[string]any{
+				"transport_profile": map[string]any{
+					"preset": "provider-default",
+				},
+				"tls_profile": map[string]any{
+					"preset": "codex_go_standard_h2_v1",
+				},
+			},
+		},
+	}
+	authB := &cliproxyauth.Auth{
+		ID:       "codex-session-auth",
+		Provider: "codex",
+		ProxyURL: "http://shared-proxy.example.com:8080",
+		Metadata: map[string]any{
+			"account_settings": map[string]any{
+				"transport_profile": map[string]any{
+					"preset": "provider-default",
+				},
+				"tls_profile": map[string]any{
+					"preset":       "codex_go_http11_v1",
+					"force_http11": true,
+				},
+			},
+		},
+	}
+
+	keyA := codexWebsocketSessionStoreKey("session-1", authA, "wss://chatgpt.com/backend-api/codex/responses")
+	keyB := codexWebsocketSessionStoreKey("session-1", authB, "wss://chatgpt.com/backend-api/codex/responses")
+
+	if keyA == "" || keyB == "" {
+		t.Fatalf("expected non-empty session store keys, got %q and %q", keyA, keyB)
+	}
+	if keyA == keyB {
+		t.Fatalf("expected websocket session keys to differ by tls_profile, got %q", keyA)
+	}
+}
+
+func TestCodexWebsocketSessionStoreKey_IncludesFallbackProxy(t *testing.T) {
+	auth := &cliproxyauth.Auth{
+		ID:       "codex-session-auth",
+		Provider: "codex",
+		Metadata: map[string]any{
+			"account_settings": map[string]any{
+				"transport_profile": map[string]any{
+					"preset": "provider-default",
+				},
+			},
+		},
+	}
+
+	keyA := codexWebsocketSessionStoreKey("session-1", auth, "wss://chatgpt.com/backend-api/codex/responses", "http://cfg-proxy-a.example.com:8080")
+	keyB := codexWebsocketSessionStoreKey("session-1", auth, "wss://chatgpt.com/backend-api/codex/responses", "http://cfg-proxy-b.example.com:8080")
+
+	if keyA == "" || keyB == "" {
+		t.Fatalf("expected non-empty session store keys, got %q and %q", keyA, keyB)
+	}
+	if keyA == keyB {
+		t.Fatalf("expected websocket session keys to differ by effective fallback proxy, got %q", keyA)
+	}
+}

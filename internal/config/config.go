@@ -135,6 +135,9 @@ type Config struct {
 	// These are used as fallbacks when the client does not send its own headers.
 	ClaudeHeaderDefaults ClaudeHeaderDefaults `yaml:"claude-header-defaults" json:"claude-header-defaults"`
 
+	// ManagedHeaderProfile controls online refresh of version-sensitive managed header profiles.
+	ManagedHeaderProfile ManagedHeaderProfileConfig `yaml:"managed-header-profile" json:"managed-header-profile"`
+
 	// OpenAICompatibility defines OpenAI API compatibility configurations for external providers.
 	OpenAICompatibility []OpenAICompatibility `yaml:"openai-compatibility" json:"openai-compatibility"`
 
@@ -188,6 +191,16 @@ type ClaudeHeaderDefaults struct {
 type CodexHeaderDefaults struct {
 	UserAgent    string `yaml:"user-agent" json:"user-agent"`
 	BetaFeatures string `yaml:"beta-features" json:"beta-features"`
+}
+
+// ManagedHeaderProfileConfig controls whether core can consult public online
+// registries to refresh provider-managed version markers. The pointer bool lets
+// config-loaded runtimes default to enabled while hand-built test configs stay
+// offline unless explicitly opted in.
+type ManagedHeaderProfileConfig struct {
+	OnlineUpdate        *bool `yaml:"online-update,omitempty" json:"online-update,omitempty"`
+	FetchTimeoutSeconds int   `yaml:"fetch-timeout-seconds,omitempty" json:"fetch-timeout-seconds,omitempty"`
+	CacheTTLSeconds     int   `yaml:"cache-ttl-seconds,omitempty" json:"cache-ttl-seconds,omitempty"`
 }
 
 // TLSConfig holds HTTPS server settings.
@@ -669,6 +682,10 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.Pprof.Addr = DefaultPprofAddr
 	cfg.AmpCode.RestrictManagementToLocalhost = false // Default to false: API key auth is sufficient
 	cfg.RemoteManagement.PanelGitHubRepository = DefaultPanelGitHubRepository
+	managedHeaderOnlineUpdate := true
+	cfg.ManagedHeaderProfile.OnlineUpdate = &managedHeaderOnlineUpdate
+	cfg.ManagedHeaderProfile.FetchTimeoutSeconds = 2
+	cfg.ManagedHeaderProfile.CacheTTLSeconds = 6 * 60 * 60
 	cfg.IncognitoBrowser = false
 	if err = yaml.Unmarshal(data, &cfg); err != nil {
 		if optional {
@@ -752,6 +769,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 
 	// Sanitize Claude header defaults.
 	cfg.SanitizeClaudeHeaderDefaults()
+
+	// Sanitize managed header profile online update settings.
+	cfg.SanitizeManagedHeaderProfile()
 
 	// Sanitize Claude key headers
 	cfg.SanitizeClaudeKeys()
@@ -867,6 +887,50 @@ func (cfg *Config) SanitizeClaudeHeaderDefaults() {
 	cfg.ClaudeHeaderDefaults.OS = strings.TrimSpace(cfg.ClaudeHeaderDefaults.OS)
 	cfg.ClaudeHeaderDefaults.Arch = strings.TrimSpace(cfg.ClaudeHeaderDefaults.Arch)
 	cfg.ClaudeHeaderDefaults.Timeout = strings.TrimSpace(cfg.ClaudeHeaderDefaults.Timeout)
+}
+
+func (cfg *Config) SanitizeManagedHeaderProfile() {
+	if cfg == nil {
+		return
+	}
+	if cfg.ManagedHeaderProfile.FetchTimeoutSeconds <= 0 {
+		cfg.ManagedHeaderProfile.FetchTimeoutSeconds = 2
+	}
+	if cfg.ManagedHeaderProfile.FetchTimeoutSeconds > 10 {
+		cfg.ManagedHeaderProfile.FetchTimeoutSeconds = 10
+	}
+	if cfg.ManagedHeaderProfile.CacheTTLSeconds <= 0 {
+		cfg.ManagedHeaderProfile.CacheTTLSeconds = 6 * 60 * 60
+	}
+	if cfg.ManagedHeaderProfile.CacheTTLSeconds < 60 {
+		cfg.ManagedHeaderProfile.CacheTTLSeconds = 60
+	}
+}
+
+func ManagedHeaderOnlineUpdateEnabled(cfg *Config) bool {
+	return cfg != nil &&
+		cfg.ManagedHeaderProfile.OnlineUpdate != nil &&
+		*cfg.ManagedHeaderProfile.OnlineUpdate
+}
+
+func ManagedHeaderProfileFetchTimeout(cfg *Config) int {
+	if cfg == nil || cfg.ManagedHeaderProfile.FetchTimeoutSeconds <= 0 {
+		return 2
+	}
+	if cfg.ManagedHeaderProfile.FetchTimeoutSeconds > 10 {
+		return 10
+	}
+	return cfg.ManagedHeaderProfile.FetchTimeoutSeconds
+}
+
+func ManagedHeaderProfileCacheTTL(cfg *Config) int {
+	if cfg == nil || cfg.ManagedHeaderProfile.CacheTTLSeconds <= 0 {
+		return 6 * 60 * 60
+	}
+	if cfg.ManagedHeaderProfile.CacheTTLSeconds < 60 {
+		return 60
+	}
+	return cfg.ManagedHeaderProfile.CacheTTLSeconds
 }
 
 // SanitizeKiroKeys trims whitespace from Kiro credential fields.

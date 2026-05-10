@@ -44,7 +44,11 @@ func newProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 		proxyURL = strings.TrimSpace(cfg.ProxyURL)
 	}
 
-	if transportKey := RuntimeTransportProfileCacheKey(proxyURL, auth); transportKey != "" {
+	baseURLHost := RuntimeTransportHostFromContext(ctx)
+	if baseURLHost == "" {
+		baseURLHost = runtimeTransportBaseURLHost(auth)
+	}
+	if transportKey := RuntimeTransportProfileCacheKeyForHost(proxyURL, baseURLHost, auth); transportKey != "" {
 		httpClientCacheMutex.RLock()
 		if cachedClient, ok := httpClientCache[transportKey]; ok {
 			httpClientCacheMutex.RUnlock()

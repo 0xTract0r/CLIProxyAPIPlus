@@ -34,6 +34,52 @@ func TestToolPrefixDisabled(t *testing.T) {
 	}
 }
 
+func TestRefreshDisabled(t *testing.T) {
+	var a *Auth
+	if a.RefreshDisabled() {
+		t.Error("nil auth should not disable refresh")
+	}
+
+	a = &Auth{Metadata: map[string]any{"refresh_disabled": true}}
+	if !a.RefreshDisabled() {
+		t.Error("refresh_disabled=true should disable refresh")
+	}
+
+	a = &Auth{Metadata: map[string]any{"disable_refresh": "true"}}
+	if !a.RefreshDisabled() {
+		t.Error("disable_refresh=true should disable refresh")
+	}
+
+	a = &Auth{Metadata: map[string]any{"refresh_enabled": false}}
+	if !a.RefreshDisabled() {
+		t.Error("refresh_enabled=false should disable refresh")
+	}
+
+	a = &Auth{Metadata: map[string]any{
+		"account_settings": map[string]any{"refresh_enabled": false},
+	}}
+	if !a.RefreshDisabled() {
+		t.Error("account_settings.refresh_enabled=false should disable refresh")
+	}
+
+	a = &Auth{Metadata: map[string]any{
+		"account_settings": map[string]string{"auto_refresh": "false"},
+	}}
+	if !a.RefreshDisabled() {
+		t.Error("account_settings.auto_refresh=false should disable refresh")
+	}
+
+	a = &Auth{Attributes: map[string]string{"refresh_disabled": "true"}}
+	if !a.RefreshDisabled() {
+		t.Error("attribute refresh_disabled=true should disable refresh")
+	}
+
+	a = &Auth{Metadata: map[string]any{"refresh_disabled": false, "refresh_enabled": true}}
+	if a.RefreshDisabled() {
+		t.Error("explicit false disabled keys and true enabled keys should keep refresh enabled")
+	}
+}
+
 func TestEnsureIndexUsesCredentialIdentity(t *testing.T) {
 	t.Parallel()
 

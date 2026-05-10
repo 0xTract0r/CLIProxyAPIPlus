@@ -3,11 +3,13 @@ package management
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
@@ -157,8 +159,8 @@ func TestPatchAuthFileAccountSettings_RewritesRuntimeSnapshotAndStoredSchema(t *
 	if got := headersMeta["Version"]; got != "1.2.3" {
 		t.Fatalf("metadata.headers.Version = %#v, want %q", got, "1.2.3")
 	}
-	if got := headersMeta["Originator"]; got != "codex-tui" {
-		t.Fatalf("metadata.headers.Originator = %#v, want %q", got, "codex-tui")
+	if got := headersMeta["Originator"]; got != "Codex Desktop" {
+		t.Fatalf("metadata.headers.Originator = %#v, want %q", got, "Codex Desktop")
 	}
 	if got := headersMeta["X-Codex-Beta-Features"]; got != "feature-a,feature-b" {
 		t.Fatalf("metadata.headers.X-Codex-Beta-Features = %#v, want %q", got, "feature-a,feature-b")
@@ -189,11 +191,84 @@ func TestPatchAuthFileAccountSettings_RewritesRuntimeSnapshotAndStoredSchema(t *
 	if got := resp.AccountSettings.ManagedHeaders["Version"]; got != "1.2.3" {
 		t.Fatalf("response managed Version = %q, want %q", got, "1.2.3")
 	}
-	if got := resp.AccountSettings.ManagedHeaders["Originator"]; got != "codex-tui" {
-		t.Fatalf("response managed Originator = %q, want %q", got, "codex-tui")
+	if got := resp.AccountSettings.ManagedHeaders["Originator"]; got != "Codex Desktop" {
+		t.Fatalf("response managed Originator = %q, want %q", got, "Codex Desktop")
 	}
 	if resp.AccountSettings.ManagedHeaderState == nil || resp.AccountSettings.ManagedHeaderState.Current == nil {
 		t.Fatalf("expected managed_header_state.current to be present")
+	}
+}
+
+func TestPatchAuthFileAccountSettings_DisablesRefreshForAccessTokenOnlyRecords(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	record := &coreauth.Auth{
+		ID:               "codex-access-token-only.json",
+		FileName:         "codex-access-token-only.json",
+		Provider:         "codex",
+		NextRefreshAfter: time.Now().Add(5 * time.Second),
+		Attributes: map[string]string{
+			"path": "/tmp/codex-access-token-only.json",
+		},
+		Metadata: map[string]any{
+			"type":          "codex",
+			"access_token":  "access-token",
+			"refresh_token": "must-not-be-used",
+			"email":         "codex@example.test",
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("failed to register auth record: %v", errRegister)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+
+	body := `{"name":"codex-access-token-only.json","disabled":false,"refresh_enabled":false,"extra_headers":{}}`
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/account-settings", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	ctx.Request = req
+	h.PatchAuthFileAccountSettings(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+
+	updated, ok := manager.GetByID("codex-access-token-only.json")
+	if !ok || updated == nil {
+		t.Fatalf("expected updated auth record")
+	}
+	if !updated.RefreshDisabled() {
+		t.Fatalf("expected refresh to be disabled")
+	}
+	if !updated.NextRefreshAfter.IsZero() {
+		t.Fatalf("NextRefreshAfter = %s, want zero", updated.NextRefreshAfter)
+	}
+	if got := updated.Metadata["refresh_token"]; got != "must-not-be-used" {
+		t.Fatalf("refresh token should not be mutated by settings toggle, got %#v", got)
+	}
+
+	var resp authFileAccountSettingsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to decode patch response: %v", err)
+	}
+	if resp.AccountSettings.RefreshEnabled {
+		t.Fatalf("response refresh_enabled = true, want false")
+	}
+	if resp.AccountSettings.Activation.State != "refresh-disabled" {
+		t.Fatalf("activation state = %q, want refresh-disabled", resp.AccountSettings.Activation.State)
+	}
+
+	refreshed, errRefresh := h.refreshAuthStatus(context.Background(), updated)
+	if !errors.Is(errRefresh, errAuthRefreshDisabled) {
+		t.Fatalf("refreshAuthStatus error = %v, want errAuthRefreshDisabled", errRefresh)
+	}
+	if refreshed == nil || !refreshed.RefreshDisabled() {
+		t.Fatalf("refresh-disabled auth should remain disabled after manual refresh attempt")
 	}
 }
 
@@ -314,17 +389,35 @@ func TestGetAuthFileAccountSettings_PersistsCodexManagedHeaderHistoryAcrossVersi
 		t.Fatalf("expected managed_header_state to be present")
 	}
 	if len(firstResp.AccountSettings.ManagedHeaderState.History) != 1 {
-		t.Fatalf("history length = %d, want 1", len(firstResp.AccountSettings.ManagedHeaderState.History))
+		t.Fatalf("history length = %d, want 1: %#v", len(firstResp.AccountSettings.ManagedHeaderState.History), firstResp.AccountSettings.ManagedHeaderState.History)
 	}
 	firstHistory := firstResp.AccountSettings.ManagedHeaderState.History[0]
-	if got := firstHistory.ChangedFields; !reflect.DeepEqual(got, []string{"User-Agent", "Version"}) {
+	if got := firstHistory.ChangedFields; !reflect.DeepEqual(got, []string{"User-Agent", "Version", "terminal"}) {
 		t.Fatalf("first changed_fields = %#v, want only version markers", got)
+	}
+	if got := firstHistory.PreviousSummaryHeaders["User-Agent"]; got != "codex-tui/0.118.0 (Mac OS 26.3.1; arm64) iTerm.app/3.6.9 (codex-tui; 0.118.0)" {
+		t.Fatalf("previous summary User-Agent = %q", got)
+	}
+	if got := firstHistory.NextSummaryHeaders["User-Agent"]; got != firstResp.AccountSettings.ManagedHeaders["User-Agent"] {
+		t.Fatalf("next summary User-Agent = %q, want current managed User-Agent", got)
 	}
 	if got := firstHistory.PreviousVersionedCapabilities["Version"]; got != "0.118.0" {
 		t.Fatalf("previous Version = %q, want %q", got, "0.118.0")
 	}
 	if got := firstHistory.NextVersionedCapabilities["Version"]; got != "0.124.0" {
 		t.Fatalf("next Version = %q, want %q", got, "0.124.0")
+	}
+	if got := firstHistory.PreviousStableIdentity["Originator"]; got != "codex-tui" {
+		t.Fatalf("previous stable Originator = %q, want codex-tui", got)
+	}
+	if got := firstHistory.NextStableIdentity["Originator"]; got != "codex-tui" {
+		t.Fatalf("next stable Originator = %q, want codex-tui", got)
+	}
+	if got := firstHistory.PreviousRuntimeFingerprint["terminal"]; got != "iTerm.app/3.6.9 (codex-tui; 0.118.0)" {
+		t.Fatalf("previous runtime terminal = %q", got)
+	}
+	if got := firstHistory.NextRuntimeFingerprint["terminal"]; got != "iTerm.app/3.6.9 (codex-tui; 0.124.0)" {
+		t.Fatalf("next runtime terminal = %q", got)
 	}
 	if got := firstResp.AccountSettings.ManagedHeaderState.Current.StableIdentity["Originator"]; got != "codex-tui" {
 		t.Fatalf("stable identity Originator = %q, want %q", got, "codex-tui")
@@ -355,7 +448,7 @@ func TestGetAuthFileAccountSettings_PersistsCodexManagedHeaderHistoryAcrossVersi
 		t.Fatalf("history should append only; first entry changed: %#v", secondResp.AccountSettings.ManagedHeaderState.History)
 	}
 	secondHistory := secondResp.AccountSettings.ManagedHeaderState.History[1]
-	if got := secondHistory.ChangedFields; !reflect.DeepEqual(got, []string{"User-Agent", "Version"}) {
+	if got := secondHistory.ChangedFields; !reflect.DeepEqual(got, []string{"User-Agent", "Version", "terminal"}) {
 		t.Fatalf("second changed_fields = %#v, want only version markers", got)
 	}
 	if got := secondHistory.PreviousVersionedCapabilities["Version"]; got != "0.124.0" {
@@ -385,6 +478,389 @@ func TestGetAuthFileAccountSettings_PersistsCodexManagedHeaderHistoryAcrossVersi
 	}
 	if !reflect.DeepEqual(secondStoredState.History, secondResp.AccountSettings.ManagedHeaderState.History) {
 		t.Fatalf("stored history = %#v, want %#v", secondStoredState.History, secondResp.AccountSettings.ManagedHeaderState.History)
+	}
+}
+
+func TestGetAuthFileAccountSettings_MigratesLegacyCodexHeadersToManagedState(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	online := true
+	oldOverride := runtimehelps.ManagedHeaderOnlineFetchOverride
+	runtimehelps.ManagedHeaderOnlineFetchOverride = func(provider string, cfg *config.Config) (runtimehelps.ManagedHeaderOnlineVersion, bool) {
+		if provider != "codex" {
+			return runtimehelps.ManagedHeaderOnlineVersion{}, false
+		}
+		return runtimehelps.ManagedHeaderOnlineVersion{
+			Version: "0.130.0",
+			ManagedHeaderProfileSource: runtimehelps.ManagedHeaderProfileSource{
+				Source:    "online:npm",
+				SourceURL: "https://registry.npmjs.org/@openai%2fcodex/latest",
+				CheckedAt: "2026-04-29T12:00:00Z",
+			},
+		}, true
+	}
+	t.Cleanup(func() {
+		runtimehelps.ManagedHeaderOnlineFetchOverride = oldOverride
+	})
+
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	record := &coreauth.Auth{
+		ID:       "codex-legacy-managed-state.json",
+		FileName: "codex-legacy-managed-state.json",
+		Provider: "codex",
+		Metadata: map[string]any{
+			"type": "codex",
+			"headers": map[string]any{
+				"User-Agent": "codex-tui/0.124.0 (Mac OS 26.3.1; arm64) iTerm.app/3.6.9 (codex-tui; 0.124.0)",
+				"Version":    "0.124.0",
+				"Originator": "codex-tui",
+			},
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("failed to register auth record: %v", errRegister)
+	}
+
+	cfg := &config.Config{
+		AuthDir: t.TempDir(),
+		ManagedHeaderProfile: config.ManagedHeaderProfileConfig{
+			OnlineUpdate: &online,
+		},
+	}
+	h := NewHandlerWithoutConfigFilePath(cfg, manager)
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodGet, "/v0/management/auth-files/account-settings?name=codex-legacy-managed-state.json", nil)
+	ctx.Request = req
+	h.GetAuthFileAccountSettings(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+	var resp authFileAccountSettingsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	state := resp.AccountSettings.ManagedHeaderState
+	if state == nil || state.Current == nil {
+		t.Fatalf("expected migrated managed_header_state.current")
+	}
+	if got := state.Current.Source; got != "community:codex-proxy" {
+		t.Fatalf("current source = %q, want community:codex-proxy", got)
+	}
+	if got := resp.AccountSettings.ManagedHeaders["Version"]; got != "26.318.11754" {
+		t.Fatalf("managed Version = %q, want Codex Desktop app version", got)
+	}
+	updated, ok := manager.GetByID("codex-legacy-managed-state.json")
+	if !ok || updated == nil {
+		t.Fatalf("expected updated auth record")
+	}
+	stored := readAccountSettingsMetadata(updated, cfg)
+	if stored.ManagedHeaderState == nil || stored.ManagedHeaderState.Current == nil {
+		t.Fatalf("expected managed state persisted into account_settings")
+	}
+}
+
+func TestGetAuthFileAccountSettings_UsesOnlineManagedHeaderSourceAndRecordsHistory(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	onlineVersion := "0.130.0"
+	checkedAt := "2026-04-29T12:00:00Z"
+	online := true
+	oldOverride := runtimehelps.ManagedHeaderOnlineFetchOverride
+	runtimehelps.ManagedHeaderOnlineFetchOverride = func(provider string, cfg *config.Config) (runtimehelps.ManagedHeaderOnlineVersion, bool) {
+		if provider != "codex" {
+			return runtimehelps.ManagedHeaderOnlineVersion{}, false
+		}
+		return runtimehelps.ManagedHeaderOnlineVersion{
+			Version: onlineVersion,
+			ManagedHeaderProfileSource: runtimehelps.ManagedHeaderProfileSource{
+				Source:    "online:npm",
+				SourceURL: "https://registry.npmjs.org/@openai%2fcodex/latest",
+				CheckedAt: checkedAt,
+			},
+		}, true
+	}
+	t.Cleanup(func() {
+		runtimehelps.ManagedHeaderOnlineFetchOverride = oldOverride
+	})
+
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	record := &coreauth.Auth{
+		ID:       "codex-online-history.json",
+		FileName: "codex-online-history.json",
+		Provider: "codex",
+		Attributes: map[string]string{
+			"path": "/tmp/codex-online-history.json",
+		},
+		Metadata: map[string]any{
+			"type": "codex",
+			"headers": map[string]any{
+				"User-Agent": "codex-tui/0.124.0 (Mac OS 26.3.1; arm64) iTerm.app/3.6.9 (codex-tui; 0.124.0)",
+				"Version":    "0.124.0",
+				"Originator": "codex-tui",
+			},
+			"account_settings": map[string]any{
+				"schema_version": 1,
+				"managed_header_state": map[string]any{
+					"policy_version": "codex-managed/v2",
+					"current": map[string]any{
+						"generated_at": "2026-04-24T10:00:00Z",
+						"source":       "default",
+						"summary_headers": map[string]any{
+							"User-Agent": "codex-tui/0.124.0 (Mac OS 26.3.1; arm64) iTerm.app/3.6.9 (codex-tui; 0.124.0)",
+							"Version":    "0.124.0",
+							"Originator": "codex-tui",
+						},
+						"versioned_capabilities": map[string]any{
+							"User-Agent": "codex-tui/0.124.0 (Mac OS 26.3.1; arm64) iTerm.app/3.6.9 (codex-tui; 0.124.0)",
+							"Version":    "0.124.0",
+						},
+						"stable_identity": map[string]any{
+							"Originator": "codex-tui",
+						},
+						"runtime_fingerprint": map[string]any{
+							"platform": "Mac OS 26.3.1; arm64",
+							"terminal": "iTerm.app/3.6.9 (codex-tui; 0.124.0)",
+						},
+					},
+				},
+			},
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("failed to register auth record: %v", errRegister)
+	}
+
+	cfg := &config.Config{
+		AuthDir: t.TempDir(),
+		ManagedHeaderProfile: config.ManagedHeaderProfileConfig{
+			OnlineUpdate: &online,
+		},
+	}
+	h := NewHandlerWithoutConfigFilePath(cfg, manager)
+
+	getAccountSettings := func() authFileAccountSettingsResponse {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(rec)
+		req := httptest.NewRequest(http.MethodGet, "/v0/management/auth-files/account-settings?name=codex-online-history.json", nil)
+		ctx.Request = req
+		h.GetAuthFileAccountSettings(ctx)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+		}
+
+		var resp authFileAccountSettingsResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("failed to decode response: %v", err)
+		}
+		return resp
+	}
+
+	firstResp := getAccountSettings()
+	if got := firstResp.AccountSettings.ManagedHeaders["Version"]; got != "26.318.11754" {
+		t.Fatalf("managed Version = %q, want Codex Desktop app version", got)
+	}
+	if got := firstResp.AccountSettings.ManagedHeaderState.Current.Source; got != "community:codex-proxy" {
+		t.Fatalf("current source = %q, want community:codex-proxy", got)
+	}
+	if got := firstResp.AccountSettings.ManagedHeaderState.Current.SourceURL; got != "https://github.com/icebear0828/codex-proxy" {
+		t.Fatalf("current source_url = %q", got)
+	}
+	if got := firstResp.AccountSettings.ManagedHeaderState.Current.CheckedAt; got != "" {
+		t.Fatalf("current checked_at = %q, want empty for static community profile", got)
+	}
+	if len(firstResp.AccountSettings.ManagedHeaderState.History) != 1 {
+		t.Fatalf("history length = %d, want 1: %#v", len(firstResp.AccountSettings.ManagedHeaderState.History), firstResp.AccountSettings.ManagedHeaderState.History)
+	}
+	firstHistory := firstResp.AccountSettings.ManagedHeaderState.History[0]
+	if got := firstHistory.PreviousSource; got != "default" {
+		t.Fatalf("previous source = %q, want default", got)
+	}
+	if got := firstHistory.NextSource; got != "community:codex-proxy" {
+		t.Fatalf("next source = %q, want community:codex-proxy", got)
+	}
+	if got := firstHistory.PreviousVersionedCapabilities["Version"]; got != "0.124.0" {
+		t.Fatalf("previous Version = %q, want 0.124.0", got)
+	}
+	if got := firstHistory.NextVersionedCapabilities["Version"]; got != "26.318.11754" {
+		t.Fatalf("next Version = %q, want 26.318.11754", got)
+	}
+	if got := firstResp.AccountSettings.ManagedHeaderState.Current.StableIdentity["Originator"]; got != "Codex Desktop" {
+		t.Fatalf("stable identity Originator = %q, want Codex Desktop", got)
+	}
+	if got := firstResp.AccountSettings.ManagedHeaderState.Current.RuntimeFingerprint["platform"]; got != "darwin; arm64" {
+		t.Fatalf("platform fingerprint = %q, want Codex Desktop platform", got)
+	}
+	if got := firstResp.AccountSettings.ManagedHeaderState.Current.RuntimeFingerprint["terminal"]; got != "" {
+		t.Fatalf("terminal fingerprint = %q, want empty Codex Desktop terminal", got)
+	}
+
+	onlineVersion = "0.131.0"
+	checkedAt = "2026-04-29T13:00:00Z"
+	secondResp := getAccountSettings()
+	if got := secondResp.AccountSettings.ManagedHeaders["Version"]; got != "26.318.11754" {
+		t.Fatalf("second managed Version = %q, want Codex Desktop app version", got)
+	}
+	if len(secondResp.AccountSettings.ManagedHeaderState.History) != 1 {
+		t.Fatalf("second history length = %d, want 1", len(secondResp.AccountSettings.ManagedHeaderState.History))
+	}
+	if !reflect.DeepEqual(secondResp.AccountSettings.ManagedHeaderState.History[0], firstHistory) {
+		t.Fatalf("history should append only; first entry changed: %#v", secondResp.AccountSettings.ManagedHeaderState.History)
+	}
+	if got := secondResp.AccountSettings.ManagedHeaderState.Current.StableIdentity["Originator"]; got != "Codex Desktop" {
+		t.Fatalf("stable identity Originator = %q, want Codex Desktop", got)
+	}
+	if got := secondResp.AccountSettings.ManagedHeaderState.Current.RuntimeFingerprint["platform"]; got != "darwin; arm64" {
+		t.Fatalf("platform fingerprint = %q, want Codex Desktop platform", got)
+	}
+	if got := secondResp.AccountSettings.ManagedHeaderState.Current.RuntimeFingerprint["terminal"]; got != "" {
+		t.Fatalf("second terminal fingerprint = %q, want empty Codex Desktop terminal", got)
+	}
+}
+
+func TestGetAuthFileAccountSettings_UsesOnlineCodexProxyBundleAndRecordsHistory(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	online := true
+	oldOverride := runtimehelps.ManagedHeaderOnlineFetchOverride
+	runtimehelps.ManagedHeaderOnlineFetchOverride = func(provider string, cfg *config.Config) (runtimehelps.ManagedHeaderOnlineVersion, bool) {
+		if provider != "codex" {
+			return runtimehelps.ManagedHeaderOnlineVersion{}, false
+		}
+		return runtimehelps.ManagedHeaderOnlineVersion{
+			Version: "26.400.1",
+			ManagedHeaderProfileSource: runtimehelps.ManagedHeaderProfileSource{
+				Source:       "community:codex-proxy",
+				SourceURL:    "https://raw.githubusercontent.com/icebear0828/codex-proxy/master/config/default.yaml https://raw.githubusercontent.com/icebear0828/codex-proxy/master/config/fingerprint.yaml",
+				CheckedAt:    "2026-05-09T02:00:00Z",
+				Completeness: "online-coherent-bundle",
+			},
+			CodexProxyBundle: &runtimehelps.CodexProxyManagedHeaderBundle{
+				Originator:      "Codex Desktop",
+				AppVersion:      "26.400.1",
+				Platform:        "darwin",
+				Arch:            "arm64",
+				ChromiumVersion: "145",
+				DefaultHeaders: map[string]string{
+					"sec-ch-ua":          `"Chromium";v="145", "Not A(Brand";v="24"`,
+					"sec-ch-ua-mobile":   "?0",
+					"sec-ch-ua-platform": `"macOS"`,
+					"Accept-Encoding":    "gzip, deflate, br, zstd",
+					"Accept-Language":    "en-US,en;q=0.9",
+					"sec-fetch-site":     "same-origin",
+					"sec-fetch-mode":     "cors",
+					"sec-fetch-dest":     "empty",
+				},
+			},
+		}, true
+	}
+	t.Cleanup(func() {
+		runtimehelps.ManagedHeaderOnlineFetchOverride = oldOverride
+	})
+
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	record := &coreauth.Auth{
+		ID:       "codex-proxy-online-history.json",
+		FileName: "codex-proxy-online-history.json",
+		Provider: "codex",
+		Metadata: map[string]any{
+			"type": "codex",
+			"account_settings": map[string]any{
+				"schema_version": 1,
+				"managed_header_state": map[string]any{
+					"policy_version": "codex-managed/v2",
+					"current": map[string]any{
+						"generated_at": "2026-05-08T10:00:00Z",
+						"source":       "community:codex-proxy",
+						"source_url":   "https://github.com/icebear0828/codex-proxy",
+						"completeness": "static-coherent-bundle",
+						"summary_headers": map[string]any{
+							"User-Agent": "Codex Desktop/26.318.11754 (darwin; arm64)",
+							"Version":    "26.318.11754",
+							"Originator": "Codex Desktop",
+						},
+						"versioned_capabilities": map[string]any{
+							"User-Agent": "Codex Desktop/26.318.11754 (darwin; arm64)",
+							"Version":    "26.318.11754",
+						},
+						"stable_identity": map[string]any{
+							"Originator":         "Codex Desktop",
+							"sec-ch-ua":          `"Chromium";v="144"`,
+							"sec-ch-ua-mobile":   "?0",
+							"sec-ch-ua-platform": `"macOS"`,
+						},
+						"runtime_fingerprint": map[string]any{
+							"platform": "darwin; arm64",
+							"terminal": "",
+						},
+					},
+				},
+			},
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("failed to register auth record: %v", errRegister)
+	}
+
+	cfg := &config.Config{
+		AuthDir: t.TempDir(),
+		ManagedHeaderProfile: config.ManagedHeaderProfileConfig{
+			OnlineUpdate: &online,
+		},
+	}
+	h := NewHandlerWithoutConfigFilePath(cfg, manager)
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodGet, "/v0/management/auth-files/account-settings?name=codex-proxy-online-history.json", nil)
+	ctx.Request = req
+	h.GetAuthFileAccountSettings(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+	var resp authFileAccountSettingsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	state := resp.AccountSettings.ManagedHeaderState
+	if state == nil || state.Current == nil {
+		t.Fatalf("expected managed header state")
+	}
+	if got := resp.AccountSettings.ManagedHeaders["Version"]; got != "26.400.1" {
+		t.Fatalf("managed Version = %q, want online codex-proxy version", got)
+	}
+	if got := state.Current.CheckedAt; got != "2026-05-09T02:00:00Z" {
+		t.Fatalf("checked_at = %q", got)
+	}
+	if got := state.Current.Completeness; got != "online-coherent-bundle" {
+		t.Fatalf("completeness = %q", got)
+	}
+	if got := state.Current.StableIdentity["sec-ch-ua"]; !strings.Contains(got, `"Chromium";v="145"`) {
+		t.Fatalf("sec-ch-ua = %q, want Chromium 145", got)
+	}
+	if len(state.History) != 1 {
+		t.Fatalf("history length = %d, want 1: %#v", len(state.History), state.History)
+	}
+	history := state.History[0]
+	if got := history.PreviousVersionedCapabilities["Version"]; got != "26.318.11754" {
+		t.Fatalf("previous version = %q", got)
+	}
+	if got := history.NextVersionedCapabilities["Version"]; got != "26.400.1" {
+		t.Fatalf("next version = %q", got)
+	}
+	if !containsString(history.ChangedFields, "Version") || !containsString(history.ChangedFields, "sec-ch-ua") {
+		t.Fatalf("changed fields = %#v, want version and sec-ch-ua changes", history.ChangedFields)
 	}
 }
 
@@ -565,6 +1041,240 @@ func TestGetAuthFileAccountSettings_PersistsClaudeManagedHeaderHistoryAcrossVers
 	}
 }
 
+func TestGetAuthFileAccountSettings_PersistsCoreManagedRuntimeIdentity(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	records := []*coreauth.Auth{
+		{
+			ID:       "claude-runtime.json",
+			FileName: "claude-runtime.json",
+			Provider: "claude",
+			ProxyURL: "http://shared-proxy:8080",
+			Metadata: map[string]any{
+				"type":  "claude",
+				"email": "claude-a@example.test",
+			},
+		},
+		{
+			ID:       "codex-runtime-a.json",
+			FileName: "codex-runtime-a.json",
+			Provider: "codex",
+			ProxyURL: "http://shared-proxy:8080",
+			Metadata: map[string]any{
+				"type":  "codex",
+				"email": "codex-a@example.test",
+			},
+		},
+		{
+			ID:       "codex-runtime-b.json",
+			FileName: "codex-runtime-b.json",
+			Provider: "codex",
+			ProxyURL: "http://shared-proxy:8080",
+			Metadata: map[string]any{
+				"type":  "codex",
+				"email": "codex-b@example.test",
+			},
+		},
+		{
+			ID:       "gemini-runtime.json",
+			FileName: "gemini-runtime.json",
+			Provider: "gemini-cli",
+			Metadata: map[string]any{
+				"type": "gemini-cli",
+			},
+		},
+	}
+	for _, record := range records {
+		if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+			t.Fatalf("failed to register auth record: %v", errRegister)
+		}
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+	getAccountSettings := func(name string) authFileAccountSettingsResponse {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(rec)
+		req := httptest.NewRequest(http.MethodGet, "/v0/management/auth-files/account-settings?name="+name, nil)
+		ctx.Request = req
+		h.GetAuthFileAccountSettings(ctx)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected status %d for %s, got %d with body %s", http.StatusOK, name, rec.Code, rec.Body.String())
+		}
+		var resp authFileAccountSettingsResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("failed to decode response for %s: %v", name, err)
+		}
+		return resp
+	}
+
+	claude := getAccountSettings("claude-runtime.json")
+	if claude.AccountSettings.RuntimeIdentity == nil || claude.AccountSettings.RuntimeIdentity.Current == nil {
+		t.Fatalf("expected runtime identity for claude account without explicit profile")
+	}
+	if got := claude.AccountSettings.RuntimeIdentity.Current.ProfileID; got != "claude_reqwest_rustls_compatible_v1" {
+		t.Fatalf("claude profile_id = %q, want claude_reqwest_rustls_compatible_v1", got)
+	}
+	if got := claude.AccountSettings.RuntimeIdentity.Current.TLSProfileID; got != "claude_reqwest_rustls_compatible_v1" {
+		t.Fatalf("claude tls_profile_id = %q, want claude_reqwest_rustls_compatible_v1", got)
+	}
+	if !claude.AccountSettings.RuntimeIdentity.Current.CoreManaged || !claude.AccountSettings.RuntimeIdentity.Current.RuntimeEnforced {
+		t.Fatalf("claude identity core/runtime flags = core:%v enforced:%v", claude.AccountSettings.RuntimeIdentity.Current.CoreManaged, claude.AccountSettings.RuntimeIdentity.Current.RuntimeEnforced)
+	}
+
+	first := getAccountSettings("codex-runtime-a.json")
+	if first.AccountSettings.RuntimeIdentity == nil || first.AccountSettings.RuntimeIdentity.Current == nil {
+		t.Fatalf("expected runtime_identity.current for codex account")
+	}
+	firstIdentity := first.AccountSettings.RuntimeIdentity.Current
+	if firstIdentity.IdentityID == "" {
+		t.Fatalf("identity_id should be generated")
+	}
+	if firstIdentity.ProfileID != "codex_proxy_compatible_v1" || firstIdentity.TLSProfileID != "codex_proxy_compatible_v1" {
+		t.Fatalf("profile IDs = (%q, %q), want codex_proxy_compatible_v1", firstIdentity.ProfileID, firstIdentity.TLSProfileID)
+	}
+	if !firstIdentity.CoreManaged || !firstIdentity.RuntimeEnforced {
+		t.Fatalf("identity core/runtime flags = core:%v enforced:%v", firstIdentity.CoreManaged, firstIdentity.RuntimeEnforced)
+	}
+	if firstIdentity.Revision != 1 {
+		t.Fatalf("revision = %d, want 1", firstIdentity.Revision)
+	}
+	if firstIdentity.AuthIDHash == "" || firstIdentity.AccountHash == "" || firstIdentity.ProxyHash == "" || firstIdentity.SeedHash == "" {
+		t.Fatalf("expected hashed identity fields: %#v", firstIdentity)
+	}
+	if strings.Contains(firstIdentity.AccountHash, "codex-a@example.test") || strings.Contains(firstIdentity.ProxyHash, "shared-proxy") {
+		t.Fatalf("identity should not expose raw account/proxy values: %#v", firstIdentity)
+	}
+
+	repeated := getAccountSettings("codex-runtime-a.json")
+	if repeated.AccountSettings.RuntimeIdentity == nil || repeated.AccountSettings.RuntimeIdentity.Current == nil {
+		t.Fatalf("expected repeated runtime identity")
+	}
+	if repeated.AccountSettings.RuntimeIdentity.Current.IdentityID != firstIdentity.IdentityID {
+		t.Fatalf("identity_id changed across reads: %q -> %q", firstIdentity.IdentityID, repeated.AccountSettings.RuntimeIdentity.Current.IdentityID)
+	}
+	if repeated.AccountSettings.RuntimeIdentity.Current.Revision != 1 {
+		t.Fatalf("revision after repeated read = %d, want 1", repeated.AccountSettings.RuntimeIdentity.Current.Revision)
+	}
+	if len(repeated.AccountSettings.RuntimeIdentity.History) != 0 {
+		t.Fatalf("history after repeated read = %#v, want empty", repeated.AccountSettings.RuntimeIdentity.History)
+	}
+
+	second := getAccountSettings("codex-runtime-b.json")
+	if second.AccountSettings.RuntimeIdentity == nil || second.AccountSettings.RuntimeIdentity.Current == nil {
+		t.Fatalf("expected runtime identity for second codex account")
+	}
+	if second.AccountSettings.RuntimeIdentity.Current.IdentityID == firstIdentity.IdentityID {
+		t.Fatalf("different account should get different identity_id %q", firstIdentity.IdentityID)
+	}
+
+	gemini := getAccountSettings("gemini-runtime.json")
+	if gemini.AccountSettings.RuntimeIdentity == nil || gemini.AccountSettings.RuntimeIdentity.Current == nil {
+		t.Fatalf("expected runtime identity for gemini-cli account without managed headers")
+	}
+	if got := gemini.AccountSettings.RuntimeIdentity.Current.ProfileID; got != "gemini_cli_native_v1" {
+		t.Fatalf("gemini profile_id = %q, want gemini_cli_native_v1", got)
+	}
+
+	updated, ok := manager.GetByID("gemini-runtime.json")
+	if !ok || updated == nil {
+		t.Fatalf("expected stored gemini auth")
+	}
+	stored := readAccountSettingsMetadata(updated, &config.Config{AuthDir: t.TempDir()})
+	if stored.RuntimeIdentityState == nil || stored.RuntimeIdentityState.Current == nil {
+		t.Fatalf("expected runtime_identity_state persisted for provider without managed headers")
+	}
+}
+
+func TestPatchAuthFileAccountSettings_AppendsRuntimeIdentityHistoryOnProfileChange(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	record := &coreauth.Auth{
+		ID:       "codex-runtime-history.json",
+		FileName: "codex-runtime-history.json",
+		Provider: "codex",
+		Metadata: map[string]any{
+			"type":  "codex",
+			"email": "codex-history@example.test",
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("failed to register auth record: %v", errRegister)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+	getAccountSettings := func() authFileAccountSettingsResponse {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(rec)
+		req := httptest.NewRequest(http.MethodGet, "/v0/management/auth-files/account-settings?name=codex-runtime-history.json", nil)
+		ctx.Request = req
+		h.GetAuthFileAccountSettings(ctx)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected GET status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+		}
+		var resp authFileAccountSettingsResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("failed to decode get response: %v", err)
+		}
+		return resp
+	}
+
+	initial := getAccountSettings()
+	if initial.AccountSettings.RuntimeIdentity == nil || initial.AccountSettings.RuntimeIdentity.Current == nil {
+		t.Fatalf("expected initial runtime identity")
+	}
+	initialIdentity := initial.AccountSettings.RuntimeIdentity.Current
+
+	body := `{"name":"codex-runtime-history.json","disabled":false,"extra_headers":{},"transport_profile":{"preset":"provider-default","alpn":["h2"]}}`
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/account-settings", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	ctx.Request = req
+	h.PatchAuthFileAccountSettings(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected PATCH status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+	var patched authFileAccountSettingsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &patched); err != nil {
+		t.Fatalf("failed to decode patch response: %v", err)
+	}
+	state := patched.AccountSettings.RuntimeIdentity
+	if state == nil || state.Current == nil {
+		t.Fatalf("expected patched runtime identity")
+	}
+	if state.Current.IdentityID == initialIdentity.IdentityID {
+		t.Fatalf("identity_id should change when profile seed changes")
+	}
+	if state.Current.ProfileID != "provider-default" {
+		t.Fatalf("current profile_id = %q, want provider-default", state.Current.ProfileID)
+	}
+	if state.Current.CoreManaged {
+		t.Fatalf("explicit provider-default profile should not be marked core-managed")
+	}
+	if len(state.History) != 1 {
+		t.Fatalf("history length = %d, want 1: %#v", len(state.History), state.History)
+	}
+	history := state.History[0]
+	if history.Previous == nil || history.Next == nil {
+		t.Fatalf("history should store previous and next snapshots: %#v", history)
+	}
+	if history.Previous.IdentityID != initialIdentity.IdentityID {
+		t.Fatalf("history previous identity_id = %q, want %q", history.Previous.IdentityID, initialIdentity.IdentityID)
+	}
+	if !containsString(history.ChangedFields, "profile_id") || !containsString(history.ChangedFields, "source") {
+		t.Fatalf("changed fields = %#v, want profile/source changes", history.ChangedFields)
+	}
+}
+
 func TestGetAuthFileAccountSettings_CodexSupportedTransportProfileWarnsAboutScope(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
 	gin.SetMode(gin.TestMode)
@@ -714,6 +1424,112 @@ func TestGetAuthFileAccountSettings_ClaudeTransportProfileShowsRuntimeActive(t *
 	}
 }
 
+func TestGetAuthFileAccountSettings_ClaudeTLSProfileShowsRuntimeActive(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	record := &coreauth.Auth{
+		ID:       "claude-tls-runtime.json",
+		FileName: "claude-tls-runtime.json",
+		Provider: "claude",
+		Attributes: map[string]string{
+			"path": "/tmp/claude-tls-runtime.json",
+		},
+		Metadata: map[string]any{
+			"type": "claude",
+			"account_settings": map[string]any{
+				"schema_version": 1,
+				"tls_profile": map[string]any{
+					"preset": "claude_chrome_like_mac_v3",
+				},
+			},
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("failed to register auth record: %v", errRegister)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodGet, "/v0/management/auth-files/account-settings?name=claude-tls-runtime.json", nil)
+	ctx.Request = req
+	h.GetAuthFileAccountSettings(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+
+	var resp authFileAccountSettingsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if resp.AccountSettings.Activation.State != "tls-profile-active" {
+		t.Fatalf("activation.state = %q, want %q", resp.AccountSettings.Activation.State, "tls-profile-active")
+	}
+	if resp.AccountSettings.Activation.Summary != "TLS profile active" {
+		t.Fatalf("activation.summary = %q, want %q", resp.AccountSettings.Activation.Summary, "TLS profile active")
+	}
+	if len(resp.AccountSettings.Warnings) != 1 || !strings.Contains(resp.AccountSettings.Warnings[0], "uTLS ClientHello") {
+		t.Fatalf("warnings = %#v, want claude uTLS runtime warning", resp.AccountSettings.Warnings)
+	}
+}
+
+func TestGetAuthFileAccountSettings_CodexTLSProfileWarnsAboutScope(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	record := &coreauth.Auth{
+		ID:       "codex-tls-runtime.json",
+		FileName: "codex-tls-runtime.json",
+		Provider: "codex",
+		Attributes: map[string]string{
+			"path": "/tmp/codex-tls-runtime.json",
+		},
+		Metadata: map[string]any{
+			"type": "codex",
+			"account_settings": map[string]any{
+				"schema_version": 1,
+				"tls_profile": map[string]any{
+					"preset":       "codex_go_http11_v1",
+					"force_http11": true,
+				},
+			},
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("failed to register auth record: %v", errRegister)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodGet, "/v0/management/auth-files/account-settings?name=codex-tls-runtime.json", nil)
+	ctx.Request = req
+	h.GetAuthFileAccountSettings(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+
+	var resp authFileAccountSettingsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if resp.AccountSettings.Activation.State != "tls-profile-active" {
+		t.Fatalf("activation.state = %q, want %q", resp.AccountSettings.Activation.State, "tls-profile-active")
+	}
+	if len(resp.AccountSettings.Warnings) != 1 || !strings.Contains(resp.AccountSettings.Warnings[0], "not the Codex Desktop rustls native transport yet") {
+		t.Fatalf("warnings = %#v, want codex scoped tls warning", resp.AccountSettings.Warnings)
+	}
+}
+
 func TestGetAuthFileAccountSettings_FallsBackToDisplayNameWhenFileNameMissing(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
 	gin.SetMode(gin.TestMode)
@@ -753,4 +1569,13 @@ func TestGetAuthFileAccountSettings_FallsBackToDisplayNameWhenFileNameMissing(t 
 	if got := resp.Name; got != "codex-runtime.json" {
 		t.Fatalf("response name = %q, want %q", got, "codex-runtime.json")
 	}
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }

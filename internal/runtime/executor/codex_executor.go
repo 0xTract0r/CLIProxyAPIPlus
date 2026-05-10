@@ -29,10 +29,6 @@ import (
 	"github.com/google/uuid"
 )
 
-const (
-	codexOriginator = "codex-tui"
-)
-
 var dataTag = []byte("data:")
 
 func captureManagedHeaderSnapshot(headers http.Header, names []string) map[string]string {
@@ -165,6 +161,7 @@ func (e *CodexExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth
 	if err := e.PrepareRequest(httpReq, auth); err != nil {
 		return nil, err
 	}
+	ctx = helps.WithRuntimeTransportHostFromRequest(ctx, httpReq)
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
 	return httpClient.Do(httpReq)
 }
@@ -232,6 +229,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		AuthType:  authType,
 		AuthValue: authValue,
 	})
+	ctx = helps.WithRuntimeTransportHostFromRequest(ctx, httpReq)
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
@@ -379,6 +377,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 		AuthType:  authType,
 		AuthValue: authValue,
 	})
+	ctx = helps.WithRuntimeTransportHostFromRequest(ctx, httpReq)
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
@@ -475,6 +474,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		AuthValue: authValue,
 	})
 
+	ctx = helps.WithRuntimeTransportHostFromRequest(ctx, httpReq)
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
@@ -810,6 +810,7 @@ func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, s
 		cfgUserAgent, _ := codexHeaderDefaults(cfg, auth)
 		ensureHeaderWithConfigPrecedence(r.Header, ginHeaders, "User-Agent", cfgUserAgent, helps.DefaultCodexManagedUserAgent())
 	}
+	applyCodexCommunityDesktopHeaders(r.Header, profile)
 
 	if strings.Contains(r.Header.Get("User-Agent"), "Mac OS") {
 		misc.EnsureHeader(r.Header, ginHeaders, "Session_id", uuid.NewString())
@@ -834,7 +835,7 @@ func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, s
 		originator := strings.TrimSpace(profile.Originator)
 		r.Header.Set("Originator", originator)
 	} else if !isAPIKey {
-		r.Header.Set("Originator", codexOriginator)
+		r.Header.Set("Originator", helps.DefaultCodexManagedOriginator())
 	}
 	if !isAPIKey {
 		if auth != nil && auth.Metadata != nil {
@@ -843,7 +844,20 @@ func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, s
 			}
 		}
 	}
-	managedHeaderSnapshot := captureManagedHeaderSnapshot(r.Header, []string{"User-Agent", "Version", "Originator", "X-Codex-Beta-Features"})
+	managedHeaderSnapshot := captureManagedHeaderSnapshot(r.Header, []string{
+		"User-Agent",
+		"Version",
+		"Originator",
+		"X-Codex-Beta-Features",
+		"sec-ch-ua",
+		"sec-ch-ua-mobile",
+		"sec-ch-ua-platform",
+		"Accept-Encoding",
+		"Accept-Language",
+		"sec-fetch-site",
+		"sec-fetch-mode",
+		"sec-fetch-dest",
+	})
 	var attrs map[string]string
 	if auth != nil {
 		attrs = auth.Attributes
@@ -851,6 +865,26 @@ func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, s
 	util.ApplyCustomHeadersFromAttrs(r, attrs)
 	if cliproxyauth.HasStructuredAccountSettingsMetadata(auth) {
 		applyManagedHeaderSnapshot(r.Header, managedHeaderSnapshot)
+	}
+}
+
+func applyCodexCommunityDesktopHeaders(headers http.Header, profile helps.CodexClientProfile) {
+	if headers == nil {
+		return
+	}
+	for name, value := range map[string]string{
+		"sec-ch-ua":          profile.SecCHUA,
+		"sec-ch-ua-mobile":   profile.SecCHUAMobile,
+		"sec-ch-ua-platform": profile.SecCHUAPlatform,
+		"Accept-Encoding":    profile.AcceptEncoding,
+		"Accept-Language":    profile.AcceptLanguage,
+		"sec-fetch-site":     profile.SecFetchSite,
+		"sec-fetch-mode":     profile.SecFetchMode,
+		"sec-fetch-dest":     profile.SecFetchDest,
+	} {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			headers.Set(name, trimmed)
+		}
 	}
 }
 

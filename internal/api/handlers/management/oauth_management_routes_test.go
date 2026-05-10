@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
+	claudeauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/claude"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
@@ -86,6 +88,110 @@ func TestCancelOAuthSessionMarksStatusCancelled(t *testing.T) {
 		t.Fatalf("status payload = %#v, want cancelled", statusPayload)
 	}
 }
+
+func TestClaudeOAuthReauthUsesTargetAccountContext(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	targetPath := filepath.Join(authDir, "claude-existing.json")
+	target := &coreauth.Auth{
+		ID:       "claude-existing.json",
+		FileName: "claude-existing.json",
+		Provider: "claude",
+		ProxyURL: "socks5://proxy.example:1080",
+		Attributes: map[string]string{
+			"path": targetPath,
+		},
+		Metadata: map[string]any{
+			"type":          "claude",
+			"email":         "old@example.com",
+			"access_token":  "old-access",
+			"refresh_token": "old-refresh",
+			"proxy_url":     "socks5://proxy.example:1080",
+			"note":          "keep me",
+			"account_settings": map[string]any{
+				"schema_version": 1,
+				"tls_profile": map[string]any{
+					"profile_id": "claude_reqwest_rustls_compatible_v1",
+				},
+			},
+		},
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{
+		AuthDir: authDir,
+		SDKConfig: config.SDKConfig{
+			ProxyURL: "socks5://global-proxy.example:1080",
+		},
+	}, nil)
+
+	summary := h.claudeOAuthTransportSummary(target)
+	if summary["proxy_source"] != "account" {
+		t.Fatalf("proxy_source = %q, want account", summary["proxy_source"])
+	}
+	if summary["tls_profile"] != "claude_reqwest_rustls_compatible_v1" {
+		t.Fatalf("tls_profile = %q, want claude_reqwest_rustls_compatible_v1", summary["tls_profile"])
+	}
+
+	record := buildClaudeOAuthTokenRecord(target, &claudeauth.ClaudeTokenStorage{
+		Email:        "new@example.com",
+		AccessToken:  "new-access",
+		RefreshToken: "new-refresh",
+	})
+	if record.ID != target.ID || record.FileName != target.FileName {
+		t.Fatalf("record identity = (%q,%q), want (%q,%q)", record.ID, record.FileName, target.ID, target.FileName)
+	}
+	if got := record.Attributes["path"]; got != targetPath {
+		t.Fatalf("record path = %q, want %q", got, targetPath)
+	}
+	if got := record.ProxyURL; got != target.ProxyURL {
+		t.Fatalf("record proxy = %q, want %q", got, target.ProxyURL)
+	}
+	if got := record.Metadata["note"]; got != "keep me" {
+		t.Fatalf("metadata note = %#v, want keep me", got)
+	}
+	if _, ok := record.Metadata["account_settings"]; !ok {
+		t.Fatalf("account_settings was not preserved")
+	}
+	for _, key := range []string{"access_token", "refresh_token"} {
+		if _, ok := record.Metadata[key]; ok {
+			t.Fatalf("old %s leaked into metadata", key)
+		}
+	}
+	if got := record.Metadata["email"]; got != "new@example.com" {
+		t.Fatalf("metadata email = %#v, want new@example.com", got)
+	}
+}
+
+func TestClaudeOAuthExchangeRetryClassifier(t *testing.T) {
+	retriable := []error{
+		contextNSError("token exchange request failed: Post \"https://api.anthropic.com/v1/oauth/token\": socks connect tcp 80.174.217.1:12324->api.anthropic.com:443: unknown error connection not allowed by ruleset"),
+		contextNSError("token exchange request failed: Post \"https://api.anthropic.com/v1/oauth/token\": proxyconnect tcp: connection reset by peer"),
+		contextNSError("token exchange request failed: Post \"https://api.anthropic.com/v1/oauth/token\": dial tcp: i/o timeout"),
+	}
+	for _, err := range retriable {
+		if !isRetriableClaudeOAuthExchangeError(err) {
+			t.Fatalf("expected retriable error for %q", err)
+		}
+	}
+
+	notRetriable := []error{
+		contextNSError("token exchange failed with status 400: {\"error\":\"invalid_grant\"}"),
+		contextNSError("failed to parse token response: invalid character"),
+		context.Canceled,
+		context.DeadlineExceeded,
+	}
+	for _, err := range notRetriable {
+		if isRetriableClaudeOAuthExchangeError(err) {
+			t.Fatalf("expected non-retriable error for %q", err)
+		}
+	}
+}
+
+type contextNSError string
+
+func (e contextNSError) Error() string { return string(e) }
 
 func TestRefreshAuthFileStatusRecordsHistory(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
