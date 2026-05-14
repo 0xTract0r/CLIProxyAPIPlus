@@ -14,6 +14,7 @@ import (
 	qwenauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/qwen"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
@@ -255,7 +256,7 @@ func (e *QwenExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 	if err != nil {
 		return resp, err
 	}
-	applyQwenHeaders(httpReq, token, false)
+	applyQwenHeaders(httpReq, token, false, auth)
 	var authLabel, authType, authValue string
 	if auth != nil {
 		authLabel = auth.Label
@@ -365,7 +366,7 @@ func (e *QwenExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 	if err != nil {
 		return nil, err
 	}
-	applyQwenHeaders(httpReq, token, true)
+	applyQwenHeaders(httpReq, token, true, auth)
 	var authLabel, authType, authValue string
 	if auth != nil {
 		authLabel = auth.Label
@@ -504,7 +505,7 @@ func (e *QwenExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*c
 	return auth, nil
 }
 
-func applyQwenHeaders(r *http.Request, token string, stream bool) {
+func applyQwenHeaders(r *http.Request, token string, stream bool, auth *cliproxyauth.Auth) {
 	r.Header.Set("Content-Type", "application/json")
 	r.Header.Set("Authorization", "Bearer "+token)
 	r.Header.Set("User-Agent", qwenUserAgent)
@@ -522,9 +523,18 @@ func applyQwenHeaders(r *http.Request, token string, stream bool) {
 
 	if stream {
 		r.Header.Set("Accept", "text/event-stream")
-		return
+	} else {
+		r.Header.Set("Accept", "application/json")
 	}
-	r.Header.Set("Accept", "application/json")
+
+	// Apply account-defined custom headers (account_settings.headers /
+	// extra_headers) after the hard-coded provider headers, matching the
+	// Codex/Claude/Kimi/Kilo executor pattern. This lets account-level
+	// configuration override the defaults the same way it already does for
+	// other providers.
+	if auth != nil {
+		util.ApplyCustomHeadersFromAttrs(r, auth.Attributes)
+	}
 }
 
 func qwenCreds(a *cliproxyauth.Auth) (token, baseURL string) {

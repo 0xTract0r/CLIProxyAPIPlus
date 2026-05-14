@@ -115,7 +115,7 @@ func (e *IFlowExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	if err != nil {
 		return resp, err
 	}
-	applyIFlowHeaders(httpReq, apiKey, false)
+	applyIFlowHeaders(httpReq, apiKey, false, auth)
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
@@ -223,7 +223,7 @@ func (e *IFlowExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	if err != nil {
 		return nil, err
 	}
-	applyIFlowHeaders(httpReq, apiKey, true)
+	applyIFlowHeaders(httpReq, apiKey, true, auth)
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
@@ -452,7 +452,7 @@ func (e *IFlowExecutor) refreshOAuthBased(ctx context.Context, auth *cliproxyaut
 	return auth, nil
 }
 
-func applyIFlowHeaders(r *http.Request, apiKey string, stream bool) {
+func applyIFlowHeaders(r *http.Request, apiKey string, stream bool, auth *cliproxyauth.Auth) {
 	r.Header.Set("Content-Type", "application/json")
 	r.Header.Set("Authorization", "Bearer "+apiKey)
 	r.Header.Set("User-Agent", iflowUserAgent)
@@ -474,6 +474,15 @@ func applyIFlowHeaders(r *http.Request, apiKey string, stream bool) {
 		r.Header.Set("Accept", "text/event-stream")
 	} else {
 		r.Header.Set("Accept", "application/json")
+	}
+
+	// Apply account-defined custom headers (account_settings.headers /
+	// extra_headers). Custom headers run after the hard-coded provider headers
+	// so the explicit account configuration can override defaults in the same
+	// way Codex/Claude/Kimi/Kilo executors already do via
+	// util.ApplyCustomHeadersFromAttrs.
+	if auth != nil {
+		util.ApplyCustomHeadersFromAttrs(r, auth.Attributes)
 	}
 }
 
