@@ -60,8 +60,26 @@ type IFlowAuth struct {
 
 // NewIFlowAuth constructs a new IFlowAuth with proxy-aware transport.
 func NewIFlowAuth(cfg *config.Config) *IFlowAuth {
+	return NewIFlowAuthWithProxyURL(cfg, "")
+}
+
+// NewIFlowAuthWithProxyURL constructs a new IFlowAuth with an account-scoped
+// proxy override. The non-empty proxyURL takes precedence over the global
+// cfg.ProxyURL so OAuth/cookie refresh respects the per-account proxy
+// configured in auth files. When proxyURL is empty the constructor falls back
+// to cfg.ProxyURL for backward compatibility.
+func NewIFlowAuthWithProxyURL(cfg *config.Config, proxyURL string) *IFlowAuth {
+	effectiveProxyURL := strings.TrimSpace(proxyURL)
+	var sdkCfg config.SDKConfig
+	if cfg != nil {
+		sdkCfg = cfg.SDKConfig
+		if effectiveProxyURL == "" {
+			effectiveProxyURL = strings.TrimSpace(cfg.ProxyURL)
+		}
+	}
+	sdkCfg.ProxyURL = effectiveProxyURL
 	client := &http.Client{Timeout: 30 * time.Second}
-	return &IFlowAuth{httpClient: util.SetProxy(&cfg.SDKConfig, client)}
+	return &IFlowAuth{httpClient: util.SetProxy(&sdkCfg, client)}
 }
 
 // AuthorizationURL builds the authorization URL and matching redirect URI.

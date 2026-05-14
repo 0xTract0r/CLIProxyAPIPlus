@@ -84,8 +84,26 @@ type QwenAuth struct {
 
 // NewQwenAuth creates a new QwenAuth instance with a proxy-configured HTTP client.
 func NewQwenAuth(cfg *config.Config) *QwenAuth {
+	return NewQwenAuthWithProxyURL(cfg, "")
+}
+
+// NewQwenAuthWithProxyURL creates a new QwenAuth instance with an account-scoped
+// proxy override. The non-empty proxyURL takes precedence over the global
+// cfg.ProxyURL so OAuth refresh respects the per-account proxy configured in
+// auth files. When proxyURL is empty the constructor falls back to cfg.ProxyURL
+// for backward compatibility.
+func NewQwenAuthWithProxyURL(cfg *config.Config, proxyURL string) *QwenAuth {
+	effectiveProxyURL := strings.TrimSpace(proxyURL)
+	var sdkCfg config.SDKConfig
+	if cfg != nil {
+		sdkCfg = cfg.SDKConfig
+		if effectiveProxyURL == "" {
+			effectiveProxyURL = strings.TrimSpace(cfg.ProxyURL)
+		}
+	}
+	sdkCfg.ProxyURL = effectiveProxyURL
 	return &QwenAuth{
-		httpClient: util.SetProxy(&cfg.SDKConfig, &http.Client{}),
+		httpClient: util.SetProxy(&sdkCfg, &http.Client{}),
 	}
 }
 
