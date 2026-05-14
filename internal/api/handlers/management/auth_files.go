@@ -366,6 +366,7 @@ func (h *Handler) managementCallbackURL(path string) (string, error) {
 }
 
 func (h *Handler) ListAuthFiles(c *gin.Context) {
+	start := time.Now()
 	if h == nil {
 		c.JSON(500, gin.H{"error": "handler not initialized"})
 		return
@@ -377,16 +378,36 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 	auths := h.authManager.List()
 	files := make([]gin.H, 0, len(auths))
 	for _, auth := range auths {
-		auth = h.syncAuthManagedHeaderState(c.Request.Context(), auth)
+		// Fast path: build the entry directly from the in-memory auth state.
+		// Managed-header / runtime-identity sync used to run synchronously here
+		// which made the endpoint depend on outbound HTTP (e.g. resolving the
+		// online managed-header version) and OAuth refresh retry storms when an
+		// account proxy was unreachable. The endpoint must remain a read-only
+		// projection of the current state.
 		if entry := h.buildAuthFileEntry(auth); entry != nil {
 			files = append(files, entry)
 		}
+		// Schedule the sync in the background so subsequent reads observe an
+		// up-to-date projection without blocking the current request.
+		h.scheduleManagedHeaderSync(auth)
 	}
 	sort.Slice(files, func(i, j int) bool {
 		nameI, _ := files[i]["name"].(string)
 		nameJ, _ := files[j]["name"].(string)
 		return strings.ToLower(nameI) < strings.ToLower(nameJ)
 	})
+	durationMS := time.Since(start).Milliseconds()
+	if durationMS >= managedHeaderSyncSlowListThresholdMS {
+		log.WithFields(log.Fields{
+			"duration_ms": durationMS,
+			"count":       len(files),
+		}).Warn("ListAuthFiles slow: investigate background scheduler health")
+	} else if log.IsLevelEnabled(log.DebugLevel) {
+		log.WithFields(log.Fields{
+			"duration_ms": durationMS,
+			"count":       len(files),
+		}).Debug("ListAuthFiles served")
+	}
 	c.JSON(200, gin.H{"files": files})
 }
 
@@ -2932,12 +2953,340 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 	if store == nil {
 		return "", fmt.Errorf("token store unavailable")
 	}
+
+	// Bug fix: re-auth flows previously overwrote user-defined fields such as
+	// proxy_url / note / headers / refresh_disabled / refresh_enabled / websockets /
+	// account_settings. Look up an existing record either by the new ID or by the
+	// same provider+account identity so we can merge those fields back in before
+	// persisting. When the look-up finds a renamed orphan (e.g. plan-type changed
+	// from "plus" to "pro" so the credential filename changed), capture its path
+	// so we can clean it up after the new file is saved.
+	previous, orphanPath := h.lookupExistingAuthForReauth(record)
+	if previous != nil {
+		mergeUserDefinedAuthMetadataInto(record, previous)
+		inheritUserDefinedAuthAttributesInto(record, previous)
+	}
+
 	if h.postAuthHook != nil {
 		if err := h.postAuthHook(ctx, record); err != nil {
 			return "", fmt.Errorf("post-auth hook failed: %w", err)
 		}
 	}
-	return store.Save(ctx, record)
+	savedPath, errSave := store.Save(ctx, record)
+	if errSave != nil {
+		return savedPath, errSave
+	}
+
+	// Remove the stale credential file when the filename changed during re-auth
+	// (for example codex plan-type plus->pro). Avoid deleting the file we just
+	// wrote.
+	if orphanPath != "" && savedPath != "" && filepath.Clean(orphanPath) != filepath.Clean(savedPath) {
+		if errRemove := os.Remove(orphanPath); errRemove != nil && !os.IsNotExist(errRemove) {
+			log.WithError(errRemove).WithFields(log.Fields{
+				"auth_id":       record.ID,
+				"provider":      record.Provider,
+				"orphan_path":   orphanPath,
+				"replaced_with": savedPath,
+			}).Warn("re-auth: failed to remove orphan credential file after rename")
+		} else if errRemove == nil {
+			log.WithFields(log.Fields{
+				"auth_id":       record.ID,
+				"provider":      record.Provider,
+				"orphan_path":   orphanPath,
+				"replaced_with": savedPath,
+			}).Info("re-auth: removed orphan credential file after filename change")
+		}
+		// Best effort: ask the auth manager to drop the in-memory entry that
+		// pointed at the old filename so the disabled clone doesn't continue to
+		// haunt operators.
+		if h.authManager != nil && previous != nil && previous.ID != record.ID {
+			disabled := previous.Clone()
+			disabled.Disabled = true
+			disabled.Status = coreauth.StatusDisabled
+			disabled.StatusMessage = "superseded by re-auth"
+			disabled.UpdatedAt = time.Now()
+			if _, errUpdate := h.authManager.Update(ctx, disabled); errUpdate != nil {
+				log.WithError(errUpdate).WithFields(log.Fields{
+					"auth_id":  previous.ID,
+					"provider": previous.Provider,
+				}).Debug("re-auth: failed to mark old auth entry disabled after rename")
+			}
+		}
+	}
+	return savedPath, nil
+}
+
+// lookupExistingAuthForReauth attempts to find a prior auth record that maps to
+// the same account as the supplied re-auth record. The returned previous record
+// is used to merge user-defined metadata; orphanPath is non-empty when the
+// previous record lives at a different filename (typically because the OAuth
+// claims caused the filename to change), in which case the caller is expected
+// to delete that file after the new record is persisted.
+func (h *Handler) lookupExistingAuthForReauth(record *coreauth.Auth) (previous *coreauth.Auth, orphanPath string) {
+	if h == nil || h.authManager == nil || record == nil {
+		return nil, ""
+	}
+	if existing, ok := h.authManager.GetByID(record.ID); ok && existing != nil {
+		return existing, ""
+	}
+	// Fall back to provider + email/account_id matching so we still inherit user
+	// fields when the credential filename changed (e.g. codex plan-type change).
+	newEmail := strings.ToLower(strings.TrimSpace(authEmail(record)))
+	newAccountID := strings.ToLower(strings.TrimSpace(metadataString(record.Metadata, "account_id")))
+	if newEmail == "" && newAccountID == "" {
+		return nil, ""
+	}
+	provider := strings.ToLower(strings.TrimSpace(record.Provider))
+	if provider == "" {
+		return nil, ""
+	}
+	var candidate *coreauth.Auth
+	for _, candAuth := range h.authManager.List() {
+		if candAuth == nil {
+			continue
+		}
+		if candAuth.ID == record.ID {
+			continue
+		}
+		if strings.ToLower(strings.TrimSpace(candAuth.Provider)) != provider {
+			continue
+		}
+		candEmail := strings.ToLower(strings.TrimSpace(authEmail(candAuth)))
+		candAccountID := strings.ToLower(strings.TrimSpace(metadataString(candAuth.Metadata, "account_id")))
+		matched := false
+		if newEmail != "" && candEmail == newEmail {
+			matched = true
+		}
+		if !matched && newAccountID != "" && candAccountID == newAccountID {
+			matched = true
+		}
+		if !matched {
+			continue
+		}
+		// Prefer the candidate that still has user-defined data we want to keep.
+		if candidate == nil || hasUserDefinedAuthMetadata(candAuth) && !hasUserDefinedAuthMetadata(candidate) {
+			candidate = candAuth
+		}
+	}
+	if candidate == nil {
+		return nil, ""
+	}
+	orphan := strings.TrimSpace(authAttribute(candidate, "path"))
+	return candidate, orphan
+}
+
+// reauthUserDefinedMetadataKeys lists metadata keys that originate from the
+// operator (or were previously persisted by the management UI) and must
+// survive an OAuth re-auth round-trip even when the OAuth response does not
+// echo them back.
+var reauthUserDefinedMetadataKeys = []string{
+	"proxy_url",
+	"note",
+	"label",
+	"tags",
+	"headers",
+	"extra_headers",
+	"refresh_disabled",
+	"refresh_enabled",
+	"disable_refresh",
+	"auto_refresh_disabled",
+	"auto_refresh",
+	"auto_refresh_enabled",
+	"websockets",
+	"websocket",
+	"websocket_settings",
+	"disabled",
+	"account_settings",
+	"runtime_only",
+	"priority",
+	"prefix",
+}
+
+// reauthTokenMetadataKeys lists metadata keys whose values are owned by the
+// OAuth response itself and therefore must always come from the new record,
+// never from the previous one. Anything not in this list and not in
+// reauthUserDefinedMetadataKeys is treated as custom data and inherited so we
+// do not lose forward-compatible operator additions.
+var reauthTokenMetadataKeys = map[string]struct{}{
+	"access_token":         {},
+	"refresh_token":        {},
+	"id_token":             {},
+	"token":                {},
+	"email":                {},
+	"account_id":           {},
+	"username":             {},
+	"chatgpt_account_id":   {},
+	"plan_type":            {},
+	"expired":              {},
+	"expires_at":           {},
+	"oauth_expires_at":     {},
+	"expires_in":           {},
+	"last_refresh":         {},
+	"lastrefresh":          {},
+	"last_refreshed_at":    {},
+	"lastrefreshedat":      {},
+	"timestamp":            {},
+	"type":                 {},
+	"project_id":           {},
+	"auto":                 {},
+	"checked":              {},
+	"scope":                {},
+	"token_type":           {},
+	"auth_method":          {},
+	"duo_gateway_base_url": {},
+	"duo_gateway_token":    {},
+	"duo_gateway_headers":  {},
+	"duo_gateway_expires_at": {},
+	"model_provider":       {},
+	"model_name":           {},
+	"model_details":        {},
+}
+
+func isReauthUserDefinedMetadataKey(key string) bool {
+	key = strings.ToLower(strings.TrimSpace(key))
+	if key == "" {
+		return false
+	}
+	for _, candidate := range reauthUserDefinedMetadataKeys {
+		if key == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func isReauthTokenMetadataKey(key string) bool {
+	if _, ok := reauthTokenMetadataKeys[strings.ToLower(strings.TrimSpace(key))]; ok {
+		return true
+	}
+	return false
+}
+
+// mergeUserDefinedAuthMetadataInto copies operator-controlled metadata from the
+// previous auth record onto the new record without overwriting OAuth/token
+// owned keys. The new record retains precedence whenever it already has a
+// non-empty value for a given key so callers can still intentionally update
+// preserved fields (e.g. supply a new note during re-auth).
+func mergeUserDefinedAuthMetadataInto(record, previous *coreauth.Auth) {
+	if record == nil || previous == nil || len(previous.Metadata) == 0 {
+		return
+	}
+	if record.Metadata == nil {
+		record.Metadata = make(map[string]any, len(previous.Metadata))
+	}
+	for key, value := range previous.Metadata {
+		trimmedKey := strings.TrimSpace(key)
+		if trimmedKey == "" {
+			continue
+		}
+		if isReauthTokenMetadataKey(trimmedKey) {
+			continue
+		}
+		if existing, ok := record.Metadata[trimmedKey]; ok && !isEmptyMetadataValue(existing) {
+			continue
+		}
+		record.Metadata[trimmedKey] = value
+	}
+	// Make sure ProxyURL field on the record mirrors the persisted metadata so
+	// downstream consumers (account_settings projection, runtime executors)
+	// see the same value the operator previously configured.
+	if record.ProxyURL == "" {
+		if proxy := strings.TrimSpace(metadataString(record.Metadata, "proxy_url")); proxy != "" {
+			record.ProxyURL = proxy
+		} else if proxy := strings.TrimSpace(previous.ProxyURL); proxy != "" {
+			record.ProxyURL = proxy
+			if record.Metadata == nil {
+				record.Metadata = make(map[string]any)
+			}
+			if _, ok := record.Metadata["proxy_url"]; !ok {
+				record.Metadata["proxy_url"] = proxy
+			}
+		}
+	}
+	if strings.TrimSpace(record.Label) == "" && strings.TrimSpace(previous.Label) != "" {
+		record.Label = previous.Label
+	}
+	if strings.TrimSpace(record.Prefix) == "" && strings.TrimSpace(previous.Prefix) != "" {
+		record.Prefix = previous.Prefix
+	}
+}
+
+// inheritUserDefinedAuthAttributesInto copies operator-controlled attributes
+// (custom headers, note, runtime_only marker, etc.) from the previous record
+// when the new record omits them. OAuth handlers typically only populate the
+// `path` attribute, so without this step every re-auth would drop the
+// management-UI configured header overrides.
+func inheritUserDefinedAuthAttributesInto(record, previous *coreauth.Auth) {
+	if record == nil || previous == nil || len(previous.Attributes) == 0 {
+		return
+	}
+	if record.Attributes == nil {
+		record.Attributes = make(map[string]string, len(previous.Attributes))
+	}
+	for key, value := range previous.Attributes {
+		trimmedKey := strings.TrimSpace(key)
+		if trimmedKey == "" {
+			continue
+		}
+		lowerKey := strings.ToLower(trimmedKey)
+		// Identity attributes are rebuilt from the new auth record. Skip them
+		// so we do not accidentally restore stale paths or emails.
+		if lowerKey == "path" || lowerKey == "email" || lowerKey == "account_email" {
+			continue
+		}
+		if existing, ok := record.Attributes[trimmedKey]; ok && strings.TrimSpace(existing) != "" {
+			continue
+		}
+		record.Attributes[trimmedKey] = value
+	}
+}
+
+func hasUserDefinedAuthMetadata(auth *coreauth.Auth) bool {
+	if auth == nil || len(auth.Metadata) == 0 {
+		return false
+	}
+	for key := range auth.Metadata {
+		if isReauthUserDefinedMetadataKey(key) {
+			value := auth.Metadata[key]
+			if !isEmptyMetadataValue(value) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func isEmptyMetadataValue(value any) bool {
+	switch v := value.(type) {
+	case nil:
+		return true
+	case string:
+		return strings.TrimSpace(v) == ""
+	case map[string]any:
+		return len(v) == 0
+	case map[string]string:
+		return len(v) == 0
+	case []any:
+		return len(v) == 0
+	case []string:
+		return len(v) == 0
+	default:
+		return false
+	}
+}
+
+func metadataString(meta map[string]any, key string) string {
+	if len(meta) == 0 {
+		return ""
+	}
+	value, ok := meta[key]
+	if !ok {
+		return ""
+	}
+	if str, isStr := value.(string); isStr {
+		return str
+	}
+	return ""
 }
 
 func gitLabBaseURLFromRequest(c *gin.Context) string {

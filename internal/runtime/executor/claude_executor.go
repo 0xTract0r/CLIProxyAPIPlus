@@ -643,6 +643,13 @@ func (e *ClaudeExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (
 	if auth == nil {
 		return nil, fmt.Errorf("claude executor: auth is nil")
 	}
+	// Honor operator-controlled refresh_disabled / refresh_enabled=false flags
+	// at the executor layer so unaware request paths cannot bypass the
+	// auto-refresh scheduler.
+	if auth.RefreshDisabled() {
+		log.Debugf("claude executor: refresh skipped because refresh_disabled=true")
+		return auth, nil
+	}
 	var refreshToken string
 	if auth.Metadata != nil {
 		if v, ok := auth.Metadata["refresh_token"].(string); ok && v != "" {

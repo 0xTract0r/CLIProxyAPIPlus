@@ -704,6 +704,14 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 	if auth == nil {
 		return nil, statusErr{code: 500, msg: "codex executor: auth is nil"}
 	}
+	// Honor operator-controlled refresh_disabled / refresh_enabled=false flags
+	// at the executor layer so unaware request paths (e.g. retry-on-401 from
+	// chat completion) cannot bypass the auto-refresh scheduler and still
+	// punch through to the OAuth provider.
+	if auth.RefreshDisabled() {
+		log.Debugf("codex executor: refresh skipped because refresh_disabled=true")
+		return auth, nil
+	}
 	var refreshToken string
 	if auth.Metadata != nil {
 		if v, ok := auth.Metadata["refresh_token"].(string); ok && v != "" {
