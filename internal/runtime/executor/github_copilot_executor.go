@@ -422,8 +422,12 @@ func (e *GitHubCopilotExecutor) Refresh(ctx context.Context, auth *cliproxyauth.
 		return auth, nil
 	}
 
-	// Validate the token can still get a Copilot API token
-	copilotAuth := copilotauth.NewCopilotAuth(e.cfg)
+	// Validate the token can still get a Copilot API token. Honor the
+	// account-scoped auth.ProxyURL so the token-exchange round-trip egresses
+	// via the per-account proxy configured in the auth file, instead of
+	// silently falling back to the global cfg.ProxyURL. Mirrors the
+	// refresh-proxy invariant in docs/repo-memory-ledger.md section 13.
+	copilotAuth := copilotauth.NewCopilotAuthWithProxyURL(e.cfg, auth.ProxyURL)
 	_, err := copilotAuth.GetCopilotAPIToken(ctx, accessToken)
 	if err != nil {
 		return nil, statusErr{code: http.StatusUnauthorized, msg: fmt.Sprintf("github-copilot token validation failed: %v", err)}
@@ -452,8 +456,12 @@ func (e *GitHubCopilotExecutor) ensureAPIToken(ctx context.Context, auth *clipro
 	}
 	e.mu.RUnlock()
 
-	// Get a new Copilot API token
-	copilotAuth := copilotauth.NewCopilotAuth(e.cfg)
+	// Get a new Copilot API token. ensureAPIToken runs on every business
+	// request that misses the cache; honor the account-scoped auth.ProxyURL so
+	// each refresh egresses via the per-account proxy instead of leaking
+	// through the global cfg.ProxyURL. Mirrors the refresh-proxy invariant in
+	// docs/repo-memory-ledger.md section 13.
+	copilotAuth := copilotauth.NewCopilotAuthWithProxyURL(e.cfg, auth.ProxyURL)
 	apiToken, err := copilotAuth.GetCopilotAPIToken(ctx, accessToken)
 	if err != nil {
 		return "", "", statusErr{code: http.StatusUnauthorized, msg: fmt.Sprintf("failed to get copilot api token: %v", err)}
@@ -1316,7 +1324,11 @@ func FetchGitHubCopilotModels(ctx context.Context, auth *cliproxyauth.Auth, cfg 
 		return registry.GetGitHubCopilotModels()
 	}
 
-	copilotAuth := copilotauth.NewCopilotAuth(cfg)
+	// FetchGitHubCopilotModels is called with a specific auth record; honor its
+	// account-scoped auth.ProxyURL so the dynamic /models discovery egresses
+	// via the per-account proxy instead of the global cfg.ProxyURL. Mirrors
+	// the refresh-proxy invariant in docs/repo-memory-ledger.md section 13.
+	copilotAuth := copilotauth.NewCopilotAuthWithProxyURL(cfg, auth.ProxyURL)
 
 	entries, err := copilotAuth.ListModelsWithGitHubToken(ctx, accessToken)
 	if err != nil {

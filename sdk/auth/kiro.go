@@ -370,7 +370,11 @@ func (a *KiroAuthenticator) Refresh(ctx context.Context, cfg *config.Config, aut
 	var tokenData *kiroauth.KiroTokenData
 	var err error
 
-	ssoClient := kiroauth.NewSSOOIDCClient(cfg)
+	// Honor the account-scoped auth.ProxyURL when refreshing the Kiro token via
+	// the SDK Authenticator entry point. This mirrors the executor-layer fix
+	// and keeps token refresh on the per-account proxy instead of silently
+	// falling back to the global cfg.ProxyURL (ledger section 13).
+	ssoClient := kiroauth.NewSSOOIDCClientWithProxyURL(cfg, auth.ProxyURL)
 
 	// Use SSO OIDC refresh for AWS Builder ID or IDC, otherwise use Kiro's OAuth refresh endpoint
 	switch {
@@ -382,7 +386,7 @@ func (a *KiroAuthenticator) Refresh(ctx context.Context, cfg *config.Config, aut
 		tokenData, err = ssoClient.RefreshToken(ctx, clientID, clientSecret, refreshToken)
 	default:
 		// Fallback to Kiro's refresh endpoint (for social auth: Google/GitHub)
-		oauth := kiroauth.NewKiroOAuth(cfg)
+		oauth := kiroauth.NewKiroOAuthWithProxyURL(cfg, auth.ProxyURL)
 		tokenData, err = oauth.RefreshToken(ctx, refreshToken)
 	}
 

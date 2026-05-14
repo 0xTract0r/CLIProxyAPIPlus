@@ -3647,7 +3647,11 @@ func (e *KiroExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*c
 	var tokenData *kiroauth.KiroTokenData
 	var err error
 
-	ssoClient := kiroauth.NewSSOOIDCClient(e.cfg)
+	// Honor the account-scoped auth.ProxyURL (e.g. SOCKS5 proxy assigned to a
+	// specific Kiro auth file) so token refresh egresses via the account proxy
+	// instead of silently falling back to the global cfg.ProxyURL. Mirrors the
+	// Claude/Codex/Qwen/IFlow refresh-proxy invariant (ledger section 13).
+	ssoClient := kiroauth.NewSSOOIDCClientWithProxyURL(e.cfg, auth.ProxyURL)
 
 	// Use SSO OIDC refresh for AWS Builder ID or IDC, otherwise use Kiro's OAuth refresh endpoint
 	switch {
@@ -3662,7 +3666,7 @@ func (e *KiroExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*c
 	default:
 		// Fallback to Kiro's OAuth refresh endpoint (for social auth: Google/GitHub)
 		log.Debugf("kiro executor: using Kiro OAuth refresh endpoint")
-		oauth := kiroauth.NewKiroOAuth(e.cfg)
+		oauth := kiroauth.NewKiroOAuthWithProxyURL(e.cfg, auth.ProxyURL)
 		tokenData, err = oauth.RefreshToken(ctx, refreshToken)
 	}
 
@@ -3793,7 +3797,10 @@ func (e *KiroExecutor) fetchAndSaveProfileArn(ctx context.Context, auth *cliprox
 	clientID, _ := auth.Metadata["client_id"].(string)
 	refreshToken, _ := auth.Metadata["refresh_token"].(string)
 
-	ssoClient := kiroauth.NewSSOOIDCClient(e.cfg)
+	// Honor account-scoped auth.ProxyURL when calling CodeWhisperer APIs to
+	// discover/refresh the profile ARN; this code path is invoked after the
+	// caller has already located the specific Kiro auth record.
+	ssoClient := kiroauth.NewSSOOIDCClientWithProxyURL(e.cfg, auth.ProxyURL)
 	profileArn := ssoClient.FetchProfileArn(ctx, accessToken, clientID, refreshToken)
 	if profileArn == "" {
 		log.Debugf("kiro executor: FetchProfileArn returned no profiles")

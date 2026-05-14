@@ -169,7 +169,12 @@ func (e *GitLabExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (
 		return nil, fmt.Errorf("gitlab duo executor: missing base URL or token")
 	}
 
-	client := gitlab.NewAuthClient(e.cfg)
+	// Honor the account-scoped auth.ProxyURL (e.g. SOCKS5 proxy assigned to a
+	// specific GitLab Duo auth file) so OAuth refresh and direct-access token
+	// exchange egress via the account proxy instead of silently falling back to
+	// the global cfg.ProxyURL. Mirrors the refresh-proxy invariant in
+	// docs/repo-memory-ledger.md section 13.
+	client := gitlab.NewAuthClientWithProxyURL(e.cfg, auth.ProxyURL)
 	method := strings.ToLower(strings.TrimSpace(gitLabMetadataString(auth.Metadata, "auth_method", "auth_kind")))
 	if method == "" {
 		method = gitLabAuthMethodOAuth

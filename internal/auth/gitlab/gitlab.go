@@ -94,10 +94,27 @@ type AuthClient struct {
 }
 
 func NewAuthClient(cfg *config.Config) *AuthClient {
-	client := &http.Client{}
+	return NewAuthClientWithProxyURL(cfg, "")
+}
+
+// NewAuthClientWithProxyURL creates a new GitLab OAuth auth client with an
+// account-scoped proxy override. The non-empty proxyURL takes precedence over
+// the global cfg.ProxyURL so OAuth refresh and direct-access token exchange
+// respect the per-account proxy configured in auth files. When proxyURL is
+// empty the constructor falls back to cfg.ProxyURL for backward compatibility,
+// matching the legacy behavior of NewAuthClient.
+func NewAuthClientWithProxyURL(cfg *config.Config, proxyURL string) *AuthClient {
+	effectiveProxyURL := strings.TrimSpace(proxyURL)
+	var sdkCfg config.SDKConfig
 	if cfg != nil {
-		client = util.SetProxy(&cfg.SDKConfig, client)
+		sdkCfg = cfg.SDKConfig
+		if effectiveProxyURL == "" {
+			effectiveProxyURL = strings.TrimSpace(cfg.ProxyURL)
+		}
 	}
+	sdkCfg.ProxyURL = effectiveProxyURL
+	client := &http.Client{}
+	client = util.SetProxy(&sdkCfg, client)
 	return &AuthClient{httpClient: client}
 }
 

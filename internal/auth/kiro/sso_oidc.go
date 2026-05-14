@@ -55,10 +55,27 @@ type SSOOIDCClient struct {
 
 // NewSSOOIDCClient creates a new SSO OIDC client.
 func NewSSOOIDCClient(cfg *config.Config) *SSOOIDCClient {
-	client := &http.Client{Timeout: 30 * time.Second}
+	return NewSSOOIDCClientWithProxyURL(cfg, "")
+}
+
+// NewSSOOIDCClientWithProxyURL creates a new SSO OIDC client with an
+// account-scoped proxy override. The non-empty proxyURL takes precedence over
+// the global cfg.ProxyURL so token refresh respects the per-account proxy
+// configured in auth files. When proxyURL is empty the constructor falls back
+// to cfg.ProxyURL for backward compatibility, matching the legacy behavior of
+// NewSSOOIDCClient.
+func NewSSOOIDCClientWithProxyURL(cfg *config.Config, proxyURL string) *SSOOIDCClient {
+	effectiveProxyURL := strings.TrimSpace(proxyURL)
+	var sdkCfg config.SDKConfig
 	if cfg != nil {
-		client = util.SetProxy(&cfg.SDKConfig, client)
+		sdkCfg = cfg.SDKConfig
+		if effectiveProxyURL == "" {
+			effectiveProxyURL = strings.TrimSpace(cfg.ProxyURL)
+		}
 	}
+	sdkCfg.ProxyURL = effectiveProxyURL
+	client := &http.Client{Timeout: 30 * time.Second}
+	client = util.SetProxy(&sdkCfg, client)
 	return &SSOOIDCClient{
 		httpClient: client,
 		cfg:        cfg,

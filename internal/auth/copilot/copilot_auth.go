@@ -63,8 +63,28 @@ type CopilotAuth struct {
 // NewCopilotAuth creates a new CopilotAuth service instance.
 // It initializes an HTTP client with proxy settings from the provided configuration.
 func NewCopilotAuth(cfg *config.Config) *CopilotAuth {
+	return NewCopilotAuthWithProxyURL(cfg, "")
+}
+
+// NewCopilotAuthWithProxyURL creates a new CopilotAuth service with an
+// account-scoped proxy override. The non-empty proxyURL takes precedence over
+// the global cfg.ProxyURL so the GitHub-token validation, Copilot API token
+// exchange (called on every business request via ensureAPIToken) and dynamic
+// /models discovery respect the per-account proxy configured in auth files.
+// When proxyURL is empty the constructor falls back to cfg.ProxyURL for
+// backward compatibility, matching the legacy behavior of NewCopilotAuth.
+func NewCopilotAuthWithProxyURL(cfg *config.Config, proxyURL string) *CopilotAuth {
+	effectiveProxyURL := strings.TrimSpace(proxyURL)
+	var sdkCfg config.SDKConfig
+	if cfg != nil {
+		sdkCfg = cfg.SDKConfig
+		if effectiveProxyURL == "" {
+			effectiveProxyURL = strings.TrimSpace(cfg.ProxyURL)
+		}
+	}
+	sdkCfg.ProxyURL = effectiveProxyURL
 	return &CopilotAuth{
-		httpClient:   util.SetProxy(&cfg.SDKConfig, &http.Client{Timeout: 30 * time.Second}),
+		httpClient:   util.SetProxy(&sdkCfg, &http.Client{Timeout: 30 * time.Second}),
 		deviceClient: NewDeviceFlowClient(cfg),
 		cfg:          cfg,
 	}

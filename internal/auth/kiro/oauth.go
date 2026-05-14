@@ -49,10 +49,27 @@ type KiroOAuth struct {
 
 // NewKiroOAuth creates a new Kiro OAuth handler.
 func NewKiroOAuth(cfg *config.Config) *KiroOAuth {
-	client := &http.Client{Timeout: 30 * time.Second}
+	return NewKiroOAuthWithProxyURL(cfg, "")
+}
+
+// NewKiroOAuthWithProxyURL creates a new Kiro OAuth handler with an
+// account-scoped proxy override. The non-empty proxyURL takes precedence over
+// the global cfg.ProxyURL so social-auth (Google/GitHub) Kiro token refresh
+// respects the per-account proxy configured in auth files. When proxyURL is
+// empty the constructor falls back to cfg.ProxyURL for backward compatibility,
+// matching the legacy behavior of NewKiroOAuth.
+func NewKiroOAuthWithProxyURL(cfg *config.Config, proxyURL string) *KiroOAuth {
+	effectiveProxyURL := strings.TrimSpace(proxyURL)
+	var sdkCfg config.SDKConfig
 	if cfg != nil {
-		client = util.SetProxy(&cfg.SDKConfig, client)
+		sdkCfg = cfg.SDKConfig
+		if effectiveProxyURL == "" {
+			effectiveProxyURL = strings.TrimSpace(cfg.ProxyURL)
+		}
 	}
+	sdkCfg.ProxyURL = effectiveProxyURL
+	client := &http.Client{Timeout: 30 * time.Second}
+	client = util.SetProxy(&sdkCfg, client)
 	fp := GlobalFingerprintManager().GetFingerprint("login")
 	return &KiroOAuth{
 		httpClient:  client,
