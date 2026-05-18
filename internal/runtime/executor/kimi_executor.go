@@ -67,6 +67,7 @@ func (e *KimiExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth,
 	if err := e.PrepareRequest(httpReq, auth); err != nil {
 		return nil, err
 	}
+	ctx = withRuntimeTransportHostFromRequest(ctx, httpReq)
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
 	return httpClient.Do(httpReq)
 }
@@ -120,6 +121,7 @@ func (e *KimiExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 		return resp, err
 	}
 	applyKimiHeadersWithAuth(httpReq, token, false, auth)
+	ctx = withRuntimeTransportHostFromRequest(ctx, httpReq)
 	var attrs map[string]string
 	if auth != nil {
 		attrs = auth.Attributes
@@ -229,6 +231,7 @@ func (e *KimiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 		return nil, err
 	}
 	applyKimiHeadersWithAuth(httpReq, token, true, auth)
+	ctx = withRuntimeTransportHostFromRequest(ctx, httpReq)
 	var attrs map[string]string
 	if auth != nil {
 		attrs = auth.Attributes

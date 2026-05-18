@@ -51,6 +51,11 @@ func (e *IFlowExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Aut
 	if strings.TrimSpace(apiKey) != "" {
 		req.Header.Set("Authorization", "Bearer "+apiKey)
 	}
+	var attrs map[string]string
+	if auth != nil {
+		attrs = auth.Attributes
+	}
+	util.ApplyCustomHeadersFromAttrs(req, attrs)
 	return nil
 }
 
@@ -66,6 +71,7 @@ func (e *IFlowExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth
 	if err := e.PrepareRequest(httpReq, auth); err != nil {
 		return nil, err
 	}
+	ctx = withRuntimeTransportHostFromRequest(ctx, httpReq)
 	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
 	return httpClient.Do(httpReq)
 }
@@ -116,6 +122,7 @@ func (e *IFlowExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		return resp, err
 	}
 	applyIFlowHeaders(httpReq, apiKey, false, auth)
+	ctx = withRuntimeTransportHostFromRequest(ctx, httpReq)
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
@@ -224,6 +231,7 @@ func (e *IFlowExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		return nil, err
 	}
 	applyIFlowHeaders(httpReq, apiKey, true, auth)
+	ctx = withRuntimeTransportHostFromRequest(ctx, httpReq)
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID

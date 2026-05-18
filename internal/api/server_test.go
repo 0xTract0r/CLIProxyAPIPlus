@@ -301,6 +301,13 @@ func TestManagementFrontendOAuthRoutesRegistered(t *testing.T) {
 			wantStatus: http.StatusOK,
 		},
 		{
+			name:       "test auth file message",
+			method:     http.MethodPost,
+			path:       "/v0/management/auth-files/test-message",
+			body:       `{"name":""}`,
+			wantStatus: http.StatusBadRequest,
+		},
+		{
 			name:       "cancel oauth session",
 			method:     http.MethodDelete,
 			path:       "/v0/management/oauth-session?state=route-test-state",

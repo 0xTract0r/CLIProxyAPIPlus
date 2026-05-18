@@ -13,8 +13,10 @@ import (
 )
 
 const (
-	oauthSessionTTL             = 10 * time.Minute
+	oauthCallbackWaitTimeout    = 15 * time.Minute
+	oauthSessionTTL             = oauthCallbackWaitTimeout + 5*time.Minute
 	maxOAuthStateLength         = 128
+	oauthSessionStatusComplete  = "ok"
 	oauthSessionStatusCancelled = "cancelled"
 )
 
@@ -25,11 +27,16 @@ var (
 )
 
 type oauthSession struct {
-	Provider  string
-	Status    string
-	CreatedAt time.Time
-	ExpiresAt time.Time
-	cancel    context.CancelFunc
+	Provider    string
+	Status      string
+	SavedPath   string
+	AuthName    string
+	Note        string
+	ProxyURL    string
+	CompletedAt time.Time
+	CreatedAt   time.Time
+	ExpiresAt   time.Time
+	cancel      context.CancelFunc
 }
 
 type oauthSessionStore struct {
@@ -95,7 +102,7 @@ func (s *oauthSessionStore) SetError(state, message string) {
 	if !ok {
 		return
 	}
-	if isOAuthSessionCancelledStatus(session.Status) {
+	if isOAuthSessionCancelledStatus(session.Status) || isOAuthSessionCompleteStatus(session.Status) {
 		return
 	}
 	session.Status = message
@@ -115,6 +122,35 @@ func (s *oauthSessionStore) Complete(state string) {
 
 	s.purgeExpiredLocked(now)
 	delete(s.sessions, state)
+}
+
+func (s *oauthSessionStore) CompleteWithResult(state string, result oauthSessionResult) {
+	state = strings.TrimSpace(state)
+	if state == "" {
+		return
+	}
+	now := time.Now()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.purgeExpiredLocked(now)
+	session, ok := s.sessions[state]
+	if !ok {
+		return
+	}
+	session.Status = oauthSessionStatusComplete
+	session.SavedPath = strings.TrimSpace(result.SavedPath)
+	session.AuthName = strings.TrimSpace(result.AuthName)
+	session.Note = strings.TrimSpace(result.Note)
+	session.ProxyURL = strings.TrimSpace(result.ProxyURL)
+	if provider := strings.ToLower(strings.TrimSpace(result.Provider)); provider != "" {
+		session.Provider = provider
+	}
+	session.CompletedAt = now
+	session.ExpiresAt = now.Add(s.ttl)
+	session.cancel = nil
+	s.sessions[state] = session
 }
 
 func (s *oauthSessionStore) Cancel(state string) bool {
@@ -159,7 +195,7 @@ func (s *oauthSessionStore) CompleteProvider(provider string) int {
 	removed := 0
 	for state, session := range s.sessions {
 		if strings.EqualFold(session.Provider, provider) {
-			if isOAuthSessionCancelledStatus(session.Status) {
+			if isOAuthSessionCancelledStatus(session.Status) || isOAuthSessionCompleteStatus(session.Status) {
 				continue
 			}
 			delete(s.sessions, state)
@@ -242,6 +278,10 @@ func SetOAuthSessionError(state, message string) { oauthSessions.SetError(state,
 
 func CompleteOAuthSession(state string) { oauthSessions.Complete(state) }
 
+func CompleteOAuthSessionWithResult(state string, result oauthSessionResult) {
+	oauthSessions.CompleteWithResult(state, result)
+}
+
 func CancelOAuthSessionState(state string) bool { return oauthSessions.Cancel(state) }
 
 func CompleteOAuthSessionsByProvider(provider string) int {
@@ -266,6 +306,10 @@ func IsOAuthSessionPending(state, provider string) bool {
 
 func isOAuthSessionCancelledStatus(status string) bool {
 	return strings.EqualFold(strings.TrimSpace(status), oauthSessionStatusCancelled)
+}
+
+func isOAuthSessionCompleteStatus(status string) bool {
+	return strings.EqualFold(strings.TrimSpace(status), oauthSessionStatusComplete)
 }
 
 func ValidateOAuthState(state string) error {

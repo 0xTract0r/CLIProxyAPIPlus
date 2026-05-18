@@ -1,6 +1,8 @@
 package codex
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"io"
 	"net/http"
@@ -77,4 +79,123 @@ func TestNewCodexAuthWithProxyURL_OverrideProxyTakesPrecedence(t *testing.T) {
 	if proxyURL == nil || proxyURL.String() != "http://override.example.com:8081" {
 		t.Fatalf("proxy URL = %v, want http://override.example.com:8081", proxyURL)
 	}
+}
+
+func TestNewCodexAuthWithHTTPClientUsesCallerClientForTokenExchange(t *testing.T) {
+	var captured *http.Request
+	client := &http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			clone := req.Clone(req.Context())
+			clone.Header = req.Header.Clone()
+			if clone.Header.Get("User-Agent") == "" {
+				clone.Header.Set("User-Agent", "managed-codex/26.318.11754")
+			}
+			if clone.Header.Get("Version") == "" {
+				clone.Header.Set("Version", "26.318.11754")
+			}
+			if clone.Header.Get("Accept-Encoding") == "" {
+				clone.Header.Set("Accept-Encoding", "gzip, deflate, br, zstd")
+			}
+			if clone.Header.Get("Content-Type") == "" {
+				clone.Header.Set("Content-Type", "should-not-be-used")
+			}
+			captured = clone
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body: io.NopCloser(bytes.NewReader(gzipTestPayload(t, `{
+					"access_token":"access-token",
+					"refresh_token":"refresh-token",
+					"id_token":"not-a-jwt",
+					"token_type":"Bearer",
+					"expires_in":3600
+				}`))),
+				Header: http.Header{
+					"Content-Encoding": []string{"gzip"},
+					"Content-Type":     []string{"application/json"},
+				},
+				Request: req,
+			}, nil
+		}),
+	}
+	auth := NewCodexAuthWithHTTPClient(client)
+
+	bundle, err := auth.ExchangeCodeForTokens(context.Background(), "oauth-code", &PKCECodes{
+		CodeVerifier:  "verifier",
+		CodeChallenge: "challenge",
+	})
+	if err != nil {
+		t.Fatalf("exchange code: %v", err)
+	}
+	if bundle == nil || bundle.TokenData.AccessToken != "access-token" || bundle.TokenData.RefreshToken != "refresh-token" {
+		t.Fatalf("unexpected token bundle: %#v", bundle)
+	}
+	if captured == nil {
+		t.Fatal("caller HTTP client was not used")
+	}
+	if captured.URL.String() != TokenURL {
+		t.Fatalf("token URL = %q", captured.URL.String())
+	}
+	if captured.Header.Get("Content-Type") != "application/x-www-form-urlencoded" {
+		t.Fatalf("Content-Type = %q", captured.Header.Get("Content-Type"))
+	}
+	if captured.Header.Get("Accept") != "application/json" {
+		t.Fatalf("Accept = %q", captured.Header.Get("Accept"))
+	}
+	if captured.Header.Get("User-Agent") != "managed-codex/26.318.11754" {
+		t.Fatalf("User-Agent = %q", captured.Header.Get("User-Agent"))
+	}
+	if captured.Header.Get("Version") != "26.318.11754" {
+		t.Fatalf("Version = %q", captured.Header.Get("Version"))
+	}
+	if captured.Header.Get("Accept-Encoding") != "gzip, deflate, br, zstd" {
+		t.Fatalf("Accept-Encoding = %q", captured.Header.Get("Accept-Encoding"))
+	}
+}
+
+func TestExchangeCodeForTokensNonJSONResponseIncludesDiagnostics(t *testing.T) {
+	auth := NewCodexAuthWithHTTPClient(&http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader("\x1b[31mproxy returned a terminal banner")),
+				Header: http.Header{
+					"Content-Type": []string{"text/plain; charset=utf-8"},
+				},
+				Request: req,
+			}, nil
+		}),
+	})
+
+	_, err := auth.ExchangeCodeForTokens(context.Background(), "oauth-code", &PKCECodes{
+		CodeVerifier:  "verifier",
+		CodeChallenge: "challenge",
+	})
+	if err == nil {
+		t.Fatal("expected parse error")
+	}
+	msg := err.Error()
+	for _, want := range []string{
+		"failed to parse token response",
+		"status=200",
+		"content_type=text/plain; charset=utf-8",
+		"content_encoding=<empty>",
+		`body_preview="\x1b[31mproxy returned a terminal banner"`,
+	} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("error %q does not contain %q", msg, want)
+		}
+	}
+}
+
+func gzipTestPayload(t *testing.T, raw string) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	writer := gzip.NewWriter(&buf)
+	if _, err := writer.Write([]byte(raw)); err != nil {
+		t.Fatalf("gzip write: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("gzip close: %v", err)
+	}
+	return buf.Bytes()
 }

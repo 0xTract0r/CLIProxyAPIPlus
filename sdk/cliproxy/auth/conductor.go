@@ -1077,6 +1077,7 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	if auth == nil {
 		return nil, nil
 	}
+	hydrateRuntimeFields(auth)
 	if auth.ID == "" {
 		auth.ID = uuid.NewString()
 	}
@@ -1100,6 +1101,7 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	if auth == nil || auth.ID == "" {
 		return nil, nil
 	}
+	hydrateRuntimeFields(auth)
 	m.mu.Lock()
 	if existing, ok := m.auths[auth.ID]; ok && existing != nil {
 		if !auth.indexAssigned && auth.Index == "" {
@@ -1143,6 +1145,7 @@ func (m *Manager) Load(ctx context.Context) error {
 		if auth == nil || auth.ID == "" {
 			continue
 		}
+		hydrateRuntimeFields(auth)
 		auth.EnsureIndex()
 		m.auths[auth.ID] = auth.Clone()
 	}
@@ -1154,6 +1157,11 @@ func (m *Manager) Load(ctx context.Context) error {
 	m.mu.Unlock()
 	m.syncScheduler()
 	return nil
+}
+
+func hydrateRuntimeFields(auth *Auth) {
+	ApplyRuntimeFieldsFromMetadata(auth)
+	ApplyCustomHeadersFromMetadata(auth)
 }
 
 // Execute performs a non-streaming execution using the configured selector and executor.
@@ -3499,7 +3507,18 @@ func (m *Manager) HttpRequest(ctx context.Context, auth *Auth, req *http.Request
 	if exec == nil {
 		return nil, &Error{Code: "provider_not_found", Message: "executor not registered for provider: " + providerKey}
 	}
-	return exec.HttpRequest(ctx, auth, req)
+	execCtx := ctx
+	if execCtx == nil {
+		execCtx = req.Context()
+	}
+	if execCtx == nil {
+		execCtx = context.Background()
+	}
+	if rt := m.roundTripperFor(auth); rt != nil {
+		execCtx = context.WithValue(execCtx, roundTripperContextKey{}, rt)
+		execCtx = context.WithValue(execCtx, "cliproxy.roundtripper", rt)
+	}
+	return exec.HttpRequest(execCtx, auth, req)
 }
 
 func (m *Manager) findAllAntigravityCreditsCandidateAuths(routeModel string, opts cliproxyexecutor.Options) []creditsCandidateEntry {

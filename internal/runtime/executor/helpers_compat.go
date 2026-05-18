@@ -21,6 +21,10 @@ func newProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 	return helps.NewProxyAwareHTTPClient(ctx, cfg, auth, timeout)
 }
 
+func withRuntimeTransportHostFromRequest(ctx context.Context, req *http.Request) context.Context {
+	return helps.WithRuntimeTransportHostFromRequest(ctx, req)
+}
+
 func payloadRequestedModel(opts cliproxyexecutor.Options, fallback string) string {
 	return helps.PayloadRequestedModel(opts, fallback)
 }

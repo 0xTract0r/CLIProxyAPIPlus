@@ -4,15 +4,21 @@
 package claude
 
 import (
+	"bytes"
+	"compress/gzip"
+	"compress/zlib"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/andybalholm/brotli"
+	"github.com/klauspost/compress/zstd"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	log "github.com/sirupsen/logrus"
 )
@@ -202,7 +208,7 @@ func (o *ClaudeAuth) ExchangeCodeForTokens(ctx context.Context, code, state stri
 		}
 	}()
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := readOAuthTokenResponseBody(resp)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read token response: %w", err)
 	}
@@ -215,7 +221,7 @@ func (o *ClaudeAuth) ExchangeCodeForTokens(ctx context.Context, code, state stri
 
 	var tokenResp tokenResponse
 	if err = json.Unmarshal(body, &tokenResp); err != nil {
-		return nil, fmt.Errorf("failed to parse token response: %w", err)
+		return nil, fmt.Errorf("failed to parse token response: %w; %s", err, summarizeOAuthHTTPResponse(resp, body))
 	}
 
 	// Create token data
@@ -246,6 +252,100 @@ func summarizeOAuthErrorBody(body []byte) string {
 		return summary[:maxOAuthErrorBodyBytes] + "..."
 	}
 	return summary
+}
+
+func summarizeOAuthHTTPResponse(resp *http.Response, body []byte) string {
+	status := 0
+	contentType := ""
+	contentEncoding := ""
+	if resp != nil {
+		status = resp.StatusCode
+		contentType = strings.TrimSpace(resp.Header.Get("Content-Type"))
+		contentEncoding = strings.TrimSpace(resp.Header.Get("Content-Encoding"))
+	}
+	if contentType == "" {
+		contentType = "<empty>"
+	}
+	if contentEncoding == "" {
+		contentEncoding = "<empty>"
+	}
+	preview := summarizeOAuthErrorBody(body)
+	if preview != "<empty response body>" {
+		preview = strconv.QuoteToASCII(preview)
+	}
+	return fmt.Sprintf("status=%d content_type=%s content_encoding=%s body_preview=%s", status, contentType, contentEncoding, preview)
+}
+
+func readOAuthTokenResponseBody(resp *http.Response) ([]byte, error) {
+	if resp == nil || resp.Body == nil {
+		return nil, fmt.Errorf("empty token response body")
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	encodings := oauthTokenContentEncodings(resp.Header.Get("Content-Encoding"))
+	if len(encodings) == 0 {
+		return body, nil
+	}
+	decoded := body
+	for i := len(encodings) - 1; i >= 0; i-- {
+		decoded, err = decodeOAuthTokenResponseBody(decoded, encodings[i])
+		if err != nil {
+			return nil, err
+		}
+	}
+	return decoded, nil
+}
+
+func oauthTokenContentEncodings(value string) []string {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+	parts := strings.Split(value, ",")
+	encodings := make([]string, 0, len(parts))
+	for _, part := range parts {
+		encoding := strings.ToLower(strings.TrimSpace(part))
+		if encoding == "" || encoding == "identity" {
+			continue
+		}
+		encodings = append(encodings, encoding)
+	}
+	return encodings
+}
+
+func decodeOAuthTokenResponseBody(body []byte, encoding string) ([]byte, error) {
+	switch strings.ToLower(strings.TrimSpace(encoding)) {
+	case "gzip", "x-gzip":
+		reader, err := gzip.NewReader(bytes.NewReader(body))
+		if err != nil {
+			return nil, fmt.Errorf("decode gzip token response: %w", err)
+		}
+		defer func() {
+			_ = reader.Close()
+		}()
+		return io.ReadAll(reader)
+	case "br":
+		return io.ReadAll(brotli.NewReader(bytes.NewReader(body)))
+	case "zstd":
+		reader, err := zstd.NewReader(bytes.NewReader(body))
+		if err != nil {
+			return nil, fmt.Errorf("decode zstd token response: %w", err)
+		}
+		defer reader.Close()
+		return io.ReadAll(reader)
+	case "deflate":
+		reader, err := zlib.NewReader(bytes.NewReader(body))
+		if err != nil {
+			return nil, fmt.Errorf("decode deflate token response: %w", err)
+		}
+		defer func() {
+			_ = reader.Close()
+		}()
+		return io.ReadAll(reader)
+	default:
+		return nil, fmt.Errorf("unsupported token response content-encoding %q", encoding)
+	}
 }
 
 // RefreshTokens refreshes the access token using the refresh token.
@@ -291,20 +391,20 @@ func (o *ClaudeAuth) RefreshTokens(ctx context.Context, refreshToken string) (*C
 		_ = resp.Body.Close()
 	}()
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := readOAuthTokenResponseBody(resp)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read refresh response: %w", err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("token refresh failed with status %d: %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("token refresh failed with status %d: %s", resp.StatusCode, summarizeOAuthErrorBody(body))
 	}
 
 	// log.Debugf("Token response: %s", string(body))
 
 	var tokenResp tokenResponse
 	if err = json.Unmarshal(body, &tokenResp); err != nil {
-		return nil, fmt.Errorf("failed to parse token response: %w", err)
+		return nil, fmt.Errorf("failed to parse token response: %w; %s", err, summarizeOAuthHTTPResponse(resp, body))
 	}
 
 	// Create token data

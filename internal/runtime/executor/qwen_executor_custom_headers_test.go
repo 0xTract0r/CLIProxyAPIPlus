@@ -50,3 +50,31 @@ func TestApplyQwenHeaders_NilAuthDoesNotPanic(t *testing.T) {
 		t.Fatalf("expected Accept=text/event-stream, got %q", got)
 	}
 }
+
+func TestQwenPrepareRequest_AppliesCustomHeaders(t *testing.T) {
+	req, err := http.NewRequest(http.MethodGet, "https://portal.qwen.ai/v1/models", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	auth := &cliproxyauth.Auth{
+		Provider: "qwen",
+		Attributes: map[string]string{
+			"api_key":              "fake_token",
+			"header:X-Custom-Foo":  "bar",
+			"header:X-Account-Tag": "qwen-a",
+		},
+	}
+
+	if err := NewQwenExecutor(nil).PrepareRequest(req, auth); err != nil {
+		t.Fatalf("prepare request: %v", err)
+	}
+	if got := req.Header.Get("Authorization"); got != "Bearer fake_token" {
+		t.Fatalf("expected Authorization=Bearer fake_token, got %q", got)
+	}
+	if got := req.Header.Get("X-Custom-Foo"); got != "bar" {
+		t.Fatalf("expected X-Custom-Foo=bar, got %q", got)
+	}
+	if got := req.Header.Get("X-Account-Tag"); got != "qwen-a" {
+		t.Fatalf("expected X-Account-Tag=qwen-a, got %q", got)
+	}
+}

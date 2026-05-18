@@ -276,6 +276,11 @@ func (e *AntigravityExecutor) PrepareRequest(req *http.Request, auth *cliproxyau
 		return statusErr{code: http.StatusUnauthorized, msg: "missing access token"}
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
+	var attrs map[string]string
+	if auth != nil {
+		attrs = auth.Attributes
+	}
+	util.ApplyCustomHeadersFromAttrs(req, attrs)
 	return nil
 }
 
@@ -312,6 +317,7 @@ func (e *AntigravityExecutor) HttpRequest(ctx context.Context, auth *cliproxyaut
 		return nil, err
 	}
 
+	ctx = helps.WithRuntimeTransportHostFromRequest(ctx, httpReq)
 	httpClient := newAntigravityHTTPClient(ctx, e.cfg, auth, 0)
 	return httpClient.Do(httpReq)
 }

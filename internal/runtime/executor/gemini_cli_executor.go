@@ -102,6 +102,7 @@ func (e *GeminiCLIExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.
 	if err := e.PrepareRequest(httpReq, auth); err != nil {
 		return nil, err
 	}
+	ctx = helps.WithRuntimeTransportHostFromRequest(ctx, httpReq)
 	httpClient := newHTTPClient(ctx, e.cfg, auth, 0)
 	return httpClient.Do(httpReq)
 }
@@ -154,7 +155,8 @@ func (e *GeminiCLIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth
 		models = append([]string{baseModel}, models...)
 	}
 
-	httpClient := newHTTPClient(ctx, e.cfg, auth, 0)
+	transportCtx := helps.WithRuntimeTransportHost(ctx, codeAssistEndpoint)
+	httpClient := newHTTPClient(transportCtx, e.cfg, auth, 0)
 	respCtx := context.WithValue(ctx, "alt", opts.Alt)
 
 	var authID, authLabel, authType, authValue string
@@ -303,7 +305,8 @@ func (e *GeminiCLIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 		models = append([]string{baseModel}, models...)
 	}
 
-	httpClient := newHTTPClient(ctx, e.cfg, auth, 0)
+	transportCtx := helps.WithRuntimeTransportHost(ctx, codeAssistEndpoint)
+	httpClient := newHTTPClient(transportCtx, e.cfg, auth, 0)
 	respCtx := context.WithValue(ctx, "alt", opts.Alt)
 
 	var authID, authLabel, authType, authValue string
@@ -477,7 +480,8 @@ func (e *GeminiCLIExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.
 		models = append([]string{baseModel}, models...)
 	}
 
-	httpClient := newHTTPClient(ctx, e.cfg, auth, 0)
+	transportCtx := helps.WithRuntimeTransportHost(ctx, codeAssistEndpoint)
+	httpClient := newHTTPClient(transportCtx, e.cfg, auth, 0)
 	respCtx := context.WithValue(ctx, "alt", opts.Alt)
 
 	var authID, authLabel, authType, authValue string

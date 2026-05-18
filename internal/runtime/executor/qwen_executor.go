@@ -188,6 +188,11 @@ func (e *QwenExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Auth
 	if strings.TrimSpace(token) != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
+	var attrs map[string]string
+	if auth != nil {
+		attrs = auth.Attributes
+	}
+	util.ApplyCustomHeadersFromAttrs(req, attrs)
 	return nil
 }
 
@@ -203,6 +208,7 @@ func (e *QwenExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth,
 	if err := e.PrepareRequest(httpReq, auth); err != nil {
 		return nil, err
 	}
+	ctx = withRuntimeTransportHostFromRequest(ctx, httpReq)
 	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
 	return httpClient.Do(httpReq)
 }
@@ -257,6 +263,7 @@ func (e *QwenExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 		return resp, err
 	}
 	applyQwenHeaders(httpReq, token, false, auth)
+	ctx = withRuntimeTransportHostFromRequest(ctx, httpReq)
 	var authLabel, authType, authValue string
 	if auth != nil {
 		authLabel = auth.Label
@@ -367,6 +374,7 @@ func (e *QwenExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 		return nil, err
 	}
 	applyQwenHeaders(httpReq, token, true, auth)
+	ctx = withRuntimeTransportHostFromRequest(ctx, httpReq)
 	var authLabel, authType, authValue string
 	if auth != nil {
 		authLabel = auth.Label

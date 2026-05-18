@@ -67,6 +67,17 @@ func ApplyCustomHeadersFromMetadata(auth *Auth) {
 	}
 }
 
+func ApplyRuntimeFieldsFromMetadata(auth *Auth) {
+	if auth == nil || len(auth.Metadata) == 0 {
+		return
+	}
+	if strings.TrimSpace(auth.ProxyURL) == "" {
+		if proxyURL, ok := auth.Metadata["proxy_url"].(string); ok {
+			auth.ProxyURL = strings.TrimSpace(proxyURL)
+		}
+	}
+}
+
 func HasStructuredAccountSettingsMetadata(auth *Auth) bool {
 	if auth == nil || len(auth.Metadata) == 0 {
 		return false

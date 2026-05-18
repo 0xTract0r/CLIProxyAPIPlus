@@ -5,15 +5,21 @@
 package codex
 
 import (
+	"bytes"
+	"compress/gzip"
+	"compress/zlib"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/andybalholm/brotli"
+	"github.com/klauspost/compress/zstd"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	log "github.com/sirupsen/logrus"
@@ -55,6 +61,16 @@ func NewCodexAuthWithProxyURL(cfg *config.Config, proxyURL string) *CodexAuth {
 	return &CodexAuth{
 		httpClient: util.SetProxy(&sdkCfg, &http.Client{}),
 	}
+}
+
+// NewCodexAuthWithHTTPClient creates a CodexAuth with a caller-managed HTTP
+// client. Management OAuth uses this to bind token exchange to the same
+// account-scoped runtime transport and managed headers that will be persisted.
+func NewCodexAuthWithHTTPClient(client *http.Client) *CodexAuth {
+	if client == nil {
+		client = util.SetProxy(nil, &http.Client{})
+	}
+	return &CodexAuth{httpClient: client}
 }
 
 // GenerateAuthURL creates the OAuth authorization URL with PKCE (Proof Key for Code Exchange).
@@ -125,14 +141,14 @@ func (o *CodexAuth) ExchangeCodeForTokensWithRedirect(ctx context.Context, code,
 		_ = resp.Body.Close()
 	}()
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := readTokenResponseBody(resp)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read token response: %w", err)
 	}
 	// log.Debugf("Token response: %s", string(body))
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("token exchange failed with status %d: %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("token exchange failed: %s", summarizeTokenHTTPResponse(resp, body))
 	}
 
 	// Parse token response
@@ -145,7 +161,7 @@ func (o *CodexAuth) ExchangeCodeForTokensWithRedirect(ctx context.Context, code,
 	}
 
 	if err = json.Unmarshal(body, &tokenResp); err != nil {
-		return nil, fmt.Errorf("failed to parse token response: %w", err)
+		return nil, fmt.Errorf("failed to parse token response: %w; %s", err, summarizeTokenHTTPResponse(resp, body))
 	}
 
 	// Extract account ID from ID token
@@ -211,13 +227,13 @@ func (o *CodexAuth) RefreshTokens(ctx context.Context, refreshToken string) (*Co
 		_ = resp.Body.Close()
 	}()
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := readTokenResponseBody(resp)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read refresh response: %w", err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("token refresh failed with status %d: %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("token refresh failed: %s", summarizeTokenHTTPResponse(resp, body))
 	}
 
 	var tokenResp struct {
@@ -229,7 +245,7 @@ func (o *CodexAuth) RefreshTokens(ctx context.Context, refreshToken string) (*Co
 	}
 
 	if err = json.Unmarshal(body, &tokenResp); err != nil {
-		return nil, fmt.Errorf("failed to parse refresh response: %w", err)
+		return nil, fmt.Errorf("failed to parse refresh response: %w; %s", err, summarizeTokenHTTPResponse(resp, body))
 	}
 
 	// Extract account ID from ID token
@@ -309,6 +325,109 @@ func isNonRetryableRefreshErr(err error) bool {
 	}
 	raw := strings.ToLower(err.Error())
 	return strings.Contains(raw, "refresh_token_reused")
+}
+
+func summarizeTokenHTTPResponse(resp *http.Response, body []byte) string {
+	status := 0
+	contentType := ""
+	contentEncoding := ""
+	if resp != nil {
+		status = resp.StatusCode
+		contentType = strings.TrimSpace(resp.Header.Get("Content-Type"))
+		contentEncoding = strings.TrimSpace(resp.Header.Get("Content-Encoding"))
+	}
+	if contentType == "" {
+		contentType = "<empty>"
+	}
+	if contentEncoding == "" {
+		contentEncoding = "<empty>"
+	}
+
+	preview := strings.TrimSpace(string(body))
+	const maxPreview = 512
+	if len(preview) > maxPreview {
+		preview = preview[:maxPreview] + "...(truncated)"
+	}
+	if preview == "" {
+		preview = "<empty>"
+	} else {
+		preview = strconv.QuoteToASCII(preview)
+	}
+	return fmt.Sprintf("status=%d content_type=%s content_encoding=%s body_preview=%s", status, contentType, contentEncoding, preview)
+}
+
+func readTokenResponseBody(resp *http.Response) ([]byte, error) {
+	if resp == nil || resp.Body == nil {
+		return nil, fmt.Errorf("empty token response body")
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	encodings := tokenContentEncodings(resp.Header.Get("Content-Encoding"))
+	if len(encodings) == 0 {
+		return body, nil
+	}
+
+	decoded := body
+	for i := len(encodings) - 1; i >= 0; i-- {
+		decoded, err = decodeTokenResponseBody(decoded, encodings[i])
+		if err != nil {
+			return nil, err
+		}
+	}
+	return decoded, nil
+}
+
+func tokenContentEncodings(value string) []string {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+	parts := strings.Split(value, ",")
+	encodings := make([]string, 0, len(parts))
+	for _, part := range parts {
+		encoding := strings.ToLower(strings.TrimSpace(part))
+		if encoding == "" || encoding == "identity" {
+			continue
+		}
+		encodings = append(encodings, encoding)
+	}
+	return encodings
+}
+
+func decodeTokenResponseBody(body []byte, encoding string) ([]byte, error) {
+	switch strings.ToLower(strings.TrimSpace(encoding)) {
+	case "gzip", "x-gzip":
+		reader, err := gzip.NewReader(bytes.NewReader(body))
+		if err != nil {
+			return nil, fmt.Errorf("decode gzip token response: %w", err)
+		}
+		defer func() {
+			_ = reader.Close()
+		}()
+		return io.ReadAll(reader)
+	case "br":
+		return io.ReadAll(brotli.NewReader(bytes.NewReader(body)))
+	case "zstd":
+		reader, err := zstd.NewReader(bytes.NewReader(body))
+		if err != nil {
+			return nil, fmt.Errorf("decode zstd token response: %w", err)
+		}
+		defer reader.Close()
+		return io.ReadAll(reader)
+	case "deflate":
+		reader, err := zlib.NewReader(bytes.NewReader(body))
+		if err != nil {
+			return nil, fmt.Errorf("decode deflate token response: %w", err)
+		}
+		defer func() {
+			_ = reader.Close()
+		}()
+		return io.ReadAll(reader)
+	default:
+		return nil, fmt.Errorf("unsupported token response content-encoding %q", encoding)
+	}
 }
 
 // UpdateTokenStorage updates an existing CodexTokenStorage with new token data.

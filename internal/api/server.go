@@ -714,6 +714,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.POST("/auth-files", s.mgmt.UploadAuthFile)
 		mgmt.DELETE("/auth-files", s.mgmt.DeleteAuthFile)
 		mgmt.POST("/auth-files/refresh-status", s.mgmt.RefreshAuthFileStatus)
+		mgmt.POST("/auth-files/test-message", s.mgmt.TestAuthFileMessage)
 		mgmt.PATCH("/auth-files/status", s.mgmt.PatchAuthFileStatus)
 		mgmt.GET("/auth-files/account-settings", s.mgmt.GetAuthFileAccountSettings)
 		mgmt.PATCH("/auth-files/account-settings", s.mgmt.PatchAuthFileAccountSettings)

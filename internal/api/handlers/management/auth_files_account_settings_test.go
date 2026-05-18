@@ -278,12 +278,13 @@ func TestGetAuthFileAccountSettings_PersistsCodexManagedHeaderHistoryAcrossVersi
 
 	store := &memoryAuthStore{}
 	manager := coreauth.NewManager(store, nil, nil)
+	authName := "codex-history-" + strings.ReplaceAll(time.Now().Format("150405.000000000"), ".", "-") + ".json"
 	record := &coreauth.Auth{
-		ID:       "codex-history.json",
-		FileName: "codex-history.json",
+		ID:       authName,
+		FileName: authName,
 		Provider: "codex",
 		Attributes: map[string]string{
-			"path": "/tmp/codex-history.json",
+			"path": "/tmp/" + authName,
 		},
 		Metadata: map[string]any{
 			"type": "codex",
@@ -347,7 +348,7 @@ func TestGetAuthFileAccountSettings_PersistsCodexManagedHeaderHistoryAcrossVersi
 		t.Helper()
 		rec := httptest.NewRecorder()
 		ctx, _ := gin.CreateTestContext(rec)
-		req := httptest.NewRequest(http.MethodGet, "/v0/management/auth-files/account-settings?name=codex-history.json", nil)
+		req := httptest.NewRequest(http.MethodGet, "/v0/management/auth-files/account-settings?name="+authName, nil)
 		ctx.Request = req
 		h.GetAuthFileAccountSettings(ctx)
 
@@ -363,7 +364,7 @@ func TestGetAuthFileAccountSettings_PersistsCodexManagedHeaderHistoryAcrossVersi
 	}
 	readStoredState := func() *authFileManagedHeaderState {
 		t.Helper()
-		updated, ok := manager.GetByID("codex-history.json")
+		updated, ok := manager.GetByID(authName)
 		if !ok || updated == nil {
 			t.Fatalf("expected updated auth record")
 		}

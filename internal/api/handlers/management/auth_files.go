@@ -45,6 +45,8 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"golang.org/x/oauth2"
@@ -55,7 +57,7 @@ var lastRefreshKeys = []string{"last_refresh", "lastRefresh", "last_refreshed_at
 
 const (
 	anthropicCallbackPort         = 54545
-	anthropicOAuthExchangeTimeout = 60 * time.Second
+	anthropicOAuthExchangeTimeout = 2 * time.Minute
 	anthropicOAuthExchangeRetries = 3
 	geminiCallbackPort            = 8085
 	codexCallbackPort             = 1455
@@ -72,6 +74,9 @@ type authFileManagedHeaderProjection struct {
 	SourceURL             string            `json:"source_url,omitempty"`
 	CheckedAt             string            `json:"checked_at,omitempty"`
 	Completeness          string            `json:"completeness,omitempty"`
+	VariantPolicy         string            `json:"variant_policy,omitempty"`
+	VersionVariant        string            `json:"version_variant,omitempty"`
+	BrandOrderVariant     string            `json:"brand_order_variant,omitempty"`
 	SummaryHeaders        map[string]string `json:"summary_headers,omitempty"`
 	VersionedCapabilities map[string]string `json:"versioned_capabilities,omitempty"`
 	StableIdentity        map[string]string `json:"stable_identity,omitempty"`
@@ -141,13 +146,14 @@ type authFileRuntimeIdentityState struct {
 }
 
 type authFileAccountSettingsStored struct {
-	SchemaVersion        int                           `json:"schema_version"`
-	ExtraHeaders         map[string]string             `json:"extra_headers,omitempty"`
-	RefreshEnabled       *bool                         `json:"refresh_enabled,omitempty"`
-	TransportProfile     any                           `json:"transport_profile,omitempty"`
-	TLSProfile           any                           `json:"tls_profile,omitempty"`
-	ManagedHeaderState   *authFileManagedHeaderState   `json:"managed_header_state,omitempty"`
-	RuntimeIdentityState *authFileRuntimeIdentityState `json:"runtime_identity_state,omitempty"`
+	SchemaVersion         int                           `json:"schema_version"`
+	ManagedHeaderSeedHash string                        `json:"managed_header_seed_hash,omitempty"`
+	ExtraHeaders          map[string]string             `json:"extra_headers,omitempty"`
+	RefreshEnabled        *bool                         `json:"refresh_enabled,omitempty"`
+	TransportProfile      any                           `json:"transport_profile,omitempty"`
+	TLSProfile            any                           `json:"tls_profile,omitempty"`
+	ManagedHeaderState    *authFileManagedHeaderState   `json:"managed_header_state,omitempty"`
+	RuntimeIdentityState  *authFileRuntimeIdentityState `json:"runtime_identity_state,omitempty"`
 }
 
 type authFileAccountSettingsView struct {
@@ -1210,6 +1216,7 @@ func (h *Handler) buildAuthFromFileData(path string, data []byte) (*coreauth.Aut
 			auth.Runtime = existing.Runtime
 		}
 	}
+	coreauth.ApplyRuntimeFieldsFromMetadata(auth)
 	coreauth.ApplyCustomHeadersFromMetadata(auth)
 	return auth, nil
 }
@@ -1484,6 +1491,7 @@ func managedHeaderProjectionForAuth(auth *coreauth.Auth, cfg *config.Config) aut
 		return authFileManagedHeaderProjection{}
 	}
 	generatedAt := time.Now().UTC().Format(time.RFC3339)
+	var projection authFileManagedHeaderProjection
 	switch strings.ToLower(strings.TrimSpace(auth.Provider)) {
 	case "claude":
 		profile := runtimehelps.ResolveClaudeDeviceProfile(auth, "", nil, cfg)
@@ -1493,7 +1501,7 @@ func managedHeaderProjectionForAuth(auth *coreauth.Auth, cfg *config.Config) aut
 				timeoutValue = trimmed
 			}
 		}
-		return authFileManagedHeaderProjection{
+		projection = authFileManagedHeaderProjection{
 			GeneratedAt: generatedAt,
 			SummaryHeaders: normalizeHeaderMap(map[string]string{
 				"User-Agent":                  profile.UserAgent,
@@ -1522,7 +1530,7 @@ func managedHeaderProjectionForAuth(auth *coreauth.Auth, cfg *config.Config) aut
 		}
 	case "codex":
 		profile := runtimehelps.ResolveCodexClientProfile(auth, nil, cfg)
-		return authFileManagedHeaderProjection{
+		projection = authFileManagedHeaderProjection{
 			GeneratedAt:           generatedAt,
 			SummaryHeaders:        runtimehelps.CodexManagedHeaders(profile),
 			VersionedCapabilities: runtimehelps.CodexManagedVersionedCapabilities(profile),
@@ -1536,6 +1544,7 @@ func managedHeaderProjectionForAuth(auth *coreauth.Auth, cfg *config.Config) aut
 	default:
 		return authFileManagedHeaderProjection{}
 	}
+	return personalizeManagedHeaderProjectionForAuth(auth, projection)
 }
 
 func mergeAccountHeaders(managedHeaders map[string]string, extraHeaders map[string]string) map[string]string {
@@ -1711,6 +1720,7 @@ func (h *Handler) syncAuthManagedHeaderState(ctx context.Context, auth *coreauth
 	if h == nil || auth == nil {
 		return auth
 	}
+	ensureManagedHeaderSeedForOAuthCredential(auth)
 	stored := readAccountSettingsMetadata(auth, h.cfg)
 	projection := managedHeaderProjectionForAuth(auth, h.cfg)
 	var nextState *authFileManagedHeaderState
@@ -1747,6 +1757,7 @@ func (h *Handler) syncAuthManagedHeaderState(ctx context.Context, auth *coreauth
 	}
 	stored.ManagedHeaderState = nextState
 	stored.RuntimeIdentityState = nextRuntimeIdentity
+	stored.ManagedHeaderSeedHash = accountManagedHeaderSeedHash(updated)
 	updated.Metadata["account_settings"] = stored
 	if shouldSyncHeaders {
 		overwriteAuthMetadataHeaders(updated, runtimeHeaders)
@@ -1764,6 +1775,26 @@ func (h *Handler) syncAuthManagedHeaderState(ctx context.Context, auth *coreauth
 		return persisted
 	}
 	return updated
+}
+
+func ensureManagedHeaderSeedForOAuthCredential(auth *coreauth.Auth) {
+	if auth == nil || auth.Metadata == nil {
+		return
+	}
+	switch providerKey(auth) {
+	case "codex", "claude":
+	default:
+		return
+	}
+	if strings.TrimSpace(metadataString(auth.Metadata, "managed_header_seed")) != "" {
+		return
+	}
+	for _, key := range []string{"refresh_token", "access_token", "id_token", "token"} {
+		if !isEmptyMetadataValue(auth.Metadata[key]) {
+			ensureManagedHeaderSeed(auth)
+			return
+		}
+	}
 }
 
 func normalizeRuntimeIdentityState(state *authFileRuntimeIdentityState) *authFileRuntimeIdentityState {
@@ -2097,6 +2128,9 @@ func normalizeManagedHeaderState(state *authFileManagedHeaderState) *authFileMan
 			SourceURL:             strings.TrimSpace(state.Current.SourceURL),
 			CheckedAt:             strings.TrimSpace(state.Current.CheckedAt),
 			Completeness:          strings.TrimSpace(state.Current.Completeness),
+			VariantPolicy:         strings.TrimSpace(state.Current.VariantPolicy),
+			VersionVariant:        strings.TrimSpace(state.Current.VersionVariant),
+			BrandOrderVariant:     strings.TrimSpace(state.Current.BrandOrderVariant),
 			SummaryHeaders:        normalizeHeaderMap(state.Current.SummaryHeaders),
 			VersionedCapabilities: normalizeHeaderMap(state.Current.VersionedCapabilities),
 			StableIdentity:        normalizeHeaderMap(state.Current.StableIdentity),
@@ -2166,6 +2200,9 @@ func mergeManagedHeaderState(previous *authFileManagedHeaderState, projection au
 		SourceURL:             strings.TrimSpace(projection.SourceURL),
 		CheckedAt:             strings.TrimSpace(projection.CheckedAt),
 		Completeness:          strings.TrimSpace(projection.Completeness),
+		VariantPolicy:         strings.TrimSpace(projection.VariantPolicy),
+		VersionVariant:        strings.TrimSpace(projection.VersionVariant),
+		BrandOrderVariant:     strings.TrimSpace(projection.BrandOrderVariant),
 		SummaryHeaders:        normalizeHeaderMap(projection.SummaryHeaders),
 		VersionedCapabilities: normalizeHeaderMap(projection.VersionedCapabilities),
 		StableIdentity:        normalizeHeaderMap(projection.StableIdentity),
@@ -2268,7 +2305,10 @@ func managedHeaderProjectionEquivalent(left *authFileManagedHeaderProjection, ri
 		reflect.DeepEqual(left.StableIdentity, right.StableIdentity) &&
 		reflect.DeepEqual(left.RuntimeFingerprint, right.RuntimeFingerprint) &&
 		strings.TrimSpace(left.Source) == strings.TrimSpace(right.Source) &&
-		strings.TrimSpace(left.SourceURL) == strings.TrimSpace(right.SourceURL)
+		strings.TrimSpace(left.SourceURL) == strings.TrimSpace(right.SourceURL) &&
+		strings.TrimSpace(left.VariantPolicy) == strings.TrimSpace(right.VariantPolicy) &&
+		strings.TrimSpace(left.VersionVariant) == strings.TrimSpace(right.VersionVariant) &&
+		strings.TrimSpace(left.BrandOrderVariant) == strings.TrimSpace(right.BrandOrderVariant)
 }
 
 func managedHeaderStateEquivalent(left *authFileManagedHeaderState, right *authFileManagedHeaderState) bool {
@@ -2343,6 +2383,302 @@ func findAuthByName(authManager *coreauth.Manager, name string) *coreauth.Auth {
 type refreshAuthFileStatusRequest struct {
 	Name    string `json:"name"`
 	Trigger string `json:"trigger"`
+}
+
+type testAuthFileMessageRequest struct {
+	Name      string `json:"name"`
+	Model     string `json:"model"`
+	Message   string `json:"message"`
+	MaxTokens int    `json:"max_tokens"`
+}
+
+func (h *Handler) TestAuthFileMessage(c *gin.Context) {
+	if h == nil || h.authManager == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "auth manager unavailable"})
+		return
+	}
+
+	var req testAuthFileMessageRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
+		return
+	}
+
+	auth := findAuthByName(h.authManager, name)
+	if auth == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "auth file not found"})
+		return
+	}
+	if auth.Disabled || auth.Status == coreauth.StatusDisabled {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "auth file is disabled"})
+		return
+	}
+
+	model := strings.TrimSpace(req.Model)
+	modelFromProviderDefault := false
+	if model == "" {
+		models := registry.GetGlobalRegistry().GetModelsForClient(auth.ID)
+		for _, info := range models {
+			if info != nil && strings.TrimSpace(info.ID) != "" {
+				model = strings.TrimSpace(info.ID)
+				break
+			}
+		}
+	}
+	if model == "" {
+		model = defaultAuthFileTestMessageModel(auth)
+		modelFromProviderDefault = model != ""
+	}
+	if model == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "model is required because this auth has no registered models yet"})
+		return
+	}
+
+	message := strings.TrimSpace(req.Message)
+	if message == "" {
+		message = "Reply with OK."
+	}
+	maxTokens := req.MaxTokens
+	if maxTokens <= 0 {
+		maxTokens = 16
+	}
+	if maxTokens > 64 {
+		maxTokens = 64
+	}
+
+	payload, errMarshal := json.Marshal(map[string]any{
+		"model": model,
+		"messages": []map[string]string{
+			{"role": "user", "content": message},
+		},
+		"stream":     false,
+		"max_tokens": maxTokens,
+	})
+	if errMarshal != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to build test request"})
+		return
+	}
+
+	selectedAuthID := ""
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Minute)
+	defer cancel()
+
+	provider := providerKey(auth)
+	if provider == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "auth file provider is required"})
+		return
+	}
+	if modelFromProviderDefault {
+		registerAuthFileTestMessageModel(auth.ID, provider, model)
+	}
+	metadata := map[string]any{
+		cliproxyexecutor.RequestedModelMetadataKey: model,
+		cliproxyexecutor.PinnedAuthMetadataKey:     auth.ID,
+		cliproxyexecutor.SelectedAuthCallbackMetadataKey: func(authID string) {
+			selectedAuthID = strings.TrimSpace(authID)
+		},
+	}
+	execReq := cliproxyexecutor.Request{
+		Model:    model,
+		Payload:  payload,
+		Metadata: metadata,
+	}
+	opts := cliproxyexecutor.Options{
+		Stream:          false,
+		OriginalRequest: payload,
+		SourceFormat:    sdktranslator.FromString("openai"),
+		Metadata:        metadata,
+	}
+	metadata[cliproxyexecutor.SelectedAuthCallbackMetadataKey] = func(authID string) {
+		selectedAuthID = strings.TrimSpace(authID)
+	}
+
+	startedAt := time.Now()
+	resp, errExecute := h.authManager.Execute(ctx, []string{provider}, execReq, opts)
+	latencyMs := time.Since(startedAt).Milliseconds()
+	if errExecute != nil {
+		status := http.StatusBadGateway
+		if statusCoder, ok := errExecute.(interface{ StatusCode() int }); ok && statusCoder != nil {
+			if code := statusCoder.StatusCode(); code > 0 {
+				status = code
+			}
+		}
+		if status <= 0 {
+			status = http.StatusBadGateway
+		}
+		responseSelectedAuthID := selectedAuthID
+		if responseSelectedAuthID == "" {
+			responseSelectedAuthID = auth.ID
+		}
+		c.JSON(status, gin.H{
+			"error":            errExecute.Error(),
+			"auth_id":          auth.ID,
+			"selected_auth_id": responseSelectedAuthID,
+			"provider":         provider,
+			"model":            model,
+			"latency_ms":       latencyMs,
+		})
+		return
+	}
+	if selectedAuthID != "" && selectedAuthID != auth.ID {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error":            "test request selected a different auth account",
+			"auth_id":          auth.ID,
+			"selected_auth_id": selectedAuthID,
+		})
+		return
+	}
+
+	responseSelectedAuthID := selectedAuthID
+	if responseSelectedAuthID == "" {
+		responseSelectedAuthID = auth.ID
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"status":           "ok",
+		"name":             authDisplayName(auth),
+		"auth_id":          auth.ID,
+		"selected_auth_id": responseSelectedAuthID,
+		"provider":         provider,
+		"model":            model,
+		"latency_ms":       latencyMs,
+		"output_preview":   truncateTestMessagePreview(extractTestMessagePreview(resp.Payload), 240),
+	})
+}
+
+func defaultAuthFileTestMessageModel(auth *coreauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	provider := providerKey(auth)
+	var models []*registry.ModelInfo
+	preferred := []string{}
+	switch provider {
+	case "codex":
+		switch strings.ToLower(strings.TrimSpace(metadataString(auth.Metadata, "plan_type"))) {
+		case "free":
+			models = registry.GetCodexFreeModels()
+		case "team":
+			models = registry.GetCodexTeamModels()
+		case "plus":
+			models = registry.GetCodexPlusModels()
+		case "pro":
+			models = registry.GetCodexProModels()
+		default:
+			models = registry.GetStaticModelDefinitionsByChannel("codex")
+		}
+		preferred = []string{"gpt-5.4-mini", "gpt-5.2", "gpt-5.3-codex"}
+	case "claude", "anthropic":
+		models = registry.GetClaudeModels()
+		preferred = []string{"claude-haiku-4-5-20251001", "claude-3-5-haiku-20241022"}
+	case "gemini-cli":
+		models = registry.GetGeminiCLIModels()
+		preferred = []string{"gemini-2.5-flash-lite", "gemini-2.5-flash"}
+	case "iflow":
+		models = registry.GetIFlowModels()
+		preferred = []string{"qwen3-coder-plus"}
+	case "kimi":
+		models = registry.GetKimiModels()
+	case "qwen":
+		models = registry.GetQwenModels()
+	case "antigravity":
+		models = registry.GetAntigravityModels()
+		preferred = []string{"claude-sonnet-4-6", "gemini-3-flash"}
+	default:
+		return ""
+	}
+	if id := firstPreferredModelID(models, preferred); id != "" {
+		return id
+	}
+	for _, info := range models {
+		if info == nil {
+			continue
+		}
+		id := strings.TrimSpace(info.ID)
+		if id == "" || strings.EqualFold(id, "gpt-5.3-codex-spark") {
+			continue
+		}
+		return id
+	}
+	return ""
+}
+
+func registerAuthFileTestMessageModel(authID, provider, model string) {
+	authID = strings.TrimSpace(authID)
+	provider = strings.TrimSpace(provider)
+	model = strings.TrimSpace(model)
+	if authID == "" || provider == "" || model == "" {
+		return
+	}
+	info := registry.LookupStaticModelInfo(model)
+	if info == nil {
+		info = &registry.ModelInfo{
+			ID:      model,
+			Object:  "model",
+			OwnedBy: provider,
+			Type:    provider,
+			Version: model,
+		}
+	}
+	registry.GetGlobalRegistry().RegisterClient(authID, provider, []*registry.ModelInfo{info})
+}
+
+func firstPreferredModelID(models []*registry.ModelInfo, preferred []string) string {
+	if len(models) == 0 || len(preferred) == 0 {
+		return ""
+	}
+	available := make(map[string]string, len(models))
+	for _, info := range models {
+		if info == nil {
+			continue
+		}
+		id := strings.TrimSpace(info.ID)
+		if id == "" {
+			continue
+		}
+		available[strings.ToLower(id)] = id
+	}
+	for _, want := range preferred {
+		if id := available[strings.ToLower(strings.TrimSpace(want))]; id != "" {
+			return id
+		}
+	}
+	return ""
+}
+
+func extractTestMessagePreview(payload []byte) string {
+	if len(payload) == 0 {
+		return ""
+	}
+	for _, path := range []string{
+		"choices.0.message.content",
+		"choices.0.text",
+		"output_text",
+		"response.output_text",
+		"response.output.0.content.0.text",
+		"output.0.content.0.text",
+	} {
+		if value := strings.TrimSpace(gjson.GetBytes(payload, path).String()); value != "" {
+			return value
+		}
+	}
+	return strings.TrimSpace(string(payload))
+}
+
+func truncateTestMessagePreview(value string, maxRunes int) string {
+	value = strings.TrimSpace(value)
+	if maxRunes <= 0 {
+		return ""
+	}
+	runes := []rune(value)
+	if len(runes) <= maxRunes {
+		return value
+	}
+	return string(runes[:maxRunes]) + "..."
 }
 
 const authStatusRefreshFailureBackoff = time.Minute
@@ -2861,13 +3197,14 @@ func (h *Handler) PatchAuthFileAccountSettings(c *gin.Context) {
 	}
 
 	targetAuth.Metadata["account_settings"] = authFileAccountSettingsStored{
-		SchemaVersion:        accountSettingsSchemaVersion,
-		ExtraHeaders:         extraHeaders,
-		RefreshEnabled:       refreshEnabledStorageValue(refreshEnabled),
-		TransportProfile:     transportProfile,
-		TLSProfile:           tlsProfile,
-		ManagedHeaderState:   existingStored.ManagedHeaderState,
-		RuntimeIdentityState: existingStored.RuntimeIdentityState,
+		SchemaVersion:         accountSettingsSchemaVersion,
+		ManagedHeaderSeedHash: accountManagedHeaderSeedHash(targetAuth),
+		ExtraHeaders:          extraHeaders,
+		RefreshEnabled:        refreshEnabledStorageValue(refreshEnabled),
+		TransportProfile:      transportProfile,
+		TLSProfile:            tlsProfile,
+		ManagedHeaderState:    existingStored.ManagedHeaderState,
+		RuntimeIdentityState:  existingStored.RuntimeIdentityState,
 	}
 	applyAuthRefreshEnabledMetadata(targetAuth, refreshEnabled)
 
@@ -3108,38 +3445,38 @@ var reauthUserDefinedMetadataKeys = []string{
 // reauthUserDefinedMetadataKeys is treated as custom data and inherited so we
 // do not lose forward-compatible operator additions.
 var reauthTokenMetadataKeys = map[string]struct{}{
-	"access_token":         {},
-	"refresh_token":        {},
-	"id_token":             {},
-	"token":                {},
-	"email":                {},
-	"account_id":           {},
-	"username":             {},
-	"chatgpt_account_id":   {},
-	"plan_type":            {},
-	"expired":              {},
-	"expires_at":           {},
-	"oauth_expires_at":     {},
-	"expires_in":           {},
-	"last_refresh":         {},
-	"lastrefresh":          {},
-	"last_refreshed_at":    {},
-	"lastrefreshedat":      {},
-	"timestamp":            {},
-	"type":                 {},
-	"project_id":           {},
-	"auto":                 {},
-	"checked":              {},
-	"scope":                {},
-	"token_type":           {},
-	"auth_method":          {},
-	"duo_gateway_base_url": {},
-	"duo_gateway_token":    {},
-	"duo_gateway_headers":  {},
+	"access_token":           {},
+	"refresh_token":          {},
+	"id_token":               {},
+	"token":                  {},
+	"email":                  {},
+	"account_id":             {},
+	"username":               {},
+	"chatgpt_account_id":     {},
+	"plan_type":              {},
+	"expired":                {},
+	"expires_at":             {},
+	"oauth_expires_at":       {},
+	"expires_in":             {},
+	"last_refresh":           {},
+	"lastrefresh":            {},
+	"last_refreshed_at":      {},
+	"lastrefreshedat":        {},
+	"timestamp":              {},
+	"type":                   {},
+	"project_id":             {},
+	"auto":                   {},
+	"checked":                {},
+	"scope":                  {},
+	"token_type":             {},
+	"auth_method":            {},
+	"duo_gateway_base_url":   {},
+	"duo_gateway_token":      {},
+	"duo_gateway_headers":    {},
 	"duo_gateway_expires_at": {},
-	"model_provider":       {},
-	"model_name":           {},
-	"model_details":        {},
+	"model_provider":         {},
+	"model_name":             {},
+	"model_details":          {},
 }
 
 func isReauthUserDefinedMetadataKey(key string) bool {
@@ -3537,8 +3874,7 @@ func (h *Handler) newClaudeOAuthAuth(ctx context.Context, target *coreauth.Auth)
 	if target == nil {
 		return claude.NewClaudeAuth(h.cfg)
 	}
-	transportCtx := runtimehelps.WithRuntimeTransportHost(ctx, "api.anthropic.com")
-	client := runtimehelps.NewProxyAwareHTTPClient(transportCtx, h.cfg, target, anthropicOAuthExchangeTimeout)
+	client := h.oauthIdentityHTTPClient(ctx, "api.anthropic.com", target, anthropicOAuthExchangeTimeout)
 	return claude.NewClaudeAuthWithHTTPClient(client)
 }
 
@@ -3686,6 +4022,15 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 		targetAuth = h.syncAuthManagedHeaderState(c.Request.Context(), targetAuth)
 	}
 
+	setup, errSetup := parseOAuthAccountSetupFromRequest(c)
+	if errSetup != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errSetup.Error()})
+		return
+	}
+	if targetAuth != nil {
+		setup = nil
+	}
+
 	// Generate PKCE codes
 	pkceCodes, err := claude.GeneratePKCECodes()
 	if err != nil {
@@ -3702,11 +4047,15 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 		return
 	}
 
-	// Initialize Claude auth service. For account re-authentication, bind the
-	// OAuth token exchange to the selected account's proxy/runtime profile so
+	// Initialize Claude auth service. For account re-authentication or new account setup,
+	// bind the OAuth token exchange to the selected account proxy/runtime profile so
 	// it does not silently fall back to the global core proxy.
-	anthropicAuth := h.newClaudeOAuthAuth(ctx, targetAuth)
-	oauthTransportSummary := h.claudeOAuthTransportSummary(targetAuth)
+	exchangeAuth := targetAuth
+	if exchangeAuth == nil && setup != nil {
+		exchangeAuth = h.prepareOAuthSetupRuntimeAuth("claude", setup)
+	}
+	anthropicAuth := h.newClaudeOAuthAuth(ctx, exchangeAuth)
+	oauthTransportSummary := h.claudeOAuthTransportSummary(exchangeAuth)
 
 	// Generate authorization URL (then override redirect_uri to reuse server port)
 	authURL, state, err := anthropicAuth.GenerateAuthURL(state, pkceCodes)
@@ -3764,8 +4113,8 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 		}
 
 		fmt.Println("Waiting for authentication callback...")
-		// Wait up to 5 minutes
-		resultMap, errWait := waitForFile(waitFile, 5*time.Minute)
+		// Wait until the OAuth callback deadline
+		resultMap, errWait := waitForFile(waitFile, oauthCallbackWaitTimeout)
 		if errWait != nil {
 			if errors.Is(errWait, errOAuthSessionNotPending) {
 				return
@@ -3840,6 +4189,8 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 		// Create token storage
 		tokenStorage := anthropicAuth.CreateTokenStorage(bundle)
 		record := buildClaudeOAuthTokenRecord(targetAuth, tokenStorage)
+		copyOAuthSetupSeed(record, exchangeAuth)
+		h.applyOAuthAccountSetupToRecord(record, setup)
 		savedPath, errSave := h.saveTokenRecord(ctx, record)
 		if errSave != nil {
 			log.Errorf("Failed to save authentication tokens: %v", errSave)
@@ -3852,11 +4203,11 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 			fmt.Println("API key obtained and saved")
 		}
 		fmt.Println("You can now use Claude services through this CLI")
-		CompleteOAuthSession(state)
+		CompleteOAuthSessionWithRecord(state, savedPath, record)
 		CompleteOAuthSessionsByProvider("anthropic")
 	}()
 
-	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
+	c.JSON(http.StatusOK, oauthStartResponse(authURL, state))
 }
 
 func tokenStorageEmailForLog(bundle *claude.ClaudeAuthBundle) string {
@@ -3869,7 +4220,13 @@ func tokenStorageEmailForLog(bundle *claude.ClaudeAuthBundle) string {
 func (h *Handler) RequestGeminiCLIToken(c *gin.Context) {
 	ctx := context.Background()
 	ctx = PopulateAuthContext(ctx, c)
-	proxyHTTPClient := util.SetProxy(&h.cfg.SDKConfig, &http.Client{})
+	setup, errSetup := parseOAuthAccountSetupFromRequest(c)
+	if errSetup != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errSetup.Error()})
+		return
+	}
+	effectiveCfg := h.configForOAuthSetup(setup)
+	proxyHTTPClient := util.SetProxy(&effectiveCfg.SDKConfig, &http.Client{})
 	ctx = context.WithValue(ctx, oauth2.HTTPClient, proxyHTTPClient)
 
 	// Optional project ID from query
@@ -3917,7 +4274,7 @@ func (h *Handler) RequestGeminiCLIToken(c *gin.Context) {
 		// Wait for callback file written by server route
 		waitFile := filepath.Join(h.cfg.AuthDir, fmt.Sprintf(".oauth-gemini-%s.oauth", state))
 		fmt.Println("Waiting for authentication callback...")
-		deadline := time.Now().Add(5 * time.Minute)
+		deadline := time.Now().Add(oauthCallbackWaitTimeout)
 		var authCode string
 		for {
 			if !IsOAuthSessionPending(state, "gemini") {
@@ -4019,7 +4376,7 @@ func (h *Handler) RequestGeminiCLIToken(c *gin.Context) {
 
 		// Initialize authenticated HTTP client via GeminiAuth to honor proxy settings
 		gemAuth := geminiAuth.NewGeminiAuth()
-		gemClient, errGetClient := gemAuth.GetAuthenticatedClient(ctx, &ts, h.cfg, &geminiAuth.WebLoginOptions{
+		gemClient, errGetClient := gemAuth.GetAuthenticatedClient(ctx, &ts, effectiveCfg, &geminiAuth.WebLoginOptions{
 			NoBrowser: true,
 		})
 		if errGetClient != nil {
@@ -4110,6 +4467,7 @@ func (h *Handler) RequestGeminiCLIToken(c *gin.Context) {
 			Storage:  &ts,
 			Metadata: recordMetadata,
 		}
+		h.applyOAuthAccountSetupToRecord(record, setup)
 		savedPath, errSave := h.saveTokenRecord(ctx, record)
 		if errSave != nil {
 			log.Errorf("Failed to save token to file: %v", errSave)
@@ -4117,17 +4475,22 @@ func (h *Handler) RequestGeminiCLIToken(c *gin.Context) {
 			return
 		}
 
-		CompleteOAuthSession(state)
+		CompleteOAuthSessionWithRecord(state, savedPath, record)
 		CompleteOAuthSessionsByProvider("gemini")
 		fmt.Printf("You can now use Gemini CLI services through this CLI; token saved to %s\n", savedPath)
 	}()
 
-	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
+	c.JSON(http.StatusOK, oauthStartResponse(authURL, state))
 }
 
 func (h *Handler) RequestCodexToken(c *gin.Context) {
 	ctx := context.Background()
 	ctx = PopulateAuthContext(ctx, c)
+	setup, errSetup := parseOAuthAccountSetupFromRequest(c)
+	if errSetup != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errSetup.Error()})
+		return
+	}
 
 	fmt.Println("Initializing Codex authentication...")
 
@@ -4147,8 +4510,14 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 		return
 	}
 
-	// Initialize Codex auth service
-	openaiAuth := codex.NewCodexAuth(h.cfg)
+	// Initialize Codex auth service. New-account setup gets a temporary
+	// account identity before token exchange so the exchange uses the same
+	// proxy, managed headers, and runtime transport profile that will be saved.
+	setupAuth := h.prepareOAuthSetupRuntimeAuth("codex", setup)
+	openaiAuth := codex.NewCodexAuthWithProxyURL(h.cfg, "")
+	if setupAuth != nil {
+		openaiAuth = codex.NewCodexAuthWithHTTPClient(h.oauthIdentityHTTPClient(ctx, "auth.openai.com", setupAuth, anthropicOAuthExchangeTimeout))
+	}
 
 	// Generate authorization URL
 	authURL, err := openaiAuth.GenerateAuthURL(state, pkceCodes)
@@ -4184,7 +4553,7 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 
 		// Wait for callback file
 		waitFile := filepath.Join(h.cfg.AuthDir, fmt.Sprintf(".oauth-codex-%s.oauth", state))
-		deadline := time.Now().Add(5 * time.Minute)
+		deadline := time.Now().Add(oauthCallbackWaitTimeout)
 		var code string
 		for {
 			if !IsOAuthSessionPending(state, "codex") {
@@ -4223,7 +4592,7 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 		bundle, errExchange := openaiAuth.ExchangeCodeForTokens(ctx, code, pkceCodes)
 		if errExchange != nil {
 			authErr := codex.NewAuthenticationError(codex.ErrCodeExchangeFailed, errExchange)
-			SetOAuthSessionError(state, "Failed to exchange authorization code for tokens")
+			SetOAuthSessionError(state, oauthExchangeFailureStatus("Codex", errExchange))
 			log.Errorf("Failed to exchange authorization code for tokens: %v", authErr)
 			return
 		}
@@ -4253,6 +4622,8 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 				"account_id": tokenStorage.AccountID,
 			},
 		}
+		copyOAuthSetupSeed(record, setupAuth)
+		h.applyOAuthAccountSetupToRecord(record, setup)
 		savedPath, errSave := h.saveTokenRecord(ctx, record)
 		if errSave != nil {
 			SetOAuthSessionError(state, "Failed to save authentication tokens")
@@ -4264,11 +4635,11 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 			fmt.Println("API key obtained and saved")
 		}
 		fmt.Println("You can now use Codex services through this CLI")
-		CompleteOAuthSession(state)
+		CompleteOAuthSessionWithRecord(state, savedPath, record)
 		CompleteOAuthSessionsByProvider("codex")
 	}()
 
-	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
+	c.JSON(http.StatusOK, oauthStartResponse(authURL, state))
 }
 
 func (h *Handler) RequestGitLabToken(c *gin.Context) {
@@ -4339,7 +4710,7 @@ func (h *Handler) RequestGitLabToken(c *gin.Context) {
 		}
 
 		waitFile := filepath.Join(h.cfg.AuthDir, fmt.Sprintf(".oauth-gitlab-%s.oauth", state))
-		deadline := time.Now().Add(5 * time.Minute)
+		deadline := time.Now().Add(oauthCallbackWaitTimeout)
 		var code string
 		for {
 			if !IsOAuthSessionPending(state, "gitlab") {
@@ -4422,11 +4793,11 @@ func (h *Handler) RequestGitLabToken(c *gin.Context) {
 		}
 
 		fmt.Printf("GitLab Duo authentication successful. Token saved to %s\n", savedPath)
-		CompleteOAuthSession(state)
+		CompleteOAuthSessionWithRecord(state, savedPath, record)
 		CompleteOAuthSessionsByProvider("gitlab")
 	}()
 
-	c.JSON(http.StatusOK, gin.H{"status": "ok", "url": authURL, "state": state})
+	c.JSON(http.StatusOK, oauthStartResponse(authURL, state))
 }
 
 func (h *Handler) RequestGitLabPATToken(c *gin.Context) {
@@ -4531,10 +4902,15 @@ func (h *Handler) RequestGitLabPATToken(c *gin.Context) {
 func (h *Handler) RequestAntigravityToken(c *gin.Context) {
 	ctx := context.Background()
 	ctx = PopulateAuthContext(ctx, c)
+	setup, errSetup := parseOAuthAccountSetupFromRequest(c)
+	if errSetup != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errSetup.Error()})
+		return
+	}
 
 	fmt.Println("Initializing Antigravity authentication...")
 
-	authSvc := antigravity.NewAntigravityAuth(h.cfg, nil)
+	authSvc := antigravity.NewAntigravityAuth(h.configForOAuthSetup(setup), nil)
 
 	state, errState := misc.GenerateRandomState()
 	if errState != nil {
@@ -4571,7 +4947,7 @@ func (h *Handler) RequestAntigravityToken(c *gin.Context) {
 		}
 
 		waitFile := filepath.Join(h.cfg.AuthDir, fmt.Sprintf(".oauth-antigravity-%s.oauth", state))
-		deadline := time.Now().Add(5 * time.Minute)
+		deadline := time.Now().Add(oauthCallbackWaitTimeout)
 		var authCode string
 		for {
 			if !IsOAuthSessionPending(state, "antigravity") {
@@ -4674,6 +5050,7 @@ func (h *Handler) RequestAntigravityToken(c *gin.Context) {
 			Label:    label,
 			Metadata: metadata,
 		}
+		h.applyOAuthAccountSetupToRecord(record, setup)
 		savedPath, errSave := h.saveTokenRecord(ctx, record)
 		if errSave != nil {
 			log.Errorf("Failed to save token to file: %v", errSave)
@@ -4681,7 +5058,7 @@ func (h *Handler) RequestAntigravityToken(c *gin.Context) {
 			return
 		}
 
-		CompleteOAuthSession(state)
+		CompleteOAuthSessionWithRecord(state, savedPath, record)
 		CompleteOAuthSessionsByProvider("antigravity")
 		fmt.Printf("Authentication successful! Token saved to %s\n", savedPath)
 		if projectID != "" {
@@ -4690,18 +5067,23 @@ func (h *Handler) RequestAntigravityToken(c *gin.Context) {
 		fmt.Println("You can now use Antigravity services through this CLI")
 	}()
 
-	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
+	c.JSON(http.StatusOK, oauthStartResponse(authURL, state))
 }
 
 func (h *Handler) RequestQwenToken(c *gin.Context) {
 	ctx := context.Background()
 	ctx = PopulateAuthContext(ctx, c)
+	setup, errSetup := parseOAuthAccountSetupFromRequest(c)
+	if errSetup != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errSetup.Error()})
+		return
+	}
 
 	fmt.Println("Initializing Qwen authentication...")
 
 	state := fmt.Sprintf("gem-%d", time.Now().UnixNano())
 	// Initialize Qwen auth service
-	qwenAuth := qwen.NewQwenAuth(h.cfg)
+	qwenAuth := qwen.NewQwenAuth(h.configForOAuthSetup(setup))
 
 	// Generate authorization URL
 	deviceFlow, err := qwenAuth.InitiateDeviceFlow(ctx)
@@ -4734,6 +5116,7 @@ func (h *Handler) RequestQwenToken(c *gin.Context) {
 			Storage:  tokenStorage,
 			Metadata: map[string]any{"email": tokenStorage.Email},
 		}
+		h.applyOAuthAccountSetupToRecord(record, setup)
 		savedPath, errSave := h.saveTokenRecord(ctx, record)
 		if errSave != nil {
 			log.Errorf("Failed to save authentication tokens: %v", errSave)
@@ -4743,21 +5126,26 @@ func (h *Handler) RequestQwenToken(c *gin.Context) {
 
 		fmt.Printf("Authentication successful! Token saved to %s\n", savedPath)
 		fmt.Println("You can now use Qwen services through this CLI")
-		CompleteOAuthSession(state)
+		CompleteOAuthSessionWithRecord(state, savedPath, record)
 	}()
 
-	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
+	c.JSON(http.StatusOK, oauthStartResponse(authURL, state))
 }
 
 func (h *Handler) RequestKimiToken(c *gin.Context) {
 	ctx := context.Background()
 	ctx = PopulateAuthContext(ctx, c)
+	setup, errSetup := parseOAuthAccountSetupFromRequest(c)
+	if errSetup != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errSetup.Error()})
+		return
+	}
 
 	fmt.Println("Initializing Kimi authentication...")
 
 	state := fmt.Sprintf("kmi-%d", time.Now().UnixNano())
 	// Initialize Kimi auth service
-	kimiAuth := kimi.NewKimiAuth(h.cfg)
+	kimiAuth := kimi.NewKimiAuth(h.configForOAuthSetup(setup))
 
 	// Generate authorization URL
 	deviceFlow, errStartDeviceFlow := kimiAuth.StartDeviceFlow(ctx)
@@ -4810,6 +5198,7 @@ func (h *Handler) RequestKimiToken(c *gin.Context) {
 			Storage:  tokenStorage,
 			Metadata: metadata,
 		}
+		h.applyOAuthAccountSetupToRecord(record, setup)
 		savedPath, errSave := h.saveTokenRecord(ctx, record)
 		if errSave != nil {
 			log.Errorf("Failed to save authentication tokens: %v", errSave)
@@ -4819,21 +5208,26 @@ func (h *Handler) RequestKimiToken(c *gin.Context) {
 
 		fmt.Printf("Authentication successful! Token saved to %s\n", savedPath)
 		fmt.Println("You can now use Kimi services through this CLI")
-		CompleteOAuthSession(state)
+		CompleteOAuthSessionWithRecord(state, savedPath, record)
 		CompleteOAuthSessionsByProvider("kimi")
 	}()
 
-	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
+	c.JSON(http.StatusOK, oauthStartResponse(authURL, state))
 }
 
 func (h *Handler) RequestIFlowToken(c *gin.Context) {
 	ctx := context.Background()
 	ctx = PopulateAuthContext(ctx, c)
+	setup, errSetup := parseOAuthAccountSetupFromRequest(c)
+	if errSetup != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": errSetup.Error()})
+		return
+	}
 
 	fmt.Println("Initializing iFlow authentication...")
 
 	state := fmt.Sprintf("ifl-%d", time.Now().UnixNano())
-	authSvc := iflowauth.NewIFlowAuth(h.cfg)
+	authSvc := iflowauth.NewIFlowAuth(h.configForOAuthSetup(setup))
 	authURL, redirectURI := authSvc.AuthorizationURL(state, iflowauth.CallbackPort)
 
 	RegisterOAuthSession(state, "iflow")
@@ -4862,7 +5256,7 @@ func (h *Handler) RequestIFlowToken(c *gin.Context) {
 		fmt.Println("Waiting for authentication...")
 
 		waitFile := filepath.Join(h.cfg.AuthDir, fmt.Sprintf(".oauth-iflow-%s.oauth", state))
-		deadline := time.Now().Add(5 * time.Minute)
+		deadline := time.Now().Add(oauthCallbackWaitTimeout)
 		var resultMap map[string]string
 		for {
 			if !IsOAuthSessionPending(state, "iflow") {
@@ -4920,6 +5314,7 @@ func (h *Handler) RequestIFlowToken(c *gin.Context) {
 			Metadata:   map[string]any{"email": identifier, "api_key": tokenStorage.APIKey},
 			Attributes: map[string]string{"api_key": tokenStorage.APIKey},
 		}
+		h.applyOAuthAccountSetupToRecord(record, setup)
 
 		savedPath, errSave := h.saveTokenRecord(ctx, record)
 		if errSave != nil {
@@ -4933,11 +5328,11 @@ func (h *Handler) RequestIFlowToken(c *gin.Context) {
 			fmt.Println("API key obtained and saved")
 		}
 		fmt.Println("You can now use iFlow services through this CLI")
-		CompleteOAuthSession(state)
+		CompleteOAuthSessionWithRecord(state, savedPath, record)
 		CompleteOAuthSessionsByProvider("iflow")
 	}()
 
-	c.JSON(http.StatusOK, gin.H{"status": "ok", "url": authURL, "state": state})
+	c.JSON(http.StatusOK, oauthStartResponse(authURL, state))
 }
 
 func (h *Handler) RequestGitHubToken(c *gin.Context) {
@@ -5023,7 +5418,7 @@ func (h *Handler) RequestGitHubToken(c *gin.Context) {
 
 		fmt.Printf("Authentication successful! Token saved to %s\n", savedPath)
 		fmt.Println("You can now use GitHub Copilot services through this CLI")
-		CompleteOAuthSession(state)
+		CompleteOAuthSessionWithRecord(state, savedPath, record)
 		CompleteOAuthSessionsByProvider("github-copilot")
 	}()
 
@@ -5547,13 +5942,34 @@ func (h *Handler) GetAuthStatus(c *gin.Context) {
 		return
 	}
 
-	_, status, ok := GetOAuthSession(state)
+	session, ok := oauthSessions.Get(state)
 	if !ok {
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
 		return
 	}
+	status := session.Status
 	if isOAuthSessionCancelledStatus(status) {
 		c.JSON(http.StatusOK, gin.H{"status": oauthSessionStatusCancelled})
+		return
+	}
+	if isOAuthSessionCompleteStatus(status) {
+		payload := gin.H{
+			"status":   oauthSessionStatusComplete,
+			"provider": session.Provider,
+		}
+		if session.SavedPath != "" {
+			payload["saved_path"] = session.SavedPath
+		}
+		if session.AuthName != "" {
+			payload["auth_name"] = session.AuthName
+		}
+		if session.Note != "" {
+			payload["note"] = session.Note
+		}
+		if session.ProxyURL != "" {
+			payload["proxy_url"] = session.ProxyURL
+		}
+		c.JSON(http.StatusOK, payload)
 		return
 	}
 	if status != "" {
@@ -5580,6 +5996,21 @@ func (h *Handler) GetAuthStatus(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"status": "wait"})
+}
+
+func oauthExchangeFailureStatus(provider string, err error) string {
+	provider = strings.TrimSpace(provider)
+	if provider == "" {
+		provider = "OAuth"
+	}
+	if err == nil {
+		return provider + " OAuth token exchange failed"
+	}
+	message := strings.Join(strings.Fields(err.Error()), " ")
+	if message == "" {
+		return provider + " OAuth token exchange failed"
+	}
+	return provider + " OAuth token exchange failed: " + truncateTestMessagePreview(message, 280)
 }
 
 func (h *Handler) CancelOAuthSession(c *gin.Context) {
@@ -5724,7 +6155,7 @@ func (h *Handler) RequestKiroToken(c *gin.Context) {
 					if email != "" {
 						fmt.Printf("Authenticated as: %s\n", email)
 					}
-					CompleteOAuthSession(state)
+					CompleteOAuthSessionWithRecord(state, savedPath, record)
 					return
 				}
 			}
@@ -5791,7 +6222,7 @@ func (h *Handler) RequestKiroToken(c *gin.Context) {
 
 			// Wait for callback file
 			waitFile := filepath.Join(h.cfg.AuthDir, fmt.Sprintf(".oauth-kiro-%s.oauth", state))
-			deadline := time.Now().Add(5 * time.Minute)
+			deadline := time.Now().Add(oauthCallbackWaitTimeout)
 
 			for {
 				if time.Now().After(deadline) {
@@ -5878,7 +6309,7 @@ func (h *Handler) RequestKiroToken(c *gin.Context) {
 					if email != "" {
 						fmt.Printf("Authenticated as: %s\n", email)
 					}
-					CompleteOAuthSession(state)
+					CompleteOAuthSessionWithRecord(state, savedPath, record)
 					return
 				}
 				time.Sleep(500 * time.Millisecond)
@@ -5978,7 +6409,7 @@ func (h *Handler) RequestKiloToken(c *gin.Context) {
 		}
 
 		fmt.Printf("Authentication successful! Token saved to %s\n", savedPath)
-		CompleteOAuthSession(state)
+		CompleteOAuthSessionWithRecord(state, savedPath, record)
 		CompleteOAuthSessionsByProvider("kilo")
 	}()
 
