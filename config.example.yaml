@@ -193,6 +193,11 @@ nonstream-keepalive-interval: 0
 #   runtime-version: "v24.3.0"
 #   timeout: "600"
 
+# Claude request policy. Default keeps explicit Sonnet model choices unchanged
+# and returns a hint instead of silently routing long Sonnet context to Opus.
+# claude:
+#   sonnet_long_context_policy: fail_with_hint  # fail_with_hint | route_to_opus_1m | compact_required
+
 # Default headers for Codex OAuth model requests.
 # These are used only for file-backed/OAuth Codex requests when the client
 # does not send the header. `user-agent` applies to HTTP and websocket requests;

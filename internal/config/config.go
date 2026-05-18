@@ -27,6 +27,12 @@ const (
 	DefaultLogsDeleteAfterDays   = 30
 )
 
+const (
+	ClaudeSonnetLongContextPolicyFailWithHint  = "fail_with_hint"
+	ClaudeSonnetLongContextPolicyRouteToOpus1M = "route_to_opus_1m"
+	ClaudeSonnetLongContextPolicyCompact       = "compact_required"
+)
+
 // Config represents the application's configuration, loaded from a YAML file.
 type Config struct {
 	SDKConfig `yaml:",inline"`
@@ -135,6 +141,9 @@ type Config struct {
 	// These are used as fallbacks when the client does not send its own headers.
 	ClaudeHeaderDefaults ClaudeHeaderDefaults `yaml:"claude-header-defaults" json:"claude-header-defaults"`
 
+	// Claude configures Claude-specific request policy.
+	Claude ClaudeConfig `yaml:"claude" json:"claude"`
+
 	// ManagedHeaderProfile controls online refresh of version-sensitive managed header profiles.
 	ManagedHeaderProfile ManagedHeaderProfileConfig `yaml:"managed-header-profile" json:"managed-header-profile"`
 
@@ -183,6 +192,14 @@ type ClaudeHeaderDefaults struct {
 	Arch                   string `yaml:"arch" json:"arch"`
 	Timeout                string `yaml:"timeout" json:"timeout"`
 	StabilizeDeviceProfile *bool  `yaml:"stabilize-device-profile,omitempty" json:"stabilize-device-profile,omitempty"`
+}
+
+// ClaudeConfig contains Claude-specific runtime policy.
+type ClaudeConfig struct {
+	// SonnetLongContextPolicy controls how Sonnet requests above the normal
+	// 200K window are handled. Recognized values:
+	// fail_with_hint, route_to_opus_1m, compact_required.
+	SonnetLongContextPolicy string `yaml:"sonnet_long_context_policy" json:"sonnet_long_context_policy"`
 }
 
 // CodexHeaderDefaults configures fallback header values injected into Codex
@@ -682,6 +699,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.Pprof.Addr = DefaultPprofAddr
 	cfg.AmpCode.RestrictManagementToLocalhost = false // Default to false: API key auth is sufficient
 	cfg.RemoteManagement.PanelGitHubRepository = DefaultPanelGitHubRepository
+	cfg.Claude.SonnetLongContextPolicy = ClaudeSonnetLongContextPolicyFailWithHint
 	managedHeaderOnlineUpdate := true
 	cfg.ManagedHeaderProfile.OnlineUpdate = &managedHeaderOnlineUpdate
 	cfg.ManagedHeaderProfile.FetchTimeoutSeconds = 2
@@ -769,6 +787,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 
 	// Sanitize Claude header defaults.
 	cfg.SanitizeClaudeHeaderDefaults()
+
+	// Sanitize Claude-specific runtime policy.
+	cfg.SanitizeClaudeConfig()
 
 	// Sanitize managed header profile online update settings.
 	cfg.SanitizeManagedHeaderProfile()
@@ -887,6 +908,28 @@ func (cfg *Config) SanitizeClaudeHeaderDefaults() {
 	cfg.ClaudeHeaderDefaults.OS = strings.TrimSpace(cfg.ClaudeHeaderDefaults.OS)
 	cfg.ClaudeHeaderDefaults.Arch = strings.TrimSpace(cfg.ClaudeHeaderDefaults.Arch)
 	cfg.ClaudeHeaderDefaults.Timeout = strings.TrimSpace(cfg.ClaudeHeaderDefaults.Timeout)
+}
+
+// NormalizeClaudeSonnetLongContextPolicy returns a supported policy value.
+func NormalizeClaudeSonnetLongContextPolicy(policy string) string {
+	switch strings.ToLower(strings.TrimSpace(policy)) {
+	case "", ClaudeSonnetLongContextPolicyFailWithHint:
+		return ClaudeSonnetLongContextPolicyFailWithHint
+	case ClaudeSonnetLongContextPolicyRouteToOpus1M:
+		return ClaudeSonnetLongContextPolicyRouteToOpus1M
+	case ClaudeSonnetLongContextPolicyCompact:
+		return ClaudeSonnetLongContextPolicyCompact
+	default:
+		return ClaudeSonnetLongContextPolicyFailWithHint
+	}
+}
+
+// SanitizeClaudeConfig normalizes Claude-specific runtime policy.
+func (cfg *Config) SanitizeClaudeConfig() {
+	if cfg == nil {
+		return
+	}
+	cfg.Claude.SonnetLongContextPolicy = NormalizeClaudeSonnetLongContextPolicy(cfg.Claude.SonnetLongContextPolicy)
 }
 
 func (cfg *Config) SanitizeManagedHeaderProfile() {
