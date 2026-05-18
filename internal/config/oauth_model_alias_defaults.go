@@ -38,6 +38,17 @@ func defaultGitHubCopilotAliases() []OAuthModelAlias {
 	}
 }
 
+// defaultClaudeAliases returns Claude OAuth aliases used by Claude Code-style clients.
+func defaultClaudeAliases() []OAuthModelAlias {
+	return []OAuthModelAlias{
+		{Name: "claude-sonnet-4-6", Alias: "sonnet[1m]", Fork: true},
+		{Name: "claude-opus-4-7", Alias: "opus[1m]", Fork: true},
+		{Name: "claude-sonnet-4-6", Alias: "claude-sonnet-4-6[1m]", Fork: true},
+		{Name: "claude-opus-4-7", Alias: "claude-opus-4-7[1m]", Fork: true},
+		{Name: "claude-opus-4-6", Alias: "claude-opus-4-6[1m]", Fork: true},
+	}
+}
+
 // GitHubCopilotAliasesFromModels generates oauth-model-alias entries from a dynamic
 // list of model IDs fetched from the Copilot API. It auto-creates aliases for
 // models whose ID contains a dot (e.g. "claude-opus-4.6" → "claude-opus-4-6"),

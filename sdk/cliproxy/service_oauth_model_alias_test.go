@@ -113,3 +113,35 @@ func TestApplyOAuthModelAlias_DefaultGitHubCopilotAliasViaSanitize(t *testing.T)
 		t.Fatalf("expected aliased model name %q, got %q", "models/claude-opus-4-6", out[1].Name)
 	}
 }
+
+func TestApplyOAuthModelAlias_DefaultClaude1MAliasListingViaSanitize(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.SanitizeOAuthModelAlias()
+
+	models := []*ModelInfo{
+		{ID: "claude-sonnet-4-6", Name: "models/claude-sonnet-4-6"},
+		{ID: "claude-opus-4-7", Name: "models/claude-opus-4-7"},
+		{ID: "claude-opus-4-6", Name: "models/claude-opus-4-6"},
+	}
+
+	out := applyOAuthModelAlias(cfg, "claude", "oauth", models)
+	modelIDs := make(map[string]bool, len(out))
+	for _, model := range out {
+		modelIDs[model.ID] = true
+	}
+	expected := []string{
+		"claude-sonnet-4-6",
+		"claude-opus-4-7",
+		"claude-opus-4-6",
+		"sonnet[1m]",
+		"opus[1m]",
+		"claude-sonnet-4-6[1m]",
+		"claude-opus-4-7[1m]",
+		"claude-opus-4-6[1m]",
+	}
+	for _, id := range expected {
+		if !modelIDs[id] {
+			t.Fatalf("expected listed model %q to be present in %#v", id, modelIDs)
+		}
+	}
+}

@@ -237,3 +237,28 @@ func TestApplyOAuthModelAlias_SuffixPreservation(t *testing.T) {
 		t.Errorf("applyOAuthModelAlias() model = %q, want %q", resolvedModel, "gemini-2.5-pro-exp-03-25(8192)")
 	}
 }
+
+func TestResolveOAuthUpstreamModel_DefaultClaude1MAliases(t *testing.T) {
+	t.Parallel()
+
+	cfg := &internalconfig.Config{}
+	cfg.SanitizeOAuthModelAlias()
+
+	mgr := NewManager(nil, nil, nil)
+	mgr.SetConfig(&internalconfig.Config{})
+	mgr.SetOAuthModelAlias(cfg.OAuthModelAlias)
+
+	auth := createAuthForChannel("claude")
+	tests := map[string]string{
+		"sonnet[1m]":            "claude-sonnet-4-6",
+		"opus[1m]":              "claude-opus-4-7",
+		"claude-sonnet-4-6[1m]": "claude-sonnet-4-6",
+		"claude-opus-4-7[1m]":   "claude-opus-4-7",
+		"claude-opus-4-6[1m]":   "claude-opus-4-6",
+	}
+	for input, want := range tests {
+		if got := mgr.resolveOAuthUpstreamModel(auth, input); got != want {
+			t.Fatalf("resolveOAuthUpstreamModel(%q) = %q, want %q", input, got, want)
+		}
+	}
+}

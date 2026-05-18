@@ -30,6 +30,16 @@ func TestCodexStaticModelsIncludeGPT55(t *testing.T) {
 	}
 }
 
+func TestClaudeSonnet46StaticModelHas1MContext(t *testing.T) {
+	model := findModelInfo(GetClaudeModels(), "claude-sonnet-4-6")
+	if model == nil {
+		t.Fatal("expected claude-sonnet-4-6 in static Claude models")
+	}
+	if model.ContextLength != 1000000 {
+		t.Fatalf("claude-sonnet-4-6 context length = %d, want 1000000", model.ContextLength)
+	}
+}
+
 func findModelInfo(models []*ModelInfo, id string) *ModelInfo {
 	for _, model := range models {
 		if model != nil && model.ID == id {

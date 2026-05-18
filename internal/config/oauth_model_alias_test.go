@@ -145,6 +145,37 @@ func TestSanitizeOAuthModelAlias_InjectsDefaultGitHubCopilotAliases(t *testing.T
 	}
 }
 
+func TestSanitizeOAuthModelAlias_InjectsDefaultClaude1MAliases(t *testing.T) {
+	cfg := &Config{}
+
+	cfg.SanitizeOAuthModelAlias()
+
+	claudeAliases := cfg.OAuthModelAlias["claude"]
+	if len(claudeAliases) == 0 {
+		t.Fatal("expected default claude aliases to be injected")
+	}
+
+	aliasToName := make(map[string]string, len(claudeAliases))
+	for _, a := range claudeAliases {
+		if !a.Fork {
+			t.Fatalf("expected default claude alias %q to have fork=true", a.Alias)
+		}
+		aliasToName[a.Alias] = a.Name
+	}
+	expected := map[string]string{
+		"sonnet[1m]":            "claude-sonnet-4-6",
+		"opus[1m]":              "claude-opus-4-7",
+		"claude-sonnet-4-6[1m]": "claude-sonnet-4-6",
+		"claude-opus-4-7[1m]":   "claude-opus-4-7",
+		"claude-opus-4-6[1m]":   "claude-opus-4-6",
+	}
+	for alias, wantName := range expected {
+		if got := aliasToName[alias]; got != wantName {
+			t.Fatalf("expected claude alias %q to map to %q, got %q", alias, wantName, got)
+		}
+	}
+}
+
 func TestSanitizeOAuthModelAlias_DoesNotOverrideUserKiroAliases(t *testing.T) {
 	// When user has configured kiro aliases, defaults should NOT be injected
 	cfg := &Config{

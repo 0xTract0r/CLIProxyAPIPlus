@@ -986,6 +986,76 @@ func TestClaudeExecutor_GeneratesNewUserIDByDefault(t *testing.T) {
 	}
 }
 
+func TestClaudeExecutor_Explicit1MAliasUsesOfficialModelWithoutLegacyContextBeta(t *testing.T) {
+	type capturedRequest struct {
+		model string
+		beta  string
+	}
+	var captured []capturedRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		captured = append(captured, capturedRequest{
+			model: gjson.GetBytes(body, "model").String(),
+			beta:  r.Header.Get("Anthropic-Beta"),
+		})
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","model":"claude-sonnet-4-6","role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key":  "sk-ant-oat-test",
+		"base_url": server.URL,
+	}}
+	payload := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
+
+	tests := []struct {
+		name           string
+		requestedModel string
+	}{
+		{name: "plain official model", requestedModel: "claude-sonnet-4-6"},
+		{name: "explicit 1m alias", requestedModel: "sonnet[1m]"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+				Model:   "claude-sonnet-4-6",
+				Payload: payload,
+			}, cliproxyexecutor.Options{
+				SourceFormat: sdktranslator.FromString("claude"),
+				Metadata: map[string]any{
+					cliproxyexecutor.RequestedModelMetadataKey: tt.requestedModel,
+				},
+			})
+			if err != nil {
+				t.Fatalf("Execute() error = %v", err)
+			}
+			got := captured[len(captured)-1]
+			if got.model != "claude-sonnet-4-6" {
+				t.Fatalf("upstream model = %q, want %q", got.model, "claude-sonnet-4-6")
+			}
+			if strings.Contains(got.beta, "context-1m-2025-08-07") {
+				t.Fatalf("Anthropic-Beta should not contain removed context-1m beta; header=%q", got.beta)
+			}
+		})
+	}
+}
+
+func TestApplyClaudeHeaders_DoesNotInjectRemoved1MContextBeta(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", nil)
+	req = req.WithContext(contextWithGinHeaders(map[string]string{
+		"X-CPA-CLAUDE-1M": "1",
+	}))
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "sk-ant-oat-test"}}
+
+	applyClaudeHeaders(req, auth, "sk-ant-oat-test", true, nil, nil)
+
+	if got := req.Header.Get("Anthropic-Beta"); strings.Contains(got, "context-1m-2025-08-07") {
+		t.Fatalf("Anthropic-Beta should not contain removed context-1m beta; header=%q", got)
+	}
+}
+
 func TestStripClaudeToolPrefixFromResponse_NestedToolReference(t *testing.T) {
 	input := []byte(`{"content":[{"type":"tool_result","tool_use_id":"toolu_123","content":[{"type":"tool_reference","tool_name":"proxy_mcp__nia__manage_resource"}]}]}`)
 	out := stripClaudeToolPrefixFromResponse(input, "proxy_")

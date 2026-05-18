@@ -137,3 +137,25 @@ func TestGetRequestDetails_ImageModelReturns503(t *testing.T) {
 		t.Fatalf("unexpected error message: %q", msg)
 	}
 }
+
+func TestGetRequestDetails_RoutesRegisteredClaude1MAlias(t *testing.T) {
+	modelRegistry := registry.GetGlobalRegistry()
+	modelRegistry.RegisterClient("test-request-details-claude-1m", "claude", []*registry.ModelInfo{
+		{ID: "sonnet[1m]", Created: time.Now().Unix()},
+	})
+	t.Cleanup(func() {
+		modelRegistry.UnregisterClient("test-request-details-claude-1m")
+	})
+
+	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, coreauth.NewManager(nil, nil, nil))
+	providers, model, errMsg := handler.getRequestDetails("sonnet[1m]")
+	if errMsg != nil {
+		t.Fatalf("getRequestDetails() error = %v", errMsg)
+	}
+	if !reflect.DeepEqual(providers, []string{"claude"}) {
+		t.Fatalf("getRequestDetails() providers = %v, want [claude]", providers)
+	}
+	if model != "sonnet[1m]" {
+		t.Fatalf("getRequestDetails() model = %q, want %q", model, "sonnet[1m]")
+	}
+}
