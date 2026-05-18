@@ -1998,7 +1998,25 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			}
 		} else {
 			if result.Model != "" {
-				if !isRequestScopedNotFoundResultError(result.Error) {
+				if isLongContextExtraUsageRequiredResultError(result.Error) {
+					state := ensureModelState(auth, result.Model)
+					state.Unavailable = false
+					state.Status = StatusActive
+					state.NextRetryAfter = time.Time{}
+					state.Quota = QuotaState{}
+					state.UpdatedAt = now
+					if result.Error != nil {
+						errCopy := cloneError(result.Error)
+						errCopy.Code = "long_context_extra_usage_required"
+						state.LastError = errCopy
+						state.StatusMessage = "Claude Sonnet 1M requires Claude extra usage"
+						auth.LastError = cloneError(errCopy)
+						auth.StatusMessage = state.StatusMessage
+					}
+					auth.Status = StatusActive
+					auth.UpdatedAt = now
+					updateAggregatedAvailability(auth, now)
+				} else if !isRequestScopedNotFoundResultError(result.Error) {
 					disableCooling := quotaCooldownDisabledForAuth(auth)
 					state := ensureModelState(auth, result.Model)
 					state.Unavailable = true
@@ -2405,6 +2423,21 @@ func isRequestScopedNotFoundResultError(err *Error) bool {
 		return false
 	}
 	return isRequestScopedNotFoundMessage(err.Message)
+}
+
+func isLongContextExtraUsageRequiredMessage(message string) bool {
+	lower := strings.ToLower(strings.TrimSpace(message))
+	if lower == "" {
+		return false
+	}
+	return strings.Contains(lower, "extra usage is required for long context requests")
+}
+
+func isLongContextExtraUsageRequiredResultError(err *Error) bool {
+	if err == nil || statusCodeFromResult(err) != http.StatusTooManyRequests {
+		return false
+	}
+	return isLongContextExtraUsageRequiredMessage(err.Message)
 }
 
 // isRequestInvalidError returns true if the error represents a client request

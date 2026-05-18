@@ -690,6 +690,80 @@ func TestManager_Execute_DisableCooling_DoesNotBlackoutAfter429RetryAfter(t *tes
 	}
 }
 
+func TestManager_Execute_ClaudeLongContextExtraUsageDoesNotCooldownModel(t *testing.T) {
+	prev := quotaCooldownDisabled.Load()
+	quotaCooldownDisabled.Store(false)
+	t.Cleanup(func() { quotaCooldownDisabled.Store(prev) })
+
+	m := NewManager(nil, nil, nil)
+	executor := &authFallbackExecutor{
+		id: "claude",
+		executeErrors: map[string]error{
+			"auth-claude-extra-usage": &Error{
+				HTTPStatus: http.StatusTooManyRequests,
+				Message:    `{"error":{"type":"rate_limit_error","message":"Extra usage is required for long context requests"}}`,
+			},
+		},
+	}
+	m.RegisterExecutor(executor)
+
+	auth := &Auth{ID: "auth-claude-extra-usage", Provider: "claude"}
+	if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	model := "claude-sonnet-4-6"
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(auth.ID, "claude", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() { reg.UnregisterClient(auth.ID) })
+
+	req := cliproxyexecutor.Request{Model: model}
+	for i := 0; i < 2; i++ {
+		_, errExecute := m.Execute(context.Background(), []string{"claude"}, req, cliproxyexecutor.Options{})
+		if errExecute == nil {
+			t.Fatalf("execute %d error = nil, want extra usage error", i+1)
+		}
+		if statusCodeFromError(errExecute) != http.StatusTooManyRequests {
+			t.Fatalf("execute %d status = %d, want %d", i+1, statusCodeFromError(errExecute), http.StatusTooManyRequests)
+		}
+	}
+
+	calls := executor.ExecuteCalls()
+	if len(calls) != 2 {
+		t.Fatalf("execute calls = %d, want 2; calls=%v", len(calls), calls)
+	}
+
+	updated, ok := m.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatalf("expected auth to be present")
+	}
+	state := updated.ModelStates[model]
+	if state == nil {
+		t.Fatalf("expected model state to be present")
+	}
+	if state.Unavailable {
+		t.Fatalf("extra usage long-context error should not mark model unavailable")
+	}
+	if !state.NextRetryAfter.IsZero() {
+		t.Fatalf("extra usage long-context error should not set cooldown, got %v", state.NextRetryAfter)
+	}
+	if updated.Unavailable {
+		t.Fatalf("extra usage long-context error should not mark auth unavailable")
+	}
+	if !updated.NextRetryAfter.IsZero() {
+		t.Fatalf("extra usage long-context error should not set auth cooldown, got %v", updated.NextRetryAfter)
+	}
+	if state.Quota.Exceeded {
+		t.Fatalf("extra usage long-context error should not mark plan quota exhausted")
+	}
+	if state.LastError == nil || state.LastError.Code != "long_context_extra_usage_required" {
+		t.Fatalf("LastError = %+v, want long_context_extra_usage_required", state.LastError)
+	}
+	if count := reg.GetModelCount(model); count <= 0 {
+		t.Fatalf("model should remain registered, count=%d", count)
+	}
+}
+
 func TestManager_Execute_DisableCooling_RetriesAfter429RetryAfter(t *testing.T) {
 	prev := quotaCooldownDisabled.Load()
 	quotaCooldownDisabled.Store(false)
