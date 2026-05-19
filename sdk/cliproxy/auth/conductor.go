@@ -1210,9 +1210,6 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 	if len(normalized) == 0 {
 		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
-	if errPolicy := m.guardClaudeLongContextPolicy(normalized, req, opts); errPolicy != nil {
-		return cliproxyexecutor.Response{}, errPolicy
-	}
 
 	_, maxRetryCredentials, maxWait := m.retrySettings()
 

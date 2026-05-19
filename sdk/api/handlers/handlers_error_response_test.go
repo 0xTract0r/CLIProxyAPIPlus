@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +14,24 @@ import (
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 )
+
+func TestBuildErrorResponseBody_RequestTooLarge(t *testing.T) {
+	body := BuildErrorResponseBody(http.StatusRequestEntityTooLarge, "compact or clear context")
+
+	var parsed ErrorResponse
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		t.Fatalf("unmarshal response body: %v\n%s", err, string(body))
+	}
+	if parsed.Error.Type != "invalid_request_error" {
+		t.Fatalf("error type = %q, want invalid_request_error", parsed.Error.Type)
+	}
+	if parsed.Error.Code != "request_too_large" {
+		t.Fatalf("error code = %q, want request_too_large", parsed.Error.Code)
+	}
+	if parsed.Error.Message != "compact or clear context" {
+		t.Fatalf("error message = %q, want compact or clear context", parsed.Error.Message)
+	}
+}
 
 func TestWriteErrorResponse_AddonHeadersDisabledByDefault(t *testing.T) {
 	gin.SetMode(gin.TestMode)

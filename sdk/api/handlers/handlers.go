@@ -121,6 +121,9 @@ func BuildErrorResponseBody(status int, errText string) []byte {
 	case http.StatusNotFound:
 		errType = "invalid_request_error"
 		code = "model_not_found"
+	case http.StatusRequestEntityTooLarge:
+		errType = "invalid_request_error"
+		code = "request_too_large"
 	default:
 		if status >= http.StatusInternalServerError {
 			errType = "server_error"

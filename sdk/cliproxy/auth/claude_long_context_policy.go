@@ -27,9 +27,9 @@ func (m *Manager) guardClaudeLongContextPolicy(providers []string, req cliproxye
 	requestedModel := requestedModelForPolicy(req, opts)
 	if inputTokens > claudeMaxContextTokens {
 		return &Error{
-			Code:       "claude_context_too_large",
+			Code:       "request_too_large",
 			Message:    fmt.Sprintf("Claude request is estimated at %d input tokens, above the 1M context limit. Compact or clear context before retrying. No routing was attempted; requested model %q was not changed.", inputTokens, requestedModel),
-			HTTPStatus: http.StatusUnprocessableEntity,
+			HTTPStatus: http.StatusRequestEntityTooLarge,
 		}
 	}
 
@@ -63,9 +63,9 @@ func newClaudeSonnetLongContextPolicyError(policy, requestedModel string, inputT
 		message = fmt.Sprintf("Claude Sonnet request is estimated at %d input tokens, above the normal 200K context window. Sonnet 1M requires Claude extra usage. Use opus[1m], compact or clear context, or explicitly enable Claude extra usage before retrying. Requested model %q was not changed.", inputTokens, requestedModel)
 	}
 	return &Error{
-		Code:       "claude_sonnet_long_context_policy",
+		Code:       "invalid_request_error",
 		Message:    message,
-		HTTPStatus: http.StatusUnprocessableEntity,
+		HTTPStatus: http.StatusBadRequest,
 	}
 }
 
