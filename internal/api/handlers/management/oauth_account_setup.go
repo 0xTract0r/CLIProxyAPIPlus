@@ -376,6 +376,9 @@ func accountManagedHeaderVariantForAuth(auth *coreauth.Auth, seed uint64) accoun
 			brandSlot = parsedSlot
 		}
 	}
+	if providerKey(auth) == "claude" {
+		versionOffset = 0
+	}
 	return accountManagedHeaderVariant{
 		VersionOffset:     versionOffset,
 		VersionVariant:    managedHeaderVersionVariantName(versionOffset),

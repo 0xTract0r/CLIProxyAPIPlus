@@ -67,3 +67,60 @@ func TestResolveClaudeDeviceProfile_UsesOnlineRegistryVersionWithoutChangingPinn
 		t.Fatalf("Completeness = %q, want partial-cli-version-only", got)
 	}
 }
+
+func TestResolveClaudeDeviceProfile_PrefersObservedClaudeCLIOverNewerOnlineFallback(t *testing.T) {
+	ResetClaudeDeviceProfileCache()
+	resetManagedHeaderOnlineProfileCacheForTests()
+	online := true
+	oldOverride := ManagedHeaderOnlineFetchOverride
+	ManagedHeaderOnlineFetchOverride = func(provider string, cfg *config.Config) (managedHeaderOnlineVersion, bool) {
+		if provider != "claude" {
+			return managedHeaderOnlineVersion{}, false
+		}
+		return managedHeaderOnlineVersion{
+			Version: "2.1.144",
+			ManagedHeaderProfileSource: ManagedHeaderProfileSource{
+				Source:       managedHeaderProfileSourceNPM,
+				SourceURL:    claudeCodeNPMURL,
+				CheckedAt:    "2026-05-19T12:00:00Z",
+				Completeness: "partial-cli-version-only",
+			},
+		}, true
+	}
+	t.Cleanup(func() {
+		ManagedHeaderOnlineFetchOverride = oldOverride
+		ResetClaudeDeviceProfileCache()
+		resetManagedHeaderOnlineProfileCacheForTests()
+	})
+
+	profile := ResolveClaudeDeviceProfile(&cliproxyauth.Auth{
+		ID:       "claude-observed-auth",
+		Provider: "claude",
+	}, "", map[string][]string{
+		"User-Agent":                  {"claude-cli/2.1.142 (external, cli)"},
+		"X-Stainless-Package-Version": {"0.80.0"},
+		"X-Stainless-Runtime-Version": {"v24.5.0"},
+		"X-Stainless-Os":              {"Linux"},
+		"X-Stainless-Arch":            {"x64"},
+	}, &config.Config{
+		ManagedHeaderProfile: config.ManagedHeaderProfileConfig{
+			OnlineUpdate: &online,
+		},
+	})
+
+	if got := profile.UserAgent; got != "claude-cli/2.1.142 (external, cli)" {
+		t.Fatalf("UserAgent = %q, want observed local Claude CLI version", got)
+	}
+	if got := profile.PackageVersion; got != "0.80.0" {
+		t.Fatalf("PackageVersion = %q, want observed package version", got)
+	}
+	if got := profile.RuntimeVersion; got != "v24.5.0" {
+		t.Fatalf("RuntimeVersion = %q, want observed runtime version", got)
+	}
+	if got := profile.OS; got != defaultClaudeFingerprintOS {
+		t.Fatalf("OS = %q, want pinned baseline", got)
+	}
+	if got := profile.Arch; got != defaultClaudeFingerprintArch {
+		t.Fatalf("Arch = %q, want pinned baseline", got)
+	}
+}

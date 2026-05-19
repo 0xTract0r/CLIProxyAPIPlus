@@ -191,6 +191,25 @@ func parseClaudeCLIVersion(userAgent string) (claudeCLIVersion, bool) {
 	return claudeCLIVersion{major: major, minor: minor, patch: patch}, true
 }
 
+func formatClaudeCLIVersion(version claudeCLIVersion) string {
+	return strconv.Itoa(version.major) + "." + strconv.Itoa(version.minor) + "." + strconv.Itoa(version.patch)
+}
+
+func ClaudeVersionFromUserAgent(userAgent string) (string, bool) {
+	version, ok := parseClaudeCLIVersion(userAgent)
+	if !ok {
+		return "", false
+	}
+	return formatClaudeCLIVersion(version), true
+}
+
+func (profile ClaudeDeviceProfile) VersionString() string {
+	if !profile.hasVersion {
+		return ""
+	}
+	return formatClaudeCLIVersion(profile.version)
+}
+
 func shouldUpgradeClaudeDeviceProfile(candidate, current ClaudeDeviceProfile) bool {
 	if candidate.UserAgent == "" || !candidate.hasVersion {
 		return false
@@ -306,7 +325,13 @@ func ResolveClaudeDeviceProfile(auth *cliproxyauth.Auth, apiKey string, headers 
 		candidate = pinClaudeDeviceProfilePlatform(candidate, baseline)
 	}
 	if hasCandidate && !shouldUpgradeClaudeDeviceProfile(candidate, baseline) {
-		hasCandidate = false
+		staticBaselineVersion, _ := parseClaudeCLIVersion(defaultClaudeFingerprintUserAgent)
+		allowObservedFirstParty := baseline.Source.Source == managedHeaderProfileSourceNPM &&
+			candidate.hasVersion &&
+			candidate.version.Compare(staticBaselineVersion) >= 0
+		if !allowObservedFirstParty {
+			hasCandidate = false
+		}
 	}
 
 	claudeDeviceProfileCacheMu.RLock()
@@ -380,8 +405,8 @@ func ApplyClaudeDeviceProfileHeaders(r *http.Request, profile ClaudeDeviceProfil
 // current baseline device profile. It extracts the version from the User-Agent.
 func DefaultClaudeVersion(cfg *config.Config) string {
 	profile := defaultClaudeDeviceProfile(cfg)
-	if version, ok := parseClaudeCLIVersion(profile.UserAgent); ok {
-		return strconv.Itoa(version.major) + "." + strconv.Itoa(version.minor) + "." + strconv.Itoa(version.patch)
+	if version := profile.VersionString(); version != "" {
+		return version
 	}
 	return "2.1.63"
 }

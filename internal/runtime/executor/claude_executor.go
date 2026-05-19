@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"runtime"
 	"strings"
 	"time"
@@ -160,7 +161,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 
 	// Apply cloaking (system prompt injection, fake user ID, sensitive word obfuscation)
 	// based on client type and configuration.
-	body = applyCloaking(ctx, e.cfg, auth, body, baseModel, apiKey)
+	body = applyCloaking(ctx, e.cfg, auth, body, baseModel, apiKey, resolveClaudeBillingVersion(ctx, e.cfg, auth, apiKey))
 	body = ensureModelMaxTokens(body, baseModel)
 
 	requestedModel := payloadRequestedModel(opts, req.Model)
@@ -341,7 +342,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 
 	// Apply cloaking (system prompt injection, fake user ID, sensitive word obfuscation)
 	// based on client type and configuration.
-	body = applyCloaking(ctx, e.cfg, auth, body, baseModel, apiKey)
+	body = applyCloaking(ctx, e.cfg, auth, body, baseModel, apiKey, resolveClaudeBillingVersion(ctx, e.cfg, auth, apiKey))
 	body = ensureModelMaxTokens(body, baseModel)
 
 	requestedModel := payloadRequestedModel(opts, req.Model)
@@ -540,7 +541,7 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 
 	if !strings.HasPrefix(baseModel, "claude-3-5-haiku") {
-		body = checkSystemInstructions(body)
+		body = checkSystemInstructionsWithVersion(body, false, resolveClaudeBillingVersion(ctx, e.cfg, auth, apiKey))
 	}
 
 	// Keep count_tokens requests compatible with Anthropic cache-control constraints too.
@@ -983,6 +984,33 @@ func claudeManagedHeaderValueFromAttrs(attrs map[string]string, headerName strin
 	return ""
 }
 
+func ginHeadersFromContext(ctx context.Context) http.Header {
+	if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
+		return ginCtx.Request.Header
+	}
+	return nil
+}
+
+func resolveClaudeBillingVersion(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, apiKey string) string {
+	if auth != nil && !cliproxyauth.HasStructuredAccountSettingsMetadata(auth) {
+		if version, ok := helps.ClaudeVersionFromUserAgent(claudeManagedHeaderValue(auth, "User-Agent")); ok {
+			return version
+		}
+	}
+
+	ginHeaders := ginHeadersFromContext(ctx)
+	if helps.ClaudeDeviceProfileStabilizationEnabled(cfg) {
+		if version := helps.ResolveClaudeDeviceProfile(auth, apiKey, ginHeaders, cfg).VersionString(); version != "" {
+			return version
+		}
+	}
+
+	if version, ok := helps.ClaudeVersionFromUserAgent(strings.TrimSpace(ginHeaders.Get("User-Agent"))); ok {
+		return version
+	}
+	return helps.DefaultClaudeVersion(cfg)
+}
+
 func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string, stream bool, extraBetas []string, cfg *config.Config) {
 	hdrDefault := func(cfgVal, fallback string) string {
 		if cfgVal != "" {
@@ -1006,10 +1034,7 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 	}
 	r.Header.Set("Content-Type", "application/json")
 
-	var ginHeaders http.Header
-	if ginCtx, ok := r.Context().Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
-		ginHeaders = ginCtx.Request.Header
-	}
+	ginHeaders := ginHeadersFromContext(r.Context())
 	stabilizeDeviceProfile := helps.ClaudeDeviceProfileStabilizationEnabled(cfg)
 	var deviceProfile helps.ClaudeDeviceProfile
 	if stabilizeDeviceProfile {
@@ -1522,6 +1547,8 @@ func injectFakeUserID(payload []byte, apiKey string, useCache bool) []byte {
 // Format: x-anthropic-billing-header: cc_version=<ver>.<build>; cc_entrypoint=cli; cch=<hash>;
 const fingerprintSalt = "59cf53e54c78"
 
+var claudeBillingHeaderVersionPattern = regexp.MustCompile(`\bcc_version=([0-9]+\.[0-9]+\.[0-9]+)\.[^;]*`)
+
 func computeFingerprint(messageText, version string) string {
 	indices := [3]int{4, 7, 20}
 	runes := []rune(messageText)
@@ -1557,11 +1584,32 @@ func generateBillingHeader(payload []byte, experimentalCCHSigning bool, version,
 	return fmt.Sprintf("x-anthropic-billing-header: cc_version=%s.%s; cc_entrypoint=%s; cch=%s;%s", version, buildHash, entrypoint, cch, workloadPart)
 }
 
+func replaceBillingHeaderVersion(billingHeader string, version string) (string, bool) {
+	version = strings.TrimSpace(version)
+	if version == "" || !strings.HasPrefix(billingHeader, "x-anthropic-billing-header:") {
+		return billingHeader, false
+	}
+	return claudeBillingHeaderVersionPattern.ReplaceAllStringFunc(billingHeader, func(match string) string {
+		parts := strings.SplitN(strings.TrimPrefix(match, "cc_version="), ".", 4)
+		if len(parts) != 4 {
+			return match
+		}
+		return "cc_version=" + version + "." + parts[3]
+	}), true
+}
+
 func checkSystemInstructionsWithMode(payload []byte, strictMode bool) []byte {
-	return checkSystemInstructionsWithSigningMode(payload, strictMode, false, false, "2.1.63", "", "")
+	return checkSystemInstructionsWithVersion(payload, strictMode, "2.1.63")
+}
+
+func checkSystemInstructionsWithVersion(payload []byte, strictMode bool, version string) []byte {
+	return checkSystemInstructionsWithSigningMode(payload, strictMode, false, false, version, "", "")
 }
 
 func checkSystemInstructionsWithSigningMode(payload []byte, strictMode bool, experimentalCCHSigning bool, oauthMode bool, version, entrypoint, workload string) []byte {
+	if strings.TrimSpace(version) == "" {
+		version = "2.1.63"
+	}
 	system := gjson.GetBytes(payload, "system")
 
 	messageText := ""
@@ -1579,6 +1627,11 @@ func checkSystemInstructionsWithSigningMode(payload []byte, strictMode bool, exp
 
 	firstText := gjson.GetBytes(payload, "system.0.text").String()
 	if strings.HasPrefix(firstText, "x-anthropic-billing-header:") {
+		if updatedText, changed := replaceBillingHeaderVersion(firstText, version); changed && updatedText != firstText {
+			if updated, err := sjson.SetBytes(payload, "system.0.text", updatedText); err == nil {
+				return updated
+			}
+		}
 		return payload
 	}
 
@@ -1698,7 +1751,7 @@ IMPORTANT: this context may or may not be relevant to your tasks. You should not
 
 // applyCloaking applies cloaking transformations to the payload based on config and client.
 // Cloaking includes: system prompt injection, fake user ID, and sensitive word obfuscation.
-func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, payload []byte, model string, apiKey string) []byte {
+func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, payload []byte, model string, apiKey string, billingVersion string) []byte {
 	clientUserAgent := getClientUserAgent(ctx)
 
 	// Get cloak config from ClaudeKey configuration
@@ -1744,7 +1797,7 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 
 	// Skip system instructions for claude-3-5-haiku models
 	if !strings.HasPrefix(model, "claude-3-5-haiku") {
-		payload = checkSystemInstructionsWithMode(payload, strictMode)
+		payload = checkSystemInstructionsWithVersion(payload, strictMode, billingVersion)
 	}
 
 	// Inject fake user ID

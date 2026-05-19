@@ -213,8 +213,8 @@ func TestApplyOAuthAccountSetupToRecordGeneratesPerAccountManagedHeaders(t *test
 				t.Fatalf("codex sec-ch-ua should retain account-level variance without mutating app version, first=%q second=%q", firstHeaders["sec-ch-ua"], secondHeaders["sec-ch-ua"])
 			}
 		} else if provider == "claude" {
-			if firstHeaders["User-Agent"] == secondHeaders["User-Agent"] {
-				t.Fatalf("claude User-Agent should use fixed near-latest account variants, first=%q second=%q", firstHeaders["User-Agent"], secondHeaders["User-Agent"])
+			if firstHeaders["User-Agent"] != secondHeaders["User-Agent"] {
+				t.Fatalf("claude User-Agent should stay on the coherent CLI baseline, first=%q second=%q", firstHeaders["User-Agent"], secondHeaders["User-Agent"])
 			}
 			if firstHeaders["X-Stainless-Package-Version"] != secondHeaders["X-Stainless-Package-Version"] {
 				t.Fatalf("claude package version must preserve sourced value, first=%q second=%q", firstHeaders["X-Stainless-Package-Version"], secondHeaders["X-Stainless-Package-Version"])
@@ -240,6 +240,10 @@ func TestApplyOAuthAccountSetupToRecordGeneratesPerAccountManagedHeaders(t *test
 		if provider == "codex" {
 			if firstStored.ManagedHeaderState.Current.BrandOrderVariant == "" || secondStored.ManagedHeaderState.Current.BrandOrderVariant == "" {
 				t.Fatalf("codex brand order variants should be persisted: first=%#v second=%#v", firstStored.ManagedHeaderState.Current, secondStored.ManagedHeaderState.Current)
+			}
+		} else if provider == "claude" {
+			if firstStored.ManagedHeaderState.Current.VersionVariant != "latest" || secondStored.ManagedHeaderState.Current.VersionVariant != "latest" {
+				t.Fatalf("claude version variants should not drift from latest: first=%#v second=%#v", firstStored.ManagedHeaderState.Current, secondStored.ManagedHeaderState.Current)
 			}
 		}
 	}

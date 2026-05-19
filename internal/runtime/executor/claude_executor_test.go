@@ -65,6 +65,16 @@ func assertClaudeFingerprint(t *testing.T, headers http.Header, userAgent, pkgVe
 	}
 }
 
+func billingVersionFromBody(t *testing.T, body []byte) string {
+	t.Helper()
+	billingHeader := gjson.GetBytes(body, "system.0.text").String()
+	match := regexp.MustCompile(`\bcc_version=([0-9]+\.[0-9]+\.[0-9]+)\.`).FindStringSubmatch(billingHeader)
+	if len(match) != 2 {
+		t.Fatalf("expected billing cc_version in body, got system.0.text=%q body=%s", billingHeader, string(body))
+	}
+	return match[1]
+}
+
 func TestApplyClaudeHeaders_UsesConfiguredBaselineFingerprint(t *testing.T) {
 	resetClaudeDeviceProfileCache()
 	stabilize := true
@@ -1039,6 +1049,419 @@ func TestClaudeExecutor_Explicit1MAliasUsesOfficialModelWithoutLegacyContextBeta
 				t.Fatalf("Anthropic-Beta should not contain removed context-1m beta; header=%q", got.beta)
 			}
 		})
+	}
+}
+
+func TestClaudeExecutor_AlignsBillingVersionWithStabilizedUserAgent(t *testing.T) {
+	resetClaudeDeviceProfileCache()
+	stabilize := true
+
+	type capturedRequest struct {
+		body      []byte
+		userAgent string
+	}
+	var captured capturedRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		captured = capturedRequest{
+			body:      bytes.Clone(body),
+			userAgent: r.Header.Get("User-Agent"),
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","model":"claude-sonnet-4-6","role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{
+		ClaudeHeaderDefaults: config.ClaudeHeaderDefaults{
+			UserAgent:              "claude-cli/2.1.70 (external, cli)",
+			PackageVersion:         "0.80.0",
+			RuntimeVersion:         "v24.5.0",
+			OS:                     "MacOS",
+			Arch:                   "arm64",
+			StabilizeDeviceProfile: &stabilize,
+		},
+	})
+	auth := &cliproxyauth.Auth{
+		ID: "auth-billing-stabilized",
+		Attributes: map[string]string{
+			"api_key":     "sk-ant-oat-test",
+			"base_url":    server.URL,
+			"cloak_mode":  "always",
+			"tool_prefix": "disabled",
+		},
+	}
+	ctx := contextWithGinHeaders(map[string]string{
+		"User-Agent":                  "claude-cli/2.1.80 (external, cli)",
+		"X-Stainless-Package-Version": "0.81.0",
+		"X-Stainless-Runtime-Version": "v24.6.0",
+		"X-Stainless-Os":              "Linux",
+		"X-Stainless-Arch":            "x64",
+	})
+	payload := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
+
+	_, err := executor.Execute(ctx, auth, cliproxyexecutor.Request{
+		Model:   "claude-sonnet-4-6",
+		Payload: payload,
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if captured.userAgent != "claude-cli/2.1.80 (external, cli)" {
+		t.Fatalf("User-Agent = %q, want stabilized incoming version", captured.userAgent)
+	}
+	if got := billingVersionFromBody(t, captured.body); got != "2.1.80" {
+		t.Fatalf("billing cc_version = %q, want %q", got, "2.1.80")
+	}
+}
+
+func TestClaudeExecutor_RewritesStaleBillingVersionToStabilizedUserAgent(t *testing.T) {
+	resetClaudeDeviceProfileCache()
+	stabilize := true
+
+	var captured capturedRequestForBilling
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		captured = capturedRequestForBilling{
+			body:      bytes.Clone(body),
+			userAgent: r.Header.Get("User-Agent"),
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","model":"claude-sonnet-4-6","role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{
+		ClaudeHeaderDefaults: config.ClaudeHeaderDefaults{
+			UserAgent:              "claude-cli/2.1.70 (external, cli)",
+			PackageVersion:         "0.80.0",
+			RuntimeVersion:         "v24.5.0",
+			OS:                     "MacOS",
+			Arch:                   "arm64",
+			StabilizeDeviceProfile: &stabilize,
+		},
+	})
+	auth := &cliproxyauth.Auth{
+		ID: "auth-billing-stale-execute",
+		Attributes: map[string]string{
+			"api_key":     "sk-ant-oat-test",
+			"base_url":    server.URL,
+			"cloak_mode":  "always",
+			"tool_prefix": "disabled",
+		},
+	}
+	ctx := contextWithGinHeaders(map[string]string{
+		"User-Agent":                  "claude-cli/2.1.83 (external, cli)",
+		"X-Stainless-Package-Version": "0.81.0",
+		"X-Stainless-Runtime-Version": "v24.6.0",
+		"X-Stainless-Os":              "Linux",
+		"X-Stainless-Arch":            "x64",
+	})
+	payload := []byte(`{"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.63.abc; cc_entrypoint=cli; cch=12345;"},{"type":"text","text":"existing"}],"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
+
+	_, err := executor.Execute(ctx, auth, cliproxyexecutor.Request{
+		Model:   "claude-sonnet-4-6",
+		Payload: payload,
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if captured.userAgent != "claude-cli/2.1.83 (external, cli)" {
+		t.Fatalf("User-Agent = %q, want stabilized incoming version", captured.userAgent)
+	}
+	if got := billingVersionFromBody(t, captured.body); got != "2.1.83" {
+		t.Fatalf("billing cc_version = %q, want %q", got, "2.1.83")
+	}
+}
+
+func TestClaudeExecutor_AlignsBillingVersionWithSavedManagedUserAgent(t *testing.T) {
+	var captured capturedRequestForBilling
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		captured = capturedRequestForBilling{
+			body:      bytes.Clone(body),
+			userAgent: r.Header.Get("User-Agent"),
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","model":"claude-sonnet-4-6","role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		ID: "auth-billing-saved-header",
+		Attributes: map[string]string{
+			"api_key":    "sk-ant-oat-test",
+			"base_url":   server.URL,
+			"cloak_mode": "always",
+		},
+		Metadata: map[string]any{
+			"headers": map[string]any{
+				"User-Agent": "claude-cli/2.1.77 (external, cli)",
+			},
+		},
+	}
+	payload := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
+
+	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-sonnet-4-6",
+		Payload: payload,
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if captured.userAgent != "claude-cli/2.1.77 (external, cli)" {
+		t.Fatalf("User-Agent = %q, want saved managed header", captured.userAgent)
+	}
+	if got := billingVersionFromBody(t, captured.body); got != "2.1.77" {
+		t.Fatalf("billing cc_version = %q, want %q", got, "2.1.77")
+	}
+}
+
+type capturedRequestForBilling struct {
+	body      []byte
+	userAgent string
+}
+
+func TestClaudeExecutorStream_AlignsBillingVersionWithStabilizedUserAgent(t *testing.T) {
+	resetClaudeDeviceProfileCache()
+	stabilize := true
+
+	var captured capturedRequestForBilling
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		captured = capturedRequestForBilling{
+			body:      bytes.Clone(body),
+			userAgent: r.Header.Get("User-Agent"),
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"model\":\"claude-sonnet-4-6\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n"))
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{
+		ClaudeHeaderDefaults: config.ClaudeHeaderDefaults{
+			UserAgent:              "claude-cli/2.1.70 (external, cli)",
+			PackageVersion:         "0.80.0",
+			RuntimeVersion:         "v24.5.0",
+			OS:                     "MacOS",
+			Arch:                   "arm64",
+			StabilizeDeviceProfile: &stabilize,
+		},
+	})
+	auth := &cliproxyauth.Auth{
+		ID: "auth-billing-stream",
+		Attributes: map[string]string{
+			"api_key":     "sk-ant-oat-test",
+			"base_url":    server.URL,
+			"cloak_mode":  "always",
+			"tool_prefix": "disabled",
+		},
+	}
+	ctx := contextWithGinHeaders(map[string]string{
+		"User-Agent":                  "claude-cli/2.1.81 (external, cli)",
+		"X-Stainless-Package-Version": "0.81.0",
+		"X-Stainless-Runtime-Version": "v24.6.0",
+		"X-Stainless-Os":              "Linux",
+		"X-Stainless-Arch":            "x64",
+	})
+	payload := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
+
+	stream, err := executor.ExecuteStream(ctx, auth, cliproxyexecutor.Request{
+		Model:   "claude-sonnet-4-6",
+		Payload: payload,
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")})
+	if err != nil {
+		t.Fatalf("ExecuteStream() error = %v", err)
+	}
+	for chunk := range stream.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("stream chunk error = %v", chunk.Err)
+		}
+	}
+	if captured.userAgent != "claude-cli/2.1.81 (external, cli)" {
+		t.Fatalf("User-Agent = %q, want stabilized incoming version", captured.userAgent)
+	}
+	if got := billingVersionFromBody(t, captured.body); got != "2.1.81" {
+		t.Fatalf("billing cc_version = %q, want %q", got, "2.1.81")
+	}
+}
+
+func TestClaudeExecutorStream_RewritesStaleBillingVersionToStabilizedUserAgent(t *testing.T) {
+	resetClaudeDeviceProfileCache()
+	stabilize := true
+
+	var captured capturedRequestForBilling
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		captured = capturedRequestForBilling{
+			body:      bytes.Clone(body),
+			userAgent: r.Header.Get("User-Agent"),
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"model\":\"claude-sonnet-4-6\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n"))
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{
+		ClaudeHeaderDefaults: config.ClaudeHeaderDefaults{
+			UserAgent:              "claude-cli/2.1.70 (external, cli)",
+			PackageVersion:         "0.80.0",
+			RuntimeVersion:         "v24.5.0",
+			OS:                     "MacOS",
+			Arch:                   "arm64",
+			StabilizeDeviceProfile: &stabilize,
+		},
+	})
+	auth := &cliproxyauth.Auth{
+		ID: "auth-billing-stale-stream",
+		Attributes: map[string]string{
+			"api_key":     "sk-ant-oat-test",
+			"base_url":    server.URL,
+			"cloak_mode":  "always",
+			"tool_prefix": "disabled",
+		},
+	}
+	ctx := contextWithGinHeaders(map[string]string{
+		"User-Agent":                  "claude-cli/2.1.84 (external, cli)",
+		"X-Stainless-Package-Version": "0.81.0",
+		"X-Stainless-Runtime-Version": "v24.6.0",
+		"X-Stainless-Os":              "Linux",
+		"X-Stainless-Arch":            "x64",
+	})
+	payload := []byte(`{"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.63.abc; cc_entrypoint=cli; cch=12345;"}],"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
+
+	stream, err := executor.ExecuteStream(ctx, auth, cliproxyexecutor.Request{
+		Model:   "claude-sonnet-4-6",
+		Payload: payload,
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")})
+	if err != nil {
+		t.Fatalf("ExecuteStream() error = %v", err)
+	}
+	for chunk := range stream.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("stream chunk error = %v", chunk.Err)
+		}
+	}
+	if captured.userAgent != "claude-cli/2.1.84 (external, cli)" {
+		t.Fatalf("User-Agent = %q, want stabilized incoming version", captured.userAgent)
+	}
+	if got := billingVersionFromBody(t, captured.body); got != "2.1.84" {
+		t.Fatalf("billing cc_version = %q, want %q", got, "2.1.84")
+	}
+}
+
+func TestClaudeExecutorCountTokens_AlignsBillingVersionWithStabilizedUserAgent(t *testing.T) {
+	resetClaudeDeviceProfileCache()
+	stabilize := true
+
+	var captured capturedRequestForBilling
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		captured = capturedRequestForBilling{
+			body:      bytes.Clone(body),
+			userAgent: r.Header.Get("User-Agent"),
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"input_tokens":1}`))
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{
+		ClaudeHeaderDefaults: config.ClaudeHeaderDefaults{
+			UserAgent:              "claude-cli/2.1.70 (external, cli)",
+			PackageVersion:         "0.80.0",
+			RuntimeVersion:         "v24.5.0",
+			OS:                     "MacOS",
+			Arch:                   "arm64",
+			StabilizeDeviceProfile: &stabilize,
+		},
+	})
+	auth := &cliproxyauth.Auth{
+		ID: "auth-billing-count",
+		Attributes: map[string]string{
+			"api_key":  "sk-ant-oat-test",
+			"base_url": server.URL,
+		},
+	}
+	ctx := contextWithGinHeaders(map[string]string{
+		"User-Agent":                  "claude-cli/2.1.82 (external, cli)",
+		"X-Stainless-Package-Version": "0.81.0",
+		"X-Stainless-Runtime-Version": "v24.6.0",
+		"X-Stainless-Os":              "Linux",
+		"X-Stainless-Arch":            "x64",
+	})
+	payload := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
+
+	_, err := executor.CountTokens(ctx, auth, cliproxyexecutor.Request{
+		Model:   "claude-sonnet-4-6",
+		Payload: payload,
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")})
+	if err != nil {
+		t.Fatalf("CountTokens() error = %v", err)
+	}
+	if captured.userAgent != "claude-cli/2.1.82 (external, cli)" {
+		t.Fatalf("User-Agent = %q, want stabilized incoming version", captured.userAgent)
+	}
+	if got := billingVersionFromBody(t, captured.body); got != "2.1.82" {
+		t.Fatalf("billing cc_version = %q, want %q", got, "2.1.82")
+	}
+}
+
+func TestClaudeExecutorCountTokens_RewritesStaleBillingVersionToStabilizedUserAgent(t *testing.T) {
+	resetClaudeDeviceProfileCache()
+	stabilize := true
+
+	var captured capturedRequestForBilling
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		captured = capturedRequestForBilling{
+			body:      bytes.Clone(body),
+			userAgent: r.Header.Get("User-Agent"),
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"input_tokens":1}`))
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{
+		ClaudeHeaderDefaults: config.ClaudeHeaderDefaults{
+			UserAgent:              "claude-cli/2.1.70 (external, cli)",
+			PackageVersion:         "0.80.0",
+			RuntimeVersion:         "v24.5.0",
+			OS:                     "MacOS",
+			Arch:                   "arm64",
+			StabilizeDeviceProfile: &stabilize,
+		},
+	})
+	auth := &cliproxyauth.Auth{
+		ID: "auth-billing-stale-count",
+		Attributes: map[string]string{
+			"api_key":  "sk-ant-oat-test",
+			"base_url": server.URL,
+		},
+	}
+	ctx := contextWithGinHeaders(map[string]string{
+		"User-Agent":                  "claude-cli/2.1.85 (external, cli)",
+		"X-Stainless-Package-Version": "0.81.0",
+		"X-Stainless-Runtime-Version": "v24.6.0",
+		"X-Stainless-Os":              "Linux",
+		"X-Stainless-Arch":            "x64",
+	})
+	payload := []byte(`{"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.63.abc; cc_entrypoint=cli; cch=12345;"}],"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
+
+	_, err := executor.CountTokens(ctx, auth, cliproxyexecutor.Request{
+		Model:   "claude-sonnet-4-6",
+		Payload: payload,
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")})
+	if err != nil {
+		t.Fatalf("CountTokens() error = %v", err)
+	}
+	if captured.userAgent != "claude-cli/2.1.85 (external, cli)" {
+		t.Fatalf("User-Agent = %q, want stabilized incoming version", captured.userAgent)
+	}
+	if got := billingVersionFromBody(t, captured.body); got != "2.1.85" {
+		t.Fatalf("billing cc_version = %q, want %q", got, "2.1.85")
 	}
 }
 
@@ -2127,7 +2550,7 @@ func TestApplyCloaking_PreservesConfiguredStrictModeAndSensitiveWordsWhenModeOmi
 	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "key-123"}}
 	payload := []byte(`{"system":"proxy rules","messages":[{"role":"user","content":[{"type":"text","text":"proxy access"}]}]}`)
 
-	out := applyCloaking(context.Background(), cfg, auth, payload, "claude-3-5-sonnet-20241022", "key-123")
+	out := applyCloaking(context.Background(), cfg, auth, payload, "claude-3-5-sonnet-20241022", "key-123", "2.1.63")
 
 	blocks := gjson.GetBytes(out, "system").Array()
 	if len(blocks) != 3 {
