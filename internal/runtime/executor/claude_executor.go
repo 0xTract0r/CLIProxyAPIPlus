@@ -87,6 +87,13 @@ func NewClaudeExecutor(cfg *config.Config) *ClaudeExecutor { return &ClaudeExecu
 
 func (e *ClaudeExecutor) Identifier() string { return "claude" }
 
+func claudeUpstreamTransportError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return statusErr{code: http.StatusBadGateway, msg: err.Error()}
+}
+
 // PrepareRequest injects Claude credentials into the outgoing HTTP request.
 func (e *ClaudeExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Auth) error {
 	if req == nil {
@@ -95,6 +102,10 @@ func (e *ClaudeExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Au
 	apiKey, _ := claudeCreds(auth)
 	if strings.TrimSpace(apiKey) == "" {
 		return nil
+	}
+	deviceProfile := helps.ResolveClaudeDeviceProfile(auth, apiKey, req.Header, e.cfg)
+	if helps.ClaudeDeviceProfileStabilizationEnabled(e.cfg) {
+		helps.ApplyClaudeDeviceProfileHeaders(req, deviceProfile)
 	}
 	useAPIKey := auth != nil && auth.Attributes != nil && strings.TrimSpace(auth.Attributes["api_key"]) != ""
 	isAnthropicBase := req.URL != nil && strings.EqualFold(req.URL.Scheme, "https") && strings.EqualFold(req.URL.Host, "api.anthropic.com")
@@ -129,6 +140,7 @@ func (e *ClaudeExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Aut
 }
 
 func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
+	ctx = contextWithClaudeInboundHeaders(ctx, opts.Headers)
 	if opts.Alt == "responses/compact" {
 		return resp, statusErr{code: http.StatusNotImplemented, msg: "/responses/compact not supported"}
 	}
@@ -232,7 +244,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
 		recordAPIResponseError(ctx, e.cfg, err)
-		return resp, err
+		return resp, claudeUpstreamTransportError(err)
 	}
 	recordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
@@ -312,6 +324,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 }
 
 func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
+	ctx = contextWithClaudeInboundHeaders(ctx, opts.Headers)
 	if opts.Alt == "responses/compact" {
 		return nil, statusErr{code: http.StatusNotImplemented, msg: "/responses/compact not supported"}
 	}
@@ -410,7 +423,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
 		recordAPIResponseError(ctx, e.cfg, err)
-		return nil, err
+		return nil, claudeUpstreamTransportError(err)
 	}
 	recordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
@@ -526,6 +539,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 }
 
 func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	ctx = contextWithClaudeInboundHeaders(ctx, opts.Headers)
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
 	apiKey, baseURL := claudeCreds(auth)
@@ -587,7 +601,7 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 	resp, err := httpClient.Do(httpReq)
 	if err != nil {
 		recordAPIResponseError(ctx, e.cfg, err)
-		return cliproxyexecutor.Response{}, err
+		return cliproxyexecutor.Response{}, claudeUpstreamTransportError(err)
 	}
 	recordAPIResponseMetadata(ctx, e.cfg, resp.StatusCode, resp.Header.Clone())
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -985,10 +999,53 @@ func claudeManagedHeaderValueFromAttrs(attrs map[string]string, headerName strin
 }
 
 func ginHeadersFromContext(ctx context.Context) http.Header {
-	if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
+	ginCtx := ginContextFromContext(ctx)
+	if ginCtx != nil && ginCtx.Request != nil {
 		return ginCtx.Request.Header
 	}
+	if headers, ok := ctx.Value(claudeInboundHeadersContextKey).(http.Header); ok {
+		return headers
+	}
 	return nil
+}
+
+func ginContextFromContext(ctx context.Context) *gin.Context {
+	if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil {
+		return ginCtx
+	}
+	return nil
+}
+
+const claudeDeviceProfileContextKey = "claude_device_profile"
+
+type claudeInboundHeadersContextKeyType struct{}
+
+var claudeInboundHeadersContextKey = claudeInboundHeadersContextKeyType{}
+
+func contextWithClaudeInboundHeaders(ctx context.Context, headers http.Header) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if ginContextFromContext(ctx) != nil || len(headers) == 0 {
+		return ctx
+	}
+	return context.WithValue(ctx, claudeInboundHeadersContextKey, headers.Clone())
+}
+
+func resolveClaudeDeviceProfileForRequest(ctx context.Context, auth *cliproxyauth.Auth, apiKey string, headers http.Header, cfg *config.Config) helps.ClaudeDeviceProfile {
+	ginCtx := ginContextFromContext(ctx)
+	if ginCtx != nil {
+		if cached, ok := ginCtx.Get(claudeDeviceProfileContextKey); ok {
+			if profile, okProfile := cached.(helps.ClaudeDeviceProfile); okProfile {
+				return profile
+			}
+		}
+	}
+	profile := helps.ResolveClaudeDeviceProfile(auth, apiKey, headers, cfg)
+	if ginCtx != nil {
+		ginCtx.Set(claudeDeviceProfileContextKey, profile)
+	}
+	return profile
 }
 
 func resolveClaudeBillingVersion(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, apiKey string) string {
@@ -999,10 +1056,8 @@ func resolveClaudeBillingVersion(ctx context.Context, cfg *config.Config, auth *
 	}
 
 	ginHeaders := ginHeadersFromContext(ctx)
-	if helps.ClaudeDeviceProfileStabilizationEnabled(cfg) {
-		if version := helps.ResolveClaudeDeviceProfile(auth, apiKey, ginHeaders, cfg).VersionString(); version != "" {
-			return version
-		}
+	if version := resolveClaudeDeviceProfileForRequest(ctx, auth, apiKey, ginHeaders, cfg).VersionString(); version != "" {
+		return version
 	}
 
 	if version, ok := helps.ClaudeVersionFromUserAgent(strings.TrimSpace(ginHeaders.Get("User-Agent"))); ok {
@@ -1036,10 +1091,7 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 
 	ginHeaders := ginHeadersFromContext(r.Context())
 	stabilizeDeviceProfile := helps.ClaudeDeviceProfileStabilizationEnabled(cfg)
-	var deviceProfile helps.ClaudeDeviceProfile
-	if stabilizeDeviceProfile {
-		deviceProfile = helps.ResolveClaudeDeviceProfile(auth, apiKey, ginHeaders, cfg)
-	}
+	deviceProfile := resolveClaudeDeviceProfileForRequest(r.Context(), auth, apiKey, ginHeaders, cfg)
 
 	baseBetas := "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05,structured-outputs-2025-12-15,fast-mode-2026-02-01,redact-thinking-2026-02-12,token-efficient-tools-2026-03-28"
 	if val := strings.TrimSpace(ginHeaders.Get("Anthropic-Beta")); val != "" {

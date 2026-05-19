@@ -124,6 +124,9 @@ func BuildErrorResponseBody(status int, errText string) []byte {
 	case http.StatusRequestEntityTooLarge:
 		errType = "invalid_request_error"
 		code = "request_too_large"
+	case http.StatusBadGateway:
+		errType = "server_error"
+		code = "bad_gateway"
 	default:
 		if status >= http.StatusInternalServerError {
 			errType = "server_error"

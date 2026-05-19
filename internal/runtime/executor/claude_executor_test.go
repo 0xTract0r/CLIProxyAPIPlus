@@ -117,6 +117,79 @@ func TestApplyClaudeHeaders_UsesConfiguredBaselineFingerprint(t *testing.T) {
 	}
 }
 
+func TestApplyClaudeHeaders_RecordsClientObservationWhenStabilizationDisabled(t *testing.T) {
+	resetClaudeDeviceProfileCache()
+	stabilize := false
+
+	cfg := &config.Config{
+		ClaudeHeaderDefaults: config.ClaudeHeaderDefaults{
+			StabilizeDeviceProfile: &stabilize,
+		},
+	}
+	auth := &cliproxyauth.Auth{
+		ID: "auth-observation-without-stabilization",
+		Attributes: map[string]string{
+			"api_key": "key-observation-without-stabilization",
+		},
+	}
+	incoming := http.Header{
+		"User-Agent":                  []string{"claude-cli/2.1.140 (external, cli)"},
+		"X-Stainless-Package-Version": []string{"0.80.0"},
+		"X-Stainless-Runtime-Version": []string{"v24.5.0"},
+		"X-Stainless-Os":              []string{"darwin"},
+		"X-Stainless-Arch":            []string{"arm64"},
+	}
+
+	req := newClaudeHeaderTestRequest(t, incoming)
+	applyClaudeHeaders(req, auth, "key-observation-without-stabilization", false, nil, cfg)
+
+	observations := helps.ClaudeDeviceProfileObservations(auth, "")
+	if len(observations) != 1 {
+		t.Fatalf("observations length = %d, want 1: %#v", len(observations), observations)
+	}
+	if got := observations[0].Version; got != "2.1.140" {
+		t.Fatalf("observed version = %q, want 2.1.140: %#v", got, observations[0])
+	}
+}
+
+func TestResolveClaudeBillingVersionAndApplyHeaders_RecordSingleClientObservation(t *testing.T) {
+	resetClaudeDeviceProfileCache()
+	stabilize := false
+
+	cfg := &config.Config{
+		ClaudeHeaderDefaults: config.ClaudeHeaderDefaults{
+			StabilizeDeviceProfile: &stabilize,
+		},
+	}
+	auth := &cliproxyauth.Auth{
+		ID: "auth-observation-request-cache",
+		Attributes: map[string]string{
+			"api_key": "key-observation-request-cache",
+		},
+	}
+	incoming := http.Header{
+		"User-Agent":                  []string{"claude-cli/2.1.141 (external, cli)"},
+		"X-Stainless-Package-Version": []string{"0.80.1"},
+		"X-Stainless-Runtime-Version": []string{"v24.5.1"},
+		"X-Stainless-Os":              []string{"darwin"},
+		"X-Stainless-Arch":            []string{"arm64"},
+	}
+
+	req := newClaudeHeaderTestRequest(t, incoming)
+	if got := resolveClaudeBillingVersion(req.Context(), cfg, auth, "key-observation-request-cache"); got != "2.1.141" {
+		t.Fatalf("billing version = %q, want 2.1.141", got)
+	}
+	applyClaudeHeaders(req, auth, "key-observation-request-cache", false, nil, cfg)
+
+	observations := helps.ClaudeDeviceProfileObservations(auth, "")
+	if len(observations) != 1 {
+		t.Fatalf("observations length = %d, want 1: %#v", len(observations), observations)
+	}
+	if got := observations[0].RequestCount; got != 1 {
+		t.Fatalf("request_count = %d, want 1: %#v", got, observations[0])
+	}
+}
+
 func TestApplyClaudeHeaders_StructuredAccountSettingsKeepsManagedHeadersAuthoritative(t *testing.T) {
 	resetClaudeDeviceProfileCache()
 	stabilize := true
@@ -1221,6 +1294,93 @@ func TestClaudeExecutor_AlignsBillingVersionWithSavedManagedUserAgent(t *testing
 type capturedRequestForBilling struct {
 	body      []byte
 	userAgent string
+}
+
+func TestClaudeExecutorPrepareRequest_RecordsDirectClientVersionObservation(t *testing.T) {
+	resetClaudeDeviceProfileCache()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		FileName: "claude-direct-auth.json",
+		Provider: "claude",
+		Attributes: map[string]string{
+			"api_key": "sk-ant-oat-test",
+		},
+	}
+	req := httptest.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages?beta=true", nil)
+	req.Header.Set("User-Agent", "claude-cli/2.1.142 (external, sdk-cli)")
+	req.Header.Set("X-Stainless-Package-Version", "0.94.0")
+	req.Header.Set("X-Stainless-Runtime-Version", "v24.3.0")
+
+	if err := executor.PrepareRequest(req, auth); err != nil {
+		t.Fatalf("PrepareRequest() error = %v", err)
+	}
+	observations := helps.ClaudeDeviceProfileObservations(auth, "")
+	if len(observations) != 1 {
+		t.Fatalf("observations length = %d, want 1: %#v", len(observations), observations)
+	}
+	if got := observations[0].Version; got != "2.1.142" {
+		t.Fatalf("observation version = %q, want 2.1.142", got)
+	}
+}
+
+func TestClaudeExecutor_UsesOptionsHeadersForClientVersionObservation(t *testing.T) {
+	resetClaudeDeviceProfileCache()
+	stabilize := true
+
+	var captured capturedRequestForBilling
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		captured = capturedRequestForBilling{
+			body:      bytes.Clone(body),
+			userAgent: r.Header.Get("User-Agent"),
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","model":"claude-sonnet-4-6","role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{
+		ClaudeHeaderDefaults: config.ClaudeHeaderDefaults{
+			StabilizeDeviceProfile: &stabilize,
+		},
+	})
+	auth := &cliproxyauth.Auth{
+		FileName: "claude-file-auth.json",
+		Provider: "claude",
+		Attributes: map[string]string{
+			"api_key":     "sk-ant-oat-test",
+			"base_url":    server.URL,
+			"tool_prefix": "disabled",
+		},
+	}
+	payload := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
+	headers := http.Header{
+		"User-Agent":                  []string{"claude-cli/2.1.142 (external, cli)"},
+		"X-Stainless-Package-Version": []string{"0.94.0"},
+		"X-Stainless-Runtime-Version": []string{"v24.3.0"},
+	}
+
+	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-sonnet-4-6",
+		Payload: payload,
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude"), Headers: headers})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if captured.userAgent != "claude-cli/2.1.142 (external, cli)" {
+		t.Fatalf("User-Agent = %q, want options header version", captured.userAgent)
+	}
+	if got := billingVersionFromBody(t, captured.body); got != "2.1.142" {
+		t.Fatalf("billing cc_version = %q, want %q", got, "2.1.142")
+	}
+	observations := helps.ClaudeDeviceProfileObservations(auth, "")
+	if len(observations) != 1 {
+		t.Fatalf("observations length = %d, want 1: %#v", len(observations), observations)
+	}
+	if got := observations[0].Version; got != "2.1.142" {
+		t.Fatalf("observation version = %q, want 2.1.142", got)
+	}
 }
 
 func TestClaudeExecutorStream_AlignsBillingVersionWithStabilizedUserAgent(t *testing.T) {

@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"regexp"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -29,6 +30,7 @@ var (
 	claudeCLIVersionPattern = regexp.MustCompile(`^claude-cli/(\d+)\.(\d+)\.(\d+)`)
 
 	claudeDeviceProfileCache            = make(map[string]claudeDeviceProfileCacheEntry)
+	claudeDeviceProfileObservations     = make(map[string][]claudeDeviceProfileObservationEntry)
 	claudeDeviceProfileCacheMu          sync.RWMutex
 	claudeDeviceProfileCacheCleanupOnce sync.Once
 
@@ -74,9 +76,29 @@ type ClaudeDeviceProfile struct {
 	hasVersion     bool
 }
 
+type ClaudeDeviceProfileObservation struct {
+	UserAgent      string                     `json:"user_agent,omitempty"`
+	Version        string                     `json:"version,omitempty"`
+	PackageVersion string                     `json:"package_version,omitempty"`
+	RuntimeVersion string                     `json:"runtime_version,omitempty"`
+	OS             string                     `json:"os,omitempty"`
+	Arch           string                     `json:"arch,omitempty"`
+	Source         ManagedHeaderProfileSource `json:"source,omitempty"`
+	FirstSeenAt    string                     `json:"first_seen_at,omitempty"`
+	LastSeenAt     string                     `json:"last_seen_at,omitempty"`
+	RequestCount   int                        `json:"request_count,omitempty"`
+}
+
 type claudeDeviceProfileCacheEntry struct {
 	profile ClaudeDeviceProfile
 	expire  time.Time
+}
+
+type claudeDeviceProfileObservationEntry struct {
+	profile   ClaudeDeviceProfile
+	firstSeen time.Time
+	lastSeen  time.Time
+	count     int
 }
 
 func ClaudeDeviceProfileStabilizationEnabled(cfg *config.Config) bool {
@@ -89,6 +111,7 @@ func ClaudeDeviceProfileStabilizationEnabled(cfg *config.Config) bool {
 func ResetClaudeDeviceProfileCache() {
 	claudeDeviceProfileCacheMu.Lock()
 	claudeDeviceProfileCache = make(map[string]claudeDeviceProfileCacheEntry)
+	claudeDeviceProfileObservations = make(map[string][]claudeDeviceProfileObservationEntry)
 	claudeDeviceProfileCacheMu.Unlock()
 }
 
@@ -279,8 +302,14 @@ func firstNonEmptyHeader(headers http.Header, name, fallback string) string {
 
 func claudeDeviceProfileScopeKey(auth *cliproxyauth.Auth, apiKey string) string {
 	switch {
+	case auth != nil && strings.TrimSpace(auth.FileName) != "":
+		return "file:" + strings.TrimSpace(auth.FileName)
 	case auth != nil && strings.TrimSpace(auth.ID) != "":
 		return "auth:" + strings.TrimSpace(auth.ID)
+	case auth != nil && strings.TrimSpace(auth.Label) != "":
+		return "label:" + strings.TrimSpace(auth.Label)
+	case auth != nil:
+		return "global"
 	case strings.TrimSpace(apiKey) != "":
 		return "api_key:" + strings.TrimSpace(apiKey)
 	default:
@@ -291,6 +320,37 @@ func claudeDeviceProfileScopeKey(auth *cliproxyauth.Auth, apiKey string) string 
 func claudeDeviceProfileCacheKey(auth *cliproxyauth.Auth, apiKey string) string {
 	sum := sha256.Sum256([]byte(claudeDeviceProfileScopeKey(auth, apiKey)))
 	return hex.EncodeToString(sum[:])
+}
+
+func claudeDeviceProfileObservationCacheKeys(auth *cliproxyauth.Auth, apiKey string) []string {
+	rawKeys := []string{claudeDeviceProfileScopeKey(auth, apiKey)}
+	if auth != nil {
+		if fileName := strings.TrimSpace(auth.FileName); fileName != "" {
+			rawKeys = append(rawKeys, "file:"+fileName, "auth:"+fileName)
+		}
+		if id := strings.TrimSpace(auth.ID); id != "" {
+			rawKeys = append(rawKeys, "auth:"+id, "file:"+id)
+		}
+		if label := strings.TrimSpace(auth.Label); label != "" {
+			rawKeys = append(rawKeys, "label:"+label, "auth:"+label)
+		}
+	}
+	if key := strings.TrimSpace(apiKey); key != "" {
+		rawKeys = append(rawKeys, "api_key:"+key)
+	}
+	rawKeys = append(rawKeys, "global")
+	seen := make(map[string]bool, len(rawKeys))
+	out := make([]string, 0, len(rawKeys))
+	for _, rawKey := range rawKeys {
+		rawKey = strings.TrimSpace(rawKey)
+		if rawKey == "" || seen[rawKey] {
+			continue
+		}
+		seen[rawKey] = true
+		sum := sha256.Sum256([]byte(rawKey))
+		out = append(out, hex.EncodeToString(sum[:]))
+	}
+	return out
 }
 
 func startClaudeDeviceProfileCacheCleanup() {
@@ -309,9 +369,104 @@ func purgeExpiredClaudeDeviceProfiles() {
 	for key, entry := range claudeDeviceProfileCache {
 		if !entry.expire.After(now) {
 			delete(claudeDeviceProfileCache, key)
+			delete(claudeDeviceProfileObservations, key)
 		}
 	}
 	claudeDeviceProfileCacheMu.Unlock()
+}
+
+func recordClaudeDeviceProfileObservation(cacheKey string, profile ClaudeDeviceProfile, now time.Time) {
+	if cacheKey == "" || profile.UserAgent == "" || !profile.hasVersion {
+		return
+	}
+	entries := claudeDeviceProfileObservations[cacheKey]
+	version := profile.VersionString()
+	for i := range entries {
+		if entries[i].profile.UserAgent == profile.UserAgent && entries[i].profile.VersionString() == version {
+			entries[i].lastSeen = now
+			entries[i].count++
+			entries[i].profile = profile
+			claudeDeviceProfileObservations[cacheKey] = sortClaudeDeviceProfileObservationEntries(entries)
+			return
+		}
+	}
+	entries = append(entries, claudeDeviceProfileObservationEntry{
+		profile:   profile,
+		firstSeen: now,
+		lastSeen:  now,
+		count:     1,
+	})
+	claudeDeviceProfileObservations[cacheKey] = sortClaudeDeviceProfileObservationEntries(entries)
+}
+
+func sortClaudeDeviceProfileObservationEntries(entries []claudeDeviceProfileObservationEntry) []claudeDeviceProfileObservationEntry {
+	sort.SliceStable(entries, func(i, j int) bool {
+		return entries[i].lastSeen.After(entries[j].lastSeen)
+	})
+	if len(entries) > 8 {
+		entries = entries[:8]
+	}
+	return entries
+}
+
+func ClaudeDeviceProfileObservations(auth *cliproxyauth.Auth, apiKey string) []ClaudeDeviceProfileObservation {
+	cacheKeys := claudeDeviceProfileObservationCacheKeys(auth, apiKey)
+	claudeDeviceProfileCacheMu.RLock()
+	var entries []claudeDeviceProfileObservationEntry
+	for _, cacheKey := range cacheKeys {
+		entries = append(entries, claudeDeviceProfileObservations[cacheKey]...)
+	}
+	claudeDeviceProfileCacheMu.RUnlock()
+	if len(entries) == 0 {
+		return nil
+	}
+	merged := make(map[string]claudeDeviceProfileObservationEntry, len(entries))
+	for _, entry := range entries {
+		version := entry.profile.VersionString()
+		if entry.profile.UserAgent == "" || version == "" {
+			continue
+		}
+		key := entry.profile.UserAgent + "\x00" + version
+		existing, ok := merged[key]
+		if !ok {
+			merged[key] = entry
+			continue
+		}
+		if entry.firstSeen.Before(existing.firstSeen) {
+			existing.firstSeen = entry.firstSeen
+		}
+		if entry.lastSeen.After(existing.lastSeen) {
+			existing.lastSeen = entry.lastSeen
+			existing.profile = entry.profile
+		}
+		existing.count += entry.count
+		merged[key] = existing
+	}
+	entries = entries[:0]
+	for _, entry := range merged {
+		entries = append(entries, entry)
+	}
+	entries = sortClaudeDeviceProfileObservationEntries(entries)
+	out := make([]ClaudeDeviceProfileObservation, 0, len(entries))
+	for _, entry := range entries {
+		version := entry.profile.VersionString()
+		if version == "" {
+			continue
+		}
+		out = append(out, ClaudeDeviceProfileObservation{
+			UserAgent:      entry.profile.UserAgent,
+			Version:        version,
+			PackageVersion: entry.profile.PackageVersion,
+			RuntimeVersion: entry.profile.RuntimeVersion,
+			OS:             entry.profile.OS,
+			Arch:           entry.profile.Arch,
+			Source:         entry.profile.Source,
+			FirstSeenAt:    entry.firstSeen.UTC().Format(time.RFC3339),
+			LastSeenAt:     entry.lastSeen.UTC().Format(time.RFC3339),
+			RequestCount:   entry.count,
+		})
+	}
+	return out
 }
 
 func ResolveClaudeDeviceProfile(auth *cliproxyauth.Auth, apiKey string, headers http.Header, cfg *config.Config) ClaudeDeviceProfile {
@@ -326,8 +481,7 @@ func ResolveClaudeDeviceProfile(auth *cliproxyauth.Auth, apiKey string, headers 
 	}
 	if hasCandidate && !shouldUpgradeClaudeDeviceProfile(candidate, baseline) {
 		staticBaselineVersion, _ := parseClaudeCLIVersion(defaultClaudeFingerprintUserAgent)
-		allowObservedFirstParty := baseline.Source.Source == managedHeaderProfileSourceNPM &&
-			candidate.hasVersion &&
+		allowObservedFirstParty := candidate.hasVersion &&
 			candidate.version.Compare(staticBaselineVersion) >= 0
 		if !allowObservedFirstParty {
 			hasCandidate = false
@@ -345,6 +499,7 @@ func ResolveClaudeDeviceProfile(auth *cliproxyauth.Auth, apiKey string, headers 
 		}
 
 		claudeDeviceProfileCacheMu.Lock()
+		recordClaudeDeviceProfileObservation(cacheKey, candidate, now)
 		entry, hasCached = claudeDeviceProfileCache[cacheKey]
 		cachedValid = hasCached && entry.expire.After(now) && entry.profile.UserAgent != ""
 		if cachedValid {

@@ -33,6 +33,24 @@ func TestBuildErrorResponseBody_RequestTooLarge(t *testing.T) {
 	}
 }
 
+func TestBuildErrorResponseBody_BadGateway(t *testing.T) {
+	body := BuildErrorResponseBody(http.StatusBadGateway, "socks connect failed")
+
+	var parsed ErrorResponse
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		t.Fatalf("unmarshal response body: %v\n%s", err, string(body))
+	}
+	if parsed.Error.Type != "server_error" {
+		t.Fatalf("error type = %q, want server_error", parsed.Error.Type)
+	}
+	if parsed.Error.Code != "bad_gateway" {
+		t.Fatalf("error code = %q, want bad_gateway", parsed.Error.Code)
+	}
+	if parsed.Error.Message != "socks connect failed" {
+		t.Fatalf("error message = %q, want socks connect failed", parsed.Error.Message)
+	}
+}
+
 func TestWriteErrorResponse_AddonHeadersDisabledByDefault(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()

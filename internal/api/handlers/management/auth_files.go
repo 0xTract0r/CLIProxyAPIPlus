@@ -157,19 +157,20 @@ type authFileAccountSettingsStored struct {
 }
 
 type authFileAccountSettingsView struct {
-	ProxyURL           string                                `json:"proxy_url"`
-	Note               string                                `json:"note"`
-	Disabled           bool                                  `json:"disabled"`
-	ManagedHeaders     map[string]string                     `json:"managed_headers"`
-	ExtraHeaders       map[string]string                     `json:"extra_headers"`
-	RefreshEnabled     bool                                  `json:"refresh_enabled"`
-	TransportProfile   any                                   `json:"transport_profile"`
-	TLSProfile         any                                   `json:"tls_profile"`
-	RuntimeProfile     *runtimehelps.RuntimeTransportProfile `json:"runtime_profile,omitempty"`
-	RuntimeIdentity    *authFileRuntimeIdentityState         `json:"runtime_identity,omitempty"`
-	ManagedHeaderState *authFileManagedHeaderState           `json:"managed_header_state,omitempty"`
-	Activation         authFileAccountSettingsActivation     `json:"activation"`
-	Warnings           []string                              `json:"warnings"`
+	ProxyURL           string                                        `json:"proxy_url"`
+	Note               string                                        `json:"note"`
+	Disabled           bool                                          `json:"disabled"`
+	ManagedHeaders     map[string]string                             `json:"managed_headers"`
+	ExtraHeaders       map[string]string                             `json:"extra_headers"`
+	RefreshEnabled     bool                                          `json:"refresh_enabled"`
+	TransportProfile   any                                           `json:"transport_profile"`
+	TLSProfile         any                                           `json:"tls_profile"`
+	RuntimeProfile     *runtimehelps.RuntimeTransportProfile         `json:"runtime_profile,omitempty"`
+	RuntimeIdentity    *authFileRuntimeIdentityState                 `json:"runtime_identity,omitempty"`
+	ManagedHeaderState *authFileManagedHeaderState                   `json:"managed_header_state,omitempty"`
+	ClientObservations []runtimehelps.ClaudeDeviceProfileObservation `json:"client_version_observations,omitempty"`
+	Activation         authFileAccountSettingsActivation             `json:"activation"`
+	Warnings           []string                                      `json:"warnings"`
 }
 
 type authFileAccountSettingsActivation struct {
@@ -1686,6 +1687,10 @@ func buildAuthFileAccountSettingsView(auth *coreauth.Auth, cfg *config.Config) a
 	} else if stored.TLSProfile != nil && strings.EqualFold(providerKey(auth), "codex") {
 		warnings = append(warnings, "codex tls_profile is runtime-enforced only for Go transport knobs such as account-scoped pooling, ALPN, and HTTP/1.1 forcing; it is not the Codex Desktop rustls native transport yet")
 	}
+	var clientObservations []runtimehelps.ClaudeDeviceProfileObservation
+	if strings.EqualFold(providerKey(auth), "claude") {
+		clientObservations = runtimehelps.ClaudeDeviceProfileObservations(auth, "")
+	}
 
 	return authFileAccountSettingsView{
 		ProxyURL:           authProxyURL(auth),
@@ -1699,6 +1704,7 @@ func buildAuthFileAccountSettingsView(auth *coreauth.Auth, cfg *config.Config) a
 		RuntimeProfile:     runtimeProfile,
 		RuntimeIdentity:    runtimeIdentity,
 		ManagedHeaderState: managedHeaderState,
+		ClientObservations: clientObservations,
 		Activation: authFileAccountSettingsActivation{
 			Summary:   accountSettingsActivationSummary(auth, managedHeaders, extraHeaders, refreshEnabled, transportRuntimeEnforced, tlsRuntimeEnforced),
 			State:     accountSettingsActivationState(auth, stored.TransportProfile, stored.TLSProfile, refreshEnabled, transportRuntimeEnforced, tlsRuntimeEnforced),

@@ -1042,6 +1042,72 @@ func TestGetAuthFileAccountSettings_PersistsClaudeManagedHeaderHistoryAcrossVers
 	}
 }
 
+func TestGetAuthFileAccountSettings_ReturnsClaudeClientVersionObservations(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+	runtimehelps.ResetClaudeDeviceProfileCache()
+	t.Cleanup(runtimehelps.ResetClaudeDeviceProfileCache)
+
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	record := &coreauth.Auth{
+		ID:       "claude-observations.json",
+		FileName: "claude-observations.json",
+		Provider: "claude",
+		Attributes: map[string]string{
+			"path": "/tmp/claude-observations.json",
+		},
+		Metadata: map[string]any{
+			"type": "claude",
+			"account_settings": map[string]any{
+				"schema_version": 1,
+			},
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("failed to register auth record: %v", errRegister)
+	}
+
+	cfg := &config.Config{AuthDir: t.TempDir()}
+	_ = runtimehelps.ResolveClaudeDeviceProfile(record, "", http.Header{
+		"User-Agent":                  []string{"claude-cli/2.1.140 (external, cli)"},
+		"X-Stainless-Package-Version": []string{"0.80.0"},
+		"X-Stainless-Runtime-Version": []string{"v24.5.0"},
+	}, cfg)
+	_ = runtimehelps.ResolveClaudeDeviceProfile(record, "", http.Header{
+		"User-Agent":                  []string{"claude-cli/2.1.142 (external, cli)"},
+		"X-Stainless-Package-Version": []string{"0.81.0"},
+		"X-Stainless-Runtime-Version": []string{"v24.6.0"},
+	}, cfg)
+
+	h := NewHandlerWithoutConfigFilePath(cfg, manager)
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodGet, "/v0/management/auth-files/account-settings?name=claude-observations.json", nil)
+	ctx.Request = req
+	h.GetAuthFileAccountSettings(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+
+	var resp authFileAccountSettingsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	observations := resp.AccountSettings.ClientObservations
+	if len(observations) != 2 {
+		t.Fatalf("client observations length = %d, want 2: %#v", len(observations), observations)
+	}
+	versions := map[string]bool{}
+	for _, observation := range observations {
+		versions[observation.Version] = true
+	}
+	if !versions["2.1.140"] || !versions["2.1.142"] {
+		t.Fatalf("expected observed versions 2.1.140 and 2.1.142, got %#v", observations)
+	}
+}
+
 func TestGetAuthFileAccountSettings_PersistsCoreManagedRuntimeIdentity(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
 	gin.SetMode(gin.TestMode)

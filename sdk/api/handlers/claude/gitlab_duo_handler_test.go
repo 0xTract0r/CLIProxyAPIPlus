@@ -11,6 +11,7 @@ import (
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	runtimeexecutor "github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor"
+	runtimehelps "github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
@@ -63,6 +64,48 @@ func TestClaudeMessagesWithGitLabDuoAnthropicGateway(t *testing.T) {
 	}
 	if !strings.Contains(resp.Body.String(), `"Bash"`) {
 		t.Fatalf("expected Bash tool in response, got %s", resp.Body.String())
+	}
+}
+
+func TestClaudeMessagesRecordsIncomingClientObservation(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	runtimehelps.ResetClaudeDeviceProfileCache()
+	t.Cleanup(runtimehelps.ResetClaudeDeviceProfileCache)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","role":"assistant","model":"claude-sonnet-4-5","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer upstream.Close()
+
+	manager, _ := registerGitLabDuoAnthropicAuth(t, upstream.URL)
+	base := handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
+	h := NewClaudeCodeAPIHandler(base)
+	router := gin.New()
+	router.POST("/v1/messages", h.ClaudeMessages)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{
+		"model":"claude-sonnet-4-5",
+		"max_tokens":16,
+		"messages":[{"role":"user","content":"hi"}]
+	}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Anthropic-Version", "2023-06-01")
+	req.Header.Set("User-Agent", "claude-cli/2.1.142 (external, sdk-cli)")
+	req.Header.Set("X-Stainless-Package-Version", "0.94.0")
+	req.Header.Set("X-Stainless-Runtime-Version", "v24.3.0")
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d body=%s", resp.Code, http.StatusOK, resp.Body.String())
+	}
+	observations := runtimehelps.ClaudeDeviceProfileObservations(&coreauth.Auth{Provider: "claude"}, "")
+	if len(observations) != 1 {
+		t.Fatalf("observations length = %d, want 1: %#v", len(observations), observations)
+	}
+	if got := observations[0].Version; got != "2.1.142" {
+		t.Fatalf("version = %q, want 2.1.142", got)
 	}
 }
 

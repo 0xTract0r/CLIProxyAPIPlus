@@ -9,6 +9,8 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 )
 
 // TestClaudeExecutor_Refresh_UsesAccountProxyURL verifies that
@@ -50,5 +52,32 @@ func TestClaudeExecutor_Refresh_UsesAccountProxyURL(t *testing.T) {
 
 	if got := atomic.LoadInt32(&accountProxyHits); got == 0 {
 		t.Fatalf("expected ClaudeExecutor.Refresh to route through account proxy %s, but proxy received no CONNECT", accountProxy.URL)
+	}
+}
+
+func TestClaudeExecutor_Execute_TransportErrorIsBadGateway(t *testing.T) {
+	exec := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		Provider: "claude",
+		ProxyURL: "http://127.0.0.1:1",
+		Attributes: map[string]string{
+			"api_key":  "test-api-key",
+			"base_url": "http://example.invalid",
+		},
+	}
+
+	_, err := exec.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-haiku-4-5-20251001",
+		Payload: []byte(`{"model":"claude-haiku-4-5-20251001","messages":[{"role":"user","content":"hi"}]}`),
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")})
+	if err == nil {
+		t.Fatal("Execute() error = nil, want proxy transport error")
+	}
+	statusProvider, ok := err.(interface{ StatusCode() int })
+	if !ok {
+		t.Fatalf("Execute() error type %T does not expose StatusCode", err)
+	}
+	if statusProvider.StatusCode() != http.StatusBadGateway {
+		t.Fatalf("StatusCode() = %d, want %d", statusProvider.StatusCode(), http.StatusBadGateway)
 	}
 }
