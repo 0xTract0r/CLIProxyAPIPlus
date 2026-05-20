@@ -2565,21 +2565,14 @@ func defaultAuthFileTestMessageModel(auth *coreauth.Auth) string {
 	preferred := []string{}
 	switch provider {
 	case "codex":
-		switch strings.ToLower(strings.TrimSpace(metadataString(auth.Metadata, "plan_type"))) {
-		case "free":
-			models = registry.GetCodexFreeModels()
-		case "team":
-			models = registry.GetCodexTeamModels()
-		case "plus":
-			models = registry.GetCodexPlusModels()
-		case "pro":
-			models = registry.GetCodexProModels()
-		default:
-			models = registry.GetStaticModelDefinitionsByChannel("codex")
+		planType := metadataString(auth.Metadata, "plan_type")
+		if planType == "" && auth.Attributes != nil {
+			planType = strings.TrimSpace(auth.Attributes["plan_type"])
 		}
+		models = registry.GetCodexModelsForPlan(planType)
 		preferred = []string{"gpt-5.4-mini", "gpt-5.2", "gpt-5.3-codex"}
 	case "claude", "anthropic":
-		models = registry.GetClaudeModels()
+		models = registry.GetClaudeModelsForPlan(metadataString(auth.Metadata, "plan_type"), claudeUsageCreditsEnabledFromQuotaSnapshot(auth.Metadata))
 		preferred = []string{"claude-haiku-4-5-20251001", "claude-3-5-haiku-20241022"}
 	case "gemini-cli":
 		models = registry.GetGeminiCLIModels()

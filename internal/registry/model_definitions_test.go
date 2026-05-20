@@ -30,6 +30,18 @@ func TestCodexStaticModelsIncludeGPT55(t *testing.T) {
 	}
 }
 
+func TestCodexPlusModelsExcludeSpark(t *testing.T) {
+	if model := findModelInfo(GetCodexPlusModels(), "gpt-5.3-codex-spark"); model != nil {
+		t.Fatalf("expected codex plus tier to exclude Spark, got %+v", model)
+	}
+	if model := findModelInfo(GetCodexProModels(), "gpt-5.3-codex-spark"); model == nil {
+		t.Fatal("expected codex pro tier to include Spark")
+	}
+	if model := findModelInfo(GetCodexModelsForPlan(""), "gpt-5.3-codex-spark"); model != nil {
+		t.Fatalf("expected unknown codex tier to exclude Spark, got %+v", model)
+	}
+}
+
 func TestClaudeSonnet46StaticModelHas1MContext(t *testing.T) {
 	model := findModelInfo(GetClaudeModels(), "claude-sonnet-4-6")
 	if model == nil {
@@ -37,6 +49,24 @@ func TestClaudeSonnet46StaticModelHas1MContext(t *testing.T) {
 	}
 	if model.ContextLength != 1000000 {
 		t.Fatalf("claude-sonnet-4-6 context length = %d, want 1000000", model.ContextLength)
+	}
+}
+
+func TestClaudeModelsForPlanFiltersOneMillionContext(t *testing.T) {
+	if model := findModelInfo(GetClaudeModelsForPlan("pro", false), "claude-opus-4-7"); model != nil {
+		t.Fatalf("expected Claude Pro without usage credits to exclude Opus 1M, got %+v", model)
+	}
+	if model := findModelInfo(GetClaudeModelsForPlan("pro", false), "claude-sonnet-4-6"); model == nil {
+		t.Fatal("expected Claude Pro without usage credits to keep non-Opus Sonnet route")
+	}
+	if model := findModelInfo(GetClaudeModelsForPlan("pro", true), "claude-opus-4-7"); model == nil {
+		t.Fatal("expected Claude Pro with usage credits to include Opus 1M")
+	}
+	if model := findModelInfo(GetClaudeModelsForPlan("max", false), "claude-opus-4-7"); model == nil {
+		t.Fatal("expected Claude Max to include Opus 1M")
+	}
+	if model := findModelInfo(GetClaudeModelsForPlan("", false), "claude-opus-4-7"); model != nil {
+		t.Fatalf("expected unknown Claude plan to exclude Opus 1M, got %+v", model)
 	}
 }
 

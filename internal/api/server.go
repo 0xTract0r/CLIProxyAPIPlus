@@ -276,6 +276,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	if optionState.postAuthHook != nil {
 		s.mgmt.SetPostAuthHook(optionState.postAuthHook)
 	}
+	s.mgmt.StartQuotaSnapshotAutoRefresh(context.Background(), 0)
 	s.localPassword = optionState.localPassword
 
 	// Setup routes
@@ -605,6 +606,9 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.DELETE("/proxy-url", s.mgmt.DeleteProxyURL)
 
 		mgmt.POST("/api-call", s.mgmt.APICall)
+
+		mgmt.GET("/quota/snapshots", s.mgmt.GetQuotaSnapshots)
+		mgmt.POST("/quota/refresh", s.mgmt.RefreshQuotaSnapshots)
 
 		mgmt.GET("/quota-exceeded/switch-project", s.mgmt.GetSwitchProject)
 		mgmt.PUT("/quota-exceeded/switch-project", s.mgmt.PutSwitchProject)

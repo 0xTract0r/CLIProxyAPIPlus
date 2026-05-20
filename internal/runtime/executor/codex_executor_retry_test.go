@@ -58,6 +58,29 @@ func TestParseCodexRetryAfter(t *testing.T) {
 			t.Fatalf("expected nil for non-usage_limit_reached, got %v", *got)
 		}
 	})
+
+	t.Run("natural language retry time", func(t *testing.T) {
+		now := time.Date(2026, 5, 20, 16, 30, 0, 0, time.Local)
+		body := []byte(`You've hit your usage limit. Upgrade to Pro, purchase more credits or try again at 5:03 PM.`)
+		retryAfter := parseCodexRetryAfter(http.StatusTooManyRequests, body, now)
+		if retryAfter == nil {
+			t.Fatalf("expected retryAfter, got nil")
+		}
+		if *retryAfter != 33*time.Minute {
+			t.Fatalf("retryAfter = %v, want 33m", *retryAfter)
+		}
+	})
+
+	t.Run("usage limit without reset gets fallback", func(t *testing.T) {
+		body := []byte(`{"error":{"message":"You've hit your usage limit. Upgrade to Pro."}}`)
+		retryAfter := parseCodexRetryAfter(http.StatusTooManyRequests, body, now)
+		if retryAfter == nil {
+			t.Fatalf("expected retryAfter, got nil")
+		}
+		if *retryAfter != defaultUsageLimitRetryAfter {
+			t.Fatalf("retryAfter = %v, want %v", *retryAfter, defaultUsageLimitRetryAfter)
+		}
+	})
 }
 
 func TestNewCodexStatusErrTreatsCapacityAsRetryableRateLimit(t *testing.T) {

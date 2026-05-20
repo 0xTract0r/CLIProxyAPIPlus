@@ -141,12 +141,18 @@ func TestRequestStatisticsDoesNotFoldCacheTokensIntoTotal(t *testing.T) {
 	if snapshot.TotalTokens != 15 {
 		t.Fatalf("TotalTokens = %d, want 15", snapshot.TotalTokens)
 	}
+	if snapshot.TotalBillableTokens != 165 {
+		t.Fatalf("TotalBillableTokens = %d, want 165", snapshot.TotalBillableTokens)
+	}
 	details := snapshot.APIs["test-key"].Models["claude-sonnet-4.6"].Details
 	if len(details) != 1 {
 		t.Fatalf("details len = %d, want 1", len(details))
 	}
 	if details[0].Tokens.TotalTokens != 15 {
 		t.Fatalf("detail total tokens = %d, want 15", details[0].Tokens.TotalTokens)
+	}
+	if details[0].Tokens.BillableTokens != 165 {
+		t.Fatalf("detail billable tokens = %d, want 165", details[0].Tokens.BillableTokens)
 	}
 	if details[0].Tokens.CacheReadTokens != 100 || details[0].Tokens.CacheWriteTokens != 50 {
 		t.Fatalf("cache tokens = read %d write %d, want read 100 write 50", details[0].Tokens.CacheReadTokens, details[0].Tokens.CacheWriteTokens)

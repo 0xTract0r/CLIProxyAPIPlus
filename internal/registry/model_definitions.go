@@ -6,7 +6,11 @@ import (
 	"strings"
 )
 
-const codexBuiltinImageModelID = "gpt-image-2"
+const (
+	codexBuiltinImageModelID         = "gpt-image-2"
+	codexSparkModelID                = "gpt-5.3-codex-spark"
+	claudeLongContextThresholdTokens = 1000000
+)
 
 // staticModelsJSON mirrors the top-level structure of models.json.
 type staticModelsJSON struct {
@@ -28,6 +32,13 @@ type staticModelsJSON struct {
 // GetClaudeModels returns the standard Claude model definitions.
 func GetClaudeModels() []*ModelInfo {
 	return cloneModelInfos(getModels().Claude)
+}
+
+// GetClaudeModelsForPlan returns Claude model definitions that are safe for a
+// known subscription plan. Pro only gets Opus 1M models when usage credits are
+// explicitly enabled.
+func GetClaudeModelsForPlan(plan string, usageCreditsEnabled bool) []*ModelInfo {
+	return FilterClaudeModelsForPlan(GetClaudeModels(), plan, usageCreditsEnabled)
 }
 
 // GetGeminiModels returns the standard Gemini model definitions.
@@ -52,22 +63,116 @@ func GetAIStudioModels() []*ModelInfo {
 
 // GetCodexFreeModels returns model definitions for the Codex free plan tier.
 func GetCodexFreeModels() []*ModelInfo {
-	return WithCodexBuiltins(cloneModelInfos(getModels().CodexFree))
+	return WithCodexBuiltins(FilterCodexModelsForPlan(cloneModelInfos(getModels().CodexFree), "free"))
 }
 
 // GetCodexTeamModels returns model definitions for the Codex team plan tier.
 func GetCodexTeamModels() []*ModelInfo {
-	return WithCodexBuiltins(cloneModelInfos(getModels().CodexTeam))
+	return WithCodexBuiltins(FilterCodexModelsForPlan(cloneModelInfos(getModels().CodexTeam), "team"))
 }
 
 // GetCodexPlusModels returns model definitions for the Codex plus plan tier.
 func GetCodexPlusModels() []*ModelInfo {
-	return WithCodexBuiltins(cloneModelInfos(getModels().CodexPlus))
+	return WithCodexBuiltins(FilterCodexModelsForPlan(cloneModelInfos(getModels().CodexPlus), "plus"))
 }
 
 // GetCodexProModels returns model definitions for the Codex pro plan tier.
 func GetCodexProModels() []*ModelInfo {
-	return WithCodexBuiltins(cloneModelInfos(getModels().CodexPro))
+	return WithCodexBuiltins(FilterCodexModelsForPlan(cloneModelInfos(getModels().CodexPro), "pro"))
+}
+
+// GetCodexModelsForPlan returns Codex model definitions for a known plan. An
+// unknown plan is intentionally conservative so unsupported premium-only models
+// are not routed to accounts whose subscription tier has not been identified.
+func GetCodexModelsForPlan(plan string) []*ModelInfo {
+	switch normalizeSubscriptionPlan(plan) {
+	case "pro":
+		return GetCodexProModels()
+	case "plus":
+		return GetCodexPlusModels()
+	case "team", "business", "go", "enterprise":
+		return GetCodexTeamModels()
+	case "free":
+		return GetCodexFreeModels()
+	default:
+		return GetCodexFreeModels()
+	}
+}
+
+// FilterCodexModelsForPlan removes models that are not supported by the given
+// Codex subscription plan.
+func FilterCodexModelsForPlan(models []*ModelInfo, plan string) []*ModelInfo {
+	if len(models) == 0 {
+		return nil
+	}
+	normalizedPlan := normalizeSubscriptionPlan(plan)
+	allowSpark := normalizedPlan == "pro"
+	out := make([]*ModelInfo, 0, len(models))
+	for _, model := range models {
+		if model == nil {
+			continue
+		}
+		if !allowSpark && strings.EqualFold(strings.TrimSpace(model.ID), codexSparkModelID) {
+			continue
+		}
+		out = append(out, model)
+	}
+	return out
+}
+
+// FilterClaudeModelsForPlan removes Claude Opus 1M models that need a higher
+// subscription tier or explicit usage credits.
+func FilterClaudeModelsForPlan(models []*ModelInfo, plan string, usageCreditsEnabled bool) []*ModelInfo {
+	if len(models) == 0 {
+		return nil
+	}
+	if claudePlanAllowsOpusLongContext(plan, usageCreditsEnabled) {
+		return models
+	}
+	out := make([]*ModelInfo, 0, len(models))
+	for _, model := range models {
+		if model == nil {
+			continue
+		}
+		if isClaudeOpusLongContextModel(model) {
+			continue
+		}
+		out = append(out, model)
+	}
+	return out
+}
+
+func claudePlanAllowsOpusLongContext(plan string, usageCreditsEnabled bool) bool {
+	switch normalizeSubscriptionPlan(plan) {
+	case "max", "team", "business", "enterprise":
+		return true
+	case "pro":
+		return usageCreditsEnabled
+	default:
+		return false
+	}
+}
+
+func isClaudeOpusLongContextModel(model *ModelInfo) bool {
+	if model == nil || model.ContextLength < claudeLongContextThresholdTokens {
+		return false
+	}
+	id := strings.ToLower(strings.TrimSpace(model.ID))
+	name := strings.ToLower(strings.TrimSpace(model.DisplayName))
+	return strings.Contains(id, "opus") || strings.Contains(name, "opus")
+}
+
+func normalizeSubscriptionPlan(plan string) string {
+	normalized := strings.ToLower(strings.TrimSpace(plan))
+	normalized = strings.TrimPrefix(normalized, "plan_")
+	normalized = strings.TrimPrefix(normalized, "plan-")
+	normalized = strings.ReplaceAll(normalized, "_", "-")
+	switch normalized {
+	case "pro-lite", "prolite":
+		return "pro"
+	default:
+		return normalized
+	}
 }
 
 // GetKimiModels returns the standard Kimi (Moonshot AI) model definitions.

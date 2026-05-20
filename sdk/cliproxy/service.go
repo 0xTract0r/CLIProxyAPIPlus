@@ -923,7 +923,9 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 		models = registry.GetAntigravityModels()
 		models = applyExcludedModels(models, excluded)
 	case "claude":
-		models = registry.GetClaudeModels()
+		claudePlanType := authSubscriptionPlanType(a)
+		claudeUsageCredits := claudeUsageCreditsEnabled(a)
+		models = registry.GetClaudeModelsForPlan(claudePlanType, claudeUsageCredits)
 		if entry := s.resolveConfigClaudeKey(a); entry != nil {
 			if len(entry.Models) > 0 {
 				models = buildClaudeConfigModels(entry)
@@ -932,24 +934,11 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 				excluded = entry.ExcludedModels
 			}
 		}
+		models = registry.FilterClaudeModelsForPlan(models, claudePlanType, claudeUsageCredits)
 		models = applyExcludedModels(models, excluded)
 	case "codex":
-		codexPlanType := ""
-		if a.Attributes != nil {
-			codexPlanType = strings.TrimSpace(a.Attributes["plan_type"])
-		}
-		switch strings.ToLower(codexPlanType) {
-		case "pro":
-			models = registry.GetCodexProModels()
-		case "plus":
-			models = registry.GetCodexPlusModels()
-		case "team", "business", "go":
-			models = registry.GetCodexTeamModels()
-		case "free":
-			models = registry.GetCodexFreeModels()
-		default:
-			models = registry.GetCodexProModels()
-		}
+		codexPlanType := authSubscriptionPlanType(a)
+		models = registry.GetCodexModelsForPlan(codexPlanType)
 		if entry := s.resolveConfigCodexKey(a); entry != nil {
 			if len(entry.Models) > 0 {
 				models = buildCodexConfigModels(entry)
@@ -958,6 +947,7 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 				excluded = entry.ExcludedModels
 			}
 		}
+		models = registry.FilterCodexModelsForPlan(models, codexPlanType)
 		models = applyExcludedModels(models, excluded)
 	case "qwen":
 		models = registry.GetQwenModels()
@@ -1080,6 +1070,120 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 	}
 
 	GlobalModelRegistry().UnregisterClient(a.ID)
+}
+
+func authSubscriptionPlanType(auth *coreauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	if value := authMetadataString(auth.Metadata, "plan_type"); value != "" {
+		return value
+	}
+	if auth.Attributes != nil {
+		return strings.TrimSpace(auth.Attributes["plan_type"])
+	}
+	return ""
+}
+
+func claudeUsageCreditsEnabled(auth *coreauth.Auth) bool {
+	if auth == nil {
+		return false
+	}
+	if auth.Attributes != nil {
+		for _, key := range []string{"usage_credits_enabled", "extra_usage_enabled", "has_extra_usage_enabled"} {
+			if authTruthy(auth.Attributes[key]) {
+				return true
+			}
+		}
+	}
+	if authMetadataBool(auth.Metadata, "usage_credits_enabled", "extra_usage_enabled", "has_extra_usage_enabled") {
+		return true
+	}
+	snapshot := authMetadataMap(auth.Metadata, "quota_snapshot")
+	usage := nestedStringMap(snapshot, "usage")
+	extraUsage := nestedStringMap(usage, "extra_usage")
+	if extraUsage == nil {
+		extraUsage = nestedStringMap(usage, "extraUsage")
+	}
+	return mapBool(extraUsage, "is_enabled", "isEnabled", "enabled")
+}
+
+func authMetadataString(meta map[string]any, key string) string {
+	if len(meta) == 0 {
+		return ""
+	}
+	value, ok := meta[key]
+	if !ok {
+		return ""
+	}
+	str, ok := value.(string)
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(str)
+}
+
+func authMetadataBool(meta map[string]any, keys ...string) bool {
+	if len(meta) == 0 {
+		return false
+	}
+	for _, key := range keys {
+		if authTruthy(meta[key]) {
+			return true
+		}
+	}
+	return false
+}
+
+func authMetadataMap(meta map[string]any, key string) map[string]any {
+	if len(meta) == 0 {
+		return nil
+	}
+	return asStringMap(meta[key])
+}
+
+func nestedStringMap(meta map[string]any, key string) map[string]any {
+	if len(meta) == 0 {
+		return nil
+	}
+	return asStringMap(meta[key])
+}
+
+func mapBool(meta map[string]any, keys ...string) bool {
+	if len(meta) == 0 {
+		return false
+	}
+	for _, key := range keys {
+		if authTruthy(meta[key]) {
+			return true
+		}
+	}
+	return false
+}
+
+func asStringMap(value any) map[string]any {
+	switch typed := value.(type) {
+	case map[string]any:
+		return typed
+	default:
+		return nil
+	}
+}
+
+func authTruthy(value any) bool {
+	switch typed := value.(type) {
+	case bool:
+		return typed
+	case string:
+		switch strings.ToLower(strings.TrimSpace(typed)) {
+		case "1", "true", "yes", "y", "enabled", "on":
+			return true
+		default:
+			return false
+		}
+	default:
+		return false
+	}
 }
 
 // refreshModelRegistrationForAuth re-applies the latest model registration for

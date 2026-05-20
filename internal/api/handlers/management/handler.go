@@ -3,6 +3,7 @@
 package management
 
 import (
+	"context"
 	"crypto/subtle"
 	"fmt"
 	"net/http"
@@ -49,6 +50,7 @@ type Handler struct {
 	logDir                 string
 	postAuthHook           coreauth.PostAuthHook
 	managedHeaderScheduler *managedHeaderSyncScheduler
+	quotaRefreshCancel     context.CancelFunc
 }
 
 // NewHandler creates a new management handler instance.

@@ -598,6 +598,7 @@ func main() {
 				log.WithError(errPersist).Warnf("failed to restore pricing catalog from %s", pricingPath)
 			}
 		}
+		usage.StartDefaultPricingCatalogAutoRefresh(context.Background(), 0)
 
 		// In cloud deploy mode without config file, just wait for shutdown signals
 		if isCloudDeploy && !configFileExists {

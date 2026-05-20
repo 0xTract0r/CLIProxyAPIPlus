@@ -575,6 +575,51 @@ func TestManager_MarkResult_429_NoRetryAfter_TreatedAsTransient(t *testing.T) {
 	}
 }
 
+func TestManager_SchedulerSkipsPlanQuotaPlusAndKeepsProAvailable(t *testing.T) {
+	t.Parallel()
+
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	model := "gpt-5.5"
+	reg := registry.GetGlobalRegistry()
+	for _, id := range []string{"codex-plus-a", "codex-plus-b", "codex-pro"} {
+		reg.RegisterClient(id, "codex", []*registry.ModelInfo{{ID: model}})
+	}
+	t.Cleanup(func() {
+		for _, id := range []string{"codex-plus-a", "codex-plus-b", "codex-pro"} {
+			reg.UnregisterClient(id)
+		}
+	})
+	for _, auth := range []*Auth{
+		{ID: "codex-plus-a", Provider: "codex", Attributes: map[string]string{"plan_type": "plus"}},
+		{ID: "codex-plus-b", Provider: "codex", Attributes: map[string]string{"plan_type": "plus"}},
+		{ID: "codex-pro", Provider: "codex", Attributes: map[string]string{"plan_type": "pro"}},
+	} {
+		if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+			t.Fatalf("Register(%s) error = %v", auth.ID, errRegister)
+		}
+	}
+
+	retryAfter := 2 * time.Hour
+	for _, id := range []string{"codex-plus-a", "codex-plus-b"} {
+		manager.MarkResult(context.Background(), Result{
+			AuthID:     id,
+			Provider:   "codex",
+			Model:      model,
+			Success:    false,
+			Error:      &Error{HTTPStatus: http.StatusTooManyRequests, Message: "usage_limit_reached"},
+			RetryAfter: &retryAfter,
+		})
+	}
+
+	got, errPick := manager.scheduler.pickSingle(context.Background(), "codex", model, cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("scheduler.pickSingle() error = %v", errPick)
+	}
+	if got == nil || got.ID != "codex-pro" {
+		t.Fatalf("scheduler.pickSingle() auth = %v, want codex-pro", got)
+	}
+}
+
 // TestManager_AfterTransient429AllAuths_RecoversWithinShortWindow simulates the
 // production bug we just patched: a single client request fans out across N
 // auths under the same provider/model and every upstream call returns 429 with
