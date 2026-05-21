@@ -349,7 +349,7 @@ func TestQuotaSnapshotsCodexUnauthorizedRequiresReauth(t *testing.T) {
 	}
 }
 
-func TestQuotaSnapshotsUnauthorizedDoesNotDecodeErrorBodyAndClearsPlan(t *testing.T) {
+func TestQuotaSnapshotsUnauthorizedDoesNotDecodeErrorBodyAndPreservesLastKnownPlan(t *testing.T) {
 	t.Parallel()
 
 	gin.SetMode(gin.TestMode)
@@ -391,18 +391,20 @@ func TestQuotaSnapshotsUnauthorizedDoesNotDecodeErrorBodyAndClearsPlan(t *testin
 	if entry.Status != quotaRefreshStatusReauthRequired {
 		t.Fatalf("entry status = %q, want %q", entry.Status, quotaRefreshStatusReauthRequired)
 	}
-	if entry.PlanType != "" {
-		t.Fatalf("entry plan_type = %q, want empty after reauth", entry.PlanType)
+	if entry.PlanType != "pro" {
+		t.Fatalf("entry plan_type = %q, want last known pro after quota reauth", entry.PlanType)
 	}
 	updated, ok := manager.GetByID("codex-stale-pro")
 	if !ok {
 		t.Fatal("updated auth missing")
 	}
-	if got := metadataString(updated.Metadata, quotaSnapshotPlanTypeKey); got != "" {
-		t.Fatalf("persisted plan_type = %q, want empty after reauth", got)
+	if got := metadataString(updated.Metadata, quotaSnapshotPlanTypeKey); got != "pro" {
+		t.Fatalf("persisted plan_type = %q, want last known pro after quota reauth", got)
 	}
-	if _, ok := updated.Metadata[quotaSnapshotMetadataKey]; ok {
-		t.Fatal("quota_snapshot should be cleared after reauth-required refresh")
+	// Keep the last successful quota snapshot as stale observability data; the
+	// reauth status is recorded separately and must not erase routing capability.
+	if _, ok := updated.Metadata[quotaSnapshotMetadataKey]; !ok {
+		t.Fatal("quota_snapshot should keep last known data after quota reauth")
 	}
 	if strings.Contains(rec.Body.String(), "gzip") || strings.Contains(rec.Body.String(), "not a gzip body") {
 		t.Fatalf("response leaked error body/decode details: %s", rec.Body.String())

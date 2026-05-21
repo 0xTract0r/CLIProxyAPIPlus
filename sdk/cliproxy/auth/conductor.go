@@ -329,6 +329,19 @@ func (m *Manager) SetSelector(selector Selector) {
 	}
 }
 
+// SetHook replaces the lifecycle hook used for auth and result observations.
+func (m *Manager) SetHook(hook Hook) {
+	if m == nil {
+		return
+	}
+	if hook == nil {
+		hook = NoopHook{}
+	}
+	m.mu.Lock()
+	m.hook = hook
+	m.mu.Unlock()
+}
+
 // SetStore swaps the underlying persistence store.
 func (m *Manager) SetStore(store Store) {
 	m.mu.Lock()

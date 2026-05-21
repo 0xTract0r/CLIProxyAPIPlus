@@ -345,10 +345,6 @@ func (h *Handler) persistQuotaSnapshotError(ctx context.Context, auth *coreauth.
 	}
 	updated.Metadata[quotaRefreshStatusMetadataKey] = status
 	updated.Metadata[quotaRefreshErrorMetadataKey] = message
-	if status == quotaRefreshStatusReauthRequired {
-		delete(updated.Metadata, quotaSnapshotPlanTypeKey)
-		delete(updated.Metadata, quotaSnapshotMetadataKey)
-	}
 	updated.Metadata[quotaNextRefreshMetadataKey] = quotaSnapshotNextRefreshTime(updated, now, interval).Format(time.RFC3339)
 	updated.UpdatedAt = now
 	saved, err := manager.Update(ctx, updated)

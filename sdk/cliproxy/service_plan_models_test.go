@@ -1,6 +1,7 @@
 package cliproxy
 
 import (
+	"context"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
@@ -39,6 +40,88 @@ func TestRegisterModelsForAuth_CodexPlanFiltersSpark(t *testing.T) {
 			gotSpark := modelListContains(reg.GetModelsForClient(auth.ID), "gpt-5.3-codex-spark")
 			if gotSpark != tt.wantSpark {
 				t.Fatalf("Spark registered = %v, want %v", gotSpark, tt.wantSpark)
+			}
+		})
+	}
+}
+
+func TestCoreAuthUpdateHookRefreshesPlanFilteredModelRegistry(t *testing.T) {
+	ctx := context.Background()
+	cfg := &config.Config{}
+	cfg.SanitizeOAuthModelAlias()
+	manager := coreauth.NewManager(nil, nil, nil)
+	service := &Service{cfg: cfg, coreManager: manager}
+	manager.SetHook(authRegistryHook{service: service})
+	reg := registry.GetGlobalRegistry()
+
+	tests := []struct {
+		name         string
+		initialAuth  *coreauth.Auth
+		updatedAuth  *coreauth.Auth
+		premiumModel string
+		baseModel    string
+	}{
+		{
+			name: "claude max to pro removes opus",
+			initialAuth: &coreauth.Auth{
+				ID:       "claude-plan-update-hook",
+				Provider: "claude",
+				Status:   coreauth.StatusActive,
+				Metadata: map[string]any{
+					"quota_snapshot": map[string]any{
+						"profile": map[string]any{"account": map[string]any{"has_claude_max": true}},
+					},
+				},
+			},
+			updatedAuth: &coreauth.Auth{
+				ID:       "claude-plan-update-hook",
+				Provider: "claude",
+				Status:   coreauth.StatusActive,
+				Metadata: map[string]any{"plan_type": "pro"},
+			},
+			premiumModel: "claude-opus-4-7",
+			baseModel:    "claude-sonnet-4-6",
+		},
+		{
+			name: "codex pro to plus removes spark",
+			initialAuth: &coreauth.Auth{
+				ID:       "codex-plan-update-hook",
+				Provider: "codex",
+				Status:   coreauth.StatusActive,
+				Metadata: map[string]any{"plan_type": "pro"},
+			},
+			updatedAuth: &coreauth.Auth{
+				ID:       "codex-plan-update-hook",
+				Provider: "codex",
+				Status:   coreauth.StatusActive,
+				Metadata: map[string]any{"plan_type": "plus"},
+			},
+			premiumModel: "gpt-5.3-codex-spark",
+			baseModel:    "gpt-5.3-codex",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reg.UnregisterClient(tt.initialAuth.ID)
+			t.Cleanup(func() { reg.UnregisterClient(tt.initialAuth.ID) })
+
+			if _, err := manager.Register(ctx, tt.initialAuth); err != nil {
+				t.Fatalf("Register() error = %v", err)
+			}
+			if !modelListContains(reg.GetModelsForClient(tt.initialAuth.ID), tt.premiumModel) {
+				t.Fatalf("expected initial registry to include %s", tt.premiumModel)
+			}
+
+			if _, err := manager.Update(ctx, tt.updatedAuth); err != nil {
+				t.Fatalf("Update() error = %v", err)
+			}
+			models := reg.GetModelsForClient(tt.updatedAuth.ID)
+			if modelListContains(models, tt.premiumModel) {
+				t.Fatalf("expected updated registry to remove %s", tt.premiumModel)
+			}
+			if !modelListContains(models, tt.baseModel) {
+				t.Fatalf("expected updated registry to keep %s", tt.baseModel)
 			}
 		})
 	}

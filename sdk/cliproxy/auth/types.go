@@ -317,9 +317,6 @@ func (a *Auth) SubscriptionPlanType() string {
 	if a == nil {
 		return ""
 	}
-	if subscriptionPlanTypeBlockedByQuotaStatus(a.Metadata) {
-		return ""
-	}
 	if plan := subscriptionPlanTypeFromMetadata(a.Metadata); plan != "" {
 		return plan
 	}
@@ -333,28 +330,6 @@ func (a *Auth) SubscriptionPlanType() string {
 	return ""
 }
 
-func subscriptionPlanTypeBlockedByQuotaStatus(meta map[string]any) bool {
-	if len(meta) == 0 {
-		return false
-	}
-	status := strings.ToLower(strings.TrimSpace(normalizeSubscriptionPlanSignal(meta["quota_refresh_status"])))
-	switch status {
-	case "reauth_required":
-		return true
-	case "error":
-		message := strings.ToLower(strings.TrimSpace(normalizeSubscriptionPlanSignal(meta["quota_refresh_error"])))
-		hasAuthSignal := strings.Contains(message, "unauthorized") ||
-			strings.Contains(message, "authentication_error") ||
-			strings.Contains(message, "invalid authentication credentials") ||
-			strings.Contains(message, "invalid token") ||
-			strings.Contains(message, "forbidden")
-		hasStatusSignal := strings.Contains(message, "401") || strings.Contains(message, "403")
-		return hasAuthSignal && hasStatusSignal
-	default:
-		return false
-	}
-}
-
 func subscriptionPlanTypeFromMetadata(meta map[string]any) string {
 	if len(meta) == 0 {
 		return ""
@@ -364,10 +339,10 @@ func subscriptionPlanTypeFromMetadata(meta map[string]any) string {
 			return plan
 		}
 	}
-	if hasTruthyMetadataKey(meta, "has_claude_max", "hasClaudeMax", "has_max", "hasMax", "is_max", "isMax", "max") {
+	if hasTruthyMetadataKeyDeep(meta, "has_claude_max", "hasClaudeMax", "has_max", "hasMax", "is_max", "isMax", "max") {
 		return "max"
 	}
-	if hasTruthyMetadataKey(meta, "has_claude_pro", "hasClaudePro", "has_pro", "hasPro", "is_pro", "isPro", "pro") {
+	if hasTruthyMetadataKeyDeep(meta, "has_claude_pro", "hasClaudePro", "has_pro", "hasPro", "is_pro", "isPro", "pro") {
 		return "pro"
 	}
 	for key, value := range meta {
@@ -407,12 +382,44 @@ func metadataKeyMayContainPlanType(key string) bool {
 func normalizeSubscriptionPlanSignal(raw any) string {
 	switch value := raw.(type) {
 	case string:
-		return strings.TrimSpace(value)
+		trimmed := strings.TrimSpace(value)
+		if trimmed == "" {
+			return ""
+		}
+		normalized := strings.ToLower(strings.NewReplacer("_", "-", " ", "-").Replace(trimmed))
+		for _, marker := range []string{"max", "pro", "plus", "team", "business", "enterprise", "free", "go"} {
+			if strings.Contains(normalized, marker) {
+				return trimmed
+			}
+		}
+		return ""
 	case json.Number:
-		return strings.TrimSpace(value.String())
+		return ""
 	default:
 		return ""
 	}
+}
+
+func hasTruthyMetadataKeyDeep(meta map[string]any, keys ...string) bool {
+	if hasTruthyMetadataKey(meta, keys...) {
+		return true
+	}
+	for _, value := range meta {
+		if nested, ok := metadataObject(value); ok {
+			if hasTruthyMetadataKeyDeep(nested, keys...) {
+				return true
+			}
+			continue
+		}
+		if list, ok := value.([]any); ok {
+			for _, item := range list {
+				if nested, ok := metadataObject(item); ok && hasTruthyMetadataKeyDeep(nested, keys...) {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 func hasTruthyMetadataKey(meta map[string]any, keys ...string) bool {

@@ -115,12 +115,28 @@ func TestSubscriptionPlanTypeFromNestedClaudeProfile(t *testing.T) {
 			want: "Claude Pro",
 		},
 		{
+			name: "production claude max profile ignores subscription status fields",
+			auth: &Auth{Metadata: map[string]any{
+				"quota_snapshot": map[string]any{
+					"profile": map[string]any{
+						"account": map[string]any{"has_claude_max": true},
+						"organization": map[string]any{
+							"rate_limit_tier":         "default_claude_max_20x",
+							"subscription_created_at": "2026-03-31T17:41:42Z",
+							"subscription_status":     "canceled",
+						},
+					},
+				},
+			}},
+			want: "max",
+		},
+		{
 			name: "attributes fallback",
 			auth: &Auth{Attributes: map[string]string{"plan_type": "plus"}},
 			want: "plus",
 		},
 		{
-			name: "reauth required blocks stale premium plan",
+			name: "reauth required preserves last known premium plan",
 			auth: &Auth{
 				Metadata: map[string]any{
 					"quota_refresh_status": "reauth_required",
@@ -131,10 +147,10 @@ func TestSubscriptionPlanTypeFromNestedClaudeProfile(t *testing.T) {
 				},
 				Attributes: map[string]string{"plan_type": "max"},
 			},
-			want: "",
+			want: "max",
 		},
 		{
-			name: "legacy unauthorized error blocks stale premium plan",
+			name: "legacy unauthorized quota error preserves last known premium plan",
 			auth: &Auth{
 				Metadata: map[string]any{
 					"quota_refresh_status": "error",
@@ -143,7 +159,7 @@ func TestSubscriptionPlanTypeFromNestedClaudeProfile(t *testing.T) {
 				},
 				Attributes: map[string]string{"plan_type": "max"},
 			},
-			want: "",
+			want: "max",
 		},
 		{
 			name: "refresh disabled imported plan remains usable",

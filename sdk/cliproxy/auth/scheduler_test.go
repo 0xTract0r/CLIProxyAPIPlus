@@ -265,10 +265,10 @@ func TestManagerExecute_ClaudeOpusSkipsProEvenWithStaleRegistry(t *testing.T) {
 	}
 }
 
-func TestManagerExecute_ClaudeOpusSkipsReauthRequiredStaleMaxPlan(t *testing.T) {
+func TestManagerExecute_ClaudeOpusAllowsReauthRequiredLastKnownMaxPlan(t *testing.T) {
 	ctx := context.Background()
 	model := "claude-opus-4-7"
-	registerSchedulerModels(t, "claude", model, "claude-reauth-max-stale", "claude-active-max")
+	registerSchedulerModels(t, "claude", model, "claude-reauth-max-stale")
 
 	manager := NewManager(nil, &RoundRobinSelector{}, nil)
 	manager.executors["claude"] = schedulerTestExecutor{}
@@ -281,7 +281,6 @@ func TestManagerExecute_ClaudeOpusSkipsReauthRequiredStaleMaxPlan(t *testing.T) 
 				"plan_type":            "max",
 			},
 		},
-		{ID: "claude-active-max", Provider: "claude", Attributes: map[string]string{"plan_type": "max"}},
 	} {
 		if _, errRegister := manager.Register(ctx, auth); errRegister != nil {
 			t.Fatalf("Register(%s) error = %v", auth.ID, errRegister)
@@ -297,8 +296,8 @@ func TestManagerExecute_ClaudeOpusSkipsReauthRequiredStaleMaxPlan(t *testing.T) 
 	if _, errExec := manager.Execute(ctx, []string{"claude"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{Metadata: meta}); errExec != nil {
 		t.Fatalf("Execute() error = %v", errExec)
 	}
-	if selectedAuthID != "claude-active-max" {
-		t.Fatalf("selected auth = %q, want claude-active-max", selectedAuthID)
+	if selectedAuthID != "claude-reauth-max-stale" {
+		t.Fatalf("selected auth = %q, want claude-reauth-max-stale", selectedAuthID)
 	}
 }
 
@@ -393,10 +392,10 @@ func TestManagerExecute_CodexSparkSkipsPlusAndUnknownEvenWithStaleRegistry(t *te
 	}
 }
 
-func TestManagerExecute_CodexSparkSkipsReauthRequiredStaleProPlan(t *testing.T) {
+func TestManagerExecute_CodexSparkAllowsReauthRequiredLastKnownProPlan(t *testing.T) {
 	ctx := context.Background()
 	model := "gpt-5.3-codex-spark"
-	registerSchedulerModels(t, "codex", model, "codex-reauth-pro-stale", "codex-active-pro")
+	registerSchedulerModels(t, "codex", model, "codex-reauth-pro-stale")
 
 	manager := NewManager(nil, &RoundRobinSelector{}, nil)
 	manager.executors["codex"] = schedulerTestExecutor{}
@@ -409,7 +408,6 @@ func TestManagerExecute_CodexSparkSkipsReauthRequiredStaleProPlan(t *testing.T) 
 				"plan_type":            "pro",
 			},
 		},
-		{ID: "codex-active-pro", Provider: "codex", Attributes: map[string]string{"plan_type": "pro"}},
 	} {
 		if _, errRegister := manager.Register(ctx, auth); errRegister != nil {
 			t.Fatalf("Register(%s) error = %v", auth.ID, errRegister)
@@ -425,8 +423,8 @@ func TestManagerExecute_CodexSparkSkipsReauthRequiredStaleProPlan(t *testing.T) 
 	if _, errExec := manager.Execute(ctx, []string{"codex"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{Metadata: meta}); errExec != nil {
 		t.Fatalf("Execute() error = %v", errExec)
 	}
-	if selectedAuthID != "codex-active-pro" {
-		t.Fatalf("selected auth = %q, want codex-active-pro", selectedAuthID)
+	if selectedAuthID != "codex-reauth-pro-stale" {
+		t.Fatalf("selected auth = %q, want codex-reauth-pro-stale", selectedAuthID)
 	}
 }
 

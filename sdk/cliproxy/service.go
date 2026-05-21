@@ -92,6 +92,29 @@ type Service struct {
 	wsGateway *wsrelay.Manager
 }
 
+type authRegistryHook struct {
+	service *Service
+}
+
+func (h authRegistryHook) OnAuthRegistered(ctx context.Context, auth *coreauth.Auth) {
+	h.refresh(ctx, auth)
+}
+
+func (h authRegistryHook) OnAuthUpdated(ctx context.Context, auth *coreauth.Auth) {
+	h.refresh(ctx, auth)
+}
+
+func (h authRegistryHook) OnResult(context.Context, coreauth.Result) {}
+
+func (h authRegistryHook) refresh(ctx context.Context, auth *coreauth.Auth) {
+	if h.service == nil || h.service.coreManager == nil || auth == nil {
+		return
+	}
+	h.service.registerModelsForAuth(auth)
+	h.service.coreManager.ReconcileRegistryModelStates(ctx, auth.ID)
+	h.service.coreManager.RefreshSchedulerEntry(auth.ID)
+}
+
 // RegisterUsagePlugin registers a usage plugin on the global usage manager.
 // This allows external code to monitor API usage and token consumption.
 //
