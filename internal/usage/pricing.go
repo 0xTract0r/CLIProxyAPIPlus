@@ -17,6 +17,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	log "github.com/sirupsen/logrus"
 )
 
 type pricingState string
@@ -46,6 +48,12 @@ const (
 	defaultOpenAIPricingURL    = "https://developers.openai.com/api/docs/pricing"
 	defaultAnthropicPricingURL = "https://www.anthropic.com/pricing"
 	defaultPricingUserAgent    = "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
+)
+
+const (
+	defaultPricingRefreshInterval = 12 * time.Hour
+	pricingInitialJitterMax       = 2 * time.Minute
+	pricingRefreshJitterMax       = 30 * time.Minute
 )
 
 var (
@@ -89,18 +97,18 @@ type PricingModel struct {
 }
 
 type PricingSourceInfo struct {
-	ID              string    `json:"id"`
-	Label           string    `json:"label"`
-	URL             string    `json:"url"`
-	Status          string    `json:"status,omitempty"`
-	Message         string    `json:"message,omitempty"`
-	LastRefreshedAt time.Time `json:"last_refreshed_at,omitempty"`
-	ModelCount      int       `json:"model_count,omitempty"`
+	ID              string     `json:"id"`
+	Label           string     `json:"label"`
+	URL             string     `json:"url"`
+	Status          string     `json:"status,omitempty"`
+	Message         string     `json:"message,omitempty"`
+	LastRefreshedAt *time.Time `json:"last_refreshed_at,omitempty"`
+	ModelCount      int        `json:"model_count,omitempty"`
 }
 
 type PricingOfficialSnapshot struct {
-	LastRefreshedAt time.Time           `json:"last_refreshed_at,omitempty"`
-	PersistedAt     time.Time           `json:"persisted_at,omitempty"`
+	LastRefreshedAt *time.Time          `json:"last_refreshed_at,omitempty"`
+	PersistedAt     *time.Time          `json:"persisted_at,omitempty"`
 	Sources         []PricingSourceInfo `json:"sources"`
 }
 
@@ -162,6 +170,11 @@ type modelObservation struct {
 
 var defaultPricingCatalog = NewPricingCatalogManager()
 
+var (
+	defaultPricingRefreshMu     sync.Mutex
+	defaultPricingRefreshCancel context.CancelFunc
+)
+
 func NewPricingCatalogManager() *PricingCatalogManager {
 	manager := &PricingCatalogManager{
 		officialModels: make(map[string]PricingModel),
@@ -205,6 +218,57 @@ func ConfigureDefaultPricingCatalogPersistence(path string) error {
 	// 默认统计仓库与默认 pricing catalog 绑定，恢复 catalog 后需要同步重算历史 cost。
 	defaultRequestStatistics.RecalculatePricing()
 	return nil
+}
+
+// StartDefaultPricingCatalogAutoRefresh periodically refreshes official pricing
+// sources in the background. A small deterministic jitter window is applied so
+// restarts do not hammer upstream pricing pages at the same instant.
+func StartDefaultPricingCatalogAutoRefresh(parent context.Context, interval time.Duration) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	if interval <= 0 {
+		interval = defaultPricingRefreshInterval
+	}
+
+	defaultPricingRefreshMu.Lock()
+	cancelPrev := defaultPricingRefreshCancel
+	defaultPricingRefreshCancel = nil
+	defaultPricingRefreshMu.Unlock()
+	if cancelPrev != nil {
+		cancelPrev()
+	}
+
+	ctx, cancel := context.WithCancel(parent)
+	defaultPricingRefreshMu.Lock()
+	defaultPricingRefreshCancel = cancel
+	defaultPricingRefreshMu.Unlock()
+
+	go runDefaultPricingCatalogAutoRefresh(ctx, defaultPricingCatalog, defaultRequestStatistics, interval)
+}
+
+func runDefaultPricingCatalogAutoRefresh(ctx context.Context, catalog *PricingCatalogManager, stats *RequestStatistics, interval time.Duration) {
+	if catalog == nil {
+		return
+	}
+	for {
+		delay := catalog.nextAutoRefreshDelay(time.Now().UTC(), interval)
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+
+		if err := catalog.RefreshOfficial(ctx); err != nil {
+			if !errors.Is(err, context.Canceled) {
+				log.WithError(err).Warn("usage: failed to refresh official pricing catalog")
+			}
+		} else if stats != nil {
+			stats.RecalculatePricing()
+		}
+	}
 }
 
 func (m *PricingCatalogManager) SetHTTPClient(client *http.Client) {
@@ -329,6 +393,30 @@ func (m *PricingCatalogManager) LoadFromPersistence() error {
 	return nil
 }
 
+func (m *PricingCatalogManager) nextAutoRefreshDelay(now time.Time, interval time.Duration) time.Duration {
+	if interval <= 0 {
+		interval = defaultPricingRefreshInterval
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+
+	m.mu.RLock()
+	lastRefreshedAt := m.lastRefreshedAt
+	modelCount := len(m.officialModels)
+	m.mu.RUnlock()
+
+	if lastRefreshedAt.IsZero() || modelCount == 0 {
+		return jitterDuration(now, pricingInitialJitterMax)
+	}
+
+	next := lastRefreshedAt.Add(interval)
+	if next.After(now) {
+		return next.Sub(now) + jitterDuration(lastRefreshedAt, pricingRefreshJitterMax)
+	}
+	return jitterDuration(now, pricingRefreshJitterMax)
+}
+
 func (m *PricingCatalogManager) persistencePath() string {
 	if m == nil {
 		return ""
@@ -439,7 +527,7 @@ func (m *PricingCatalogManager) RefreshOfficial(ctx context.Context) error {
 		sourceInfo.Status = pricingSourceStatusOK
 		sourceInfo.Message = ""
 		sourceInfo.ModelCount = len(models)
-		sourceInfo.LastRefreshedAt = now
+		sourceInfo.LastRefreshedAt = timePtr(now)
 		currentSources[fetcher.ID] = sourceInfo
 		successCount++
 	}
@@ -478,8 +566,8 @@ func (m *PricingCatalogManager) Snapshot(observations []modelObservation) Pricin
 	effective := m.effectiveModelsLocked()
 	overrides := clonePricingModelMap(m.overrides)
 	official := PricingOfficialSnapshot{
-		LastRefreshedAt: m.lastRefreshedAt,
-		PersistedAt:     m.persistedAt,
+		LastRefreshedAt: optionalTime(m.lastRefreshedAt),
+		PersistedAt:     optionalTime(m.persistedAt),
 		Sources:         sortedPricingSourcesLocked(m.sources),
 	}
 	m.mu.RUnlock()
@@ -646,6 +734,7 @@ func (m *PricingCatalogManager) rebuildAliasIndexLocked() {
 
 func builtinPricingModels() map[string]PricingModel {
 	models := map[string]PricingModel{
+		"gpt-5.5":           pricingModelFromValues("gpt-5.5", "gpt-5.5", 5, 0.5, 30, 0, pricingSourceBuiltin),
 		"gpt-5.4":           pricingModelFromValues("gpt-5.4", "gpt-5.4", 2.5, 0.25, 15, 0, pricingSourceBuiltin),
 		"gpt-5.2":           pricingModelFromValues("gpt-5.2", "gpt-5.2", 1.75, 0.175, 14, 0, pricingSourceBuiltin),
 		"gpt-5.3-codex":     pricingModelFromValues("gpt-5.3-codex", "gpt-5.3-codex", 1.75, 0.175, 14, 0, pricingSourceBuiltin),
@@ -858,6 +947,9 @@ func normalizeCanonicalModelID(model string) string {
 	if strings.HasPrefix(normalized, "gpt-54") {
 		normalized = strings.Replace(normalized, "gpt-54", "gpt-5-4", 1)
 	}
+	if strings.HasPrefix(normalized, "gpt-55") {
+		normalized = strings.Replace(normalized, "gpt-55", "gpt-5-5", 1)
+	}
 	if strings.HasPrefix(normalized, "gpt-52") {
 		normalized = strings.Replace(normalized, "gpt-52", "gpt-5-2", 1)
 	}
@@ -883,10 +975,15 @@ func normalizeCanonicalModelID(model string) string {
 		return "claude-haiku-4-5"
 	case "gpt-54":
 		return "gpt-5.4"
+	case "gpt-55":
+		return "gpt-5.5"
 	case "gpt-52":
 		return "gpt-5.2"
 	}
 
+	if strings.HasPrefix(normalized, "gpt-5-5") {
+		return "gpt-5.5"
+	}
 	if strings.HasPrefix(normalized, "gpt-5-4") {
 		return "gpt-5.4"
 	}
@@ -943,8 +1040,10 @@ func aliasesForModel(canonical string, model PricingModel) []string {
 		aliases = append(aliases, "claude-sonnet-4.6", "sonnet-4.6", "sonnet-4-6")
 	case "claude-haiku-4-5":
 		aliases = append(aliases, "claude-haiku-4.5", "haiku-4.5", "haiku-4-5")
+	case "gpt-5.5":
+		aliases = append(aliases, "gpt-5-5", "gpt-55")
 	case "gpt-5.4":
-		aliases = append(aliases, "gpt-5-4")
+		aliases = append(aliases, "gpt-5-4", "gpt-54")
 	case "gpt-5.2":
 		aliases = append(aliases, "gpt-5-2")
 	case "gpt-5.3-codex":
@@ -998,6 +1097,9 @@ func clonePricingModelMap(input map[string]PricingModel) map[string]PricingModel
 func clonePricingSourceMap(input map[string]PricingSourceInfo) map[string]PricingSourceInfo {
 	result := make(map[string]PricingSourceInfo, len(input))
 	for key, value := range input {
+		if value.LastRefreshedAt != nil {
+			value.LastRefreshedAt = timePtr(*value.LastRefreshedAt)
+		}
 		result[key] = value
 	}
 	return result
@@ -1006,12 +1108,27 @@ func clonePricingSourceMap(input map[string]PricingSourceInfo) map[string]Pricin
 func sortedPricingSourcesLocked(input map[string]PricingSourceInfo) []PricingSourceInfo {
 	sources := make([]PricingSourceInfo, 0, len(input))
 	for _, source := range input {
+		if source.LastRefreshedAt != nil {
+			source.LastRefreshedAt = timePtr(*source.LastRefreshedAt)
+		}
 		sources = append(sources, source)
 	}
 	sort.Slice(sources, func(i, j int) bool {
 		return sources[i].ID < sources[j].ID
 	})
 	return sources
+}
+
+func optionalTime(value time.Time) *time.Time {
+	if value.IsZero() {
+		return nil
+	}
+	return timePtr(value)
+}
+
+func timePtr(value time.Time) *time.Time {
+	normalized := value.UTC()
+	return &normalized
 }
 
 func usdPerMTokToMicros(value float64) int64 {
@@ -1040,4 +1157,19 @@ func maxInt64(a, b int64) int64 {
 		return a
 	}
 	return b
+}
+
+func jitterDuration(seed time.Time, max time.Duration) time.Duration {
+	if max <= 0 {
+		return 0
+	}
+	nanos := max.Nanoseconds()
+	if nanos <= 0 {
+		return 0
+	}
+	seedValue := seed.UnixNano()
+	if seedValue < 0 {
+		seedValue = -seedValue
+	}
+	return time.Duration(seedValue % nanos)
 }

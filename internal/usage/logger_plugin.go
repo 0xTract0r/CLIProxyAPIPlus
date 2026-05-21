@@ -64,6 +64,7 @@ type RequestStatistics struct {
 	successCount        int64
 	failureCount        int64
 	totalTokens         int64
+	totalBillableTokens int64
 	totalCostMicros     int64
 	unpricedRequests    int64
 	unfinalizedRequests int64
@@ -89,6 +90,7 @@ type RequestStatistics struct {
 type apiStats struct {
 	TotalRequests       int64
 	TotalTokens         int64
+	TotalBillableTokens int64
 	TotalCostMicros     int64
 	UnpricedRequests    int64
 	UnfinalizedRequests int64
@@ -99,6 +101,7 @@ type apiStats struct {
 type modelStats struct {
 	TotalRequests       int64
 	TotalTokens         int64
+	TotalBillableTokens int64
 	TotalCostMicros     int64
 	UnpricedRequests    int64
 	UnfinalizedRequests int64
@@ -127,6 +130,7 @@ type TokenStats struct {
 	CacheReadTokens  int64 `json:"cache_read_input_tokens,omitempty"`
 	CacheWriteTokens int64 `json:"cache_write_input_tokens,omitempty"`
 	TotalTokens      int64 `json:"total_tokens"`
+	BillableTokens   int64 `json:"billable_tokens,omitempty"`
 }
 
 // StatisticsSnapshot represents an immutable view of the aggregated metrics.
@@ -135,6 +139,7 @@ type StatisticsSnapshot struct {
 	SuccessCount            int64   `json:"success_count"`
 	FailureCount            int64   `json:"failure_count"`
 	TotalTokens             int64   `json:"total_tokens"`
+	TotalBillableTokens     int64   `json:"total_billable_tokens,omitempty"`
 	TotalCostUSD            float64 `json:"total_cost_usd"`
 	PricingStatus           string  `json:"pricing_status,omitempty"`
 	UnpricedRequestCount    int64   `json:"unpriced_request_count,omitempty"`
@@ -156,6 +161,7 @@ type StatisticsSnapshot struct {
 type APISnapshot struct {
 	TotalRequests           int64                    `json:"total_requests"`
 	TotalTokens             int64                    `json:"total_tokens"`
+	TotalBillableTokens     int64                    `json:"total_billable_tokens,omitempty"`
 	TotalCostUSD            float64                  `json:"total_cost_usd"`
 	PricingStatus           string                   `json:"pricing_status,omitempty"`
 	UnpricedRequestCount    int64                    `json:"unpriced_request_count,omitempty"`
@@ -167,6 +173,7 @@ type APISnapshot struct {
 type ModelSnapshot struct {
 	TotalRequests           int64           `json:"total_requests"`
 	TotalTokens             int64           `json:"total_tokens"`
+	TotalBillableTokens     int64           `json:"total_billable_tokens,omitempty"`
 	TotalCostUSD            float64         `json:"total_cost_usd"`
 	PricingStatus           string          `json:"pricing_status,omitempty"`
 	UnpricedRequestCount    int64           `json:"unpriced_request_count,omitempty"`
@@ -215,6 +222,7 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 	}
 	detail := normaliseDetail(record.Detail)
 	totalTokens := detail.TotalTokens
+	totalBillableTokens := detail.BillableTokens
 	statsKey := record.APIKey
 	if statsKey == "" {
 		statsKey = resolveAPIIdentifier(ctx, record)
@@ -253,6 +261,7 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 		s.failureCount++
 	}
 	s.totalTokens += totalTokens
+	s.totalBillableTokens += totalBillableTokens
 
 	stats, ok := s.apis[statsKey]
 	if !ok {
@@ -274,6 +283,7 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 func (s *RequestStatistics) updateAPIStats(stats *apiStats, model string, detail RequestDetail, pricing pricingTotals) {
 	stats.TotalRequests++
 	stats.TotalTokens += detail.Tokens.TotalTokens
+	stats.TotalBillableTokens += detail.Tokens.BillableTokens
 	stats.TotalCostMicros += pricing.CostMicros
 	stats.UnpricedRequests += pricing.Unpriced
 	stats.UnfinalizedRequests += pricing.Unfinalized
@@ -284,6 +294,7 @@ func (s *RequestStatistics) updateAPIStats(stats *apiStats, model string, detail
 	}
 	modelStatsValue.TotalRequests++
 	modelStatsValue.TotalTokens += detail.Tokens.TotalTokens
+	modelStatsValue.TotalBillableTokens += detail.Tokens.BillableTokens
 	modelStatsValue.TotalCostMicros += pricing.CostMicros
 	modelStatsValue.UnpricedRequests += pricing.Unpriced
 	modelStatsValue.UnfinalizedRequests += pricing.Unfinalized
@@ -309,6 +320,7 @@ func (s *RequestStatistics) Snapshot() StatisticsSnapshot {
 	result.SuccessCount = s.successCount
 	result.FailureCount = s.failureCount
 	result.TotalTokens = s.totalTokens
+	result.TotalBillableTokens = s.totalBillableTokens
 	result.TotalCostUSD = microsToUSD(s.totalCostMicros)
 	result.UnpricedRequestCount = s.unpricedRequests
 	result.UnfinalizedRequestCount = s.unfinalizedRequests
@@ -321,6 +333,7 @@ func (s *RequestStatistics) Snapshot() StatisticsSnapshot {
 		apiSnapshot := APISnapshot{
 			TotalRequests:           stats.TotalRequests,
 			TotalTokens:             stats.TotalTokens,
+			TotalBillableTokens:     stats.TotalBillableTokens,
 			TotalCostUSD:            microsToUSD(stats.TotalCostMicros),
 			PricingStatus:           pricingStatusString(pricingStateForCounts(stats.TotalRequests, stats.UnpricedRequests, stats.UnfinalizedRequests)),
 			UnpricedRequestCount:    stats.UnpricedRequests,
@@ -333,6 +346,7 @@ func (s *RequestStatistics) Snapshot() StatisticsSnapshot {
 			apiSnapshot.Models[modelName] = ModelSnapshot{
 				TotalRequests:           modelStatsValue.TotalRequests,
 				TotalTokens:             modelStatsValue.TotalTokens,
+				TotalBillableTokens:     modelStatsValue.TotalBillableTokens,
 				TotalCostUSD:            microsToUSD(modelStatsValue.TotalCostMicros),
 				PricingStatus:           pricingStatusString(modelStatsValue.PricingState),
 				UnpricedRequestCount:    modelStatsValue.UnpricedRequests,
@@ -469,6 +483,10 @@ func (s *RequestStatistics) recordImported(apiName, modelName string, stats *api
 	if totalTokens < 0 {
 		totalTokens = 0
 	}
+	totalBillableTokens := detail.Tokens.BillableTokens
+	if totalBillableTokens < 0 {
+		totalBillableTokens = billableTokenCount(detail.Tokens)
+	}
 
 	s.totalRequests++
 	if detail.Failed {
@@ -477,6 +495,7 @@ func (s *RequestStatistics) recordImported(apiName, modelName string, stats *api
 		s.successCount++
 	}
 	s.totalTokens += totalTokens
+	s.totalBillableTokens += totalBillableTokens
 
 	pricing := s.computeDetailPricing(modelName, detail.Tokens)
 	if detail.CostUSD == 0 {
@@ -502,7 +521,7 @@ func dedupKey(apiName, modelName string, detail RequestDetail) string {
 	timestamp := detail.Timestamp.UTC().Format(time.RFC3339Nano)
 	tokens := normaliseTokenStats(detail.Tokens)
 	return fmt.Sprintf(
-		"%s|%s|%s|%s|%s|%t|%d|%d|%d|%d|%d|%d|%d",
+		"%s|%s|%s|%s|%s|%t|%d|%d|%d|%d|%d|%d|%d|%d",
 		apiName,
 		modelName,
 		timestamp,
@@ -516,6 +535,7 @@ func dedupKey(apiName, modelName string, detail RequestDetail) string {
 		tokens.CacheReadTokens,
 		tokens.CacheWriteTokens,
 		tokens.TotalTokens,
+		tokens.BillableTokens,
 	)
 }
 
@@ -605,6 +625,7 @@ func (s *RequestStatistics) recalculatePricingLocked() {
 	s.successCount = 0
 	s.failureCount = 0
 	s.totalTokens = 0
+	s.totalBillableTokens = 0
 	s.totalCostMicros = 0
 	s.unpricedRequests = 0
 	s.unfinalizedRequests = 0
@@ -622,6 +643,7 @@ func (s *RequestStatistics) recalculatePricingLocked() {
 		}
 		apiStatsValue.TotalRequests = 0
 		apiStatsValue.TotalTokens = 0
+		apiStatsValue.TotalBillableTokens = 0
 		apiStatsValue.TotalCostMicros = 0
 		apiStatsValue.UnpricedRequests = 0
 		apiStatsValue.UnfinalizedRequests = 0
@@ -636,6 +658,7 @@ func (s *RequestStatistics) recalculatePricingLocked() {
 			}
 			modelStatsValue.TotalRequests = 0
 			modelStatsValue.TotalTokens = 0
+			modelStatsValue.TotalBillableTokens = 0
 			modelStatsValue.TotalCostMicros = 0
 			modelStatsValue.UnpricedRequests = 0
 			modelStatsValue.UnfinalizedRequests = 0
@@ -650,6 +673,7 @@ func (s *RequestStatistics) recalculatePricingLocked() {
 				modelStatsValue.Details[idx] = detail
 
 				totalTokens := detail.Tokens.TotalTokens
+				totalBillableTokens := detail.Tokens.BillableTokens
 				s.totalRequests++
 				if detail.Failed {
 					s.failureCount++
@@ -657,15 +681,18 @@ func (s *RequestStatistics) recalculatePricingLocked() {
 					s.successCount++
 				}
 				s.totalTokens += totalTokens
+				s.totalBillableTokens += totalBillableTokens
 
 				apiStatsValue.TotalRequests++
 				apiStatsValue.TotalTokens += totalTokens
+				apiStatsValue.TotalBillableTokens += totalBillableTokens
 				apiStatsValue.TotalCostMicros += pricing.CostMicros
 				apiStatsValue.UnpricedRequests += pricing.Unpriced
 				apiStatsValue.UnfinalizedRequests += pricing.Unfinalized
 
 				modelStatsValue.TotalRequests++
 				modelStatsValue.TotalTokens += totalTokens
+				modelStatsValue.TotalBillableTokens += totalBillableTokens
 				modelStatsValue.TotalCostMicros += pricing.CostMicros
 				modelStatsValue.UnpricedRequests += pricing.Unpriced
 				modelStatsValue.UnfinalizedRequests += pricing.Unfinalized
@@ -782,6 +809,9 @@ func normaliseDetail(detail coreusage.Detail) TokenStats {
 	if tokens.TotalTokens == 0 {
 		tokens.TotalTokens = detail.InputTokens + detail.OutputTokens + detail.ReasoningTokens
 	}
+	if tokens.BillableTokens == 0 {
+		tokens.BillableTokens = billableTokenCount(tokens)
+	}
 	return tokens
 }
 
@@ -795,7 +825,19 @@ func normaliseTokenStats(tokens TokenStats) TokenStats {
 	if tokens.TotalTokens == 0 {
 		tokens.TotalTokens = tokens.InputTokens + tokens.OutputTokens + tokens.ReasoningTokens
 	}
+	if tokens.BillableTokens == 0 {
+		tokens.BillableTokens = billableTokenCount(tokens)
+	}
 	return tokens
+}
+
+func billableTokenCount(tokens TokenStats) int64 {
+	total := tokens.TotalTokens
+	if total == 0 {
+		total = tokens.InputTokens + tokens.OutputTokens + tokens.ReasoningTokens
+	}
+	cacheRead := maxInt64(tokens.CacheReadTokens, tokens.CachedTokens)
+	return total + cacheRead + tokens.CacheWriteTokens
 }
 
 func normaliseLatency(latency time.Duration) int64 {
