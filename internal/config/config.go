@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	log "github.com/sirupsen/logrus"
@@ -25,6 +26,16 @@ const (
 	DefaultErrorLogsMaxFiles     = 10
 	DefaultLogsCompressAfterDays = 7
 	DefaultLogsDeleteAfterDays   = 30
+)
+
+const (
+	DefaultQuotaSnapshotRefreshInterval            = 45 * time.Minute
+	DefaultQuotaSnapshotRefreshJitter              = 10 * time.Minute
+	DefaultQuotaSnapshotRefreshStartupMaxStaleness = 24 * time.Hour
+
+	DefaultQuotaSnapshotRefreshIntervalString            = "45m"
+	DefaultQuotaSnapshotRefreshJitterString              = "10m"
+	DefaultQuotaSnapshotRefreshStartupMaxStalenessString = "24h"
 )
 
 const (
@@ -84,6 +95,9 @@ type Config struct {
 
 	// DisableCooling disables quota cooldown scheduling when true.
 	DisableCooling bool `yaml:"disable-cooling" json:"disable-cooling"`
+
+	// QuotaSnapshotRefresh controls the background quota snapshot refresher.
+	QuotaSnapshotRefresh QuotaSnapshotRefreshConfig `yaml:"quota-snapshot-refresh" json:"quota-snapshot-refresh"`
 
 	// AuthAutoRefreshWorkers overrides the size of the core auth auto-refresh worker pool.
 	// When <= 0, the default worker count is used.
@@ -218,6 +232,15 @@ type ManagedHeaderProfileConfig struct {
 	OnlineUpdate        *bool `yaml:"online-update,omitempty" json:"online-update,omitempty"`
 	FetchTimeoutSeconds int   `yaml:"fetch-timeout-seconds,omitempty" json:"fetch-timeout-seconds,omitempty"`
 	CacheTTLSeconds     int   `yaml:"cache-ttl-seconds,omitempty" json:"cache-ttl-seconds,omitempty"`
+}
+
+// QuotaSnapshotRefreshConfig controls persisted quota snapshot refresh policy.
+type QuotaSnapshotRefreshConfig struct {
+	Enabled             *bool  `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	Interval            string `yaml:"interval,omitempty" json:"interval,omitempty"`
+	Jitter              string `yaml:"jitter,omitempty" json:"jitter,omitempty"`
+	StartupCatchUp      *bool  `yaml:"startup-catch-up,omitempty" json:"startup-catch-up,omitempty"`
+	StartupMaxStaleness string `yaml:"startup-max-staleness,omitempty" json:"startup-max-staleness,omitempty"`
 }
 
 // TLSConfig holds HTTPS server settings.
@@ -695,6 +718,13 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.ErrorLogsMaxFiles = DefaultErrorLogsMaxFiles
 	cfg.UsageStatisticsEnabled = false
 	cfg.DisableCooling = false
+	quotaSnapshotRefreshEnabled := true
+	quotaSnapshotRefreshStartupCatchUp := true
+	cfg.QuotaSnapshotRefresh.Enabled = &quotaSnapshotRefreshEnabled
+	cfg.QuotaSnapshotRefresh.Interval = DefaultQuotaSnapshotRefreshIntervalString
+	cfg.QuotaSnapshotRefresh.Jitter = DefaultQuotaSnapshotRefreshJitterString
+	cfg.QuotaSnapshotRefresh.StartupCatchUp = &quotaSnapshotRefreshStartupCatchUp
+	cfg.QuotaSnapshotRefresh.StartupMaxStaleness = DefaultQuotaSnapshotRefreshStartupMaxStalenessString
 	cfg.Pprof.Enable = false
 	cfg.Pprof.Addr = DefaultPprofAddr
 	cfg.AmpCode.RestrictManagementToLocalhost = false // Default to false: API key auth is sufficient
@@ -793,6 +823,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 
 	// Sanitize managed header profile online update settings.
 	cfg.SanitizeManagedHeaderProfile()
+
+	// Sanitize quota snapshot refresh policy.
+	cfg.SanitizeQuotaSnapshotRefresh()
 
 	// Sanitize Claude key headers
 	cfg.SanitizeClaudeKeys()
@@ -974,6 +1007,134 @@ func ManagedHeaderProfileCacheTTL(cfg *Config) int {
 		return 60
 	}
 	return cfg.ManagedHeaderProfile.CacheTTLSeconds
+}
+
+func (cfg *Config) SanitizeQuotaSnapshotRefresh() {
+	if cfg == nil {
+		return
+	}
+	if cfg.QuotaSnapshotRefresh.Enabled == nil {
+		enabled := true
+		cfg.QuotaSnapshotRefresh.Enabled = &enabled
+	}
+	if cfg.QuotaSnapshotRefresh.StartupCatchUp == nil {
+		startupCatchUp := true
+		cfg.QuotaSnapshotRefresh.StartupCatchUp = &startupCatchUp
+	}
+	cfg.QuotaSnapshotRefresh.Interval = normalizeQuotaSnapshotDuration(
+		cfg.QuotaSnapshotRefresh.Interval,
+		DefaultQuotaSnapshotRefreshInterval,
+		DefaultQuotaSnapshotRefreshIntervalString,
+	)
+	cfg.QuotaSnapshotRefresh.Jitter = normalizeQuotaSnapshotDuration(
+		cfg.QuotaSnapshotRefresh.Jitter,
+		DefaultQuotaSnapshotRefreshJitter,
+		DefaultQuotaSnapshotRefreshJitterString,
+		true,
+	)
+	cfg.QuotaSnapshotRefresh.StartupMaxStaleness = normalizeQuotaSnapshotDuration(
+		cfg.QuotaSnapshotRefresh.StartupMaxStaleness,
+		DefaultQuotaSnapshotRefreshStartupMaxStaleness,
+		DefaultQuotaSnapshotRefreshStartupMaxStalenessString,
+		true,
+	)
+}
+
+func QuotaSnapshotRefreshEnabled(cfg *Config) bool {
+	return cfg == nil ||
+		cfg.QuotaSnapshotRefresh.Enabled == nil ||
+		*cfg.QuotaSnapshotRefresh.Enabled
+}
+
+func QuotaSnapshotRefreshInterval(cfg *Config) time.Duration {
+	if cfg == nil {
+		return DefaultQuotaSnapshotRefreshInterval
+	}
+	return parseQuotaSnapshotDuration(cfg.QuotaSnapshotRefresh.Interval, DefaultQuotaSnapshotRefreshInterval)
+}
+
+func QuotaSnapshotRefreshJitter(cfg *Config) time.Duration {
+	if cfg == nil {
+		return DefaultQuotaSnapshotRefreshJitter
+	}
+	return parseQuotaSnapshotDuration(cfg.QuotaSnapshotRefresh.Jitter, DefaultQuotaSnapshotRefreshJitter, true)
+}
+
+func QuotaSnapshotRefreshStartupCatchUp(cfg *Config) bool {
+	return cfg == nil ||
+		cfg.QuotaSnapshotRefresh.StartupCatchUp == nil ||
+		*cfg.QuotaSnapshotRefresh.StartupCatchUp
+}
+
+func QuotaSnapshotRefreshStartupMaxStaleness(cfg *Config) time.Duration {
+	if cfg == nil {
+		return DefaultQuotaSnapshotRefreshStartupMaxStaleness
+	}
+	return parseQuotaSnapshotDuration(cfg.QuotaSnapshotRefresh.StartupMaxStaleness, DefaultQuotaSnapshotRefreshStartupMaxStaleness, true)
+}
+
+func normalizeQuotaSnapshotDuration(raw string, fallback time.Duration, fallbackString string, allowZero ...bool) string {
+	duration := parseQuotaSnapshotDuration(raw, fallback, allowZero...)
+	if duration < 0 || (duration == 0 && !quotaSnapshotDurationAllowsZero(allowZero...)) {
+		return fallbackString
+	}
+	return formatQuotaSnapshotDuration(duration)
+}
+
+func parseQuotaSnapshotDuration(raw string, fallback time.Duration, allowZero ...bool) time.Duration {
+	value := normalizeQuotaSnapshotDurationInput(raw)
+	if value == "" {
+		return fallback
+	}
+	duration, err := time.ParseDuration(value)
+	if err != nil || duration < 0 || (duration == 0 && !quotaSnapshotDurationAllowsZero(allowZero...)) {
+		return fallback
+	}
+	return duration
+}
+
+func quotaSnapshotDurationAllowsZero(allowZero ...bool) bool {
+	return len(allowZero) > 0 && allowZero[0]
+}
+
+func normalizeQuotaSnapshotDurationInput(raw string) string {
+	value := strings.ToLower(strings.TrimSpace(raw))
+	if value == "" {
+		return ""
+	}
+	replacements := []struct {
+		old string
+		new string
+	}{
+		{"minutes", "m"},
+		{"minute", "m"},
+		{"mins", "m"},
+		{"min", "m"},
+		{"hours", "h"},
+		{"hour", "h"},
+		{"hrs", "h"},
+		{"hr", "h"},
+	}
+	for _, replacement := range replacements {
+		if strings.HasSuffix(value, replacement.old) {
+			return strings.TrimSpace(strings.TrimSuffix(value, replacement.old)) + replacement.new
+		}
+	}
+	return value
+}
+
+func formatQuotaSnapshotDuration(duration time.Duration) string {
+	if duration == 0 {
+		return "0m"
+	}
+	switch {
+	case duration%time.Hour == 0:
+		return fmt.Sprintf("%dh", int64(duration/time.Hour))
+	case duration%time.Minute == 0:
+		return fmt.Sprintf("%dm", int64(duration/time.Minute))
+	default:
+		return duration.String()
+	}
 }
 
 // SanitizeKiroKeys trims whitespace from Kiro credential fields.
@@ -1557,17 +1718,36 @@ func appendPath(path []string, key string) []string {
 // represents a known default value that should not be written to the config file.
 // This prevents non-zero defaults from polluting the config.
 func isKnownDefaultValue(path []string, node *yaml.Node) bool {
-	// First check if it's a zero value
+	if len(path) == 0 {
+		return isZeroValueNode(node)
+	}
+
+	// Match known non-zero defaults by exact dotted path before generic zero
+	// pruning, so explicit false values are preserved for true-by-default flags.
+	fullPath := strings.Join(path, ".")
+
+	if node.Kind == yaml.ScalarNode && node.Tag == "!!bool" {
+		switch fullPath {
+		case "quota-snapshot-refresh.enabled", "quota-snapshot-refresh.startup-catch-up":
+			return node.Value == "true"
+		}
+	}
+	if node.Kind == yaml.MappingNode && fullPath == "quota-snapshot-refresh" {
+		for i := 0; i+1 < len(node.Content); i += 2 {
+			keyNode, valueNode := node.Content[i], node.Content[i+1]
+			if keyNode == nil || valueNode == nil || valueNode.Tag != "!!bool" || valueNode.Value != "false" {
+				continue
+			}
+			switch keyNode.Value {
+			case "enabled", "startup-catch-up":
+				return false
+			}
+		}
+	}
+
 	if isZeroValueNode(node) {
 		return true
 	}
-
-	// Match known non-zero defaults by exact dotted path.
-	if len(path) == 0 {
-		return false
-	}
-
-	fullPath := strings.Join(path, ".")
 
 	// Check string defaults
 	if node.Kind == yaml.ScalarNode && node.Tag == "!!str" {
@@ -1578,6 +1758,12 @@ func isKnownDefaultValue(path []string, node *yaml.Node) bool {
 			return node.Value == DefaultPanelGitHubRepository
 		case "routing.strategy":
 			return node.Value == "round-robin"
+		case "quota-snapshot-refresh.interval":
+			return node.Value == DefaultQuotaSnapshotRefreshIntervalString
+		case "quota-snapshot-refresh.jitter":
+			return node.Value == DefaultQuotaSnapshotRefreshJitterString
+		case "quota-snapshot-refresh.startup-max-staleness":
+			return node.Value == DefaultQuotaSnapshotRefreshStartupMaxStalenessString
 		}
 	}
 

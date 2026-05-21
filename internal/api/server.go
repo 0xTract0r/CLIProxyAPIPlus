@@ -276,7 +276,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	if optionState.postAuthHook != nil {
 		s.mgmt.SetPostAuthHook(optionState.postAuthHook)
 	}
-	s.mgmt.StartQuotaSnapshotAutoRefresh(context.Background(), 0)
+	s.mgmt.StartQuotaSnapshotAutoRefresh(context.Background(), managementHandlers.QuotaSnapshotRefreshPolicyFromConfig(cfg))
 	s.localPassword = optionState.localPassword
 
 	// Setup routes
@@ -1081,6 +1081,7 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 	if s.mgmt != nil {
 		s.mgmt.SetConfig(cfg)
 		s.mgmt.SetAuthManager(s.handlers.AuthManager)
+		s.mgmt.StartQuotaSnapshotAutoRefresh(context.Background(), managementHandlers.QuotaSnapshotRefreshPolicyFromConfig(cfg))
 	}
 
 	// Notify Amp module only when Amp config has changed.

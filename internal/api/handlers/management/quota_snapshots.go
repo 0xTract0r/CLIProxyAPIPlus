@@ -15,6 +15,7 @@ import (
 	"github.com/andybalholm/brotli"
 	"github.com/gin-gonic/gin"
 	"github.com/klauspost/compress/zstd"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
@@ -41,10 +42,27 @@ const (
 	codexQuotaCredentialUnauthorizedMessage   = "Codex credential unauthorized; reauthenticate this credential to refresh quota."
 	genericQuotaCredentialUnauthorizedMessage = "Credential unauthorized; reauthenticate this credential to refresh quota."
 
-	defaultQuotaSnapshotRefreshInterval = 45 * time.Minute
-	quotaSnapshotRefreshJitterMax       = 10 * time.Minute
-	quotaSnapshotRefreshScanInterval    = time.Minute
+	defaultQuotaSnapshotRefreshInterval = config.DefaultQuotaSnapshotRefreshInterval
+	quotaSnapshotRefreshPollInterval    = time.Second
+	quotaSnapshotRefreshRetryDelay      = time.Minute
+	quotaSnapshotStartupJitterMax       = time.Minute
 )
+
+type QuotaSnapshotRefreshPolicy struct {
+	Enabled             bool
+	Interval            time.Duration
+	Jitter              time.Duration
+	StartupCatchUp      bool
+	StartupMaxStaleness time.Duration
+}
+
+type quotaSnapshotRefreshPolicyPayload struct {
+	Enabled                    bool  `json:"enabled"`
+	IntervalSeconds            int64 `json:"interval_seconds"`
+	JitterSeconds              int64 `json:"jitter_seconds"`
+	StartupCatchUp             bool  `json:"startup_catch_up"`
+	StartupMaxStalenessSeconds int64 `json:"startup_max_staleness_seconds"`
+}
 
 type quotaSnapshotEntry struct {
 	AuthID          string         `json:"auth_id"`
@@ -52,11 +70,12 @@ type quotaSnapshotEntry struct {
 	Name            string         `json:"name,omitempty"`
 	Provider        string         `json:"provider"`
 	Label           string         `json:"label,omitempty"`
+	Disabled        bool           `json:"disabled,omitempty"`
 	Status          string         `json:"status"`
 	Error           string         `json:"error,omitempty"`
 	PlanType        string         `json:"plan_type,omitempty"`
-	LastRefreshedAt time.Time      `json:"last_refreshed_at,omitempty"`
-	NextRefreshAt   time.Time      `json:"next_refresh_at,omitempty"`
+	LastRefreshedAt *time.Time     `json:"last_refreshed_at,omitempty"`
+	NextRefreshAt   *time.Time     `json:"next_refresh_at,omitempty"`
 	Snapshot        map[string]any `json:"snapshot,omitempty"`
 }
 
@@ -67,23 +86,66 @@ type quotaRefreshRequest struct {
 }
 
 type quotaSnapshotPayload struct {
-	GeneratedAt time.Time            `json:"generated_at"`
-	Entries     []quotaSnapshotEntry `json:"entries"`
+	GeneratedAt time.Time                         `json:"generated_at"`
+	Policy      quotaSnapshotRefreshPolicyPayload `json:"policy"`
+	Entries     []quotaSnapshotEntry              `json:"entries"`
+}
+
+func QuotaSnapshotRefreshPolicyFromConfig(cfg *config.Config) QuotaSnapshotRefreshPolicy {
+	return QuotaSnapshotRefreshPolicy{
+		Enabled:             config.QuotaSnapshotRefreshEnabled(cfg),
+		Interval:            config.QuotaSnapshotRefreshInterval(cfg),
+		Jitter:              config.QuotaSnapshotRefreshJitter(cfg),
+		StartupCatchUp:      config.QuotaSnapshotRefreshStartupCatchUp(cfg),
+		StartupMaxStaleness: config.QuotaSnapshotRefreshStartupMaxStaleness(cfg),
+	}.normalized()
+}
+
+func (p QuotaSnapshotRefreshPolicy) normalized() QuotaSnapshotRefreshPolicy {
+	if p.Interval <= 0 {
+		p.Interval = config.DefaultQuotaSnapshotRefreshInterval
+	}
+	if p.Jitter < 0 {
+		p.Jitter = 0
+	}
+	if p.StartupMaxStaleness < 0 {
+		p.StartupMaxStaleness = config.DefaultQuotaSnapshotRefreshStartupMaxStaleness
+	}
+	return p
+}
+
+func (p QuotaSnapshotRefreshPolicy) payload() quotaSnapshotRefreshPolicyPayload {
+	p = p.normalized()
+	return quotaSnapshotRefreshPolicyPayload{
+		Enabled:                    p.Enabled,
+		IntervalSeconds:            int64(p.Interval / time.Second),
+		JitterSeconds:              int64(p.Jitter / time.Second),
+		StartupCatchUp:             p.StartupCatchUp,
+		StartupMaxStalenessSeconds: int64(p.StartupMaxStaleness / time.Second),
+	}
+}
+
+func (h *Handler) quotaSnapshotRefreshPolicy() QuotaSnapshotRefreshPolicy {
+	if h == nil {
+		return QuotaSnapshotRefreshPolicyFromConfig(nil)
+	}
+	h.mu.Lock()
+	cfg := h.cfg
+	h.mu.Unlock()
+	return QuotaSnapshotRefreshPolicyFromConfig(cfg)
 }
 
 // StartQuotaSnapshotAutoRefresh launches the core-owned quota refresher. The
 // management UI should read these persisted snapshots instead of directly
 // fanning out provider quota API calls on page entry.
-func (h *Handler) StartQuotaSnapshotAutoRefresh(parent context.Context, interval time.Duration) {
+func (h *Handler) StartQuotaSnapshotAutoRefresh(parent context.Context, policy QuotaSnapshotRefreshPolicy) {
 	if h == nil {
 		return
 	}
 	if parent == nil {
 		parent = context.Background()
 	}
-	if interval <= 0 {
-		interval = defaultQuotaSnapshotRefreshInterval
-	}
+	policy = policy.normalized()
 
 	h.mu.Lock()
 	cancelPrev := h.quotaRefreshCancel
@@ -92,30 +154,37 @@ func (h *Handler) StartQuotaSnapshotAutoRefresh(parent context.Context, interval
 	if cancelPrev != nil {
 		cancelPrev()
 	}
+	if !policy.Enabled {
+		return
+	}
 
 	ctx, cancel := context.WithCancel(parent)
 	h.mu.Lock()
 	h.quotaRefreshCancel = cancel
 	h.mu.Unlock()
 
-	go h.runQuotaSnapshotAutoRefresh(ctx, interval)
+	go h.runQuotaSnapshotAutoRefresh(ctx, policy)
 }
 
-func (h *Handler) runQuotaSnapshotAutoRefresh(ctx context.Context, interval time.Duration) {
-	ticker := time.NewTicker(quotaSnapshotRefreshScanInterval)
+func (h *Handler) runQuotaSnapshotAutoRefresh(ctx context.Context, policy QuotaSnapshotRefreshPolicy) {
+	ticker := time.NewTicker(quotaSnapshotRefreshPollInterval)
 	defer ticker.Stop()
-	h.refreshDueQuotaSnapshots(ctx, interval)
+	h.refreshDueQuotaSnapshots(ctx, policy, true)
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			h.refreshDueQuotaSnapshots(ctx, interval)
+			h.refreshDueQuotaSnapshots(ctx, policy, false)
 		}
 	}
 }
 
-func (h *Handler) refreshDueQuotaSnapshots(ctx context.Context, interval time.Duration) {
+func (h *Handler) refreshDueQuotaSnapshots(ctx context.Context, policy QuotaSnapshotRefreshPolicy, startup bool) {
+	policy = policy.normalized()
+	if !policy.Enabled {
+		return
+	}
 	manager := h.currentAuthManager()
 	if manager == nil {
 		return
@@ -129,17 +198,40 @@ func (h *Handler) refreshDueQuotaSnapshots(ctx context.Context, interval time.Du
 			continue
 		}
 		legacyUnsupported := quotaSnapshotLegacyUnsupportedProviderError(auth)
-		if next, ok := quotaSnapshotNextRefresh(auth); ok && !legacyUnsupported {
+		next, hasNext := quotaSnapshotNextRefresh(auth)
+		if hasNext && !legacyUnsupported {
+			if next.After(now) {
+				if startup && quotaSnapshotStartupCatchUpNeeded(auth, now, policy, true) {
+					next = quotaSnapshotStartupCatchUpRefreshTime(auth, now, policy)
+					if err := h.persistQuotaSnapshotSchedule(ctx, auth, next); err != nil && !strings.Contains(err.Error(), context.Canceled.Error()) {
+						log.WithError(err).Debugf("management quota: startup catch-up schedule failed for %s/%s", auth.Provider, auth.ID)
+					}
+					if next.After(now) {
+						continue
+					}
+				} else if startup && quotaSnapshotNextRefreshBeyondPolicy(auth, next, now, policy) {
+					next = quotaSnapshotNextRefreshTime(auth, now, policy)
+					if err := h.persistQuotaSnapshotSchedule(ctx, auth, next); err != nil && !strings.Contains(err.Error(), context.Canceled.Error()) {
+						log.WithError(err).Debugf("management quota: policy reschedule failed for %s/%s", auth.Provider, auth.ID)
+					}
+					continue
+				} else {
+					continue
+				}
+			}
+		} else if !legacyUnsupported {
+			next := quotaSnapshotInitialRefreshTime(auth, now, policy)
+			if startup && quotaSnapshotStartupCatchUpNeeded(auth, now, policy, false) {
+				next = quotaSnapshotStartupCatchUpRefreshTime(auth, now, policy)
+			}
+			if err := h.persistQuotaSnapshotSchedule(ctx, auth, next); err != nil && !strings.Contains(err.Error(), context.Canceled.Error()) {
+				log.WithError(err).Debugf("management quota: schedule failed for %s/%s", auth.Provider, auth.ID)
+			}
 			if next.After(now) {
 				continue
 			}
-		} else if !legacyUnsupported {
-			if err := h.persistQuotaSnapshotSchedule(ctx, auth, quotaSnapshotInitialRefreshTime(auth, now)); err != nil && !strings.Contains(err.Error(), context.Canceled.Error()) {
-				log.WithError(err).Debugf("management quota: schedule failed for %s/%s", auth.Provider, auth.ID)
-			}
-			continue
 		}
-		if _, err := h.refreshQuotaSnapshot(ctx, auth, interval); err != nil && !strings.Contains(err.Error(), context.Canceled.Error()) {
+		if _, err := h.refreshQuotaSnapshot(ctx, auth, policy); err != nil && !strings.Contains(err.Error(), context.Canceled.Error()) {
 			log.WithError(err).Debugf("management quota: refresh failed for %s/%s", auth.Provider, auth.ID)
 		}
 	}
@@ -148,10 +240,7 @@ func (h *Handler) refreshDueQuotaSnapshots(ctx context.Context, interval time.Du
 // GetQuotaSnapshots returns persisted core quota snapshots without contacting
 // upstream providers.
 func (h *Handler) GetQuotaSnapshots(c *gin.Context) {
-	c.JSON(http.StatusOK, quotaSnapshotPayload{
-		GeneratedAt: time.Now().UTC(),
-		Entries:     h.quotaSnapshotEntries(),
-	})
+	c.JSON(http.StatusOK, h.quotaSnapshotPayload())
 }
 
 // RefreshQuotaSnapshots refreshes quota snapshots through the core auth manager.
@@ -169,24 +258,19 @@ func (h *Handler) RefreshQuotaSnapshots(c *gin.Context) {
 	targets := h.quotaRefreshTargets(manager, req)
 	if len(targets) == 0 {
 		if quotaRefreshHasImplicitSupportedTargets(manager, req) {
-			c.JSON(http.StatusOK, quotaSnapshotPayload{
-				GeneratedAt: time.Now().UTC(),
-				Entries:     h.quotaSnapshotEntries(),
-			})
+			c.JSON(http.StatusOK, h.quotaSnapshotPayload())
 			return
 		}
 		c.JSON(http.StatusNotFound, gin.H{"error": "no supported quota auth found"})
 		return
 	}
 
+	policy := h.quotaSnapshotRefreshPolicy()
 	for _, auth := range targets {
-		_, _ = h.refreshQuotaSnapshot(c.Request.Context(), auth, defaultQuotaSnapshotRefreshInterval)
+		_, _ = h.refreshQuotaSnapshot(c.Request.Context(), auth, policy)
 	}
 
-	c.JSON(http.StatusOK, quotaSnapshotPayload{
-		GeneratedAt: time.Now().UTC(),
-		Entries:     h.quotaSnapshotEntries(),
-	})
+	c.JSON(http.StatusOK, h.quotaSnapshotPayload())
 }
 
 func (h *Handler) quotaRefreshTargets(manager *coreauth.Manager, req quotaRefreshRequest) []*coreauth.Auth {
@@ -238,6 +322,15 @@ func quotaRefreshHasImplicitSupportedTargets(manager *coreauth.Manager, req quot
 	return false
 }
 
+func (h *Handler) quotaSnapshotPayload() quotaSnapshotPayload {
+	policy := h.quotaSnapshotRefreshPolicy()
+	return quotaSnapshotPayload{
+		GeneratedAt: time.Now().UTC(),
+		Policy:      policy.payload(),
+		Entries:     h.quotaSnapshotEntries(),
+	}
+}
+
 func (h *Handler) quotaSnapshotEntries() []quotaSnapshotEntry {
 	manager := h.currentAuthManager()
 	if manager == nil {
@@ -274,6 +367,7 @@ func quotaSnapshotEntryFromAuth(auth *coreauth.Auth) quotaSnapshotEntry {
 		Name:      auth.FileName,
 		Provider:  auth.Provider,
 		Label:     authDisplayName(auth),
+		Disabled:  auth.Disabled,
 		Status:    status,
 		Error:     errMessage,
 		PlanType:  metadataString(auth.Metadata, quotaSnapshotPlanTypeKey),
@@ -282,10 +376,10 @@ func quotaSnapshotEntryFromAuth(auth *coreauth.Auth) quotaSnapshotEntry {
 		entry.Status = quotaRefreshStatusStale
 	}
 	if ts, ok := metadataTime(auth.Metadata, quotaLastRefreshedMetadataKey); ok {
-		entry.LastRefreshedAt = ts
+		entry.LastRefreshedAt = &ts
 	}
 	if ts, ok := metadataTime(auth.Metadata, quotaNextRefreshMetadataKey); ok {
-		entry.NextRefreshAt = ts
+		entry.NextRefreshAt = &ts
 	}
 	if snapshot, ok := auth.Metadata[quotaSnapshotMetadataKey].(map[string]any); ok {
 		entry.Snapshot = snapshot
@@ -293,7 +387,8 @@ func quotaSnapshotEntryFromAuth(auth *coreauth.Auth) quotaSnapshotEntry {
 	return entry
 }
 
-func (h *Handler) refreshQuotaSnapshot(ctx context.Context, auth *coreauth.Auth, interval time.Duration) (*coreauth.Auth, error) {
+func (h *Handler) refreshQuotaSnapshot(ctx context.Context, auth *coreauth.Auth, policy QuotaSnapshotRefreshPolicy) (*coreauth.Auth, error) {
+	policy = policy.normalized()
 	manager := h.currentAuthManager()
 	if manager == nil || auth == nil {
 		return auth, fmt.Errorf("auth manager unavailable")
@@ -301,20 +396,20 @@ func (h *Handler) refreshQuotaSnapshot(ctx context.Context, auth *coreauth.Auth,
 	exec, ok := manager.Executor(auth.Provider)
 	if !ok || exec == nil {
 		if quotaSnapshotProviderSupported(auth.Provider) {
-			next := time.Now().UTC().Add(quotaSnapshotRefreshScanInterval)
+			next := time.Now().UTC().Add(quotaSnapshotRefreshRetryDelay)
 			if err := h.persistQuotaSnapshotSchedule(ctx, auth, next); err != nil {
 				return auth, err
 			}
 			return auth, fmt.Errorf("quota refresh executor unavailable for provider %s", auth.Provider)
 		}
-		return h.persistQuotaSnapshotError(ctx, auth, quotaRefreshStatusUnsupported, quotaUnsupportedProviderMessage, interval)
+		return h.persistQuotaSnapshotError(ctx, auth, quotaRefreshStatusUnsupported, quotaUnsupportedProviderMessage, policy)
 	}
 
 	now := time.Now().UTC()
 	snapshot, planType, err := fetchProviderQuotaSnapshot(ctx, exec, auth)
 	if err != nil {
 		status, message := quotaSnapshotErrorStatusAndMessage(err)
-		return h.persistQuotaSnapshotError(ctx, auth, status, message, interval)
+		return h.persistQuotaSnapshotError(ctx, auth, status, message, policy)
 	}
 
 	updated := auth.Clone()
@@ -325,7 +420,7 @@ func (h *Handler) refreshQuotaSnapshot(ctx context.Context, auth *coreauth.Auth,
 	updated.Metadata[quotaRefreshStatusMetadataKey] = quotaRefreshStatusOK
 	delete(updated.Metadata, quotaRefreshErrorMetadataKey)
 	updated.Metadata[quotaLastRefreshedMetadataKey] = now.Format(time.RFC3339)
-	updated.Metadata[quotaNextRefreshMetadataKey] = quotaSnapshotNextRefreshTime(updated, now, interval).Format(time.RFC3339)
+	updated.Metadata[quotaNextRefreshMetadataKey] = quotaSnapshotNextRefreshTime(updated, now, policy).Format(time.RFC3339)
 	if planType != "" {
 		updated.Metadata[quotaSnapshotPlanTypeKey] = planType
 	}
@@ -333,7 +428,8 @@ func (h *Handler) refreshQuotaSnapshot(ctx context.Context, auth *coreauth.Auth,
 	return manager.Update(ctx, updated)
 }
 
-func (h *Handler) persistQuotaSnapshotError(ctx context.Context, auth *coreauth.Auth, status, message string, interval time.Duration) (*coreauth.Auth, error) {
+func (h *Handler) persistQuotaSnapshotError(ctx context.Context, auth *coreauth.Auth, status, message string, policy QuotaSnapshotRefreshPolicy) (*coreauth.Auth, error) {
+	policy = policy.normalized()
 	manager := h.currentAuthManager()
 	if manager == nil || auth == nil {
 		return auth, fmt.Errorf("auth manager unavailable")
@@ -345,7 +441,7 @@ func (h *Handler) persistQuotaSnapshotError(ctx context.Context, auth *coreauth.
 	}
 	updated.Metadata[quotaRefreshStatusMetadataKey] = status
 	updated.Metadata[quotaRefreshErrorMetadataKey] = message
-	updated.Metadata[quotaNextRefreshMetadataKey] = quotaSnapshotNextRefreshTime(updated, now, interval).Format(time.RFC3339)
+	updated.Metadata[quotaNextRefreshMetadataKey] = quotaSnapshotNextRefreshTime(updated, now, policy).Format(time.RFC3339)
 	updated.UpdatedAt = now
 	saved, err := manager.Update(ctx, updated)
 	if err != nil {
@@ -501,9 +597,6 @@ func quotaSnapshotErrorStatusAndMessage(err error) (string, string) {
 
 func quotaSnapshotImplicitRefreshSkipped(auth *coreauth.Auth) bool {
 	if auth == nil {
-		return true
-	}
-	if auth.RefreshDisabled() {
 		return true
 	}
 	if metadataString(auth.Metadata, quotaRefreshStatusMetadataKey) == quotaRefreshStatusReauthRequired {
@@ -811,19 +904,57 @@ func metadataTime(meta map[string]any, key string) (time.Time, bool) {
 	return time.Time{}, false
 }
 
-func quotaSnapshotNextRefreshTime(auth *coreauth.Auth, now time.Time, interval time.Duration) time.Time {
-	if interval <= 0 {
-		interval = defaultQuotaSnapshotRefreshInterval
+func quotaSnapshotNextRefreshTime(auth *coreauth.Auth, now time.Time, policy QuotaSnapshotRefreshPolicy) time.Time {
+	policy = policy.normalized()
+	return now.Add(policy.Interval + quotaSnapshotJitter(auth, now, policy.Jitter))
+}
+
+func quotaSnapshotInitialRefreshTime(auth *coreauth.Auth, now time.Time, policy QuotaSnapshotRefreshPolicy) time.Time {
+	policy = policy.normalized()
+	return now.Add(quotaSnapshotJitter(auth, now, policy.Jitter))
+}
+
+func quotaSnapshotNextRefreshBeyondPolicy(auth *coreauth.Auth, next, now time.Time, policy QuotaSnapshotRefreshPolicy) bool {
+	policy = policy.normalized()
+	latest := quotaSnapshotNextRefreshTime(auth, now, policy).Add(quotaSnapshotRefreshPollInterval)
+	return next.After(latest)
+}
+
+func quotaSnapshotStartupCatchUpNeeded(auth *coreauth.Auth, now time.Time, policy QuotaSnapshotRefreshPolicy, hasNext bool) bool {
+	policy = policy.normalized()
+	if !policy.StartupCatchUp {
+		return false
 	}
-	return now.Add(interval + quotaSnapshotJitter(auth, now))
+	if !hasNext {
+		return true
+	}
+	if auth == nil {
+		return false
+	}
+	if _, ok := auth.Metadata[quotaSnapshotMetadataKey].(map[string]any); !ok {
+		return true
+	}
+	if strings.EqualFold(metadataString(auth.Metadata, quotaRefreshStatusMetadataKey), quotaRefreshStatusStale) {
+		return true
+	}
+	lastRefreshedAt, ok := metadataTime(auth.Metadata, quotaLastRefreshedMetadataKey)
+	if !ok {
+		return true
+	}
+	return policy.StartupMaxStaleness > 0 && now.Sub(lastRefreshedAt) >= policy.StartupMaxStaleness
 }
 
-func quotaSnapshotInitialRefreshTime(auth *coreauth.Auth, now time.Time) time.Time {
-	return now.Add(quotaSnapshotJitter(auth, now))
+func quotaSnapshotStartupCatchUpRefreshTime(auth *coreauth.Auth, now time.Time, policy QuotaSnapshotRefreshPolicy) time.Time {
+	policy = policy.normalized()
+	jitterMax := policy.Jitter
+	if jitterMax > quotaSnapshotStartupJitterMax {
+		jitterMax = quotaSnapshotStartupJitterMax
+	}
+	return now.Add(quotaSnapshotJitter(auth, now, jitterMax))
 }
 
-func quotaSnapshotJitter(auth *coreauth.Auth, now time.Time) time.Duration {
-	if quotaSnapshotRefreshJitterMax <= 0 {
+func quotaSnapshotJitter(auth *coreauth.Auth, now time.Time, max time.Duration) time.Duration {
+	if max <= 0 {
 		return 0
 	}
 	h := fnv.New64a()
@@ -832,7 +963,7 @@ func quotaSnapshotJitter(auth *coreauth.Auth, now time.Time) time.Duration {
 		_, _ = h.Write([]byte(auth.Provider))
 	}
 	_, _ = h.Write([]byte(now.UTC().Format("200601021504")))
-	return time.Duration(int64(h.Sum64() % uint64(quotaSnapshotRefreshJitterMax)))
+	return time.Duration(int64(h.Sum64() % uint64(max)))
 }
 
 func (h *Handler) currentAuthManager() *coreauth.Manager {

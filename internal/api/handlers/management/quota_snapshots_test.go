@@ -14,6 +14,7 @@ import (
 
 	"github.com/andybalholm/brotli"
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 )
@@ -25,9 +26,10 @@ type quotaSnapshotTestExecutor struct {
 	contentEncoding string
 	responses       map[string]quotaSnapshotTestResponse
 
-	mu          sync.Mutex
-	calls       int
-	callsByAuth map[string]int
+	mu           sync.Mutex
+	calls        int
+	refreshCalls int
+	callsByAuth  map[string]int
 }
 
 type quotaSnapshotTestResponse struct {
@@ -48,6 +50,9 @@ func (e *quotaSnapshotTestExecutor) ExecuteStream(context.Context, *coreauth.Aut
 }
 
 func (e *quotaSnapshotTestExecutor) Refresh(context.Context, *coreauth.Auth) (*coreauth.Auth, error) {
+	e.mu.Lock()
+	e.refreshCalls++
+	e.mu.Unlock()
 	return nil, nil
 }
 
@@ -107,10 +112,27 @@ func (e *quotaSnapshotTestExecutor) Calls() int {
 	return e.calls
 }
 
+func (e *quotaSnapshotTestExecutor) RefreshCalls() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.refreshCalls
+}
+
 func (e *quotaSnapshotTestExecutor) CallsForAuth(authID string) int {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.callsByAuth[authID]
+}
+
+func defaultQuotaSnapshotTestPolicy() QuotaSnapshotRefreshPolicy {
+	return QuotaSnapshotRefreshPolicyFromConfig(nil)
+}
+
+func immediateStartupQuotaSnapshotTestPolicy() QuotaSnapshotRefreshPolicy {
+	policy := defaultQuotaSnapshotTestPolicy()
+	policy.Jitter = 0
+	policy.StartupCatchUp = true
+	return policy
 }
 
 func TestQuotaSnapshotsRefreshPersistsCoreSnapshot(t *testing.T) {
@@ -138,6 +160,14 @@ func TestQuotaSnapshotsRefreshPersistsCoreSnapshot(t *testing.T) {
 	router.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("refresh status = %d, want 200 body=%s", rec.Code, rec.Body.String())
+	}
+	payload := decodeQuotaSnapshotPayload(t, rec)
+	if payload.Policy.IntervalSeconds != int64(defaultQuotaSnapshotRefreshInterval/time.Second) ||
+		payload.Policy.JitterSeconds != int64(config.DefaultQuotaSnapshotRefreshJitter/time.Second) ||
+		!payload.Policy.Enabled ||
+		!payload.Policy.StartupCatchUp ||
+		payload.Policy.StartupMaxStalenessSeconds != int64(config.DefaultQuotaSnapshotRefreshStartupMaxStaleness/time.Second) {
+		t.Fatalf("quota policy payload = %#v, want default policy", payload.Policy)
 	}
 	if exec.Calls() != 1 {
 		t.Fatalf("HttpRequest calls = %d, want 1", exec.Calls())
@@ -416,7 +446,7 @@ func TestQuotaSnapshotsUnauthorizedDoesNotDecodeErrorBodyAndPreservesLastKnownPl
 	}
 }
 
-func TestQuotaSnapshotsImplicitRefreshSkipsReauthAndRefreshDisabled(t *testing.T) {
+func TestQuotaSnapshotsImplicitRefreshSkipsReauthButRefreshesRefreshDisabled(t *testing.T) {
 	t.Parallel()
 
 	gin.SetMode(gin.TestMode)
@@ -458,7 +488,7 @@ func TestQuotaSnapshotsImplicitRefreshSkipsReauthAndRefreshDisabled(t *testing.T
 	router := gin.New()
 	router.POST("/v0/management/quota/refresh", handler.RefreshQuotaSnapshots)
 
-	handler.refreshDueQuotaSnapshots(context.Background(), defaultQuotaSnapshotRefreshInterval)
+	handler.refreshDueQuotaSnapshots(context.Background(), defaultQuotaSnapshotTestPolicy(), false)
 
 	fullRec := httptest.NewRecorder()
 	fullReq := httptest.NewRequest(http.MethodPost, "/v0/management/quota/refresh", strings.NewReader(`{}`))
@@ -479,11 +509,14 @@ func TestQuotaSnapshotsImplicitRefreshSkipsReauthAndRefreshDisabled(t *testing.T
 	if got := exec.CallsForAuth("claude-reauth"); got != 0 {
 		t.Fatalf("reauth auth calls = %d, want 0", got)
 	}
-	if got := exec.CallsForAuth("claude-refresh-disabled"); got != 0 {
-		t.Fatalf("refresh-disabled auth calls = %d, want 0", got)
+	if got := exec.CallsForAuth("claude-refresh-disabled"); got != 6 {
+		t.Fatalf("refresh-disabled auth calls = %d, want 6", got)
 	}
 	if got := exec.CallsForAuth("claude-active"); got != 6 {
 		t.Fatalf("active auth calls = %d, want 6", got)
+	}
+	if got := exec.RefreshCalls(); got != 0 {
+		t.Fatalf("quota refresh must not call credential Refresh; calls = %d, want 0", got)
 	}
 }
 
@@ -502,6 +535,59 @@ func TestQuotaSnapshotEntryMarksRefreshDisabled(t *testing.T) {
 	}
 	if entry.Error != "" {
 		t.Fatalf("entry error = %q, want empty", entry.Error)
+	}
+}
+
+func TestQuotaSnapshotEntryIncludesDisabledFlag(t *testing.T) {
+	t.Parallel()
+
+	entry := quotaSnapshotEntryFromAuth(&coreauth.Auth{
+		ID:       "claude-disabled",
+		Provider: "claude",
+		Disabled: true,
+		Metadata: map[string]any{
+			quotaRefreshStatusMetadataKey: quotaRefreshStatusOK,
+			quotaSnapshotMetadataKey:      map[string]any{"profile": map[string]any{}},
+		},
+	})
+	if !entry.Disabled {
+		t.Fatal("disabled auth entry should include disabled=true")
+	}
+}
+
+func TestQuotaSnapshotResponseOmitsZeroRefreshTimesForReauth(t *testing.T) {
+	t.Parallel()
+
+	gin.SetMode(gin.TestMode)
+	manager := coreauth.NewManager(nil, nil, nil)
+	if _, err := manager.Register(context.Background(), &coreauth.Auth{
+		ID:       "claude-reauth",
+		Provider: "claude",
+		Metadata: map[string]any{
+			quotaRefreshStatusMetadataKey: quotaRefreshStatusReauthRequired,
+			quotaRefreshErrorMetadataKey:  claudeQuotaCredentialUnauthorizedMessage,
+		},
+	}); err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+	handler := NewHandlerWithoutConfigFilePath(nil, manager)
+	router := gin.New()
+	router.GET("/v0/management/quota/snapshots", handler.GetQuotaSnapshots)
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v0/management/quota/snapshots", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("snapshots status = %d, want 200 body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	for _, forbidden := range []string{"0001-01-01T00:00:00Z", `"last_refreshed_at"`, `"next_refresh_at"`} {
+		if strings.Contains(body, forbidden) {
+			t.Fatalf("snapshot response leaked zero refresh time %q: %s", forbidden, body)
+		}
+	}
+	entry := quotaSnapshotEntryForAuth(t, decodeQuotaSnapshotPayload(t, rec), "claude-reauth")
+	if entry.LastRefreshedAt != nil || entry.NextRefreshAt != nil {
+		t.Fatalf("entry refresh times = %v/%v, want nil/nil", entry.LastRefreshedAt, entry.NextRefreshAt)
 	}
 }
 
@@ -588,7 +674,7 @@ func TestQuotaSnapshotsLegacyUnauthorizedErrorMapsToReauthAndRetriesExplicitly(t
 		}
 	}
 
-	handler.refreshDueQuotaSnapshots(context.Background(), defaultQuotaSnapshotRefreshInterval)
+	handler.refreshDueQuotaSnapshots(context.Background(), defaultQuotaSnapshotTestPolicy(), false)
 	fullRec := httptest.NewRecorder()
 	fullReq := httptest.NewRequest(http.MethodPost, "/v0/management/quota/refresh", strings.NewReader(`{}`))
 	fullReq.Header.Set("Content-Type", "application/json")
@@ -915,7 +1001,7 @@ func quotaSnapshotEntryForAuth(t *testing.T, payload quotaSnapshotPayload, authI
 	return quotaSnapshotEntry{}
 }
 
-func TestQuotaSnapshotAutoRefreshSchedulesMissingNextBeforeProviderCall(t *testing.T) {
+func TestQuotaSnapshotAutoRefreshSchedulesMissingNextOnRegularTick(t *testing.T) {
 	t.Parallel()
 
 	manager := coreauth.NewManager(nil, nil, nil)
@@ -930,9 +1016,9 @@ func TestQuotaSnapshotAutoRefreshSchedulesMissingNextBeforeProviderCall(t *testi
 	}
 	handler := NewHandlerWithoutConfigFilePath(nil, manager)
 
-	handler.refreshDueQuotaSnapshots(context.Background(), defaultQuotaSnapshotRefreshInterval)
+	handler.refreshDueQuotaSnapshots(context.Background(), defaultQuotaSnapshotTestPolicy(), false)
 	if exec.Calls() != 0 {
-		t.Fatalf("first auto tick should only schedule jitter; HttpRequest calls = %d, want 0", exec.Calls())
+		t.Fatalf("regular auto tick should only schedule jitter; HttpRequest calls = %d, want 0", exec.Calls())
 	}
 
 	updated, ok := manager.GetByID("codex-plus")
@@ -941,6 +1027,211 @@ func TestQuotaSnapshotAutoRefreshSchedulesMissingNextBeforeProviderCall(t *testi
 	}
 	if _, ok := metadataTime(updated.Metadata, quotaNextRefreshMetadataKey); !ok {
 		t.Fatal("next refresh timestamp missing")
+	}
+}
+
+func TestQuotaSnapshotStartupCatchUpRefreshesMissingNextWhenJitterZero(t *testing.T) {
+	t.Parallel()
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	exec := &quotaSnapshotTestExecutor{provider: "codex"}
+	manager.RegisterExecutor(exec)
+	if _, err := manager.Register(context.Background(), &coreauth.Auth{
+		ID:       "codex-plus",
+		Provider: "codex",
+		Metadata: map[string]any{"plan_type": "plus"},
+	}); err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+	handler := NewHandlerWithoutConfigFilePath(nil, manager)
+
+	handler.refreshDueQuotaSnapshots(context.Background(), immediateStartupQuotaSnapshotTestPolicy(), true)
+	if exec.Calls() == 0 {
+		t.Fatal("startup catch-up should refresh a missing next_refresh_after when jitter is zero")
+	}
+
+	updated, ok := manager.GetByID("codex-plus")
+	if !ok {
+		t.Fatal("updated auth missing")
+	}
+	if got := metadataString(updated.Metadata, quotaRefreshStatusMetadataKey); got != quotaRefreshStatusOK {
+		t.Fatalf("status = %q, want ok", got)
+	}
+	if _, ok := updated.Metadata[quotaSnapshotMetadataKey].(map[string]any); !ok {
+		t.Fatalf("quota snapshot missing after startup catch-up: %#v", updated.Metadata[quotaSnapshotMetadataKey])
+	}
+}
+
+func TestQuotaSnapshotStartupCatchUpRefreshesStaleSnapshotWithFutureNext(t *testing.T) {
+	t.Parallel()
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	exec := &quotaSnapshotTestExecutor{provider: "codex"}
+	manager.RegisterExecutor(exec)
+	future := time.Now().UTC().Add(defaultQuotaSnapshotRefreshInterval).Format(time.RFC3339)
+	stale := time.Now().UTC().Add(-25 * time.Hour).Format(time.RFC3339)
+	if _, err := manager.Register(context.Background(), &coreauth.Auth{
+		ID:       "codex-stale",
+		Provider: "codex",
+		Metadata: map[string]any{
+			quotaSnapshotMetadataKey:      map[string]any{"usage": map[string]any{"rate_limit": map[string]any{"used_percent": 80}}},
+			quotaRefreshStatusMetadataKey: quotaRefreshStatusOK,
+			quotaLastRefreshedMetadataKey: stale,
+			quotaNextRefreshMetadataKey:   future,
+		},
+	}); err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+	handler := NewHandlerWithoutConfigFilePath(nil, manager)
+
+	handler.refreshDueQuotaSnapshots(context.Background(), immediateStartupQuotaSnapshotTestPolicy(), true)
+	if exec.Calls() == 0 {
+		t.Fatal("startup catch-up should refresh stale snapshot despite future next_refresh_after")
+	}
+}
+
+func TestQuotaSnapshotStartupCatchUpRefreshesRefreshDisabledOldOKSnapshot(t *testing.T) {
+	t.Parallel()
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	exec := &quotaSnapshotTestExecutor{provider: "codex"}
+	manager.RegisterExecutor(exec)
+	policy := immediateStartupQuotaSnapshotTestPolicy()
+	stale := time.Now().UTC().Add(-(policy.StartupMaxStaleness + time.Hour)).Format(time.RFC3339)
+	future := time.Now().UTC().Add(defaultQuotaSnapshotRefreshInterval).Format(time.RFC3339)
+	if _, err := manager.Register(context.Background(), &coreauth.Auth{
+		ID:       "codex-refresh-disabled",
+		Provider: "codex",
+		Metadata: map[string]any{
+			"refresh_disabled":            true,
+			quotaSnapshotMetadataKey:      map[string]any{"usage": map[string]any{"rate_limit": map[string]any{"used_percent": 80}}},
+			quotaRefreshStatusMetadataKey: quotaRefreshStatusOK,
+			quotaLastRefreshedMetadataKey: stale,
+			quotaNextRefreshMetadataKey:   future,
+			quotaSnapshotPlanTypeKey:      "plus",
+		},
+	}); err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+	handler := NewHandlerWithoutConfigFilePath(nil, manager)
+
+	handler.refreshDueQuotaSnapshots(context.Background(), policy, true)
+	if got := exec.CallsForAuth("codex-refresh-disabled"); got != 1 {
+		t.Fatalf("refresh-disabled old ok snapshot calls = %d, want 1", got)
+	}
+	if got := exec.RefreshCalls(); got != 0 {
+		t.Fatalf("quota refresh must not call credential Refresh; calls = %d, want 0", got)
+	}
+	updated, ok := manager.GetByID("codex-refresh-disabled")
+	if !ok {
+		t.Fatal("updated auth missing")
+	}
+	if got := metadataString(updated.Metadata, quotaRefreshStatusMetadataKey); got != quotaRefreshStatusOK {
+		t.Fatalf("status after catch-up = %q, want ok", got)
+	}
+	last, ok := metadataTime(updated.Metadata, quotaLastRefreshedMetadataKey)
+	if !ok {
+		t.Fatal("last refreshed timestamp missing after catch-up")
+	}
+	oldLast, _ := time.Parse(time.RFC3339, stale)
+	if !last.After(oldLast) {
+		t.Fatalf("last refreshed = %s, want after stale %s", last.Format(time.RFC3339), stale)
+	}
+}
+
+func TestQuotaSnapshotStartupCatchUpZeroMaxStalenessSkipsOldOKSnapshot(t *testing.T) {
+	t.Parallel()
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	exec := &quotaSnapshotTestExecutor{provider: "codex"}
+	manager.RegisterExecutor(exec)
+	policy := immediateStartupQuotaSnapshotTestPolicy()
+	policy.StartupMaxStaleness = 0
+	old := time.Now().UTC().Add(-72 * time.Hour).Format(time.RFC3339)
+	future := time.Now().UTC().Add(defaultQuotaSnapshotRefreshInterval).Format(time.RFC3339)
+	if _, err := manager.Register(context.Background(), &coreauth.Auth{
+		ID:       "codex-old-ok",
+		Provider: "codex",
+		Metadata: map[string]any{
+			quotaSnapshotMetadataKey:      map[string]any{"usage": map[string]any{"rate_limit": map[string]any{"used_percent": 80}}},
+			quotaRefreshStatusMetadataKey: quotaRefreshStatusOK,
+			quotaLastRefreshedMetadataKey: old,
+			quotaNextRefreshMetadataKey:   future,
+			quotaSnapshotPlanTypeKey:      "plus",
+		},
+	}); err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+	handler := NewHandlerWithoutConfigFilePath(nil, manager)
+
+	handler.refreshDueQuotaSnapshots(context.Background(), policy, true)
+	if got := exec.CallsForAuth("codex-old-ok"); got != 0 {
+		t.Fatalf("startup max staleness 0 should not refresh old but valid snapshot by age; calls = %d, want 0", got)
+	}
+}
+
+func TestQuotaSnapshotStartupReschedulesFutureNextWhenPolicyShortens(t *testing.T) {
+	t.Parallel()
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	exec := &quotaSnapshotTestExecutor{provider: "codex"}
+	manager.RegisterExecutor(exec)
+	oldNext := time.Now().UTC().Add(45 * time.Minute).Format(time.RFC3339)
+	last := time.Now().UTC().Add(-5 * time.Minute).Format(time.RFC3339)
+	if _, err := manager.Register(context.Background(), &coreauth.Auth{
+		ID:       "codex-short-policy",
+		Provider: "codex",
+		Metadata: map[string]any{
+			quotaSnapshotMetadataKey:      map[string]any{"usage": map[string]any{"rate_limit": map[string]any{"used_percent": 80}}},
+			quotaRefreshStatusMetadataKey: quotaRefreshStatusOK,
+			quotaLastRefreshedMetadataKey: last,
+			quotaNextRefreshMetadataKey:   oldNext,
+			quotaSnapshotPlanTypeKey:      "plus",
+		},
+	}); err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+	handler := NewHandlerWithoutConfigFilePath(nil, manager)
+	policy := immediateStartupQuotaSnapshotTestPolicy()
+	policy.Interval = time.Minute
+	policy.Jitter = time.Minute
+	policy.StartupMaxStaleness = 24 * time.Hour
+	start := time.Now().UTC()
+
+	handler.refreshDueQuotaSnapshots(context.Background(), policy, true)
+	if got := exec.CallsForAuth("codex-short-policy"); got != 0 {
+		t.Fatalf("policy shortening should reschedule future next without refreshing immediately; calls = %d, want 0", got)
+	}
+	updated, ok := manager.GetByID("codex-short-policy")
+	if !ok {
+		t.Fatal("updated auth missing")
+	}
+	next, ok := metadataTime(updated.Metadata, quotaNextRefreshMetadataKey)
+	if !ok {
+		t.Fatal("next refresh timestamp missing")
+	}
+	minNext := start.Add(time.Minute)
+	maxNext := start.Add(2*time.Minute + 2*time.Second)
+	if next.Before(minNext) || next.After(maxNext) {
+		t.Fatalf("next refresh = %s, want within %s..%s", next.Format(time.RFC3339Nano), minNext.Format(time.RFC3339Nano), maxNext.Format(time.RFC3339Nano))
+	}
+}
+
+func TestQuotaSnapshotRefreshPolicyKeepsZeroStartupMaxStaleness(t *testing.T) {
+	t.Parallel()
+
+	policy := QuotaSnapshotRefreshPolicy{
+		Enabled:             true,
+		Interval:            time.Minute,
+		Jitter:              time.Minute,
+		StartupCatchUp:      true,
+		StartupMaxStaleness: 0,
+	}.normalized()
+	if policy.StartupMaxStaleness != 0 {
+		t.Fatalf("startup max staleness = %s, want 0", policy.StartupMaxStaleness)
+	}
+	if payload := policy.payload(); payload.StartupMaxStalenessSeconds != 0 {
+		t.Fatalf("payload startup max staleness seconds = %d, want 0", payload.StartupMaxStalenessSeconds)
 	}
 }
 
@@ -959,7 +1250,7 @@ func TestQuotaSnapshotMissingExecutorDoesNotPersistUnsupportedForSupportedProvid
 	}
 	handler := NewHandlerWithoutConfigFilePath(nil, manager)
 
-	handler.refreshDueQuotaSnapshots(context.Background(), defaultQuotaSnapshotRefreshInterval)
+	handler.refreshDueQuotaSnapshots(context.Background(), defaultQuotaSnapshotTestPolicy(), false)
 
 	updated, ok := manager.GetByID("codex-plus")
 	if !ok {
@@ -1012,7 +1303,7 @@ func TestQuotaSnapshotLegacyUnsupportedProviderErrorIsStaleAndRetried(t *testing
 		t.Fatalf("legacy unsupported entry status/error = %q/%q, want stale/empty", entry.Status, entry.Error)
 	}
 
-	handler.refreshDueQuotaSnapshots(context.Background(), defaultQuotaSnapshotRefreshInterval)
+	handler.refreshDueQuotaSnapshots(context.Background(), defaultQuotaSnapshotTestPolicy(), false)
 	if exec.Calls() == 0 {
 		t.Fatal("legacy unsupported status should be retried even when next refresh is in the future")
 	}
