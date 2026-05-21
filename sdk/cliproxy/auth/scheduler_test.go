@@ -54,6 +54,34 @@ func (e retryAfterStatusErr) RetryAfter() *time.Duration {
 	return &value
 }
 
+type quotaHeaderExecutor struct {
+	headers http.Header
+}
+
+func (e quotaHeaderExecutor) Identifier() string { return "codex" }
+
+func (e quotaHeaderExecutor) Execute(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{Payload: []byte(`{}`), Headers: e.headers.Clone()}, nil
+}
+
+func (e quotaHeaderExecutor) ExecuteStream(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	chunks := make(chan cliproxyexecutor.StreamChunk)
+	close(chunks)
+	return &cliproxyexecutor.StreamResult{Headers: e.headers.Clone(), Chunks: chunks}, nil
+}
+
+func (e quotaHeaderExecutor) CountTokens(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{Payload: []byte(`{}`), Headers: e.headers.Clone()}, nil
+}
+
+func (e quotaHeaderExecutor) Refresh(_ context.Context, auth *Auth) (*Auth, error) {
+	return auth, nil
+}
+
+func (e quotaHeaderExecutor) HttpRequest(context.Context, *Auth, *http.Request) (*http.Response, error) {
+	return &http.Response{StatusCode: http.StatusOK, Header: e.headers.Clone(), Body: http.NoBody}, nil
+}
+
 type trackingSelector struct {
 	calls      int
 	lastAuthID []string
@@ -88,6 +116,13 @@ func registerSchedulerModels(t *testing.T, provider string, model string, authID
 			reg.UnregisterClient(authID)
 		}
 	})
+}
+
+func exhaustedCodexHeaders(resetAt time.Time) http.Header {
+	headers := http.Header{}
+	headers.Set("X-Codex-Primary-Used-Percent", "100")
+	headers.Set("X-Codex-Primary-Reset-At", strconv.FormatInt(resetAt.Unix(), 10))
+	return headers
 }
 
 func TestSchedulerPick_RoundRobinHighestPriority(t *testing.T) {
@@ -936,9 +971,7 @@ func TestManager_StreamSuccessCodexExhaustedHeaderCoolsAuth(t *testing.T) {
 	}
 
 	resetAt := time.Now().Add(2 * time.Hour)
-	headers := http.Header{}
-	headers.Set("X-Codex-Primary-Used-Percent", "100")
-	headers.Set("X-Codex-Primary-Reset-At", strconv.FormatInt(resetAt.Unix(), 10))
+	headers := exhaustedCodexHeaders(resetAt)
 	remaining := make(chan cliproxyexecutor.StreamChunk)
 	close(remaining)
 
@@ -967,6 +1000,88 @@ func TestManager_StreamSuccessCodexExhaustedHeaderCoolsAuth(t *testing.T) {
 	}
 	if state.NextRetryAfter.Before(resetAt.Add(-time.Minute)) {
 		t.Fatalf("NextRetryAfter = %v, want near reset %v", state.NextRetryAfter, resetAt)
+	}
+
+	picked, errPick := manager.scheduler.pickSingle(context.Background(), "codex", model, cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("scheduler.pickSingle() error = %v", errPick)
+	}
+	if picked == nil || picked.ID != proID {
+		t.Fatalf("scheduler.pickSingle() auth = %v, want %s", picked, proID)
+	}
+}
+
+func TestManager_ExecuteSuccessCodexExhaustedHeaderCoolsAuth(t *testing.T) {
+	t.Parallel()
+
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	model := "gpt-5.5"
+	plusID := "codex-plus-execute-header-exhausted"
+	proID := "codex-pro-execute-header-available"
+	registerSchedulerModels(t, "codex", model, plusID, proID)
+	manager.executors["codex"] = quotaHeaderExecutor{headers: exhaustedCodexHeaders(time.Now().Add(2 * time.Hour))}
+	for _, auth := range []*Auth{
+		{ID: plusID, Provider: "codex", Attributes: map[string]string{"plan_type": "plus"}},
+		{ID: proID, Provider: "codex", Attributes: map[string]string{"plan_type": "pro"}},
+	} {
+		if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+			t.Fatalf("Register(%s) error = %v", auth.ID, errRegister)
+		}
+	}
+
+	metadata := map[string]any{cliproxyexecutor.PinnedAuthMetadataKey: plusID}
+	if _, errExec := manager.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{Metadata: metadata}); errExec != nil {
+		t.Fatalf("Execute() error = %v", errExec)
+	}
+
+	gotPlus, ok := manager.GetByID(plusID)
+	if !ok || gotPlus == nil {
+		t.Fatalf("GetByID(%s) missing", plusID)
+	}
+	state := gotPlus.ModelStates[model]
+	if state == nil || !state.Quota.Exceeded {
+		t.Fatalf("ModelStates[%s].Quota.Exceeded = %#v, want true", model, state)
+	}
+
+	picked, errPick := manager.scheduler.pickSingle(context.Background(), "codex", model, cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("scheduler.pickSingle() error = %v", errPick)
+	}
+	if picked == nil || picked.ID != proID {
+		t.Fatalf("scheduler.pickSingle() auth = %v, want %s", picked, proID)
+	}
+}
+
+func TestManager_ExecuteCountSuccessCodexExhaustedHeaderCoolsAuth(t *testing.T) {
+	t.Parallel()
+
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	model := "gpt-5.5"
+	plusID := "codex-plus-count-header-exhausted"
+	proID := "codex-pro-count-header-available"
+	registerSchedulerModels(t, "codex", model, plusID, proID)
+	manager.executors["codex"] = quotaHeaderExecutor{headers: exhaustedCodexHeaders(time.Now().Add(2 * time.Hour))}
+	for _, auth := range []*Auth{
+		{ID: plusID, Provider: "codex", Attributes: map[string]string{"plan_type": "plus"}},
+		{ID: proID, Provider: "codex", Attributes: map[string]string{"plan_type": "pro"}},
+	} {
+		if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+			t.Fatalf("Register(%s) error = %v", auth.ID, errRegister)
+		}
+	}
+
+	metadata := map[string]any{cliproxyexecutor.PinnedAuthMetadataKey: plusID}
+	if _, errExec := manager.ExecuteCount(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{Metadata: metadata}); errExec != nil {
+		t.Fatalf("ExecuteCount() error = %v", errExec)
+	}
+
+	gotPlus, ok := manager.GetByID(plusID)
+	if !ok || gotPlus == nil {
+		t.Fatalf("GetByID(%s) missing", plusID)
+	}
+	state := gotPlus.ModelStates[model]
+	if state == nil || !state.Quota.Exceeded {
+		t.Fatalf("ModelStates[%s].Quota.Exceeded = %#v, want true", model, state)
 	}
 
 	picked, errPick := manager.scheduler.pickSingle(context.Background(), "codex", model, cliproxyexecutor.Options{}, nil)
