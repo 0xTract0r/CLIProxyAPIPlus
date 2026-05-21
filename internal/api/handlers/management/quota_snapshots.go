@@ -31,8 +31,11 @@ const (
 	quotaRefreshStatusOK              = "ok"
 	quotaRefreshStatusStale           = "stale"
 	quotaRefreshStatusError           = "error"
+	quotaRefreshStatusUnsupported     = "unsupported"
 	quotaRefreshStatusReauthRequired  = "reauth_required"
 	quotaRefreshStatusRefreshDisabled = "refresh_disabled"
+
+	quotaUnsupportedProviderMessage = "provider does not support quota refresh"
 
 	claudeQuotaCredentialUnauthorizedMessage  = "Claude credential unauthorized; reauthenticate this credential to refresh quota."
 	codexQuotaCredentialUnauthorizedMessage   = "Codex credential unauthorized; reauthenticate this credential to refresh quota."
@@ -125,11 +128,12 @@ func (h *Handler) refreshDueQuotaSnapshots(ctx context.Context, interval time.Du
 		if quotaSnapshotImplicitRefreshSkipped(auth) {
 			continue
 		}
-		if next, ok := quotaSnapshotNextRefresh(auth); ok {
+		legacyUnsupported := quotaSnapshotLegacyUnsupportedProviderError(auth)
+		if next, ok := quotaSnapshotNextRefresh(auth); ok && !legacyUnsupported {
 			if next.After(now) {
 				continue
 			}
-		} else {
+		} else if !legacyUnsupported {
 			if err := h.persistQuotaSnapshotSchedule(ctx, auth, quotaSnapshotInitialRefreshTime(auth, now)); err != nil && !strings.Contains(err.Error(), context.Canceled.Error()) {
 				log.WithError(err).Debugf("management quota: schedule failed for %s/%s", auth.Provider, auth.ID)
 			}
@@ -256,6 +260,9 @@ func quotaSnapshotEntryFromAuth(auth *coreauth.Auth) quotaSnapshotEntry {
 	if quotaSnapshotLegacyReauthRequired(auth) {
 		status = quotaRefreshStatusReauthRequired
 		errMessage = quotaCredentialUnauthorizedMessage(auth.Provider)
+	} else if quotaSnapshotLegacyUnsupportedProviderError(auth) {
+		status = quotaRefreshStatusStale
+		errMessage = ""
 	}
 	if auth.RefreshDisabled() && status != quotaRefreshStatusOK && status != quotaRefreshStatusReauthRequired {
 		status = quotaRefreshStatusRefreshDisabled
@@ -293,7 +300,14 @@ func (h *Handler) refreshQuotaSnapshot(ctx context.Context, auth *coreauth.Auth,
 	}
 	exec, ok := manager.Executor(auth.Provider)
 	if !ok || exec == nil {
-		return h.persistQuotaSnapshotError(ctx, auth, "unsupported", "provider does not support quota refresh", interval)
+		if quotaSnapshotProviderSupported(auth.Provider) {
+			next := time.Now().UTC().Add(quotaSnapshotRefreshScanInterval)
+			if err := h.persistQuotaSnapshotSchedule(ctx, auth, next); err != nil {
+				return auth, err
+			}
+			return auth, fmt.Errorf("quota refresh executor unavailable for provider %s", auth.Provider)
+		}
+		return h.persistQuotaSnapshotError(ctx, auth, quotaRefreshStatusUnsupported, quotaUnsupportedProviderMessage, interval)
 	}
 
 	now := time.Now().UTC()
@@ -520,6 +534,15 @@ func quotaSnapshotLegacyReauthRequired(auth *coreauth.Auth) bool {
 		strings.Contains(message, "forbidden")
 	hasStatusSignal := strings.Contains(message, "401") || strings.Contains(message, "403")
 	return hasAuthSignal && hasStatusSignal
+}
+
+func quotaSnapshotLegacyUnsupportedProviderError(auth *coreauth.Auth) bool {
+	if auth == nil || auth.Metadata == nil || !quotaSnapshotProviderSupported(auth.Provider) {
+		return false
+	}
+	status := strings.ToLower(strings.TrimSpace(metadataString(auth.Metadata, quotaRefreshStatusMetadataKey)))
+	message := strings.TrimSpace(metadataString(auth.Metadata, quotaRefreshErrorMetadataKey))
+	return status == quotaRefreshStatusUnsupported && strings.EqualFold(message, quotaUnsupportedProviderMessage)
 }
 
 func quotaResponseBodyReader(resp *http.Response) (io.ReadCloser, error) {

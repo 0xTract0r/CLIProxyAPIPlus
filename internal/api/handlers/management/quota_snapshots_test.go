@@ -936,3 +936,85 @@ func TestQuotaSnapshotAutoRefreshSchedulesMissingNextBeforeProviderCall(t *testi
 		t.Fatal("next refresh timestamp missing")
 	}
 }
+
+func TestQuotaSnapshotMissingExecutorDoesNotPersistUnsupportedForSupportedProvider(t *testing.T) {
+	t.Parallel()
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	if _, err := manager.Register(context.Background(), &coreauth.Auth{
+		ID:       "codex-plus",
+		Provider: "codex",
+		Metadata: map[string]any{
+			quotaNextRefreshMetadataKey: time.Now().UTC().Add(-time.Minute).Format(time.RFC3339),
+		},
+	}); err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+	handler := NewHandlerWithoutConfigFilePath(nil, manager)
+
+	handler.refreshDueQuotaSnapshots(context.Background(), defaultQuotaSnapshotRefreshInterval)
+
+	updated, ok := manager.GetByID("codex-plus")
+	if !ok {
+		t.Fatal("updated auth missing")
+	}
+	if got := metadataString(updated.Metadata, quotaRefreshStatusMetadataKey); got == quotaRefreshStatusUnsupported {
+		t.Fatalf("missing executor must not persist unsupported status for supported provider")
+	}
+	if got := metadataString(updated.Metadata, quotaRefreshErrorMetadataKey); got == quotaUnsupportedProviderMessage {
+		t.Fatalf("missing executor must not persist unsupported provider error")
+	}
+	next, ok := metadataTime(updated.Metadata, quotaNextRefreshMetadataKey)
+	if !ok {
+		t.Fatal("next refresh timestamp missing")
+	}
+	if !next.After(time.Now().UTC()) {
+		t.Fatalf("next refresh = %s, want short future retry", next.Format(time.RFC3339))
+	}
+}
+
+func TestQuotaSnapshotLegacyUnsupportedProviderErrorIsStaleAndRetried(t *testing.T) {
+	t.Parallel()
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	exec := &quotaSnapshotTestExecutor{provider: "codex"}
+	manager.RegisterExecutor(exec)
+	future := time.Now().UTC().Add(defaultQuotaSnapshotRefreshInterval).Format(time.RFC3339)
+	if _, err := manager.Register(context.Background(), &coreauth.Auth{
+		ID:       "codex-plus",
+		Provider: "codex",
+		Metadata: map[string]any{
+			quotaRefreshStatusMetadataKey: quotaRefreshStatusUnsupported,
+			quotaRefreshErrorMetadataKey:  quotaUnsupportedProviderMessage,
+			quotaNextRefreshMetadataKey:   future,
+		},
+	}); err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+	handler := NewHandlerWithoutConfigFilePath(nil, manager)
+
+	entry := quotaSnapshotEntryFromAuth(&coreauth.Auth{
+		ID:       "codex-plus",
+		Provider: "codex",
+		Metadata: map[string]any{
+			quotaRefreshStatusMetadataKey: quotaRefreshStatusUnsupported,
+			quotaRefreshErrorMetadataKey:  quotaUnsupportedProviderMessage,
+		},
+	})
+	if entry.Status != quotaRefreshStatusStale || entry.Error != "" {
+		t.Fatalf("legacy unsupported entry status/error = %q/%q, want stale/empty", entry.Status, entry.Error)
+	}
+
+	handler.refreshDueQuotaSnapshots(context.Background(), defaultQuotaSnapshotRefreshInterval)
+	if exec.Calls() == 0 {
+		t.Fatal("legacy unsupported status should be retried even when next refresh is in the future")
+	}
+
+	updated, ok := manager.GetByID("codex-plus")
+	if !ok {
+		t.Fatal("updated auth missing")
+	}
+	if got := metadataString(updated.Metadata, quotaRefreshStatusMetadataKey); got != quotaRefreshStatusOK {
+		t.Fatalf("status after retry = %q, want ok", got)
+	}
+}
