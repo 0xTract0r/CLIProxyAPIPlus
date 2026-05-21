@@ -349,8 +349,8 @@ func TestManager_ModelSupportBadRequest_FallsBackAndSuspendsAuth(t *testing.T) {
 	m.RegisterExecutor(executor)
 
 	model := "claude-opus-4-6"
-	badAuth := &Auth{ID: "aa-bad-auth", Provider: "claude"}
-	goodAuth := &Auth{ID: "bb-good-auth", Provider: "claude"}
+	badAuth := &Auth{ID: "aa-bad-auth", Provider: "claude", Attributes: map[string]string{"plan_type": "max"}}
+	goodAuth := &Auth{ID: "bb-good-auth", Provider: "claude", Attributes: map[string]string{"plan_type": "max"}}
 
 	reg := registry.GetGlobalRegistry()
 	reg.RegisterClient(badAuth.ID, "claude", []*registry.ModelInfo{{ID: model}})
@@ -419,8 +419,8 @@ func TestManagerExecuteStream_ModelSupportBadRequestFallsBackAndSuspendsAuth(t *
 	m.RegisterExecutor(executor)
 
 	model := "claude-opus-4-6"
-	badAuth := &Auth{ID: "aa-bad-auth", Provider: "claude"}
-	goodAuth := &Auth{ID: "bb-good-auth", Provider: "claude"}
+	badAuth := &Auth{ID: "aa-bad-auth", Provider: "claude", Attributes: map[string]string{"plan_type": "max"}}
+	goodAuth := &Auth{ID: "bb-good-auth", Provider: "claude", Attributes: map[string]string{"plan_type": "max"}}
 
 	reg := registry.GetGlobalRegistry()
 	reg.RegisterClient(badAuth.ID, "claude", []*registry.ModelInfo{{ID: model}})

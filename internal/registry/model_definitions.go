@@ -7,9 +7,8 @@ import (
 )
 
 const (
-	codexBuiltinImageModelID         = "gpt-image-2"
-	codexSparkModelID                = "gpt-5.3-codex-spark"
-	claudeLongContextThresholdTokens = 1000000
+	codexBuiltinImageModelID = "gpt-image-2"
+	codexSparkModelID        = "gpt-5.3-codex-spark"
 )
 
 // staticModelsJSON mirrors the top-level structure of models.json.
@@ -35,8 +34,7 @@ func GetClaudeModels() []*ModelInfo {
 }
 
 // GetClaudeModelsForPlan returns Claude model definitions that are safe for a
-// known subscription plan. Pro only gets Opus 1M models when usage credits are
-// explicitly enabled.
+// known subscription plan. Opus is only available to Claude high-tier plans.
 func GetClaudeModelsForPlan(plan string, usageCreditsEnabled bool) []*ModelInfo {
 	return FilterClaudeModelsForPlan(GetClaudeModels(), plan, usageCreditsEnabled)
 }
@@ -85,7 +83,7 @@ func GetCodexProModels() []*ModelInfo {
 // unknown plan is intentionally conservative so unsupported premium-only models
 // are not routed to accounts whose subscription tier has not been identified.
 func GetCodexModelsForPlan(plan string) []*ModelInfo {
-	switch normalizeSubscriptionPlan(plan) {
+	switch NormalizeCodexSubscriptionPlan(plan) {
 	case "pro":
 		return GetCodexProModels()
 	case "plus":
@@ -105,8 +103,7 @@ func FilterCodexModelsForPlan(models []*ModelInfo, plan string) []*ModelInfo {
 	if len(models) == 0 {
 		return nil
 	}
-	normalizedPlan := normalizeSubscriptionPlan(plan)
-	allowSpark := normalizedPlan == "pro"
+	allowSpark := CodexPlanAllowsSpark(plan)
 	out := make([]*ModelInfo, 0, len(models))
 	for _, model := range models {
 		if model == nil {
@@ -120,13 +117,13 @@ func FilterCodexModelsForPlan(models []*ModelInfo, plan string) []*ModelInfo {
 	return out
 }
 
-// FilterClaudeModelsForPlan removes Claude Opus 1M models that need a higher
-// subscription tier or explicit usage credits.
+// FilterClaudeModelsForPlan removes Claude Opus models that need a high-tier
+// Claude subscription. Usage credits do not change Opus eligibility.
 func FilterClaudeModelsForPlan(models []*ModelInfo, plan string, usageCreditsEnabled bool) []*ModelInfo {
 	if len(models) == 0 {
 		return nil
 	}
-	if claudePlanAllowsOpusLongContext(plan, usageCreditsEnabled) {
+	if ClaudePlanAllowsOpusLongContext(plan, usageCreditsEnabled) {
 		return models
 	}
 	out := make([]*ModelInfo, 0, len(models))
@@ -134,7 +131,7 @@ func FilterClaudeModelsForPlan(models []*ModelInfo, plan string, usageCreditsEna
 		if model == nil {
 			continue
 		}
-		if isClaudeOpusLongContextModel(model) {
+		if IsClaudeOpusModelInfo(model) {
 			continue
 		}
 		out = append(out, model)
@@ -142,24 +139,84 @@ func FilterClaudeModelsForPlan(models []*ModelInfo, plan string, usageCreditsEna
 	return out
 }
 
-func claudePlanAllowsOpusLongContext(plan string, usageCreditsEnabled bool) bool {
-	switch normalizeSubscriptionPlan(plan) {
+func CodexPlanAllowsSpark(plan string) bool {
+	return NormalizeCodexSubscriptionPlan(plan) == "pro"
+}
+
+func ClaudePlanAllowsOpus(plan string) bool {
+	switch NormalizeClaudeSubscriptionPlan(plan) {
 	case "max", "team", "business", "enterprise":
 		return true
-	case "pro":
-		return usageCreditsEnabled
 	default:
 		return false
 	}
 }
 
-func isClaudeOpusLongContextModel(model *ModelInfo) bool {
-	if model == nil || model.ContextLength < claudeLongContextThresholdTokens {
+func ClaudePlanAllowsOpusLongContext(plan string, _ bool) bool {
+	return ClaudePlanAllowsOpus(plan)
+}
+
+func IsClaudeOpusModelInfo(model *ModelInfo) bool {
+	if model == nil {
 		return false
 	}
-	id := strings.ToLower(strings.TrimSpace(model.ID))
-	name := strings.ToLower(strings.TrimSpace(model.DisplayName))
-	return strings.Contains(id, "opus") || strings.Contains(name, "opus")
+	return IsClaudeOpusModelID(model.ID) || IsClaudeOpusModelID(model.DisplayName)
+}
+
+func IsClaudeOpusModelID(modelID string) bool {
+	return strings.Contains(strings.ToLower(strings.TrimSpace(modelID)), "opus")
+}
+
+func IsClaudeOpus1MAlias(modelID string) bool {
+	id := strings.ToLower(strings.TrimSpace(modelID))
+	return strings.Contains(id, "opus") && strings.Contains(id, "[1m]")
+}
+
+func IsCodexSparkModelID(modelID string) bool {
+	return strings.EqualFold(strings.TrimSpace(modelID), codexSparkModelID)
+}
+
+func NormalizeClaudeSubscriptionPlan(plan string) string {
+	normalized := normalizeSubscriptionPlan(plan)
+	switch {
+	case strings.Contains(normalized, "max"):
+		return "max"
+	case strings.Contains(normalized, "team"):
+		return "team"
+	case strings.Contains(normalized, "business"):
+		return "business"
+	case strings.Contains(normalized, "enterprise"):
+		return "enterprise"
+	case strings.Contains(normalized, "pro"):
+		return "pro"
+	case strings.Contains(normalized, "free"):
+		return "free"
+	default:
+		return normalized
+	}
+}
+
+func NormalizeCodexSubscriptionPlan(plan string) string {
+	normalized := normalizeSubscriptionPlan(plan)
+	normalized = strings.TrimPrefix(normalized, "chatgpt-")
+	switch {
+	case strings.Contains(normalized, "pro"):
+		return "pro"
+	case strings.Contains(normalized, "plus"):
+		return "plus"
+	case strings.Contains(normalized, "team"):
+		return "team"
+	case strings.Contains(normalized, "business"):
+		return "business"
+	case strings.Contains(normalized, "enterprise"):
+		return "enterprise"
+	case strings.Contains(normalized, "free"):
+		return "free"
+	case normalized == "go":
+		return "go"
+	default:
+		return normalized
+	}
 }
 
 func normalizeSubscriptionPlan(plan string) string {

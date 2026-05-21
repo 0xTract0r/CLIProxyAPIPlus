@@ -150,6 +150,59 @@ func TestTestAuthFileMessageUsesProviderDefaultModelWhenNoRegisteredModel(t *tes
 	}
 }
 
+func TestDefaultAuthFileTestMessageModel_ClaudeProCreditsDoesNotPickOpus(t *testing.T) {
+	auth := &coreauth.Auth{
+		Provider: "claude",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"plan_type":           "pro",
+			"extra_usage_enabled": "true",
+		},
+	}
+
+	model := defaultAuthFileTestMessageModel(auth)
+	if model == "" {
+		t.Fatal("expected Claude default test-message model")
+	}
+	if registry.IsClaudeOpusModelID(model) {
+		t.Fatalf("Claude Pro default test-message model = %q, want non-Opus", model)
+	}
+	if got := authFileSubscriptionPlanType(auth); got != "pro" {
+		t.Fatalf("authFileSubscriptionPlanType() = %q, want pro", got)
+	}
+}
+
+func TestDefaultAuthFileTestMessageModel_ClaudeNestedMaxAllowsOpus(t *testing.T) {
+	auth := &coreauth.Auth{
+		Provider: "claude",
+		Status:   coreauth.StatusActive,
+		Metadata: map[string]any{
+			"quota_snapshot": map[string]any{
+				"profile": map[string]any{
+					"subscription": map[string]any{"has_claude_max": true},
+				},
+			},
+		},
+	}
+
+	models := registry.GetClaudeModelsForPlan(registry.NormalizeClaudeSubscriptionPlan(authFileSubscriptionPlanType(auth)), false)
+	if !modelsContainID(models, "claude-opus-4-7") {
+		t.Fatal("nested Claude Max profile should expose base Opus")
+	}
+	if got := authFileSubscriptionPlanType(auth); got != "max" {
+		t.Fatalf("authFileSubscriptionPlanType() = %q, want max", got)
+	}
+}
+
+func modelsContainID(models []*registry.ModelInfo, id string) bool {
+	for _, model := range models {
+		if model != nil && model.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
 func TestTestAuthFileMessageRequiresModelForUnknownProvider(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
 	gin.SetMode(gin.TestMode)

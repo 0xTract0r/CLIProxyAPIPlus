@@ -4,6 +4,7 @@ import (
 	"strings"
 
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 )
 
@@ -223,6 +224,11 @@ func resolveUpstreamModelFromAliasTable(m *Manager, auth *Auth, requestedModel, 
 		if original == "" {
 			continue
 		}
+		if channel == "claude" &&
+			(registry.IsClaudeOpusModelID(candidate) || registry.IsClaudeOpusModelID(original)) &&
+			!authAllowsClaudeOpusModel(auth) {
+			return ""
+		}
 		if strings.EqualFold(original, baseModel) {
 			return ""
 		}
@@ -239,6 +245,18 @@ func resolveUpstreamModelFromAliasTable(m *Manager, auth *Auth, requestedModel, 
 	}
 
 	return ""
+}
+
+func authAllowsClaudeOpusModel(auth *Auth) bool {
+	return registry.ClaudePlanAllowsOpus(authClaudeSubscriptionPlanType(auth))
+}
+
+func authClaudeSubscriptionPlanType(auth *Auth) string {
+	return registry.NormalizeClaudeSubscriptionPlan(auth.SubscriptionPlanType())
+}
+
+func authCodexSubscriptionPlanType(auth *Auth) string {
+	return registry.NormalizeCodexSubscriptionPlan(auth.SubscriptionPlanType())
 }
 
 // modelAliasChannel extracts the OAuth model alias channel from an Auth object.

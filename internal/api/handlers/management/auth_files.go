@@ -2565,14 +2565,12 @@ func defaultAuthFileTestMessageModel(auth *coreauth.Auth) string {
 	preferred := []string{}
 	switch provider {
 	case "codex":
-		planType := metadataString(auth.Metadata, "plan_type")
-		if planType == "" && auth.Attributes != nil {
-			planType = strings.TrimSpace(auth.Attributes["plan_type"])
-		}
+		planType := registry.NormalizeCodexSubscriptionPlan(authFileSubscriptionPlanType(auth))
 		models = registry.GetCodexModelsForPlan(planType)
 		preferred = []string{"gpt-5.4-mini", "gpt-5.2", "gpt-5.3-codex"}
 	case "claude", "anthropic":
-		models = registry.GetClaudeModelsForPlan(metadataString(auth.Metadata, "plan_type"), claudeUsageCreditsEnabledFromQuotaSnapshot(auth.Metadata))
+		planType := registry.NormalizeClaudeSubscriptionPlan(authFileSubscriptionPlanType(auth))
+		models = registry.GetClaudeModelsForPlan(planType, claudeUsageCreditsEnabledFromQuotaSnapshot(auth.Metadata))
 		preferred = []string{"claude-haiku-4-5-20251001", "claude-3-5-haiku-20241022"}
 	case "gemini-cli":
 		models = registry.GetGeminiCLIModels()
@@ -2604,6 +2602,10 @@ func defaultAuthFileTestMessageModel(auth *coreauth.Auth) string {
 		return id
 	}
 	return ""
+}
+
+func authFileSubscriptionPlanType(auth *coreauth.Auth) string {
+	return auth.SubscriptionPlanType()
 }
 
 func registerAuthFileTestMessageModel(authID, provider, model string) {

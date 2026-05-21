@@ -44,13 +44,16 @@ func TestRegisterModelsForAuth_CodexPlanFiltersSpark(t *testing.T) {
 	}
 }
 
-func TestRegisterModelsForAuth_ClaudePlanFiltersOneMillionContext(t *testing.T) {
-	service := &Service{cfg: &config.Config{}}
+func TestRegisterModelsForAuth_ClaudePlanFiltersOpusByHighTier(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.SanitizeOAuthModelAlias()
+	service := &Service{cfg: cfg}
 
 	tests := []struct {
-		name       string
-		auth       *coreauth.Auth
-		wantOpus1M bool
+		name            string
+		auth            *coreauth.Auth
+		wantBaseOpus    bool
+		wantOpus1MAlias bool
 	}{
 		{
 			name: "pro without usage credits",
@@ -60,7 +63,8 @@ func TestRegisterModelsForAuth_ClaudePlanFiltersOneMillionContext(t *testing.T) 
 				Status:   coreauth.StatusActive,
 				Metadata: map[string]any{"plan_type": "pro"},
 			},
-			wantOpus1M: false,
+			wantBaseOpus:    false,
+			wantOpus1MAlias: false,
 		},
 		{
 			name: "pro with usage credits",
@@ -77,7 +81,8 @@ func TestRegisterModelsForAuth_ClaudePlanFiltersOneMillionContext(t *testing.T) 
 					},
 				},
 			},
-			wantOpus1M: true,
+			wantBaseOpus:    false,
+			wantOpus1MAlias: false,
 		},
 		{
 			name: "max",
@@ -87,7 +92,68 @@ func TestRegisterModelsForAuth_ClaudePlanFiltersOneMillionContext(t *testing.T) 
 				Status:   coreauth.StatusActive,
 				Metadata: map[string]any{"plan_type": "max"},
 			},
-			wantOpus1M: true,
+			wantBaseOpus:    true,
+			wantOpus1MAlias: true,
+		},
+		{
+			name: "nested max profile",
+			auth: &coreauth.Auth{
+				ID:       "claude-nested-max-plan-filter",
+				Provider: "claude",
+				Status:   coreauth.StatusActive,
+				Metadata: map[string]any{
+					"quota_snapshot": map[string]any{
+						"profile": map[string]any{
+							"subscription": map[string]any{"has_claude_max": true},
+						},
+					},
+				},
+			},
+			wantBaseOpus:    true,
+			wantOpus1MAlias: true,
+		},
+		{
+			name: "nested pro profile",
+			auth: &coreauth.Auth{
+				ID:       "claude-nested-pro-plan-filter",
+				Provider: "claude",
+				Status:   coreauth.StatusActive,
+				Metadata: map[string]any{
+					"quota_snapshot": map[string]any{
+						"profile": map[string]any{
+							"subscription": map[string]any{"has_claude_pro": true},
+						},
+						"usage": map[string]any{
+							"extra_usage": map[string]any{"is_enabled": true},
+						},
+					},
+				},
+			},
+			wantBaseOpus:    false,
+			wantOpus1MAlias: false,
+		},
+		{
+			name: "unknown local plan",
+			auth: &coreauth.Auth{
+				ID:       "claude-unknown-plan-filter",
+				Provider: "claude",
+				Status:   coreauth.StatusActive,
+			},
+			wantBaseOpus:    false,
+			wantOpus1MAlias: false,
+		},
+		{
+			name: "attributes fallback max",
+			auth: &coreauth.Auth{
+				ID:       "claude-attrs-max-plan-filter",
+				Provider: "claude",
+				Status:   coreauth.StatusActive,
+				Attributes: map[string]string{
+					"plan_type": "max",
+				},
+			},
+			wantBaseOpus:    true,
+			wantOpus1MAlias: true,
 		},
 	}
 
@@ -98,9 +164,17 @@ func TestRegisterModelsForAuth_ClaudePlanFiltersOneMillionContext(t *testing.T) 
 			t.Cleanup(func() { reg.UnregisterClient(tt.auth.ID) })
 
 			service.registerModelsForAuth(tt.auth)
-			gotOpus1M := modelListContains(reg.GetModelsForClient(tt.auth.ID), "claude-opus-4-7")
-			if gotOpus1M != tt.wantOpus1M {
-				t.Fatalf("Opus 1M registered = %v, want %v", gotOpus1M, tt.wantOpus1M)
+			models := reg.GetModelsForClient(tt.auth.ID)
+			gotBaseOpus := modelListContains(models, "claude-opus-4-7")
+			if gotBaseOpus != tt.wantBaseOpus {
+				t.Fatalf("base Opus registered = %v, want %v", gotBaseOpus, tt.wantBaseOpus)
+			}
+			gotOpus1MAlias := modelListContains(models, "opus[1m]") || modelListContains(models, "claude-opus-4-7[1m]")
+			if gotOpus1MAlias != tt.wantOpus1MAlias {
+				t.Fatalf("Opus 1M alias registered = %v, want %v", gotOpus1MAlias, tt.wantOpus1MAlias)
+			}
+			if modelListContains(models, "claude-opus-4-6") != tt.wantBaseOpus {
+				t.Fatalf("claude-opus-4-6 registered = %v, want %v", modelListContains(models, "claude-opus-4-6"), tt.wantBaseOpus)
 			}
 		})
 	}

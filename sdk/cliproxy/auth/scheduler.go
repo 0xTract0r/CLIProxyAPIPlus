@@ -568,12 +568,16 @@ func buildScheduledAuthMeta(auth *Auth) *scheduledAuthMeta {
 		priority:          authPriority(auth),
 		virtualParent:     virtualParent,
 		websocketEnabled:  authWebsocketsEnabled(auth),
-		supportedModelSet: supportedModelSetForAuth(auth.ID),
+		supportedModelSet: supportedModelSetForAuth(auth),
 	}
 }
 
 // supportedModelSetForAuth snapshots the registry models currently registered for an auth.
-func supportedModelSetForAuth(authID string) map[string]struct{} {
+func supportedModelSetForAuth(auth *Auth) map[string]struct{} {
+	if auth == nil {
+		return nil
+	}
+	authID := auth.ID
 	authID = strings.TrimSpace(authID)
 	if authID == "" {
 		return nil
@@ -585,6 +589,9 @@ func supportedModelSetForAuth(authID string) map[string]struct{} {
 	set := make(map[string]struct{}, len(models))
 	for _, model := range models {
 		if model == nil {
+			continue
+		}
+		if !authAllowsRouteModel(auth, model.ID) {
 			continue
 		}
 		modelKey := canonicalModelKey(model.ID)

@@ -558,9 +558,15 @@ func (m *Manager) filterExecutionModels(auth *Auth, routeModel string, candidate
 	if len(candidates) == 0 {
 		return nil
 	}
+	if !authAllowsRouteModel(auth, routeModel) {
+		return nil
+	}
 	now := time.Now()
 	out := make([]string, 0, len(candidates))
 	for _, upstreamModel := range candidates {
+		if !authAllowsRouteModel(auth, upstreamModel) {
+			continue
+		}
 		stateModel := m.stateModelForExecution(auth, routeModel, upstreamModel, pooled)
 		blocked, _, _ := isAuthBlockedForModel(auth, stateModel, now)
 		if blocked {
@@ -592,6 +598,9 @@ func (m *Manager) availableAuthsForRouteModel(auths []*Auth, provider, routeMode
 	var earliest time.Time
 	for _, candidate := range auths {
 		checkModel := m.selectionModelForAuth(candidate, routeModel)
+		if !authAllowsRouteModel(candidate, routeModel) || !authAllowsRouteModel(candidate, checkModel) {
+			continue
+		}
 		blocked, reason, next := isAuthBlockedForModel(candidate, checkModel, now)
 		if !blocked {
 			priority := authPriority(candidate)
@@ -652,11 +661,46 @@ func (m *Manager) authSupportsRouteModel(registryRef *registry.ModelRegistry, au
 	if routeKey == "" {
 		return true
 	}
+	if !authAllowsRouteModel(auth, routeModel) {
+		return false
+	}
 	if registryRef.ClientSupportsModel(auth.ID, routeKey) {
 		return true
 	}
-	selectionKey := m.selectionModelKeyForAuth(auth, routeModel)
+	selectionModel := m.selectionModelForAuth(auth, routeModel)
+	if !authAllowsRouteModel(auth, selectionModel) {
+		return false
+	}
+	selectionKey := canonicalModelKey(selectionModel)
 	return selectionKey != "" && selectionKey != routeKey && registryRef.ClientSupportsModel(auth.ID, selectionKey)
+}
+
+func authAllowsRouteModel(auth *Auth, model string) bool {
+	if auth == nil {
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(auth.Provider)) {
+	case "claude":
+		return authAllowsClaudeRouteModel(auth, model)
+	case "codex":
+		return authAllowsCodexRouteModel(auth, model)
+	default:
+		return true
+	}
+}
+
+func authAllowsClaudeRouteModel(auth *Auth, model string) bool {
+	if !registry.IsClaudeOpusModelID(canonicalModelKey(model)) {
+		return true
+	}
+	return authAllowsClaudeOpusModel(auth)
+}
+
+func authAllowsCodexRouteModel(auth *Auth, model string) bool {
+	if !registry.IsCodexSparkModelID(canonicalModelKey(model)) {
+		return true
+	}
+	return registry.CodexPlanAllowsSpark(authCodexSubscriptionPlanType(auth))
 }
 
 func discardStreamChunks(ch <-chan cliproxyexecutor.StreamChunk) {
