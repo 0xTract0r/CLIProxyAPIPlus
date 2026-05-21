@@ -232,7 +232,12 @@ func TestQuotaSnapshotsClaudeUnauthorizedRequiresReauth(t *testing.T) {
 			if entry.Error != claudeQuotaCredentialUnauthorizedMessage {
 				t.Fatalf("entry error = %q, want sanitized reauth message", entry.Error)
 			}
-			for _, forbidden := range []string{"401", "403", "provider body", "invalid token", "forbidden"} {
+			for _, forbidden := range []string{"401", "403"} {
+				if strings.Contains(entry.Error, forbidden) {
+					t.Fatalf("reauth error leaked %q: entry=%#v body=%s", forbidden, entry, rec.Body.String())
+				}
+			}
+			for _, forbidden := range []string{"provider body", "invalid token", "forbidden"} {
 				if strings.Contains(rec.Body.String(), forbidden) || strings.Contains(entry.Error, forbidden) {
 					t.Fatalf("reauth response leaked %q: entry=%#v body=%s", forbidden, entry, rec.Body.String())
 				}
