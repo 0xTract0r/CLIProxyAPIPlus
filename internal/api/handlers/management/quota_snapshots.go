@@ -1,8 +1,10 @@
 package management
 
 import (
+	"compress/gzip"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"io"
@@ -10,7 +12,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/andybalholm/brotli"
 	"github.com/gin-gonic/gin"
+	"github.com/klauspost/compress/zstd"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
 )
@@ -22,6 +27,16 @@ const (
 	quotaLastRefreshedMetadataKey = "quota_last_refreshed_at"
 	quotaNextRefreshMetadataKey   = "quota_next_refresh_after"
 	quotaSnapshotPlanTypeKey      = "plan_type"
+
+	quotaRefreshStatusOK              = "ok"
+	quotaRefreshStatusStale           = "stale"
+	quotaRefreshStatusError           = "error"
+	quotaRefreshStatusReauthRequired  = "reauth_required"
+	quotaRefreshStatusRefreshDisabled = "refresh_disabled"
+
+	claudeQuotaCredentialUnauthorizedMessage  = "Claude credential unauthorized; reauthenticate this credential to refresh quota."
+	codexQuotaCredentialUnauthorizedMessage   = "Codex credential unauthorized; reauthenticate this credential to refresh quota."
+	genericQuotaCredentialUnauthorizedMessage = "Credential unauthorized; reauthenticate this credential to refresh quota."
 
 	defaultQuotaSnapshotRefreshInterval = 45 * time.Minute
 	quotaSnapshotRefreshJitterMax       = 10 * time.Minute
@@ -107,6 +122,9 @@ func (h *Handler) refreshDueQuotaSnapshots(ctx context.Context, interval time.Du
 		if auth == nil || auth.Disabled || !quotaSnapshotProviderSupported(auth.Provider) {
 			continue
 		}
+		if quotaSnapshotImplicitRefreshSkipped(auth) {
+			continue
+		}
 		if next, ok := quotaSnapshotNextRefresh(auth); ok {
 			if next.After(now) {
 				continue
@@ -146,6 +164,13 @@ func (h *Handler) RefreshQuotaSnapshots(c *gin.Context) {
 	_ = c.ShouldBindJSON(&req)
 	targets := h.quotaRefreshTargets(manager, req)
 	if len(targets) == 0 {
+		if quotaRefreshHasImplicitSupportedTargets(manager, req) {
+			c.JSON(http.StatusOK, quotaSnapshotPayload{
+				GeneratedAt: time.Now().UTC(),
+				Entries:     h.quotaSnapshotEntries(),
+			})
+			return
+		}
 		c.JSON(http.StatusNotFound, gin.H{"error": "no supported quota auth found"})
 		return
 	}
@@ -181,12 +206,32 @@ func (h *Handler) quotaRefreshTargets(manager *coreauth.Manager, req quotaRefres
 		if auth == nil || auth.Disabled || !quotaSnapshotProviderSupported(auth.Provider) {
 			continue
 		}
+		if quotaSnapshotImplicitRefreshSkipped(auth) {
+			continue
+		}
 		if provider != "" && strings.ToLower(auth.Provider) != provider {
 			continue
 		}
 		targets = append(targets, auth)
 	}
 	return targets
+}
+
+func quotaRefreshHasImplicitSupportedTargets(manager *coreauth.Manager, req quotaRefreshRequest) bool {
+	if manager == nil || req.AuthID != "" || req.Name != "" {
+		return false
+	}
+	provider := strings.ToLower(strings.TrimSpace(req.Provider))
+	for _, auth := range manager.List() {
+		if auth == nil || auth.Disabled || !quotaSnapshotProviderSupported(auth.Provider) {
+			continue
+		}
+		if provider != "" && strings.ToLower(auth.Provider) != provider {
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 func (h *Handler) quotaSnapshotEntries() []quotaSnapshotEntry {
@@ -206,18 +251,28 @@ func (h *Handler) quotaSnapshotEntries() []quotaSnapshotEntry {
 }
 
 func quotaSnapshotEntryFromAuth(auth *coreauth.Auth) quotaSnapshotEntry {
+	status := metadataString(auth.Metadata, quotaRefreshStatusMetadataKey)
+	errMessage := metadataString(auth.Metadata, quotaRefreshErrorMetadataKey)
+	if quotaSnapshotLegacyReauthRequired(auth) {
+		status = quotaRefreshStatusReauthRequired
+		errMessage = quotaCredentialUnauthorizedMessage(auth.Provider)
+	}
+	if auth.RefreshDisabled() && status != quotaRefreshStatusOK && status != quotaRefreshStatusReauthRequired {
+		status = quotaRefreshStatusRefreshDisabled
+		errMessage = ""
+	}
 	entry := quotaSnapshotEntry{
 		AuthID:    auth.ID,
 		AuthIndex: auth.Index,
 		Name:      auth.FileName,
 		Provider:  auth.Provider,
 		Label:     authDisplayName(auth),
-		Status:    metadataString(auth.Metadata, quotaRefreshStatusMetadataKey),
-		Error:     metadataString(auth.Metadata, quotaRefreshErrorMetadataKey),
+		Status:    status,
+		Error:     errMessage,
 		PlanType:  metadataString(auth.Metadata, quotaSnapshotPlanTypeKey),
 	}
 	if entry.Status == "" {
-		entry.Status = "stale"
+		entry.Status = quotaRefreshStatusStale
 	}
 	if ts, ok := metadataTime(auth.Metadata, quotaLastRefreshedMetadataKey); ok {
 		entry.LastRefreshedAt = ts
@@ -244,7 +299,8 @@ func (h *Handler) refreshQuotaSnapshot(ctx context.Context, auth *coreauth.Auth,
 	now := time.Now().UTC()
 	snapshot, planType, err := fetchProviderQuotaSnapshot(ctx, exec, auth)
 	if err != nil {
-		return h.persistQuotaSnapshotError(ctx, auth, "error", err.Error(), interval)
+		status, message := quotaSnapshotErrorStatusAndMessage(err)
+		return h.persistQuotaSnapshotError(ctx, auth, status, message, interval)
 	}
 
 	updated := auth.Clone()
@@ -252,7 +308,7 @@ func (h *Handler) refreshQuotaSnapshot(ctx context.Context, auth *coreauth.Auth,
 		updated.Metadata = make(map[string]any)
 	}
 	updated.Metadata[quotaSnapshotMetadataKey] = snapshot
-	updated.Metadata[quotaRefreshStatusMetadataKey] = "ok"
+	updated.Metadata[quotaRefreshStatusMetadataKey] = quotaRefreshStatusOK
 	delete(updated.Metadata, quotaRefreshErrorMetadataKey)
 	updated.Metadata[quotaLastRefreshedMetadataKey] = now.Format(time.RFC3339)
 	updated.Metadata[quotaNextRefreshMetadataKey] = quotaSnapshotNextRefreshTime(updated, now, interval).Format(time.RFC3339)
@@ -275,6 +331,10 @@ func (h *Handler) persistQuotaSnapshotError(ctx context.Context, auth *coreauth.
 	}
 	updated.Metadata[quotaRefreshStatusMetadataKey] = status
 	updated.Metadata[quotaRefreshErrorMetadataKey] = message
+	if status == quotaRefreshStatusReauthRequired {
+		delete(updated.Metadata, quotaSnapshotPlanTypeKey)
+		delete(updated.Metadata, quotaSnapshotMetadataKey)
+	}
 	updated.Metadata[quotaNextRefreshMetadataKey] = quotaSnapshotNextRefreshTime(updated, now, interval).Format(time.RFC3339)
 	updated.UpdatedAt = now
 	saved, err := manager.Update(ctx, updated)
@@ -304,18 +364,18 @@ func fetchProviderQuotaSnapshot(ctx context.Context, exec coreauth.ProviderExecu
 	case "codex":
 		payload, err := fetchQuotaJSON(ctx, exec, auth, http.MethodGet, "https://chatgpt.com/backend-api/wham/usage", nil)
 		if err != nil {
-			return nil, "", err
+			return nil, "", quotaReauthErrorForProvider("codex", err)
 		}
 		return map[string]any{"usage": payload}, inferCodexPlanType(auth, payload), nil
 	case "claude":
 		headers := http.Header{"anthropic-beta": []string{"oauth-2025-04-20"}}
 		profile, err := fetchQuotaJSON(ctx, exec, auth, http.MethodGet, "https://api.anthropic.com/api/oauth/profile", headers)
 		if err != nil {
-			return nil, "", err
+			return nil, "", quotaReauthErrorForProvider("claude", err)
 		}
 		usage, err := fetchQuotaJSON(ctx, exec, auth, http.MethodGet, "https://api.anthropic.com/api/oauth/usage", headers)
 		if err != nil {
-			return nil, "", err
+			return nil, "", quotaReauthErrorForProvider("claude", err)
 		}
 		planType := inferClaudePlanType(profile)
 		return map[string]any{"profile": profile, "usage": usage}, planType, nil
@@ -342,24 +402,247 @@ func fetchQuotaJSON(ctx context.Context, exec coreauth.ProviderExecutor, auth *c
 	if resp == nil {
 		return nil, fmt.Errorf("empty response")
 	}
-	defer resp.Body.Close()
-	data, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+		return nil, &quotaHTTPError{StatusCode: resp.StatusCode}
+	}
+	body, err := quotaResponseBodyReader(resp)
+	if err != nil {
+		_ = resp.Body.Close()
+		return nil, err
+	}
+	defer body.Close()
+	data, err := io.ReadAll(io.LimitReader(body, 4<<20))
 	if err != nil {
 		return nil, err
 	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("quota endpoint returned %d: %s", resp.StatusCode, strings.TrimSpace(string(data)))
-	}
 	var payload map[string]any
 	if len(data) > 0 {
-		if err := json.Unmarshal(data, &payload); err != nil {
-			return nil, err
+		normalized := normalizeQuotaJSONPayload(data)
+		if err := json.Unmarshal(normalized, &payload); err != nil {
+			return nil, fmt.Errorf("quota endpoint returned non-JSON response after decoding: %w", err)
 		}
 	}
 	if payload == nil {
 		payload = make(map[string]any)
 	}
 	return payload, nil
+}
+
+type quotaHTTPError struct {
+	StatusCode int
+}
+
+func (e *quotaHTTPError) Error() string {
+	return "quota endpoint returned non-success status"
+}
+
+type quotaReauthRequiredError struct {
+	Provider   string
+	StatusCode int
+}
+
+func (e *quotaReauthRequiredError) Error() string {
+	return quotaCredentialUnauthorizedMessage(e.Provider)
+}
+
+func quotaCredentialUnauthorizedMessage(provider string) string {
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "claude":
+		return claudeQuotaCredentialUnauthorizedMessage
+	case "codex":
+		return codexQuotaCredentialUnauthorizedMessage
+	default:
+		return genericQuotaCredentialUnauthorizedMessage
+	}
+}
+
+func quotaReauthErrorForProvider(provider string, err error) error {
+	if code, ok := quotaHTTPStatusCode(err); ok && quotaHTTPStatusRequiresReauth(code) {
+		return &quotaReauthRequiredError{Provider: provider, StatusCode: code}
+	}
+	return err
+}
+
+func quotaHTTPStatusCode(err error) (int, bool) {
+	var httpErr *quotaHTTPError
+	if errors.As(err, &httpErr) && httpErr != nil {
+		return httpErr.StatusCode, true
+	}
+	return 0, false
+}
+
+func quotaHTTPStatusRequiresReauth(statusCode int) bool {
+	return statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden
+}
+
+func quotaSnapshotErrorStatusAndMessage(err error) (string, string) {
+	var reauthErr *quotaReauthRequiredError
+	if errors.As(err, &reauthErr) && reauthErr != nil {
+		return quotaRefreshStatusReauthRequired, reauthErr.Error()
+	}
+	if err == nil {
+		return quotaRefreshStatusError, ""
+	}
+	return quotaRefreshStatusError, err.Error()
+}
+
+func quotaSnapshotImplicitRefreshSkipped(auth *coreauth.Auth) bool {
+	if auth == nil {
+		return true
+	}
+	if auth.RefreshDisabled() {
+		return true
+	}
+	if metadataString(auth.Metadata, quotaRefreshStatusMetadataKey) == quotaRefreshStatusReauthRequired {
+		return true
+	}
+	return quotaSnapshotLegacyReauthRequired(auth)
+}
+
+func quotaSnapshotLegacyReauthRequired(auth *coreauth.Auth) bool {
+	if auth == nil {
+		return false
+	}
+	if metadataString(auth.Metadata, quotaRefreshStatusMetadataKey) != quotaRefreshStatusError {
+		return false
+	}
+	message := strings.ToLower(metadataString(auth.Metadata, quotaRefreshErrorMetadataKey))
+	if message == "" {
+		return false
+	}
+	hasAuthSignal := strings.Contains(message, "unauthorized") ||
+		strings.Contains(message, "authentication_error") ||
+		strings.Contains(message, "invalid authentication credentials") ||
+		strings.Contains(message, "invalid token") ||
+		strings.Contains(message, "forbidden")
+	hasStatusSignal := strings.Contains(message, "401") || strings.Contains(message, "403")
+	return hasAuthSignal && hasStatusSignal
+}
+
+func quotaResponseBodyReader(resp *http.Response) (io.ReadCloser, error) {
+	if resp == nil || resp.Body == nil {
+		return io.NopCloser(strings.NewReader("")), nil
+	}
+	encoding := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Encoding")))
+	switch encoding {
+	case "", "identity":
+		return resp.Body, nil
+	case "gzip":
+		reader, err := gzip.NewReader(resp.Body)
+		if err != nil {
+			return nil, err
+		}
+		return quotaReadCloser{
+			Reader: reader,
+			close: func() error {
+				errClose := reader.Close()
+				errBody := resp.Body.Close()
+				if errClose != nil {
+					return errClose
+				}
+				return errBody
+			},
+		}, nil
+	case "br":
+		return quotaReadCloser{
+			Reader: brotli.NewReader(resp.Body),
+			close:  resp.Body.Close,
+		}, nil
+	case "zstd":
+		reader, err := zstd.NewReader(resp.Body)
+		if err != nil {
+			return nil, err
+		}
+		return quotaReadCloser{
+			Reader: reader,
+			close: func() error {
+				reader.Close()
+				return resp.Body.Close()
+			},
+		}, nil
+	default:
+		return resp.Body, nil
+	}
+}
+
+type quotaReadCloser struct {
+	io.Reader
+	close func() error
+}
+
+func (r quotaReadCloser) Close() error {
+	if r.close == nil {
+		return nil
+	}
+	return r.close()
+}
+
+func normalizeQuotaJSONPayload(data []byte) []byte {
+	text := string(data)
+	if strings.ContainsRune(text, 0x1b) {
+		text = stripQuotaANSIEscape(text)
+	}
+	text = strings.TrimPrefix(strings.TrimSpace(text), "\ufeff")
+	if strings.HasPrefix(text, "{") {
+		return []byte(text)
+	}
+	if idx := strings.Index(text, "{"); idx >= 0 {
+		candidate := strings.TrimSpace(text[idx:])
+		if json.Valid([]byte(candidate)) {
+			return []byte(candidate)
+		}
+		if end := strings.LastIndex(candidate, "}"); end >= 0 {
+			candidate = strings.TrimSpace(candidate[:end+1])
+			if json.Valid([]byte(candidate)) {
+				return []byte(candidate)
+			}
+		}
+	}
+	return []byte(text)
+}
+
+func stripQuotaANSIEscape(s string) string {
+	in := []rune(s)
+	var out []rune
+	for i := 0; i < len(in); i++ {
+		r := in[i]
+		if r != 0x1b {
+			out = append(out, r)
+			continue
+		}
+		if i+1 >= len(in) {
+			continue
+		}
+		next := in[i+1]
+		switch next {
+		case ']':
+			i += 2
+			for i < len(in) {
+				if in[i] == 0x07 {
+					break
+				}
+				if in[i] == 0x1b && i+1 < len(in) && in[i+1] == '\\' {
+					i++
+					break
+				}
+				i++
+			}
+		case '[':
+			i += 2
+			for i < len(in) {
+				if (in[i] >= 'A' && in[i] <= 'Z') || (in[i] >= 'a' && in[i] <= 'z') {
+					break
+				}
+				i++
+			}
+		default:
+			// Drop a bare ESC and its immediate introducer.
+		}
+	}
+	return string(out)
 }
 
 func inferClaudePlanType(profile map[string]any) string {
@@ -404,14 +687,30 @@ func claudeUsageCreditsEnabledFromQuotaSnapshot(meta map[string]any) bool {
 }
 
 func inferCodexPlanType(auth *coreauth.Auth, usage map[string]any) string {
-	for _, value := range []string{
-		metadataString(auth.Metadata, "plan_type"),
-		stringValueFromMap(usage, "plan_type"),
-		stringValueFromMap(usage, "planType"),
-		stringValueFromMap(usage, "chatgpt_plan_type"),
-		stringValueFromMap(usage, "chatgptPlanType"),
-	} {
-		if plan := normalizeClaudePlanType(value); plan != "" {
+	if plan := firstNormalizedCodexPlanFromMap(usage); plan != "" {
+		return plan
+	}
+	if auth == nil {
+		return ""
+	}
+	if plan := firstNormalizedCodexPlanFromMap(auth.Metadata); plan != "" {
+		return plan
+	}
+	if auth.Attributes != nil {
+		for _, key := range codexPlanTypeKeys {
+			if plan := registry.NormalizeCodexSubscriptionPlan(auth.Attributes[key]); plan != "" {
+				return plan
+			}
+		}
+	}
+	return ""
+}
+
+var codexPlanTypeKeys = []string{"plan_type", "planType", "chatgpt_plan_type", "chatgptPlanType"}
+
+func firstNormalizedCodexPlanFromMap(payload map[string]any) string {
+	for _, key := range codexPlanTypeKeys {
+		if plan := registry.NormalizeCodexSubscriptionPlan(stringValueFromMap(payload, key)); plan != "" {
 			return plan
 		}
 	}

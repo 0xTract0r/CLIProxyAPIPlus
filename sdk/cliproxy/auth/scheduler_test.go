@@ -235,6 +235,231 @@ func TestSchedulerPick_CodexWebsocketPrefersWebsocketEnabledAcrossPriorities(t *
 	}
 }
 
+func TestManagerExecute_ClaudeOpusSkipsProEvenWithStaleRegistry(t *testing.T) {
+	ctx := context.Background()
+	model := "claude-opus-4-7"
+	registerSchedulerModels(t, "claude", model, "claude-pro-stale", "claude-max-stale")
+
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	manager.executors["claude"] = schedulerTestExecutor{}
+	for _, auth := range []*Auth{
+		{ID: "claude-pro-stale", Provider: "claude", Attributes: map[string]string{"plan_type": "pro"}},
+		{ID: "claude-max-stale", Provider: "claude", Attributes: map[string]string{"plan_type": "max"}},
+	} {
+		if _, errRegister := manager.Register(ctx, auth); errRegister != nil {
+			t.Fatalf("Register(%s) error = %v", auth.ID, errRegister)
+		}
+	}
+
+	selectedAuthID := ""
+	meta := map[string]any{
+		cliproxyexecutor.SelectedAuthCallbackMetadataKey: func(authID string) {
+			selectedAuthID = authID
+		},
+	}
+	if _, errExec := manager.Execute(ctx, []string{"claude"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{Metadata: meta}); errExec != nil {
+		t.Fatalf("Execute() error = %v", errExec)
+	}
+	if selectedAuthID != "claude-max-stale" {
+		t.Fatalf("selected auth = %q, want claude-max-stale", selectedAuthID)
+	}
+}
+
+func TestManagerExecute_ClaudeOpusSkipsReauthRequiredStaleMaxPlan(t *testing.T) {
+	ctx := context.Background()
+	model := "claude-opus-4-7"
+	registerSchedulerModels(t, "claude", model, "claude-reauth-max-stale", "claude-active-max")
+
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	manager.executors["claude"] = schedulerTestExecutor{}
+	for _, auth := range []*Auth{
+		{
+			ID:       "claude-reauth-max-stale",
+			Provider: "claude",
+			Metadata: map[string]any{
+				"quota_refresh_status": "reauth_required",
+				"plan_type":            "max",
+			},
+		},
+		{ID: "claude-active-max", Provider: "claude", Attributes: map[string]string{"plan_type": "max"}},
+	} {
+		if _, errRegister := manager.Register(ctx, auth); errRegister != nil {
+			t.Fatalf("Register(%s) error = %v", auth.ID, errRegister)
+		}
+	}
+
+	selectedAuthID := ""
+	meta := map[string]any{
+		cliproxyexecutor.SelectedAuthCallbackMetadataKey: func(authID string) {
+			selectedAuthID = authID
+		},
+	}
+	if _, errExec := manager.Execute(ctx, []string{"claude"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{Metadata: meta}); errExec != nil {
+		t.Fatalf("Execute() error = %v", errExec)
+	}
+	if selectedAuthID != "claude-active-max" {
+		t.Fatalf("selected auth = %q, want claude-active-max", selectedAuthID)
+	}
+}
+
+func TestManagerExecute_ClaudeOpusRejectsProOnlyStaleRegistry(t *testing.T) {
+	ctx := context.Background()
+	model := "claude-opus-4-7"
+	registerSchedulerModels(t, "claude", model, "claude-pro-only-stale")
+
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	manager.executors["claude"] = schedulerTestExecutor{}
+	if _, errRegister := manager.Register(ctx, &Auth{
+		ID:       "claude-pro-only-stale",
+		Provider: "claude",
+		Attributes: map[string]string{
+			"plan_type":           "pro",
+			"extra_usage_enabled": "true",
+		},
+	}); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+
+	_, errExec := manager.Execute(ctx, []string{"claude"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if errExec == nil {
+		t.Fatal("Execute() error = nil, want auth_not_found")
+	}
+	var authErr *Error
+	if !errors.As(errExec, &authErr) || authErr.Code != "auth_not_found" {
+		t.Fatalf("Execute() error = %v, want auth_not_found", errExec)
+	}
+}
+
+func TestManagerExecute_ClaudeOpusLegacySelectorFiltersProBeforePick(t *testing.T) {
+	ctx := context.Background()
+	model := "claude-opus-4-7"
+	registerSchedulerModels(t, "claude", model, "claude-pro-legacy-stale")
+
+	selector := &trackingSelector{}
+	manager := NewManager(nil, selector, nil)
+	manager.executors["claude"] = schedulerTestExecutor{}
+	if _, errRegister := manager.Register(ctx, &Auth{
+		ID:       "claude-pro-legacy-stale",
+		Provider: "claude",
+		Attributes: map[string]string{
+			"plan_type":           "pro",
+			"extra_usage_enabled": "true",
+		},
+	}); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+
+	_, errExec := manager.Execute(ctx, []string{"claude"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if errExec == nil {
+		t.Fatal("Execute() error = nil, want auth_not_found")
+	}
+	var authErr *Error
+	if !errors.As(errExec, &authErr) || authErr.Code != "auth_not_found" {
+		t.Fatalf("Execute() error = %v, want auth_not_found", errExec)
+	}
+	if selector.calls != 0 {
+		t.Fatalf("selector calls = %d, want 0 because policy filtered candidate before Pick", selector.calls)
+	}
+}
+
+func TestManagerExecute_CodexSparkSkipsPlusAndUnknownEvenWithStaleRegistry(t *testing.T) {
+	ctx := context.Background()
+	model := "gpt-5.3-codex-spark"
+	registerSchedulerModels(t, "codex", model, "codex-plus-stale", "codex-unknown-stale", "codex-pro-stale")
+
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	manager.executors["codex"] = schedulerTestExecutor{}
+	for _, auth := range []*Auth{
+		{ID: "codex-plus-stale", Provider: "codex", Attributes: map[string]string{"plan_type": "plus"}},
+		{ID: "codex-unknown-stale", Provider: "codex"},
+		{ID: "codex-pro-stale", Provider: "codex", Attributes: map[string]string{"plan_type": "pro"}},
+	} {
+		if _, errRegister := manager.Register(ctx, auth); errRegister != nil {
+			t.Fatalf("Register(%s) error = %v", auth.ID, errRegister)
+		}
+	}
+
+	selectedAuthID := ""
+	meta := map[string]any{
+		cliproxyexecutor.SelectedAuthCallbackMetadataKey: func(authID string) {
+			selectedAuthID = authID
+		},
+	}
+	if _, errExec := manager.Execute(ctx, []string{"codex"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{Metadata: meta}); errExec != nil {
+		t.Fatalf("Execute() error = %v", errExec)
+	}
+	if selectedAuthID != "codex-pro-stale" {
+		t.Fatalf("selected auth = %q, want codex-pro-stale", selectedAuthID)
+	}
+}
+
+func TestManagerExecute_CodexSparkSkipsReauthRequiredStaleProPlan(t *testing.T) {
+	ctx := context.Background()
+	model := "gpt-5.3-codex-spark"
+	registerSchedulerModels(t, "codex", model, "codex-reauth-pro-stale", "codex-active-pro")
+
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	manager.executors["codex"] = schedulerTestExecutor{}
+	for _, auth := range []*Auth{
+		{
+			ID:       "codex-reauth-pro-stale",
+			Provider: "codex",
+			Metadata: map[string]any{
+				"quota_refresh_status": "reauth_required",
+				"plan_type":            "pro",
+			},
+		},
+		{ID: "codex-active-pro", Provider: "codex", Attributes: map[string]string{"plan_type": "pro"}},
+	} {
+		if _, errRegister := manager.Register(ctx, auth); errRegister != nil {
+			t.Fatalf("Register(%s) error = %v", auth.ID, errRegister)
+		}
+	}
+
+	selectedAuthID := ""
+	meta := map[string]any{
+		cliproxyexecutor.SelectedAuthCallbackMetadataKey: func(authID string) {
+			selectedAuthID = authID
+		},
+	}
+	if _, errExec := manager.Execute(ctx, []string{"codex"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{Metadata: meta}); errExec != nil {
+		t.Fatalf("Execute() error = %v", errExec)
+	}
+	if selectedAuthID != "codex-active-pro" {
+		t.Fatalf("selected auth = %q, want codex-active-pro", selectedAuthID)
+	}
+}
+
+func TestManagerExecute_CodexSparkRejectsPlusAndUnknownOnlyStaleRegistry(t *testing.T) {
+	ctx := context.Background()
+	model := "gpt-5.3-codex-spark"
+	registerSchedulerModels(t, "codex", model, "codex-plus-only-stale", "codex-unknown-only-stale")
+
+	selector := &trackingSelector{}
+	manager := NewManager(nil, selector, nil)
+	manager.executors["codex"] = schedulerTestExecutor{}
+	for _, auth := range []*Auth{
+		{ID: "codex-plus-only-stale", Provider: "codex", Attributes: map[string]string{"plan_type": "plus"}},
+		{ID: "codex-unknown-only-stale", Provider: "codex"},
+	} {
+		if _, errRegister := manager.Register(ctx, auth); errRegister != nil {
+			t.Fatalf("Register(%s) error = %v", auth.ID, errRegister)
+		}
+	}
+
+	_, errExec := manager.Execute(ctx, []string{"codex"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if errExec == nil {
+		t.Fatal("Execute() error = nil, want auth_not_found")
+	}
+	var authErr *Error
+	if !errors.As(errExec, &authErr) || authErr.Code != "auth_not_found" {
+		t.Fatalf("Execute() error = %v, want auth_not_found", errExec)
+	}
+	if selector.calls != 0 {
+		t.Fatalf("selector calls = %d, want 0 because policy filtered candidate before Pick", selector.calls)
+	}
+}
+
 func TestSchedulerPick_MixedProvidersUsesWeightedProviderRotationOverReadyCandidates(t *testing.T) {
 	t.Parallel()
 

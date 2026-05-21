@@ -310,6 +310,133 @@ func (a *Auth) RefreshDisabled() bool {
 	return false
 }
 
+// SubscriptionPlanType returns the best-known subscription plan recorded on an
+// auth entry. It accepts both canonical metadata (plan_type) and nested provider
+// profile/quota shapes so every model capability gate reads the same signal.
+func (a *Auth) SubscriptionPlanType() string {
+	if a == nil {
+		return ""
+	}
+	if subscriptionPlanTypeBlockedByQuotaStatus(a.Metadata) {
+		return ""
+	}
+	if plan := subscriptionPlanTypeFromMetadata(a.Metadata); plan != "" {
+		return plan
+	}
+	if len(a.Attributes) > 0 {
+		for _, key := range []string{"plan_type", "planType", "subscription_tier", "subscriptionTier", "chatgpt_plan_type", "chatgptPlanType"} {
+			if plan := normalizeSubscriptionPlanSignal(a.Attributes[key]); plan != "" {
+				return plan
+			}
+		}
+	}
+	return ""
+}
+
+func subscriptionPlanTypeBlockedByQuotaStatus(meta map[string]any) bool {
+	if len(meta) == 0 {
+		return false
+	}
+	status := strings.ToLower(strings.TrimSpace(normalizeSubscriptionPlanSignal(meta["quota_refresh_status"])))
+	switch status {
+	case "reauth_required":
+		return true
+	case "error":
+		message := strings.ToLower(strings.TrimSpace(normalizeSubscriptionPlanSignal(meta["quota_refresh_error"])))
+		hasAuthSignal := strings.Contains(message, "unauthorized") ||
+			strings.Contains(message, "authentication_error") ||
+			strings.Contains(message, "invalid authentication credentials") ||
+			strings.Contains(message, "invalid token") ||
+			strings.Contains(message, "forbidden")
+		hasStatusSignal := strings.Contains(message, "401") || strings.Contains(message, "403")
+		return hasAuthSignal && hasStatusSignal
+	default:
+		return false
+	}
+}
+
+func subscriptionPlanTypeFromMetadata(meta map[string]any) string {
+	if len(meta) == 0 {
+		return ""
+	}
+	for _, key := range []string{"plan_type", "planType", "subscription_tier", "subscriptionTier", "chatgpt_plan_type", "chatgptPlanType"} {
+		if plan := normalizeSubscriptionPlanSignal(meta[key]); plan != "" {
+			return plan
+		}
+	}
+	if hasTruthyMetadataKey(meta, "has_claude_max", "hasClaudeMax", "has_max", "hasMax", "is_max", "isMax", "max") {
+		return "max"
+	}
+	if hasTruthyMetadataKey(meta, "has_claude_pro", "hasClaudePro", "has_pro", "hasPro", "is_pro", "isPro", "pro") {
+		return "pro"
+	}
+	for key, value := range meta {
+		if metadataKeyMayContainPlanType(key) {
+			if plan := normalizeSubscriptionPlanSignal(value); plan != "" {
+				return plan
+			}
+		}
+		if nested, ok := metadataObject(value); ok {
+			if plan := subscriptionPlanTypeFromMetadata(nested); plan != "" {
+				return plan
+			}
+		}
+		if list, ok := value.([]any); ok {
+			for _, item := range list {
+				if nested, ok := metadataObject(item); ok {
+					if plan := subscriptionPlanTypeFromMetadata(nested); plan != "" {
+						return plan
+					}
+				}
+			}
+		}
+	}
+	return ""
+}
+
+func metadataKeyMayContainPlanType(key string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(key))
+	for _, marker := range []string{"plan", "tier", "subscription", "account_type", "entitlement"} {
+		if strings.Contains(normalized, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeSubscriptionPlanSignal(raw any) string {
+	switch value := raw.(type) {
+	case string:
+		return strings.TrimSpace(value)
+	case json.Number:
+		return strings.TrimSpace(value.String())
+	default:
+		return ""
+	}
+}
+
+func hasTruthyMetadataKey(meta map[string]any, keys ...string) bool {
+	if len(meta) == 0 {
+		return false
+	}
+	wanted := make(map[string]struct{}, len(keys))
+	for _, key := range keys {
+		wanted[compactMetadataKey(key)] = struct{}{}
+	}
+	for key, value := range meta {
+		if _, ok := wanted[compactMetadataKey(key)]; ok {
+			if parsed, okParse := parseBoolAny(value); okParse && parsed {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func compactMetadataKey(key string) string {
+	return strings.ToLower(strings.NewReplacer("_", "", "-", "").Replace(strings.TrimSpace(key)))
+}
+
 func refreshDisabledFromMetadata(meta map[string]any) bool {
 	if len(meta) == 0 {
 		return false

@@ -80,6 +80,89 @@ func TestRefreshDisabled(t *testing.T) {
 	}
 }
 
+func TestSubscriptionPlanTypeFromNestedClaudeProfile(t *testing.T) {
+	tests := []struct {
+		name string
+		auth *Auth
+		want string
+	}{
+		{
+			name: "canonical metadata wins",
+			auth: &Auth{Metadata: map[string]any{
+				"plan_type": "max",
+				"quota_snapshot": map[string]any{
+					"profile": map[string]any{"subscription": map[string]any{"has_claude_pro": true}},
+				},
+			}},
+			want: "max",
+		},
+		{
+			name: "nested max boolean",
+			auth: &Auth{Metadata: map[string]any{
+				"quota_snapshot": map[string]any{
+					"profile": map[string]any{"subscription": map[string]any{"has_claude_max": true}},
+				},
+			}},
+			want: "max",
+		},
+		{
+			name: "nested subscription tier string",
+			auth: &Auth{Metadata: map[string]any{
+				"quota_snapshot": map[string]any{
+					"profile": map[string]any{"subscription": map[string]any{"subscription_tier": "Claude Pro"}},
+				},
+			}},
+			want: "Claude Pro",
+		},
+		{
+			name: "attributes fallback",
+			auth: &Auth{Attributes: map[string]string{"plan_type": "plus"}},
+			want: "plus",
+		},
+		{
+			name: "reauth required blocks stale premium plan",
+			auth: &Auth{
+				Metadata: map[string]any{
+					"quota_refresh_status": "reauth_required",
+					"plan_type":            "max",
+					"quota_snapshot": map[string]any{
+						"profile": map[string]any{"subscription": map[string]any{"has_claude_max": true}},
+					},
+				},
+				Attributes: map[string]string{"plan_type": "max"},
+			},
+			want: "",
+		},
+		{
+			name: "legacy unauthorized error blocks stale premium plan",
+			auth: &Auth{
+				Metadata: map[string]any{
+					"quota_refresh_status": "error",
+					"quota_refresh_error":  "quota endpoint returned 401: invalid token",
+					"plan_type":            "max",
+				},
+				Attributes: map[string]string{"plan_type": "max"},
+			},
+			want: "",
+		},
+		{
+			name: "refresh disabled imported plan remains usable",
+			auth: &Auth{Metadata: map[string]any{
+				"refresh_disabled": true,
+				"plan_type":        "max",
+			}},
+			want: "max",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.auth.SubscriptionPlanType(); got != tt.want {
+				t.Fatalf("SubscriptionPlanType() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestEnsureIndexUsesCredentialIdentity(t *testing.T) {
 	t.Parallel()
 

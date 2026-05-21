@@ -195,6 +195,90 @@ func createAuthForChannel(channel string) *Auth {
 	}
 }
 
+func TestResolveOAuthUpstreamModel_GatesClaudeOpus1MAliasByPlan(t *testing.T) {
+	aliases := map[string][]internalconfig.OAuthModelAlias{
+		"claude": {
+			{Name: "claude-opus-4-7", Alias: "opus[1m]", Fork: true},
+			{Name: "claude-opus-4-7", Alias: "claude-opus-4-7[1m]", Fork: true},
+			{Name: "claude-opus-4-6", Alias: "my-opus", Fork: true},
+		},
+	}
+
+	tests := []struct {
+		name string
+		auth *Auth
+		want string
+	}{
+		{
+			name: "pro without credits blocks alias",
+			auth: &Auth{Provider: "claude", Attributes: map[string]string{"auth_kind": "oauth", "plan_type": "pro"}},
+			want: "",
+		},
+		{
+			name: "unknown local plan blocks alias",
+			auth: &Auth{Provider: "claude", Attributes: map[string]string{"auth_kind": "oauth"}},
+			want: "",
+		},
+		{
+			name: "pro with credits still blocks alias",
+			auth: &Auth{
+				Provider: "claude",
+				Attributes: map[string]string{
+					"auth_kind":           "oauth",
+					"plan_type":           "pro",
+					"extra_usage_enabled": "true",
+				},
+			},
+			want: "",
+		},
+		{
+			name: "max allows alias",
+			auth: &Auth{Provider: "claude", Attributes: map[string]string{"auth_kind": "oauth", "plan_type": "max"}},
+			want: "claude-opus-4-7",
+		},
+		{
+			name: "nested max profile allows alias",
+			auth: &Auth{
+				Provider:   "claude",
+				Attributes: map[string]string{"auth_kind": "oauth"},
+				Metadata: map[string]any{
+					"quota_snapshot": map[string]any{
+						"profile": map[string]any{
+							"subscription": map[string]any{"has_claude_max": true},
+						},
+					},
+				},
+			},
+			want: "claude-opus-4-7",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mgr := NewManager(nil, nil, nil)
+			mgr.SetConfig(&internalconfig.Config{})
+			mgr.SetOAuthModelAlias(aliases)
+
+			if got := mgr.resolveOAuthUpstreamModel(tt.auth, "opus[1m]"); got != tt.want {
+				t.Fatalf("resolveOAuthUpstreamModel(opus[1m]) = %q, want %q", got, tt.want)
+			}
+			if got := mgr.resolveOAuthUpstreamModel(tt.auth, "claude-opus-4-7[1m]"); got != tt.want {
+				t.Fatalf("resolveOAuthUpstreamModel(claude-opus-4-7[1m]) = %q, want %q", got, tt.want)
+			}
+			wantCustomAlias := ""
+			if tt.want != "" {
+				wantCustomAlias = "claude-opus-4-6"
+			}
+			if got := mgr.resolveOAuthUpstreamModel(tt.auth, "my-opus"); got != wantCustomAlias {
+				t.Fatalf("resolveOAuthUpstreamModel(my-opus) = %q, want %q", got, wantCustomAlias)
+			}
+			if got := mgr.resolveOAuthUpstreamModel(tt.auth, "claude-opus-4-7"); got != "" {
+				t.Fatalf("base claude-opus-4-7 should not need alias resolution, got %q", got)
+			}
+		})
+	}
+}
+
 func TestOAuthModelAliasChannel_Kimi(t *testing.T) {
 	t.Parallel()
 
@@ -248,7 +332,7 @@ func TestResolveOAuthUpstreamModel_DefaultClaude1MAliases(t *testing.T) {
 	mgr.SetConfig(&internalconfig.Config{})
 	mgr.SetOAuthModelAlias(cfg.OAuthModelAlias)
 
-	auth := createAuthForChannel("claude")
+	auth := &Auth{Provider: "claude", Attributes: map[string]string{"auth_kind": "oauth", "plan_type": "max"}}
 	tests := map[string]string{
 		"sonnet[1m]":            "claude-sonnet-4-6",
 		"opus[1m]":              "claude-opus-4-7",

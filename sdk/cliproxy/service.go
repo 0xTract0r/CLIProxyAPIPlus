@@ -923,7 +923,7 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 		models = registry.GetAntigravityModels()
 		models = applyExcludedModels(models, excluded)
 	case "claude":
-		claudePlanType := authSubscriptionPlanType(a)
+		claudePlanType := authClaudeSubscriptionPlanType(a)
 		claudeUsageCredits := claudeUsageCreditsEnabled(a)
 		models = registry.GetClaudeModelsForPlan(claudePlanType, claudeUsageCredits)
 		if entry := s.resolveConfigClaudeKey(a); entry != nil {
@@ -937,7 +937,7 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 		models = registry.FilterClaudeModelsForPlan(models, claudePlanType, claudeUsageCredits)
 		models = applyExcludedModels(models, excluded)
 	case "codex":
-		codexPlanType := authSubscriptionPlanType(a)
+		codexPlanType := authCodexSubscriptionPlanType(a)
 		models = registry.GetCodexModelsForPlan(codexPlanType)
 		if entry := s.resolveConfigCodexKey(a); entry != nil {
 			if len(entry.Models) > 0 {
@@ -1060,6 +1060,9 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 		}
 	}
 	models = applyOAuthModelAlias(s.cfg, provider, authKind, models)
+	if provider == "claude" {
+		models = registry.FilterClaudeModelsForPlan(models, authClaudeSubscriptionPlanType(a), claudeUsageCreditsEnabled(a))
+	}
 	if len(models) > 0 {
 		key := provider
 		if key == "" {
@@ -1073,16 +1076,15 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 }
 
 func authSubscriptionPlanType(auth *coreauth.Auth) string {
-	if auth == nil {
-		return ""
-	}
-	if value := authMetadataString(auth.Metadata, "plan_type"); value != "" {
-		return value
-	}
-	if auth.Attributes != nil {
-		return strings.TrimSpace(auth.Attributes["plan_type"])
-	}
-	return ""
+	return auth.SubscriptionPlanType()
+}
+
+func authClaudeSubscriptionPlanType(auth *coreauth.Auth) string {
+	return registry.NormalizeClaudeSubscriptionPlan(authSubscriptionPlanType(auth))
+}
+
+func authCodexSubscriptionPlanType(auth *coreauth.Auth) string {
+	return registry.NormalizeCodexSubscriptionPlan(authSubscriptionPlanType(auth))
 }
 
 func claudeUsageCreditsEnabled(auth *coreauth.Auth) bool {
