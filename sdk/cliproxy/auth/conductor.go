@@ -103,6 +103,9 @@ type Result struct {
 	Success bool
 	// RetryAfter carries a provider supplied retry hint (e.g. 429 retryDelay).
 	RetryAfter *time.Duration
+	// QuotaExceeded marks successful responses whose provider quota headers already
+	// indicate the selected auth should cool down before the next request.
+	QuotaExceeded bool
 	// Error describes the failure when Success is false.
 	Error *Error
 }
@@ -824,7 +827,9 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, re
 				if se, ok := errors.AsType[cliproxyexecutor.StatusError](chunk.Err); ok && se != nil {
 					rerr.HTTPStatus = se.StatusCode()
 				}
-				m.MarkResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr})
+				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
+				result.RetryAfter = retryAfterFromError(chunk.Err)
+				m.MarkResult(ctx, result)
 			}
 			if !forward {
 				return false
@@ -854,7 +859,12 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, re
 			}
 		}
 		if !failed {
-			m.MarkResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: true})
+			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: true}
+			if retryAfter := quotaRetryAfterFromHeaders(provider, headers, time.Now()); retryAfter != nil {
+				result.QuotaExceeded = true
+				result.RetryAfter = retryAfter
+			}
+			m.MarkResult(ctx, result)
 		}
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: headers, Chunks: out}
@@ -1395,6 +1405,10 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				authErr = errExec
 				continue
 			}
+			if retryAfter := quotaRetryAfterFromHeaders(provider, resp.Headers, time.Now()); retryAfter != nil {
+				result.QuotaExceeded = true
+				result.RetryAfter = retryAfter
+			}
 			m.MarkResult(execCtx, result)
 			return resp, nil
 		}
@@ -1472,6 +1486,10 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				}
 				authErr = errExec
 				continue
+			}
+			if retryAfter := quotaRetryAfterFromHeaders(provider, resp.Headers, time.Now()); retryAfter != nil {
+				result.QuotaExceeded = true
+				result.RetryAfter = retryAfter
 			}
 			m.MarkResult(execCtx, result)
 			return resp, nil
@@ -2046,16 +2064,40 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		if result.Success {
 			if result.Model != "" {
 				state := ensureModelState(auth, result.Model)
-				resetModelState(state, now)
-				updateAggregatedAvailability(auth, now)
-				if !hasModelError(auth, now) {
-					auth.LastError = nil
-					auth.StatusMessage = ""
-					auth.Status = StatusActive
+				if result.QuotaExceeded && result.RetryAfter != nil && *result.RetryAfter > 0 {
+					next := now.Add(*result.RetryAfter)
+					state.Unavailable = true
+					state.Status = StatusError
+					state.StatusMessage = "quota exhausted"
+					state.NextRetryAfter = next
+					state.LastError = &Error{Code: "quota_exhausted", Message: "quota exhausted", HTTPStatus: http.StatusTooManyRequests}
+					state.Quota = QuotaState{
+						Exceeded:      true,
+						Reason:        "quota",
+						NextRecoverAt: next,
+						BackoffLevel:  state.Quota.BackoffLevel,
+					}
+					state.UpdatedAt = now
+					auth.LastError = cloneError(state.LastError)
+					auth.StatusMessage = state.StatusMessage
+					auth.Status = StatusError
+					auth.UpdatedAt = now
+					updateAggregatedAvailability(auth, now)
+					suspendReason = "quota"
+					shouldSuspendModel = true
+					setModelQuota = true
+				} else {
+					resetModelState(state, now)
+					updateAggregatedAvailability(auth, now)
+					if !hasModelError(auth, now) {
+						auth.LastError = nil
+						auth.StatusMessage = ""
+						auth.Status = StatusActive
+					}
+					auth.UpdatedAt = now
+					shouldResumeModel = true
+					clearModelQuota = true
 				}
-				auth.UpdatedAt = now
-				shouldResumeModel = true
-				clearModelQuota = true
 			} else {
 				clearAuthStateOnSuccess(auth, now)
 			}
@@ -2415,6 +2457,62 @@ func retryAfterFromError(err error) *time.Duration {
 	}
 	value := *retryAfter
 	return &value
+}
+
+func quotaRetryAfterFromHeaders(provider string, headers http.Header, now time.Time) *time.Duration {
+	if !strings.EqualFold(strings.TrimSpace(provider), "codex") || len(headers) == 0 {
+		return nil
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	var latest time.Time
+	for _, prefix := range []string{"X-Codex", "X-Codex-Bengalfox"} {
+		if quotaHeaderPercentExhausted(headers.Get(prefix + "-Primary-Used-Percent")) {
+			if resetAt := quotaHeaderResetTime(headers, prefix+"-Primary", now); resetAt.After(latest) {
+				latest = resetAt
+			}
+		}
+		if quotaHeaderPercentExhausted(headers.Get(prefix + "-Secondary-Used-Percent")) {
+			if resetAt := quotaHeaderResetTime(headers, prefix+"-Secondary", now); resetAt.After(latest) {
+				latest = resetAt
+			}
+		}
+	}
+	if latest.IsZero() || !latest.After(now) {
+		return nil
+	}
+	retryAfter := latest.Sub(now)
+	return &retryAfter
+}
+
+func quotaHeaderPercentExhausted(raw string) bool {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return false
+	}
+	value, err := strconv.ParseFloat(raw, 64)
+	return err == nil && value >= 100
+}
+
+func quotaHeaderResetTime(headers http.Header, prefix string, now time.Time) time.Time {
+	if headers == nil {
+		return time.Time{}
+	}
+	if raw := strings.TrimSpace(headers.Get(prefix + "-Reset-At")); raw != "" {
+		if unixSeconds, err := strconv.ParseInt(raw, 10, 64); err == nil && unixSeconds > 0 {
+			resetAt := time.Unix(unixSeconds, 0)
+			if resetAt.After(now) {
+				return resetAt
+			}
+		}
+	}
+	if raw := strings.TrimSpace(headers.Get(prefix + "-Reset-After-Seconds")); raw != "" {
+		if seconds, err := strconv.ParseInt(raw, 10, 64); err == nil && seconds > 0 {
+			return now.Add(time.Duration(seconds) * time.Second)
+		}
+	}
+	return time.Time{}
 }
 
 func statusCodeFromResult(err *Error) int {

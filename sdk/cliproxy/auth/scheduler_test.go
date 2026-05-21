@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strconv"
 	"testing"
 	"time"
 
@@ -33,6 +34,24 @@ func (schedulerTestExecutor) CountTokens(ctx context.Context, auth *Auth, req cl
 
 func (schedulerTestExecutor) HttpRequest(ctx context.Context, auth *Auth, req *http.Request) (*http.Response, error) {
 	return nil, nil
+}
+
+type retryAfterStatusErr struct {
+	code       int
+	msg        string
+	retryAfter time.Duration
+}
+
+func (e retryAfterStatusErr) Error() string { return e.msg }
+
+func (e retryAfterStatusErr) StatusCode() int { return e.code }
+
+func (e retryAfterStatusErr) RetryAfter() *time.Duration {
+	if e.retryAfter <= 0 {
+		return nil
+	}
+	value := e.retryAfter
+	return &value
 }
 
 type trackingSelector struct {
@@ -840,6 +859,122 @@ func TestManager_SchedulerSkipsPlanQuotaPlusAndKeepsProAvailable(t *testing.T) {
 	}
 	if got == nil || got.ID != "codex-pro" {
 		t.Fatalf("scheduler.pickSingle() auth = %v, want codex-pro", got)
+	}
+}
+
+func TestManager_StreamChunkUsageLimitMarksPlanQuota(t *testing.T) {
+	t.Parallel()
+
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	auth := &Auth{ID: "codex-plus-stream", Provider: "codex", Attributes: map[string]string{"plan_type": "plus"}}
+	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+
+	retryAfter := 2 * time.Hour
+	remaining := make(chan cliproxyexecutor.StreamChunk, 1)
+	remaining <- cliproxyexecutor.StreamChunk{Err: retryAfterStatusErr{
+		code:       http.StatusTooManyRequests,
+		msg:        "You've hit your usage limit. Upgrade to Pro or try again later.",
+		retryAfter: retryAfter,
+	}}
+	close(remaining)
+
+	result := manager.wrapStreamResult(
+		context.Background(),
+		auth.Clone(),
+		"codex",
+		"gpt-5.5",
+		nil,
+		[]cliproxyexecutor.StreamChunk{{Payload: []byte("data: first\n\n")}},
+		remaining,
+	)
+	for range result.Chunks {
+	}
+
+	got, ok := manager.GetByID(auth.ID)
+	if !ok || got == nil {
+		t.Fatalf("GetByID() = (%v, %v), want auth", got, ok)
+	}
+	state := got.ModelStates["gpt-5.5"]
+	if state == nil {
+		t.Fatal("ModelStates[gpt-5.5] missing")
+	}
+	if !state.Quota.Exceeded {
+		t.Fatal("Quota.Exceeded = false, want true for usage-limit stream error")
+	}
+	if state.Quota.Reason != "quota" {
+		t.Fatalf("Quota.Reason = %q, want quota", state.Quota.Reason)
+	}
+	if state.NextRetryAfter.Before(time.Now().Add(retryAfter - time.Minute)) {
+		t.Fatalf("NextRetryAfter = %v, want roughly now + %v", state.NextRetryAfter, retryAfter)
+	}
+}
+
+func TestManager_StreamSuccessCodexExhaustedHeaderCoolsAuth(t *testing.T) {
+	t.Parallel()
+
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	model := "gpt-5.5"
+	plusID := "codex-plus-header-exhausted"
+	proID := "codex-pro-header-available"
+	reg := registry.GetGlobalRegistry()
+	for _, id := range []string{plusID, proID} {
+		reg.RegisterClient(id, "codex", []*registry.ModelInfo{{ID: model}})
+	}
+	t.Cleanup(func() {
+		for _, id := range []string{plusID, proID} {
+			reg.UnregisterClient(id)
+		}
+	})
+	plusAuth := &Auth{ID: plusID, Provider: "codex", Attributes: map[string]string{"plan_type": "plus"}}
+	proAuth := &Auth{ID: proID, Provider: "codex", Attributes: map[string]string{"plan_type": "pro"}}
+	for _, auth := range []*Auth{plusAuth, proAuth} {
+		if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+			t.Fatalf("Register(%s) error = %v", auth.ID, errRegister)
+		}
+	}
+
+	resetAt := time.Now().Add(2 * time.Hour)
+	headers := http.Header{}
+	headers.Set("X-Codex-Primary-Used-Percent", "100")
+	headers.Set("X-Codex-Primary-Reset-At", strconv.FormatInt(resetAt.Unix(), 10))
+	remaining := make(chan cliproxyexecutor.StreamChunk)
+	close(remaining)
+
+	result := manager.wrapStreamResult(
+		context.Background(),
+		plusAuth.Clone(),
+		"codex",
+		model,
+		headers,
+		[]cliproxyexecutor.StreamChunk{{Payload: []byte("data: done\n\n")}},
+		remaining,
+	)
+	for range result.Chunks {
+	}
+
+	gotPlus, ok := manager.GetByID(plusID)
+	if !ok || gotPlus == nil {
+		t.Fatalf("GetByID(%s) = (%v, %v), want auth", plusID, gotPlus, ok)
+	}
+	state := gotPlus.ModelStates[model]
+	if state == nil {
+		t.Fatalf("ModelStates[%s] missing", model)
+	}
+	if !state.Quota.Exceeded {
+		t.Fatal("Quota.Exceeded = false, want true from exhausted Codex success headers")
+	}
+	if state.NextRetryAfter.Before(resetAt.Add(-time.Minute)) {
+		t.Fatalf("NextRetryAfter = %v, want near reset %v", state.NextRetryAfter, resetAt)
+	}
+
+	picked, errPick := manager.scheduler.pickSingle(context.Background(), "codex", model, cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("scheduler.pickSingle() error = %v", errPick)
+	}
+	if picked == nil || picked.ID != proID {
+		t.Fatalf("scheduler.pickSingle() auth = %v, want %s", picked, proID)
 	}
 }
 
