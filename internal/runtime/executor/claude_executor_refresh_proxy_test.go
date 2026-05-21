@@ -56,6 +56,8 @@ func TestClaudeExecutor_Refresh_UsesAccountProxyURL(t *testing.T) {
 }
 
 func TestClaudeExecutor_Execute_TransportErrorIsBadGateway(t *testing.T) {
+	disableClaudeTransportRetryBackoff(t)
+
 	exec := NewClaudeExecutor(&config.Config{})
 	auth := &cliproxyauth.Auth{
 		Provider: "claude",

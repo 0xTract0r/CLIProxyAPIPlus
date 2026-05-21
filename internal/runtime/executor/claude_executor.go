@@ -136,7 +136,7 @@ func (e *ClaudeExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Aut
 	}
 	ctx = helps.WithRuntimeTransportHostFromRequest(ctx, httpReq)
 	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
-	return httpClient.Do(httpReq)
+	return doClaudeHTTPWithTransportRetry(ctx, httpClient, httpReq)
 }
 
 func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
@@ -241,7 +241,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 
 	ctx = helps.WithRuntimeTransportHostFromRequest(ctx, httpReq)
 	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
-	httpResp, err := httpClient.Do(httpReq)
+	httpResp, err := doClaudeHTTPWithTransportRetry(ctx, httpClient, httpReq)
 	if err != nil {
 		recordAPIResponseError(ctx, e.cfg, err)
 		return resp, claudeUpstreamTransportError(err)
@@ -420,7 +420,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 
 	ctx = helps.WithRuntimeTransportHostFromRequest(ctx, httpReq)
 	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
-	httpResp, err := httpClient.Do(httpReq)
+	httpResp, err := doClaudeHTTPWithTransportRetry(ctx, httpClient, httpReq)
 	if err != nil {
 		recordAPIResponseError(ctx, e.cfg, err)
 		return nil, claudeUpstreamTransportError(err)
@@ -598,7 +598,7 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 
 	ctx = helps.WithRuntimeTransportHostFromRequest(ctx, httpReq)
 	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
-	resp, err := httpClient.Do(httpReq)
+	resp, err := doClaudeHTTPWithTransportRetry(ctx, httpClient, httpReq)
 	if err != nil {
 		recordAPIResponseError(ctx, e.cfg, err)
 		return cliproxyexecutor.Response{}, claudeUpstreamTransportError(err)
