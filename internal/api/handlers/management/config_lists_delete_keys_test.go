@@ -1,6 +1,7 @@
 package management
 
 import (
+	"bytes"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -14,12 +15,102 @@ import (
 func writeTestConfigFile(t *testing.T) string {
 	t.Helper()
 
+	return writeTestConfigFileWithContent(t, "{}\n")
+}
+
+func writeTestConfigFileWithContent(t *testing.T, content string) string {
+	t.Helper()
+
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yaml")
-	if errWrite := os.WriteFile(path, []byte("{}\n"), 0o600); errWrite != nil {
+	if errWrite := os.WriteFile(path, []byte(content), 0o600); errWrite != nil {
 		t.Fatalf("failed to write test config: %v", errWrite)
 	}
 	return path
+}
+
+func TestPutAPIKeysPersistsToConfigFile(t *testing.T) {
+	t.Parallel()
+	gin.SetMode(gin.TestMode)
+
+	configPath := writeTestConfigFile(t)
+	h := &Handler{
+		cfg:            &config.Config{},
+		configFilePath: configPath,
+	}
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPut, "/v0/management/api-keys", bytes.NewBufferString(`["key-one","key-two"]`))
+
+	h.PutAPIKeys(c)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	loaded, errLoad := config.LoadConfig(configPath)
+	if errLoad != nil {
+		t.Fatalf("failed to reload config: %v", errLoad)
+	}
+	if len(loaded.APIKeys) != 2 || loaded.APIKeys[0] != "key-one" || loaded.APIKeys[1] != "key-two" {
+		t.Fatalf("api-keys not persisted: %#v", loaded.APIKeys)
+	}
+}
+
+func TestPatchAPIKeysAppendPersistsToConfigFile(t *testing.T) {
+	t.Parallel()
+	gin.SetMode(gin.TestMode)
+
+	configPath := writeTestConfigFileWithContent(t, "api-keys:\n  - key-one\n")
+	h := &Handler{
+		cfg:            &config.Config{SDKConfig: config.SDKConfig{APIKeys: []string{"key-one"}}},
+		configFilePath: configPath,
+	}
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPatch, "/v0/management/api-keys", bytes.NewBufferString(`{"old":"missing","new":"key-two"}`))
+
+	h.PatchAPIKeys(c)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	loaded, errLoad := config.LoadConfig(configPath)
+	if errLoad != nil {
+		t.Fatalf("failed to reload config: %v", errLoad)
+	}
+	if len(loaded.APIKeys) != 2 || loaded.APIKeys[0] != "key-one" || loaded.APIKeys[1] != "key-two" {
+		t.Fatalf("patched api-keys not persisted: %#v", loaded.APIKeys)
+	}
+}
+
+func TestDeleteAPIKeysPersistsToConfigFile(t *testing.T) {
+	t.Parallel()
+	gin.SetMode(gin.TestMode)
+
+	configPath := writeTestConfigFileWithContent(t, "api-keys:\n  - key-one\n  - key-two\n")
+	h := &Handler{
+		cfg:            &config.Config{SDKConfig: config.SDKConfig{APIKeys: []string{"key-one", "key-two"}}},
+		configFilePath: configPath,
+	}
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodDelete, "/v0/management/api-keys?index=0", nil)
+
+	h.DeleteAPIKeys(c)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	loaded, errLoad := config.LoadConfig(configPath)
+	if errLoad != nil {
+		t.Fatalf("failed to reload config: %v", errLoad)
+	}
+	if len(loaded.APIKeys) != 1 || loaded.APIKeys[0] != "key-two" {
+		t.Fatalf("deleted api-keys not persisted: %#v", loaded.APIKeys)
+	}
 }
 
 func TestDeleteGeminiKey_RequiresBaseURLWhenAPIKeyDuplicated(t *testing.T) {
