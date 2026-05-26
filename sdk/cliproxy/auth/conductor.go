@@ -67,8 +67,14 @@ const (
 	// refreshIneffectiveBackoff throttles refresh attempts when a refresh call
 	// returns success but still leaves the auth in a refreshable state.
 	refreshIneffectiveBackoff = 30 * time.Second
-	quotaBackoffBase          = time.Second
-	quotaBackoffMax           = 30 * time.Minute
+	// refreshMinDwellFallback is the floor for the anti-thrash backoff used
+	// after a successful refresh when the upstream provider does not return a
+	// parseable expiry. It is intentionally longer than refreshIneffectiveBackoff
+	// so a short lead time cannot create a tight refresh loop that hammers the
+	// token endpoint and rewrites the auth file every minute.
+	refreshMinDwellFallback = 15 * time.Minute
+	quotaBackoffBase        = time.Second
+	quotaBackoffMax         = 30 * time.Minute
 	// transientRateLimitCooldown is the brief cooldown applied to non-plan-quota
 	// 429 responses (e.g. model capacity, TPM bursts) so other auths can be tried
 	// while this one recovers within a short window.
@@ -3540,10 +3546,51 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 	updated.NextRefreshAfter = time.Time{}
 	updated.LastError = nil
 	updated.UpdatedAt = now
+	// Anti-thrash guard: if a successful refresh still leaves the auth in a
+	// refreshable state (e.g. the upstream access_token TTL is shorter than the
+	// provider's configured refresh lead), schedule the next refresh based on
+	// the new token's remaining lifetime instead of the very short
+	// refreshIneffectiveBackoff. Otherwise the auto-refresh loop would issue
+	// another refresh almost immediately, rewriting the auth file every minute
+	// and burning token endpoint quota.
 	if m.shouldRefresh(updated, now) {
-		updated.NextRefreshAfter = now.Add(refreshIneffectiveBackoff)
+		updated.NextRefreshAfter = now.Add(antiThrashRefreshBackoff(updated, now))
 	}
 	_, _ = m.Update(ctx, updated)
+}
+
+// antiThrashRefreshBackoff returns the minimum wait that must elapse before
+// auth becomes eligible for another refresh after a successful refresh whose
+// shouldRefresh check would otherwise immediately fire again. The goal is to
+// guarantee that each issued access_token is used for a meaningful fraction of
+// its real lifetime so the system stops hammering the upstream token endpoint.
+//
+// Selection rules:
+//   - If the freshly-issued token has a parseable expiry, wait until half of
+//     its remaining lifetime has elapsed (clamped to refreshIneffectiveBackoff
+//     as a lower bound to avoid pathological 0/negative values).
+//   - Otherwise fall back to refreshMinDwellFallback, which is intentionally
+//     long enough that thrash cannot recur even when the executor reports no
+//     expiry at all.
+func antiThrashRefreshBackoff(auth *Auth, now time.Time) time.Duration {
+	if auth == nil {
+		return refreshMinDwellFallback
+	}
+	expiry, ok := auth.ExpirationTime()
+	if !ok || expiry.IsZero() {
+		return refreshMinDwellFallback
+	}
+	ttl := expiry.Sub(now)
+	if ttl <= 0 {
+		// Token already expired (or upstream returned a stale expiry): keep
+		// the legacy short backoff so a real refresh retry can happen soon.
+		return refreshIneffectiveBackoff
+	}
+	half := ttl / 2
+	if half < refreshIneffectiveBackoff {
+		return refreshIneffectiveBackoff
+	}
+	return half
 }
 
 func (m *Manager) executorFor(provider string) ProviderExecutor {
