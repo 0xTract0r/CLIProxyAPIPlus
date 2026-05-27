@@ -204,7 +204,7 @@ type Config struct {
 type CyberPolicyAlertConfig struct {
 	// WebhookURL receives an asynchronous JSON POST when a cyber_policy hit is
 	// recorded. Default is empty (disabled).
-	WebhookURL string `yaml:"webhook_url" json:"webhook_url"`
+	WebhookURL string `yaml:"webhook-url" json:"webhook-url"`
 }
 
 // ClaudeHeaderDefaults configures default header values injected into Claude API requests.

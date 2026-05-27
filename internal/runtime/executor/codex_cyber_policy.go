@@ -57,22 +57,32 @@ func (e *CodexExecutor) recordCyberPolicy(ctx context.Context, auth *cliproxyaut
 
 	count := 0
 	detectedAt := time.Now().UTC()
+	var persistErr error
 	if e.authManager != nil && authID != "" {
-		newCount, ts := e.authManager.IncrementCyberPolicyCount(ctx, authID)
+		newCount, ts, err := e.authManager.IncrementCyberPolicyCount(ctx, authID)
 		if !ts.IsZero() {
 			detectedAt = ts
 		}
 		count = newCount
+		persistErr = err
 	}
 
-	helps.LogWithRequestID(ctx).WithFields(log.Fields{
+	logFields := log.Fields{
 		"auth_id":  authID,
 		"provider": provider,
 		"label":    label,
 		"code":     "cyber_policy",
 		"model":    model,
 		"count":    count,
-	}).Warn("upstream cyber_policy flag")
+	}
+	if persistErr != nil {
+		// 持久化失败：in-memory 计数已 bump 但重启后会丢失。升级到 ERROR 级，
+		// 同时抑制 webhook 以避免下游 operator 看到一次只在内存生效的告警。
+		helps.LogWithRequestID(ctx).WithFields(logFields).WithError(persistErr).
+			Error("upstream cyber_policy flag: persist failed; webhook suppressed")
+		return count > 0
+	}
+	helps.LogWithRequestID(ctx).WithFields(logFields).Warn("upstream cyber_policy flag")
 
 	webhookURL := ""
 	if e.cfg != nil {

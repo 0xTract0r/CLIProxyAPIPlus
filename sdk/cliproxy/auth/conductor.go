@@ -1196,32 +1196,44 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 }
 
 // IncrementCyberPolicyCount atomically bumps the cyber_policy flag counter and
-// timestamp for the auth with the given ID, persisting the change via Update.
-// It returns the new count and the timestamp recorded. When the auth cannot be
-// located it returns (0, zero time) and does not call Update.
-func (m *Manager) IncrementCyberPolicyCount(ctx context.Context, authID string) (int, time.Time) {
+// timestamp for the auth with the given ID, then persists the change.
+//
+// The read-modify-write of CyberPolicyFlagCount / LastCyberPolicyAt happens
+// entirely under m.mu so concurrent hits cannot lose increments. Persistence
+// (store + hooks) runs after the lock is released to avoid re-entrant locking
+// inside Update / persist. When persistence fails the in-memory counter is
+// still bumped (visible to subsequent reads via m.auths) but the error is
+// surfaced so callers can suppress webhook dispatch and emit an ERROR log.
+//
+// Returns the new count, the timestamp recorded, and a persistence error if
+// any. When the auth cannot be located it returns (0, zero time, nil).
+func (m *Manager) IncrementCyberPolicyCount(ctx context.Context, authID string) (int, time.Time, error) {
 	authID = strings.TrimSpace(authID)
 	if authID == "" {
-		return 0, time.Time{}
+		return 0, time.Time{}, nil
 	}
+	now := time.Now().UTC()
 	m.mu.Lock()
 	existing, ok := m.auths[authID]
 	if !ok || existing == nil {
 		m.mu.Unlock()
-		return 0, time.Time{}
+		return 0, time.Time{}, nil
 	}
+	// 锁内完成 read-modify-write：直接修改 in-memory entry，避免并发丢增量。
+	existing.CyberPolicyFlagCount++
+	existing.LastCyberPolicyAt = now
+	newCount := existing.CyberPolicyFlagCount
 	snapshot := existing.Clone()
 	m.mu.Unlock()
 	if snapshot == nil {
-		return 0, time.Time{}
+		return newCount, now, nil
 	}
-	now := time.Now().UTC()
-	snapshot.CyberPolicyFlagCount++
-	snapshot.LastCyberPolicyAt = now
-	if _, err := m.Update(ctx, snapshot); err != nil {
-		return snapshot.CyberPolicyFlagCount, now
+	// 锁外做持久化：persist 内部不再 acquire m.mu，但保险起见仍然放到锁外。
+	// 失败时把 error 透出，让调用方决定是否抑制 webhook。
+	if err := m.persist(ctx, snapshot); err != nil {
+		return newCount, now, err
 	}
-	return snapshot.CyberPolicyFlagCount, now
+	return newCount, now, nil
 }
 
 // Load resets manager state from the backing store.

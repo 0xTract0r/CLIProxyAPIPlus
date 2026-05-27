@@ -85,15 +85,6 @@ func NewCodexWebsocketsExecutor(cfg *config.Config) *CodexWebsocketsExecutor {
 	}
 }
 
-// NewCodexWebsocketsExecutorWithManager wires the cyber_policy alert path into
-// the underlying CodexExecutor.
-func NewCodexWebsocketsExecutorWithManager(cfg *config.Config, manager *cliproxyauth.Manager) *CodexWebsocketsExecutor {
-	return &CodexWebsocketsExecutor{
-		CodexExecutor: NewCodexExecutorWithManager(cfg, manager),
-		store:         globalCodexWebsocketSessionStore,
-	}
-}
-
 type codexWebsocketRead struct {
 	conn    *websocket.Conn
 	msgType int
@@ -1522,12 +1513,13 @@ func NewCodexAutoExecutor(cfg *config.Config) *CodexAutoExecutor {
 }
 
 // NewCodexAutoExecutorWithManager wires the cyber_policy alert path through to
-// the embedded HTTP and websocket executors. Production wiring should prefer
-// this constructor so counter updates land on the live auth manager.
+// the embedded HTTP executor. The websocket path lacks frame-level cyber_policy
+// detection, so it intentionally stays on the no-manager constructor; do not
+// claim symmetry until WS frames are parsed for cyber_policy events.
 func NewCodexAutoExecutorWithManager(cfg *config.Config, manager *cliproxyauth.Manager) *CodexAutoExecutor {
 	return &CodexAutoExecutor{
 		httpExec: NewCodexExecutorWithManager(cfg, manager),
-		wsExec:   NewCodexWebsocketsExecutorWithManager(cfg, manager),
+		wsExec:   NewCodexWebsocketsExecutor(cfg),
 	}
 }
 
