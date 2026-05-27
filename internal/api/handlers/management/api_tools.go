@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -23,6 +25,26 @@ import (
 )
 
 const defaultAPICallTimeout = 60 * time.Second
+
+// Stage-level timeouts applied to the outbound transport used by APICall and
+// its OAuth token-refresh helpers. The outbound chain frequently traverses
+// third party proxy providers; without these the dial / TLS handshake phase
+// can stall for the full reverse-proxy budget (typically 30s) and surface
+// as 502 to the management UI even though the local server is healthy.
+//
+// These deadlines only apply to the outbound transport. The total wall-clock
+// budget for an APICall is still bounded by defaultAPICallTimeout above. We
+// keep apiCallResponseHeaderTimeout strictly below 30s so a stalled upstream
+// fails fast inside the handler with a structured 502 instead of being
+// truncated by the operator-facing reverse proxy.
+const (
+	apiCallDialTimeout            = 10 * time.Second
+	apiCallTLSHandshakeTimeout    = 10 * time.Second
+	apiCallResponseHeaderTimeout  = 25 * time.Second
+	apiCallExpectContinueTimeout  = 1 * time.Second
+	apiCallIdleConnectionTimeout  = 90 * time.Second
+	apiCallKeepAliveProbeInterval = 30 * time.Second
+)
 
 const (
 	geminiOAuthClientID     = "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com"
@@ -230,8 +252,16 @@ func (h *Handler) APICall(c *gin.Context) {
 
 	resp, errDo := httpClient.Do(req)
 	if errDo != nil {
-		log.WithError(errDo).Debug("management APICall request failed")
-		c.JSON(http.StatusBadGateway, gin.H{"error": "request failed"})
+		failureKind := classifyAPICallError(errDo)
+		log.WithError(errDo).WithFields(log.Fields{
+			"method":       method,
+			"url":          urlStr,
+			"failure_kind": failureKind,
+		}).Warn("management APICall request failed")
+		c.JSON(http.StatusBadGateway, gin.H{
+			"error":        "request failed",
+			"failure_kind": failureKind,
+		})
 		return
 	}
 	defer func() {
@@ -242,7 +272,16 @@ func (h *Handler) APICall(c *gin.Context) {
 
 	respBody, errReadAll := io.ReadAll(resp.Body)
 	if errReadAll != nil {
-		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to read response"})
+		failureKind := classifyAPICallError(errReadAll)
+		log.WithError(errReadAll).WithFields(log.Fields{
+			"method":       method,
+			"url":          urlStr,
+			"failure_kind": failureKind,
+		}).Warn("management APICall response read failed")
+		c.JSON(http.StatusBadGateway, gin.H{
+			"error":        "failed to read response",
+			"failure_kind": failureKind,
+		})
 		return
 	}
 
@@ -696,6 +735,19 @@ func (h *Handler) authByIndex(authIndex string) *coreauth.Auth {
 }
 
 func (h *Handler) apiCallTransport(auth *coreauth.Auth) http.RoundTripper {
+	transport, _ := h.apiCallTransportWithDialer(auth)
+	return transport
+}
+
+// apiCallTransportWithDialer returns the configured outbound transport along
+// with the *net.Dialer that drives its dial phase (when applicable). The
+// dialer is returned so tests can directly assert that the 10s dial timeout
+// is in effect. For SOCKS5 transports the inner dial is delegated to
+// proxyutil and we wrap it with a context-bound timeout instead of installing
+// a fresh net.Dialer; in that case the returned dialer reflects the
+// context-timeout used to bound the SOCKS5 connect, so its Timeout field
+// still equals apiCallDialTimeout.
+func (h *Handler) apiCallTransportWithDialer(auth *coreauth.Auth) (*http.Transport, *net.Dialer) {
 	var proxyCandidates []string
 	if auth != nil {
 		if proxyStr := strings.TrimSpace(auth.ProxyURL); proxyStr != "" {
@@ -714,18 +766,145 @@ func (h *Handler) apiCallTransport(auth *coreauth.Auth) http.RoundTripper {
 	}
 
 	for _, proxyStr := range proxyCandidates {
-		if transport := buildProxyTransport(proxyStr); transport != nil {
-			return transport
+		transport, scheme := buildProxyTransport(proxyStr)
+		if transport == nil {
+			continue
 		}
+		return hardenAPICallTransport(transport, scheme)
 	}
 
 	transport, ok := http.DefaultTransport.(*http.Transport)
 	if !ok || transport == nil {
-		return &http.Transport{Proxy: nil}
+		return hardenAPICallTransport(&http.Transport{Proxy: nil}, "")
 	}
 	clone := transport.Clone()
 	clone.Proxy = nil
-	return clone
+	return hardenAPICallTransport(clone, "")
+}
+
+// hardenedDialContext is the function-pointer type we use as a sentinel to
+// detect whether a transport has already been hardened by this package. We
+// rely on equality between function values being unreliable across closures,
+// so instead we install a small wrapper closure built from this constructor
+// and recognise it via the dialer it owns.
+type hardenedDialer struct {
+	dialer *net.Dialer
+	// wrapped is the original DialContext we replaced (only used for SOCKS5
+	// where we must keep proxyutil's inner dial logic intact).
+	wrapped func(ctx context.Context, network, addr string) (net.Conn, error)
+}
+
+// dialContext is the actual http.Transport DialContext function value. We
+// install this closure unconditionally on every harden call; the *net.Dialer
+// owned by this hardenedDialer is the authoritative timeout source, so
+// tests can pull it out via transportDialerFromContextKey-style indirection
+// (we expose it through apiCallTransportWithDialer instead of leaking
+// reflection into the test surface).
+func (hd *hardenedDialer) dialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	if hd.wrapped != nil {
+		// SOCKS5 path: bound the inner proxy dial with our dial timeout so a
+		// stalled SOCKS5 connect cannot exceed apiCallDialTimeout. Using
+		// context.WithTimeout preserves any tighter caller-supplied deadline.
+		dialCtx, cancel := context.WithTimeout(ctx, hd.dialer.Timeout)
+		defer cancel()
+		return hd.wrapped(dialCtx, network, addr)
+	}
+	// Direct / HTTP-proxy path: use the freshly-built dialer so its 10s
+	// Timeout field is the authoritative bound.
+	return hd.dialer.DialContext(ctx, network, addr)
+}
+
+// hardenAPICallTransport tightens the dial / TLS / response-header deadlines
+// on the outbound transport used by management APICall. The default
+// http.DefaultTransport DialContext is built from a 30s net.Dialer which
+// exactly matches a typical reverse-proxy idle budget; when the outbound
+// proxy chain stalls during connect, the local server returns 502 instead of
+// failing fast with a structured error.
+//
+// Implementation notes:
+//   - For direct / HTTP-proxy transports the underlying DialContext is the
+//     stdlib 30s dialer; we *unconditionally* replace it with a fresh 10s
+//     net.Dialer. We do NOT guard on `if transport.DialContext == nil`,
+//     because http.DefaultTransport.Clone() already populates DialContext
+//     and that guard would silently skip the harden step (this is the bug
+//     that the first attempt shipped with).
+//   - For SOCKS5 transports built by proxyutil the DialContext is a closure
+//     that owns the inner SOCKS5 dialer (including auth flow). We must not
+//     drop that closure, so we wrap it with context.WithTimeout sized to
+//     apiCallDialTimeout. Replacing the closure would discard the SOCKS5
+//     auth path.
+//   - Idempotency: re-applying this function is safe. Each call installs a
+//     fresh hardenedDialer wrapper; the previous wrapper (if any) is
+//     discarded. Because the harden function is only invoked from the
+//     apiCallTransport construction path and apiCallTransport is called per
+//     request, re-application happens at construction time, not per dial.
+//   - stage timeouts (TLS handshake / response header / etc.) are set
+//     unconditionally to the project-chosen values. The cloned default
+//     transport's defaults are either already equal (TLSHandshakeTimeout=10s)
+//     or unset; forcing the value ensures uniform behaviour across all
+//     proxy paths.
+func hardenAPICallTransport(transport *http.Transport, proxyScheme string) (*http.Transport, *net.Dialer) {
+	if transport == nil {
+		return nil, nil
+	}
+
+	dialer := &net.Dialer{
+		Timeout:   apiCallDialTimeout,
+		KeepAlive: apiCallKeepAliveProbeInterval,
+	}
+
+	// Distinguish SOCKS5 (proxyutil installs a custom DialContext closure that
+	// must be preserved) from direct / HTTP-proxy (stdlib dialer.DialContext).
+	hd := &hardenedDialer{dialer: dialer}
+	scheme := strings.ToLower(strings.TrimSpace(proxyScheme))
+	if scheme == "socks5" || scheme == "socks5h" {
+		hd.wrapped = transport.DialContext
+	}
+	transport.DialContext = hd.dialContext
+
+	transport.TLSHandshakeTimeout = apiCallTLSHandshakeTimeout
+	transport.ResponseHeaderTimeout = apiCallResponseHeaderTimeout
+	transport.ExpectContinueTimeout = apiCallExpectContinueTimeout
+	transport.IdleConnTimeout = apiCallIdleConnectionTimeout
+	return transport, dialer
+}
+
+// classifyAPICallError maps an outbound transport error returned from
+// httpClient.Do into a stable label useful for both structured logging and
+// HTTP responses. The handler used to collapse every failure into a generic
+// 502 "request failed" which made it impossible to tell whether a stall
+// happened during DNS, dial, TLS or response-header phases.
+//
+// Ordering matters: errors.As walks the wrap chain, so a *net.OpError that
+// wraps a *net.DNSError will match both net.Error and *net.DNSError. DNS
+// errors must be checked before the generic net.Error timeout branch so we
+// don't mislabel a "DNS i/o timeout" as a plain "network_timeout".
+func classifyAPICallError(err error) string {
+	if err == nil {
+		return ""
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "context_deadline_exceeded"
+	}
+	if errors.Is(err, context.Canceled) {
+		return "context_canceled"
+	}
+	// DNS errors (including DNS i/o timeout) must be detected BEFORE the
+	// generic net.Error timeout branch — otherwise a wrapped DNS timeout is
+	// labelled "network_timeout" and the dns_error signal is lost.
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return "dns_error"
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return "network_timeout"
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		return "network_op_error:" + opErr.Op
+	}
+	return "transport_error"
 }
 
 type apiKeyConfigEntry interface {
@@ -845,13 +1024,31 @@ func resolveOpenAICompatAPIKeyProxyURL(cfg *config.Config, auth *coreauth.Auth, 
 	return ""
 }
 
-func buildProxyTransport(proxyStr string) *http.Transport {
+// buildProxyTransport returns the configured proxy transport along with the
+// proxy URL scheme (e.g. "socks5", "https"). The scheme is required by
+// hardenAPICallTransport so it can distinguish a SOCKS5 transport (whose
+// inner DialContext closure must be preserved and merely bounded with a
+// context timeout) from a direct or HTTP proxy transport (whose stdlib
+// 30s DialContext must be replaced outright by a 10s net.Dialer).
+func buildProxyTransport(proxyStr string) (*http.Transport, string) {
+	setting, errParse := proxyutil.Parse(proxyStr)
+	if errParse != nil {
+		log.WithError(errParse).Debug("parse proxy setting failed")
+		return nil, ""
+	}
 	transport, _, errBuild := proxyutil.BuildHTTPTransport(proxyStr)
 	if errBuild != nil {
 		log.WithError(errBuild).Debug("build proxy transport failed")
-		return nil
+		return nil, ""
 	}
-	return transport
+	if transport == nil {
+		return nil, ""
+	}
+	scheme := ""
+	if setting.URL != nil {
+		scheme = setting.URL.Scheme
+	}
+	return transport, scheme
 }
 
 // headerContainsValue checks whether a header map contains a target value (case-insensitive key and value).
@@ -1032,8 +1229,15 @@ func (h *Handler) GetCopilotQuota(c *gin.Context) {
 
 	resp, errDo := httpClient.Do(req)
 	if errDo != nil {
-		log.WithError(errDo).Debug("copilot quota request failed")
-		c.JSON(http.StatusBadGateway, gin.H{"error": "request failed"})
+		failureKind := classifyAPICallError(errDo)
+		log.WithError(errDo).WithFields(log.Fields{
+			"url":          apiURL,
+			"failure_kind": failureKind,
+		}).Warn("copilot quota request failed")
+		c.JSON(http.StatusBadGateway, gin.H{
+			"error":        "request failed",
+			"failure_kind": failureKind,
+		})
 		return
 	}
 	defer func() {
@@ -1044,7 +1248,15 @@ func (h *Handler) GetCopilotQuota(c *gin.Context) {
 
 	respBody, errReadAll := io.ReadAll(resp.Body)
 	if errReadAll != nil {
-		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to read response"})
+		failureKind := classifyAPICallError(errReadAll)
+		log.WithError(errReadAll).WithFields(log.Fields{
+			"url":          apiURL,
+			"failure_kind": failureKind,
+		}).Warn("copilot quota response read failed")
+		c.JSON(http.StatusBadGateway, gin.H{
+			"error":        "failed to read response",
+			"failure_kind": failureKind,
+		})
 		return
 	}
 
