@@ -427,3 +427,31 @@ nonstream-keepalive-interval: 0
 #       params: # JSON paths (gjson/sjson syntax) to remove from the payload
 #         - "generationConfig.thinkingConfig.thinkingBudget"
 #         - "generationConfig.responseJsonSchema"
+
+# Cyber policy alert side-channel for Codex `/v1/responses` upstream events.
+# When the upstream returns a `cyber_policy` flagged error (type=error or
+# type=response.failed with code=cyber_policy), the executor always emits a
+# structured WARN log and bumps the per-account CyberPolicyFlagCount /
+# LastCyberPolicyAt counters. When webhook-url is non-empty, a JSON envelope
+# is additionally POSTed to that URL asynchronously (5s timeout, no retries,
+# failures only log at WARN).
+#
+# Payload example (fields with empty string are omitted):
+#   {
+#     "event": "cyber_policy",
+#     "auth_id": "codex-alice",
+#     "provider": "codex",
+#     "label": "alice-prod",
+#     "model": "gpt-5.4-mini",
+#     "request_id": "req_01HXYZ...",
+#     "count": 3,
+#     "detected_at": "2026-05-27T09:12:33Z"
+#   }
+#
+# Security note: `auth_id` and `label` leave the host as part of the payload.
+# Operators must decide whether to sanitize them before exposing the webhook
+# endpoint to third parties. Persistence failures (e.g., store write errors)
+# suppress the webhook for that hit and log an ERROR line so the operator can
+# distinguish persisted alerts from purely in-memory increments.
+# cyber-policy-alert:
+#   webhook-url: "https://alerts.example.com/cyber-policy"
