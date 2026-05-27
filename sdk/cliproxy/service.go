@@ -423,7 +423,7 @@ func (s *Service) ensureExecutorsForAuthWithMode(a *coreauth.Auth, forceReplace 
 				}
 			}
 		}
-		s.coreManager.RegisterExecutor(executor.NewCodexAutoExecutor(s.cfg))
+		s.coreManager.RegisterExecutor(executor.NewCodexAutoExecutorWithManager(s.cfg, s.coreManager))
 		return
 	}
 	// Skip disabled auth entries when (re)binding executors.

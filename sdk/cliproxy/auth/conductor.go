@@ -1195,6 +1195,35 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	return auth.Clone(), nil
 }
 
+// IncrementCyberPolicyCount atomically bumps the cyber_policy flag counter and
+// timestamp for the auth with the given ID, persisting the change via Update.
+// It returns the new count and the timestamp recorded. When the auth cannot be
+// located it returns (0, zero time) and does not call Update.
+func (m *Manager) IncrementCyberPolicyCount(ctx context.Context, authID string) (int, time.Time) {
+	authID = strings.TrimSpace(authID)
+	if authID == "" {
+		return 0, time.Time{}
+	}
+	m.mu.Lock()
+	existing, ok := m.auths[authID]
+	if !ok || existing == nil {
+		m.mu.Unlock()
+		return 0, time.Time{}
+	}
+	snapshot := existing.Clone()
+	m.mu.Unlock()
+	if snapshot == nil {
+		return 0, time.Time{}
+	}
+	now := time.Now().UTC()
+	snapshot.CyberPolicyFlagCount++
+	snapshot.LastCyberPolicyAt = now
+	if _, err := m.Update(ctx, snapshot); err != nil {
+		return snapshot.CyberPolicyFlagCount, now
+	}
+	return snapshot.CyberPolicyFlagCount, now
+}
+
 // Load resets manager state from the backing store.
 func (m *Manager) Load(ctx context.Context) error {
 	m.mu.Lock()

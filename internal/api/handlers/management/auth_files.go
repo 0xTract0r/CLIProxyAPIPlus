@@ -624,6 +624,11 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 			}
 		}
 	}
+	// Surface cyber policy alert counters for management UI risk indicators.
+	entry["cyber_policy_flag_count"] = auth.CyberPolicyFlagCount
+	if !auth.LastCyberPolicyAt.IsZero() {
+		entry["last_cyber_policy_at"] = auth.LastCyberPolicyAt.UTC().Format(time.RFC3339)
+	}
 	entry["account_settings"] = buildAuthFileAccountSettingsView(auth, h.cfg)
 	return entry
 }
