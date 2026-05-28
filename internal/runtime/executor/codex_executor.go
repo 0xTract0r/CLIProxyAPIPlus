@@ -699,6 +699,41 @@ func countCodexInputTokens(enc tokenizer.Codec, body []byte) (int64, error) {
 	return int64(count), nil
 }
 
+func refreshFailureLogFields(auth *cliproxyauth.Auth) log.Fields {
+	fields := log.Fields{}
+	if auth == nil {
+		return fields
+	}
+	fields["provider"] = auth.Provider
+	if remark := authAccountRemark(auth); remark != "" {
+		fields["account_remark"] = remark
+	}
+	// Keep stable identifiers in structured data for local forensic correlation;
+	// the Feishu error hook redacts these fields before delivery.
+	fields["auth_id"] = auth.ID
+	fields["auth_file"] = auth.FileName
+	return fields
+}
+
+func authAccountRemark(auth *cliproxyauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	if auth.Attributes != nil {
+		if note := strings.TrimSpace(auth.Attributes["note"]); note != "" {
+			return note
+		}
+	}
+	if auth.Metadata != nil {
+		if note, ok := auth.Metadata["note"].(string); ok {
+			if trimmed := strings.TrimSpace(note); trimmed != "" {
+				return trimmed
+			}
+		}
+	}
+	return ""
+}
+
 func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {
 	log.Debugf("codex executor: refresh called")
 	if auth == nil {
@@ -724,11 +759,7 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 	svc := codexauth.NewCodexAuthWithProxyURL(e.cfg, auth.ProxyURL)
 	td, err := svc.RefreshTokensWithRetry(ctx, refreshToken, 3)
 	if err != nil {
-		log.WithFields(log.Fields{
-			"auth_id":   auth.ID,
-			"auth_file": auth.FileName,
-			"provider":  auth.Provider,
-		}).Errorf("codex executor: token refresh failed: %v", err)
+		log.WithFields(refreshFailureLogFields(auth)).Errorf("codex executor: token refresh failed: %v", err)
 		return nil, err
 	}
 	if auth.Metadata == nil {

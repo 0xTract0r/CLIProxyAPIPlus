@@ -141,7 +141,7 @@ The embedded server calls this automatically for built‑in providers; for custo
 ## Error Log Alerts
 
 - Configure `error-log-alert.feishu-webhook-url` in `config.yaml` to send application `error`, `fatal`, and `panic` log entries to a Feishu custom bot webhook. Leave it empty to disable alerts.
-- The webhook URL is treated as a secret and config reload diffs only report whether it is set or updated. Alert payloads include level, time, host, caller, message, and log fields with token-like values redacted and long values truncated.
+- The webhook URL is treated as a secret and config reload diffs only report whether it is set or updated. Alert payloads include level, time, host, caller, message, and log fields with token-like values redacted and long values truncated. Account refresh alerts include the configured account remark when available; raw auth IDs, auth filenames, emails, and token-like values are redacted from Feishu payloads.
 - The setting is applied at startup and on config hot reload; no service restart is required when replacing the webhook URL.
 
 ## Testing Tips

@@ -134,7 +134,7 @@ cliproxy.GlobalModelRegistry().RegisterClient(authID, "myprov", models)
 ## 错误日志告警
 
 - 在 `config.yaml` 配置 `error-log-alert.feishu-webhook-url` 后，应用级 `error`、`fatal`、`panic` 日志会发送到飞书自定义机器人 webhook；留空表示禁用告警。
-- webhook URL 按密钥处理，配置热更新 diff 只显示是否已设置或已更新。告警内容包含 level、time、host、caller、message 与日志字段，并会脱敏 token、Authorization、API key、secret 等字段，长字段会被截断。
+- webhook URL 按密钥处理，配置热更新 diff 只显示是否已设置或已更新。告警内容包含 level、time、host、caller、message 与日志字段，并会脱敏 token、Authorization、API key、secret 等字段，长字段会被截断。账号刷新告警会优先带上已配置的账号备注；飞书 payload 会脱敏 auth ID、auth 文件名、邮箱和 token 类字段。
 - 该配置启动时生效，也支持配置热更新；替换 webhook URL 不需要重启服务。
 
 ## 测试建议

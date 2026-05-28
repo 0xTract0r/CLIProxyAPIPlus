@@ -49,9 +49,11 @@ func TestFeishuErrorHookSendsOnlyErrorAndRedactsSecrets(t *testing.T) {
 	}
 
 	logger.WithFields(log.Fields{
-		"auth_id":       "codex-user@example.com-plus.json",
-		"refresh_token": "secret-refresh-token",
-		"body_preview":  `{"access_token":"secret-access-token","message":"bad"}`,
+		"account_remark": "Codex A01",
+		"auth_id":        "codex-user@example.com-plus.json",
+		"auth_file":      "codex-user@example.com-plus.json",
+		"refresh_token":  "secret-refresh-token",
+		"body_preview":   `{"access_token":"secret-access-token","message":"bad"}`,
 	}).Error("token refresh failed: Authorization: Bearer secret-bearer-token")
 
 	var body []byte
@@ -69,12 +71,12 @@ func TestFeishuErrorHookSendsOnlyErrorAndRedactsSecrets(t *testing.T) {
 		t.Fatalf("msg_type = %q, want text", payload.MsgType)
 	}
 	text := payload.Content.Text
-	for _, secret := range []string{"secret-refresh-token", "secret-access-token", "secret-bearer-token"} {
+	for _, secret := range []string{"secret-refresh-token", "secret-access-token", "secret-bearer-token", "codex-user@example.com-plus.json"} {
 		if strings.Contains(text, secret) {
 			t.Fatalf("alert text leaked secret %q: %s", secret, text)
 		}
 	}
-	for _, want := range []string{"level=error", "token refresh failed", "auth_id=codex-user@example.com-plus.json", "refresh_token=<redacted>", "access_token=<redacted>"} {
+	for _, want := range []string{"level=error", "token refresh failed", "account_remark=Codex A01", "auth_id=<redacted>", "auth_file=<redacted>", "refresh_token=<redacted>", "access_token=<redacted>"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("alert text missing %q: %s", want, text)
 		}
