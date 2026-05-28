@@ -1,6 +1,7 @@
 package diff
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
@@ -497,6 +498,31 @@ func TestFormatProxyURL(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestBuildConfigChangeDetails_ErrorLogAlertWebhookRedacted(t *testing.T) {
+	oldCfg := &config.Config{}
+	newCfg := &config.Config{
+		ErrorLogAlert: config.ErrorLogAlertConfig{
+			FeishuWebhookURL: "https://open.feishu.cn/open-apis/bot/v2/hook/secret-hook",
+		},
+	}
+
+	changes := BuildConfigChangeDetails(oldCfg, newCfg)
+	expectContains(t, changes, "error-log-alert.feishu-webhook-url: unset -> set")
+	for _, change := range changes {
+		if change == "https://open.feishu.cn/open-apis/bot/v2/hook/secret-hook" || strings.Contains(change, "secret-hook") {
+			t.Fatalf("webhook secret leaked in config diff: %v", changes)
+		}
+	}
+
+	updatedCfg := &config.Config{
+		ErrorLogAlert: config.ErrorLogAlertConfig{
+			FeishuWebhookURL: "https://open.feishu.cn/open-apis/bot/v2/hook/another-secret",
+		},
+	}
+	changes = BuildConfigChangeDetails(newCfg, updatedCfg)
+	expectContains(t, changes, "error-log-alert.feishu-webhook-url: updated")
 }
 
 func TestBuildConfigChangeDetails_SecretAndUpstreamUpdates(t *testing.T) {

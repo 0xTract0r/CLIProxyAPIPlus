@@ -75,6 +75,11 @@ logs-delete-after-days: 30
 # When exceeded, the oldest error log files are deleted. Default is 10. Set to 0 to disable cleanup.
 error-logs-max-files: 10
 
+# Optional external alert for application error logs. Empty webhook disables alerting.
+# The Feishu webhook value is treated as a secret; error alert payloads redact token-like fields.
+error-log-alert:
+  feishu-webhook-url: ''
+
 # When false, disable in-memory usage statistics aggregation
 usage-statistics-enabled: false
 

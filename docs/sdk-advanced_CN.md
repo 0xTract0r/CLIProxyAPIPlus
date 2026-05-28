@@ -123,9 +123,22 @@ cliproxy.GlobalModelRegistry().RegisterClient(authID, "myprov", models)
   ```
 - 对于原始 HTTP 请求，若实现了 `PrepareRequest`，或通过 `Manager.InjectCredentials(req, authID)` 进行头部注入。
 
+## 刷新失败后的重新登录状态
+
+- 当 provider refresh 返回终态 refresh token 复用错误（例如 `refresh_token_reused` 或 “refresh token has already been used”）时，Manager 会在 auth metadata 中写入 `refresh_status=reauth_required`、`refresh_disabled=true`，并设置不可重试的 `LastError`。
+- 自动刷新和管理端 `POST /v0/management/auth-files/refresh-status` 路径都会使用这个终态。这类记录不会再继续尝试刷新。运维需要重新登录，或用新的 token bundle 替换 auth 文件后，刷新才会恢复。
+- Executor 不应在这类错误后继续重试同一个 refresh token；如果刷新成功且返回了轮换后的 refresh token，应原子持久化返回的完整 token bundle。
+- 管理端刷新状态在写入失败前会对比最新 auth 快照；重叠刷新中的过期失败结果不能覆盖已经轮换成功的新 token bundle。
+- 需要在不暴露密钥的情况下对比 auth 文件时，运行 `go run ./cmd/auth-token-fingerprint --path <auth-dir> --provider codex`；它只输出 token 的 SHA-256 短指纹和刷新标记，不输出 token 原文。
+
+## 错误日志告警
+
+- 在 `config.yaml` 配置 `error-log-alert.feishu-webhook-url` 后，应用级 `error`、`fatal`、`panic` 日志会发送到飞书自定义机器人 webhook；留空表示禁用告警。
+- webhook URL 按密钥处理，配置热更新 diff 只显示是否已设置或已更新。告警内容包含 level、time、host、caller、message 与日志字段，并会脱敏 token、Authorization、API key、secret 等字段，长字段会被截断。
+- 该配置启动时生效，也支持配置热更新；替换 webhook URL 不需要重启服务。
+
 ## 测试建议
 
 - 启用请求日志：管理 API GET/PUT `/v0/management/request-log`
 - 切换调试日志：管理 API GET/PUT `/v0/management/debug`
 - 热更新：`config.yaml` 与 `auths/` 变化会自动被侦测并应用
-

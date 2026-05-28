@@ -57,6 +57,13 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if oldCfg.ErrorLogsMaxFiles != newCfg.ErrorLogsMaxFiles {
 		changes = append(changes, fmt.Sprintf("error-logs-max-files: %d -> %d", oldCfg.ErrorLogsMaxFiles, newCfg.ErrorLogsMaxFiles))
 	}
+	oldFeishuWebhookSet := strings.TrimSpace(oldCfg.ErrorLogAlert.FeishuWebhookURL) != ""
+	newFeishuWebhookSet := strings.TrimSpace(newCfg.ErrorLogAlert.FeishuWebhookURL) != ""
+	if oldFeishuWebhookSet != newFeishuWebhookSet {
+		changes = append(changes, fmt.Sprintf("error-log-alert.feishu-webhook-url: %s -> %s", redactedSetState(oldFeishuWebhookSet), redactedSetState(newFeishuWebhookSet)))
+	} else if oldFeishuWebhookSet && strings.TrimSpace(oldCfg.ErrorLogAlert.FeishuWebhookURL) != strings.TrimSpace(newCfg.ErrorLogAlert.FeishuWebhookURL) {
+		changes = append(changes, "error-log-alert.feishu-webhook-url: updated")
+	}
 	if oldCfg.RequestRetry != newCfg.RequestRetry {
 		changes = append(changes, fmt.Sprintf("request-retry: %d -> %d", oldCfg.RequestRetry, newCfg.RequestRetry))
 	}
@@ -348,6 +355,13 @@ func equalStringMap(a, b map[string]string) bool {
 		}
 	}
 	return true
+}
+
+func redactedSetState(set bool) string {
+	if set {
+		return "set"
+	}
+	return "unset"
 }
 
 func formatProxyURL(raw string) string {

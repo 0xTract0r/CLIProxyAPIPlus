@@ -3458,10 +3458,17 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 	now := time.Now()
 	if err != nil {
 		shouldReschedule := false
+		var reauthSnapshot *Auth
 		m.mu.Lock()
 		if current := m.auths[id]; current != nil {
-			current.NextRefreshAfter = now.Add(refreshFailureBackoff)
-			current.LastError = &Error{Message: err.Error()}
+			if isRefreshTokenReuseError(err) {
+				current.markRefreshReauthRequired(now)
+				reauthSnapshot = current.Clone()
+			} else {
+				current.NextRefreshAfter = now.Add(refreshFailureBackoff)
+				current.LastError = &Error{Message: err.Error()}
+				current.UpdatedAt = now
+			}
 			m.auths[id] = current
 			shouldReschedule = true
 			if m.scheduler != nil {
@@ -3469,6 +3476,12 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 			}
 		}
 		m.mu.Unlock()
+		if reauthSnapshot != nil {
+			if errPersist := m.persist(ctx, reauthSnapshot); errPersist != nil {
+				logEntryWithRequestID(ctx).WithField("auth_id", id).Warnf("failed to persist reauth-required refresh state: %v", errPersist)
+			}
+			m.hook.OnAuthUpdated(ctx, reauthSnapshot.Clone())
+		}
 		if shouldReschedule {
 			m.queueRefreshReschedule(id)
 		}

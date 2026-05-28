@@ -130,9 +130,22 @@ The embedded server calls this automatically for built‑in providers; for custo
   ```
 - For raw HTTP flows, implement `PrepareRequest` and/or call `Manager.InjectCredentials(req, authID)` to set headers.
 
+## Refresh Reauthentication States
+
+- When a provider refresh fails with a terminal refresh-token reuse error, such as `refresh_token_reused` or "refresh token has already been used", the manager marks the auth metadata with `refresh_status=reauth_required`, `refresh_disabled=true`, and a non-retryable `LastError`.
+- Automatic refresh and the management `POST /v0/management/auth-files/refresh-status` path both use this terminal state. These records are not scheduled for more refresh attempts. Operators must sign in again or replace the auth file with a fresh token bundle before refresh resumes.
+- Executors should not retry the same refresh token after this class of error; if a refresh succeeds and returns a rotated refresh token, persist the returned token bundle atomically.
+- Management status refreshes compare against the latest auth snapshot before writing failures; a stale failure from an overlapping refresh must not overwrite a newer rotated token bundle.
+- To compare auth files without exposing secrets, run `go run ./cmd/auth-token-fingerprint --path <auth-dir> --provider codex`; it prints token SHA-256 prefixes and refresh flags, never raw token values.
+
+## Error Log Alerts
+
+- Configure `error-log-alert.feishu-webhook-url` in `config.yaml` to send application `error`, `fatal`, and `panic` log entries to a Feishu custom bot webhook. Leave it empty to disable alerts.
+- The webhook URL is treated as a secret and config reload diffs only report whether it is set or updated. Alert payloads include level, time, host, caller, message, and log fields with token-like values redacted and long values truncated.
+- The setting is applied at startup and on config hot reload; no service restart is required when replacing the webhook URL.
+
 ## Testing Tips
 
 - Enable request logging: Management API GET/PUT `/v0/management/request-log`
 - Toggle debug logs: Management API GET/PUT `/v0/management/debug`
 - Hot reload changes in `config.yaml` and `auths/` are picked up automatically by the watcher
-

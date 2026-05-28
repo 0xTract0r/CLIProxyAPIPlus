@@ -78,6 +78,16 @@ func TestRefreshDisabled(t *testing.T) {
 	if a.RefreshDisabled() {
 		t.Error("explicit false disabled keys and true enabled keys should keep refresh enabled")
 	}
+
+	a = &Auth{Metadata: map[string]any{"refresh_status": "reauth_required"}}
+	if !a.RefreshDisabled() {
+		t.Error("refresh_status=reauth_required should disable refresh")
+	}
+
+	a = &Auth{Metadata: map[string]any{"reauth_required": true}}
+	if !a.RefreshDisabled() {
+		t.Error("reauth_required=true should disable refresh")
+	}
 }
 
 func TestSubscriptionPlanTypeFromNestedClaudeProfile(t *testing.T) {

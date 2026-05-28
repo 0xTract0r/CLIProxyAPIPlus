@@ -1000,6 +1000,10 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 		}
 	}
 
+	if oldCfg == nil || !reflect.DeepEqual(oldCfg.ErrorLogAlert, cfg.ErrorLogAlert) {
+		logging.ConfigureErrorLogAlert(cfg.ErrorLogAlert)
+	}
+
 	if oldCfg == nil ||
 		oldCfg.LoggingToFile != cfg.LoggingToFile ||
 		oldCfg.LogsMaxTotalSizeMB != cfg.LogsMaxTotalSizeMB ||

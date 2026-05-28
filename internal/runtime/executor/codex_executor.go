@@ -724,6 +724,11 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 	svc := codexauth.NewCodexAuthWithProxyURL(e.cfg, auth.ProxyURL)
 	td, err := svc.RefreshTokensWithRetry(ctx, refreshToken, 3)
 	if err != nil {
+		log.WithFields(log.Fields{
+			"auth_id":   auth.ID,
+			"auth_file": auth.FileName,
+			"provider":  auth.Provider,
+		}).Errorf("codex executor: token refresh failed: %v", err)
 		return nil, err
 	}
 	if auth.Metadata == nil {
