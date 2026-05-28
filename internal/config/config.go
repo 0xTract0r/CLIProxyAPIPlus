@@ -193,6 +193,11 @@ type Config struct {
 	// from your current session. Default: false.
 	IncognitoBrowser bool `yaml:"incognito-browser" json:"incognito-browser"`
 
+	// CyberPolicyAlert configures the upstream cyber_policy flag alert side channel.
+	// When WebhookURL is empty (default), no outbound POST is fired; structured logs
+	// and per-account counters still update.
+	CyberPolicyAlert CyberPolicyAlertConfig `yaml:"cyber-policy-alert" json:"cyber-policy-alert"`
+
 	legacyMigrationPending bool `yaml:"-" json:"-"`
 }
 
@@ -200,6 +205,15 @@ type Config struct {
 type ErrorLogAlertConfig struct {
 	// FeishuWebhookURL is a Feishu custom bot webhook URL. Empty disables alerting.
 	FeishuWebhookURL string `yaml:"feishu-webhook-url" json:"feishu-webhook-url"`
+}
+
+// CyberPolicyAlertConfig groups optional side-channel configuration for the
+// Codex /v1/responses upstream cyber_policy event. When WebhookURL is empty the
+// alert subsystem keeps logging and counting hits without firing HTTP callouts.
+type CyberPolicyAlertConfig struct {
+	// WebhookURL receives an asynchronous JSON POST when a cyber_policy hit is
+	// recorded. Default is empty (disabled).
+	WebhookURL string `yaml:"webhook-url" json:"webhook-url"`
 }
 
 // ClaudeHeaderDefaults configures default header values injected into Claude API requests.

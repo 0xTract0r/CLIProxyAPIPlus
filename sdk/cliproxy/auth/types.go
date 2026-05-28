@@ -89,6 +89,12 @@ type Auth struct {
 	// ModelStates tracks per-model runtime availability data.
 	ModelStates map[string]*ModelState `json:"model_states,omitempty"`
 
+	// CyberPolicyFlagCount counts how many times the upstream returned a
+	// cyber_policy flag for this auth (currently Codex /v1/responses).
+	CyberPolicyFlagCount int `json:"cyber_policy_flag_count,omitempty"`
+	// LastCyberPolicyAt records the timestamp of the most recent cyber_policy hit.
+	LastCyberPolicyAt time.Time `json:"last_cyber_policy_at,omitempty"`
+
 	// Runtime carries non-serialisable data used during execution (in-memory only).
 	Runtime any `json:"-"`
 
