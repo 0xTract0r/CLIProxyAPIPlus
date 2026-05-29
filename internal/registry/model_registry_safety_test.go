@@ -155,6 +155,83 @@ func TestGetAvailableModelsReturnsClonedSupportedParameters(t *testing.T) {
 	}
 }
 
+func TestRegisterClientAppliesCodexFastMetadataToOpenAIModelList(t *testing.T) {
+	r := newTestModelRegistry()
+	r.RegisterClient("codex-client", "codex", []*ModelInfo{
+		{ID: "gpt-5.5", OwnedBy: "openai", Type: "openai"},
+		{ID: "gpt-5.4-mini", OwnedBy: "openai", Type: "openai"},
+	})
+
+	models := r.GetAvailableModels("openai")
+	fastModel := modelMapByID(models, "gpt-5.5")
+	if fastModel == nil {
+		t.Fatalf("expected gpt-5.5 in available models, got %+v", models)
+	}
+	params, _ := fastModel["supported_parameters"].([]string)
+	if !hasString(params, "service_tier") {
+		t.Fatalf("expected gpt-5.5 to advertise service_tier, got %+v", fastModel)
+	}
+	speedTiers, _ := fastModel["additional_speed_tiers"].([]string)
+	if !hasString(speedTiers, "fast") {
+		t.Fatalf("expected gpt-5.5 to advertise fast speed tier, got %+v", fastModel)
+	}
+	serviceTiers, _ := fastModel["service_tiers"].([]ServiceTierInfo)
+	if !hasServiceTier(serviceTiers, "priority") {
+		t.Fatalf("expected gpt-5.5 to advertise priority service tier, got %+v", fastModel)
+	}
+
+	miniModel := modelMapByID(models, "gpt-5.4-mini")
+	if miniModel == nil {
+		t.Fatalf("expected gpt-5.4-mini in available models, got %+v", models)
+	}
+	if _, ok := miniModel["additional_speed_tiers"]; ok {
+		t.Fatalf("gpt-5.4-mini must not advertise fast metadata, got %+v", miniModel)
+	}
+}
+
+func TestRegisterClientDoesNotApplyCodexFastMetadataToOtherProviders(t *testing.T) {
+	r := newTestModelRegistry()
+	r.RegisterClient("openai-client", "openai", []*ModelInfo{{ID: "gpt-5.5", OwnedBy: "openai", Type: "openai"}})
+
+	models := r.GetAvailableModels("openai")
+	model := modelMapByID(models, "gpt-5.5")
+	if model == nil {
+		t.Fatalf("expected gpt-5.5 in available models, got %+v", models)
+	}
+	if _, ok := model["additional_speed_tiers"]; ok {
+		t.Fatalf("non-codex provider must not receive Codex fast metadata, got %+v", model)
+	}
+}
+
+func TestRegisterClientAppliesCodexFastMetadataToAliases(t *testing.T) {
+	r := newTestModelRegistry()
+	r.RegisterClient("codex-client", "codex", []*ModelInfo{{
+		ID:          "workspace/gpt-5.5",
+		OwnedBy:     "openai",
+		Type:        "openai",
+		DisplayName: "gpt-5.5",
+	}})
+
+	models := r.GetAvailableModels("openai")
+	model := modelMapByID(models, "workspace/gpt-5.5")
+	if model == nil {
+		t.Fatalf("expected prefixed gpt-5.5 alias in available models, got %+v", models)
+	}
+	speedTiers, _ := model["additional_speed_tiers"].([]string)
+	if !hasString(speedTiers, "fast") {
+		t.Fatalf("expected prefixed gpt-5.5 alias to advertise fast tier, got %+v", model)
+	}
+}
+
+func modelMapByID(models []map[string]any, id string) map[string]any {
+	for _, model := range models {
+		if model != nil && model["id"] == id {
+			return model
+		}
+	}
+	return nil
+}
+
 func TestLookupModelInfoReturnsCloneForStaticDefinitions(t *testing.T) {
 	first := LookupModelInfo("claude-sonnet-4-6")
 	if first == nil || first.Thinking == nil || len(first.Thinking.Levels) == 0 {

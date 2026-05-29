@@ -271,14 +271,45 @@ func applyCodexFastModeMetadata(models []*ModelInfo) {
 		if model == nil || !isCodexFastModeModelID(model.ID) {
 			continue
 		}
-		model.SupportedParameters = appendUniqueString(model.SupportedParameters, "service_tier")
-		model.AdditionalSpeedTiers = appendUniqueString(model.AdditionalSpeedTiers, "fast")
-		model.ServiceTiers = appendUniqueServiceTier(model.ServiceTiers, codexFastServiceTier)
+		applyCodexFastModeMetadataToModel(model)
 	}
 }
 
+func applyCodexFastModeMetadataToModel(model *ModelInfo) {
+	if model == nil {
+		return
+	}
+	model.SupportedParameters = appendUniqueString(model.SupportedParameters, "service_tier")
+	model.AdditionalSpeedTiers = appendUniqueString(model.AdditionalSpeedTiers, "fast")
+	model.ServiceTiers = appendUniqueServiceTier(model.ServiceTiers, codexFastServiceTier)
+}
+
+func applyCodexProviderCompatibilityMetadata(model *ModelInfo) {
+	if model == nil || !codexModelInfoSupportsFastMode(model) {
+		return
+	}
+	applyCodexFastModeMetadataToModel(model)
+}
+
+func codexModelInfoSupportsFastMode(model *ModelInfo) bool {
+	if model == nil {
+		return false
+	}
+	for _, candidate := range []string{model.ID, model.Version, model.Name, model.DisplayName} {
+		if isCodexFastModeModelID(candidate) {
+			return true
+		}
+	}
+	return false
+}
+
 func isCodexFastModeModelID(modelID string) bool {
-	switch strings.ToLower(strings.TrimSpace(modelID)) {
+	normalized := strings.ToLower(strings.TrimSpace(modelID))
+	normalized = strings.TrimPrefix(normalized, "models/")
+	if idx := strings.LastIndex(normalized, "/"); idx >= 0 {
+		normalized = normalized[idx+1:]
+	}
+	switch normalized {
 	case "gpt-5.4", "gpt-5.5":
 		return true
 	default:

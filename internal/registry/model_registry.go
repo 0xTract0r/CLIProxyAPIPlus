@@ -253,17 +253,23 @@ func (r *ModelRegistry) RegisterClient(clientID, clientProvider string, models [
 	rawModelIDs := make([]string, 0, len(models))
 	newModels := make(map[string]*ModelInfo, len(models))
 	newCounts := make(map[string]int, len(models))
+	registeredModels := make([]*ModelInfo, 0, len(models))
 	for _, model := range models {
 		if model == nil || model.ID == "" {
 			continue
 		}
-		rawModelIDs = append(rawModelIDs, model.ID)
-		newCounts[model.ID]++
-		if _, exists := newModels[model.ID]; exists {
+		modelInfo := cloneModelInfo(model)
+		if provider == "codex" {
+			applyCodexProviderCompatibilityMetadata(modelInfo)
+		}
+		registeredModels = append(registeredModels, modelInfo)
+		rawModelIDs = append(rawModelIDs, modelInfo.ID)
+		newCounts[modelInfo.ID]++
+		if _, exists := newModels[modelInfo.ID]; exists {
 			continue
 		}
-		newModels[model.ID] = model
-		uniqueModelIDs = append(uniqueModelIDs, model.ID)
+		newModels[modelInfo.ID] = modelInfo
+		uniqueModelIDs = append(uniqueModelIDs, modelInfo.ID)
 	}
 
 	if len(uniqueModelIDs) == 0 {
@@ -301,7 +307,7 @@ func (r *ModelRegistry) RegisterClient(clientID, clientProvider string, models [
 			delete(r.clientProviders, clientID)
 		}
 		r.invalidateAvailableModelsCacheLocked()
-		r.triggerModelsRegistered(provider, clientID, models)
+		r.triggerModelsRegistered(provider, clientID, registeredModels)
 		log.Debugf("Registered client %s from provider %s with %d models", clientID, clientProvider, len(rawModelIDs))
 		misc.LogCredentialSeparator()
 		return
@@ -448,7 +454,7 @@ func (r *ModelRegistry) RegisterClient(clientID, clientProvider string, models [
 	}
 
 	r.invalidateAvailableModelsCacheLocked()
-	r.triggerModelsRegistered(provider, clientID, models)
+	r.triggerModelsRegistered(provider, clientID, registeredModels)
 	if len(added) == 0 && len(removed) == 0 && !providerChanged {
 		// Only metadata (e.g., display name) changed; skip separator when no log output.
 		return

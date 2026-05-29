@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
@@ -42,6 +43,53 @@ func TestRegisterModelsForAuth_CodexPlanFiltersSpark(t *testing.T) {
 				t.Fatalf("Spark registered = %v, want %v", gotSpark, tt.wantSpark)
 			}
 		})
+	}
+}
+
+func TestRegisterModelsForAuth_CodexConfigModelsAdvertiseFastMetadata(t *testing.T) {
+	const authID = "codex-config-fast-metadata"
+	cfg := &config.Config{
+		CodexKey: []config.CodexKey{{
+			APIKey:  "codex-key",
+			BaseURL: "https://codex.example.test",
+			Models: []internalconfig.CodexModel{{
+				Name:  "gpt-5.5",
+				Alias: "codex-fast-alias",
+			}},
+		}},
+	}
+	service := &Service{cfg: cfg}
+	auth := &coreauth.Auth{
+		ID:       authID,
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"auth_kind": "apikey",
+			"api_key":   "codex-key",
+			"base_url":  "https://codex.example.test",
+		},
+	}
+	reg := registry.GetGlobalRegistry()
+	reg.UnregisterClient(auth.ID)
+	t.Cleanup(func() { reg.UnregisterClient(auth.ID) })
+
+	service.registerModelsForAuth(auth)
+	models := reg.GetAvailableModels("openai")
+	model := openAIModelByID(models, "codex-fast-alias")
+	if model == nil {
+		t.Fatalf("expected codex-fast-alias in /v1/models data, got %+v", models)
+	}
+	params, _ := model["supported_parameters"].([]string)
+	if !stringSliceContains(params, "service_tier") {
+		t.Fatalf("expected alias to advertise service_tier, got %+v", model)
+	}
+	speedTiers, _ := model["additional_speed_tiers"].([]string)
+	if !stringSliceContains(speedTiers, "fast") {
+		t.Fatalf("expected alias to advertise fast tier, got %+v", model)
+	}
+	serviceTiers, _ := model["service_tiers"].([]registry.ServiceTierInfo)
+	if !serviceTierSliceContains(serviceTiers, "priority") {
+		t.Fatalf("expected alias to advertise priority service tier, got %+v", model)
 	}
 }
 
@@ -266,6 +314,33 @@ func TestRegisterModelsForAuth_ClaudePlanFiltersOpusByHighTier(t *testing.T) {
 func modelListContains(models []*ModelInfo, id string) bool {
 	for _, model := range models {
 		if model != nil && model.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+func openAIModelByID(models []map[string]any, id string) map[string]any {
+	for _, model := range models {
+		if model != nil && model["id"] == id {
+			return model
+		}
+	}
+	return nil
+}
+
+func stringSliceContains(values []string, value string) bool {
+	for _, existing := range values {
+		if existing == value {
+			return true
+		}
+	}
+	return false
+}
+
+func serviceTierSliceContains(values []registry.ServiceTierInfo, id string) bool {
+	for _, existing := range values {
+		if existing.ID == id {
 			return true
 		}
 	}
