@@ -42,6 +42,23 @@ func TestCodexPlusModelsExcludeSpark(t *testing.T) {
 	}
 }
 
+func TestCodexFastModeMetadataAppliedToCatalogs(t *testing.T) {
+	models := []*ModelInfo{
+		{ID: "gpt-5.5", SupportedParameters: []string{"tools"}},
+		{ID: "gpt-5.4", SupportedParameters: []string{"tools"}},
+		{ID: "gpt-5.4-mini", SupportedParameters: []string{"tools"}},
+		{ID: "gpt-5.3-codex-spark", SupportedParameters: []string{"tools"}},
+	}
+	data := &staticModelsJSON{CodexPro: models}
+
+	applyCodexCatalogCompatibility(data)
+
+	assertCodexFastModeMetadata(t, "gpt-5.5", models[0])
+	assertCodexFastModeMetadata(t, "gpt-5.4", models[1])
+	assertNoCodexFastModeMetadata(t, "gpt-5.4-mini", models[2])
+	assertNoCodexFastModeMetadata(t, "gpt-5.3-codex-spark", models[3])
+}
+
 func TestProviderSpecificPlanCapabilities(t *testing.T) {
 	if ClaudePlanAllowsOpus("pro") {
 		t.Fatal("Claude Pro must not allow Opus")
@@ -150,9 +167,12 @@ func assertGPT55ModelInfo(t *testing.T, source string, model *ModelInfo) {
 	if model.MaxCompletionTokens != 128000 {
 		t.Fatalf("%s max completion tokens mismatch: got %d", source, model.MaxCompletionTokens)
 	}
-	if len(model.SupportedParameters) != 1 || model.SupportedParameters[0] != "tools" {
+	if len(model.SupportedParameters) != 2 ||
+		model.SupportedParameters[0] != "tools" ||
+		model.SupportedParameters[1] != "service_tier" {
 		t.Fatalf("%s supported parameters mismatch: got %v", source, model.SupportedParameters)
 	}
+	assertCodexFastModeMetadata(t, source, model)
 	if model.Thinking == nil {
 		t.Fatalf("%s missing thinking support", source)
 	}
@@ -166,4 +186,45 @@ func assertGPT55ModelInfo(t *testing.T, source string, model *ModelInfo) {
 			t.Fatalf("%s thinking level %d mismatch: got %q, want %q", source, i, model.Thinking.Levels[i], level)
 		}
 	}
+}
+
+func assertCodexFastModeMetadata(t *testing.T, source string, model *ModelInfo) {
+	t.Helper()
+	if !hasString(model.SupportedParameters, "service_tier") {
+		t.Fatalf("%s missing service_tier supported parameter: %+v", source, model.SupportedParameters)
+	}
+	if !hasString(model.AdditionalSpeedTiers, "fast") {
+		t.Fatalf("%s missing fast speed tier: %+v", source, model.AdditionalSpeedTiers)
+	}
+	if !hasServiceTier(model.ServiceTiers, "priority") {
+		t.Fatalf("%s missing priority service tier: %+v", source, model.ServiceTiers)
+	}
+}
+
+func assertNoCodexFastModeMetadata(t *testing.T, source string, model *ModelInfo) {
+	t.Helper()
+	if hasString(model.AdditionalSpeedTiers, "fast") {
+		t.Fatalf("%s must not advertise fast speed tier: %+v", source, model.AdditionalSpeedTiers)
+	}
+	if hasServiceTier(model.ServiceTiers, "priority") {
+		t.Fatalf("%s must not advertise priority service tier: %+v", source, model.ServiceTiers)
+	}
+}
+
+func hasString(values []string, value string) bool {
+	for _, existing := range values {
+		if existing == value {
+			return true
+		}
+	}
+	return false
+}
+
+func hasServiceTier(values []ServiceTierInfo, id string) bool {
+	for _, existing := range values {
+		if existing.ID == id {
+			return true
+		}
+	}
+	return false
 }

@@ -9,7 +9,14 @@ import (
 const (
 	codexBuiltinImageModelID = "gpt-image-2"
 	codexSparkModelID        = "gpt-5.3-codex-spark"
+	codexFastServiceTierID   = "priority"
 )
+
+var codexFastServiceTier = ServiceTierInfo{
+	ID:          codexFastServiceTierID,
+	Name:        "Fast",
+	Description: "1.5x speed, increased usage",
+}
 
 // staticModelsJSON mirrors the top-level structure of models.json.
 type staticModelsJSON struct {
@@ -247,6 +254,62 @@ func GetAntigravityModels() []*ModelInfo {
 // already present in the provided slice.
 func WithCodexBuiltins(models []*ModelInfo) []*ModelInfo {
 	return upsertModelInfos(models, codexBuiltinImageModelInfo())
+}
+
+func applyCodexCatalogCompatibility(data *staticModelsJSON) {
+	if data == nil {
+		return
+	}
+	applyCodexFastModeMetadata(data.CodexFree)
+	applyCodexFastModeMetadata(data.CodexTeam)
+	applyCodexFastModeMetadata(data.CodexPlus)
+	applyCodexFastModeMetadata(data.CodexPro)
+}
+
+func applyCodexFastModeMetadata(models []*ModelInfo) {
+	for _, model := range models {
+		if model == nil || !isCodexFastModeModelID(model.ID) {
+			continue
+		}
+		model.SupportedParameters = appendUniqueString(model.SupportedParameters, "service_tier")
+		model.AdditionalSpeedTiers = appendUniqueString(model.AdditionalSpeedTiers, "fast")
+		model.ServiceTiers = appendUniqueServiceTier(model.ServiceTiers, codexFastServiceTier)
+	}
+}
+
+func isCodexFastModeModelID(modelID string) bool {
+	switch strings.ToLower(strings.TrimSpace(modelID)) {
+	case "gpt-5.4", "gpt-5.5":
+		return true
+	default:
+		return false
+	}
+}
+
+func appendUniqueString(values []string, value string) []string {
+	needle := strings.TrimSpace(value)
+	if needle == "" {
+		return values
+	}
+	for _, existing := range values {
+		if strings.EqualFold(strings.TrimSpace(existing), needle) {
+			return values
+		}
+	}
+	return append(values, needle)
+}
+
+func appendUniqueServiceTier(values []ServiceTierInfo, value ServiceTierInfo) []ServiceTierInfo {
+	needle := strings.TrimSpace(value.ID)
+	if needle == "" {
+		return values
+	}
+	for _, existing := range values {
+		if strings.EqualFold(strings.TrimSpace(existing.ID), needle) {
+			return values
+		}
+	}
+	return append(values, value)
 }
 
 func codexBuiltinImageModelInfo() *ModelInfo {

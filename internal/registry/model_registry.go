@@ -47,6 +47,12 @@ type ModelInfo struct {
 	MaxCompletionTokens int `json:"max_completion_tokens,omitempty"`
 	// SupportedParameters lists supported parameters
 	SupportedParameters []string `json:"supported_parameters,omitempty"`
+	// AdditionalSpeedTiers lists opt-in speed tiers supported by Codex clients.
+	AdditionalSpeedTiers []string `json:"additional_speed_tiers,omitempty"`
+	// ServiceTiers describes provider service tiers that can be requested.
+	ServiceTiers []ServiceTierInfo `json:"service_tiers,omitempty"`
+	// DefaultServiceTier is the provider default service tier, when known.
+	DefaultServiceTier string `json:"default_service_tier,omitempty"`
 	// SupportedEndpoints lists supported API endpoints (e.g., "/chat/completions", "/responses").
 	SupportedEndpoints []string `json:"supported_endpoints,omitempty"`
 	// SupportedInputModalities lists supported input modalities (e.g., TEXT, IMAGE, VIDEO, AUDIO)
@@ -67,6 +73,12 @@ type ModelInfo struct {
 type availableModelsCacheEntry struct {
 	models    []map[string]any
 	expiresAt time.Time
+}
+
+type ServiceTierInfo struct {
+	ID          string `json:"id"`
+	Name        string `json:"name,omitempty"`
+	Description string `json:"description,omitempty"`
 }
 
 // ThinkingSupport describes a model family's supported internal reasoning budget range.
@@ -533,6 +545,12 @@ func cloneModelInfo(model *ModelInfo) *ModelInfo {
 	if len(model.SupportedParameters) > 0 {
 		copyModel.SupportedParameters = append([]string(nil), model.SupportedParameters...)
 	}
+	if len(model.AdditionalSpeedTiers) > 0 {
+		copyModel.AdditionalSpeedTiers = append([]string(nil), model.AdditionalSpeedTiers...)
+	}
+	if len(model.ServiceTiers) > 0 {
+		copyModel.ServiceTiers = append([]ServiceTierInfo(nil), model.ServiceTiers...)
+	}
 	if len(model.SupportedInputModalities) > 0 {
 		copyModel.SupportedInputModalities = append([]string(nil), model.SupportedInputModalities...)
 	}
@@ -866,6 +884,8 @@ func cloneModelMapValue(value any) any {
 		return copySlice
 	case []string:
 		return append([]string(nil), typed...)
+	case []ServiceTierInfo:
+		return append([]ServiceTierInfo(nil), typed...)
 	default:
 		return value
 	}
@@ -1142,6 +1162,15 @@ func (r *ModelRegistry) convertModelToMap(model *ModelInfo, handlerType string) 
 		}
 		if len(model.SupportedParameters) > 0 {
 			result["supported_parameters"] = append([]string(nil), model.SupportedParameters...)
+		}
+		if len(model.AdditionalSpeedTiers) > 0 {
+			result["additional_speed_tiers"] = append([]string(nil), model.AdditionalSpeedTiers...)
+		}
+		if len(model.ServiceTiers) > 0 {
+			result["service_tiers"] = append([]ServiceTierInfo(nil), model.ServiceTiers...)
+		}
+		if model.DefaultServiceTier != "" {
+			result["default_service_tier"] = model.DefaultServiceTier
 		}
 		if len(model.SupportedEndpoints) > 0 {
 			result["supported_endpoints"] = model.SupportedEndpoints

@@ -264,6 +264,39 @@ func TestConvertSystemRoleToDeveloper_AssistantRole(t *testing.T) {
 	}
 }
 
+func TestConvertOpenAIResponsesRequestToCodex_ServiceTierCompatibility(t *testing.T) {
+	tests := []struct {
+		name       string
+		tier       string
+		wantExists bool
+		wantTier   string
+	}{
+		{name: "priority", tier: "priority", wantExists: true, wantTier: "priority"},
+		{name: "fast", tier: "fast", wantExists: true, wantTier: "priority"},
+		{name: "unsupported", tier: "auto", wantExists: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			inputJSON := []byte(`{
+				"model": "gpt-5.2",
+				"service_tier": "` + tt.tier + `",
+				"input": [{"role":"user","content":"hello"}]
+			}`)
+
+			output := ConvertOpenAIResponsesRequestToCodex("gpt-5.2", inputJSON, false)
+			got := gjson.GetBytes(output, "service_tier")
+
+			if got.Exists() != tt.wantExists {
+				t.Fatalf("service_tier exists = %v, want %v: %s", got.Exists(), tt.wantExists, string(output))
+			}
+			if tt.wantExists && got.String() != tt.wantTier {
+				t.Fatalf("service_tier = %q, want %q: %s", got.String(), tt.wantTier, string(output))
+			}
+		})
+	}
+}
+
 func TestConvertOpenAIResponsesRequestToCodex_NormalizesWebSearchPreview(t *testing.T) {
 	inputJSON := []byte(`{
 		"model": "gpt-5.4-mini",

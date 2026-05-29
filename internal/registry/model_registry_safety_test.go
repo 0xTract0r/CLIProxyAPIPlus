@@ -113,9 +113,11 @@ func TestCleanupExpiredQuotasInvalidatesAvailableModelsCache(t *testing.T) {
 func TestGetAvailableModelsReturnsClonedSupportedParameters(t *testing.T) {
 	r := newTestModelRegistry()
 	r.RegisterClient("client-1", "openai", []*ModelInfo{{
-		ID:                  "m1",
-		DisplayName:         "Model One",
-		SupportedParameters: []string{"temperature", "top_p"},
+		ID:                   "m1",
+		DisplayName:          "Model One",
+		SupportedParameters:  []string{"temperature", "top_p"},
+		AdditionalSpeedTiers: []string{"fast"},
+		ServiceTiers:         []ServiceTierInfo{{ID: "priority", Name: "Fast"}},
 	}})
 
 	first := r.GetAvailableModels("openai")
@@ -127,11 +129,29 @@ func TestGetAvailableModelsReturnsClonedSupportedParameters(t *testing.T) {
 		t.Fatalf("expected supported_parameters slice, got %#v", first[0]["supported_parameters"])
 	}
 	params[0] = "mutated"
+	speedTiers, ok := first[0]["additional_speed_tiers"].([]string)
+	if !ok || len(speedTiers) != 1 || speedTiers[0] != "fast" {
+		t.Fatalf("expected additional_speed_tiers slice, got %#v", first[0]["additional_speed_tiers"])
+	}
+	speedTiers[0] = "mutated"
+	serviceTiers, ok := first[0]["service_tiers"].([]ServiceTierInfo)
+	if !ok || len(serviceTiers) != 1 || serviceTiers[0].ID != "priority" {
+		t.Fatalf("expected service_tiers slice, got %#v", first[0]["service_tiers"])
+	}
+	serviceTiers[0].Name = "mutated"
 
 	second := r.GetAvailableModels("openai")
 	params, ok = second[0]["supported_parameters"].([]string)
 	if !ok || len(params) != 2 || params[0] != "temperature" {
 		t.Fatalf("expected cloned supported_parameters, got %#v", second[0]["supported_parameters"])
+	}
+	speedTiers, ok = second[0]["additional_speed_tiers"].([]string)
+	if !ok || len(speedTiers) != 1 || speedTiers[0] != "fast" {
+		t.Fatalf("expected cloned additional_speed_tiers, got %#v", second[0]["additional_speed_tiers"])
+	}
+	serviceTiers, ok = second[0]["service_tiers"].([]ServiceTierInfo)
+	if !ok || len(serviceTiers) != 1 || serviceTiers[0].Name != "Fast" {
+		t.Fatalf("expected cloned service_tiers, got %#v", second[0]["service_tiers"])
 	}
 }
 

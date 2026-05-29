@@ -197,6 +197,7 @@ func fetchModelsFromRemote(ctx context.Context) (*staticModelsJSON, string) {
 		if merged != nil {
 			parsed = *merged
 		}
+		applyCodexCatalogCompatibility(&parsed)
 		if err := validateModelsCatalog(&parsed); err != nil {
 			log.Warnf("models validate failed from %s: %v", url, err)
 			continue
@@ -386,6 +387,7 @@ func loadModelsFromBytes(data []byte, source string) error {
 	if err := json.Unmarshal(data, &parsed); err != nil {
 		return fmt.Errorf("%s: decode models catalog: %w", source, err)
 	}
+	applyCodexCatalogCompatibility(&parsed)
 	if err := validateModelsCatalog(&parsed); err != nil {
 		return fmt.Errorf("%s: validate models catalog: %w", source, err)
 	}
