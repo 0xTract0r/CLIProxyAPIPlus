@@ -477,6 +477,7 @@ func main() {
 	}
 	usage.SetStatisticsEnabled(cfg.UsageStatisticsEnabled)
 	coreauth.SetQuotaCooldownDisabled(cfg.DisableCooling)
+	logging.ConfigureErrorLogAlert(cfg.ErrorLogAlert)
 
 	if err = logging.ConfigureLogOutput(cfg); err != nil {
 		log.Errorf("failed to configure log output: %v", err)

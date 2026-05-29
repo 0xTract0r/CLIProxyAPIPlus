@@ -624,6 +624,11 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 			}
 		}
 	}
+	// Surface cyber policy alert counters for management UI risk indicators.
+	entry["cyber_policy_flag_count"] = auth.CyberPolicyFlagCount
+	if !auth.LastCyberPolicyAt.IsZero() {
+		entry["last_cyber_policy_at"] = auth.LastCyberPolicyAt.UTC().Format(time.RFC3339)
+	}
 	entry["account_settings"] = buildAuthFileAccountSettingsView(auth, h.cfg)
 	return entry
 }
@@ -2769,6 +2774,8 @@ func (h *Handler) refreshAuthStatus(ctx context.Context, current *coreauth.Auth)
 
 	now := time.Now()
 	candidate := current.Clone()
+	attemptStartedAt := now
+	attemptRefreshToken := authRefreshTokenValue(candidate)
 	updated, errRefresh := exec.Refresh(ctx, candidate)
 	if updated == nil {
 		updated = candidate
@@ -2780,22 +2787,46 @@ func (h *Handler) refreshAuthStatus(ctx context.Context, current *coreauth.Auth)
 
 	if errRefresh != nil {
 		authErr := normalizeAuthRefreshError(errRefresh)
-		updated.LastError = authErr
-		updated.Status = coreauth.StatusError
-		updated.StatusMessage = strings.TrimSpace(authErr.Message)
-		updated.Unavailable = true
-		updated.NextRefreshAfter = now.Add(authStatusRefreshFailureBackoff)
-		updated.UpdatedAt = now
-		if authErr.HTTPStatus == http.StatusTooManyRequests {
-			updated.Quota.Exceeded = true
-			updated.Quota.Reason = "quota"
-			updated.Quota.NextRecoverAt = now.Add(authStatusRefreshFailureBackoff)
+		latest := h.latestAuthSnapshot(current)
+		if latest == nil {
+			latest = current.Clone()
 		}
-		saved, errUpdate := h.authManager.Update(ctx, updated)
+		preserveAuthIdentity(latest, current)
+		if refreshAttemptSuperseded(latest, attemptRefreshToken, attemptStartedAt) {
+			return latest, nil
+		}
+		if coreauth.IsRefreshTokenReuseError(errRefresh) {
+			latest.MarkRefreshReauthRequired(now)
+			saved, errUpdate := h.authManager.Update(ctx, latest)
+			if errUpdate != nil {
+				return saved, errUpdate
+			}
+			if saved != nil && saved.LastError != nil {
+				return saved, saved.LastError
+			}
+			return saved, authErr
+		}
+		latest.LastError = authErr
+		latest.Status = coreauth.StatusError
+		latest.StatusMessage = strings.TrimSpace(authErr.Message)
+		latest.Unavailable = true
+		latest.NextRefreshAfter = now.Add(authStatusRefreshFailureBackoff)
+		latest.UpdatedAt = now
+		if authErr.HTTPStatus == http.StatusTooManyRequests {
+			latest.Quota.Exceeded = true
+			latest.Quota.Reason = "quota"
+			latest.Quota.NextRecoverAt = now.Add(authStatusRefreshFailureBackoff)
+		}
+		saved, errUpdate := h.authManager.Update(ctx, latest)
 		if errUpdate != nil {
 			return saved, errUpdate
 		}
 		return saved, authErr
+	}
+
+	latest := h.latestAuthSnapshot(current)
+	if refreshAttemptSuperseded(latest, attemptRefreshToken, attemptStartedAt) {
+		return latest, nil
 	}
 
 	updated.LastError = nil
@@ -2811,6 +2842,57 @@ func (h *Handler) refreshAuthStatus(ctx context.Context, current *coreauth.Auth)
 	updated.UpdatedAt = now
 
 	return h.authManager.Update(ctx, updated)
+}
+
+func (h *Handler) latestAuthSnapshot(current *coreauth.Auth) *coreauth.Auth {
+	if h == nil || h.authManager == nil || current == nil {
+		return nil
+	}
+	if current.ID != "" {
+		if latest, ok := h.authManager.GetByID(current.ID); ok && latest != nil {
+			return latest
+		}
+	}
+	name := strings.TrimSpace(current.FileName)
+	if name == "" {
+		name = filepath.Base(strings.TrimSpace(authAttribute(current, "path")))
+	}
+	if name != "" {
+		return h.findAuthByNameOrID(name)
+	}
+	return nil
+}
+
+func authRefreshTokenValue(auth *coreauth.Auth) string {
+	if auth == nil || auth.Metadata == nil {
+		return ""
+	}
+	if token, ok := auth.Metadata["refresh_token"].(string); ok {
+		return strings.TrimSpace(token)
+	}
+	return ""
+}
+
+func refreshAttemptSuperseded(latest *coreauth.Auth, attemptedRefreshToken string, attemptStartedAt time.Time) bool {
+	if latest == nil {
+		return false
+	}
+	latestRefreshToken := authRefreshTokenValue(latest)
+	if attemptedRefreshToken != "" && latestRefreshToken != "" && latestRefreshToken != attemptedRefreshToken {
+		return true
+	}
+	if attemptStartedAt.IsZero() {
+		return false
+	}
+	if !latest.LastRefreshedAt.IsZero() && latest.LastRefreshedAt.After(attemptStartedAt) {
+		return true
+	}
+	if latest.Metadata != nil {
+		if refreshedAt, ok := extractLastRefreshTimestamp(latest.Metadata); ok && refreshedAt.After(attemptStartedAt) {
+			return true
+		}
+	}
+	return false
 }
 
 func preserveAuthIdentity(updated, current *coreauth.Auth) {

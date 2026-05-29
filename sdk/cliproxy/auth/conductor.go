@@ -1195,6 +1195,47 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	return auth.Clone(), nil
 }
 
+// IncrementCyberPolicyCount atomically bumps the cyber_policy flag counter and
+// timestamp for the auth with the given ID, then persists the change.
+//
+// The read-modify-write of CyberPolicyFlagCount / LastCyberPolicyAt happens
+// entirely under m.mu so concurrent hits cannot lose increments. Persistence
+// (store + hooks) runs after the lock is released to avoid re-entrant locking
+// inside Update / persist. When persistence fails the in-memory counter is
+// still bumped (visible to subsequent reads via m.auths) but the error is
+// surfaced so callers can suppress webhook dispatch and emit an ERROR log.
+//
+// Returns the new count, the timestamp recorded, and a persistence error if
+// any. When the auth cannot be located it returns (0, zero time, nil).
+func (m *Manager) IncrementCyberPolicyCount(ctx context.Context, authID string) (int, time.Time, error) {
+	authID = strings.TrimSpace(authID)
+	if authID == "" {
+		return 0, time.Time{}, nil
+	}
+	now := time.Now().UTC()
+	m.mu.Lock()
+	existing, ok := m.auths[authID]
+	if !ok || existing == nil {
+		m.mu.Unlock()
+		return 0, time.Time{}, nil
+	}
+	// 锁内完成 read-modify-write：直接修改 in-memory entry，避免并发丢增量。
+	existing.CyberPolicyFlagCount++
+	existing.LastCyberPolicyAt = now
+	newCount := existing.CyberPolicyFlagCount
+	snapshot := existing.Clone()
+	m.mu.Unlock()
+	if snapshot == nil {
+		return newCount, now, nil
+	}
+	// 锁外做持久化：persist 内部不再 acquire m.mu，但保险起见仍然放到锁外。
+	// 失败时把 error 透出，让调用方决定是否抑制 webhook。
+	if err := m.persist(ctx, snapshot); err != nil {
+		return newCount, now, err
+	}
+	return newCount, now, nil
+}
+
 // Load resets manager state from the backing store.
 func (m *Manager) Load(ctx context.Context) error {
 	m.mu.Lock()
@@ -3458,10 +3499,17 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 	now := time.Now()
 	if err != nil {
 		shouldReschedule := false
+		var reauthSnapshot *Auth
 		m.mu.Lock()
 		if current := m.auths[id]; current != nil {
-			current.NextRefreshAfter = now.Add(refreshFailureBackoff)
-			current.LastError = &Error{Message: err.Error()}
+			if isRefreshTokenReuseError(err) {
+				current.markRefreshReauthRequired(now)
+				reauthSnapshot = current.Clone()
+			} else {
+				current.NextRefreshAfter = now.Add(refreshFailureBackoff)
+				current.LastError = &Error{Message: err.Error()}
+				current.UpdatedAt = now
+			}
 			m.auths[id] = current
 			shouldReschedule = true
 			if m.scheduler != nil {
@@ -3469,6 +3517,12 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 			}
 		}
 		m.mu.Unlock()
+		if reauthSnapshot != nil {
+			if errPersist := m.persist(ctx, reauthSnapshot); errPersist != nil {
+				logEntryWithRequestID(ctx).WithField("auth_id", id).Warnf("failed to persist reauth-required refresh state: %v", errPersist)
+			}
+			m.hook.OnAuthUpdated(ctx, reauthSnapshot.Clone())
+		}
 		if shouldReschedule {
 			m.queueRefreshReschedule(id)
 		}

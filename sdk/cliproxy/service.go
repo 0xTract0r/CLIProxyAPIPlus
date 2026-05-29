@@ -14,6 +14,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/api"
 	kiroauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/kiro"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor"
 	_ "github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
@@ -423,7 +424,7 @@ func (s *Service) ensureExecutorsForAuthWithMode(a *coreauth.Auth, forceReplace 
 				}
 			}
 		}
-		s.coreManager.RegisterExecutor(executor.NewCodexAutoExecutor(s.cfg))
+		s.coreManager.RegisterExecutor(executor.NewCodexAutoExecutorWithManager(s.cfg, s.coreManager))
 		return
 	}
 	// Skip disabled auth entries when (re)binding executors.
@@ -471,7 +472,9 @@ func (s *Service) ensureExecutorsForAuthWithMode(a *coreauth.Auth, forceReplace 
 	case "github-copilot":
 		s.coreManager.RegisterExecutor(executor.NewGitHubCopilotExecutor(s.cfg))
 	case "gitlab":
-		s.coreManager.RegisterExecutor(executor.NewGitLabExecutor(s.cfg))
+		// gitlab Duo 在 fallback 到 Codex OpenAI 网关时会命中 cyber_policy，
+		// 必须把 manager 注入以便计数和 webhook 写回。
+		s.coreManager.RegisterExecutor(executor.NewGitLabExecutorWithManager(s.cfg, s.coreManager))
 	default:
 		providerKey := strings.ToLower(strings.TrimSpace(a.Provider))
 		if providerKey == "" {
@@ -525,6 +528,9 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	if s.cfg != nil {
+		logging.ConfigureErrorLogAlert(s.cfg.ErrorLogAlert)
 	}
 
 	usage.StartDefault(ctx)

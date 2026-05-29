@@ -89,6 +89,12 @@ type Auth struct {
 	// ModelStates tracks per-model runtime availability data.
 	ModelStates map[string]*ModelState `json:"model_states,omitempty"`
 
+	// CyberPolicyFlagCount counts how many times the upstream returned a
+	// cyber_policy flag for this auth (currently Codex /v1/responses).
+	CyberPolicyFlagCount int `json:"cyber_policy_flag_count,omitempty"`
+	// LastCyberPolicyAt records the timestamp of the most recent cyber_policy hit.
+	LastCyberPolicyAt time.Time `json:"last_cyber_policy_at,omitempty"`
+
 	// Runtime carries non-serialisable data used during execution (in-memory only).
 	Runtime any `json:"-"`
 
@@ -448,6 +454,9 @@ func refreshDisabledFromMetadata(meta map[string]any) bool {
 	if len(meta) == 0 {
 		return false
 	}
+	if isReauthRequiredMetadata(meta) {
+		return true
+	}
 	for _, key := range []string{"refresh_disabled", "disable_refresh", "auto_refresh_disabled"} {
 		if parsed, ok := parseBoolAny(meta[key]); ok && parsed {
 			return true
@@ -471,6 +480,79 @@ func refreshDisabledFromMetadata(meta map[string]any) bool {
 		}
 	}
 	return false
+}
+
+const refreshReauthRequiredMessage = "refresh token was already used; sign in again to reconnect this account"
+
+func isReauthRequiredMetadata(meta map[string]any) bool {
+	if len(meta) == 0 {
+		return false
+	}
+	if parsed, ok := parseBoolAny(meta["reauth_required"]); ok && parsed {
+		return true
+	}
+	for _, key := range []string{"refresh_status", "refresh_error_code", "refresh_disabled_reason"} {
+		if value, ok := meta[key].(string); ok && strings.EqualFold(strings.TrimSpace(value), "reauth_required") {
+			return true
+		}
+	}
+	return false
+}
+
+func isRefreshTokenReuseError(err error) bool {
+	if err == nil {
+		return false
+	}
+	raw := strings.ToLower(err.Error())
+	if raw == "" {
+		return false
+	}
+	normalized := strings.NewReplacer("-", "_", " ", "_").Replace(raw)
+	if strings.Contains(normalized, "refresh_token_reused") || strings.Contains(normalized, "refresh_token_reuse") || strings.Contains(normalized, "refresh_token_already_used") {
+		return true
+	}
+	return strings.Contains(normalized, "refresh") && strings.Contains(normalized, "already") && (strings.Contains(normalized, "used") || strings.Contains(normalized, "reuse"))
+}
+
+// IsRefreshTokenReuseError reports whether a provider refresh error means the
+// refresh token has already been rotated and this credential needs reauth.
+func IsRefreshTokenReuseError(err error) bool {
+	return isRefreshTokenReuseError(err)
+}
+
+func (a *Auth) markRefreshReauthRequired(now time.Time) {
+	if a == nil {
+		return
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	if a.Metadata == nil {
+		a.Metadata = make(map[string]any)
+	}
+	a.Metadata["refresh_disabled"] = true
+	a.Metadata["refresh_status"] = "reauth_required"
+	a.Metadata["refresh_error_code"] = "refresh_token_reused"
+	a.Metadata["refresh_disabled_reason"] = "reauth_required"
+	a.Metadata["reauth_required"] = true
+	a.Metadata["refresh_disabled_at"] = now.UTC().Format(time.RFC3339)
+	a.Metadata["last_refresh_error"] = refreshReauthRequiredMessage
+	a.NextRefreshAfter = time.Time{}
+	a.Status = StatusError
+	a.StatusMessage = "reauth_required"
+	a.LastError = &Error{
+		Code:       "reauth_required",
+		Message:    refreshReauthRequiredMessage,
+		Retryable:  false,
+		HTTPStatus: http.StatusUnauthorized,
+	}
+	a.UpdatedAt = now
+}
+
+// MarkRefreshReauthRequired persists the terminal state for a credential whose
+// refresh token was already used by another refresh flow.
+func (a *Auth) MarkRefreshReauthRequired(now time.Time) {
+	a.markRefreshReauthRequired(now)
 }
 
 func metadataObject(raw any) (map[string]any, bool) {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -35,6 +36,104 @@ func (e schedulerProviderTestExecutor) CountTokens(ctx context.Context, auth *Au
 
 func (e schedulerProviderTestExecutor) HttpRequest(ctx context.Context, auth *Auth, req *http.Request) (*http.Response, error) {
 	return nil, nil
+}
+
+type terminalRefreshExecutor struct {
+	schedulerProviderTestExecutor
+	calls     int
+	seenToken string
+}
+
+func (e *terminalRefreshExecutor) Refresh(ctx context.Context, auth *Auth) (*Auth, error) {
+	e.calls++
+	if auth != nil && auth.Metadata != nil {
+		e.seenToken, _ = auth.Metadata["refresh_token"].(string)
+	}
+	return nil, errors.New(`token refresh failed: status=401 content_type=application/json content_encoding=<empty> body_preview="{\"error\":\"invalid_grant\",\"error_description\":\"Refresh token has already been used\"}"`)
+}
+
+type captureStore struct {
+	saved []*Auth
+}
+
+func (s *captureStore) List(context.Context) ([]*Auth, error) { return nil, nil }
+
+func (s *captureStore) Save(_ context.Context, auth *Auth) (string, error) {
+	if auth != nil {
+		s.saved = append(s.saved, auth.Clone())
+	}
+	return "", nil
+}
+
+func (s *captureStore) Delete(context.Context, string) error { return nil }
+
+func (s *captureStore) last() *Auth {
+	if len(s.saved) == 0 {
+		return nil
+	}
+	return s.saved[len(s.saved)-1]
+}
+
+func TestManagerRefreshAuth_DisablesRefreshAfterRefreshTokenReused(t *testing.T) {
+	ctx := context.Background()
+	store := &captureStore{}
+	manager := NewManager(store, nil, nil)
+	executor := &terminalRefreshExecutor{
+		schedulerProviderTestExecutor: schedulerProviderTestExecutor{provider: "codex"},
+	}
+	manager.RegisterExecutor(executor)
+
+	auth := &Auth{
+		ID:       "codex-refresh-reused",
+		Provider: "codex",
+		Metadata: map[string]any{
+			"refresh_token":            "old-refresh-token",
+			"refresh_interval_seconds": 1,
+		},
+	}
+	if _, err := manager.Register(ctx, auth); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+
+	manager.refreshAuth(ctx, auth.ID)
+	if executor.calls != 1 {
+		t.Fatalf("refresh calls = %d, want 1", executor.calls)
+	}
+	if executor.seenToken != "old-refresh-token" {
+		t.Fatalf("refresh token used = %q, want original token", executor.seenToken)
+	}
+
+	updated, ok := manager.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatal("expected auth to remain registered")
+	}
+	if !updated.RefreshDisabled() {
+		t.Fatal("RefreshDisabled() = false, want true after terminal reuse error")
+	}
+	if updated.Status != StatusError || updated.StatusMessage != "reauth_required" {
+		t.Fatalf("status = %q/%q, want error/reauth_required", updated.Status, updated.StatusMessage)
+	}
+	if updated.LastError == nil || updated.LastError.Code != "reauth_required" || updated.LastError.Retryable {
+		t.Fatalf("LastError = %+v, want non-retryable reauth_required", updated.LastError)
+	}
+	if strings.Contains(updated.LastError.Message, "old-refresh-token") {
+		t.Fatalf("LastError message leaked refresh token: %q", updated.LastError.Message)
+	}
+	if got, _ := updated.Metadata["last_refresh_error"].(string); got == "" || strings.Contains(got, "old-refresh-token") {
+		t.Fatalf("last_refresh_error = %q, want visible message without token", got)
+	}
+	if _, shouldSchedule := nextRefreshCheckAt(time.Now(), updated, time.Second); shouldSchedule {
+		t.Fatal("nextRefreshCheckAt() scheduled terminal reauth auth, want unscheduled")
+	}
+
+	manager.refreshAuth(ctx, auth.ID)
+	if executor.calls != 1 {
+		t.Fatalf("refresh calls after second manager refresh = %d, want still 1", executor.calls)
+	}
+	saved := store.last()
+	if saved == nil || !saved.RefreshDisabled() {
+		t.Fatalf("persisted auth RefreshDisabled() = %v, want true", saved != nil && saved.RefreshDisabled())
+	}
 }
 
 func TestManager_RefreshSchedulerEntry_RebuildsSupportedModelSetAfterModelRegistration(t *testing.T) {

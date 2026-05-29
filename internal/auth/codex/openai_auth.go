@@ -308,12 +308,16 @@ func (o *CodexAuth) RefreshTokensWithRetry(ctx context.Context, refreshToken str
 			return tokenData, nil
 		}
 		if isNonRetryableRefreshErr(err) {
-			log.Warnf("Token refresh attempt %d failed with non-retryable error: %v", attempt+1, err)
+			log.Errorf("Token refresh attempt %d failed with non-retryable error: %v", attempt+1, err)
 			return nil, err
 		}
 
 		lastErr = err
-		log.Warnf("Token refresh attempt %d failed: %v", attempt+1, err)
+		if attempt+1 >= maxRetries {
+			log.Errorf("Token refresh attempt %d failed: %v", attempt+1, err)
+		} else {
+			log.Warnf("Token refresh attempt %d failed: %v", attempt+1, err)
+		}
 	}
 
 	return nil, fmt.Errorf("token refresh failed after %d attempts: %w", maxRetries, lastErr)
@@ -324,7 +328,14 @@ func isNonRetryableRefreshErr(err error) bool {
 		return false
 	}
 	raw := strings.ToLower(err.Error())
-	return strings.Contains(raw, "refresh_token_reused")
+	if raw == "" {
+		return false
+	}
+	normalized := strings.NewReplacer("-", "_", " ", "_").Replace(raw)
+	if strings.Contains(normalized, "refresh_token_reused") || strings.Contains(normalized, "refresh_token_reuse") || strings.Contains(normalized, "refresh_token_already_used") {
+		return true
+	}
+	return strings.Contains(normalized, "refresh") && strings.Contains(normalized, "already") && (strings.Contains(normalized, "used") || strings.Contains(normalized, "reuse"))
 }
 
 func summarizeTokenHTTPResponse(resp *http.Response, body []byte) string {

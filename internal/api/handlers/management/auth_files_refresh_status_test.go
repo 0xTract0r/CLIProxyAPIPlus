@@ -215,6 +215,236 @@ func TestRefreshAuthFileStatusPersistsCurrentFailure(t *testing.T) {
 	}
 }
 
+func TestRefreshAuthFileStatusDoesNotOverwriteConcurrentSuccessOnFailure(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	manager.RegisterExecutor(&refreshStatusExecutor{
+		provider: "codex",
+		refresh: func(ctx context.Context, auth *coreauth.Auth) (*coreauth.Auth, error) {
+			latest := auth.Clone()
+			if latest.Metadata == nil {
+				latest.Metadata = make(map[string]any)
+			}
+			refreshedAt := time.Now()
+			latest.Metadata["refresh_token"] = "new-refresh-token"
+			latest.Metadata["access_token"] = "new-access-token"
+			latest.Metadata["last_refresh"] = refreshedAt.Format(time.RFC3339Nano)
+			latest.Status = coreauth.StatusActive
+			latest.StatusMessage = ""
+			latest.Unavailable = false
+			latest.LastError = nil
+			latest.LastRefreshedAt = refreshedAt
+			latest.UpdatedAt = refreshedAt
+			if _, errUpdate := manager.Update(ctx, latest); errUpdate != nil {
+				return nil, errUpdate
+			}
+			return nil, &coreauth.Error{
+				Code:      "refresh_failed",
+				Message:   "context canceled",
+				Retryable: true,
+			}
+		},
+	})
+
+	record := &coreauth.Auth{
+		ID:            "codex-race.json",
+		FileName:      "codex-race.json",
+		Provider:      "codex",
+		Status:        coreauth.StatusError,
+		StatusMessage: "context canceled",
+		Unavailable:   true,
+		Attributes: map[string]string{
+			"path": "/tmp/codex-race.json",
+		},
+		Metadata: map[string]any{
+			"type":          "codex",
+			"email":         "race@example.com",
+			"refresh_token": "old-refresh-token",
+			"access_token":  "old-access-token",
+			"last_refresh":  "2026-05-22T19:38:35+08:00",
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("register auth record: %v", errRegister)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPost, "/v0/management/auth-files/refresh-status", strings.NewReader(`{"name":"codex-race.json"}`))
+	req.Header.Set("Content-Type", "application/json")
+	ctx.Request = req
+	h.RefreshAuthFileStatus(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+
+	var payload struct {
+		Status string `json:"status"`
+		Error  string `json:"error"`
+	}
+	if errDecode := json.Unmarshal(rec.Body.Bytes(), &payload); errDecode != nil {
+		t.Fatalf("decode response: %v", errDecode)
+	}
+	if payload.Status != "ok" {
+		t.Fatalf("response status = %q, want ok", payload.Status)
+	}
+	if payload.Error != "" {
+		t.Fatalf("response error = %q, want empty stale failure", payload.Error)
+	}
+
+	updated, ok := manager.GetByID("codex-race.json")
+	if !ok || updated == nil {
+		t.Fatalf("expected refreshed auth record")
+	}
+	if got := updated.Metadata["refresh_token"]; got != "new-refresh-token" {
+		t.Fatalf("refresh_token = %q, want concurrent success token", got)
+	}
+	if got := updated.Metadata["access_token"]; got != "new-access-token" {
+		t.Fatalf("access_token = %q, want concurrent success token", got)
+	}
+	if updated.Status != coreauth.StatusActive {
+		t.Fatalf("status = %q, want active", updated.Status)
+	}
+	if updated.StatusMessage != "" {
+		t.Fatalf("status message = %q, want empty", updated.StatusMessage)
+	}
+	if updated.Unavailable {
+		t.Fatalf("expected unavailable to remain false after concurrent success")
+	}
+
+	events, errRead := readAuthStatusHistoryEventsFromFile(
+		authStatusHistoryPath(h.cfg.AuthDir),
+		"codex-race.json",
+		5,
+	)
+	if errRead != nil {
+		t.Fatalf("read auth status history: %v", errRead)
+	}
+	if len(events) != 1 {
+		t.Fatalf("history events = %d, want 1", len(events))
+	}
+	if events[0].EventType != "cleared" {
+		t.Fatalf("event_type = %q, want cleared", events[0].EventType)
+	}
+}
+
+func TestRefreshAuthFileStatusMarksRefreshTokenReuseReauthRequired(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	manager.RegisterExecutor(&refreshStatusExecutor{
+		provider: "codex",
+		refresh: func(ctx context.Context, auth *coreauth.Auth) (*coreauth.Auth, error) {
+			return nil, &coreauth.Error{
+				Code:       "refresh_token_reused",
+				Message:    "token refresh failed: old-refresh-token refresh_token_reused",
+				Retryable:  false,
+				HTTPStatus: http.StatusUnauthorized,
+			}
+		},
+	})
+
+	record := &coreauth.Auth{
+		ID:       "codex-reused.json",
+		FileName: "codex-reused.json",
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"path": "/tmp/codex-reused.json",
+		},
+		Metadata: map[string]any{
+			"type":          "codex",
+			"email":         "codex@example.com",
+			"refresh_token": "old-refresh-token",
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("register auth record: %v", errRegister)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPost, "/v0/management/auth-files/refresh-status", strings.NewReader(`{"name":"codex-reused.json"}`))
+	req.Header.Set("Content-Type", "application/json")
+	ctx.Request = req
+	h.RefreshAuthFileStatus(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+
+	var payload struct {
+		Status string `json:"status"`
+		Error  string `json:"error"`
+	}
+	if errDecode := json.Unmarshal(rec.Body.Bytes(), &payload); errDecode != nil {
+		t.Fatalf("decode response: %v", errDecode)
+	}
+	if payload.Status != "warning" {
+		t.Fatalf("response status = %q, want warning", payload.Status)
+	}
+	if !strings.Contains(payload.Error, "sign in again") {
+		t.Fatalf("response error = %q, want reauth hint", payload.Error)
+	}
+	if strings.Contains(payload.Error, "old-refresh-token") {
+		t.Fatalf("response error leaked refresh token: %q", payload.Error)
+	}
+
+	updated, ok := manager.GetByID("codex-reused.json")
+	if !ok || updated == nil {
+		t.Fatalf("expected refreshed auth record")
+	}
+	if !updated.RefreshDisabled() {
+		t.Fatal("RefreshDisabled() = false, want true after refresh_token_reused")
+	}
+	if updated.Status != coreauth.StatusError || updated.StatusMessage != "reauth_required" {
+		t.Fatalf("status = %q/%q, want error/reauth_required", updated.Status, updated.StatusMessage)
+	}
+	if !updated.NextRefreshAfter.IsZero() {
+		t.Fatalf("NextRefreshAfter = %v, want zero for terminal reauth", updated.NextRefreshAfter)
+	}
+	if got, _ := updated.Metadata["refresh_error_code"].(string); got != "refresh_token_reused" {
+		t.Fatalf("refresh_error_code = %q, want refresh_token_reused", got)
+	}
+	if got, _ := updated.Metadata["refresh_status"].(string); got != "reauth_required" {
+		t.Fatalf("refresh_status = %q, want reauth_required", got)
+	}
+	if updated.LastError == nil || updated.LastError.Code != "reauth_required" || updated.LastError.Retryable {
+		t.Fatalf("LastError = %+v, want non-retryable reauth_required", updated.LastError)
+	}
+	if strings.Contains(updated.LastError.Message, "old-refresh-token") {
+		t.Fatalf("LastError message leaked refresh token: %q", updated.LastError.Message)
+	}
+
+	events, errRead := readAuthStatusHistoryEventsFromFile(
+		authStatusHistoryPath(h.cfg.AuthDir),
+		"codex-reused.json",
+		5,
+	)
+	if errRead != nil {
+		t.Fatalf("read auth status history: %v", errRead)
+	}
+	if len(events) != 1 {
+		t.Fatalf("history events = %d, want 1", len(events))
+	}
+	if events[0].EventType != "warning" {
+		t.Fatalf("event_type = %q, want warning", events[0].EventType)
+	}
+	if strings.Contains(events[0].Error, "old-refresh-token") {
+		t.Fatalf("history error leaked refresh token: %q", events[0].Error)
+	}
+}
+
 func TestRefreshAuthFileStatusLeavesTransientPreExpiryFailureNonRed(t *testing.T) {
 	t.Skip("TODO(2026-05-14): main 已重做 refresh status 语义，原 archive 期望与现实不符，待重新对齐")
 	t.Setenv("MANAGEMENT_PASSWORD", "")

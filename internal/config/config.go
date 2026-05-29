@@ -90,6 +90,9 @@ type Config struct {
 	// When exceeded, the oldest error log files are deleted. Default is 10. Set to 0 to disable cleanup.
 	ErrorLogsMaxFiles int `yaml:"error-logs-max-files" json:"error-logs-max-files"`
 
+	// ErrorLogAlert controls external notifications for application error logs.
+	ErrorLogAlert ErrorLogAlertConfig `yaml:"error-log-alert" json:"error-log-alert"`
+
 	// UsageStatisticsEnabled toggles in-memory usage aggregation; when false, usage data is discarded.
 	UsageStatisticsEnabled bool `yaml:"usage-statistics-enabled" json:"usage-statistics-enabled"`
 
@@ -190,7 +193,27 @@ type Config struct {
 	// from your current session. Default: false.
 	IncognitoBrowser bool `yaml:"incognito-browser" json:"incognito-browser"`
 
+	// CyberPolicyAlert configures the upstream cyber_policy flag alert side channel.
+	// When WebhookURL is empty (default), no outbound POST is fired; structured logs
+	// and per-account counters still update.
+	CyberPolicyAlert CyberPolicyAlertConfig `yaml:"cyber-policy-alert" json:"cyber-policy-alert"`
+
 	legacyMigrationPending bool `yaml:"-" json:"-"`
+}
+
+// ErrorLogAlertConfig configures external alerting for application error logs.
+type ErrorLogAlertConfig struct {
+	// FeishuWebhookURL is a Feishu custom bot webhook URL. Empty disables alerting.
+	FeishuWebhookURL string `yaml:"feishu-webhook-url" json:"feishu-webhook-url"`
+}
+
+// CyberPolicyAlertConfig groups optional side-channel configuration for the
+// Codex /v1/responses upstream cyber_policy event. When WebhookURL is empty the
+// alert subsystem keeps logging and counting hits without firing HTTP callouts.
+type CyberPolicyAlertConfig struct {
+	// WebhookURL receives an asynchronous JSON POST when a cyber_policy hit is
+	// recorded. Default is empty (disabled).
+	WebhookURL string `yaml:"webhook-url" json:"webhook-url"`
 }
 
 // ClaudeHeaderDefaults configures default header values injected into Claude API requests.
@@ -798,6 +821,8 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	if cfg.ErrorLogsMaxFiles < 0 {
 		cfg.ErrorLogsMaxFiles = DefaultErrorLogsMaxFiles
 	}
+
+	cfg.ErrorLogAlert.FeishuWebhookURL = strings.TrimSpace(cfg.ErrorLogAlert.FeishuWebhookURL)
 
 	if cfg.MaxRetryCredentials < 0 {
 		cfg.MaxRetryCredentials = 0

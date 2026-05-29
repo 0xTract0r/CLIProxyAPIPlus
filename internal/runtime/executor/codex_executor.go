@@ -124,11 +124,22 @@ func patchCodexCompletedOutput(eventData []byte, outputItemsByIndex map[int64][]
 
 // CodexExecutor is a stateless executor for Codex (OpenAI Responses API entrypoint).
 // If api_key is unavailable on auth, it falls back to legacy via ClientAdapter.
+//
+// 当通过 NewCodexExecutorWithManager 构造时，executor 会在检测到 Codex 上游
+// cyber_policy 事件时同步更新对应 Auth 的 CyberPolicyFlagCount / LastCyberPolicyAt。
+// 旧的 NewCodexExecutor 入口保持 nil manager，仅用于不需要计数写回的测试场景。
 type CodexExecutor struct {
-	cfg *config.Config
+	cfg         *config.Config
+	authManager *cliproxyauth.Manager
 }
 
 func NewCodexExecutor(cfg *config.Config) *CodexExecutor { return &CodexExecutor{cfg: cfg} }
+
+// NewCodexExecutorWithManager wires the auth manager so cyber_policy hits are
+// persisted into the auth record (CyberPolicyFlagCount / LastCyberPolicyAt).
+func NewCodexExecutorWithManager(cfg *config.Config, manager *cliproxyauth.Manager) *CodexExecutor {
+	return &CodexExecutor{cfg: cfg, authManager: manager}
+}
 
 func (e *CodexExecutor) Identifier() string { return "codex" }
 
@@ -509,6 +520,9 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		var param any
 		outputItemsByIndex := make(map[int64][]byte)
 		var outputItemsFallback [][]byte
+		// cyberPolicyRecorded 保证同一 ExecuteStream 调用内只对 cyber_policy 计数一次
+		// （response 端常见会先发 `type=error`，紧接着 `type=response.failed`）。
+		var cyberPolicyRecorded bool
 		for scanner.Scan() {
 			line := scanner.Bytes()
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
@@ -516,7 +530,8 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 
 			if bytes.HasPrefix(line, dataTag) {
 				data := bytes.TrimSpace(line[5:])
-				switch gjson.GetBytes(data, "type").String() {
+				eventType := gjson.GetBytes(data, "type").String()
+				switch eventType {
 				case "response.output_item.done":
 					collectCodexOutputItemDone(data, outputItemsByIndex, &outputItemsFallback)
 				case "response.completed":
@@ -525,6 +540,11 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 					}
 					data = patchCodexCompletedOutput(data, outputItemsByIndex, outputItemsFallback)
 					translatedLine = append([]byte("data: "), data...)
+				case "error", "response.failed":
+					if !cyberPolicyRecorded && cyberPolicyHitFromData(data, eventType) {
+						cyberPolicyRecorded = true
+						e.recordCyberPolicy(ctx, auth, req.Model)
+					}
 				}
 			}
 
@@ -699,6 +719,41 @@ func countCodexInputTokens(enc tokenizer.Codec, body []byte) (int64, error) {
 	return int64(count), nil
 }
 
+func refreshFailureLogFields(auth *cliproxyauth.Auth) log.Fields {
+	fields := log.Fields{}
+	if auth == nil {
+		return fields
+	}
+	fields["provider"] = auth.Provider
+	if remark := authAccountRemark(auth); remark != "" {
+		fields["account_remark"] = remark
+	}
+	// Keep stable identifiers in structured data for local forensic correlation;
+	// the Feishu error hook redacts these fields before delivery.
+	fields["auth_id"] = auth.ID
+	fields["auth_file"] = auth.FileName
+	return fields
+}
+
+func authAccountRemark(auth *cliproxyauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	if auth.Attributes != nil {
+		if note := strings.TrimSpace(auth.Attributes["note"]); note != "" {
+			return note
+		}
+	}
+	if auth.Metadata != nil {
+		if note, ok := auth.Metadata["note"].(string); ok {
+			if trimmed := strings.TrimSpace(note); trimmed != "" {
+				return trimmed
+			}
+		}
+	}
+	return ""
+}
+
 func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {
 	log.Debugf("codex executor: refresh called")
 	if auth == nil {
@@ -724,6 +779,7 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 	svc := codexauth.NewCodexAuthWithProxyURL(e.cfg, auth.ProxyURL)
 	td, err := svc.RefreshTokensWithRetry(ctx, refreshToken, 3)
 	if err != nil {
+		log.WithFields(refreshFailureLogFields(auth)).Errorf("codex executor: token refresh failed: %v", err)
 		return nil, err
 	}
 	if auth.Metadata == nil {

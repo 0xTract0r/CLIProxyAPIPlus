@@ -34,6 +34,9 @@ const (
 
 type GitLabExecutor struct {
 	cfg *config.Config
+	// authManager 用于把 Codex 网关 fallback 路径上的 cyber_policy 命中计数回写到
+	// 同一 Auth 记录上。当通过 NewGitLabExecutor 构造时保持 nil（仅用于测试场景）。
+	authManager *cliproxyauth.Manager
 }
 
 type gitLabPrompt struct {
@@ -55,6 +58,12 @@ type gitLabOpenAIStreamState struct {
 
 func NewGitLabExecutor(cfg *config.Config) *GitLabExecutor {
 	return &GitLabExecutor{cfg: cfg}
+}
+
+// NewGitLabExecutorWithManager 让 GitLab Duo 在落到 Codex OpenAI 网关 fallback 时
+// 也能把 cyber_policy 命中写回 auth manager；production 入口应使用本构造函数。
+func NewGitLabExecutorWithManager(cfg *config.Config, manager *cliproxyauth.Manager) *GitLabExecutor {
+	return &GitLabExecutor{cfg: cfg, authManager: manager}
 }
 
 func (e *GitLabExecutor) Identifier() string { return gitLabProviderKey }
@@ -262,7 +271,8 @@ func (e *GitLabExecutor) nativeGateway(
 	if nativeAuth, ok := buildGitLabOpenAIGatewayAuth(auth); ok {
 		nativeReq := req
 		nativeReq.Model = gitLabResolvedModel(auth, req.Model)
-		return NewCodexExecutor(e.cfg), nativeAuth, nativeReq, true
+		// 把 manager 透传到 codex executor，cyber_policy 命中才能计数 + 触发 webhook
+		return NewCodexExecutorWithManager(e.cfg, e.authManager), nativeAuth, nativeReq, true
 	}
 	return nil, nil, req, false
 }
@@ -272,7 +282,8 @@ func (e *GitLabExecutor) nativeGatewayHTTP(auth *cliproxyauth.Auth) (cliproxyaut
 		return NewClaudeExecutor(e.cfg), nativeAuth
 	}
 	if nativeAuth, ok := buildGitLabOpenAIGatewayAuth(auth); ok {
-		return NewCodexExecutor(e.cfg), nativeAuth
+		// HttpRequest 路径同样把 manager 透传，保持与 nativeGateway 一致
+		return NewCodexExecutorWithManager(e.cfg, e.authManager), nativeAuth
 	}
 	return nil, nil
 }
