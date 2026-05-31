@@ -83,6 +83,8 @@ var oauthToolsToRemove = map[string]bool{}
 // omit max_tokens. Prefer registered model metadata before using a fallback.
 const defaultModelMaxTokens = 1024
 
+const claudeClientSafeTransportErrorMessage = "upstream transport error"
+
 func NewClaudeExecutor(cfg *config.Config) *ClaudeExecutor { return &ClaudeExecutor{cfg: cfg} }
 
 func (e *ClaudeExecutor) Identifier() string { return "claude" }
@@ -91,7 +93,7 @@ func claudeUpstreamTransportError(err error) error {
 	if err == nil {
 		return nil
 	}
-	return statusErr{code: http.StatusBadGateway, msg: err.Error()}
+	return statusErr{code: http.StatusBadGateway, msg: claudeClientSafeTransportErrorMessage}
 }
 
 func newClaudeStatusErr(statusCode int, body []byte, headers http.Header, now time.Time) statusErr {
