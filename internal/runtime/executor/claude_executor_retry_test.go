@@ -1,7 +1,9 @@
 package executor
 
 import (
+	"errors"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 )
@@ -46,5 +48,46 @@ func TestNewClaudeStatusErrUsesRetryAfterHeaderForUsageLimit(t *testing.T) {
 	}
 	if *retryAfter != 123*time.Second {
 		t.Fatalf("retryAfter = %v, want 123s", *retryAfter)
+	}
+}
+
+func TestClaudeUpstreamTransportErrorRedactsNetworkDetails(t *testing.T) {
+	rawErr := errors.New(`Post "https://api.anthropic.com/v1/messages": read tcp 172.25.0.2:37824->80.174.217.1:12324: read: connection reset by peer; proxy=http://user:pass@80.174.217.1:12324`)
+
+	err := claudeUpstreamTransportError(rawErr)
+	if err == nil {
+		t.Fatal("expected transport error, got nil")
+	}
+	statusErr, ok := err.(interface{ StatusCode() int })
+	if !ok {
+		t.Fatalf("expected status error, got %T", err)
+	}
+	if got := statusErr.StatusCode(); got != http.StatusBadGateway {
+		t.Fatalf("status = %d, want %d", got, http.StatusBadGateway)
+	}
+	if got := err.Error(); got != claudeClientSafeTransportErrorMessage {
+		t.Fatalf("message = %q, want %q", got, claudeClientSafeTransportErrorMessage)
+	}
+
+	for _, forbidden := range []string{
+		"172.25.0.2",
+		"80.174.217.1",
+		"37824",
+		"12324",
+		"user",
+		"pass",
+		"read tcp",
+		"->",
+		"api.anthropic.com",
+	} {
+		if strings.Contains(err.Error(), forbidden) {
+			t.Fatalf("client error leaked %q in %q", forbidden, err.Error())
+		}
+	}
+}
+
+func TestClaudeUpstreamTransportErrorNil(t *testing.T) {
+	if err := claudeUpstreamTransportError(nil); err != nil {
+		t.Fatalf("expected nil error, got %v", err)
 	}
 }
