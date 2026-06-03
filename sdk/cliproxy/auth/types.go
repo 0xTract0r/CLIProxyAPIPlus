@@ -484,6 +484,12 @@ func refreshDisabledFromMetadata(meta map[string]any) bool {
 
 const refreshReauthRequiredMessage = "refresh token was already used; sign in again to reconnect this account"
 
+// refreshReauthRequiredGenericMessage is the sanitized message persisted when a
+// refresh token is rejected as invalid/expired/revoked (e.g. provider returns
+// OAuth invalid_grant) rather than specifically reused. It never echoes the raw
+// provider body so tokens cannot leak into auth files or the management UI.
+const refreshReauthRequiredGenericMessage = "refresh token is no longer valid; sign in again to reconnect this account"
+
 func isReauthRequiredMetadata(meta map[string]any) bool {
 	if len(meta) == 0 {
 		return false
@@ -520,29 +526,92 @@ func IsRefreshTokenReuseError(err error) bool {
 	return isRefreshTokenReuseError(err)
 }
 
+// terminalRefreshAuthError reports whether a provider refresh error is terminal,
+// meaning the refresh token can no longer be exchanged and the credential needs
+// the operator to authenticate again. It returns a fixed, sanitized error code
+// for diagnostics (never the raw provider body, which may embed token material).
+//
+// Rationale (no Anthropic/Claude public docs exist for refresh-token rotation):
+//   - RFC 6749 §5.2 defines OAuth invalid_grant for a refresh request as the
+//     refresh token being invalid / expired / revoked / reused. None of these
+//     are recoverable by retrying the same token.
+//   - RFC 9700 §4.14 recommends refresh-token rotation with replay detection,
+//     where re-submitting a rotated-out token can revoke the whole token family.
+//     So retrying a terminal token is not just useless, it can make recovery
+//     strictly harder.
+//
+// This is only ever called on a refresh-call error, so a bare invalid_grant is
+// itself terminal. The reuse signatures handled by isRefreshTokenReuseError are
+// a subset and keep their dedicated code for backward compatibility.
+func terminalRefreshAuthError(err error) (string, bool) {
+	if err == nil {
+		return "", false
+	}
+	if isRefreshTokenReuseError(err) {
+		return "refresh_token_reused", true
+	}
+	raw := strings.ToLower(err.Error())
+	if raw == "" {
+		return "", false
+	}
+	normalized := strings.NewReplacer("-", "_", " ", "_").Replace(raw)
+	if strings.Contains(normalized, "invalid_grant") {
+		return "invalid_grant", true
+	}
+	return "", false
+}
+
+// IsTerminalRefreshAuthError reports whether a provider refresh error is
+// terminal and the credential must be re-authenticated rather than retried.
+func IsTerminalRefreshAuthError(err error) bool {
+	_, terminal := terminalRefreshAuthError(err)
+	return terminal
+}
+
+// reauthMessageForCode returns the sanitized, user-facing message persisted for
+// a given terminal refresh error code.
+func reauthMessageForCode(code string) string {
+	if code == "refresh_token_reused" {
+		return refreshReauthRequiredMessage
+	}
+	return refreshReauthRequiredGenericMessage
+}
+
 func (a *Auth) markRefreshReauthRequired(now time.Time) {
+	a.markRefreshReauthRequiredWithReason(now, "refresh_token_reused")
+}
+
+// markRefreshReauthRequiredWithReason records the terminal reauth-required state
+// using the supplied sanitized error code (e.g. "refresh_token_reused" or
+// "invalid_grant"). The persisted message is derived from the code and never
+// contains the raw provider body.
+func (a *Auth) markRefreshReauthRequiredWithReason(now time.Time, code string) {
 	if a == nil {
 		return
 	}
 	if now.IsZero() {
 		now = time.Now()
 	}
+	if strings.TrimSpace(code) == "" {
+		code = "refresh_token_reused"
+	}
+	message := reauthMessageForCode(code)
 	if a.Metadata == nil {
 		a.Metadata = make(map[string]any)
 	}
 	a.Metadata["refresh_disabled"] = true
 	a.Metadata["refresh_status"] = "reauth_required"
-	a.Metadata["refresh_error_code"] = "refresh_token_reused"
+	a.Metadata["refresh_error_code"] = code
 	a.Metadata["refresh_disabled_reason"] = "reauth_required"
 	a.Metadata["reauth_required"] = true
 	a.Metadata["refresh_disabled_at"] = now.UTC().Format(time.RFC3339)
-	a.Metadata["last_refresh_error"] = refreshReauthRequiredMessage
+	a.Metadata["last_refresh_error"] = message
 	a.NextRefreshAfter = time.Time{}
 	a.Status = StatusError
 	a.StatusMessage = "reauth_required"
 	a.LastError = &Error{
 		Code:       "reauth_required",
-		Message:    refreshReauthRequiredMessage,
+		Message:    message,
 		Retryable:  false,
 		HTTPStatus: http.StatusUnauthorized,
 	}
@@ -553,6 +622,99 @@ func (a *Auth) markRefreshReauthRequired(now time.Time) {
 // refresh token was already used by another refresh flow.
 func (a *Auth) MarkRefreshReauthRequired(now time.Time) {
 	a.markRefreshReauthRequired(now)
+}
+
+// tokenOwnedMetadataKeys are metadata fields owned by the OAuth/token lifecycle.
+// They must only move forward (a successful refresh or re-auth), never be rolled
+// back by a stale clone that carried older token state while writing unrelated
+// runtime metadata (e.g. quota status, managed headers).
+var tokenOwnedMetadataKeys = map[string]struct{}{
+	"access_token":      {},
+	"refresh_token":     {},
+	"id_token":          {},
+	"token":             {},
+	"expired":           {},
+	"expires_at":        {},
+	"oauth_expires_at":  {},
+	"expires_in":        {},
+	"last_refresh":      {},
+	"last_refreshed_at": {},
+	"timestamp":         {},
+}
+
+// tokenOwnedFreshness returns the most recent timestamp that describes when this
+// credential's token-owned state was last issued/updated. A successful refresh
+// or re-auth advances it (newer expiry / last_refresh); a stale clone keeps an
+// older value. It is used to detect and reject token rollbacks.
+func tokenOwnedFreshness(a *Auth) time.Time {
+	if a == nil {
+		return time.Time{}
+	}
+	latest := a.LastRefreshedAt
+	if exp, ok := a.ExpirationTime(); ok && exp.After(latest) {
+		latest = exp
+	}
+	if a.Metadata != nil {
+		for _, key := range []string{"last_refresh", "last_refreshed_at", "timestamp"} {
+			if t, ok := parseTimeValue(a.Metadata[key]); ok && t.After(latest) {
+				latest = t
+			}
+		}
+	}
+	return latest
+}
+
+// hasTokenMaterial reports whether the record actually carries OAuth token
+// material (access/refresh/id token). It gates the rollback guard so that
+// resets, disables, or delete -> re-add flows that intentionally drop tokens are
+// never treated as stale write-backs.
+func hasTokenMaterial(a *Auth) bool {
+	if a == nil || a.Metadata == nil {
+		return false
+	}
+	for _, key := range []string{"refresh_token", "access_token", "id_token", "token"} {
+		if v, ok := a.Metadata[key].(string); ok && strings.TrimSpace(v) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// preserveNewerTokenOwnedFields guards against a stale write-back rolling token
+// state backwards. It only acts when BOTH the existing in-memory record and the
+// incoming update carry token material and the existing one is strictly newer
+// (e.g. a refresh landed between the caller cloning the auth and calling Update
+// with unrelated metadata changes). In that case the incoming record's
+// token-owned fields are replaced with the existing ones, while non-token
+// metadata (quota / header / status) is left untouched and still applies.
+//
+// When the incoming record is same-or-newer (a real refresh or re-auth), or when
+// either side has no token material (reset / disable / re-add), this is a no-op
+// and the update proceeds unchanged.
+func preserveNewerTokenOwnedFields(incoming, existing *Auth) bool {
+	if incoming == nil || existing == nil {
+		return false
+	}
+	if !hasTokenMaterial(existing) || !hasTokenMaterial(incoming) {
+		return false
+	}
+	if !tokenOwnedFreshness(existing).After(tokenOwnedFreshness(incoming)) {
+		return false
+	}
+	if incoming.Metadata == nil {
+		incoming.Metadata = make(map[string]any, len(tokenOwnedMetadataKeys))
+	}
+	for key := range tokenOwnedMetadataKeys {
+		if value, ok := existing.Metadata[key]; ok {
+			incoming.Metadata[key] = value
+		} else {
+			delete(incoming.Metadata, key)
+		}
+	}
+	if existing.LastRefreshedAt.After(incoming.LastRefreshedAt) {
+		incoming.LastRefreshedAt = existing.LastRefreshedAt
+	}
+	return true
 }
 
 func metadataObject(raw any) (map[string]any, bool) {
