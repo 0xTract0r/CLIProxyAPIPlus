@@ -1023,10 +1023,11 @@ func stripImageGenerationTool(body []byte) []byte {
 // 组织验证的 ChatGPT 账号，对它们 image_generation 工具有害无益。
 //
 // 取值语义（大小写不敏感、TrimSpace）：
-//   ""（未配置/空）、"strip"、"true"、"on" → strip（剥离，新默认）。
-//   "off"、"false"、"inject" → 恢复旧的注入行为（按需注入简版 image_generation 工具），
-//                              留给已做组织验证、想用 Codex 出图的人。
-//   其它未知值 → 安全起见也走默认 strip（仅显式的 off/false/inject 才注入）。
+//
+//	""（未配置/空）、"strip"、"true"、"on" → strip（剥离，新默认）。
+//	"off"、"false"、"inject" → 恢复旧的注入行为（按需注入简版 image_generation 工具），
+//	                           留给已做组织验证、想用 Codex 出图的人。
+//	其它未知值 → 安全起见也走默认 strip（仅显式的 off/false/inject 才注入）。
 //
 // 注意：cfg == nil 也走 strip 默认行为。stripImageGenerationTool 只读 body，不依赖
 // cfg，因此 nil cfg 路径不会 panic。
