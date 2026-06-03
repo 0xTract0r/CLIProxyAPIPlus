@@ -184,40 +184,77 @@ func TestApplyImageGenerationPolicy_StripModeCaseInsensitive(t *testing.T) {
 	}
 }
 
-func TestApplyImageGenerationPolicy_DefaultOffInjects(t *testing.T) {
-	// 默认（""）保持现有注入行为，不剥离。
+func TestApplyImageGenerationPolicy_DefaultEmptyStrips(t *testing.T) {
+	// 新默认：空字符串（未配置）剥离 image_generation 工具，不再注入。
+	cfg := &config.Config{}
+	body := []byte(`{"model":"gpt-5.4","tools":[{"type":"image_generation","model":"gpt-image-2"}]}`)
+	result := applyImageGenerationPolicy(cfg, body, "gpt-5.4")
+
+	if gjson.GetBytes(result, "tools").Exists() {
+		t.Fatalf("expected default (empty) mode to strip image_generation, got %s", gjson.GetBytes(result, "tools").Raw)
+	}
+}
+
+func TestApplyImageGenerationPolicy_DefaultEmptyDoesNotInject(t *testing.T) {
+	// 新默认：空字符串不再注入工具。
 	cfg := &config.Config{}
 	body := []byte(`{"model":"gpt-5.4","input":"draw a cat"}`)
 	result := applyImageGenerationPolicy(cfg, body, "gpt-5.4")
 
-	tools := gjson.GetBytes(result, "tools")
-	arr := tools.Array()
-	if len(arr) != 1 || arr[0].Get("type").String() != "image_generation" {
-		t.Fatalf("expected default mode to inject image_generation, got %s", tools.Raw)
+	if gjson.GetBytes(result, "tools").Exists() {
+		t.Fatalf("expected default (empty) mode to inject nothing, got %s", gjson.GetBytes(result, "tools").Raw)
+	}
+}
+
+func TestApplyImageGenerationPolicy_TrueAndOnStrip(t *testing.T) {
+	for _, v := range []string{"true", "TRUE", "on", "On"} {
+		cfg := &config.Config{}
+		cfg.DisableImageGeneration = v
+		body := []byte(`{"model":"gpt-5.4","tools":[{"type":"image_generation"}]}`)
+		result := applyImageGenerationPolicy(cfg, body, "gpt-5.4")
+
+		if gjson.GetBytes(result, "tools").Exists() {
+			t.Fatalf("expected %q to strip image_generation, got %s", v, gjson.GetBytes(result, "tools").Raw)
+		}
+	}
+}
+
+func TestApplyImageGenerationPolicy_UnknownValueStrips(t *testing.T) {
+	// 未知值安全起见按默认 strip 处理。
+	cfg := &config.Config{}
+	cfg.DisableImageGeneration = "wat"
+	body := []byte(`{"model":"gpt-5.4","tools":[{"type":"image_generation","model":"gpt-image-2"}]}`)
+	result := applyImageGenerationPolicy(cfg, body, "gpt-5.4")
+
+	if gjson.GetBytes(result, "tools").Exists() {
+		t.Fatalf("expected unknown value to strip (default), got %s", gjson.GetBytes(result, "tools").Raw)
 	}
 }
 
 func TestApplyImageGenerationPolicy_ExplicitOffInjects(t *testing.T) {
-	cfg := &config.Config{}
-	cfg.DisableImageGeneration = "off"
-	body := []byte(`{"model":"gpt-5.4","tools":[{"type":"function","name":"f1"}]}`)
-	result := applyImageGenerationPolicy(cfg, body, "gpt-5.4")
+	for _, v := range []string{"off", "false", "inject", "OFF", " Inject "} {
+		cfg := &config.Config{}
+		cfg.DisableImageGeneration = v
+		body := []byte(`{"model":"gpt-5.4","tools":[{"type":"function","name":"f1"}]}`)
+		result := applyImageGenerationPolicy(cfg, body, "gpt-5.4")
 
-	tools := gjson.GetBytes(result, "tools")
-	arr := tools.Array()
-	if len(arr) != 2 {
-		t.Fatalf("expected off mode to inject (2 tools), got %d: %s", len(arr), tools.Raw)
-	}
-	if arr[1].Get("type").String() != "image_generation" {
-		t.Fatalf("expected image_generation injected, got %s", tools.Raw)
+		tools := gjson.GetBytes(result, "tools")
+		arr := tools.Array()
+		if len(arr) != 2 {
+			t.Fatalf("expected %q to inject (2 tools), got %d: %s", v, len(arr), tools.Raw)
+		}
+		if arr[1].Get("type").String() != "image_generation" {
+			t.Fatalf("expected %q to inject image_generation, got %s", v, tools.Raw)
+		}
 	}
 }
 
-func TestApplyImageGenerationPolicy_NilCfgInjects(t *testing.T) {
-	body := []byte(`{"model":"gpt-5.4","input":"draw a cat"}`)
+func TestApplyImageGenerationPolicy_NilCfgStrips(t *testing.T) {
+	// nil cfg 走默认 strip 行为，且不 panic（strip 不依赖 cfg）。
+	body := []byte(`{"model":"gpt-5.4","tools":[{"type":"image_generation","model":"gpt-image-2"}]}`)
 	result := applyImageGenerationPolicy(nil, body, "gpt-5.4")
 
-	if !gjson.GetBytes(result, "tools").Exists() {
-		t.Fatalf("expected nil cfg to fall back to injection, got %s", string(result))
+	if gjson.GetBytes(result, "tools").Exists() {
+		t.Fatalf("expected nil cfg to strip (default), got %s", string(result))
 	}
 }

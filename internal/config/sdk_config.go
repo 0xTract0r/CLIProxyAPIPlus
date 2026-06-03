@@ -22,13 +22,17 @@ type SDKConfig struct {
 	RequestLog bool `yaml:"request-log" json:"request-log"`
 
 	// DisableImageGeneration 控制如何处理 Codex 请求体里的 image_generation 工具。
-	// 取值语义：
-	//   ""、"off"（默认）：保持现有行为，按需注入简版 image_generation 工具，不剥离。
-	//   "strip"：转发前从 tools 数组里移除所有 type==image_generation 的工具（包括
-	//            Codex 客户端自带的完整 gpt-image-2 定义），且不注入；若移除后 tools
-	//            变为空数组，则删除整个 tools 字段，避免空 tools 触发上游报错。
-	// 用于规避未做组织验证的 ChatGPT 账号被 OpenAI 以 image_generation_user_error
-	// （"The model 'gpt-image-2' does not exist."）拒绝的问题。
+	// 新默认是 strip：这个 fork 主要服务未做组织验证的 ChatGPT 账号，对它们
+	// image_generation 工具有害无益（会被 OpenAI 以 image_generation_user_error
+	// "The model 'gpt-image-2' does not exist." 拒绝），所以默认就剥离，201 上不配置即生效。
+	// 取值语义（大小写不敏感、TrimSpace）：
+	//   ""（未配置/空）、"strip"、"true"、"on"（默认）：转发前从 tools 数组里移除所有
+	//            type==image_generation 的工具（包括 Codex 客户端自带的完整 gpt-image-2
+	//            定义），且不注入；若移除后 tools 变为空数组，则删除整个 tools 字段，
+	//            避免空 tools 触发上游报错。
+	//   "off"、"false"、"inject"：恢复旧行为，按需注入简版 image_generation 工具，留给
+	//            已做组织验证、想用 Codex 出图的人。
+	//   其它未知值：安全起见按默认 strip 处理。
 	DisableImageGeneration string `yaml:"disable-image-generation" json:"disable-image-generation"`
 
 	// APIKeys is a list of keys for authenticating clients to this proxy server.
