@@ -1186,6 +1186,13 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 				auth.ModelStates = existing.ModelStates
 			}
 		}
+		// Guard against a stale write-back rolling token state backwards: if a
+		// refresh advanced the stored tokens after the caller cloned this auth,
+		// keep the newer token-owned fields while still applying the caller's
+		// non-token metadata changes.
+		if preserveNewerTokenOwnedFields(auth, existing) {
+			logEntryWithRequestID(ctx).WithField("auth_id", auth.ID).Warn("auth update carried stale token-owned fields; preserved newer stored token state")
+		}
 	}
 	auth.EnsureIndex()
 	authClone := auth.Clone()
@@ -3508,8 +3515,14 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 		var reauthSnapshot *Auth
 		m.mu.Lock()
 		if current := m.auths[id]; current != nil {
-			if isRefreshTokenReuseError(err) {
-				current.markRefreshReauthRequired(now)
+			// Terminal refresh failures (refresh token reused / invalid_grant /
+			// revoked / expired) cannot be recovered by retrying the same token,
+			// and retrying may trip provider reuse detection. Persist the
+			// reauth-required state so the failure is visible after a restart and
+			// the auto-refresh loop stops hammering a dead token. Transient
+			// failures keep the in-memory short backoff and retry.
+			if code, terminal := terminalRefreshAuthError(err); terminal {
+				current.markRefreshReauthRequiredWithReason(now, code)
 				reauthSnapshot = current.Clone()
 			} else {
 				current.NextRefreshAfter = now.Add(refreshFailureBackoff)

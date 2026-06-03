@@ -136,6 +136,84 @@ func TestManagerRefreshAuth_DisablesRefreshAfterRefreshTokenReused(t *testing.T)
 	}
 }
 
+type invalidGrantRefreshExecutor struct {
+	schedulerProviderTestExecutor
+	calls int
+}
+
+func (e *invalidGrantRefreshExecutor) Refresh(ctx context.Context, auth *Auth) (*Auth, error) {
+	e.calls++
+	// Production incident error: Claude refused the refresh token with an OAuth
+	// invalid_grant that is NOT a reuse phrasing, so it previously fell through
+	// to the transient 5-minute retry path instead of reauth-required.
+	return nil, errors.New(`token refresh failed: status=400 content_type=application/json body_preview="{\"error\":\"invalid_grant\",\"error_description\":\"Refresh token not found or invalid\"}"`)
+}
+
+// TestManagerRefreshAuth_DisablesRefreshAfterInvalidGrant covers T007: a Claude
+// invalid_grant refresh failure must be persisted as terminal reauth-required
+// and must stop the auto-refresh loop, instead of retrying the dead token every
+// 5 minutes.
+func TestManagerRefreshAuth_DisablesRefreshAfterInvalidGrant(t *testing.T) {
+	ctx := context.Background()
+	store := &captureStore{}
+	manager := NewManager(store, nil, nil)
+	executor := &invalidGrantRefreshExecutor{
+		schedulerProviderTestExecutor: schedulerProviderTestExecutor{provider: "claude"},
+	}
+	manager.RegisterExecutor(executor)
+
+	auth := &Auth{
+		ID:       "claude-invalid-grant",
+		Provider: "claude",
+		Metadata: map[string]any{
+			"refresh_token":            "dead-refresh-token",
+			"refresh_interval_seconds": 1,
+		},
+	}
+	if _, err := manager.Register(ctx, auth); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+
+	manager.refreshAuth(ctx, auth.ID)
+	if executor.calls != 1 {
+		t.Fatalf("refresh calls = %d, want 1", executor.calls)
+	}
+
+	updated, ok := manager.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatal("expected auth to remain registered")
+	}
+	if !updated.RefreshDisabled() {
+		t.Fatal("RefreshDisabled() = false, want true after terminal invalid_grant")
+	}
+	if updated.Status != StatusError || updated.StatusMessage != "reauth_required" {
+		t.Fatalf("status = %q/%q, want error/reauth_required", updated.Status, updated.StatusMessage)
+	}
+	if got, _ := updated.Metadata["refresh_error_code"].(string); got != "invalid_grant" {
+		t.Fatalf("refresh_error_code = %q, want invalid_grant", got)
+	}
+	if !updated.NextRefreshAfter.IsZero() {
+		t.Fatalf("NextRefreshAfter = %v, want zero (terminal, no retry)", updated.NextRefreshAfter)
+	}
+	if updated.LastError == nil || updated.LastError.Retryable {
+		t.Fatalf("LastError = %+v, want non-retryable", updated.LastError)
+	}
+	if msg, _ := updated.Metadata["last_refresh_error"].(string); msg == "" ||
+		strings.Contains(msg, "dead-refresh-token") || strings.Contains(strings.ToLower(msg), "body_preview") {
+		t.Fatalf("last_refresh_error = %q, want sanitized message without token/raw body", msg)
+	}
+
+	// The terminal state is persisted and a second refresh tick does not retry.
+	saved := store.last()
+	if saved == nil || !saved.RefreshDisabled() {
+		t.Fatalf("persisted auth RefreshDisabled() = %v, want true", saved != nil && saved.RefreshDisabled())
+	}
+	manager.refreshAuth(ctx, auth.ID)
+	if executor.calls != 1 {
+		t.Fatalf("refresh calls after second tick = %d, want still 1 (no retry of dead token)", executor.calls)
+	}
+}
+
 func TestManager_RefreshSchedulerEntry_RebuildsSupportedModelSetAfterModelRegistration(t *testing.T) {
 	ctx := context.Background()
 

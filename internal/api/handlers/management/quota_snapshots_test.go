@@ -630,6 +630,60 @@ func TestQuotaSnapshotsBulkRefreshReturnsEntriesWhenAllImplicitTargetsSkipped(t 
 	}
 }
 
+// TestQuotaSnapshotsManualGlobalRefreshReprobesRecoveredAuth covers T008: after
+// an operator re-authenticates, the credential becomes StatusActive but a stale
+// quota_refresh_status=reauth_required may still linger. A background auto-refresh
+// stays cautious and skips it, but an explicit user-initiated global refresh must
+// re-probe the recovered credential and clear the stale status.
+func TestQuotaSnapshotsManualGlobalRefreshReprobesRecoveredAuth(t *testing.T) {
+	t.Parallel()
+
+	gin.SetMode(gin.TestMode)
+	manager := coreauth.NewManager(nil, nil, nil)
+	exec := &quotaSnapshotTestExecutor{provider: "claude"}
+	manager.RegisterExecutor(exec)
+	if _, err := manager.Register(context.Background(), &coreauth.Auth{
+		ID:       "claude-recovered",
+		Provider: "claude",
+		Status:   coreauth.StatusActive,
+		Metadata: map[string]any{
+			quotaRefreshStatusMetadataKey: quotaRefreshStatusReauthRequired,
+			quotaRefreshErrorMetadataKey:  claudeQuotaCredentialUnauthorizedMessage,
+		},
+	}); err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+	handler := NewHandlerWithoutConfigFilePath(nil, manager)
+	router := gin.New()
+	router.POST("/v0/management/quota/refresh", handler.RefreshQuotaSnapshots)
+
+	// Background auto-refresh stays cautious: it must not re-probe a credential
+	// whose quota status is still reauth_required.
+	handler.refreshDueQuotaSnapshots(context.Background(), defaultQuotaSnapshotTestPolicy(), false)
+	if got := exec.CallsForAuth("claude-recovered"); got != 0 {
+		t.Fatalf("background refresh calls = %d, want 0 (must stay cautious)", got)
+	}
+
+	// Explicit, user-initiated global refresh re-probes the recovered credential.
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v0/management/quota/refresh", strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("manual refresh status = %d, want 200 body=%s", rec.Code, rec.Body.String())
+	}
+	if got := exec.CallsForAuth("claude-recovered"); got == 0 {
+		t.Fatalf("manual global refresh did not re-probe recovered auth (calls=0)")
+	}
+	entry := quotaSnapshotEntryForAuth(t, decodeQuotaSnapshotPayload(t, rec), "claude-recovered")
+	if entry.Status != quotaRefreshStatusOK {
+		t.Fatalf("entry status = %q, want %q after successful re-probe", entry.Status, quotaRefreshStatusOK)
+	}
+	if entry.Error != "" {
+		t.Fatalf("entry error = %q, want cleared after successful re-probe", entry.Error)
+	}
+}
+
 func TestQuotaSnapshotsLegacyUnauthorizedErrorMapsToReauthAndRetriesExplicitly(t *testing.T) {
 	t.Parallel()
 

@@ -88,22 +88,14 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 			if jsonEqual(existing, raw) {
 				return path, nil
 			}
-			file, errOpen := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0o600)
-			if errOpen != nil {
-				return "", fmt.Errorf("auth filestore: open existing failed: %w", errOpen)
-			}
-			if _, errWrite := file.Write(raw); errWrite != nil {
-				_ = file.Close()
-				return "", fmt.Errorf("auth filestore: write existing failed: %w", errWrite)
-			}
-			if errClose := file.Close(); errClose != nil {
-				return "", fmt.Errorf("auth filestore: close existing failed: %w", errClose)
-			}
-			return path, nil
 		} else if !os.IsNotExist(errRead) {
 			return "", fmt.Errorf("auth filestore: read existing failed: %w", errRead)
 		}
-		if errWrite := os.WriteFile(path, raw, 0o600); errWrite != nil {
+		// Atomic write: a refresh token is high-value state that may require manual
+		// re-auth if lost, so an interrupted write must never truncate or leave a
+		// half-written auth file. Write to a temp file in the same directory, fsync,
+		// then rename over the target. On any failure the previous file is intact.
+		if errWrite := writeFileAtomic(path, raw, 0o600); errWrite != nil {
 			return "", fmt.Errorf("auth filestore: write file failed: %w", errWrite)
 		}
 	default:
@@ -120,6 +112,40 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 	}
 
 	return path, nil
+}
+
+// writeFileAtomic writes data to path atomically: it creates a temp file in the
+// same directory, writes and fsyncs it, then renames it over the destination.
+// A crash or write error therefore never exposes a truncated or empty auth file
+// — the previous contents survive intact until the rename completes. The temp
+// file is created with perm and cleaned up if the rename does not happen.
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	// Best-effort cleanup; after a successful rename tmpName no longer exists and
+	// the Remove simply fails silently.
+	defer func() { _ = os.Remove(tmpName) }()
+
+	if err = tmp.Chmod(perm); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err = tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err = tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err = tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
 }
 
 // List enumerates all auth JSON files under the configured directory.

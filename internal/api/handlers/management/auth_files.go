@@ -3562,6 +3562,15 @@ var reauthTokenMetadataKeys = map[string]struct{}{
 	"model_details":          {},
 }
 
+// reauthRuntimeMetadataKeys lists derived runtime state that should not survive
+// an OAuth re-auth round-trip. Keeping stale quota errors across re-auth can
+// make a recovered credential continue to look unauthorized in the management UI.
+var reauthRuntimeMetadataKeys = map[string]struct{}{
+	quotaRefreshStatusMetadataKey: {},
+	quotaRefreshErrorMetadataKey:  {},
+	quotaNextRefreshMetadataKey:   {},
+}
+
 func isReauthUserDefinedMetadataKey(key string) bool {
 	key = strings.ToLower(strings.TrimSpace(key))
 	if key == "" {
@@ -3577,6 +3586,13 @@ func isReauthUserDefinedMetadataKey(key string) bool {
 
 func isReauthTokenMetadataKey(key string) bool {
 	if _, ok := reauthTokenMetadataKeys[strings.ToLower(strings.TrimSpace(key))]; ok {
+		return true
+	}
+	return false
+}
+
+func isReauthRuntimeMetadataKey(key string) bool {
+	if _, ok := reauthRuntimeMetadataKeys[strings.ToLower(strings.TrimSpace(key))]; ok {
 		return true
 	}
 	return false
@@ -3600,6 +3616,9 @@ func mergeUserDefinedAuthMetadataInto(record, previous *coreauth.Auth) {
 			continue
 		}
 		if isReauthTokenMetadataKey(trimmedKey) {
+			continue
+		}
+		if isReauthRuntimeMetadataKey(trimmedKey) {
 			continue
 		}
 		if existing, ok := record.Metadata[trimmedKey]; ok && !isEmptyMetadataValue(existing) {
