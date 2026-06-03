@@ -481,6 +481,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 
 		// If from == to (Claude → Claude), directly forward the SSE stream without translation
 		if from == to {
+			invokeRepairer := newClaudeInvokeRepairer(ginHeadersFromContext(ctx), bodyForTranslation)
 			scanner := bufio.NewScanner(decodedBody)
 			scanner.Buffer(nil, 52_428_800) // 50MB
 			for scanner.Scan() {
@@ -495,11 +496,12 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				if oauthToken && oauthToolNamesRemapped {
 					line = reverseRemapOAuthToolNamesFromStreamLine(line)
 				}
-				// Forward the line as-is to preserve SSE format
-				cloned := make([]byte, len(line)+1)
-				copy(cloned, line)
-				cloned[len(line)] = '\n'
-				out <- cliproxyexecutor.StreamChunk{Payload: cloned}
+				for _, chunk := range invokeRepairer.ProcessLine(line) {
+					out <- cliproxyexecutor.StreamChunk{Payload: chunk}
+				}
+			}
+			for _, chunk := range invokeRepairer.Flush() {
+				out <- cliproxyexecutor.StreamChunk{Payload: chunk}
 			}
 			if errScan := scanner.Err(); errScan != nil {
 				recordAPIResponseError(ctx, e.cfg, errScan)
