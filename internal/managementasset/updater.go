@@ -17,9 +17,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
-	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
+	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/sync/singleflight"
 )
@@ -191,7 +191,7 @@ func runAutoUpdater(ctx context.Context) {
 			return
 		}
 		if cfg.RemoteManagement.DisableAutoUpdatePanel {
-			log.Debug("management asset auto-updater skipped: panel auto-update disabled")
+			log.Debug("management asset auto-updater skipped: disable-auto-update-panel is enabled")
 			return
 		}
 
@@ -384,7 +384,7 @@ func EnsureLatestManagementHTML(ctx context.Context, staticDir string, proxyURL 
 		}
 
 		if remoteHash != "" && !strings.EqualFold(remoteHash, downloadedHash) {
-			log.Errorf("management asset digest mismatch: expected %s got %s; aborting update for safety", remoteHash, downloadedHash)
+			log.Errorf("management asset digest mismatch: expected %s got %s — aborting update for safety", remoteHash, downloadedHash)
 			return nil, nil
 		}
 
@@ -407,6 +407,9 @@ func ensureFallbackManagementHTML(ctx context.Context, client *http.Client, loca
 		log.WithError(err).Warn("failed to download fallback management control panel page")
 		return false
 	}
+
+	log.Warnf("management asset downloaded from fallback URL without digest verification (hash=%s) — "+
+		"enable verified GitHub updates by keeping disable-auto-update-panel set to false", downloadedHash)
 
 	if err = atomicWriteFile(localPath, data); err != nil {
 		log.WithError(err).Warn("failed to persist fallback management control panel page")

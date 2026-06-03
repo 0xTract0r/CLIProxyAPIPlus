@@ -4,16 +4,21 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/cache"
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
-	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/cache"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
+	log "github.com/sirupsen/logrus"
+	"github.com/sirupsen/logrus/hooks/test"
+	"github.com/tidwall/gjson"
 )
 
 func testGeminiSignaturePayload() string {
@@ -56,6 +61,40 @@ func invalidClaudeThinkingPayload() []byte {
 	}`)
 }
 
+func newSignatureDebugHook(t *testing.T) *test.Hook {
+	t.Helper()
+
+	previousLevel := log.GetLevel()
+	log.SetLevel(log.DebugLevel)
+	hook := test.NewLocal(log.StandardLogger())
+	t.Cleanup(func() {
+		hook.Reset()
+		log.SetLevel(previousLevel)
+	})
+	return hook
+}
+
+func assertSignatureDebugDoesNotLeak(t *testing.T, hook *test.Hook, forbidden string) {
+	t.Helper()
+
+	if forbidden == "" {
+		return
+	}
+	for _, entry := range hook.AllEntries() {
+		if strings.Contains(entry.Message, forbidden) {
+			t.Fatalf("debug log leaked signature in message: %q", entry.Message)
+		}
+		for key, value := range entry.Data {
+			if strings.Contains(fmt.Sprint(value), forbidden) {
+				t.Fatalf("debug log leaked signature in field %q: %v", key, value)
+			}
+		}
+	}
+}
+
+// Fork increment: in strict bypass mode the Antigravity executor rejects invalid
+// Claude signatures with HTTP 400 instead of silently stripping them, so this test
+// asserts the request is rejected before any upstream call is made.
 func TestAntigravityExecutor_StrictBypassRejectsInvalidSignature(t *testing.T) {
 	previousCache := cache.SignatureCacheEnabled()
 	previousStrict := cache.SignatureBypassStrictMode()
@@ -127,6 +166,59 @@ func TestAntigravityExecutor_StrictBypassRejectsInvalidSignature(t *testing.T) {
 	if got := hits.Load(); got != 0 {
 		t.Fatalf("expected invalid signature to be rejected before upstream request, got %d upstream hits", got)
 	}
+}
+
+// Upstream increment: the Claude executor logs (and does not leak) signatures it
+// sanitizes before forwarding to the Claude upstream. This path is independent of
+// the Antigravity strict-bypass rejection above.
+func TestClaudeExecutor_LogsSanitizedClaudeUpstreamSignatures(t *testing.T) {
+	hook := newSignatureDebugHook(t)
+	rawSignature := "skip_thought_signature_validator"
+	body := []byte(`{
+		"model": "claude-sonnet-4-5",
+		"messages": [
+			{
+				"role": "assistant",
+				"content": [
+					{"type": "thinking", "thinking": "bad", "signature": "` + rawSignature + `"},
+					{"type": "text", "text": "hello"},
+					{"type": "tool_use", "id": "call_123", "name": "get_weather", "input": {}, "signature": "` + rawSignature + `"}
+				]
+			}
+		]
+	}`)
+
+	output := sanitizeClaudeMessagesForClaudeUpstreamWithDebug(context.Background(), body, "claude-sonnet-4-5")
+	parts := gjson.GetBytes(output, "messages.0.content").Array()
+	if len(parts) != 2 {
+		t.Fatalf("content length = %d, want 2 after invalid thinking strip: %s", len(parts), output)
+	}
+	if parts[1].Get("signature").Exists() {
+		t.Fatalf("tool_use signature should be removed before Claude upstream: %s", output)
+	}
+
+	found := false
+	for _, entry := range hook.AllEntries() {
+		if entry.Level != log.DebugLevel {
+			continue
+		}
+		if entry.Data["component"] != "signature_sanitizer" ||
+			entry.Data["executor"] != "claude" ||
+			entry.Data["action"] != "sanitize_claude_messages" {
+			continue
+		}
+		if entry.Data["dropped_blocks"] != 1 {
+			t.Fatalf("dropped_blocks = %v, want 1", entry.Data["dropped_blocks"])
+		}
+		if entry.Data["dropped_signatures"] != 1 {
+			t.Fatalf("dropped_signatures = %v, want 1", entry.Data["dropped_signatures"])
+		}
+		found = true
+	}
+	if !found {
+		t.Fatal("expected debug log for Claude upstream signature sanitization")
+	}
+	assertSignatureDebugDoesNotLeak(t, hook, rawSignature)
 }
 
 func TestAntigravityExecutor_NonStrictBypassSkipsPrecheck(t *testing.T) {

@@ -6,8 +6,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
 
 func writeStubAuthFile(path string) error {

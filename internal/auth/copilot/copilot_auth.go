@@ -12,8 +12,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -24,11 +24,11 @@ const (
 	copilotAPIEndpoint = "https://api.githubcopilot.com"
 
 	// Common HTTP header values for Copilot API requests.
-	copilotUserAgent       = "GithubCopilot/1.0"
-	copilotEditorVersion   = "vscode/1.100.0"
-	copilotPluginVersion   = "copilot/1.300.0"
-	copilotIntegrationID   = "vscode-chat"
-	copilotOpenAIIntent    = "conversation-panel"
+	copilotUserAgent     = "GithubCopilot/1.0"
+	copilotEditorVersion = "vscode/1.100.0"
+	copilotPluginVersion = "copilot/1.300.0"
+	copilotIntegrationID = "vscode-chat"
+	copilotOpenAIIntent  = "conversation-panel"
 )
 
 // CopilotAPIToken represents the Copilot API token response.
@@ -266,9 +266,9 @@ const maxModelsResponseSize = 2 * 1024 * 1024
 
 // allowedCopilotAPIHosts is the set of hosts that are considered safe for Copilot API requests.
 var allowedCopilotAPIHosts = map[string]bool{
-	"api.githubcopilot.com":          true,
-	"api.individual.githubcopilot.com": true,
-	"api.business.githubcopilot.com":   true,
+	"api.githubcopilot.com":               true,
+	"api.individual.githubcopilot.com":    true,
+	"api.business.githubcopilot.com":      true,
 	"copilot-proxy.githubusercontent.com": true,
 }
 

@@ -21,16 +21,16 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	kiroauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/kiro"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
-	kiroclaude "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/kiro/claude"
-	kirocommon "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/kiro/common"
-	kiroopenai "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/kiro/openai"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
-	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
-	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
+	kiroauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/kiro"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	kiroclaude "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/kiro/claude"
+	kirocommon "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/kiro/common"
+	kiroopenai "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/kiro/openai"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -3650,7 +3650,7 @@ func (e *KiroExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*c
 	// Honor the account-scoped auth.ProxyURL (e.g. SOCKS5 proxy assigned to a
 	// specific Kiro auth file) so token refresh egresses via the account proxy
 	// instead of silently falling back to the global cfg.ProxyURL. Mirrors the
-	// Claude/Codex/Qwen/IFlow refresh-proxy invariant (ledger section 13).
+	// Claude/Codex refresh-proxy invariant (ledger section 13).
 	ssoClient := kiroauth.NewSSOOIDCClientWithProxyURL(e.cfg, auth.ProxyURL)
 
 	// Use SSO OIDC refresh for AWS Builder ID or IDC, otherwise use Kiro's OAuth refresh endpoint

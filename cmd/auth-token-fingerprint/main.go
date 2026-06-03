@@ -7,7 +7,7 @@ import (
 	"os"
 	"strings"
 
-	internalcmd "github.com/router-for-me/CLIProxyAPI/v6/internal/cmd"
+	internalcmd "github.com/router-for-me/CLIProxyAPI/v7/internal/cmd"
 )
 
 type pathList []string

@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"strings"
 
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
 
 // BuildTLSEvidenceProbeRoundTripper builds a diagnostic transport from the

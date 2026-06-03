@@ -7,9 +7,9 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/watcher/diff"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher/diff"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
 
 // StableIDGenerator generates stable, deterministic IDs for auth entries.
@@ -101,6 +101,20 @@ func ApplyAuthExcludedModelsMeta(auth *coreauth.Auth, cfg *config.Config, perKey
 	if authKind != "" {
 		auth.Attributes["auth_kind"] = authKind
 	}
+}
+
+// applyDisableCoolingMeta records the per-credential disable-cooling override on
+// the auth entry metadata when enabled. The metadata is left untouched (nil) when
+// the credential does not opt out of cooling, so callers without the override keep
+// a nil Metadata map.
+func applyDisableCoolingMeta(auth *coreauth.Auth, disable bool) {
+	if auth == nil || !disable {
+		return
+	}
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	auth.Metadata["disable_cooling"] = true
 }
 
 // addConfigHeadersToAttrs adds header configuration to auth attributes.

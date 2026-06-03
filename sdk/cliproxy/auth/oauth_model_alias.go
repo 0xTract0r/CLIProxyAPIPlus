@@ -3,9 +3,9 @@ package auth
 import (
 	"strings"
 
-	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 )
 
 type modelAliasEntry interface {
@@ -283,7 +283,7 @@ func modelAliasChannel(auth *Auth) string {
 // and auth kind. Returns empty string if the provider/authKind combination doesn't support
 // OAuth model alias (e.g., API key authentication).
 //
-// Supported channels: gemini-cli, vertex, aistudio, antigravity, claude, codex, qwen, iflow, kiro, github-copilot, kimi.
+// Supported channels: gemini-cli, vertex, aistudio, antigravity, claude, codex, kiro, github-copilot, kimi.
 func OAuthModelAliasChannel(provider, authKind string) string {
 	provider = strings.ToLower(strings.TrimSpace(provider))
 	authKind = strings.ToLower(strings.TrimSpace(authKind))
@@ -307,7 +307,7 @@ func OAuthModelAliasChannel(provider, authKind string) string {
 			return ""
 		}
 		return "codex"
-	case "gemini-cli", "aistudio", "antigravity", "qwen", "iflow", "kiro", "github-copilot", "kimi":
+	case "gemini-cli", "aistudio", "antigravity", "kiro", "github-copilot", "kimi":
 		return provider
 	default:
 		return ""

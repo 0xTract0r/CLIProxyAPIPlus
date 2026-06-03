@@ -15,9 +15,9 @@ import (
 	"github.com/andybalholm/brotli"
 	"github.com/gin-gonic/gin"
 	"github.com/klauspost/compress/zstd"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
 )
 

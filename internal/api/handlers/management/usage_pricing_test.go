@@ -8,7 +8,7 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/usage"
 )
 
 func TestUsagePricingOverrideLifecycle(t *testing.T) {

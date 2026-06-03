@@ -7,9 +7,13 @@ import (
 )
 
 const (
-	codexBuiltinImageModelID = "gpt-image-2"
-	codexSparkModelID        = "gpt-5.3-codex-spark"
-	codexFastServiceTierID   = "priority"
+	codexBuiltinImageModelID        = "gpt-image-2"
+	codexSparkModelID               = "gpt-5.3-codex-spark"
+	codexFastServiceTierID          = "priority"
+	xaiBuiltinImageModelID          = "grok-imagine-image"
+	xaiBuiltinImageQualityModelID   = "grok-imagine-image-quality"
+	xaiBuiltinVideoModelID          = "grok-imagine-video"
+	xaiBuiltinVideo15PreviewModelID = "grok-imagine-video-1.5-preview"
 )
 
 var codexFastServiceTier = ServiceTierInfo{
@@ -29,10 +33,9 @@ type staticModelsJSON struct {
 	CodexTeam   []*ModelInfo `json:"codex-team"`
 	CodexPlus   []*ModelInfo `json:"codex-plus"`
 	CodexPro    []*ModelInfo `json:"codex-pro"`
-	Qwen        []*ModelInfo `json:"qwen"`
-	IFlow       []*ModelInfo `json:"iflow"`
 	Kimi        []*ModelInfo `json:"kimi"`
 	Antigravity []*ModelInfo `json:"antigravity"`
+	XAI         []*ModelInfo `json:"xai"`
 }
 
 // GetClaudeModels returns the standard Claude model definitions.
@@ -249,6 +252,11 @@ func GetAntigravityModels() []*ModelInfo {
 	return cloneModelInfos(getModels().Antigravity)
 }
 
+// GetXAIModels returns the standard xAI Grok model definitions.
+func GetXAIModels() []*ModelInfo {
+	return WithXAIBuiltins(cloneModelInfos(getModels().XAI))
+}
+
 // WithCodexBuiltins injects hard-coded Codex-only model definitions that should
 // not depend on remote models.json updates. Built-ins replace any matching IDs
 // already present in the provided slice.
@@ -343,6 +351,12 @@ func appendUniqueServiceTier(values []ServiceTierInfo, value ServiceTierInfo) []
 	return append(values, value)
 }
 
+// WithXAIBuiltins injects hard-coded xAI image/video model definitions that should
+// not depend on remote models.json updates.
+func WithXAIBuiltins(models []*ModelInfo) []*ModelInfo {
+	return upsertModelInfos(models, xaiBuiltinImageModelInfo(), xaiBuiltinImageQualityModelInfo(), xaiBuiltinVideoModelInfo(), xaiBuiltinVideo15PreviewModelInfo())
+}
+
 func codexBuiltinImageModelInfo() *ModelInfo {
 	return &ModelInfo{
 		ID:          codexBuiltinImageModelID,
@@ -352,6 +366,58 @@ func codexBuiltinImageModelInfo() *ModelInfo {
 		Type:        "openai",
 		DisplayName: "GPT Image 2",
 		Version:     codexBuiltinImageModelID,
+	}
+}
+
+func xaiBuiltinImageModelInfo() *ModelInfo {
+	return &ModelInfo{
+		ID:          xaiBuiltinImageModelID,
+		Object:      "model",
+		Created:     1735689600, // 2025-01-01
+		OwnedBy:     "xai",
+		Type:        "xai",
+		DisplayName: "Grok Imagine Image",
+		Name:        xaiBuiltinImageModelID,
+		Description: "xAI Grok image generation model.",
+	}
+}
+
+func xaiBuiltinImageQualityModelInfo() *ModelInfo {
+	return &ModelInfo{
+		ID:          xaiBuiltinImageQualityModelID,
+		Object:      "model",
+		Created:     1735689600, // 2025-01-01
+		OwnedBy:     "xai",
+		Type:        "xai",
+		DisplayName: "Grok Imagine Image Quality",
+		Name:        xaiBuiltinImageQualityModelID,
+		Description: "xAI Grok higher-fidelity image generation model.",
+	}
+}
+
+func xaiBuiltinVideoModelInfo() *ModelInfo {
+	return &ModelInfo{
+		ID:          xaiBuiltinVideoModelID,
+		Object:      "model",
+		Created:     1735689600, // 2025-01-01
+		OwnedBy:     "xai",
+		Type:        "xai",
+		DisplayName: "Grok Imagine Video",
+		Name:        xaiBuiltinVideoModelID,
+		Description: "xAI Grok video generation model.",
+	}
+}
+
+func xaiBuiltinVideo15PreviewModelInfo() *ModelInfo {
+	return &ModelInfo{
+		ID:          xaiBuiltinVideo15PreviewModelID,
+		Object:      "model",
+		Created:     1735689600, // 2025-01-01
+		OwnedBy:     "xai",
+		Type:        "xai",
+		DisplayName: "Grok Imagine Video 1.5 Preview",
+		Name:        xaiBuiltinVideo15PreviewModelID,
+		Description: "xAI Grok preview video generation model.",
 	}
 }
 
@@ -423,13 +489,13 @@ func cloneModelInfos(models []*ModelInfo) []*ModelInfo {
 //   - gemini-cli
 //   - aistudio
 //   - codex
-//   - qwen
-//   - iflow
 //   - kimi
-//   - kilo
 //   - github-copilot
+//   - kiro
+//   - kilo
 //   - amazonq
-//   - antigravity (returns static overrides only)
+//   - antigravity
+//   - xai
 func GetStaticModelDefinitionsByChannel(channel string) []*ModelInfo {
 	key := strings.ToLower(strings.TrimSpace(channel))
 	switch key {
@@ -445,10 +511,6 @@ func GetStaticModelDefinitionsByChannel(channel string) []*ModelInfo {
 		return GetAIStudioModels()
 	case "codex":
 		return GetCodexProModels()
-	case "qwen":
-		return GetQwenModels()
-	case "iflow":
-		return GetIFlowModels()
 	case "kimi":
 		return GetKimiModels()
 	case "github-copilot":
@@ -461,6 +523,8 @@ func GetStaticModelDefinitionsByChannel(channel string) []*ModelInfo {
 		return GetAmazonQModels()
 	case "antigravity":
 		return GetAntigravityModels()
+	case "xai", "x-ai", "grok":
+		return GetXAIModels()
 	default:
 		return nil
 	}
@@ -481,10 +545,9 @@ func LookupStaticModelInfo(modelID string) *ModelInfo {
 		data.GeminiCLI,
 		data.AIStudio,
 		data.CodexPro,
-		GetQwenModels(),
-		GetIFlowModels(),
 		data.Kimi,
 		data.Antigravity,
+		data.XAI,
 		GetGitHubCopilotModels(),
 		GetKiroModels(),
 		GetKiloModels(),

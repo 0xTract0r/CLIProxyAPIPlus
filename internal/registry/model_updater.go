@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v6/sdk/proxyutil"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/proxyutil"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -73,7 +73,7 @@ func SetModelRefreshCallback(cb ModelRefreshCallback) {
 func init() {
 	// Load embedded data as fallback on startup.
 	if err := loadModelsFromBytes(embeddedModelsJSON, "embed"); err != nil {
-		panic(fmt.Sprintf("registry: failed to parse embedded models.json: %v", err))
+		log.Warnf("registry: failed to parse embedded models.json (embedded catalog may be incomplete or invalid; continuing startup and will rely on remote model refresh): %v", err)
 	}
 }
 
@@ -262,17 +262,14 @@ func mergeMissingModelSections(data, fallback *staticModelsJSON) *staticModelsJS
 	if len(merged.CodexPro) == 0 {
 		merged.CodexPro = cloneModelInfos(fallback.CodexPro)
 	}
-	if len(merged.Qwen) == 0 {
-		merged.Qwen = cloneModelInfos(fallback.Qwen)
-	}
-	if len(merged.IFlow) == 0 {
-		merged.IFlow = cloneModelInfos(fallback.IFlow)
-	}
 	if len(merged.Kimi) == 0 {
 		merged.Kimi = cloneModelInfos(fallback.Kimi)
 	}
 	if len(merged.Antigravity) == 0 {
 		merged.Antigravity = cloneModelInfos(fallback.Antigravity)
+	}
+	if len(merged.XAI) == 0 {
+		merged.XAI = cloneModelInfos(fallback.XAI)
 	}
 	return &merged
 }
@@ -303,6 +300,7 @@ func detectChangedProviders(oldData, newData *staticModelsJSON) []string {
 		{"codex", oldData.CodexPro, newData.CodexPro},
 		{"kimi", oldData.Kimi, newData.Kimi},
 		{"antigravity", oldData.Antigravity, newData.Antigravity},
+		{"xai", oldData.XAI, newData.XAI},
 	}
 
 	seen := make(map[string]bool, len(sections))
@@ -424,6 +422,7 @@ func validateModelsCatalog(data *staticModelsJSON) error {
 		{name: "codex-pro", models: data.CodexPro},
 		{name: "kimi", models: data.Kimi},
 		{name: "antigravity", models: data.Antigravity},
+		{name: "xai", models: data.XAI},
 	}
 
 	for _, section := range requiredSections {
@@ -436,7 +435,8 @@ func validateModelsCatalog(data *staticModelsJSON) error {
 
 func validateModelSection(section string, models []*ModelInfo) error {
 	if len(models) == 0 {
-		return fmt.Errorf("%s section is empty", section)
+		log.Warnf("models catalog: %s section is empty, continuing without those model definitions", section)
+		return nil
 	}
 
 	seen := make(map[string]struct{}, len(models))

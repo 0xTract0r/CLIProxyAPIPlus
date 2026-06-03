@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
 // antiThrashTestExecutor records every Refresh call and rewrites the expiry to

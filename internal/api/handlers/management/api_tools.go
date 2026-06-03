@@ -15,10 +15,10 @@ import (
 
 	"github.com/fxamacker/cbor/v2"
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/geminicli"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
-	"github.com/router-for-me/CLIProxyAPI/v6/sdk/proxyutil"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/geminicli"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/proxyutil"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
@@ -869,6 +869,9 @@ func hardenAPICallTransport(transport *http.Transport, proxyScheme string) (*htt
 	return transport, dialer
 }
 
+// MERGE-REVIEW: fork-only APICall transport hardening (hardenedDialer / hardenAPICallTransport /
+// classifyAPICallError) retained; upstream had no counterpart here. This is an allowed intentional
+// timeout exception per AGENTS.md (management APICall timeout in api_tools.go).
 // classifyAPICallError maps an outbound transport error returned from
 // httpClient.Do into a stable label useful for both structured logging and
 // HTTP responses. The handler used to collapse every failure into a generic
@@ -1009,6 +1012,9 @@ func resolveOpenAICompatAPIKeyProxyURL(cfg *config.Config, auth *coreauth.Auth, 
 
 	for i := range cfg.OpenAICompatibility {
 		compat := &cfg.OpenAICompatibility[i]
+		if compat.Disabled {
+			continue
+		}
 		for _, candidate := range candidates {
 			if candidate != "" && strings.EqualFold(strings.TrimSpace(candidate), compat.Name) {
 				for j := range compat.APIKeyEntries {

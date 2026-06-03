@@ -336,10 +336,19 @@ func (l *authAutoRefreshLoop) remove(authID string) {
 }
 
 func nextRefreshCheckAt(now time.Time, auth *Auth, interval time.Duration) (time.Time, bool) {
-	if auth == nil || auth.Disabled {
+	if auth == nil {
 		return time.Time{}, false
 	}
+	// MERGE-REVIEW: upstream v7 no longer unschedules merely-Disabled auths (it keeps
+	// their tokens fresh so re-enabling does not force re-auth) and instead stops
+	// auto-refresh on unauthorized failures via hasUnauthorizedAuthFailure. We adopt the
+	// upstream structure but keep the fork's RefreshDisabled() short-circuit, which carries
+	// the fork credential-refresh isolation and the invalid_grant/refresh-token-reuse
+	// terminal handling (reauth_required) that must never be retried.
 	if auth.RefreshDisabled() {
+		return time.Time{}, false
+	}
+	if hasUnauthorizedAuthFailure(auth) {
 		return time.Time{}, false
 	}
 
