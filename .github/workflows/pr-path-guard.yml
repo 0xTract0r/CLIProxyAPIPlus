@@ -6,6 +6,8 @@ on:
       - opened
       - synchronize
       - reopened
+      - labeled
+      - unlabeled
 
 jobs:
   ensure-no-translator-changes:
@@ -21,8 +23,11 @@ jobs:
           files: |
             internal/translator/**
       - name: Fail when restricted paths change
-        if: steps.changed-files.outputs.any_changed == 'true'
+        # The "upstream-sync" label exempts whole-repo upstream merge PRs, which
+        # necessarily touch internal/translator/**. Normal PRs stay guarded.
+        if: steps.changed-files.outputs.any_changed == 'true' && !contains(github.event.pull_request.labels.*.name, 'upstream-sync')
         run: |
           echo "Changes under internal/translator are not allowed in pull requests."
-          echo "You need to create an issue for our maintenance team to make the necessary changes."
+          echo "Add the 'upstream-sync' label for whole-repo upstream merge PRs, or"
+          echo "create an issue for our maintenance team to make the necessary changes."
           exit 1
