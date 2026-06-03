@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -215,7 +216,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	body, _ = sjson.DeleteBytes(body, "safety_identifier")
 	body, _ = sjson.DeleteBytes(body, "stream_options")
 	body = normalizeCodexInstructions(body)
-	body = ensureImageGenerationTool(body, baseModel)
+	body = applyImageGenerationPolicy(e.cfg, body, baseModel)
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
 	httpReq, err := e.cacheHelper(ctx, from, url, req, body)
@@ -363,7 +364,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 	body, _ = sjson.DeleteBytes(body, "stream")
 	body = normalizeCodexInstructions(body)
-	body = ensureImageGenerationTool(body, baseModel)
+	body = applyImageGenerationPolicy(e.cfg, body, baseModel)
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses/compact"
 	httpReq, err := e.cacheHelper(ctx, from, url, req, body)
@@ -459,7 +460,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	body, _ = sjson.DeleteBytes(body, "stream_options")
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 	body = normalizeCodexInstructions(body)
-	body = ensureImageGenerationTool(body, baseModel)
+	body = applyImageGenerationPolicy(e.cfg, body, baseModel)
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
 	httpReq, err := e.cacheHelper(ctx, from, url, req, body)
@@ -992,6 +993,38 @@ func ensureImageGenerationTool(body []byte, baseModel string) []byte {
 	}
 	body, _ = sjson.SetRawBytes(body, "tools.-1", imageGenToolJSON)
 	return body
+}
+
+// stripImageGenerationTool 从请求体 tools 数组里移除所有 type==image_generation
+// 的工具（包括 Codex 客户端自带的完整 gpt-image-2 定义）。若移除后 tools 变为空
+// 数组，则删除整个 tools 字段，避免空 tools + tool_choice 触发上游报错。无 tools
+// 字段时原样返回。
+func stripImageGenerationTool(body []byte) []byte {
+	tools := gjson.GetBytes(body, "tools")
+	if !tools.Exists() || !tools.IsArray() {
+		return body
+	}
+	arr := tools.Array()
+	// 从后往前删，避免下标在删除过程中漂移。
+	for i := len(arr) - 1; i >= 0; i-- {
+		if arr[i].Get("type").String() == "image_generation" {
+			body, _ = sjson.DeleteBytes(body, "tools."+strconv.Itoa(i))
+		}
+	}
+	// 重新读取，若 tools 已为空数组则删除整个字段。
+	if remaining := gjson.GetBytes(body, "tools"); remaining.IsArray() && len(remaining.Array()) == 0 {
+		body, _ = sjson.DeleteBytes(body, "tools")
+	}
+	return body
+}
+
+// applyImageGenerationPolicy 按配置开关决定如何处理 image_generation 工具：
+// "strip" 走剥离逻辑；其它取值（含 ""、"off"）保持现有注入行为。
+func applyImageGenerationPolicy(cfg *config.Config, body []byte, baseModel string) []byte {
+	if cfg != nil && strings.EqualFold(strings.TrimSpace(cfg.DisableImageGeneration), "strip") {
+		return stripImageGenerationTool(body)
+	}
+	return ensureImageGenerationTool(body, baseModel)
 }
 
 func isCodexModelCapacityError(errorBody []byte) bool {

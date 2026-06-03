@@ -21,6 +21,16 @@ type SDKConfig struct {
 	// RequestLog enables or disables detailed request logging functionality.
 	RequestLog bool `yaml:"request-log" json:"request-log"`
 
+	// DisableImageGeneration 控制如何处理 Codex 请求体里的 image_generation 工具。
+	// 取值语义：
+	//   ""、"off"（默认）：保持现有行为，按需注入简版 image_generation 工具，不剥离。
+	//   "strip"：转发前从 tools 数组里移除所有 type==image_generation 的工具（包括
+	//            Codex 客户端自带的完整 gpt-image-2 定义），且不注入；若移除后 tools
+	//            变为空数组，则删除整个 tools 字段，避免空 tools 触发上游报错。
+	// 用于规避未做组织验证的 ChatGPT 账号被 OpenAI 以 image_generation_user_error
+	// （"The model 'gpt-image-2' does not exist."）拒绝的问题。
+	DisableImageGeneration string `yaml:"disable-image-generation" json:"disable-image-generation"`
+
 	// APIKeys is a list of keys for authenticating clients to this proxy server.
 	APIKeys []string `yaml:"api-keys" json:"api-keys"`
 
