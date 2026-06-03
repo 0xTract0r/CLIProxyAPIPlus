@@ -2672,9 +2672,14 @@ func isRequestInvalidError(err error) bool {
 	switch status {
 	case http.StatusBadRequest:
 		msg := err.Error()
+		// image_generation_user_error 是请求级错误（例如 codex-cli 自带的
+		// image_generation 工具引用了上游不存在的 gpt-image-2 模型）。它由请求体
+		// 本身触发，切换账号或上游模型都无法修复，因此归类为请求级不可重试，避免
+		// 误触发账号轮换死循环。
 		return strings.Contains(msg, "invalid_request_error") ||
 			strings.Contains(msg, "INVALID_ARGUMENT") ||
-			strings.Contains(msg, "FAILED_PRECONDITION")
+			strings.Contains(msg, "FAILED_PRECONDITION") ||
+			strings.Contains(msg, "image_generation_user_error")
 	case http.StatusNotFound:
 		return isRequestScopedNotFoundMessage(err.Error())
 	case http.StatusUnprocessableEntity:

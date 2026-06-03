@@ -211,6 +211,21 @@ nonstream-keepalive-interval: 0
 #   user-agent: "codex_cli_rs/0.114.0 (Mac OS 14.2.0; x86_64) vscode/1.111.0"
 #   beta-features: "multi_agent"
 
+# Controls how the Codex request body's image_generation tool is handled before forwarding.
+# The default is now "strip": this fork mainly serves unverified-organization ChatGPT accounts,
+# for which the image_generation tool is harmful (rejected by OpenAI with
+# image_generation_user_error: "The model 'gpt-image-2' does not exist."). Leaving this empty
+# already strips, so 201 needs no configuration.
+#   "" (unset) / "strip" / "true" / "on" (default): remove all image_generation tools from the
+#            request body before forwarding (including the client's full gpt-image-2 definition)
+#            and inject nothing. If the tools array becomes empty after removal, the whole tools
+#            field is dropped to avoid an empty tools array triggering an upstream error.
+#   "off" / "false" / "inject": restore the old behavior (inject the lightweight image_generation
+#            tool as needed). Use this only for organization-verified accounts that want Codex
+#            image generation.
+#   any other unknown value: treated as the default "strip".
+disable-image-generation: ''
+
 # Kiro (AWS CodeWhisperer) configuration
 # Note: Kiro API currently only operates in us-east-1 region
 #kiro:
