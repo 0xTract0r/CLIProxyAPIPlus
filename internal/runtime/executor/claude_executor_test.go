@@ -2492,6 +2492,312 @@ func TestClaudeExecutor_ExecuteStream_AcceptEncodingOverrideCannotBypassIdentity
 	}
 }
 
+func TestClaudeExecutor_ExecuteStream_RepairsClaudeCodeTextInvokeToToolUse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(strings.Join([]string{
+			"event: message_start\n",
+			"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"model\":\"claude-opus-4-8\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
+			"event: content_block_start\n",
+			"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+			"event: content_block_delta\n",
+			"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"准备执行。\\n\\n<invoke name=\\\"\"}}\n\n",
+			"event: content_block_delta\n",
+			"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Bash\\\">\\n<parameter name=\\\"command\\\">echo hi</parameter>\\n<parameter name=\\\"description\\\">Run echo</parameter>\\n<parameter name=\\\"dangerouslyDisableSandbox\\\">true</parameter>\\n</invoke>\"}}\n\n",
+			"event: content_block_stop\n",
+			"data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+			"event: message_delta\n",
+			"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}\n\n",
+			"event: message_stop\n",
+			"data: {\"type\":\"message_stop\"}\n\n",
+		}, "")))
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key":  "key-123",
+		"base_url": server.URL,
+	}}
+	payload := []byte(`{"stream":true,"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}],"tools":[{"name":"Bash","description":"Run shell","input_schema":{"type":"object"}}]}`)
+
+	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-opus-4-8",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("claude"),
+		Headers: http.Header{
+			"User-Agent": []string{"claude-cli/2.1.158 (external, cli)"},
+			"X-App":      []string{"cli"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream error: %v", err)
+	}
+	var got strings.Builder
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("unexpected chunk error: %v", chunk.Err)
+		}
+		got.Write(chunk.Payload)
+	}
+	body := got.String()
+	if strings.Contains(body, "<invoke") {
+		t.Fatalf("text invoke leaked to client: %s", body)
+	}
+	for _, want := range []string{
+		`"type":"tool_use"`,
+		`"name":"Bash"`,
+		`"type":"input_json_delta"`,
+		`echo hi`,
+		`dangerouslyDisableSandbox`,
+		`"stop_reason":"tool_use"`,
+		`准备执行。`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("repaired stream missing %q: %s", want, body)
+		}
+	}
+	if strings.Contains(body, `"stop_reason":"end_turn"`) {
+		t.Fatalf("end_turn stop reason should be replaced after repaired tool use: %s", body)
+	}
+}
+
+func TestClaudeExecutor_ExecuteStream_DoesNotRepairUnknownTextInvokeTool(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(strings.Join([]string{
+			"event: message_start\n",
+			"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"model\":\"claude-opus-4-8\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
+			"event: content_block_start\n",
+			"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+			"event: content_block_delta\n",
+			"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"<invoke name=\\\"UnknownTool\\\"><parameter name=\\\"command\\\">echo hi</parameter></invoke>\"}}\n\n",
+			"event: content_block_stop\n",
+			"data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+			"event: message_delta\n",
+			"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}\n\n",
+			"event: message_stop\n",
+			"data: {\"type\":\"message_stop\"}\n\n",
+		}, "")))
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key":  "key-123",
+		"base_url": server.URL,
+	}}
+	payload := []byte(`{"stream":true,"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}],"tools":[{"name":"Bash","description":"Run shell","input_schema":{"type":"object"}}]}`)
+
+	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-opus-4-8",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("claude"),
+		Headers: http.Header{
+			"User-Agent": []string{"claude-cli/2.1.158 (external, cli)"},
+			"X-App":      []string{"cli"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream error: %v", err)
+	}
+	var got strings.Builder
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("unexpected chunk error: %v", chunk.Err)
+		}
+		got.Write(chunk.Payload)
+	}
+	body := got.String()
+	if !strings.Contains(body, `UnknownTool`) {
+		t.Fatalf("unknown invoke should remain text: %s", body)
+	}
+	if strings.Contains(body, `"stop_reason":"tool_use"`) {
+		t.Fatalf("unknown invoke must not force tool_use stop reason: %s", body)
+	}
+	if !strings.Contains(body, `"stop_reason":"end_turn"`) {
+		t.Fatalf("unknown invoke should keep original end_turn: %s", body)
+	}
+}
+
+func TestClaudeExecutor_ExecuteStream_DoesNotRepairInvokeWithTrailingText(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(strings.Join([]string{
+			"event: message_start\n",
+			"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"model\":\"claude-opus-4-8\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
+			"event: content_block_start\n",
+			"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+			"event: content_block_delta\n",
+			"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"<invoke name=\\\"Bash\\\"><parameter name=\\\"command\\\">echo hi</parameter></invoke> then explain it\"}}\n\n",
+			"event: content_block_stop\n",
+			"data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+			"event: message_delta\n",
+			"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}\n\n",
+			"event: message_stop\n",
+			"data: {\"type\":\"message_stop\"}\n\n",
+		}, "")))
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key":  "key-123",
+		"base_url": server.URL,
+	}}
+	payload := []byte(`{"stream":true,"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}],"tools":[{"name":"Bash","description":"Run shell","input_schema":{"type":"object"}}]}`)
+
+	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-opus-4-8",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("claude"),
+		Headers: http.Header{
+			"User-Agent": []string{"claude-cli/2.1.158 (external, cli)"},
+			"X-App":      []string{"cli"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream error: %v", err)
+	}
+	var got strings.Builder
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("unexpected chunk error: %v", chunk.Err)
+		}
+		got.Write(chunk.Payload)
+	}
+	body := got.String()
+	if !strings.Contains(body, `then explain it`) {
+		t.Fatalf("trailing text should remain in text stream: %s", body)
+	}
+	if strings.Contains(body, `"stop_reason":"tool_use"`) {
+		t.Fatalf("trailing text invoke must not force tool_use stop reason: %s", body)
+	}
+}
+
+func TestClaudeExecutor_ExecuteStream_DoesNotRepairInvokeWithTrailingTextInLaterDelta(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(strings.Join([]string{
+			"event: message_start\n",
+			"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"model\":\"claude-opus-4-8\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
+			"event: content_block_start\n",
+			"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+			"event: content_block_delta\n",
+			"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"<invoke name=\\\"Bash\\\"><parameter name=\\\"command\\\">echo hi</parameter></invoke>\"}}\n\n",
+			"event: content_block_delta\n",
+			"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" then explain it\"}}\n\n",
+			"event: content_block_stop\n",
+			"data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+			"event: message_delta\n",
+			"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}\n\n",
+			"event: message_stop\n",
+			"data: {\"type\":\"message_stop\"}\n\n",
+		}, "")))
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key":  "key-123",
+		"base_url": server.URL,
+	}}
+	payload := []byte(`{"stream":true,"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}],"tools":[{"name":"Bash","description":"Run shell","input_schema":{"type":"object"}}]}`)
+
+	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-opus-4-8",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("claude"),
+		Headers: http.Header{
+			"User-Agent": []string{"claude-cli/2.1.158 (external, cli)"},
+			"X-App":      []string{"cli"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream error: %v", err)
+	}
+	var got strings.Builder
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("unexpected chunk error: %v", chunk.Err)
+		}
+		got.Write(chunk.Payload)
+	}
+	body := got.String()
+	if !strings.Contains(body, `Bash`) || !strings.Contains(body, `echo hi`) || !strings.Contains(body, `then explain it`) {
+		t.Fatalf("split trailing text invoke should remain text: %s", body)
+	}
+	if strings.Contains(body, `"stop_reason":"tool_use"`) || strings.Contains(body, `toolu_repaired_`) {
+		t.Fatalf("split trailing text invoke must not be repaired to tool_use: %s", body)
+	}
+	if !strings.Contains(body, `"stop_reason":"end_turn"`) {
+		t.Fatalf("split trailing text invoke should keep original end_turn: %s", body)
+	}
+}
+
+func TestClaudeExecutor_ExecuteStream_DoesNotRepairNonClaudeCodeCliHeader(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(strings.Join([]string{
+			"event: message_start\n",
+			"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"model\":\"claude-opus-4-8\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
+			"event: content_block_start\n",
+			"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+			"event: content_block_delta\n",
+			"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"<invoke name=\\\"Bash\\\"><parameter name=\\\"command\\\">echo hi</parameter></invoke>\"}}\n\n",
+			"event: content_block_stop\n",
+			"data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+			"event: message_delta\n",
+			"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}\n\n",
+			"event: message_stop\n",
+			"data: {\"type\":\"message_stop\"}\n\n",
+		}, "")))
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key":  "key-123",
+		"base_url": server.URL,
+	}}
+	payload := []byte(`{"stream":true,"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}],"tools":[{"name":"Bash","description":"Run shell","input_schema":{"type":"object"}}]}`)
+
+	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-opus-4-8",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("claude"),
+		Headers: http.Header{
+			"User-Agent": []string{"curl/8.7.1"},
+			"X-App":      []string{"cli"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream error: %v", err)
+	}
+	var got strings.Builder
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("unexpected chunk error: %v", chunk.Err)
+		}
+		got.Write(chunk.Payload)
+	}
+	body := got.String()
+	if !strings.Contains(body, `<invoke name=\"Bash\"`) {
+		t.Fatalf("non Claude Code cli header should not be repaired: %s", body)
+	}
+	if strings.Contains(body, `"stop_reason":"tool_use"`) || strings.Contains(body, `toolu_repaired_`) {
+		t.Fatalf("non Claude Code cli header must not force tool_use: %s", body)
+	}
+	if !strings.Contains(body, `"stop_reason":"end_turn"`) {
+		t.Fatalf("non Claude Code cli header should keep original end_turn: %s", body)
+	}
+}
+
 func expectedClaudeCodeStaticPrompt() string {
 	return strings.Join([]string{
 		helps.ClaudeCodeIntro,
