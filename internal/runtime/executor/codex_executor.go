@@ -138,7 +138,7 @@ func codexTerminalStreamErr(eventData []byte) (statusErr, []byte, bool) {
 	if !codexTerminalStreamErrShouldHandle(body) {
 		return statusErr{}, nil, false
 	}
-	return newCodexStatusErr(http.StatusBadRequest, body), body, true
+	return newCodexStatusErr(http.StatusBadRequest, body, nil), body, true
 }
 
 func codexTerminalStreamErrShouldHandle(body []byte) bool {

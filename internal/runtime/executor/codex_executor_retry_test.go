@@ -142,7 +142,7 @@ func TestNewCodexStatusErrClassifiesKnownCodexFailures(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			err := newCodexStatusErr(tc.statusCode, tc.body)
+			err := newCodexStatusErr(tc.statusCode, tc.body, nil)
 
 			if got := err.StatusCode(); got != tc.wantStatus {
 				t.Fatalf("status code = %d, want %d", got, tc.wantStatus)
@@ -155,7 +155,7 @@ func TestNewCodexStatusErrClassifiesKnownCodexFailures(t *testing.T) {
 func TestNewCodexStatusErrPreservesUnclassifiedErrors(t *testing.T) {
 	body := []byte(`{"error":{"message":"documentation mentions too many tokens, but this is a billing configuration failure","type":"server_error","code":"billing_config_error"}}`)
 
-	err := newCodexStatusErr(http.StatusBadGateway, body)
+	err := newCodexStatusErr(http.StatusBadGateway, body, nil)
 
 	if got := err.StatusCode(); got != http.StatusBadGateway {
 		t.Fatalf("status code = %d, want %d", got, http.StatusBadGateway)
