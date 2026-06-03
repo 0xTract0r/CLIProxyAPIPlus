@@ -18,6 +18,7 @@ var providerAppliers = map[string]ProviderApplier{
 	"codex":       nil,
 	"antigravity": nil,
 	"kimi":        nil,
+	"xai":         nil,
 }
 
 // GetProviderApplier returns the ProviderApplier for the given provider name.
@@ -62,7 +63,7 @@ func IsUserDefinedModel(modelInfo *registry.ModelInfo) bool {
 //   - body: Original request body JSON
 //   - model: Model name, optionally with thinking suffix (e.g., "claude-sonnet-4-5(16384)")
 //   - fromFormat: Source request format (e.g., openai, codex, gemini)
-//   - toFormat: Target provider format for the request body (gemini, gemini-cli, antigravity, claude, openai, codex, kimi)
+//   - toFormat: Target provider format for the request body (gemini, gemini-cli, antigravity, claude, openai, codex, kimi, xai)
 //   - providerKey: Provider identifier used for registry model lookups (may differ from toFormat, e.g., openrouter -> openai)
 //
 // Returns:
@@ -118,9 +119,6 @@ func ApplyThinking(body []byte, model string, fromFormat string, toFormat string
 	}
 	if modelInfo.Thinking == nil {
 		config := extractThinkingConfig(body, providerFormat)
-		if !hasThinkingConfig(config) && fromFormat != providerFormat {
-			config = extractThinkingConfig(body, fromFormat)
-		}
 		if hasThinkingConfig(config) {
 			log.WithFields(log.Fields{
 				"model":    baseModel,
@@ -148,9 +146,6 @@ func ApplyThinking(body []byte, model string, fromFormat string, toFormat string
 		}).Debug("thinking: config from model suffix |")
 	} else {
 		config = extractThinkingConfig(body, providerFormat)
-		if !hasThinkingConfig(config) && fromFormat != providerFormat {
-			config = extractThinkingConfig(body, fromFormat)
-		}
 		if hasThinkingConfig(config) {
 			log.WithFields(log.Fields{
 				"provider": providerFormat,
@@ -328,11 +323,9 @@ func extractThinkingConfig(body []byte, provider string) ThinkingConfig {
 		return extractClaudeConfig(body)
 	case "gemini", "gemini-cli", "antigravity":
 		return extractGeminiConfig(body, provider)
-	case "iflow":
-		return extractIFlowConfig(body)
 	case "openai":
 		return extractOpenAIConfig(body)
-	case "codex":
+	case "codex", "xai":
 		return extractCodexConfig(body)
 	case "kimi":
 		// Kimi uses OpenAI-compatible reasoning_effort format
@@ -342,33 +335,75 @@ func extractThinkingConfig(body []byte, provider string) ThinkingConfig {
 	}
 }
 
-// extractIFlowConfig extracts thinking configuration for iFlow requests.
-//
-// iFlow executors currently translate incoming requests to an OpenAI-compatible
-// body before ApplyThinking runs, then materialize provider-native fields
-// (chat_template_kwargs.enable_thinking / reasoning_split) during apply.
-// Support both representations so ApplyThinking works on translated bodies and
-// remains idempotent if a request is reprocessed after native fields exist.
-func extractIFlowConfig(body []byte) ThinkingConfig {
-	if enable := gjson.GetBytes(body, "chat_template_kwargs.enable_thinking"); enable.Exists() {
-		if enable.Bool() {
-			return ThinkingConfig{Mode: ModeAuto, Budget: -1}
-		}
-		return ThinkingConfig{Mode: ModeNone, Budget: 0}
-	}
-
-	if split := gjson.GetBytes(body, "reasoning_split"); split.Exists() {
-		if split.Bool() {
-			return ThinkingConfig{Mode: ModeAuto, Budget: -1}
-		}
-		return ThinkingConfig{Mode: ModeNone, Budget: 0}
-	}
-
-	return extractOpenAIConfig(body)
-}
-
 func hasThinkingConfig(config ThinkingConfig) bool {
 	return config.Mode != ModeBudget || config.Budget != 0 || config.Level != ""
+}
+
+// ExtractReasoningEffort returns the request's thinking setting as a canonical
+// reasoning_effort label for usage logging. Model suffixes have the same
+// priority as ApplyThinking: a valid suffix overrides body fields.
+func ExtractReasoningEffort(body []byte, provider, model string) string {
+	if effort := reasoningEffortFromSuffix(ParseSuffix(model)); effort != "" {
+		return effort
+	}
+
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	config := extractThinkingConfig(body, provider)
+	if !hasThinkingConfig(config) {
+		switch provider {
+		case "openai-response":
+			config = extractCodexConfig(body)
+		case "openai":
+			config = extractCodexConfig(body)
+		}
+	}
+	return reasoningEffortFromConfig(config)
+}
+
+// ExtractTranslatedReasoningEffort returns the final provider payload's thinking
+// setting as a canonical reasoning_effort label for usage logging.
+func ExtractTranslatedReasoningEffort(body []byte, provider string) string {
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	config := extractThinkingConfig(body, provider)
+	if !hasThinkingConfig(config) {
+		switch provider {
+		case "openai", "openai-response":
+			config = extractCodexConfig(body)
+			if !hasThinkingConfig(config) {
+				config = extractOpenAIConfig(body)
+			}
+		}
+	}
+	return reasoningEffortFromConfig(config)
+}
+
+func reasoningEffortFromSuffix(suffix SuffixResult) string {
+	if !suffix.HasSuffix {
+		return ""
+	}
+	return reasoningEffortFromConfig(parseSuffixToConfig(suffix.RawSuffix, "", suffix.ModelName))
+}
+
+func reasoningEffortFromConfig(config ThinkingConfig) string {
+	if !hasThinkingConfig(config) {
+		return ""
+	}
+	switch config.Mode {
+	case ModeNone:
+		return string(LevelNone)
+	case ModeAuto:
+		return string(LevelAuto)
+	case ModeLevel:
+		return strings.ToLower(strings.TrimSpace(string(config.Level)))
+	case ModeBudget:
+		level, ok := ConvertBudgetToLevel(config.Budget)
+		if !ok {
+			return ""
+		}
+		return level
+	default:
+		return ""
+	}
 }
 
 // extractClaudeConfig extracts thinking configuration from Claude format request body.

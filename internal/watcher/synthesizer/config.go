@@ -85,6 +85,7 @@ func (s *ConfigSynthesizer) synthesizeGeminiKeys(ctx *SynthesisContext) []*corea
 			CreatedAt:  now,
 			UpdatedAt:  now,
 		}
+		applyDisableCoolingMeta(a, entry.DisableCooling)
 		ApplyAuthExcludedModelsMeta(a, cfg, entry.ExcludedModels, "apikey")
 		out = append(out, a)
 	}
@@ -133,6 +134,7 @@ func (s *ConfigSynthesizer) synthesizeClaudeKeys(ctx *SynthesisContext) []*corea
 			CreatedAt:  now,
 			UpdatedAt:  now,
 		}
+		applyDisableCoolingMeta(a, ck.DisableCooling)
 		ApplyAuthExcludedModelsMeta(a, cfg, ck.ExcludedModels, "apikey")
 		out = append(out, a)
 	}
@@ -183,6 +185,7 @@ func (s *ConfigSynthesizer) synthesizeCodexKeys(ctx *SynthesisContext) []*coreau
 			CreatedAt:  now,
 			UpdatedAt:  now,
 		}
+		applyDisableCoolingMeta(a, ck.DisableCooling)
 		ApplyAuthExcludedModelsMeta(a, cfg, ck.ExcludedModels, "apikey")
 		out = append(out, a)
 	}
@@ -240,6 +243,7 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 				CreatedAt:  now,
 				UpdatedAt:  now,
 			}
+			applyDisableCoolingMeta(a, compat.DisableCooling)
 			out = append(out, a)
 			createdEntries++
 		}
@@ -270,6 +274,7 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 				CreatedAt:  now,
 				UpdatedAt:  now,
 			}
+			applyDisableCoolingMeta(a, compat.DisableCooling)
 			out = append(out, a)
 		}
 	}

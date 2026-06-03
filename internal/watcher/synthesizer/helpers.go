@@ -103,6 +103,20 @@ func ApplyAuthExcludedModelsMeta(auth *coreauth.Auth, cfg *config.Config, perKey
 	}
 }
 
+// applyDisableCoolingMeta records the per-credential disable-cooling override on
+// the auth entry metadata when enabled. The metadata is left untouched (nil) when
+// the credential does not opt out of cooling, so callers without the override keep
+// a nil Metadata map.
+func applyDisableCoolingMeta(auth *coreauth.Auth, disable bool) {
+	if auth == nil || !disable {
+		return
+	}
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	auth.Metadata["disable_cooling"] = true
+}
+
 // addConfigHeadersToAttrs adds header configuration to auth attributes.
 // Headers are prefixed with "header:" in the attributes map.
 func addConfigHeadersToAttrs(headers map[string]string, attrs map[string]string) {

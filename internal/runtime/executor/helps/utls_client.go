@@ -1,6 +1,7 @@
 package helps
 
 import (
+	"context"
 	"net"
 	"net/http"
 	"strings"
@@ -17,7 +18,7 @@ import (
 )
 
 // utlsRoundTripper implements http.RoundTripper using utls with Chrome fingerprint
-// to bypass Cloudflare's TLS fingerprinting on Anthropic domains.
+// to bypass Cloudflare's TLS fingerprinting on protected domains.
 type utlsRoundTripper struct {
 	mu          sync.Mutex
 	connections map[string]*http2.ClientConn
@@ -32,7 +33,7 @@ func newUtlsRoundTripper(proxyURL string, clientHello tls.ClientHelloID) *utlsRo
 	if proxyURL != "" {
 		proxyDialer, mode, errBuild := proxyutil.BuildDialer(proxyURL)
 		if errBuild != nil {
-			log.Errorf("utls: failed to configure proxy dialer for %q: %v", proxyURL, errBuild)
+			log.Errorf("utls: failed to configure proxy dialer for %q: %v", proxyutil.Redact(proxyURL), errBuild)
 		} else if mode != proxyutil.ModeInherit && proxyDialer != nil {
 			dialer = proxyDialer
 		}
@@ -148,21 +149,23 @@ func (t *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 	return resp, nil
 }
 
-// anthropicHosts contains the hosts that should use utls Chrome TLS fingerprint.
-var anthropicHosts = map[string]struct{}{
+// utlsProtectedHosts contains the hosts that should use utls Chrome TLS fingerprint
+// to bypass Cloudflare's TLS fingerprinting.
+var utlsProtectedHosts = map[string]struct{}{
 	"api.anthropic.com": {},
+	"chatgpt.com":       {},
 }
 
-// fallbackRoundTripper uses utls for Anthropic HTTPS hosts and falls back to
-// standard transport for all other requests (non-HTTPS or non-Anthropic hosts).
+// fallbackRoundTripper uses utls for protected HTTPS hosts and falls back to
+// standard transport for all other requests (non-HTTPS or non-protected hosts).
 type fallbackRoundTripper struct {
-	utls     *utlsRoundTripper
+	utls     http.RoundTripper
 	fallback http.RoundTripper
 }
 
 func (f *fallbackRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	if req.URL.Scheme == "https" {
-		if _, ok := anthropicHosts[strings.ToLower(req.URL.Hostname())]; ok {
+		if _, ok := utlsProtectedHosts[strings.ToLower(req.URL.Hostname())]; ok {
 			return f.utls.RoundTrip(req)
 		}
 	}
@@ -170,11 +173,12 @@ func (f *fallbackRoundTripper) RoundTrip(req *http.Request) (*http.Response, err
 }
 
 // NewUtlsHTTPClient creates an HTTP client using a Chrome-like uTLS preset for
-// Anthropic API hosts. This is a project-managed preset, not an official Claude
+// protected API hosts. This is a project-managed preset, not an official Claude
 // Code TLS fingerprint or provider-edge parity claim. Falls back to standard
-// transport for non-HTTPS requests.
-func NewUtlsHTTPClient(cfg *config.Config, auth *cliproxyauth.Auth, timeout time.Duration) *http.Client {
-	return NewUtlsHTTPClientForProfile(cfg, auth, timeout, "claude_utls_chrome_133")
+// transport for non-HTTPS requests. A round tripper injected via the
+// "cliproxy.roundtripper" context value is honored when no explicit proxy is set.
+func NewUtlsHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, timeout time.Duration) *http.Client {
+	return NewUtlsHTTPClientForProfile(ctx, cfg, auth, timeout, "claude_utls_chrome_133")
 }
 
 func NewUtlsRoundTripperForProfile(proxyURL string, profileID string) http.RoundTripper {
@@ -188,7 +192,7 @@ func NewUtlsRoundTripperForProfile(proxyURL string, profileID string) http.Round
 	}
 }
 
-func NewUtlsHTTPClientForProfile(cfg *config.Config, auth *cliproxyauth.Auth, timeout time.Duration, profileID string) *http.Client {
+func NewUtlsHTTPClientForProfile(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, timeout time.Duration, profileID string) *http.Client {
 	var proxyURL string
 	if auth != nil {
 		proxyURL = strings.TrimSpace(auth.ProxyURL)
@@ -197,8 +201,28 @@ func NewUtlsHTTPClientForProfile(cfg *config.Config, auth *cliproxyauth.Auth, ti
 		proxyURL = strings.TrimSpace(cfg.ProxyURL)
 	}
 
+	clientHello, ok := resolveClaudeClientHelloID(profileID)
+	if !ok {
+		clientHello, _ = resolveClaudeClientHelloID("claude_utls_chrome_133")
+	}
+
+	var ctxRoundTripper http.RoundTripper
+	if ctx != nil {
+		ctxRoundTripper, _ = ctx.Value("cliproxy.roundtripper").(http.RoundTripper)
+	}
+
+	var utlsRT http.RoundTripper = newUtlsRoundTripper(proxyURL, clientHello)
+	standardTransport := standardTransportForProxy(proxyURL)
+	if proxyURL == "" && ctxRoundTripper != nil {
+		utlsRT = ctxRoundTripper
+		standardTransport = ctxRoundTripper
+	}
+
 	client := &http.Client{
-		Transport: NewUtlsRoundTripperForProfile(proxyURL, profileID),
+		Transport: &fallbackRoundTripper{
+			utls:     utlsRT,
+			fallback: standardTransport,
+		},
 	}
 	if timeout > 0 {
 		client.Timeout = timeout

@@ -3650,7 +3650,7 @@ func (e *KiroExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*c
 	// Honor the account-scoped auth.ProxyURL (e.g. SOCKS5 proxy assigned to a
 	// specific Kiro auth file) so token refresh egresses via the account proxy
 	// instead of silently falling back to the global cfg.ProxyURL. Mirrors the
-	// Claude/Codex/Qwen/IFlow refresh-proxy invariant (ledger section 13).
+	// Claude/Codex refresh-proxy invariant (ledger section 13).
 	ssoClient := kiroauth.NewSSOOIDCClientWithProxyURL(e.cfg, auth.ProxyURL)
 
 	// Use SSO OIDC refresh for AWS Builder ID or IDC, otherwise use Kiro's OAuth refresh endpoint

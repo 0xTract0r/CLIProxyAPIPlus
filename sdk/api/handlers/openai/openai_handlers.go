@@ -60,6 +60,15 @@ func (h *OpenAIAPIHandler) Models() []map[string]any {
 // It returns a list of available AI models with their capabilities
 // and specifications in OpenAI-compatible format.
 func (h *OpenAIAPIHandler) OpenAIModels(c *gin.Context) {
+	// Upstream Codex clients request a trimmed catalog via the client_version query.
+	if _, ok := c.Request.URL.Query()["client_version"]; ok {
+		c.JSON(http.StatusOK, h.codexClientModelsResponse())
+		return
+	}
+
+	// Return the full model metadata so fork-specific capability fields
+	// (e.g. supported_parameters, additional_speed_tiers, service_tiers) are
+	// preserved for standard OpenAI /v1/models consumers.
 	c.JSON(http.StatusOK, gin.H{
 		"object": "list",
 		"data":   h.Models(),
@@ -73,7 +82,7 @@ func (h *OpenAIAPIHandler) OpenAIModels(c *gin.Context) {
 // Parameters:
 //   - c: The Gin context containing the HTTP request and response
 func (h *OpenAIAPIHandler) ChatCompletions(c *gin.Context) {
-	rawJSON, err := c.GetRawData()
+	rawJSON, err := handlers.ReadRequestBody(c)
 	// If data retrieval fails, return a 400 Bad Request error.
 	if err != nil {
 		c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
@@ -145,7 +154,7 @@ func shouldTreatAsResponsesFormat(rawJSON []byte) bool {
 // Parameters:
 //   - c: The Gin context containing the HTTP request and response
 func (h *OpenAIAPIHandler) Completions(c *gin.Context) {
-	rawJSON, err := c.GetRawData()
+	rawJSON, err := handlers.ReadRequestBody(c)
 	// If data retrieval fails, return a 400 Bad Request error.
 	if err != nil {
 		c.JSON(http.StatusBadRequest, handlers.ErrorResponse{

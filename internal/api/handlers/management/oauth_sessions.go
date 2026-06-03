@@ -312,6 +312,21 @@ func isOAuthSessionCompleteStatus(status string) bool {
 	return strings.EqualFold(strings.TrimSpace(status), oauthSessionStatusComplete)
 }
 
+func oauthSessionErrorWithCause(message string, cause error) string {
+	message = strings.TrimSpace(message)
+	if message == "" {
+		message = "Authentication failed"
+	}
+	if cause == nil {
+		return message
+	}
+	detail := strings.TrimSpace(cause.Error())
+	if detail == "" {
+		return message
+	}
+	return message + ": " + detail
+}
+
 func ValidateOAuthState(state string) error {
 	trimmed := strings.TrimSpace(state)
 	if trimmed == "" {
@@ -349,16 +364,14 @@ func NormalizeOAuthProvider(provider string) (string, error) {
 		return "gitlab", nil
 	case "gemini", "google":
 		return "gemini", nil
-	case "iflow", "i-flow":
-		return "iflow", nil
 	case "antigravity", "anti-gravity":
 		return "antigravity", nil
-	case "qwen":
-		return "qwen", nil
 	case "kiro":
 		return "kiro", nil
 	case "github":
 		return "github", nil
+	case "xai", "x-ai", "x.ai", "grok":
+		return "xai", nil
 	default:
 		return "", errUnsupportedOAuthFlow
 	}
@@ -384,6 +397,9 @@ func WriteOAuthCallbackFile(authDir, provider, state, code, errorMessage string)
 
 	fileName := fmt.Sprintf(".oauth-%s-%s.oauth", canonicalProvider, state)
 	filePath := filepath.Join(authDir, fileName)
+	if err := os.MkdirAll(authDir, 0o700); err != nil {
+		return "", fmt.Errorf("create oauth callback dir: %w", err)
+	}
 	payload := oauthCallbackFilePayload{
 		Code:  strings.TrimSpace(code),
 		State: strings.TrimSpace(state),
