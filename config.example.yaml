@@ -211,6 +211,14 @@ nonstream-keepalive-interval: 0
 #   user-agent: "codex_cli_rs/0.114.0 (Mac OS 14.2.0; x86_64) vscode/1.111.0"
 #   beta-features: "multi_agent"
 
+# Controls how the Codex request body's image_generation tool is handled before forwarding.
+#   "" / "off" (default): keep current behavior (inject the lightweight image_generation tool as needed).
+#   "strip": remove all image_generation tools from the request body before forwarding (including
+#            the client's full gpt-image-2 definition) and inject nothing. Use this to work around
+#            unverified-organization ChatGPT accounts being rejected by gpt-image-2
+#            (image_generation_user_error: "The model 'gpt-image-2' does not exist.").
+disable-image-generation: ''
+
 # Kiro (AWS CodeWhisperer) configuration
 # Note: Kiro API currently only operates in us-east-1 region
 #kiro:
