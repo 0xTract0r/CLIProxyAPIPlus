@@ -904,7 +904,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		clearCodexReasoningReplayOnInvalidSignature(replayScope, httpResp.StatusCode, b)
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
-		err = newCodexStatusErr(httpResp.StatusCode, b)
+		err = newCodexStatusErr(httpResp.StatusCode, b, httpResp.Header)
 		return resp, err
 	}
 	data, err := io.ReadAll(httpResp.Body)
@@ -1068,7 +1068,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 		b = applyCodexIdentityConfuseResponsePayload(b, identityState)
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
-		err = newCodexStatusErr(httpResp.StatusCode, b)
+		err = newCodexStatusErr(httpResp.StatusCode, b, httpResp.Header)
 		return resp, err
 	}
 	data, err := io.ReadAll(httpResp.Body)
@@ -1180,7 +1180,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		clearCodexReasoningReplayOnInvalidSignature(replayScope, httpResp.StatusCode, data)
 		helps.AppendAPIResponseChunk(ctx, e.cfg, data)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
-		err = newCodexStatusErr(httpResp.StatusCode, data)
+		err = newCodexStatusErr(httpResp.StatusCode, data, httpResp.Header)
 		return nil, err
 	}
 	out := make(chan cliproxyexecutor.StreamChunk)
@@ -1785,14 +1785,24 @@ func applyCodexCommunityDesktopHeaders(headers http.Header, profile helps.CodexC
 	}
 }
 
-func newCodexStatusErr(statusCode int, body []byte) statusErr {
+func newCodexStatusErr(statusCode int, body []byte, headers http.Header) statusErr {
 	errCode := statusCode
 	if isCodexModelCapacityError(body) {
 		errCode = http.StatusTooManyRequests
 	}
 	body = classifyCodexStatusError(errCode, body)
 	err := statusErr{code: errCode, msg: string(body)}
-	if retryAfter := parseCodexRetryAfter(errCode, body, time.Now()); retryAfter != nil {
+	now := time.Now()
+	// Prefer the exhausted-window reset carried in Codex's rate-limit headers: it is
+	// the authoritative reset time (5h / weekly plan limits) and is present even when
+	// the body uses "rate_limit_reached" rather than "usage_limit_reached". The body
+	// parser only recognizes usage-limit text and otherwise falls back to a coarse
+	// 1-hour default, so honoring the header first cools an exhausted credential for
+	// its real reset and lets rotation move traffic to a healthy account. Header is
+	// only consulted for 429s; non-429 statuses keep the body-only behavior.
+	if retryAfter := codexRateLimitRetryAfterFromHeaders(headers, now); retryAfter != nil && errCode == http.StatusTooManyRequests {
+		err.retryAfter = retryAfter
+	} else if retryAfter := parseCodexRetryAfter(errCode, body, now); retryAfter != nil {
 		err.retryAfter = retryAfter
 	}
 	return err

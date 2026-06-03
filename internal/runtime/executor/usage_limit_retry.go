@@ -131,3 +131,65 @@ func retryAfterFromNaturalLanguage(body []byte, now time.Time) *time.Duration {
 	}
 	return nil
 }
+
+// codexRateLimitRetryAfterFromHeaders derives a retry-after window from Codex's
+// rate-limit response headers when a primary/secondary window is fully consumed
+// (used-percent >= 100). Codex surfaces sustained 5h/weekly plan limits via these
+// headers (and a body type like "rate_limit_reached") that isUsageLimitBody does
+// not match, so the 429 path would otherwise fall back to the 1-minute transient
+// cooldown and keep re-selecting an exhausted credential. Mirrors the success-path
+// logic in quotaRetryAfterFromHeaders (sdk/cliproxy/auth/conductor.go); keep the two
+// in sync. Returns nil when no window is exhausted (e.g. TPM bursts / model capacity),
+// preserving fast transient recovery.
+func codexRateLimitRetryAfterFromHeaders(headers http.Header, now time.Time) *time.Duration {
+	if len(headers) == 0 {
+		return nil
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	var latest time.Time
+	for _, prefix := range []string{"X-Codex", "X-Codex-Bengalfox"} {
+		for _, window := range []string{"Primary", "Secondary"} {
+			if !codexRateLimitPercentExhausted(headers.Get(prefix + "-" + window + "-Used-Percent")) {
+				continue
+			}
+			if resetAt := codexRateLimitResetTime(headers, prefix+"-"+window, now); resetAt.After(latest) {
+				latest = resetAt
+			}
+		}
+	}
+	if latest.IsZero() || !latest.After(now) {
+		return nil
+	}
+	retryAfter := latest.Sub(now)
+	return &retryAfter
+}
+
+func codexRateLimitPercentExhausted(raw string) bool {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return false
+	}
+	value, err := strconv.ParseFloat(raw, 64)
+	return err == nil && value >= 100
+}
+
+func codexRateLimitResetTime(headers http.Header, prefix string, now time.Time) time.Time {
+	if headers == nil {
+		return time.Time{}
+	}
+	if raw := strings.TrimSpace(headers.Get(prefix + "-Reset-At")); raw != "" {
+		if unixSeconds, err := strconv.ParseInt(raw, 10, 64); err == nil && unixSeconds > 0 {
+			if resetAt := time.Unix(unixSeconds, 0); resetAt.After(now) {
+				return resetAt
+			}
+		}
+	}
+	if raw := strings.TrimSpace(headers.Get(prefix + "-Reset-After-Seconds")); raw != "" {
+		if seconds, err := strconv.ParseInt(raw, 10, 64); err == nil && seconds > 0 {
+			return now.Add(time.Duration(seconds) * time.Second)
+		}
+	}
+	return time.Time{}
+}

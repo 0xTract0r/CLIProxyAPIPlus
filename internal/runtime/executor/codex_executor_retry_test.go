@@ -87,7 +87,7 @@ func TestParseCodexRetryAfter(t *testing.T) {
 func TestNewCodexStatusErrTreatsCapacityAsRetryableRateLimit(t *testing.T) {
 	body := []byte(`{"error":{"message":"Selected model is at capacity. Please try a different model."}}`)
 
-	err := newCodexStatusErr(http.StatusBadRequest, body)
+	err := newCodexStatusErr(http.StatusBadRequest, body, nil)
 
 	if got := err.StatusCode(); got != http.StatusTooManyRequests {
 		t.Fatalf("status code = %d, want %d", got, http.StatusTooManyRequests)
