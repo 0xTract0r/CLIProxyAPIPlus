@@ -201,3 +201,70 @@ func TestSaveTokenRecord_RenamedFileNameInheritsAndRemovesOrphan(t *testing.T) {
 		t.Fatalf("expected orphan file %s to be removed", oldPath)
 	}
 }
+
+// TestSaveTokenRecord_DropsStaleQuotaRuntimeStateOnReauth asserts that a
+// re-auth round-trip inherits operator-controlled metadata but deliberately
+// drops derived quota runtime state (quota_refresh_status / quota_refresh_error
+// / quota_next_refresh_after). Keeping a stale quota_refresh_status=reauth_required
+// across re-auth was the root cause of a recovered Claude credential continuing
+// to show "needs re-auth" in the management Quota page (T008).
+func TestSaveTokenRecord_DropsStaleQuotaRuntimeStateOnReauth(t *testing.T) {
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	previous := &coreauth.Auth{
+		ID:       "claude-user@example.com.json",
+		FileName: "claude-user@example.com.json",
+		Provider: "claude",
+		Metadata: map[string]any{
+			"type":  "claude",
+			"email": "user@example.com",
+			// operator-controlled, must still be inherited
+			"note":             "managed account",
+			"refresh_disabled": true,
+			// derived quota runtime state, must NOT survive re-auth
+			quotaRefreshStatusMetadataKey: quotaRefreshStatusReauthRequired,
+			quotaRefreshErrorMetadataKey:  "Claude credential unauthorized; reauthenticate this credential to refresh quota.",
+			quotaNextRefreshMetadataKey:   "2026-06-02T16:32:30Z",
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), previous); errRegister != nil {
+		t.Fatalf("failed to register previous auth: %v", errRegister)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+	h.tokenStore = store
+
+	record := &coreauth.Auth{
+		ID:       "claude-user@example.com.json",
+		FileName: "claude-user@example.com.json",
+		Provider: "claude",
+		Metadata: map[string]any{
+			"type":          "claude",
+			"email":         "user@example.com",
+			"access_token":  "NEW_TOKEN",
+			"refresh_token": "NEW_REFRESH",
+		},
+	}
+	if _, errSave := h.saveTokenRecord(context.Background(), record); errSave != nil {
+		t.Fatalf("saveTokenRecord returned error: %v", errSave)
+	}
+
+	// Operator metadata still inherited.
+	if got, _ := record.Metadata["note"].(string); got != "managed account" {
+		t.Fatalf("note = %q, want inherited %q", got, "managed account")
+	}
+	if got, _ := record.Metadata["refresh_disabled"].(bool); !got {
+		t.Fatalf("refresh_disabled = %v, want inherited true", got)
+	}
+
+	// Stale quota runtime state dropped so the recovered credential is not stuck.
+	for _, key := range []string{
+		quotaRefreshStatusMetadataKey,
+		quotaRefreshErrorMetadataKey,
+		quotaNextRefreshMetadataKey,
+	} {
+		if _, ok := record.Metadata[key]; ok {
+			t.Fatalf("metadata[%q] survived re-auth, want dropped: %#v", key, record.Metadata[key])
+		}
+	}
+}

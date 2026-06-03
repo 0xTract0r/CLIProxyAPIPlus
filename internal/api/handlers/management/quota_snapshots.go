@@ -294,7 +294,12 @@ func (h *Handler) quotaRefreshTargets(manager *coreauth.Manager, req quotaRefres
 		if auth == nil || auth.Disabled || !quotaSnapshotProviderSupported(auth.Provider) {
 			continue
 		}
-		if quotaSnapshotImplicitRefreshSkipped(auth) {
+		// An explicit, user-initiated global refresh re-probes credentials that
+		// have recovered (e.g. after re-auth) even when a stale reauth_required
+		// quota status lingers. Background auto-refresh stays cautious via
+		// quotaSnapshotImplicitRefreshSkipped so it never hammers a genuinely
+		// unauthorized quota endpoint.
+		if quotaSnapshotImplicitRefreshSkipped(auth) && !quotaSnapshotAuthRecovered(auth) {
 			continue
 		}
 		if provider != "" && strings.ToLower(auth.Provider) != provider {
@@ -603,6 +608,24 @@ func quotaSnapshotImplicitRefreshSkipped(auth *coreauth.Auth) bool {
 		return true
 	}
 	return quotaSnapshotLegacyReauthRequired(auth)
+}
+
+// quotaSnapshotAuthRecovered reports whether the credential itself is currently
+// usable again, independent of a possibly-stale quota_refresh_status. After an
+// operator re-authenticates, the credential becomes StatusActive (and not
+// disabled/unavailable) even though an old reauth_required quota status may
+// still linger in metadata. Such a recovered credential must not stay skipped
+// forever on an explicit, user-initiated global quota refresh.
+//
+// Detection deliberately relies only on fields that are written fresh by the
+// re-auth flow (Status / Disabled / Unavailable) and never on metadata flags
+// such as refresh_disabled / reauth_required, which are operator-controlled and
+// can be inherited stale across a re-auth round-trip.
+func quotaSnapshotAuthRecovered(auth *coreauth.Auth) bool {
+	if auth == nil || auth.Disabled || auth.Unavailable {
+		return false
+	}
+	return auth.Status == coreauth.StatusActive
 }
 
 func quotaSnapshotLegacyReauthRequired(auth *coreauth.Auth) bool {
