@@ -68,6 +68,35 @@ func TestRefreshTokensWithRetry_NonRetryableOnlyAttemptsOnce(t *testing.T) {
 	}
 }
 
+func TestCodexBareClientAppliesServingUserAgentOnRefresh(t *testing.T) {
+	var captured *http.Request
+	auth := &CodexAuth{
+		httpClient: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				captured = req.Clone(req.Context())
+				return &http.Response{
+					StatusCode: http.StatusBadRequest,
+					Body:       io.NopCloser(strings.NewReader(`{"error":"invalid_grant"}`)),
+					Header:     make(http.Header),
+					Request:    req,
+				}, nil
+			}),
+		},
+		userAgent: codexOAuthUserAgent,
+	}
+
+	// The bare client used for background refresh must present the serving
+	// User-Agent instead of an empty Go default. The request is sent before the
+	// error response is parsed, so the captured request reflects the headers.
+	_, _ = auth.RefreshTokensWithRetry(context.Background(), "refresh-token", 1)
+	if captured == nil {
+		t.Fatal("refresh request was not sent")
+	}
+	if got := captured.Header.Get("User-Agent"); got != codexOAuthUserAgent {
+		t.Fatalf("User-Agent = %q, want %q", got, codexOAuthUserAgent)
+	}
+}
+
 func TestNewCodexAuthWithProxyURL_OverrideDirectDisablesProxy(t *testing.T) {
 	cfg := &config.Config{SDKConfig: config.SDKConfig{ProxyURL: "http://proxy.example.com:8080"}}
 	auth := NewCodexAuthWithProxyURL(cfg, "direct")

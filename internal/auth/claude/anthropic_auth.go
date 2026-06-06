@@ -35,6 +35,14 @@ const (
 
 	claudeRefreshMinBackoff = 5 * time.Second
 	claudeRefreshMaxBackoff = 5 * time.Minute
+
+	// claudeOAuthUserAgent mirrors the baseline User-Agent serving sends for Claude
+	// (defaultClaudeFingerprintUserAgent in internal/runtime/executor/helps). OAuth
+	// token exchange/refresh has no inbound client context, so it uses this baseline
+	// default to stay consistent with the serving identity. Kept as a local copy
+	// because that constant is unexported and importing the executor package here
+	// would create an import cycle.
+	claudeOAuthUserAgent = "claude-cli/2.1.63 (external, cli)"
 )
 
 const maxOAuthErrorBodyBytes = 512
@@ -144,6 +152,12 @@ type tokenResponse struct {
 // and refreshing expired tokens using PKCE for enhanced security.
 type ClaudeAuth struct {
 	httpClient *http.Client
+	// userAgent, when non-empty, is set on OAuth token exchange/refresh requests.
+	// Only the bare-client constructors (NewClaudeAuthWithProxyURL) populate it so
+	// background token refresh presents the serving identity; the management-bound
+	// client (NewClaudeAuthWithHTTPClient) leaves it empty and relies on its own
+	// managed-header transport.
+	userAgent string
 }
 
 // NewClaudeAuth creates a new Anthropic authentication service.
@@ -181,6 +195,7 @@ func NewClaudeAuthWithProxyURL(cfg *config.Config, proxyURL string) *ClaudeAuth 
 	// Cloudflare's bot detection on Anthropic domains
 	return &ClaudeAuth{
 		httpClient: NewAnthropicHttpClient(sdkCfg),
+		userAgent:  claudeOAuthUserAgent,
 	}
 }
 
@@ -288,6 +303,9 @@ func (o *ClaudeAuth) ExchangeCodeForTokens(ctx context.Context, code, state stri
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
+	if o.userAgent != "" {
+		req.Header.Set("User-Agent", o.userAgent)
+	}
 
 	resp, err := o.httpClient.Do(req)
 	if err != nil {
@@ -502,6 +520,9 @@ func (o *ClaudeAuth) refreshTokensSingleFlight(ctx context.Context, refreshToken
 
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
+	if o.userAgent != "" {
+		req.Header.Set("User-Agent", o.userAgent)
+	}
 
 	resp, err := o.httpClient.Do(req)
 	if err != nil {

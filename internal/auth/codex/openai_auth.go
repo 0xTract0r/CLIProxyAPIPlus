@@ -31,6 +31,13 @@ const (
 	TokenURL    = "https://auth.openai.com/oauth/token"
 	ClientID    = "app_EMoamEEZ73f0CkXaXp7hrann"
 	RedirectURI = "http://localhost:1455/auth/callback"
+
+	// codexOAuthUserAgent mirrors codexUserAgent used by serving (defined in
+	// internal/runtime/executor). OAuth token exchange/refresh has no inbound
+	// client context, so it uses this constant to stay consistent with the serving
+	// identity. Kept as a local copy because that constant is unexported and
+	// importing the executor package here would create an import cycle.
+	codexOAuthUserAgent = "codex-tui/0.135.0 (Mac OS 26.5.0; arm64) iTerm.app/3.6.10 (codex-tui; 0.135.0)"
 )
 
 // CodexAuth handles the OpenAI OAuth2 authentication flow.
@@ -38,6 +45,12 @@ const (
 // exchanging authorization codes for tokens, and refreshing access tokens.
 type CodexAuth struct {
 	httpClient *http.Client
+	// userAgent, when non-empty, is set on OAuth token exchange/refresh requests.
+	// Only the bare-client constructors (NewCodexAuthWithProxyURL) populate it so
+	// background token refresh presents the serving identity; the management-bound
+	// client (NewCodexAuthWithHTTPClient) leaves it empty and relies on its own
+	// managed-header transport.
+	userAgent string
 }
 
 // NewCodexAuth creates a new CodexAuth service instance.
@@ -60,6 +73,7 @@ func NewCodexAuthWithProxyURL(cfg *config.Config, proxyURL string) *CodexAuth {
 	sdkCfg.ProxyURL = effectiveProxyURL
 	return &CodexAuth{
 		httpClient: util.SetProxy(&sdkCfg, &http.Client{}),
+		userAgent:  codexOAuthUserAgent,
 	}
 }
 
@@ -132,6 +146,9 @@ func (o *CodexAuth) ExchangeCodeForTokensWithRedirect(ctx context.Context, code,
 
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
+	if o.userAgent != "" {
+		req.Header.Set("User-Agent", o.userAgent)
+	}
 
 	resp, err := o.httpClient.Do(req)
 	if err != nil {
@@ -218,6 +235,9 @@ func (o *CodexAuth) RefreshTokens(ctx context.Context, refreshToken string) (*Co
 
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
+	if o.userAgent != "" {
+		req.Header.Set("User-Agent", o.userAgent)
+	}
 
 	resp, err := o.httpClient.Do(req)
 	if err != nil {
