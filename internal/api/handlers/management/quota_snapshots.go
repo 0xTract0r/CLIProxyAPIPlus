@@ -194,7 +194,13 @@ func (h *Handler) refreshDueQuotaSnapshots(ctx context.Context, policy QuotaSnap
 		if auth == nil || auth.Disabled || !quotaSnapshotProviderSupported(auth.Provider) {
 			continue
 		}
-		if quotaSnapshotImplicitRefreshSkipped(auth) {
+		// Recovered (StatusActive) accounts may still carry a stale
+		// quota_refresh_status=reauth_required written by an earlier transient
+		// 401/403. Mirror the explicit-refresh path (quotaRefreshTargets) so the
+		// implicit skip does not pin them forever; the next-refresh schedule below
+		// still throttles re-probing so genuinely unauthorized accounts are not
+		// hammered.
+		if quotaSnapshotImplicitRefreshSkipped(auth) && !quotaSnapshotAuthRecovered(auth) {
 			continue
 		}
 		legacyUnsupported := quotaSnapshotLegacyUnsupportedProviderError(auth)

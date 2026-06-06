@@ -630,18 +630,22 @@ func TestQuotaSnapshotsBulkRefreshReturnsEntriesWhenAllImplicitTargetsSkipped(t 
 	}
 }
 
-// TestQuotaSnapshotsManualGlobalRefreshReprobesRecoveredAuth covers T008: after
-// an operator re-authenticates, the credential becomes StatusActive but a stale
-// quota_refresh_status=reauth_required may still linger. A background auto-refresh
-// stays cautious and skips it, but an explicit user-initiated global refresh must
-// re-probe the recovered credential and clear the stale status.
-func TestQuotaSnapshotsManualGlobalRefreshReprobesRecoveredAuth(t *testing.T) {
+// TestQuotaSnapshotsBackgroundRefreshReprobesRecoveredAuth covers T008: after an
+// operator re-authenticates, the credential becomes StatusActive but a stale
+// quota_refresh_status=reauth_required may still linger. PR #3 only let an
+// explicit user-initiated global refresh re-probe such a credential, so the
+// background auto-refresh kept it pinned forever. The background scheduler must
+// now also re-probe a recovered (StatusActive) credential once its next-refresh
+// schedule is due, while a still-unavailable (non-recovered) credential stays
+// skipped.
+func TestQuotaSnapshotsBackgroundRefreshReprobesRecoveredAuth(t *testing.T) {
 	t.Parallel()
 
 	gin.SetMode(gin.TestMode)
 	manager := coreauth.NewManager(nil, nil, nil)
 	exec := &quotaSnapshotTestExecutor{provider: "claude"}
 	manager.RegisterExecutor(exec)
+	overdue := time.Now().UTC().Add(-time.Minute).Format(time.RFC3339)
 	if _, err := manager.Register(context.Background(), &coreauth.Auth{
 		ID:       "claude-recovered",
 		Provider: "claude",
@@ -649,38 +653,56 @@ func TestQuotaSnapshotsManualGlobalRefreshReprobesRecoveredAuth(t *testing.T) {
 		Metadata: map[string]any{
 			quotaRefreshStatusMetadataKey: quotaRefreshStatusReauthRequired,
 			quotaRefreshErrorMetadataKey:  claudeQuotaCredentialUnauthorizedMessage,
+			quotaNextRefreshMetadataKey:   overdue,
 		},
 	}); err != nil {
-		t.Fatalf("Register() error = %v", err)
+		t.Fatalf("Register(recovered) error = %v", err)
+	}
+	// A still-unavailable credential is not recovered and must stay skipped even
+	// when its next-refresh schedule is due.
+	if _, err := manager.Register(context.Background(), &coreauth.Auth{
+		ID:          "claude-unavailable",
+		Provider:    "claude",
+		Status:      coreauth.StatusActive,
+		Unavailable: true,
+		Metadata: map[string]any{
+			quotaRefreshStatusMetadataKey: quotaRefreshStatusReauthRequired,
+			quotaRefreshErrorMetadataKey:  claudeQuotaCredentialUnauthorizedMessage,
+			quotaNextRefreshMetadataKey:   overdue,
+		},
+	}); err != nil {
+		t.Fatalf("Register(unavailable) error = %v", err)
 	}
 	handler := NewHandlerWithoutConfigFilePath(nil, manager)
 	router := gin.New()
-	router.POST("/v0/management/quota/refresh", handler.RefreshQuotaSnapshots)
+	router.GET("/v0/management/quota/snapshots", handler.GetQuotaSnapshots)
 
-	// Background auto-refresh stays cautious: it must not re-probe a credential
-	// whose quota status is still reauth_required.
+	// Background auto-refresh now re-probes the recovered + due credential...
 	handler.refreshDueQuotaSnapshots(context.Background(), defaultQuotaSnapshotTestPolicy(), false)
-	if got := exec.CallsForAuth("claude-recovered"); got != 0 {
-		t.Fatalf("background refresh calls = %d, want 0 (must stay cautious)", got)
+	if got := exec.CallsForAuth("claude-recovered"); got == 0 {
+		t.Fatalf("background refresh did not re-probe recovered auth (calls=0)")
+	}
+	// ...but still skips the unavailable (non-recovered) credential.
+	if got := exec.CallsForAuth("claude-unavailable"); got != 0 {
+		t.Fatalf("background refresh re-probed unavailable auth, calls = %d, want 0", got)
 	}
 
-	// Explicit, user-initiated global refresh re-probes the recovered credential.
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/v0/management/quota/refresh", strings.NewReader(`{}`))
-	req.Header.Set("Content-Type", "application/json")
-	router.ServeHTTP(rec, req)
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v0/management/quota/snapshots", nil))
 	if rec.Code != http.StatusOK {
-		t.Fatalf("manual refresh status = %d, want 200 body=%s", rec.Code, rec.Body.String())
+		t.Fatalf("snapshots status = %d, want 200 body=%s", rec.Code, rec.Body.String())
 	}
-	if got := exec.CallsForAuth("claude-recovered"); got == 0 {
-		t.Fatalf("manual global refresh did not re-probe recovered auth (calls=0)")
+	payload := decodeQuotaSnapshotPayload(t, rec)
+	recovered := quotaSnapshotEntryForAuth(t, payload, "claude-recovered")
+	if recovered.Status != quotaRefreshStatusOK {
+		t.Fatalf("recovered entry status = %q, want %q after re-probe", recovered.Status, quotaRefreshStatusOK)
 	}
-	entry := quotaSnapshotEntryForAuth(t, decodeQuotaSnapshotPayload(t, rec), "claude-recovered")
-	if entry.Status != quotaRefreshStatusOK {
-		t.Fatalf("entry status = %q, want %q after successful re-probe", entry.Status, quotaRefreshStatusOK)
+	if recovered.Error != "" {
+		t.Fatalf("recovered entry error = %q, want cleared after re-probe", recovered.Error)
 	}
-	if entry.Error != "" {
-		t.Fatalf("entry error = %q, want cleared after successful re-probe", entry.Error)
+	unavailable := quotaSnapshotEntryForAuth(t, payload, "claude-unavailable")
+	if unavailable.Status != quotaRefreshStatusReauthRequired {
+		t.Fatalf("unavailable entry status = %q, want %q", unavailable.Status, quotaRefreshStatusReauthRequired)
 	}
 }
 
