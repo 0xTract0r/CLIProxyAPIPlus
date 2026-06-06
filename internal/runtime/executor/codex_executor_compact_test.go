@@ -42,7 +42,7 @@ func TestCodexExecutorCompactAddsDefaultInstructions(t *testing.T) {
 			}))
 			defer server.Close()
 
-			executor := NewCodexExecutor(&config.Config{})
+			executor := NewCodexExecutor(&config.Config{SDKConfig: config.SDKConfig{CodexFastMode: true}})
 			auth := &cliproxyauth.Auth{Attributes: map[string]string{
 				"base_url": server.URL,
 				"api_key":  "test",
@@ -70,6 +70,9 @@ func TestCodexExecutorCompactAddsDefaultInstructions(t *testing.T) {
 			}
 			if gjson.GetBytes(gotBody, "instructions").String() != "" {
 				t.Fatalf("instructions = %q, want empty string", gjson.GetBytes(gotBody, "instructions").String())
+			}
+			if tier := gjson.GetBytes(gotBody, "service_tier").String(); tier != "priority" {
+				t.Fatalf("service_tier = %q, want priority; body=%s", tier, string(gotBody))
 			}
 			if string(resp.Payload) != `{"id":"resp_1","object":"response.compaction","usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}` {
 				t.Fatalf("payload = %s", string(resp.Payload))

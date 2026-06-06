@@ -116,6 +116,11 @@ routing:
 # When true, enable authentication for the WebSocket API (/v1/ws).
 ws-auth: false
 
+# When true, force supported Codex upstream requests to use service_tier: "priority"
+# for Codex Fast mode compatibility. Actual Fast/Priority allocation still depends
+# on the routed upstream account and credits/entitlement.
+codex-fast-mode: false
+
 # When > 0, emit blank lines every N seconds for non-streaming responses to prevent idle timeouts.
 nonstream-keepalive-interval: 0
 

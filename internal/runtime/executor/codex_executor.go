@@ -143,6 +143,22 @@ func NewCodexExecutorWithManager(cfg *config.Config, manager *cliproxyauth.Manag
 
 func (e *CodexExecutor) Identifier() string { return "codex" }
 
+func applyCodexFastMode(cfg *config.Config, model string, body []byte) []byte {
+	if cfg == nil || !cfg.CodexFastMode || len(body) == 0 || !isCodexFastModeModel(model) {
+		return body
+	}
+	updated, err := sjson.SetBytes(body, "service_tier", "priority")
+	if err != nil {
+		return body
+	}
+	return updated
+}
+
+func isCodexFastModeModel(model string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(thinking.ParseSuffix(model).ModelName))
+	return normalized == "gpt-5.4" || normalized == "gpt-5.5"
+}
+
 // PrepareRequest injects Codex credentials into the outgoing HTTP request.
 func (e *CodexExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Auth) error {
 	if req == nil {
@@ -210,6 +226,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	body = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 	body, _ = sjson.SetBytes(body, "stream", true)
+	body = applyCodexFastMode(e.cfg, baseModel, body)
 	body, _ = sjson.DeleteBytes(body, "previous_response_id")
 	body, _ = sjson.DeleteBytes(body, "prompt_cache_retention")
 	body, _ = sjson.DeleteBytes(body, "safety_identifier")
@@ -362,6 +379,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	body = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 	body, _ = sjson.DeleteBytes(body, "stream")
+	body = applyCodexFastMode(e.cfg, baseModel, body)
 	body = normalizeCodexInstructions(body)
 	body = ensureImageGenerationTool(body, baseModel)
 
@@ -458,6 +476,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	body, _ = sjson.DeleteBytes(body, "safety_identifier")
 	body, _ = sjson.DeleteBytes(body, "stream_options")
 	body, _ = sjson.SetBytes(body, "model", baseModel)
+	body = applyCodexFastMode(e.cfg, baseModel, body)
 	body = normalizeCodexInstructions(body)
 	body = ensureImageGenerationTool(body, baseModel)
 

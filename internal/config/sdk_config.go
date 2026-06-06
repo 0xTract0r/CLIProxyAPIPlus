@@ -28,6 +28,11 @@ type SDKConfig struct {
 	// Default is false (disabled).
 	PassthroughHeaders bool `yaml:"passthrough-headers" json:"passthrough-headers"`
 
+	// CodexFastMode forces supported Codex upstream requests to use the Priority service tier.
+	// This is a CPA-side compatibility switch for Codex Fast mode; upstream may still
+	// serve the request as default if the routed account has no usable Fast/Priority entitlement.
+	CodexFastMode bool `yaml:"codex-fast-mode" json:"codex-fast-mode"`
+
 	// Streaming configures server-side streaming behavior (keep-alives and safe bootstrap retries).
 	Streaming StreamingConfig `yaml:"streaming" json:"streaming"`
 

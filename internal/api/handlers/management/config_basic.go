@@ -287,6 +287,14 @@ func (h *Handler) PutRequestLog(c *gin.Context) {
 	h.updateBoolField(c, func(v bool) { h.cfg.RequestLog = v })
 }
 
+// Codex fast mode
+func (h *Handler) GetCodexFastMode(c *gin.Context) {
+	c.JSON(200, gin.H{"codex-fast-mode": h.cfg.CodexFastMode})
+}
+func (h *Handler) PutCodexFastMode(c *gin.Context) {
+	h.updateBoolField(c, func(v bool) { h.cfg.CodexFastMode = v })
+}
+
 // Websocket auth
 func (h *Handler) GetWebsocketAuth(c *gin.Context) {
 	c.JSON(200, gin.H{"ws-auth": h.cfg.WebsocketAuth})

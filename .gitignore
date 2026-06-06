@@ -30,6 +30,8 @@ auths/*
 
 # Documentation
 docs/*
+!docs/codex-fast-mode-investigation.md
+!docs/repo-memory-ledger.md
 AGENTS.md
 CLAUDE.md
 GEMINI.md
