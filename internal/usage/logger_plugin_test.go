@@ -37,6 +37,47 @@ func TestRequestStatisticsRecordIncludesLatency(t *testing.T) {
 	}
 }
 
+func TestRequestStatisticsSnapshotWithOptionsTrimsDetailsOnly(t *testing.T) {
+	stats := NewRequestStatistics()
+	oldTime := time.Date(2026, 3, 20, 10, 0, 0, 0, time.UTC)
+	recentTime := time.Date(2026, 3, 20, 12, 0, 0, 0, time.UTC)
+	for _, requestedAt := range []time.Time{oldTime, recentTime} {
+		stats.Record(context.Background(), coreusage.Record{
+			APIKey:      "test-key",
+			Model:       "gpt-5.4",
+			RequestedAt: requestedAt,
+			Detail: coreusage.Detail{
+				InputTokens:  10,
+				OutputTokens: 20,
+				TotalTokens:  30,
+			},
+		})
+	}
+
+	withoutDetails := stats.SnapshotWithOptions(SnapshotOptions{ExcludeDetails: true})
+	if withoutDetails.TotalRequests != 2 || withoutDetails.TotalTokens != 60 {
+		t.Fatalf("aggregate snapshot = requests %d tokens %d, want 2/60", withoutDetails.TotalRequests, withoutDetails.TotalTokens)
+	}
+	if details := withoutDetails.APIs["test-key"].Models["gpt-5.4"].Details; len(details) != 0 {
+		t.Fatalf("excluded details len = %d, want 0", len(details))
+	}
+
+	recentOnly := stats.SnapshotWithOptions(SnapshotOptions{
+		Since:       recentTime.Add(-time.Minute),
+		DetailLimit: 1,
+	})
+	details := recentOnly.APIs["test-key"].Models["gpt-5.4"].Details
+	if len(details) != 1 {
+		t.Fatalf("recent details len = %d, want 1", len(details))
+	}
+	if !details[0].Timestamp.Equal(recentTime) {
+		t.Fatalf("recent detail timestamp = %s, want %s", details[0].Timestamp, recentTime)
+	}
+	if recentOnly.TotalRequests != 2 {
+		t.Fatalf("recent aggregate total requests = %d, want full aggregate 2", recentOnly.TotalRequests)
+	}
+}
+
 func TestRequestStatisticsMergeSnapshotDedupIgnoresLatency(t *testing.T) {
 	stats := NewRequestStatistics()
 	timestamp := time.Date(2026, 3, 20, 12, 0, 0, 0, time.UTC)

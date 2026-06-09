@@ -181,6 +181,12 @@ type ModelSnapshot struct {
 	Details                 []RequestDetail `json:"details"`
 }
 
+type SnapshotOptions struct {
+	ExcludeDetails bool
+	Since          time.Time
+	DetailLimit    int
+}
+
 var defaultRequestStatistics = NewRequestStatistics()
 
 // GetRequestStatistics returns the shared statistics store.
@@ -308,6 +314,12 @@ func (s *RequestStatistics) updateAPIStats(stats *apiStats, model string, detail
 
 // Snapshot returns a copy of the aggregated metrics for external consumption.
 func (s *RequestStatistics) Snapshot() StatisticsSnapshot {
+	return s.SnapshotWithOptions(SnapshotOptions{})
+}
+
+// SnapshotWithOptions returns a copy of aggregated metrics and can omit or
+// window per-request details for latency-sensitive management UI reads.
+func (s *RequestStatistics) SnapshotWithOptions(options SnapshotOptions) StatisticsSnapshot {
 	result := StatisticsSnapshot{}
 	if s == nil {
 		return result
@@ -341,8 +353,7 @@ func (s *RequestStatistics) Snapshot() StatisticsSnapshot {
 			Models:                  make(map[string]ModelSnapshot, len(stats.Models)),
 		}
 		for modelName, modelStatsValue := range stats.Models {
-			requestDetails := make([]RequestDetail, len(modelStatsValue.Details))
-			copy(requestDetails, modelStatsValue.Details)
+			requestDetails := snapshotRequestDetails(modelStatsValue.Details, options)
 			apiSnapshot.Models[modelName] = ModelSnapshot{
 				TotalRequests:           modelStatsValue.TotalRequests,
 				TotalTokens:             modelStatsValue.TotalTokens,
@@ -397,6 +408,27 @@ func (s *RequestStatistics) Snapshot() StatisticsSnapshot {
 	}
 
 	return result
+}
+
+func snapshotRequestDetails(details []RequestDetail, options SnapshotOptions) []RequestDetail {
+	if options.ExcludeDetails {
+		return []RequestDetail{}
+	}
+	filtered := details
+	if !options.Since.IsZero() {
+		filtered = make([]RequestDetail, 0, len(details))
+		for _, detail := range details {
+			if !detail.Timestamp.Before(options.Since) {
+				filtered = append(filtered, detail)
+			}
+		}
+	}
+	if options.DetailLimit > 0 && len(filtered) > options.DetailLimit {
+		filtered = filtered[len(filtered)-options.DetailLimit:]
+	}
+	requestDetails := make([]RequestDetail, len(filtered))
+	copy(requestDetails, filtered)
+	return requestDetails
 }
 
 type MergeResult struct {

@@ -1,14 +1,68 @@
 package management
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
+	mgmtusage "github.com/router-for-me/CLIProxyAPI/v7/internal/usage"
+	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 )
+
+func TestGetUsageStatisticsSupportsLightweightOptions(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	stats := mgmtusage.NewRequestStatistics()
+	oldTime := time.Date(2026, 3, 20, 10, 0, 0, 0, time.UTC)
+	recentTime := time.Date(2026, 3, 20, 12, 0, 0, 0, time.UTC)
+	for _, requestedAt := range []time.Time{oldTime, recentTime} {
+		stats.Record(context.Background(), coreusage.Record{
+			APIKey:      "test-key",
+			Model:       "gpt-5.4",
+			RequestedAt: requestedAt,
+			Detail: coreusage.Detail{
+				InputTokens:  10,
+				OutputTokens: 20,
+				TotalTokens:  30,
+			},
+		})
+	}
+
+	handler := &Handler{}
+	handler.SetUsageStatistics(stats)
+
+	rec := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(rec)
+	ginCtx.Request = httptest.NewRequest(http.MethodGet, "/v0/management/usage?include_details=false", nil)
+	handler.GetUsageStatistics(ginCtx)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	payload := decodeUsageStatisticsPayload(t, rec)
+	if payload.Usage.TotalRequests != 2 {
+		t.Fatalf("total_requests = %d, want 2", payload.Usage.TotalRequests)
+	}
+	if details := payload.Usage.APIs["test-key"].Models["gpt-5.4"].Details; len(details) != 0 {
+		t.Fatalf("details len with include_details=false = %d, want 0", len(details))
+	}
+
+	rec = httptest.NewRecorder()
+	ginCtx, _ = gin.CreateTestContext(rec)
+	ginCtx.Request = httptest.NewRequest(http.MethodGet, "/v0/management/usage?since="+recentTime.Add(-time.Minute).Format(time.RFC3339), nil)
+	handler.GetUsageStatistics(ginCtx)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	payload = decodeUsageStatisticsPayload(t, rec)
+	details := payload.Usage.APIs["test-key"].Models["gpt-5.4"].Details
+	if len(details) != 1 || !details[0].Timestamp.Equal(recentTime) {
+		t.Fatalf("details with since = %#v, want only recent detail", details)
+	}
+}
 
 func TestGetUsageQueuePopsRequestedRecords(t *testing.T) {
 	gin.SetMode(gin.TestMode)
@@ -81,6 +135,21 @@ func withManagementUsageQueue(t *testing.T, fn func()) {
 	}()
 
 	fn()
+}
+
+func decodeUsageStatisticsPayload(t *testing.T, rec *httptest.ResponseRecorder) struct {
+	Usage          mgmtusage.StatisticsSnapshot `json:"usage"`
+	FailedRequests int64                        `json:"failed_requests"`
+} {
+	t.Helper()
+	var payload struct {
+		Usage          mgmtusage.StatisticsSnapshot `json:"usage"`
+		FailedRequests int64                        `json:"failed_requests"`
+	}
+	if errUnmarshal := json.Unmarshal(rec.Body.Bytes(), &payload); errUnmarshal != nil {
+		t.Fatalf("unmarshal usage response: %v body=%s", errUnmarshal, rec.Body.String())
+	}
+	return payload
 }
 
 func requireRecordID(t *testing.T, raw json.RawMessage, want int) {

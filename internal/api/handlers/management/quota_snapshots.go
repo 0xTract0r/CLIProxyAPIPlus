@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -46,6 +47,7 @@ const (
 	quotaSnapshotRefreshPollInterval    = time.Second
 	quotaSnapshotRefreshRetryDelay      = time.Minute
 	quotaSnapshotStartupJitterMax       = time.Minute
+	quotaSnapshotProviderTimeout        = 15 * time.Second
 )
 
 type QuotaSnapshotRefreshPolicy struct {
@@ -54,6 +56,7 @@ type QuotaSnapshotRefreshPolicy struct {
 	Jitter              time.Duration
 	StartupCatchUp      bool
 	StartupMaxStaleness time.Duration
+	ProviderTimeout     time.Duration
 }
 
 type quotaSnapshotRefreshPolicyPayload struct {
@@ -62,6 +65,7 @@ type quotaSnapshotRefreshPolicyPayload struct {
 	JitterSeconds              int64 `json:"jitter_seconds"`
 	StartupCatchUp             bool  `json:"startup_catch_up"`
 	StartupMaxStalenessSeconds int64 `json:"startup_max_staleness_seconds"`
+	ProviderTimeoutSeconds     int64 `json:"provider_timeout_seconds"`
 }
 
 type quotaSnapshotEntry struct {
@@ -86,9 +90,26 @@ type quotaRefreshRequest struct {
 }
 
 type quotaSnapshotPayload struct {
-	GeneratedAt time.Time                         `json:"generated_at"`
-	Policy      quotaSnapshotRefreshPolicyPayload `json:"policy"`
-	Entries     []quotaSnapshotEntry              `json:"entries"`
+	GeneratedAt    time.Time                         `json:"generated_at"`
+	Policy         quotaSnapshotRefreshPolicyPayload `json:"policy"`
+	Entries        []quotaSnapshotEntry              `json:"entries"`
+	RefreshResults []quotaRefreshResult              `json:"refresh_results,omitempty"`
+}
+
+type quotaRefreshResult struct {
+	AuthID      string   `json:"auth_id"`
+	AuthIndex   string   `json:"auth_index,omitempty"`
+	Name        string   `json:"name,omitempty"`
+	Provider    string   `json:"provider"`
+	Label       string   `json:"label,omitempty"`
+	Status      string   `json:"status"`
+	Error       string   `json:"error,omitempty"`
+	ErrorClass  string   `json:"error_class,omitempty"`
+	ElapsedMS   int64    `json:"elapsed_ms"`
+	Refreshed   bool     `json:"refreshed"`
+	ProxySource string   `json:"proxy_source,omitempty"`
+	ProxyHash   string   `json:"proxy_hash,omitempty"`
+	TargetURLs  []string `json:"target_urls,omitempty"`
 }
 
 func QuotaSnapshotRefreshPolicyFromConfig(cfg *config.Config) QuotaSnapshotRefreshPolicy {
@@ -111,6 +132,9 @@ func (p QuotaSnapshotRefreshPolicy) normalized() QuotaSnapshotRefreshPolicy {
 	if p.StartupMaxStaleness < 0 {
 		p.StartupMaxStaleness = config.DefaultQuotaSnapshotRefreshStartupMaxStaleness
 	}
+	if p.ProviderTimeout <= 0 {
+		p.ProviderTimeout = quotaSnapshotProviderTimeout
+	}
 	return p
 }
 
@@ -122,6 +146,7 @@ func (p QuotaSnapshotRefreshPolicy) payload() quotaSnapshotRefreshPolicyPayload 
 		JitterSeconds:              int64(p.Jitter / time.Second),
 		StartupCatchUp:             p.StartupCatchUp,
 		StartupMaxStalenessSeconds: int64(p.StartupMaxStaleness / time.Second),
+		ProviderTimeoutSeconds:     int64(p.ProviderTimeout / time.Second),
 	}
 }
 
@@ -272,11 +297,14 @@ func (h *Handler) RefreshQuotaSnapshots(c *gin.Context) {
 	}
 
 	policy := h.quotaSnapshotRefreshPolicy()
+	results := make([]quotaRefreshResult, 0, len(targets))
 	for _, auth := range targets {
-		_, _ = h.refreshQuotaSnapshot(c.Request.Context(), auth, policy)
+		results = append(results, h.refreshQuotaSnapshotResult(c.Request.Context(), auth, policy))
 	}
 
-	c.JSON(http.StatusOK, h.quotaSnapshotPayload())
+	payload := h.quotaSnapshotPayload()
+	payload.RefreshResults = results
+	c.JSON(http.StatusOK, payload)
 }
 
 func (h *Handler) quotaRefreshTargets(manager *coreauth.Manager, req quotaRefreshRequest) []*coreauth.Auth {
@@ -417,7 +445,9 @@ func (h *Handler) refreshQuotaSnapshot(ctx context.Context, auth *coreauth.Auth,
 	}
 
 	now := time.Now().UTC()
-	snapshot, planType, err := fetchProviderQuotaSnapshot(ctx, exec, auth)
+	providerCtx, cancel := context.WithTimeout(ctx, policy.ProviderTimeout)
+	defer cancel()
+	snapshot, planType, err := fetchProviderQuotaSnapshot(providerCtx, exec, auth)
 	if err != nil {
 		status, message := quotaSnapshotErrorStatusAndMessage(err)
 		return h.persistQuotaSnapshotError(ctx, auth, status, message, policy)
@@ -437,6 +467,82 @@ func (h *Handler) refreshQuotaSnapshot(ctx context.Context, auth *coreauth.Auth,
 	}
 	updated.UpdatedAt = now
 	return manager.Update(ctx, updated)
+}
+
+func (h *Handler) refreshQuotaSnapshotResult(ctx context.Context, auth *coreauth.Auth, policy QuotaSnapshotRefreshPolicy) quotaRefreshResult {
+	start := time.Now()
+	result := quotaRefreshResultFromAuth(auth)
+	updated, err := h.refreshQuotaSnapshot(ctx, auth, policy)
+	result.ElapsedMS = time.Since(start).Milliseconds()
+	if updated != nil {
+		result = quotaRefreshResultFromAuth(updated)
+		result.ElapsedMS = time.Since(start).Milliseconds()
+	}
+	if result.Status == "" {
+		result.Status = quotaRefreshStatusStale
+	}
+	if err != nil {
+		result.Refreshed = false
+		result.ErrorClass = quotaSnapshotErrorClass(err, result.Status)
+		if result.Error == "" {
+			result.Error = err.Error()
+		}
+	} else if result.Status == quotaRefreshStatusOK {
+		result.Refreshed = true
+	}
+	logQuotaRefreshResult(result, err)
+	return result
+}
+
+func quotaRefreshResultFromAuth(auth *coreauth.Auth) quotaRefreshResult {
+	if auth == nil {
+		return quotaRefreshResult{}
+	}
+	entry := quotaSnapshotEntryFromAuth(auth)
+	result := quotaRefreshResult{
+		AuthID:      entry.AuthID,
+		AuthIndex:   entry.AuthIndex,
+		Name:        entry.Name,
+		Provider:    entry.Provider,
+		Label:       entry.Label,
+		Status:      entry.Status,
+		Error:       entry.Error,
+		TargetURLs:  quotaProviderTargetURLs(entry.Provider),
+		ProxySource: "direct",
+	}
+	if auth != nil && authProxyURL(auth) != "" {
+		result.ProxySource = "account"
+		result.ProxyHash = optionalSHA256(authProxyURL(auth))
+	}
+	if result.Status == quotaRefreshStatusOK {
+		result.Refreshed = true
+	}
+	return result
+}
+
+func logQuotaRefreshResult(result quotaRefreshResult, err error) {
+	fields := log.Fields{
+		"auth_id":      result.AuthID,
+		"auth_index":   result.AuthIndex,
+		"name":         result.Name,
+		"provider":     result.Provider,
+		"status":       result.Status,
+		"error_class":  result.ErrorClass,
+		"elapsed_ms":   result.ElapsedMS,
+		"refreshed":    result.Refreshed,
+		"proxy_source": result.ProxySource,
+		"proxy_hash":   result.ProxyHash,
+		"target_urls":  strings.Join(result.TargetURLs, ","),
+	}
+	entry := log.WithFields(fields)
+	if err != nil || result.Status == quotaRefreshStatusError || result.Status == quotaRefreshStatusReauthRequired {
+		if err != nil {
+			entry = entry.WithError(err)
+		}
+		entry.Warn("management quota refresh account failed")
+		return
+	}
+	entry.Info("management quota refresh account completed")
 }
 
 func (h *Handler) persistQuotaSnapshotError(ctx context.Context, auth *coreauth.Auth, status, message string, policy QuotaSnapshotRefreshPolicy) (*coreauth.Auth, error) {
@@ -553,7 +659,7 @@ type quotaHTTPError struct {
 }
 
 func (e *quotaHTTPError) Error() string {
-	return "quota endpoint returned non-success status"
+	return fmt.Sprintf("quota endpoint returned non-success status %d", e.StatusCode)
 }
 
 type quotaReauthRequiredError struct {
@@ -604,6 +710,56 @@ func quotaSnapshotErrorStatusAndMessage(err error) (string, string) {
 		return quotaRefreshStatusError, ""
 	}
 	return quotaRefreshStatusError, err.Error()
+}
+
+func quotaSnapshotErrorClass(err error, status string) string {
+	switch status {
+	case quotaRefreshStatusReauthRequired:
+		return "reauth_required"
+	case quotaRefreshStatusUnsupported:
+		return "unsupported"
+	}
+	if err == nil {
+		return ""
+	}
+	var httpErr *quotaHTTPError
+	if errors.As(err, &httpErr) && httpErr != nil {
+		return "http_status"
+	}
+	var netErr net.Error
+	if errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &netErr) && netErr.Timeout()) {
+		return "timeout"
+	}
+	if errors.Is(err, context.Canceled) {
+		return "canceled"
+	}
+	lower := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(lower, "connection not allowed by ruleset"):
+		return "proxy_ruleset_reject"
+	case strings.Contains(lower, "non-success status"):
+		return "http_status"
+	case strings.Contains(lower, "deadline exceeded") || strings.Contains(lower, "timeout") || strings.Contains(lower, "timed out"):
+		return "timeout"
+	case strings.Contains(lower, "executor unavailable"):
+		return "executor_unavailable"
+	default:
+		return "provider_error"
+	}
+}
+
+func quotaProviderTargetURLs(provider string) []string {
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "codex":
+		return []string{"https://chatgpt.com/backend-api/wham/usage"}
+	case "claude":
+		return []string{
+			"https://api.anthropic.com/api/oauth/profile",
+			"https://api.anthropic.com/api/oauth/usage",
+		}
+	default:
+		return nil
+	}
 }
 
 func quotaSnapshotImplicitRefreshSkipped(auth *coreauth.Auth) bool {
