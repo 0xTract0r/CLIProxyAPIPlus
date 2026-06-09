@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -47,16 +48,55 @@ type pricingOverridePayload struct {
 	CacheWriteUSDPerMTok  float64 `json:"cache_write_usd_per_mtok"`
 }
 
+const maxUsageDetailLimit = 10000
+
 // GetUsageStatistics returns the in-memory request statistics snapshot.
 func (h *Handler) GetUsageStatistics(c *gin.Context) {
+	options, errOptions := parseUsageSnapshotOptions(c)
+	if errOptions != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errOptions.Error()})
+		return
+	}
 	var snapshot usage.StatisticsSnapshot
 	if h != nil && h.usageStats != nil {
-		snapshot = h.usageStats.Snapshot()
+		snapshot = h.usageStats.SnapshotWithOptions(options)
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"usage":           snapshot,
 		"failed_requests": snapshot.FailureCount,
 	})
+}
+
+func parseUsageSnapshotOptions(c *gin.Context) (usage.SnapshotOptions, error) {
+	options := usage.SnapshotOptions{}
+	if c == nil {
+		return options, nil
+	}
+	if raw := strings.TrimSpace(c.Query("include_details")); raw != "" {
+		includeDetails, err := strconv.ParseBool(raw)
+		if err != nil {
+			return options, fmt.Errorf("include_details must be a boolean")
+		}
+		options.ExcludeDetails = !includeDetails
+	}
+	if raw := strings.TrimSpace(c.Query("since")); raw != "" {
+		since, err := time.Parse(time.RFC3339, raw)
+		if err != nil {
+			return options, fmt.Errorf("since must be RFC3339")
+		}
+		options.Since = since
+	}
+	if raw := strings.TrimSpace(c.Query("detail_limit")); raw != "" {
+		limit, err := strconv.Atoi(raw)
+		if err != nil || limit <= 0 {
+			return options, fmt.Errorf("detail_limit must be a positive integer")
+		}
+		if limit > maxUsageDetailLimit {
+			limit = maxUsageDetailLimit
+		}
+		options.DetailLimit = limit
+	}
+	return options, nil
 }
 
 // ExportUsageStatistics returns a complete usage snapshot for backup/migration.

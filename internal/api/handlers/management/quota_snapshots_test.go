@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -25,6 +26,7 @@ type quotaSnapshotTestExecutor struct {
 	bodyBytes       []byte
 	contentEncoding string
 	responses       map[string]quotaSnapshotTestResponse
+	responsesByAuth map[string]quotaSnapshotTestResponse
 
 	mu           sync.Mutex
 	calls        int
@@ -37,6 +39,8 @@ type quotaSnapshotTestResponse struct {
 	body            string
 	bodyBytes       []byte
 	contentEncoding string
+	delay           time.Duration
+	err             error
 }
 
 func (e *quotaSnapshotTestExecutor) Identifier() string { return e.provider }
@@ -86,9 +90,24 @@ func (e *quotaSnapshotTestExecutor) HttpRequest(ctx context.Context, auth *corea
 	}
 	if specific, ok := e.responses[req.URL.String()]; ok {
 		response = specific
-		if response.statusCode == 0 {
-			response.statusCode = http.StatusOK
+	}
+	if specific, ok := e.responsesByAuth[authID]; ok {
+		response = specific
+	}
+	if response.statusCode == 0 {
+		response.statusCode = http.StatusOK
+	}
+	if response.delay > 0 {
+		timer := time.NewTimer(response.delay)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-timer.C:
 		}
+	}
+	if response.err != nil {
+		return nil, response.err
 	}
 	bodyBytes := []byte(response.body)
 	if response.bodyBytes != nil {
@@ -200,6 +219,117 @@ func TestQuotaSnapshotsRefreshPersistsCoreSnapshot(t *testing.T) {
 	}
 	if !strings.Contains(getRec.Body.String(), `"status":"ok"`) {
 		t.Fatalf("GET body missing ok snapshot: %s", getRec.Body.String())
+	}
+}
+
+func TestQuotaSnapshotsRefreshReturnsPerAccountResults(t *testing.T) {
+	t.Parallel()
+
+	gin.SetMode(gin.TestMode)
+	manager := coreauth.NewManager(nil, nil, nil)
+	exec := &quotaSnapshotTestExecutor{
+		provider: "codex",
+		responsesByAuth: map[string]quotaSnapshotTestResponse{
+			"codex-ruleset": {
+				err: errors.New("socks connect tcp 80.174.217.1:12324->api.anthropic.com:443: unknown error connection not allowed by ruleset"),
+			},
+		},
+	}
+	manager.RegisterExecutor(exec)
+	if _, err := manager.Register(context.Background(), &coreauth.Auth{
+		ID:       "codex-ok",
+		Provider: "codex",
+		Metadata: map[string]any{"plan_type": "plus"},
+	}); err != nil {
+		t.Fatalf("Register ok auth error = %v", err)
+	}
+	if _, err := manager.Register(context.Background(), &coreauth.Auth{
+		ID:       "codex-ruleset",
+		Provider: "codex",
+		ProxyURL: "socks5://user:pass@80.174.217.1:12324",
+		Metadata: map[string]any{"plan_type": "plus"},
+	}); err != nil {
+		t.Fatalf("Register ruleset auth error = %v", err)
+	}
+	handler := NewHandlerWithoutConfigFilePath(nil, manager)
+	router := gin.New()
+	router.POST("/v0/management/quota/refresh", handler.RefreshQuotaSnapshots)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v0/management/quota/refresh", strings.NewReader(`{"provider":"codex"}`))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("refresh status = %d, want 200 body=%s", rec.Code, rec.Body.String())
+	}
+	payload := decodeQuotaSnapshotPayload(t, rec)
+	if len(payload.RefreshResults) != 2 {
+		t.Fatalf("refresh_results length = %d, want 2 body=%s", len(payload.RefreshResults), rec.Body.String())
+	}
+	okResult := quotaRefreshResultForAuth(t, payload, "codex-ok")
+	if okResult.Status != quotaRefreshStatusOK || !okResult.Refreshed || okResult.ErrorClass != "" {
+		t.Fatalf("ok result = %#v, want ok/refreshed/no error_class", okResult)
+	}
+	failResult := quotaRefreshResultForAuth(t, payload, "codex-ruleset")
+	if failResult.Status != quotaRefreshStatusError || failResult.Refreshed {
+		t.Fatalf("ruleset result status/refreshed = %q/%v, want error/false", failResult.Status, failResult.Refreshed)
+	}
+	if failResult.ErrorClass != "proxy_ruleset_reject" {
+		t.Fatalf("ruleset error_class = %q, want proxy_ruleset_reject; result=%#v", failResult.ErrorClass, failResult)
+	}
+	if failResult.ProxySource != "account" || !strings.HasPrefix(failResult.ProxyHash, "sha256:") {
+		t.Fatalf("ruleset proxy fields = %q/%q, want account/sha256 hash", failResult.ProxySource, failResult.ProxyHash)
+	}
+	if strings.Contains(rec.Body.String(), "user:pass") {
+		t.Fatalf("response leaked proxy credentials: %s", rec.Body.String())
+	}
+	entry := quotaSnapshotEntryForAuth(t, payload, "codex-ruleset")
+	if entry.Status != quotaRefreshStatusError || !strings.Contains(entry.Error, "connection not allowed by ruleset") {
+		t.Fatalf("ruleset entry = %#v, want persisted error status", entry)
+	}
+}
+
+func TestQuotaSnapshotRefreshResultClassifiesProviderTimeout(t *testing.T) {
+	t.Parallel()
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	exec := &quotaSnapshotTestExecutor{
+		provider: "codex",
+		responsesByAuth: map[string]quotaSnapshotTestResponse{
+			"codex-slow": {delay: time.Second},
+		},
+	}
+	manager.RegisterExecutor(exec)
+	auth, err := manager.Register(context.Background(), &coreauth.Auth{
+		ID:       "codex-slow",
+		Provider: "codex",
+		Metadata: map[string]any{"plan_type": "plus"},
+	})
+	if err != nil {
+		t.Fatalf("Register slow auth error = %v", err)
+	}
+	handler := NewHandlerWithoutConfigFilePath(nil, manager)
+	policy := defaultQuotaSnapshotTestPolicy()
+	policy.ProviderTimeout = 20 * time.Millisecond
+
+	start := time.Now()
+	result := handler.refreshQuotaSnapshotResult(context.Background(), auth, policy)
+	elapsed := time.Since(start)
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("refresh elapsed = %s, want bounded by provider timeout", elapsed)
+	}
+	if result.Status != quotaRefreshStatusError || result.ErrorClass != "timeout" || result.Refreshed {
+		t.Fatalf("timeout result = %#v, want error/timeout/not refreshed", result)
+	}
+	if got := exec.CallsForAuth("codex-slow"); got != 1 {
+		t.Fatalf("slow auth calls = %d, want 1", got)
+	}
+	updated, ok := manager.GetByID("codex-slow")
+	if !ok {
+		t.Fatal("updated auth missing")
+	}
+	if got := metadataString(updated.Metadata, quotaRefreshErrorMetadataKey); !strings.Contains(got, "deadline exceeded") {
+		t.Fatalf("metadata quota_refresh_error = %q, want deadline exceeded", got)
 	}
 }
 
@@ -1075,6 +1205,17 @@ func quotaSnapshotEntryForAuth(t *testing.T, payload quotaSnapshotPayload, authI
 	}
 	t.Fatalf("quota entry for auth %q not found in %#v", authID, payload.Entries)
 	return quotaSnapshotEntry{}
+}
+
+func quotaRefreshResultForAuth(t *testing.T, payload quotaSnapshotPayload, authID string) quotaRefreshResult {
+	t.Helper()
+	for _, result := range payload.RefreshResults {
+		if result.AuthID == authID {
+			return result
+		}
+	}
+	t.Fatalf("quota refresh result for auth %q not found in %#v", authID, payload.RefreshResults)
+	return quotaRefreshResult{}
 }
 
 func TestQuotaSnapshotAutoRefreshSchedulesMissingNextOnRegularTick(t *testing.T) {
