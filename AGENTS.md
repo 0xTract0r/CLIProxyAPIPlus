@@ -4,6 +4,10 @@ Go 1.26+ proxy server providing OpenAI/Gemini/Claude/Codex compatible APIs with 
 
 ## Repository
 - GitHub: https://github.com/router-for-me/CLIProxyAPI
+- Fork workflow note: the `0xTract0r/CLIProxyAPIPlus` fork uses a single
+  integration branch (`origin/main`). Do not restore upstream's
+  `.github/workflows/auto-retarget-main-pr-to-dev.yml`; this fork has no `dev`
+  branch, and upstream syncs may reintroduce that obsolete workflow.
 
 ## Commands
 ```bash
