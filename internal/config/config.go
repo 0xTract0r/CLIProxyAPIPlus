@@ -176,6 +176,14 @@ type Config struct {
 	// ManagedHeaderProfile controls online refresh of version-sensitive managed header profiles.
 	ManagedHeaderProfile ManagedHeaderProfileConfig `yaml:"managed-header-profile" json:"managed-header-profile"`
 
+	// NormalizeAccountEnv is a global switch (requirement ⑦) that rewrites the real
+	// cwd / home paths inside <env> and <system-reminder> blocks of the request body
+	// to a per-account canonical path. It is independent of cloak / device-profile
+	// stabilization and defaults to disabled (nil/false): when off the body is left
+	// untouched, so enabling it is a safe, zero-migration gray rollout that can be
+	// rolled back by turning the switch off again.
+	NormalizeAccountEnv *bool `yaml:"normalize-account-env,omitempty" json:"normalize-account-env,omitempty"`
+
 	// OpenAICompatibility defines OpenAI API compatibility configurations for external providers.
 	OpenAICompatibility []OpenAICompatibility `yaml:"openai-compatibility" json:"openai-compatibility"`
 
@@ -1070,6 +1078,15 @@ func ManagedHeaderOnlineUpdateEnabled(cfg *Config) bool {
 	return cfg != nil &&
 		cfg.ManagedHeaderProfile.OnlineUpdate != nil &&
 		*cfg.ManagedHeaderProfile.OnlineUpdate
+}
+
+// NormalizeAccountEnvEnabled reports whether the global account env/cwd
+// normalization switch (requirement ⑦) is on. It defaults to false when the
+// pointer is unset, so the body is never rewritten unless an operator opts in.
+func NormalizeAccountEnvEnabled(cfg *Config) bool {
+	return cfg != nil &&
+		cfg.NormalizeAccountEnv != nil &&
+		*cfg.NormalizeAccountEnv
 }
 
 func ManagedHeaderProfileFetchTimeout(cfg *Config) int {
