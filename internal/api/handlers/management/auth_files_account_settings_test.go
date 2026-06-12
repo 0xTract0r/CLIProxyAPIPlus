@@ -1182,11 +1182,14 @@ func TestGetAuthFileAccountSettings_PersistsCoreManagedRuntimeIdentity(t *testin
 	if claude.AccountSettings.RuntimeIdentity == nil || claude.AccountSettings.RuntimeIdentity.Current == nil {
 		t.Fatalf("expected runtime identity for claude account without explicit profile")
 	}
-	if got := claude.AccountSettings.RuntimeIdentity.Current.ProfileID; got != "claude_reqwest_rustls_compatible_v1" {
-		t.Fatalf("claude profile_id = %q, want claude_reqwest_rustls_compatible_v1", got)
+	// claude default (no explicit tls_profile) now surfaces the replicated
+	// claude-cli ClientHello identity, which is the core-managed claude->anthropic
+	// default outbound profile.
+	if got := claude.AccountSettings.RuntimeIdentity.Current.ProfileID; got != "claude_cli_clienthello_v1" {
+		t.Fatalf("claude profile_id = %q, want claude_cli_clienthello_v1", got)
 	}
-	if got := claude.AccountSettings.RuntimeIdentity.Current.TLSProfileID; got != "claude_reqwest_rustls_compatible_v1" {
-		t.Fatalf("claude tls_profile_id = %q, want claude_reqwest_rustls_compatible_v1", got)
+	if got := claude.AccountSettings.RuntimeIdentity.Current.TLSProfileID; got != "claude_cli_clienthello_v1" {
+		t.Fatalf("claude tls_profile_id = %q, want claude_cli_clienthello_v1", got)
 	}
 	if !claude.AccountSettings.RuntimeIdentity.Current.CoreManaged || !claude.AccountSettings.RuntimeIdentity.Current.RuntimeEnforced {
 		t.Fatalf("claude identity core/runtime flags = core:%v enforced:%v", claude.AccountSettings.RuntimeIdentity.Current.CoreManaged, claude.AccountSettings.RuntimeIdentity.Current.RuntimeEnforced)
@@ -1635,6 +1638,180 @@ func TestGetAuthFileAccountSettings_FallsBackToDisplayNameWhenFileNameMissing(t 
 	}
 	if got := resp.Name; got != "codex-runtime.json" {
 		t.Fatalf("response name = %q, want %q", got, "codex-runtime.json")
+	}
+}
+
+// TestGetAuthFileAccountSettings_SyntheticDeviceIDMasked verifies that GET
+// account-settings returns a masked synthetic_device_id (first 16 hex chars +
+// ellipsis), that it is stable across repeated calls for the same account, and
+// that it is absent (omitempty) when the auth record is missing.
+func TestGetAuthFileAccountSettings_SyntheticDeviceIDMasked(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	record := &coreauth.Auth{
+		ID:       "claude-synthetic.json",
+		FileName: "claude-synthetic.json",
+		Provider: "claude",
+		Attributes: map[string]string{
+			"path": "/tmp/claude-synthetic.json",
+		},
+		Metadata: map[string]any{
+			"type": "claude",
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("failed to register auth record: %v", errRegister)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{
+		AuthDir: t.TempDir(),
+		ClaudeHeaderDefaults: config.ClaudeHeaderDefaults{
+			UserAgent:      "claude-cli/3.0.0 (external, cli)",
+			PackageVersion: "0.90.0",
+			RuntimeVersion: "v30.0.0",
+		},
+	}, manager)
+
+	callGet := func() authFileAccountSettingsView {
+		rec := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(rec)
+		req := httptest.NewRequest(http.MethodGet, "/v0/management/auth-files/account-settings?name=claude-synthetic.json", nil)
+		ctx.Request = req
+		h.GetAuthFileAccountSettings(ctx)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+		}
+		var resp authFileAccountSettingsResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("failed to decode response: %v", err)
+		}
+		return resp.AccountSettings
+	}
+
+	first := callGet()
+
+	// Must be present and non-empty.
+	if first.SyntheticDeviceID == "" {
+		t.Fatal("synthetic_device_id must be non-empty for a valid account")
+	}
+
+	// Must be masked: ends with ellipsis, prefix is exactly 16 hex chars.
+	if !strings.HasSuffix(first.SyntheticDeviceID, "…") {
+		t.Fatalf("synthetic_device_id = %q: must end with ellipsis", first.SyntheticDeviceID)
+	}
+	// The ellipsis character "…" is 3 UTF-8 bytes; the mask prefix is everything before it.
+	prefix := strings.TrimSuffix(first.SyntheticDeviceID, "…")
+	if len(prefix) != 16 {
+		t.Fatalf("synthetic_device_id prefix length = %d, want 16; got %q", len(prefix), first.SyntheticDeviceID)
+	}
+	for _, r := range prefix {
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f')) {
+			t.Fatalf("synthetic_device_id prefix %q contains non-hex character %q", prefix, string(r))
+		}
+	}
+
+	// Must not contain the full 64-hex raw device id: the prefix has only 16 chars.
+	if len(prefix) >= 64 {
+		t.Fatalf("synthetic_device_id must not expose the full 64-hex value; got prefix len %d", len(prefix))
+	}
+
+	// Must be stable across repeated GET calls for the same account.
+	second := callGet()
+	if second.SyntheticDeviceID != first.SyntheticDeviceID {
+		t.Fatalf("synthetic_device_id changed between calls: %q != %q", first.SyntheticDeviceID, second.SyntheticDeviceID)
+	}
+}
+
+// TestPatchAuthFileAccountSettings_SyntheticDeviceIDIsReadOnly verifies that
+// sending synthetic_device_id in a PATCH body does not overwrite any persisted
+// state and that the response still returns the server-derived masked value.
+func TestPatchAuthFileAccountSettings_SyntheticDeviceIDIsReadOnly(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	record := &coreauth.Auth{
+		ID:       "claude-patch-readonly.json",
+		FileName: "claude-patch-readonly.json",
+		Provider: "claude",
+		Attributes: map[string]string{
+			"path": "/tmp/claude-patch-readonly.json",
+		},
+		Metadata: map[string]any{
+			"type": "claude",
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("failed to register auth record: %v", errRegister)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{
+		AuthDir: t.TempDir(),
+		ClaudeHeaderDefaults: config.ClaudeHeaderDefaults{
+			UserAgent:      "claude-cli/3.0.0 (external, cli)",
+			PackageVersion: "0.90.0",
+			RuntimeVersion: "v30.0.0",
+		},
+	}, manager)
+
+	// First GET to capture the server-derived masked value.
+	getSettings := func() string {
+		rec := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(rec)
+		req := httptest.NewRequest(http.MethodGet, "/v0/management/auth-files/account-settings?name=claude-patch-readonly.json", nil)
+		ctx.Request = req
+		h.GetAuthFileAccountSettings(ctx)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET: expected %d, got %d: %s", http.StatusOK, rec.Code, rec.Body.String())
+		}
+		var resp authFileAccountSettingsResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("GET decode: %v", err)
+		}
+		return resp.AccountSettings.SyntheticDeviceID
+	}
+
+	serverDerived := getSettings()
+	if serverDerived == "" {
+		t.Fatal("server-derived synthetic_device_id must be non-empty")
+	}
+
+	// PATCH that attempts to overwrite synthetic_device_id.
+	body := `{"name":"claude-patch-readonly.json","disabled":false,"synthetic_device_id":"aaaa000000000000…"}`
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/account-settings", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	ctx.Request = req
+	h.PatchAuthFileAccountSettings(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PATCH: expected %d, got %d: %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+
+	var patchResp authFileAccountSettingsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &patchResp); err != nil {
+		t.Fatalf("PATCH decode: %v", err)
+	}
+
+	// Response must return the server-derived value, not the client-supplied one.
+	if patchResp.AccountSettings.SyntheticDeviceID != serverDerived {
+		t.Fatalf("PATCH response synthetic_device_id = %q, want server-derived %q; field appears writable",
+			patchResp.AccountSettings.SyntheticDeviceID, serverDerived)
+	}
+
+	// Confirm the stored metadata does not contain synthetic_device_id.
+	updated, ok := manager.GetByID("claude-patch-readonly.json")
+	if !ok || updated == nil {
+		t.Fatal("expected updated auth record to be present")
+	}
+	raw, _ := json.Marshal(updated.Metadata["account_settings"])
+	if strings.Contains(string(raw), "synthetic_device_id") {
+		t.Fatalf("account_settings metadata must not persist synthetic_device_id; got: %s", string(raw))
 	}
 }
 

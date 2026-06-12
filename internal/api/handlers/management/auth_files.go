@@ -168,8 +168,14 @@ type authFileAccountSettingsView struct {
 	RuntimeIdentity    *authFileRuntimeIdentityState                 `json:"runtime_identity,omitempty"`
 	ManagedHeaderState *authFileManagedHeaderState                   `json:"managed_header_state,omitempty"`
 	ClientObservations []runtimehelps.ClaudeDeviceProfileObservation `json:"client_version_observations,omitempty"`
-	Activation         authFileAccountSettingsActivation             `json:"activation"`
-	Warnings           []string                                      `json:"warnings"`
+	// SyntheticDeviceID is a read-only, masked representation of the per-account
+	// synthetic device_id derived by ① (helps.SyntheticDeviceID). Only the first 16
+	// hex characters are exposed, followed by an ellipsis, so that callers can
+	// compare stability across requests without recovering the full derived value.
+	// It is never persisted and PATCH requests must not include this field.
+	SyntheticDeviceID string                            `json:"synthetic_device_id,omitempty"`
+	Activation        authFileAccountSettingsActivation `json:"activation"`
+	Warnings          []string                          `json:"warnings"`
 }
 
 type authFileAccountSettingsActivation struct {
@@ -1775,6 +1781,24 @@ func buildAuthFileAccountSettingsView(auth *coreauth.Auth, cfg *config.Config) a
 		clientObservations = runtimehelps.ClaudeDeviceProfileObservations(auth, "")
 	}
 
+	// Derive the masked synthetic device_id for read-only display (Epic B/P2.B1).
+	// The full 64-hex value is intentionally not exposed; only the first 16 hex
+	// characters followed by an ellipsis are returned so observers can confirm
+	// per-account stability without reconstructing the full derived value.
+	var syntheticDeviceIDMasked string
+	if auth != nil {
+		authDir := ""
+		if cfg != nil {
+			authDir = cfg.AuthDir
+		}
+		full := runtimehelps.SyntheticDeviceID(authDir, auth, "")
+		if len(full) >= 16 {
+			syntheticDeviceIDMasked = full[:16] + "…"
+		} else if full != "" {
+			syntheticDeviceIDMasked = full + "…"
+		}
+	}
+
 	return authFileAccountSettingsView{
 		ProxyURL:           authProxyURL(auth),
 		Note:               authNote(auth),
@@ -1788,6 +1812,7 @@ func buildAuthFileAccountSettingsView(auth *coreauth.Auth, cfg *config.Config) a
 		RuntimeIdentity:    runtimeIdentity,
 		ManagedHeaderState: managedHeaderState,
 		ClientObservations: clientObservations,
+		SyntheticDeviceID:  syntheticDeviceIDMasked,
 		Activation: authFileAccountSettingsActivation{
 			Summary:   accountSettingsActivationSummary(auth, managedHeaders, extraHeaders, refreshEnabled, transportRuntimeEnforced, tlsRuntimeEnforced),
 			State:     accountSettingsActivationState(auth, stored.TransportProfile, stored.TLSProfile, refreshEnabled, transportRuntimeEnforced, tlsRuntimeEnforced),

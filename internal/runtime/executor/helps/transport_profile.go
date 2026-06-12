@@ -170,7 +170,12 @@ func coreManagedRuntimeTransportProfile(provider string) *RuntimeTransportProfil
 	profileID := provider + "_cli_native_v1"
 	switch provider {
 	case "claude":
-		profileID = "claude_reqwest_rustls_compatible_v1"
+		// Default claude->anthropic outbound replicates the real claude-cli
+		// (Node/OpenSSL) ClientHello via uTLS HelloCustom + ALPN http/1.1
+		// (resolveClaudeClientHelloID -> HelloCustom). This is the no-tls_profile
+		// default; a per-account tls_profile still overrides it (handled in
+		// ResolveRuntimeTransportProfile before this function is reached).
+		profileID = claudeCLIClientHelloProfileID
 	case "codex":
 		profileID = "codex_proxy_compatible_v1"
 	case "gemini-cli":
@@ -179,8 +184,8 @@ func coreManagedRuntimeTransportProfile(provider string) *RuntimeTransportProfil
 	family := "cli-native"
 	tlsFamily := "runtime-native"
 	if provider == "claude" {
-		family = "claude-reqwest-compatible"
-		tlsFamily = "rustls-compatible"
+		family = "utls"
+		tlsFamily = "utls"
 	} else if provider == "codex" {
 		family = "codex-proxy-compatible"
 		tlsFamily = "rustls-compatible"
@@ -381,6 +386,7 @@ func (p *RuntimeTransportProfile) SupportsTransportRuntime() bool {
 		switch p.ProfileID {
 		case "provider-default",
 			"claude_cli_native_v1",
+			"claude_cli_clienthello_v1",
 			"claude_reqwest_rustls_compatible_v1":
 			return true
 		case
@@ -433,7 +439,8 @@ func (p *RuntimeTransportProfile) SupportsTLSRuntime() bool {
 			return false
 		}
 		switch p.TLSProfileID {
-		case "claude_reqwest_rustls_compatible_v1":
+		case "claude_cli_clienthello_v1",
+			"claude_reqwest_rustls_compatible_v1":
 			return true
 		case
 			"claude_chrome_like_mac_v1",
