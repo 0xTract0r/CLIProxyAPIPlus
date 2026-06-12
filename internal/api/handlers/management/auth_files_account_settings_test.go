@@ -1182,11 +1182,14 @@ func TestGetAuthFileAccountSettings_PersistsCoreManagedRuntimeIdentity(t *testin
 	if claude.AccountSettings.RuntimeIdentity == nil || claude.AccountSettings.RuntimeIdentity.Current == nil {
 		t.Fatalf("expected runtime identity for claude account without explicit profile")
 	}
-	if got := claude.AccountSettings.RuntimeIdentity.Current.ProfileID; got != "claude_reqwest_rustls_compatible_v1" {
-		t.Fatalf("claude profile_id = %q, want claude_reqwest_rustls_compatible_v1", got)
+	// claude default (no explicit tls_profile) now surfaces the replicated
+	// claude-cli ClientHello identity, which is the core-managed claude->anthropic
+	// default outbound profile.
+	if got := claude.AccountSettings.RuntimeIdentity.Current.ProfileID; got != "claude_cli_clienthello_v1" {
+		t.Fatalf("claude profile_id = %q, want claude_cli_clienthello_v1", got)
 	}
-	if got := claude.AccountSettings.RuntimeIdentity.Current.TLSProfileID; got != "claude_reqwest_rustls_compatible_v1" {
-		t.Fatalf("claude tls_profile_id = %q, want claude_reqwest_rustls_compatible_v1", got)
+	if got := claude.AccountSettings.RuntimeIdentity.Current.TLSProfileID; got != "claude_cli_clienthello_v1" {
+		t.Fatalf("claude tls_profile_id = %q, want claude_cli_clienthello_v1", got)
 	}
 	if !claude.AccountSettings.RuntimeIdentity.Current.CoreManaged || !claude.AccountSettings.RuntimeIdentity.Current.RuntimeEnforced {
 		t.Fatalf("claude identity core/runtime flags = core:%v enforced:%v", claude.AccountSettings.RuntimeIdentity.Current.CoreManaged, claude.AccountSettings.RuntimeIdentity.Current.RuntimeEnforced)

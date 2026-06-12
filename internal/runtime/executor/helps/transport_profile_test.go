@@ -6,8 +6,36 @@ import (
 	"strings"
 	"testing"
 
+	tls "github.com/refraction-networking/utls"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
+
+// assertClaudeCLIClientHelloRoundTripper verifies that the given round tripper
+// is the uTLS replicated claude-cli ClientHello transport: a fallback round
+// tripper whose protected-host path uses a utlsRoundTripper pinned to
+// HelloCustom (newClaudeCLIClientHelloSpec) with ALPN http/1.1.
+func assertClaudeCLIClientHelloRoundTripper(t *testing.T, rt http.RoundTripper) {
+	t.Helper()
+	fallback, ok := rt.(*fallbackRoundTripper)
+	if !ok {
+		t.Fatalf("claude default round tripper = %T, want *fallbackRoundTripper (uTLS claude-cli ClientHello)", rt)
+	}
+	utlsRT, ok := fallback.utls.(*utlsRoundTripper)
+	if !ok {
+		t.Fatalf("claude default protected transport = %T, want *utlsRoundTripper", fallback.utls)
+	}
+	if utlsRT.clientHello.Str() != tls.HelloCustom.Str() {
+		t.Fatalf("claude default ClientHello = %s, want HelloCustom", utlsRT.clientHello.Str())
+	}
+	spec, err := utlsRT.clientHelloSpec(utlsRT.clientHello)
+	if err != nil {
+		t.Fatalf("claude default clientHelloSpec: %v", err)
+	}
+	alpn := alpnProtocols(spec)
+	if len(alpn) != 1 || alpn[0] != "http/1.1" {
+		t.Fatalf("claude default ALPN = %v, want [http/1.1]", alpn)
+	}
+}
 
 func TestIsRuntimeTransportProfileEnforced_ClaudePreset(t *testing.T) {
 	auth := &cliproxyauth.Auth{
@@ -207,7 +235,9 @@ func TestRuntimeTransportProfile_CoreManagedAccountIdentityForEmptyCLIProvider(t
 		provider  string
 		profileID string
 	}{
-		{name: "claude", provider: "claude", profileID: "claude_reqwest_rustls_compatible_v1"},
+		// claude default (no tls_profile) now replicates the real claude-cli
+		// ClientHello via uTLS HelloCustom, not the prior reqwest/rustls preset.
+		{name: "claude", provider: "claude", profileID: "claude_cli_clienthello_v1"},
 		{name: "codex", provider: "codex", profileID: "codex_proxy_compatible_v1"},
 		{name: "gemini", provider: "gemini", profileID: "gemini_cli_native_v1"},
 		{name: "gemini cli", provider: "gemini-cli", profileID: "gemini_cli_native_v1"},
@@ -231,16 +261,69 @@ func TestRuntimeTransportProfile_CoreManagedAccountIdentityForEmptyCLIProvider(t
 			if tc.provider == "codex" && (profile.Family != "codex-proxy-compatible" || profile.TLSFamily != "rustls-compatible") {
 				t.Fatalf("codex managed families = (%q, %q), want codex-proxy-compatible/rustls-compatible", profile.Family, profile.TLSFamily)
 			}
-			if tc.provider == "claude" && (profile.Family != "claude-reqwest-compatible" || profile.TLSFamily != "rustls-compatible") {
-				t.Fatalf("claude managed families = (%q, %q), want claude-reqwest-compatible/rustls-compatible", profile.Family, profile.TLSFamily)
+			if tc.provider == "claude" && (profile.Family != "utls" || profile.TLSFamily != "utls") {
+				t.Fatalf("claude managed families = (%q, %q), want utls/utls", profile.Family, profile.TLSFamily)
 			}
 			if !profile.SupportsRuntime() || !profile.SupportsTransportRuntime() || !profile.SupportsTLSRuntime() {
 				t.Fatalf("expected managed profile to support runtime: %#v", profile)
 			}
-			if transport, ok := BuildRuntimeTransportRoundTripper("", auth); !ok || transport == nil {
-				t.Fatalf("expected executable CLI-native transport, got %T ok=%v", transport, ok)
+			transport, ok := BuildRuntimeTransportRoundTripper("", auth)
+			if !ok || transport == nil {
+				t.Fatalf("expected executable runtime transport, got %T ok=%v", transport, ok)
+			}
+			if tc.provider == "claude" {
+				// The claude default must route through the uTLS replicated
+				// claude-cli ClientHello (HelloCustom + ALPN http/1.1), not the
+				// standard Go transport used by the prior reqwest/rustls preset.
+				assertClaudeCLIClientHelloRoundTripper(t, transport)
 			}
 		})
+	}
+}
+
+func TestRuntimeTransportProfile_ClaudePerAccountTLSProfileOverridesDefault(t *testing.T) {
+	// An explicit per-account tls_profile must win over the new claude-cli
+	// HelloCustom default; the default only applies when no profile is set.
+	auth := &cliproxyauth.Auth{
+		ID:       "claude-explicit-tls",
+		Provider: "claude",
+		Metadata: map[string]any{
+			"account_settings": map[string]any{
+				"tls_profile": map[string]any{
+					"preset": "claude_utls_chrome_133",
+				},
+			},
+		},
+	}
+
+	profile := ResolveRuntimeTransportProfile(auth)
+	if profile == nil {
+		t.Fatal("expected explicit claude tls_profile to resolve")
+	}
+	if profile.CoreManaged {
+		t.Fatalf("explicit tls_profile must not be core-managed default: %#v", profile)
+	}
+	if profile.TLSProfileID != "claude_utls_chrome_133" {
+		t.Fatalf("TLSProfileID = %q, want claude_utls_chrome_133 (per-account override)", profile.TLSProfileID)
+	}
+	if profile.ProfileID == "claude_cli_clienthello_v1" || profile.TLSProfileID == "claude_cli_clienthello_v1" {
+		t.Fatalf("explicit tls_profile must not be overridden by claude-cli default: %#v", profile)
+	}
+
+	transport, ok := BuildRuntimeTransportRoundTripper("", auth)
+	if !ok || transport == nil {
+		t.Fatalf("expected executable transport for explicit tls_profile, got %T ok=%v", transport, ok)
+	}
+	fallback, ok := transport.(*fallbackRoundTripper)
+	if !ok {
+		t.Fatalf("explicit chrome tls_profile transport = %T, want *fallbackRoundTripper", transport)
+	}
+	utlsRT, ok := fallback.utls.(*utlsRoundTripper)
+	if !ok {
+		t.Fatalf("explicit chrome tls_profile protected transport = %T, want *utlsRoundTripper", fallback.utls)
+	}
+	if utlsRT.clientHello.Str() != tls.HelloChrome_133.Str() {
+		t.Fatalf("explicit chrome tls_profile ClientHello = %s, want HelloChrome_133", utlsRT.clientHello.Str())
 	}
 }
 
@@ -307,7 +390,7 @@ func TestRuntimeTransportProfile_CoreManagedCacheKeyIsAccountIsolated(t *testing
 	if keyA == keyB {
 		t.Fatalf("expected core-managed cache keys to differ by auth/account, got %q", keyA)
 	}
-	for _, want := range []string{"auth=claude-file-a", "account=oauth:claude-a@example.com", "base=api.anthropic.com", "proxy=http://shared-proxy:8080", "claude_reqwest_rustls_compatible_v1", "core-managed-account-runtime"} {
+	for _, want := range []string{"auth=claude-file-a", "account=oauth:claude-a@example.com", "base=api.anthropic.com", "proxy=http://shared-proxy:8080", "claude_cli_clienthello_v1", "core-managed-account-runtime"} {
 		if !strings.Contains(keyA, want) {
 			t.Fatalf("cache key %q does not contain %q", keyA, want)
 		}
