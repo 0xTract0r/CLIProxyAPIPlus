@@ -128,29 +128,56 @@ func SyntheticDeviceID(authDir string, auth *cliproxyauth.Auth, apiKey string) s
 }
 
 // InjectAccountDeviceID rewrites only the device_id inside metadata.user_id with a
-// per-account synthetic value, fabricating a synthetic object when the field is
+// per-account synthetic value, fabricating a synthetic value when the field is
 // missing. It is equivalent to InjectAccountDeviceIDWithOptions with
 // fabricateIfMissing=true and is kept for the main messages path.
 func InjectAccountDeviceID(payload []byte, authDir string, auth *cliproxyauth.Auth, apiKey string) []byte {
 	return InjectAccountDeviceIDWithOptions(payload, authDir, auth, apiKey, true)
 }
 
+// buildSyntheticUserID serializes the synthetic metadata.user_id payload as compact
+// JSON text. Anthropic validates metadata.user_id as an opaque string, so this JSON
+// text is what gets stored *as a string value* (not as a nested object).
+func buildSyntheticUserID(deviceID, accountUUID, sessionID string) string {
+	inner, err := sjson.Set("{}", "device_id", deviceID)
+	if err != nil {
+		return ""
+	}
+	inner, err = sjson.Set(inner, "account_uuid", accountUUID)
+	if err != nil {
+		return ""
+	}
+	inner, err = sjson.Set(inner, "session_id", sessionID)
+	if err != nil {
+		return ""
+	}
+	return inner
+}
+
 // InjectAccountDeviceIDWithOptions rewrites only the device_id inside
-// metadata.user_id with a per-account synthetic value, while preserving the JSON
-// shape Claude Code sends:
+// metadata.user_id with a per-account synthetic value, while preserving the exact
+// wire shape Claude Code sends. Crucially, metadata.user_id is a JSON *string* whose
+// content happens to be JSON text:
 //
-//	metadata.user_id = {"device_id":"<64hex>","account_uuid":"","session_id":"<uuid>"}
+//	"metadata":{"user_id":"{\"device_id\":\"<64hex>\",\"account_uuid\":\"\",\"session_id\":\"<uuid>\"}"}
+//
+// Anthropic validates metadata.user_id as an opaque string ("Input should be a valid
+// string"); emitting it as a nested JSON object gets the whole /v1/messages request
+// rejected with a 400. The value is therefore always written back as a string.
 //
 // Behavior:
-//   - metadata.user_id is a JSON object: replace device_id only; keep account_uuid
-//     and session_id (the client's per-session value) untouched.
-//   - metadata.user_id is a non-object value (e.g. the legacy flat string): replace
-//     it with a synthetic object carrying a fresh session_id.
+//   - metadata.user_id is a string whose content is JSON: parse the inner JSON,
+//     replace device_id only, keep account_uuid and session_id (the client's
+//     per-session value) untouched, and re-serialize as a JSON string value.
+//   - metadata.user_id is any other value (e.g. the legacy flat string, or an
+//     unexpected object): replace it with a synthetic JSON string carrying a fresh
+//     session_id.
 //   - metadata.user_id is missing: behavior depends on fabricateIfMissing.
-//     When true, a synthetic object is created (main messages path). When false,
-//     the payload is left untouched so we never add a field the real client did not
-//     send (count_tokens path: real claude-cli count_tokens fingerprint is unknown,
-//     so do not emit an extra metadata.user_id that could be used to detect us).
+//     When true, a synthetic JSON string is created (main messages path). When
+//     false, the payload is left untouched so we never add a field the real client
+//     did not send (count_tokens path: real claude-cli count_tokens fingerprint is
+//     unknown, so do not emit an extra metadata.user_id that could be used to detect
+//     us).
 //   - Any failure to mutate the payload is a safe no-op: the original payload is
 //     returned unchanged so the request is never rejected with a 400. The caller
 //     therefore always passes through valid bodies.
@@ -163,29 +190,41 @@ func InjectAccountDeviceIDWithOptions(payload []byte, authDir string, auth *clip
 	deviceID := SyntheticDeviceID(authDir, auth, apiKey)
 
 	userID := gjson.GetBytes(payload, "metadata.user_id")
-	if userID.Exists() && userID.IsObject() {
-		updated, err := sjson.SetBytes(payload, "metadata.user_id.device_id", deviceID)
-		if err != nil {
-			return payload
+	if userID.Exists() && userID.Type == gjson.String {
+		// The wire value is a string. Its content is expected to be JSON text such
+		// as {"device_id":...,"account_uuid":...,"session_id":...}. Parse the inner
+		// JSON, swap device_id only, then write the re-serialized JSON back as a
+		// string value (sjson.SetBytes with a string quotes/escapes it).
+		inner := userID.String()
+		if gjson.Valid(inner) && gjson.Get(inner, "device_id").Exists() {
+			rewritten, err := sjson.Set(inner, "device_id", deviceID)
+			if err != nil {
+				return payload
+			}
+			updated, errSet := sjson.SetBytes(payload, "metadata.user_id", rewritten)
+			if errSet != nil {
+				return payload
+			}
+			return updated
 		}
-		return updated
+		// A string that is not the expected JSON shape (legacy flat string): fall
+		// through to replace it wholesale with a synthetic JSON string.
 	}
 
-	// metadata.user_id is missing or not an object.
+	// metadata.user_id is missing or not a parseable JSON string.
 	if !userID.Exists() && !fabricateIfMissing {
 		// Do not fabricate metadata.user_id: passing through keeps our request
 		// shape identical to a real client that omitted the field.
 		return payload
 	}
 
-	// Missing metadata.user_id (when fabrication is allowed) or a non-object value
-	// (legacy flat string): set a synthetic object. account_uuid stays empty per the
-	// device-id design; the session_id is regenerated since the prior value (if any)
-	// is not reusable here.
-	synthetic := map[string]string{
-		"device_id":    deviceID,
-		"account_uuid": "",
-		"session_id":   uuid.New().String(),
+	// Missing metadata.user_id (when fabrication is allowed) or an unexpected value
+	// (legacy flat string / object): set a synthetic JSON string. account_uuid stays
+	// empty per the device-id design; the session_id is regenerated since the prior
+	// value (if any) is not reusable here.
+	synthetic := buildSyntheticUserID(deviceID, "", uuid.New().String())
+	if synthetic == "" {
+		return payload
 	}
 	updated, err := sjson.SetBytes(payload, "metadata.user_id", synthetic)
 	if err != nil {

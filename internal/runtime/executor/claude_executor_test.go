@@ -3227,18 +3227,26 @@ func ctxWithUserAgent(userAgent string) context.Context {
 func TestApplyCloaking_InjectsDeviceIDForClaudeCLIButNotSystemBlocks(t *testing.T) {
 	cfg := &config.Config{AuthDir: t.TempDir()}
 	auth := &cliproxyauth.Auth{FileName: "account-a.json", Attributes: map[string]string{"api_key": "key-123"}}
-	payload := []byte(`{"system":"original system","metadata":{"user_id":{"device_id":"realdevice","account_uuid":"","session_id":"sess-1"}},"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
+	// metadata.user_id is sent by claude-cli as a JSON *string* (not an object);
+	// Anthropic validates it as an opaque string.
+	payload := []byte(`{"system":"original system","metadata":{"user_id":"{\"device_id\":\"realdevice\",\"account_uuid\":\"\",\"session_id\":\"sess-1\"}"},"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
 
 	ctx := ctxWithUserAgent("claude-cli/2.1.60 (external, cli)")
 	out := applyCloaking(ctx, cfg, auth, payload, "claude-3-5-sonnet-20241022", "key-123", "2.1.63")
 
+	// metadata.user_id must stay a JSON string (object form would 400 at Anthropic).
+	userIDField := gjson.GetBytes(out, "metadata.user_id")
+	if userIDField.Type != gjson.String {
+		t.Fatalf("expected metadata.user_id to remain a JSON string, got type=%v raw=%q", userIDField.Type, userIDField.Raw)
+	}
+	inner := userIDField.String()
 	// device_id must be rewritten to a synthetic 64-hex value.
-	device := gjson.GetBytes(out, "metadata.user_id.device_id").String()
+	device := gjson.Get(inner, "device_id").String()
 	if device == "realdevice" || len(device) != 64 {
 		t.Fatalf("expected synthetic 64-hex device_id for claude-cli, got %q", device)
 	}
 	// session_id preserved.
-	if got := gjson.GetBytes(out, "metadata.user_id.session_id").String(); got != "sess-1" {
+	if got := gjson.Get(inner, "session_id").String(); got != "sess-1" {
 		t.Fatalf("expected session_id preserved, got %q", got)
 	}
 	// The original system string must NOT be replaced with injected Claude Code
@@ -3257,7 +3265,7 @@ func TestApplyCloaking_InjectsDeviceIDForClaudeCLIButNotSystemBlocks(t *testing.
 func TestApplyCloaking_DeviceIDDiffersBetweenAccounts(t *testing.T) {
 	dir := t.TempDir()
 	cfg := &config.Config{AuthDir: dir}
-	payload := []byte(`{"metadata":{"user_id":{"device_id":"x","session_id":"s"}},"messages":[]}`)
+	payload := []byte(`{"metadata":{"user_id":"{\"device_id\":\"x\",\"account_uuid\":\"\",\"session_id\":\"s\"}"},"messages":[]}`)
 	ctx := ctxWithUserAgent("claude-cli/2.1.60 (external, cli)")
 
 	authA := &cliproxyauth.Auth{FileName: "account-a.json", Attributes: map[string]string{"api_key": "key-a"}}
@@ -3266,8 +3274,15 @@ func TestApplyCloaking_DeviceIDDiffersBetweenAccounts(t *testing.T) {
 	outA := applyCloaking(ctx, cfg, authA, payload, "claude-3-5-sonnet-20241022", "key-a", "2.1.63")
 	outB := applyCloaking(ctx, cfg, authB, payload, "claude-3-5-sonnet-20241022", "key-b", "2.1.63")
 
-	devA := gjson.GetBytes(outA, "metadata.user_id.device_id").String()
-	devB := gjson.GetBytes(outB, "metadata.user_id.device_id").String()
+	// metadata.user_id must remain a JSON string on both paths; device_id is read
+	// from the inner JSON text.
+	fieldA := gjson.GetBytes(outA, "metadata.user_id")
+	fieldB := gjson.GetBytes(outB, "metadata.user_id")
+	if fieldA.Type != gjson.String || fieldB.Type != gjson.String {
+		t.Fatalf("expected metadata.user_id to remain a JSON string, got typeA=%v typeB=%v", fieldA.Type, fieldB.Type)
+	}
+	devA := gjson.Get(fieldA.String(), "device_id").String()
+	devB := gjson.Get(fieldB.String(), "device_id").String()
 	if devA == "" || devB == "" || devA == devB {
 		t.Fatalf("expected distinct device IDs per account, got %q and %q", devA, devB)
 	}
