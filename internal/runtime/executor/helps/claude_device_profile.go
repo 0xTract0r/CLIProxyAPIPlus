@@ -300,6 +300,18 @@ func firstNonEmptyHeader(headers http.Header, name, fallback string) string {
 	return fallback
 }
 
+// ClaudeAccountScopeKey exposes the per-account scope key used by the device
+// profile cache so that other identity-rewriting paths (e.g. the cloak path that
+// derives a synthetic device_id) can scope state to the same upstream account.
+//
+// The scope precedence is FileName > ID > Label > (auth present -> global) > apiKey
+// > global. It is deterministic for a given auth/apiKey and intentionally avoids
+// volatile material (such as OAuth tokens), so derived values stay stable across
+// requests and refreshes while differing between distinct upstream accounts.
+func ClaudeAccountScopeKey(auth *cliproxyauth.Auth, apiKey string) string {
+	return claudeDeviceProfileScopeKey(auth, apiKey)
+}
+
 func claudeDeviceProfileScopeKey(auth *cliproxyauth.Auth, apiKey string) string {
 	switch {
 	case auth != nil && strings.TrimSpace(auth.FileName) != "":

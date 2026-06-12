@@ -1017,16 +1017,25 @@ func TestClaudeExecutor_ReusesUserIDAcrossModelsWhenCacheEnabled(t *testing.T) {
 	}
 	t.Logf("user_id[0] (model=%s): %s", requestModels[0], userIDs[0])
 	t.Logf("user_id[1] (model=%s): %s", requestModels[1], userIDs[1])
-	if userIDs[0] != userIDs[1] {
-		t.Fatalf("expected user_id to be reused across models, got %q and %q", userIDs[0], userIDs[1])
+	// New account-scoped contract: metadata.user_id is a JSON object and the
+	// device_id is derived per account, so it stays stable across models/requests
+	// regardless of the legacy CacheUserID flag. session_id may differ per request.
+	device0 := gjson.GetBytes([]byte(userIDs[0]), "device_id").String()
+	device1 := gjson.GetBytes([]byte(userIDs[1]), "device_id").String()
+	if device0 == "" || device1 == "" {
+		t.Fatalf("expected device_id populated, got %q and %q", userIDs[0], userIDs[1])
 	}
-	if !helps.IsValidUserID(userIDs[0]) {
-		t.Fatalf("user_id %q is not valid", userIDs[0])
+	if device0 != device1 {
+		t.Fatalf("expected device_id reused across models, got %q and %q", device0, device1)
 	}
-	t.Logf("✓ End-to-end test passed: Same user_id (%s) was used for both models", userIDs[0])
+	t.Logf("✓ End-to-end test passed: Same device_id (%s) was used for both models", device0)
 }
 
-func TestClaudeExecutor_GeneratesNewUserIDByDefault(t *testing.T) {
+// TestClaudeExecutor_DeviceIDIsAccountStableByDefault verifies the account-scoped
+// device_id design: with no cloak/cache flag set, the synthetic device_id is derived
+// deterministically per upstream account, so it is identical across requests rather
+// than randomized per request (the prior behavior, which looked like abuse evasion).
+func TestClaudeExecutor_DeviceIDIsAccountStableByDefault(t *testing.T) {
 	var userIDs []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
@@ -1036,11 +1045,14 @@ func TestClaudeExecutor_GeneratesNewUserIDByDefault(t *testing.T) {
 	}))
 	defer server.Close()
 
-	executor := NewClaudeExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{
-		"api_key":  "key-123",
-		"base_url": server.URL,
-	}}
+	executor := NewClaudeExecutor(&config.Config{AuthDir: t.TempDir()})
+	auth := &cliproxyauth.Auth{
+		FileName: "account-a.json",
+		Attributes: map[string]string{
+			"api_key":  "key-123",
+			"base_url": server.URL,
+		},
+	}
 
 	payload := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
 
@@ -1061,11 +1073,13 @@ func TestClaudeExecutor_GeneratesNewUserIDByDefault(t *testing.T) {
 	if userIDs[0] == "" || userIDs[1] == "" {
 		t.Fatal("expected user_id to be populated")
 	}
-	if userIDs[0] == userIDs[1] {
-		t.Fatalf("expected user_id to change when caching is not enabled, got identical values %q", userIDs[0])
+	device0 := gjson.GetBytes([]byte(userIDs[0]), "device_id").String()
+	device1 := gjson.GetBytes([]byte(userIDs[1]), "device_id").String()
+	if device0 == "" || device1 == "" {
+		t.Fatalf("expected device_id populated, got %q and %q", userIDs[0], userIDs[1])
 	}
-	if !helps.IsValidUserID(userIDs[0]) || !helps.IsValidUserID(userIDs[1]) {
-		t.Fatalf("user_ids should be valid, got %q and %q", userIDs[0], userIDs[1])
+	if device0 != device1 {
+		t.Fatalf("expected device_id stable across requests for the same account, got %q and %q", device0, device1)
 	}
 }
 
@@ -3191,6 +3205,71 @@ func TestApplyCloaking_PreservesConfiguredStrictModeAndSensitiveWordsWhenModeOmi
 	}
 	if got := gjson.GetBytes(out, "messages.0.content.0.text").String(); !strings.Contains(got, "\u200B") {
 		t.Fatalf("expected configured sensitive word obfuscation to apply, got %q", got)
+	}
+}
+
+// ctxWithUserAgent builds a context carrying a gin request with the given
+// User-Agent so applyCloaking can resolve the client type via getClientUserAgent.
+func ctxWithUserAgent(userAgent string) context.Context {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginReq := httptest.NewRequest(http.MethodPost, "http://localhost/v1/messages", nil)
+	ginReq.Header.Set("User-Agent", userAgent)
+	ginCtx.Request = ginReq
+	req := httptest.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", nil)
+	return context.WithValue(req.Context(), "gin", ginCtx)
+}
+
+// TestApplyCloaking_InjectsDeviceIDForClaudeCLIButNotSystemBlocks covers P1.2:
+// real claude-cli clients are excluded from the broader cloak (no injected system
+// blocks), yet the account-scoped synthetic device_id must still be applied.
+func TestApplyCloaking_InjectsDeviceIDForClaudeCLIButNotSystemBlocks(t *testing.T) {
+	cfg := &config.Config{AuthDir: t.TempDir()}
+	auth := &cliproxyauth.Auth{FileName: "account-a.json", Attributes: map[string]string{"api_key": "key-123"}}
+	payload := []byte(`{"system":"original system","metadata":{"user_id":{"device_id":"realdevice","account_uuid":"","session_id":"sess-1"}},"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
+
+	ctx := ctxWithUserAgent("claude-cli/2.1.60 (external, cli)")
+	out := applyCloaking(ctx, cfg, auth, payload, "claude-3-5-sonnet-20241022", "key-123", "2.1.63")
+
+	// device_id must be rewritten to a synthetic 64-hex value.
+	device := gjson.GetBytes(out, "metadata.user_id.device_id").String()
+	if device == "realdevice" || len(device) != 64 {
+		t.Fatalf("expected synthetic 64-hex device_id for claude-cli, got %q", device)
+	}
+	// session_id preserved.
+	if got := gjson.GetBytes(out, "metadata.user_id.session_id").String(); got != "sess-1" {
+		t.Fatalf("expected session_id preserved, got %q", got)
+	}
+	// The original system string must NOT be replaced with injected Claude Code
+	// system blocks (claude-cli is excluded from the broader cloak).
+	system := gjson.GetBytes(out, "system")
+	if system.IsArray() {
+		t.Fatalf("expected claude-cli system to remain the original (no injected cloak blocks), got array: %s", system.Raw)
+	}
+	if got := system.String(); got != "original system" {
+		t.Fatalf("expected claude-cli system left untouched, got %q", got)
+	}
+}
+
+// TestApplyCloaking_DeviceIDDiffersBetweenAccounts asserts the anti-correlation
+// invariant at the cloak layer: distinct accounts derive distinct device IDs.
+func TestApplyCloaking_DeviceIDDiffersBetweenAccounts(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &config.Config{AuthDir: dir}
+	payload := []byte(`{"metadata":{"user_id":{"device_id":"x","session_id":"s"}},"messages":[]}`)
+	ctx := ctxWithUserAgent("claude-cli/2.1.60 (external, cli)")
+
+	authA := &cliproxyauth.Auth{FileName: "account-a.json", Attributes: map[string]string{"api_key": "key-a"}}
+	authB := &cliproxyauth.Auth{FileName: "account-b.json", Attributes: map[string]string{"api_key": "key-b"}}
+
+	outA := applyCloaking(ctx, cfg, authA, payload, "claude-3-5-sonnet-20241022", "key-a", "2.1.63")
+	outB := applyCloaking(ctx, cfg, authB, payload, "claude-3-5-sonnet-20241022", "key-b", "2.1.63")
+
+	devA := gjson.GetBytes(outA, "metadata.user_id.device_id").String()
+	devB := gjson.GetBytes(outB, "metadata.user_id.device_id").String()
+	if devA == "" || devB == "" || devA == devB {
+		t.Fatalf("expected distinct device IDs per account, got %q and %q", devA, devB)
 	}
 }
 
