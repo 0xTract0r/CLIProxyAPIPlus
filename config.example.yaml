@@ -268,6 +268,15 @@ nonstream-keepalive-interval: 0
 # claude:
 #   sonnet_long_context_policy: fail_with_hint  # fail_with_hint | route_to_opus_1m | compact_required
 
+# Global account env/cwd normalization switch (default false). When enabled, the
+# real working directory, user name and home path inside <env> / <system-reminder>
+# blocks of the Claude request body are rewritten to a per-account canonical path,
+# so multiple clients sharing one upstream account present as one machine. It only
+# touches those environment-description blocks (never tool_use / tool_result args
+# or ordinary conversation) and is independent of cloak / device-profile settings.
+# Off = body unchanged (safe gray rollout; roll back by setting it false again).
+# normalize-account-env: false
+
 # Default headers for Codex OAuth model requests.
 # These are used only for file-backed/OAuth Codex requests when the client
 # does not send the header. `user-agent` applies to HTTP and websocket requests;
