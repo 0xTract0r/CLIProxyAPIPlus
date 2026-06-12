@@ -685,6 +685,20 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 	}
 	body = sanitizeClaudeMessagesForClaudeUpstreamWithDebug(ctx, body, baseModel)
 
+	// Account-scoped device_id normalization for the count_tokens path. Unlike the
+	// main messages path (applyCloaking), this only rewrites an existing
+	// metadata.user_id.device_id and never fabricates the field when it is absent:
+	// the real claude-cli count_tokens fingerprint is not yet captured, so emitting
+	// an extra metadata.user_id we are not sure the client sends could itself become
+	// a detection signal. Existing user_id objects still get their device_id swapped
+	// to the same account-derived value used by Execute; a parse failure is a safe
+	// pass-through (never a 400).
+	countTokensAuthDir := ""
+	if e.cfg != nil {
+		countTokensAuthDir = e.cfg.AuthDir
+	}
+	body = helps.InjectAccountDeviceIDWithOptions(body, countTokensAuthDir, auth, apiKey, false)
+
 	url := fmt.Sprintf("%s/v1/messages/count_tokens?beta=true", baseURL)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {

@@ -128,25 +128,39 @@ func SyntheticDeviceID(authDir string, auth *cliproxyauth.Auth, apiKey string) s
 }
 
 // InjectAccountDeviceID rewrites only the device_id inside metadata.user_id with a
-// per-account synthetic value, while preserving the JSON shape Claude Code sends:
+// per-account synthetic value, fabricating a synthetic object when the field is
+// missing. It is equivalent to InjectAccountDeviceIDWithOptions with
+// fabricateIfMissing=true and is kept for the main messages path.
+func InjectAccountDeviceID(payload []byte, authDir string, auth *cliproxyauth.Auth, apiKey string) []byte {
+	return InjectAccountDeviceIDWithOptions(payload, authDir, auth, apiKey, true)
+}
+
+// InjectAccountDeviceIDWithOptions rewrites only the device_id inside
+// metadata.user_id with a per-account synthetic value, while preserving the JSON
+// shape Claude Code sends:
 //
 //	metadata.user_id = {"device_id":"<64hex>","account_uuid":"","session_id":"<uuid>"}
 //
 // Behavior:
 //   - metadata.user_id is a JSON object: replace device_id only; keep account_uuid
 //     and session_id (the client's per-session value) untouched.
-//   - metadata.user_id is missing or not a JSON object (e.g. the legacy flat string):
-//     replace it with a synthetic object carrying a fresh session_id.
+//   - metadata.user_id is a non-object value (e.g. the legacy flat string): replace
+//     it with a synthetic object carrying a fresh session_id.
+//   - metadata.user_id is missing: behavior depends on fabricateIfMissing.
+//     When true, a synthetic object is created (main messages path). When false,
+//     the payload is left untouched so we never add a field the real client did not
+//     send (count_tokens path: real claude-cli count_tokens fingerprint is unknown,
+//     so do not emit an extra metadata.user_id that could be used to detect us).
 //   - Any failure to mutate the payload is a safe no-op: the original payload is
 //     returned unchanged so the request is never rejected with a 400. The caller
 //     therefore always passes through valid bodies.
-func InjectAccountDeviceID(payload []byte, authDir string, auth *cliproxyauth.Auth, apiKey string) []byte {
-	deviceID := SyntheticDeviceID(authDir, auth, apiKey)
-
+func InjectAccountDeviceIDWithOptions(payload []byte, authDir string, auth *cliproxyauth.Auth, apiKey string, fabricateIfMissing bool) []byte {
 	if !gjson.ValidBytes(payload) {
 		// Do not attempt to rewrite an unparseable body; pass it through.
 		return payload
 	}
+
+	deviceID := SyntheticDeviceID(authDir, auth, apiKey)
 
 	userID := gjson.GetBytes(payload, "metadata.user_id")
 	if userID.Exists() && userID.IsObject() {
@@ -157,9 +171,17 @@ func InjectAccountDeviceID(payload []byte, authDir string, auth *cliproxyauth.Au
 		return updated
 	}
 
-	// Missing metadata.user_id or a non-object value (legacy flat string): set a
-	// synthetic object. account_uuid stays empty per the device-id design; the
-	// session_id is regenerated since the prior value (if any) is not reusable here.
+	// metadata.user_id is missing or not an object.
+	if !userID.Exists() && !fabricateIfMissing {
+		// Do not fabricate metadata.user_id: passing through keeps our request
+		// shape identical to a real client that omitted the field.
+		return payload
+	}
+
+	// Missing metadata.user_id (when fabrication is allowed) or a non-object value
+	// (legacy flat string): set a synthetic object. account_uuid stays empty per the
+	// device-id design; the session_id is regenerated since the prior value (if any)
+	// is not reusable here.
 	synthetic := map[string]string{
 		"device_id":    deviceID,
 		"account_uuid": "",

@@ -152,6 +152,128 @@ func TestInjectAccountDeviceID_EmptyPayloadPassesThrough(t *testing.T) {
 	}
 }
 
+// TestInjectAccountDeviceIDWithOptions_NoFabricate_ReplacesExistingDeviceID covers
+// the count_tokens path with fabricateIfMissing=false: when metadata.user_id is a
+// JSON object, device_id is still swapped to the account-derived value while
+// session_id and account_uuid stay untouched.
+func TestInjectAccountDeviceIDWithOptions_NoFabricate_ReplacesExistingDeviceID(t *testing.T) {
+	dir := newTestAuthDir(t)
+	auth := &cliproxyauth.Auth{FileName: "account-a.json"}
+
+	payload := []byte(`{"model":"claude","metadata":{"user_id":{"device_id":"realdevice","account_uuid":"acct-uuid","session_id":"sess-uuid"}},"messages":[{"role":"user","content":"hi"}]}`)
+
+	out := InjectAccountDeviceIDWithOptions(payload, dir, auth, "api-key-1", false)
+
+	gotDevice := gjson.GetBytes(out, "metadata.user_id.device_id").String()
+	if gotDevice == "realdevice" {
+		t.Fatalf("expected device_id to be rewritten, still got real value")
+	}
+	if !hex64.MatchString(gotDevice) {
+		t.Fatalf("expected synthetic 64-hex device_id, got %q", gotDevice)
+	}
+	// It must match the value produced by the Execute/main path for the same account.
+	wantDevice := SyntheticDeviceID(dir, auth, "api-key-1")
+	if gotDevice != wantDevice {
+		t.Fatalf("expected device_id derived from the same account scope, got %q want %q", gotDevice, wantDevice)
+	}
+	if got := gjson.GetBytes(out, "metadata.user_id.session_id").String(); got != "sess-uuid" {
+		t.Fatalf("expected session_id preserved, got %q", got)
+	}
+	if got := gjson.GetBytes(out, "metadata.user_id.account_uuid").String(); got != "acct-uuid" {
+		t.Fatalf("expected account_uuid preserved, got %q", got)
+	}
+}
+
+// TestInjectAccountDeviceIDWithOptions_NoFabricate_LeavesMissingUntouched covers the
+// count_tokens safety rule: when metadata.user_id is absent and fabrication is
+// disabled, the body is returned verbatim so we never emit a field the real client
+// did not send.
+func TestInjectAccountDeviceIDWithOptions_NoFabricate_LeavesMissingUntouched(t *testing.T) {
+	dir := newTestAuthDir(t)
+	auth := &cliproxyauth.Auth{FileName: "account-a.json"}
+
+	payload := []byte(`{"model":"claude","messages":[]}`)
+	out := InjectAccountDeviceIDWithOptions(payload, dir, auth, "", false)
+
+	if !bytes.Equal(out, payload) {
+		t.Fatalf("expected missing metadata.user_id left untouched, got %q", out)
+	}
+	if gjson.GetBytes(out, "metadata.user_id").Exists() {
+		t.Fatalf("expected no metadata.user_id fabricated, got %q", out)
+	}
+}
+
+// TestInjectAccountDeviceIDWithOptions_NoFabricate_MetadataPresentNoUserID confirms
+// that an existing metadata object without user_id is not augmented when fabrication
+// is disabled.
+func TestInjectAccountDeviceIDWithOptions_NoFabricate_MetadataPresentNoUserID(t *testing.T) {
+	dir := newTestAuthDir(t)
+	auth := &cliproxyauth.Auth{FileName: "account-a.json"}
+
+	payload := []byte(`{"model":"claude","metadata":{"foo":"bar"},"messages":[]}`)
+	out := InjectAccountDeviceIDWithOptions(payload, dir, auth, "", false)
+
+	if !bytes.Equal(out, payload) {
+		t.Fatalf("expected metadata without user_id left untouched, got %q", out)
+	}
+	if gjson.GetBytes(out, "metadata.user_id").Exists() {
+		t.Fatalf("expected no metadata.user_id fabricated, got %q", out)
+	}
+}
+
+// TestInjectAccountDeviceIDWithOptions_NoFabricate_ReplacesLegacyFlatString confirms
+// that a present-but-flat user_id is still normalized to a synthetic object even
+// with fabrication disabled: the no-fabricate rule only applies to a truly absent
+// field, matching the leader's spec ("非 JSON 扁平串 → 整体换合成 JSON").
+func TestInjectAccountDeviceIDWithOptions_NoFabricate_ReplacesLegacyFlatString(t *testing.T) {
+	dir := newTestAuthDir(t)
+	auth := &cliproxyauth.Auth{FileName: "account-a.json"}
+
+	payload := []byte(`{"metadata":{"user_id":"user_abc_account_x_session_y"}}`)
+	out := InjectAccountDeviceIDWithOptions(payload, dir, auth, "", false)
+
+	if !gjson.GetBytes(out, "metadata.user_id").IsObject() {
+		t.Fatalf("expected legacy flat string replaced with synthetic object")
+	}
+	device := gjson.GetBytes(out, "metadata.user_id.device_id").String()
+	if !hex64.MatchString(device) {
+		t.Fatalf("expected synthetic device_id, got %q", device)
+	}
+}
+
+// TestInjectAccountDeviceIDWithOptions_NoFabricate_InvalidPayloadPassesThrough
+// confirms the parse-failure safe pass-through still holds on the count_tokens path.
+func TestInjectAccountDeviceIDWithOptions_NoFabricate_InvalidPayloadPassesThrough(t *testing.T) {
+	dir := newTestAuthDir(t)
+	auth := &cliproxyauth.Auth{FileName: "account-a.json"}
+
+	invalid := []byte(`{"metadata": this is not json`)
+	out := InjectAccountDeviceIDWithOptions(invalid, dir, auth, "", false)
+
+	if !bytes.Equal(out, invalid) {
+		t.Fatalf("expected invalid payload returned unchanged, got %q", out)
+	}
+}
+
+// TestInjectAccountDeviceID_MainPathStillFabricates guards against a regression on
+// the main messages path: the fabricate-default wrapper must keep creating a
+// synthetic metadata.user_id when the field is missing.
+func TestInjectAccountDeviceID_MainPathStillFabricates(t *testing.T) {
+	dir := newTestAuthDir(t)
+	auth := &cliproxyauth.Auth{FileName: "account-a.json"}
+
+	payload := []byte(`{"model":"claude","messages":[]}`)
+	out := InjectAccountDeviceID(payload, dir, auth, "")
+
+	if !gjson.GetBytes(out, "metadata.user_id").IsObject() {
+		t.Fatalf("expected main path to fabricate metadata.user_id, got %q", out)
+	}
+	device := gjson.GetBytes(out, "metadata.user_id.device_id").String()
+	if !hex64.MatchString(device) {
+		t.Fatalf("expected synthetic device_id, got %q", device)
+	}
+}
+
 func TestSyntheticDeviceID_FallsBackToProcessSaltWithoutAuthDir(t *testing.T) {
 	auth := &cliproxyauth.Auth{FileName: "account-a.json"}
 
