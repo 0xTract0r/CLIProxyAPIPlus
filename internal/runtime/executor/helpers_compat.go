@@ -65,18 +65,6 @@ func isClaudeCodeClient(userAgent string) bool {
 	return helps.IsClaudeCodeClient(userAgent)
 }
 
-func cachedUserID(apiKey string) string {
-	return helps.CachedUserID(apiKey)
-}
-
-func generateFakeUserID() string {
-	return helps.GenerateFakeUserID()
-}
-
-func isValidUserID(userID string) bool {
-	return helps.IsValidUserID(userID)
-}
-
 func shouldCloak(cloakMode string, userAgent string) bool {
 	return helps.ShouldCloak(cloakMode, userAgent)
 }
