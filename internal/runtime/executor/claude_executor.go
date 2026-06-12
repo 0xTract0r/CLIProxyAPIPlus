@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/andybalholm/brotli"
@@ -1162,7 +1163,25 @@ func contextWithClaudeInboundHeaders(ctx context.Context, headers http.Header) c
 	return context.WithValue(ctx, claudeInboundHeadersContextKey, headers.Clone())
 }
 
+var claudeDeviceProfileStaleGuardWarnOnce sync.Once
+
+// warnClaudeDeviceProfileStaleGuard emits a single operator-facing warning when
+// the runtime is in the stale-prone managed-header configuration (stabilize on,
+// online-update explicitly off, no operator baseline UA). In that state the
+// floor is the frozen hardcoded claude-cli version constant, which can drift
+// stale relative to live clients and produce an "old UA + new body" mismatch
+// when the observation cache is empty. See A6.3 in 08-impl-spec.md.
+func warnClaudeDeviceProfileStaleGuard(cfg *config.Config) {
+	if !helps.ClaudeDeviceProfileStaleGuardActive(cfg) {
+		return
+	}
+	claudeDeviceProfileStaleGuardWarnOnce.Do(func() {
+		log.Warn("claude device profile: stabilize-device-profile is enabled but managed-header-profile.online-update is disabled and no claude-header-defaults.user-agent baseline is configured; the device fingerprint falls back to a frozen built-in version constant and may drift stale (old UA + new body). Enable online-update or set claude-header-defaults.user-agent to a current claude-cli version.")
+	})
+}
+
 func resolveClaudeDeviceProfileForRequest(ctx context.Context, auth *cliproxyauth.Auth, apiKey string, headers http.Header, cfg *config.Config) helps.ClaudeDeviceProfile {
+	warnClaudeDeviceProfileStaleGuard(cfg)
 	ginCtx := ginContextFromContext(ctx)
 	if ginCtx != nil {
 		if cached, ok := ginCtx.Get(claudeDeviceProfileContextKey); ok {
@@ -1223,33 +1242,64 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 	stabilizeDeviceProfile := helps.ClaudeDeviceProfileStabilizationEnabled(cfg)
 	deviceProfile := resolveClaudeDeviceProfileForRequest(r.Context(), auth, apiKey, ginHeaders, cfg)
 
-	baseBetas := "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05,structured-outputs-2025-12-15,fast-mode-2026-02-01,redact-thinking-2026-02-12,token-efficient-tools-2026-03-28"
-	if val := strings.TrimSpace(ginHeaders.Get("Anthropic-Beta")); val != "" {
-		baseBetas = val
-		if !strings.Contains(val, "oauth") {
-			baseBetas += ",oauth-2025-04-20"
+	// baseBetas is the manually maintained floor, aligned to the real
+	// claude-cli anthropic-beta set captured in
+	// docs/fingerprint/cpa-reqs/04-traffic-ref.md (claude-cli/2.1.158):
+	//   claude-code-20250219, context-1m-2025-08-07,
+	//   interleaved-thinking-2025-05-14, thinking-token-count-2026-05-13,
+	//   context-management-2025-06-27, prompt-caching-scope-2026-01-05,
+	//   mid-conversation-system-2026-04-07.
+	// We intentionally do NOT inject betas real claude-cli never sends
+	// (e.g. structured-outputs / fast-mode / redact-thinking /
+	// token-efficient-tools) because injecting stale/foreign betas can
+	// corrupt tool_use JSON on newer models (OmniRoute #3415). We also do
+	// NOT synthesize context-1m-2025-08-07 here: Claude 1M is GA and Claude
+	// Code selects it via the model suffix, not a beta flag. oauth-2025-04-20
+	// is kept as a strong-fill because it is required by the OAuth path and
+	// is not visible in the cpa-mediated capture.
+	baseBetas := "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07"
+
+	// Union baseBetas with the client's real anthropic-beta set instead of
+	// replacing it. Replacing would drop baseBetas-only floor entries when a
+	// client sends a narrower set; union keeps the per-account beta set
+	// monotonically non-decreasing (only-up, never-down). Client-only betas
+	// are preserved so the header stays self-consistent with the forwarded
+	// body capabilities.
+	betaSet := make(map[string]bool)
+	appendBeta := func(list string) {
+		for _, b := range strings.Split(list, ",") {
+			betaName := strings.TrimSpace(b)
+			if betaName != "" && !betaSet[betaName] {
+				betaSet[betaName] = true
+				if baseBetas == "" {
+					baseBetas = betaName
+				} else {
+					baseBetas += "," + betaName
+				}
+			}
 		}
 	}
+	// Seed the set with the floor that is already in baseBetas.
+	for _, b := range strings.Split(baseBetas, ",") {
+		if betaName := strings.TrimSpace(b); betaName != "" {
+			betaSet[betaName] = true
+		}
+	}
+	if val := strings.TrimSpace(ginHeaders.Get("Anthropic-Beta")); val != "" {
+		appendBeta(val)
+	}
+	if !betaSet["oauth-2025-04-20"] {
+		appendBeta("oauth-2025-04-20")
+	}
 	if !strings.Contains(baseBetas, "interleaved-thinking") {
-		baseBetas += ",interleaved-thinking-2025-05-14"
+		appendBeta("interleaved-thinking-2025-05-14")
 	}
 
 	// Merge extra betas from request body. Do not synthesize the removed
 	// context-1m beta; Claude 1M is GA and Claude Code uses model suffixes.
 	if len(extraBetas) > 0 {
-		existingSet := make(map[string]bool)
-		for _, b := range strings.Split(baseBetas, ",") {
-			betaName := strings.TrimSpace(b)
-			if betaName != "" {
-				existingSet[betaName] = true
-			}
-		}
 		for _, beta := range extraBetas {
-			beta = strings.TrimSpace(beta)
-			if beta != "" && !existingSet[beta] {
-				baseBetas += "," + beta
-				existingSet[beta] = true
-			}
+			appendBeta(beta)
 		}
 	}
 	r.Header.Set("Anthropic-Beta", baseBetas)
@@ -1259,7 +1309,12 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 	if useAPIKey {
 		misc.EnsureHeader(r.Header, ginHeaders, "Anthropic-Dangerous-Direct-Browser-Access", "true")
 	}
-	misc.EnsureHeader(r.Header, ginHeaders, "X-App", "cli")
+	// x-app is a low-entropy A-class identity field: real claude-cli always
+	// sends "cli". Force it instead of using EnsureHeader so a client-supplied
+	// X-App (e.g. "browser") can never leak through and de-anonymize the
+	// account. Per-account managed headers (header:X-App) applied later still
+	// win, since that is an intentional operator override, not client input.
+	r.Header.Set("X-App", "cli")
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Retry-Count", "0")
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Runtime", "node")
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Lang", "js")

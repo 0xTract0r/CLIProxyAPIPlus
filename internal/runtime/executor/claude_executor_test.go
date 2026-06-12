@@ -3481,3 +3481,216 @@ func TestRestoreClaudeOAuthToolNamesFromStreamLine_MixedCaseWithPrefix(t *testin
 		t.Fatalf("Glob should be restored to glob, got: %s", string(out))
 	}
 }
+
+// betaSetFromHeader splits an Anthropic-Beta header into a presence set.
+func betaSetFromHeader(header string) map[string]bool {
+	set := make(map[string]bool)
+	for _, b := range strings.Split(header, ",") {
+		if name := strings.TrimSpace(b); name != "" {
+			set[name] = true
+		}
+	}
+	return set
+}
+
+// TestApplyClaudeHeaders_ForcesXAppCliRegardlessOfClient verifies A6.1: a
+// client-supplied X-App value (e.g. "browser") never leaks to the upstream;
+// x-app is always forced to "cli".
+func TestApplyClaudeHeaders_ForcesXAppCliRegardlessOfClient(t *testing.T) {
+	resetClaudeDeviceProfileCache()
+
+	req := newClaudeHeaderTestRequest(t, http.Header{
+		"X-App": []string{"foo"},
+	})
+	auth := &cliproxyauth.Auth{
+		Attributes: map[string]string{"api_key": "key-xapp"},
+	}
+	applyClaudeHeaders(req, auth, "key-xapp", false, nil, nil)
+
+	if got := req.Header.Get("X-App"); got != "cli" {
+		t.Fatalf("X-App = %q, want %q (client value must not leak)", got, "cli")
+	}
+}
+
+// TestApplyClaudeHeaders_ManagedXAppStillWins confirms A6.1 does not break the
+// intentional per-account managed X-App override path: header:X-App is applied
+// after the forced default and remains authoritative.
+func TestApplyClaudeHeaders_ManagedXAppStillWins(t *testing.T) {
+	resetClaudeDeviceProfileCache()
+
+	req := newClaudeHeaderTestRequest(t, http.Header{
+		"X-App": []string{"browser"},
+	})
+	auth := &cliproxyauth.Auth{
+		Attributes: map[string]string{
+			"api_key":      "key-xapp-managed",
+			"header:X-App": "cli",
+		},
+	}
+	applyClaudeHeaders(req, auth, "key-xapp-managed", false, nil, nil)
+
+	if got := req.Header.Get("X-App"); got != "cli" {
+		t.Fatalf("X-App = %q, want %q", got, "cli")
+	}
+}
+
+// TestApplyClaudeHeaders_AnthropicBetaUnionsClientWithFloor verifies A6.2:
+// baseBetas is unioned with the client's real anthropic-beta set (not replaced),
+// so baseBetas-only floor entries survive, client-only entries are preserved,
+// strong-fill entries are present, and the set only grows (never-down).
+func TestApplyClaudeHeaders_AnthropicBetaUnionsClientWithFloor(t *testing.T) {
+	resetClaudeDeviceProfileCache()
+
+	// Client sends a narrow beta set that includes one client-only beta and
+	// omits several floor betas.
+	req := newClaudeHeaderTestRequest(t, http.Header{
+		"Anthropic-Beta": []string{"claude-code-20250219,fine-grained-tool-streaming-2025-05-14"},
+	})
+	auth := &cliproxyauth.Auth{
+		Attributes: map[string]string{"api_key": "key-beta"},
+	}
+	applyClaudeHeaders(req, auth, "key-beta", false, nil, nil)
+
+	got := betaSetFromHeader(req.Header.Get("Anthropic-Beta"))
+
+	// Floor (baseBetas-only) entries must not be dropped by a narrow client set.
+	for _, floorBeta := range []string{
+		"claude-code-20250219",
+		"interleaved-thinking-2025-05-14",
+		"thinking-token-count-2026-05-13",
+		"context-management-2025-06-27",
+		"prompt-caching-scope-2026-01-05",
+		"mid-conversation-system-2026-04-07",
+	} {
+		if !got[floorBeta] {
+			t.Fatalf("Anthropic-Beta missing floor beta %q; header=%q", floorBeta, req.Header.Get("Anthropic-Beta"))
+		}
+	}
+	// Client-only beta is preserved.
+	if !got["fine-grained-tool-streaming-2025-05-14"] {
+		t.Fatalf("Anthropic-Beta dropped client-only beta; header=%q", req.Header.Get("Anthropic-Beta"))
+	}
+	// Strong-fill oauth beta present.
+	if !got["oauth-2025-04-20"] {
+		t.Fatalf("Anthropic-Beta missing strong-fill oauth-2025-04-20; header=%q", req.Header.Get("Anthropic-Beta"))
+	}
+	// We must NOT inject betas real claude-cli never sends.
+	for _, forbidden := range []string{
+		"structured-outputs-2025-12-15",
+		"fast-mode-2026-02-01",
+		"redact-thinking-2026-02-12",
+		"token-efficient-tools-2026-03-28",
+		"context-1m-2025-08-07",
+	} {
+		if got[forbidden] {
+			t.Fatalf("Anthropic-Beta should not contain %q; header=%q", forbidden, req.Header.Get("Anthropic-Beta"))
+		}
+	}
+}
+
+// TestApplyClaudeHeaders_AnthropicBetaFloorWithoutClient verifies A6.2 keeps the
+// full real-claude-cli-aligned floor when the client sends no anthropic-beta.
+func TestApplyClaudeHeaders_AnthropicBetaFloorWithoutClient(t *testing.T) {
+	resetClaudeDeviceProfileCache()
+
+	req := newClaudeHeaderTestRequest(t, http.Header{})
+	auth := &cliproxyauth.Auth{
+		Attributes: map[string]string{"api_key": "key-beta-floor"},
+	}
+	applyClaudeHeaders(req, auth, "key-beta-floor", false, nil, nil)
+
+	got := betaSetFromHeader(req.Header.Get("Anthropic-Beta"))
+	for _, floorBeta := range []string{
+		"claude-code-20250219",
+		"oauth-2025-04-20",
+		"interleaved-thinking-2025-05-14",
+		"thinking-token-count-2026-05-13",
+		"context-management-2025-06-27",
+		"prompt-caching-scope-2026-01-05",
+		"mid-conversation-system-2026-04-07",
+	} {
+		if !got[floorBeta] {
+			t.Fatalf("Anthropic-Beta missing floor beta %q; header=%q", floorBeta, req.Header.Get("Anthropic-Beta"))
+		}
+	}
+}
+
+// TestClaudeDeviceProfileStaleGuardActive_DetectsStaleProneConfig verifies A6.3
+// detects only the stale-prone configuration: stabilize on, online-update
+// explicitly off, and no operator baseline UA. Any of: stabilize off, online on,
+// or a configured baseline UA, disarms the guard.
+func TestClaudeDeviceProfileStaleGuardActive_DetectsStaleProneConfig(t *testing.T) {
+	stabilize := true
+	online := true
+	offline := false
+
+	staleCfg := &config.Config{
+		ClaudeHeaderDefaults: config.ClaudeHeaderDefaults{
+			StabilizeDeviceProfile: &stabilize,
+		},
+		ManagedHeaderProfile: config.ManagedHeaderProfileConfig{OnlineUpdate: &offline},
+	}
+	if !helps.ClaudeDeviceProfileStaleGuardActive(staleCfg) {
+		t.Fatalf("expected guard active for stabilize+online-off+no-baseline")
+	}
+
+	// Configured baseline UA is an explicit authoritative floor; guard off.
+	baselineCfg := &config.Config{
+		ClaudeHeaderDefaults: config.ClaudeHeaderDefaults{
+			StabilizeDeviceProfile: &stabilize,
+			UserAgent:              "claude-cli/2.1.158 (external, cli)",
+		},
+		ManagedHeaderProfile: config.ManagedHeaderProfileConfig{OnlineUpdate: &offline},
+	}
+	if helps.ClaudeDeviceProfileStaleGuardActive(baselineCfg) {
+		t.Fatalf("guard must be off when an operator baseline UA is configured")
+	}
+
+	// Online-update on disarms the guard.
+	onlineCfg := &config.Config{
+		ClaudeHeaderDefaults: config.ClaudeHeaderDefaults{StabilizeDeviceProfile: &stabilize},
+		ManagedHeaderProfile: config.ManagedHeaderProfileConfig{OnlineUpdate: &online},
+	}
+	if helps.ClaudeDeviceProfileStaleGuardActive(onlineCfg) {
+		t.Fatalf("guard must be off when online-update is enabled")
+	}
+
+	// Stabilize off disarms the guard.
+	if helps.ClaudeDeviceProfileStaleGuardActive(&config.Config{}) {
+		t.Fatalf("guard must be off when stabilize is disabled")
+	}
+}
+
+// TestApplyClaudeHeaders_StaleGuardOffPreservesObservedNewerClient confirms A6.3
+// does not overwrite a newer real first-party client value with the stale frozen
+// baseline when online-update is off and the cache is empty: the observed newer
+// value wins (only-up, never the stale floor).
+func TestApplyClaudeHeaders_StaleGuardOffPreservesObservedNewerClient(t *testing.T) {
+	resetClaudeDeviceProfileCache()
+	stabilize := true
+	offline := false
+
+	cfg := &config.Config{
+		ClaudeHeaderDefaults: config.ClaudeHeaderDefaults{
+			OS:                     "MacOS",
+			Arch:                   "arm64",
+			StabilizeDeviceProfile: &stabilize,
+		},
+		ManagedHeaderProfile: config.ManagedHeaderProfileConfig{OnlineUpdate: &offline},
+	}
+	auth := &cliproxyauth.Auth{
+		ID:         "auth-stale-guard",
+		Attributes: map[string]string{"api_key": "key-stale-guard"},
+	}
+
+	// Real client far newer than the frozen built-in baseline (2.1.63).
+	req := newClaudeHeaderTestRequest(t, http.Header{
+		"User-Agent":                  []string{"claude-cli/2.1.158 (external, cli)"},
+		"X-Stainless-Package-Version": []string{"0.94.0"},
+		"X-Stainless-Runtime-Version": []string{"v24.3.0"},
+		"X-Stainless-Os":              []string{"MacOS"},
+		"X-Stainless-Arch":            []string{"arm64"},
+	})
+	applyClaudeHeaders(req, auth, "key-stale-guard", false, nil, cfg)
+	assertClaudeFingerprint(t, req.Header, "claude-cli/2.1.158 (external, cli)", "0.94.0", "v24.3.0", "MacOS", "arm64")
+}

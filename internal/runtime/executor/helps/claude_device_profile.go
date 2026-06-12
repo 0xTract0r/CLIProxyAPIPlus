@@ -108,6 +108,30 @@ func ClaudeDeviceProfileStabilizationEnabled(cfg *config.Config) bool {
 	return *cfg.ClaudeHeaderDefaults.StabilizeDeviceProfile
 }
 
+// ClaudeDeviceProfileStaleGuardActive reports whether the runtime is in the
+// stale-prone managed-header configuration described in
+// docs/fingerprint/cpa-reqs/07-header-cwd-revised-plan.md §2.6/§4.1: stabilize
+// is enabled, online-update is explicitly disabled, AND no operator baseline
+// User-Agent is configured. In that combination the only floor left is the
+// hardcoded defaultClaudeFingerprintUserAgent constant, which drifts stale as
+// real claude-cli advances. When the observation cache is also empty (e.g.
+// right after start or for a not-yet-seen account), an unparseable/third-party
+// client request would fall back to that frozen constant and could produce an
+// "old UA + new body" mismatch. This predicate lets the resolve path surface a
+// one-time operator warning. It does not change flooring behavior: an
+// explicitly configured baseline is still an intentional, authoritative floor.
+func ClaudeDeviceProfileStaleGuardActive(cfg *config.Config) bool {
+	if !ClaudeDeviceProfileStabilizationEnabled(cfg) {
+		return false
+	}
+	if config.ManagedHeaderOnlineUpdateEnabled(cfg) {
+		return false
+	}
+	// An operator-configured baseline UA is an explicit, authoritative floor;
+	// it is not the stale hardcoded constant, so the guard does not apply.
+	return cfg == nil || strings.TrimSpace(cfg.ClaudeHeaderDefaults.UserAgent) == ""
+}
+
 func ResetClaudeDeviceProfileCache() {
 	claudeDeviceProfileCacheMu.Lock()
 	claudeDeviceProfileCache = make(map[string]claudeDeviceProfileCacheEntry)
