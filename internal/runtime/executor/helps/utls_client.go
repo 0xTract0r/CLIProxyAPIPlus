@@ -5,7 +5,6 @@ import (
 	"net"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	tls "github.com/refraction-networking/utls"
@@ -13,19 +12,28 @@ import (
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/proxyutil"
 	log "github.com/sirupsen/logrus"
-	"golang.org/x/net/http2"
 	"golang.org/x/net/proxy"
 )
 
-// utlsRoundTripper implements http.RoundTripper using utls with Chrome fingerprint
-// to bypass Cloudflare's TLS fingerprinting on protected domains.
+// claudeCLIClientHelloProfileID is the project profile that replicates the
+// real claude-cli (Node/OpenSSL) ClientHello. Resolving it yields a uTLS
+// HelloCustom ID; the matching spec is built by newClaudeCLIClientHelloSpec.
+const claudeCLIClientHelloProfileID = "claude_cli_clienthello_v1"
+
+// claudeCLIALPN is the only ALPN protocol real claude-cli advertises.
+// claude-cli negotiates http/1.1 and never offers h2, so the outbound
+// connection must speak HTTP/1.1 (no HTTP/2, no h2 in ALPN).
+var claudeCLIALPN = []string{"http/1.1"}
+
+// utlsRoundTripper implements http.RoundTripper using utls to replicate a
+// target client TLS fingerprint on protected API hosts. The default profile
+// replicates real claude-cli (HelloCustom + ALPN http/1.1); other profiles
+// keep the prior Chrome-like presets. Transport is HTTP/1.1 only.
 type utlsRoundTripper struct {
-	mu          sync.Mutex
-	connections map[string]*http2.ClientConn
-	pending     map[string]*sync.Cond
 	dialer      proxy.Dialer
 	clientHello tls.ClientHelloID
 	insecure    bool
+	transport   *http.Transport
 }
 
 func newUtlsRoundTripper(proxyURL string, clientHello tls.ClientHelloID) *utlsRoundTripper {
@@ -38,119 +46,241 @@ func newUtlsRoundTripper(proxyURL string, clientHello tls.ClientHelloID) *utlsRo
 			dialer = proxyDialer
 		}
 	}
-	return &utlsRoundTripper{
-		connections: make(map[string]*http2.ClientConn),
-		pending:     make(map[string]*sync.Cond),
+	rt := &utlsRoundTripper{
 		dialer:      dialer,
 		clientHello: clientHello,
 	}
+	rt.transport = rt.newHTTP11Transport()
+	return rt
 }
 
 func newDiagnosticUtlsRoundTripper(dialer proxy.Dialer, clientHello tls.ClientHelloID) *utlsRoundTripper {
 	if dialer == nil {
 		dialer = proxy.Direct
 	}
-	return &utlsRoundTripper{
-		connections: make(map[string]*http2.ClientConn),
-		pending:     make(map[string]*sync.Cond),
+	rt := &utlsRoundTripper{
 		dialer:      dialer,
 		clientHello: clientHello,
 		insecure:    true,
 	}
+	rt.transport = rt.newHTTP11Transport()
+	return rt
 }
 
-func (t *utlsRoundTripper) getOrCreateConnection(host, addr string) (*http2.ClientConn, error) {
-	t.mu.Lock()
+// newHTTP11Transport builds an HTTP/1.1-only transport that performs the uTLS
+// handshake via DialTLSContext. ForceAttemptHTTP2 is disabled and the uTLS
+// connection only advertises http/1.1, so the upgrade to HTTP/2 never happens.
+func (t *utlsRoundTripper) newHTTP11Transport() *http.Transport {
+	return &http.Transport{
+		ForceAttemptHTTP2:   false,
+		DialTLSContext:      t.dialTLSContext,
+		MaxIdleConns:        100,
+		IdleConnTimeout:     90 * time.Second,
+		TLSHandshakeTimeout: 0,
+	}
+}
 
-	if h2Conn, ok := t.connections[host]; ok && h2Conn.CanTakeNewRequest() {
-		t.mu.Unlock()
-		return h2Conn, nil
+// dialTLSContext dials the upstream and performs the uTLS handshake. When the
+// configured ClientHello is HelloCustom, it applies the claude-cli ClientHello
+// spec. If the custom handshake fails, it falls back to the prior Chrome-like
+// behavior so connectivity is preserved (global fallback, not per-account).
+func (t *utlsRoundTripper) dialTLSContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
 	}
 
-	if cond, ok := t.pending[host]; ok {
-		cond.Wait()
-		if h2Conn, ok := t.connections[host]; ok && h2Conn.CanTakeNewRequest() {
-			t.mu.Unlock()
-			return h2Conn, nil
-		}
+	conn, err := t.handshake(ctx, host, addr, t.clientHello)
+	if err == nil {
+		return conn, nil
 	}
 
-	cond := sync.NewCond(&t.mu)
-	t.pending[host] = cond
-	t.mu.Unlock()
+	// P1.7: handshake failure falls back to the existing Chrome-like
+	// implementation. This is a global behavior, not per-account.
+	fallbackHello := tls.HelloChrome_133
+	if t.clientHello.Str() == fallbackHello.Str() {
+		return nil, err
+	}
+	log.Debugf("utls: custom ClientHello handshake to %s failed (%v); falling back to %s", host, err, fallbackHello.Str())
+	return t.handshake(ctx, host, addr, fallbackHello)
+}
 
-	h2Conn, err := t.createConnection(host, addr)
-
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	delete(t.pending, host)
-	cond.Broadcast()
-
+// handshake performs a single uTLS handshake with the given ClientHelloID.
+// The resulting ClientHello always advertises ALPN http/1.1 only, so the
+// stdlib transport speaks HTTP/1.1 (no HTTP/2 negotiation) for both the
+// replicated claude-cli profile and the Chrome-like fallback.
+func (t *utlsRoundTripper) handshake(ctx context.Context, host, addr string, clientHelloID tls.ClientHelloID) (net.Conn, error) {
+	spec, err := t.clientHelloSpec(clientHelloID)
 	if err != nil {
 		return nil, err
 	}
 
-	t.connections[host] = h2Conn
-	return h2Conn, nil
-}
-
-func (t *utlsRoundTripper) createConnection(host, addr string) (*http2.ClientConn, error) {
-	conn, err := t.dialer.Dial("tcp", addr)
+	rawConn, err := t.dialContext(ctx, "tcp", addr)
 	if err != nil {
 		return nil, err
 	}
 
 	tlsConfig := &tls.Config{ServerName: host, InsecureSkipVerify: t.insecure}
-	clientHello := t.clientHello
-	if !clientHello.IsSet() {
-		clientHello = tls.HelloChrome_133
-	}
-	tlsConn := tls.UClient(conn, tlsConfig, clientHello)
-
-	if err := tlsConn.Handshake(); err != nil {
-		conn.Close()
-		return nil, err
+	tlsConn := tls.UClient(rawConn, tlsConfig, tls.HelloCustom)
+	if errApply := tlsConn.ApplyPreset(spec); errApply != nil {
+		_ = rawConn.Close()
+		return nil, errApply
 	}
 
-	tr := &http2.Transport{}
-	h2Conn, err := tr.NewClientConn(tlsConn)
+	if errHS := tlsConn.HandshakeContext(ctx); errHS != nil {
+		_ = rawConn.Close()
+		return nil, errHS
+	}
+	return tlsConn, nil
+}
+
+// clientHelloSpec returns the ClientHelloSpec for the given ID. The replicated
+// claude-cli profile (HelloCustom) uses newClaudeCLIClientHelloSpec; any other
+// preset is materialized via UTLSIdToSpec and then forced to advertise ALPN
+// http/1.1 only, so the fallback path also speaks HTTP/1.1 cleanly.
+func (t *utlsRoundTripper) clientHelloSpec(clientHelloID tls.ClientHelloID) (*tls.ClientHelloSpec, error) {
+	if clientHelloID.Str() == tls.HelloCustom.Str() {
+		return newClaudeCLIClientHelloSpec()
+	}
+	spec, err := tls.UTLSIdToSpec(clientHelloID)
 	if err != nil {
-		tlsConn.Close()
 		return nil, err
 	}
+	forceALPNHTTP11(&spec)
+	return &spec, nil
+}
 
-	return h2Conn, nil
+// forceALPNHTTP11 rewrites any ALPN extension in the spec to advertise only
+// http/1.1, ensuring the negotiated protocol is HTTP/1.1.
+func forceALPNHTTP11(spec *tls.ClientHelloSpec) {
+	for _, ext := range spec.Extensions {
+		if alpn, ok := ext.(*tls.ALPNExtension); ok {
+			alpn.AlpnProtocols = append([]string(nil), claudeCLIALPN...)
+		}
+	}
+}
+
+// dialContext dials using the configured proxy dialer, honoring ctx when the
+// dialer supports it.
+func (t *utlsRoundTripper) dialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	if ctxDialer, ok := t.dialer.(proxy.ContextDialer); ok {
+		return ctxDialer.DialContext(ctx, network, addr)
+	}
+	type result struct {
+		conn net.Conn
+		err  error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		conn, err := t.dialer.Dial(network, addr)
+		ch <- result{conn: conn, err: err}
+	}()
+	select {
+	case <-ctx.Done():
+		go func() {
+			if r := <-ch; r.conn != nil {
+				_ = r.conn.Close()
+			}
+		}()
+		return nil, ctx.Err()
+	case r := <-ch:
+		return r.conn, r.err
+	}
 }
 
 func (t *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	hostname := req.URL.Hostname()
-	port := req.URL.Port()
-	if port == "" {
-		port = "443"
-	}
-	addr := net.JoinHostPort(hostname, port)
-
-	h2Conn, err := t.getOrCreateConnection(hostname, addr)
-	if err != nil {
-		return nil, err
-	}
-
-	resp, err := h2Conn.RoundTrip(req)
-	if err != nil {
-		t.mu.Lock()
-		if cached, ok := t.connections[hostname]; ok && cached == h2Conn {
-			delete(t.connections, hostname)
-		}
-		t.mu.Unlock()
-		return nil, err
-	}
-
-	return resp, nil
+	return t.transport.RoundTrip(req)
 }
 
-// utlsProtectedHosts contains the hosts that should use utls Chrome TLS fingerprint
-// to bypass Cloudflare's TLS fingerprinting.
+// newClaudeCLIClientHelloSpec builds the uTLS ClientHelloSpec that replicates
+// the real claude-cli (Node/OpenSSL) ClientHello, targeting
+// JA3 e97f5146a7009cc2918b50e903b6ff8d. Cipher suites and the 12 extensions
+// (with their wire order) follow docs/fingerprint/cpa-reqs/03-tls-target.md.
+// No GREASE, no ALPS(17513), no ECH, no padding.
+//
+// Note: the JA3 target was captured against an IP (no SNI). For production
+// connections to a real host, an SNI(server_name) extension is added first per
+// OpenSSL convention so the handshake succeeds; that adds extension 0 to the
+// JA3 extensions list and flips the JA4 first segment from t13i to t13d, which
+// is expected. The cipher/curve/order structure still matches the target.
+func newClaudeCLIClientHelloSpec() (*tls.ClientHelloSpec, error) {
+	return &tls.ClientHelloSpec{
+		// JA3 ciphers: 4865-4866-4867-49195-49199-49196-49200-52393-52392-49161-49171-49162-49172-156-157-47-53
+		CipherSuites: []uint16{
+			tls.TLS_AES_128_GCM_SHA256,                        // 0x1301
+			tls.TLS_AES_256_GCM_SHA384,                        // 0x1302
+			tls.TLS_CHACHA20_POLY1305_SHA256,                  // 0x1303
+			tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,       // 0xc02b
+			tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,         // 0xc02f
+			tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,       // 0xc02c
+			tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,         // 0xc030
+			tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256, // 0xcca9
+			tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,   // 0xcca8
+			tls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA,          // 0xc009
+			tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,            // 0xc013
+			tls.TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA,          // 0xc00a
+			tls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,            // 0xc014
+			tls.TLS_RSA_WITH_AES_128_GCM_SHA256,               // 0x009c
+			tls.TLS_RSA_WITH_AES_256_GCM_SHA384,               // 0x009d
+			tls.TLS_RSA_WITH_AES_128_CBC_SHA,                  // 0x002f
+			tls.TLS_RSA_WITH_AES_256_CBC_SHA,                  // 0x0035
+		},
+		CompressionMethods: []byte{0x00}, // null
+		Extensions: []tls.TLSExtension{
+			// server_name(0): not in the IP-capture JA3 (extension list
+			// 23-65281-10-11-35-16-5-13-18-51-45-43). Added first per OpenSSL
+			// convention so the handshake works against a real host. SNI value
+			// is filled from tls.Config.ServerName by ApplyPreset.
+			&tls.SNIExtension{},
+			// 1. extended_master_secret (0x0017 / 23)
+			&tls.ExtendedMasterSecretExtension{},
+			// 2. renegotiation_info (0xff01 / 65281)
+			&tls.RenegotiationInfoExtension{Renegotiation: tls.RenegotiateOnceAsClient},
+			// 3. supported_groups (0x000a / 10): x25519, secp256r1, secp384r1
+			&tls.SupportedCurvesExtension{Curves: []tls.CurveID{
+				tls.X25519,    // 29
+				tls.CurveP256, // 23
+				tls.CurveP384, // 24
+			}},
+			// 4. ec_point_formats (0x000b / 11): uncompressed
+			&tls.SupportedPointsExtension{SupportedPoints: []uint8{0x00}},
+			// 5. session_ticket (0x0023 / 35)
+			&tls.SessionTicketExtension{},
+			// 6. ALPN (0x0010 / 16): only http/1.1
+			&tls.ALPNExtension{AlpnProtocols: append([]string(nil), claudeCLIALPN...)},
+			// 7. status_request (0x0005 / 5)
+			&tls.StatusRequestExtension{},
+			// 8. signature_algorithms (0x000d / 13)
+			&tls.SignatureAlgorithmsExtension{SupportedSignatureAlgorithms: []tls.SignatureScheme{
+				tls.ECDSAWithP256AndSHA256, // 0x0403
+				tls.PSSWithSHA256,          // 0x0804
+				tls.PKCS1WithSHA256,        // 0x0401
+				tls.ECDSAWithP384AndSHA384, // 0x0503
+				tls.PSSWithSHA384,          // 0x0805
+				tls.PKCS1WithSHA384,        // 0x0501
+				tls.PSSWithSHA512,          // 0x0806
+				tls.PKCS1WithSHA512,        // 0x0601
+				tls.PKCS1WithSHA1,          // 0x0201
+			}},
+			// 9. signed_certificate_timestamp / SCT (0x0012 / 18)
+			&tls.SCTExtension{},
+			// 10. key_share (0x0033 / 51): only x25519 (Data auto-filled by ApplyPreset)
+			&tls.KeyShareExtension{KeyShares: []tls.KeyShare{
+				{Group: tls.X25519},
+			}},
+			// 11. psk_key_exchange_modes (0x002d / 45): psk_dhe_ke
+			&tls.PSKKeyExchangeModesExtension{Modes: []uint8{tls.PskModeDHE}},
+			// 12. supported_versions (0x002b / 43): TLS1.3, TLS1.2
+			&tls.SupportedVersionsExtension{Versions: []uint16{
+				tls.VersionTLS13,
+				tls.VersionTLS12,
+			}},
+		},
+	}, nil
+}
+
+// utlsProtectedHosts contains the hosts that should use the utls replicated TLS
+// fingerprint to match the claimed client identity on protected upstreams.
 var utlsProtectedHosts = map[string]struct{}{
 	"api.anthropic.com": {},
 	"chatgpt.com":       {},
@@ -172,19 +302,20 @@ func (f *fallbackRoundTripper) RoundTrip(req *http.Request) (*http.Response, err
 	return f.fallback.RoundTrip(req)
 }
 
-// NewUtlsHTTPClient creates an HTTP client using a Chrome-like uTLS preset for
-// protected API hosts. This is a project-managed preset, not an official Claude
-// Code TLS fingerprint or provider-edge parity claim. Falls back to standard
-// transport for non-HTTPS requests. A round tripper injected via the
+// NewUtlsHTTPClient creates an HTTP client that replicates the real claude-cli
+// (Node/OpenSSL) TLS fingerprint for protected API hosts (target JA3
+// e97f5146a7009cc2918b50e903b6ff8d, ALPN http/1.1). Falls back to the standard
+// transport for non-HTTPS requests, and to the prior Chrome-like ClientHello if
+// the custom handshake fails. A round tripper injected via the
 // "cliproxy.roundtripper" context value is honored when no explicit proxy is set.
 func NewUtlsHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, timeout time.Duration) *http.Client {
-	return NewUtlsHTTPClientForProfile(ctx, cfg, auth, timeout, "claude_utls_chrome_133")
+	return NewUtlsHTTPClientForProfile(ctx, cfg, auth, timeout, claudeCLIClientHelloProfileID)
 }
 
 func NewUtlsRoundTripperForProfile(proxyURL string, profileID string) http.RoundTripper {
 	clientHello, ok := resolveClaudeClientHelloID(profileID)
 	if !ok {
-		clientHello, _ = resolveClaudeClientHelloID("claude_utls_chrome_133")
+		clientHello, _ = resolveClaudeClientHelloID(claudeCLIClientHelloProfileID)
 	}
 	return &fallbackRoundTripper{
 		utls:     newUtlsRoundTripper(proxyURL, clientHello),
@@ -203,7 +334,7 @@ func NewUtlsHTTPClientForProfile(ctx context.Context, cfg *config.Config, auth *
 
 	clientHello, ok := resolveClaudeClientHelloID(profileID)
 	if !ok {
-		clientHello, _ = resolveClaudeClientHelloID("claude_utls_chrome_133")
+		clientHello, _ = resolveClaudeClientHelloID(claudeCLIClientHelloProfileID)
 	}
 
 	var ctxRoundTripper http.RoundTripper
@@ -247,6 +378,9 @@ func standardTransportForProxy(proxyURL string) http.RoundTripper {
 
 func resolveClaudeClientHelloID(profileID string) (tls.ClientHelloID, bool) {
 	switch strings.ToLower(strings.TrimSpace(profileID)) {
+	case claudeCLIClientHelloProfileID, "claude_cli_clienthello", "claude_node_openssl_v1":
+		// P1.5: replicate real claude-cli (Node/OpenSSL) ClientHello.
+		return tls.HelloCustom, true
 	case "claude_utls_chrome_133", "claude_chrome_like_mac_v3", "chrome_133":
 		return tls.HelloChrome_133, true
 	case "claude_chrome_like_mac_v1", "chrome_120":
