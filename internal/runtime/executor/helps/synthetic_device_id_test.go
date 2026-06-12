@@ -67,15 +67,37 @@ func TestSyntheticDeviceID_StableAcrossSaltReload(t *testing.T) {
 	}
 }
 
+// assertUserIDIsStringWithInnerJSON enforces the egress invariant that broke in
+// production: metadata.user_id must be a JSON *string* (not an object), and its
+// content must itself be valid JSON carrying device_id/account_uuid/session_id.
+// Anthropic validates metadata.user_id as an opaque string; an object value gets the
+// whole request rejected with HTTP 400 "metadata.user_id: Input should be a valid
+// string". It returns the parsed inner JSON text for further field assertions.
+func assertUserIDIsStringWithInnerJSON(t *testing.T, out []byte) string {
+	t.Helper()
+	field := gjson.GetBytes(out, "metadata.user_id")
+	if field.Type != gjson.String {
+		t.Fatalf("metadata.user_id must be a JSON string (Anthropic rejects objects with 400), got type=%v value=%q", field.Type, field.Raw)
+	}
+	inner := field.String()
+	if !gjson.Valid(inner) {
+		t.Fatalf("metadata.user_id string content must be valid JSON text, got %q", inner)
+	}
+	return inner
+}
+
 func TestInjectAccountDeviceID_ReplacesOnlyDeviceID(t *testing.T) {
 	dir := newTestAuthDir(t)
 	auth := &cliproxyauth.Auth{FileName: "account-a.json"}
 
-	payload := []byte(`{"model":"claude","metadata":{"user_id":{"device_id":"realdevice","account_uuid":"acct-uuid","session_id":"sess-uuid"}},"messages":[{"role":"user","content":"hi"}]}`)
+	// The client sends metadata.user_id as a JSON *string* whose content is JSON.
+	payload := []byte(`{"model":"claude","metadata":{"user_id":"{\"device_id\":\"realdevice\",\"account_uuid\":\"acct-uuid\",\"session_id\":\"sess-uuid\"}"},"messages":[{"role":"user","content":"hi"}]}`)
 
 	out := InjectAccountDeviceID(payload, dir, auth, "api-key-1")
 
-	gotDevice := gjson.GetBytes(out, "metadata.user_id.device_id").String()
+	inner := assertUserIDIsStringWithInnerJSON(t, out)
+
+	gotDevice := gjson.Get(inner, "device_id").String()
 	if gotDevice == "realdevice" {
 		t.Fatalf("expected device_id to be rewritten, still got real value")
 	}
@@ -83,10 +105,10 @@ func TestInjectAccountDeviceID_ReplacesOnlyDeviceID(t *testing.T) {
 		t.Fatalf("expected synthetic 64-hex device_id, got %q", gotDevice)
 	}
 	// session_id and account_uuid must be preserved untouched.
-	if got := gjson.GetBytes(out, "metadata.user_id.session_id").String(); got != "sess-uuid" {
+	if got := gjson.Get(inner, "session_id").String(); got != "sess-uuid" {
 		t.Fatalf("expected session_id preserved, got %q", got)
 	}
-	if got := gjson.GetBytes(out, "metadata.user_id.account_uuid").String(); got != "acct-uuid" {
+	if got := gjson.Get(inner, "account_uuid").String(); got != "acct-uuid" {
 		t.Fatalf("expected account_uuid preserved, got %q", got)
 	}
 	// Unrelated fields (messages) must not be touched (cache integrity).
@@ -95,18 +117,19 @@ func TestInjectAccountDeviceID_ReplacesOnlyDeviceID(t *testing.T) {
 	}
 }
 
-func TestInjectAccountDeviceID_BuildsObjectWhenMissing(t *testing.T) {
+func TestInjectAccountDeviceID_BuildsStringWhenMissing(t *testing.T) {
 	dir := newTestAuthDir(t)
 	auth := &cliproxyauth.Auth{FileName: "account-a.json"}
 
 	payload := []byte(`{"model":"claude","messages":[]}`)
 	out := InjectAccountDeviceID(payload, dir, auth, "")
 
-	device := gjson.GetBytes(out, "metadata.user_id.device_id").String()
+	inner := assertUserIDIsStringWithInnerJSON(t, out)
+	device := gjson.Get(inner, "device_id").String()
 	if !hex64.MatchString(device) {
-		t.Fatalf("expected synthetic device_id object built, got %q", device)
+		t.Fatalf("expected synthetic device_id built, got %q", device)
 	}
-	if !gjson.GetBytes(out, "metadata.user_id.session_id").Exists() {
+	if !gjson.Get(inner, "session_id").Exists() {
 		t.Fatalf("expected a session_id to be generated")
 	}
 }
@@ -118,10 +141,8 @@ func TestInjectAccountDeviceID_ReplacesLegacyFlatString(t *testing.T) {
 	payload := []byte(`{"metadata":{"user_id":"user_abc_account_x_session_y"}}`)
 	out := InjectAccountDeviceID(payload, dir, auth, "")
 
-	if !gjson.GetBytes(out, "metadata.user_id").IsObject() {
-		t.Fatalf("expected legacy flat string replaced with synthetic object")
-	}
-	device := gjson.GetBytes(out, "metadata.user_id.device_id").String()
+	inner := assertUserIDIsStringWithInnerJSON(t, out)
+	device := gjson.Get(inner, "device_id").String()
 	if !hex64.MatchString(device) {
 		t.Fatalf("expected synthetic device_id, got %q", device)
 	}
@@ -160,11 +181,12 @@ func TestInjectAccountDeviceIDWithOptions_NoFabricate_ReplacesExistingDeviceID(t
 	dir := newTestAuthDir(t)
 	auth := &cliproxyauth.Auth{FileName: "account-a.json"}
 
-	payload := []byte(`{"model":"claude","metadata":{"user_id":{"device_id":"realdevice","account_uuid":"acct-uuid","session_id":"sess-uuid"}},"messages":[{"role":"user","content":"hi"}]}`)
+	payload := []byte(`{"model":"claude","metadata":{"user_id":"{\"device_id\":\"realdevice\",\"account_uuid\":\"acct-uuid\",\"session_id\":\"sess-uuid\"}"},"messages":[{"role":"user","content":"hi"}]}`)
 
 	out := InjectAccountDeviceIDWithOptions(payload, dir, auth, "api-key-1", false)
 
-	gotDevice := gjson.GetBytes(out, "metadata.user_id.device_id").String()
+	inner := assertUserIDIsStringWithInnerJSON(t, out)
+	gotDevice := gjson.Get(inner, "device_id").String()
 	if gotDevice == "realdevice" {
 		t.Fatalf("expected device_id to be rewritten, still got real value")
 	}
@@ -176,10 +198,10 @@ func TestInjectAccountDeviceIDWithOptions_NoFabricate_ReplacesExistingDeviceID(t
 	if gotDevice != wantDevice {
 		t.Fatalf("expected device_id derived from the same account scope, got %q want %q", gotDevice, wantDevice)
 	}
-	if got := gjson.GetBytes(out, "metadata.user_id.session_id").String(); got != "sess-uuid" {
+	if got := gjson.Get(inner, "session_id").String(); got != "sess-uuid" {
 		t.Fatalf("expected session_id preserved, got %q", got)
 	}
-	if got := gjson.GetBytes(out, "metadata.user_id.account_uuid").String(); got != "acct-uuid" {
+	if got := gjson.Get(inner, "account_uuid").String(); got != "acct-uuid" {
 		t.Fatalf("expected account_uuid preserved, got %q", got)
 	}
 }
@@ -232,10 +254,8 @@ func TestInjectAccountDeviceIDWithOptions_NoFabricate_ReplacesLegacyFlatString(t
 	payload := []byte(`{"metadata":{"user_id":"user_abc_account_x_session_y"}}`)
 	out := InjectAccountDeviceIDWithOptions(payload, dir, auth, "", false)
 
-	if !gjson.GetBytes(out, "metadata.user_id").IsObject() {
-		t.Fatalf("expected legacy flat string replaced with synthetic object")
-	}
-	device := gjson.GetBytes(out, "metadata.user_id.device_id").String()
+	inner := assertUserIDIsStringWithInnerJSON(t, out)
+	device := gjson.Get(inner, "device_id").String()
 	if !hex64.MatchString(device) {
 		t.Fatalf("expected synthetic device_id, got %q", device)
 	}
@@ -257,7 +277,7 @@ func TestInjectAccountDeviceIDWithOptions_NoFabricate_InvalidPayloadPassesThroug
 
 // TestInjectAccountDeviceID_MainPathStillFabricates guards against a regression on
 // the main messages path: the fabricate-default wrapper must keep creating a
-// synthetic metadata.user_id when the field is missing.
+// synthetic metadata.user_id (as a JSON string) when the field is missing.
 func TestInjectAccountDeviceID_MainPathStillFabricates(t *testing.T) {
 	dir := newTestAuthDir(t)
 	auth := &cliproxyauth.Auth{FileName: "account-a.json"}
@@ -265,12 +285,43 @@ func TestInjectAccountDeviceID_MainPathStillFabricates(t *testing.T) {
 	payload := []byte(`{"model":"claude","messages":[]}`)
 	out := InjectAccountDeviceID(payload, dir, auth, "")
 
-	if !gjson.GetBytes(out, "metadata.user_id").IsObject() {
-		t.Fatalf("expected main path to fabricate metadata.user_id, got %q", out)
-	}
-	device := gjson.GetBytes(out, "metadata.user_id.device_id").String()
+	inner := assertUserIDIsStringWithInnerJSON(t, out)
+	device := gjson.Get(inner, "device_id").String()
 	if !hex64.MatchString(device) {
 		t.Fatalf("expected synthetic device_id, got %q", device)
+	}
+}
+
+// TestInjectAccountDeviceID_EgressUserIDNeverObject is the direct regression guard
+// for the 201 real-egress 400: across all branches (existing string, legacy flat
+// string, fabricated) the emitted metadata.user_id must never be a JSON object.
+func TestInjectAccountDeviceID_EgressUserIDNeverObject(t *testing.T) {
+	dir := newTestAuthDir(t)
+	auth := &cliproxyauth.Auth{FileName: "account-a.json"}
+
+	cases := map[string][]byte{
+		"existing-json-string": []byte(`{"metadata":{"user_id":"{\"device_id\":\"realdevice\",\"account_uuid\":\"\",\"session_id\":\"s1\"}"}}`),
+		"legacy-flat-string":   []byte(`{"metadata":{"user_id":"user_abc_account_x_session_y"}}`),
+		"missing":              []byte(`{"model":"claude","messages":[]}`),
+		// An unexpected object value must also be normalized back to a string, never
+		// left/emitted as an object.
+		"unexpected-object": []byte(`{"metadata":{"user_id":{"device_id":"realdevice"}}}`),
+	}
+	for name, payload := range cases {
+		t.Run(name, func(t *testing.T) {
+			out := InjectAccountDeviceID(payload, dir, auth, "k")
+			field := gjson.GetBytes(out, "metadata.user_id")
+			if field.IsObject() {
+				t.Fatalf("metadata.user_id emitted as object (would 400 at Anthropic): %q", field.Raw)
+			}
+			if field.Type != gjson.String {
+				t.Fatalf("metadata.user_id must be a string, got type=%v", field.Type)
+			}
+			device := gjson.Get(field.String(), "device_id").String()
+			if !hex64.MatchString(device) {
+				t.Fatalf("expected synthetic device_id, got %q", device)
+			}
+		})
 	}
 }
 
