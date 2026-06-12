@@ -1802,28 +1802,10 @@ func getCloakConfigFromAuth(auth *cliproxyauth.Auth) (string, bool, []string, bo
 	return cloakMode, strictMode, sensitiveWords, cacheUserID
 }
 
-// injectFakeUserID generates and injects a fake user ID into the request metadata.
-// When useCache is false, a new user ID is generated for every call.
-func injectFakeUserID(payload []byte, apiKey string, useCache bool) []byte {
-	generateID := func() string {
-		if useCache {
-			return helps.CachedUserID(apiKey)
-		}
-		return helps.GenerateFakeUserID()
-	}
-
-	metadata := gjson.GetBytes(payload, "metadata")
-	if !metadata.Exists() {
-		payload, _ = sjson.SetBytes(payload, "metadata.user_id", generateID())
-		return payload
-	}
-
-	existingUserID := gjson.GetBytes(payload, "metadata.user_id").String()
-	if existingUserID == "" || !helps.IsValidUserID(existingUserID) {
-		payload, _ = sjson.SetBytes(payload, "metadata.user_id", generateID())
-	}
-	return payload
-}
+// Account-scoped device_id rewriting now lives in helps.InjectAccountDeviceID and
+// is invoked from applyCloaking (before the ShouldCloak gate) so it also applies to
+// real claude-cli clients. The legacy injectFakeUserID path (apiKey/TTL cache) was
+// removed because the synthetic device_id is derived deterministically per account.
 
 // fingerprintSalt is the salt used by Claude Code to compute the 3-char build fingerprint.
 const fingerprintSalt = "59cf53e54c78"
@@ -2105,10 +2087,25 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 		}
 	}
 
-	// Determine if cloaking should be applied
+	// Always rewrite metadata.user_id.device_id with a per-account synthetic value.
+	// This runs before the ShouldCloak gate so it also applies to real claude-cli
+	// clients (which are otherwise excluded from cloaking). It only touches the
+	// device_id field and never injects cloak system blocks or sensitive-word
+	// obfuscation, so claude-cli traffic keeps its original system/messages/tools.
+	authDir := ""
+	if cfg != nil {
+		authDir = cfg.AuthDir
+	}
+	payload = helps.InjectAccountDeviceID(payload, authDir, auth, apiKey)
+
+	// Determine if the remaining (broader) cloak transformations should be applied.
+	// claude-cli clients are intentionally excluded here; only the device_id
+	// rewrite above applies to them.
 	if !helps.ShouldCloak(cloakMode, clientUserAgent) {
 		return payload
 	}
+
+	_ = cacheUserID // cache-based user ID is superseded by the account-scoped device_id derivation.
 
 	// Skip system instructions for claude-3-5-haiku models
 	if !strings.HasPrefix(model, "claude-3-5-haiku") {
@@ -2116,9 +2113,6 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 		workload := getWorkloadFromContext(ctx)
 		payload = checkSystemInstructionsWithSigningMode(payload, strictMode, useCCHSigning, oauthToken, billingVersion, entrypoint, workload)
 	}
-
-	// Inject fake user ID
-	payload = injectFakeUserID(payload, apiKey, cacheUserID)
 
 	// Apply sensitive word obfuscation
 	if len(sensitiveWords) > 0 {
