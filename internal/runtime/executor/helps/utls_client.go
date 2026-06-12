@@ -18,7 +18,18 @@ import (
 // claudeCLIClientHelloProfileID is the project profile that replicates the
 // real claude-cli (Node/OpenSSL) ClientHello. Resolving it yields a uTLS
 // HelloCustom ID; the matching spec is built by newClaudeCLIClientHelloSpec.
+// This profile is wired into the claude->anthropic core-managed default
+// outbound path (see coreManagedRuntimeTransportProfile in
+// transport_profile.go); it is NOT the default for NewUtlsHTTPClient, whose
+// only production caller is the codex executor (chatgpt.com).
 const claudeCLIClientHelloProfileID = "claude_cli_clienthello_v1"
+
+// utlsHTTPClientDefaultProfileID is the default ClientHello profile for
+// NewUtlsHTTPClient. Its only production caller is the codex executor
+// (host chatgpt.com), so the default must stay the Chrome-like preset used
+// before the claude-cli ClientHello work; routing codex outbound through the
+// claude-cli HelloCustom fingerprint would misrepresent the codex client.
+const utlsHTTPClientDefaultProfileID = "claude_utls_chrome_133"
 
 // claudeCLIALPN is the only ALPN protocol real claude-cli advertises.
 // claude-cli negotiates http/1.1 and never offers h2, so the outbound
@@ -302,14 +313,16 @@ func (f *fallbackRoundTripper) RoundTrip(req *http.Request) (*http.Response, err
 	return f.fallback.RoundTrip(req)
 }
 
-// NewUtlsHTTPClient creates an HTTP client that replicates the real claude-cli
-// (Node/OpenSSL) TLS fingerprint for protected API hosts (target JA3
-// e97f5146a7009cc2918b50e903b6ff8d, ALPN http/1.1). Falls back to the standard
-// transport for non-HTTPS requests, and to the prior Chrome-like ClientHello if
-// the custom handshake fails. A round tripper injected via the
+// NewUtlsHTTPClient creates an HTTP client using a Chrome-like uTLS preset for
+// protected API hosts. This is a project-managed preset, not an official Claude
+// Code TLS fingerprint or provider-edge parity claim. Its only production
+// caller is the codex executor (chatgpt.com); the claude->anthropic default
+// outbound path replicates the claude-cli ClientHello separately via the
+// core-managed runtime transport profile. Falls back to the standard transport
+// for non-HTTPS requests. A round tripper injected via the
 // "cliproxy.roundtripper" context value is honored when no explicit proxy is set.
 func NewUtlsHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, timeout time.Duration) *http.Client {
-	return NewUtlsHTTPClientForProfile(ctx, cfg, auth, timeout, claudeCLIClientHelloProfileID)
+	return NewUtlsHTTPClientForProfile(ctx, cfg, auth, timeout, utlsHTTPClientDefaultProfileID)
 }
 
 func NewUtlsRoundTripperForProfile(proxyURL string, profileID string) http.RoundTripper {
@@ -334,7 +347,7 @@ func NewUtlsHTTPClientForProfile(ctx context.Context, cfg *config.Config, auth *
 
 	clientHello, ok := resolveClaudeClientHelloID(profileID)
 	if !ok {
-		clientHello, _ = resolveClaudeClientHelloID(claudeCLIClientHelloProfileID)
+		clientHello, _ = resolveClaudeClientHelloID(utlsHTTPClientDefaultProfileID)
 	}
 
 	var ctxRoundTripper http.RoundTripper

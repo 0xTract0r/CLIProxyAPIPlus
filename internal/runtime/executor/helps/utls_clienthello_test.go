@@ -1,6 +1,7 @@
 package helps
 
 import (
+	"context"
 	"crypto/md5"
 	"encoding/hex"
 	"fmt"
@@ -44,14 +45,50 @@ func TestResolveClaudeClientHelloIDCustomProfile(t *testing.T) {
 	}
 }
 
-func TestNewUtlsHTTPClientDefaultsToCustomProfile(t *testing.T) {
-	// P1.6: the default profile is the replicated claude-cli ClientHello.
+func TestClaudeCLIClientHelloProfileResolvesToCustom(t *testing.T) {
+	// P1.6: the replicated claude-cli profile resolves to HelloCustom. This
+	// profile is wired into the claude->anthropic core-managed default outbound
+	// path (transport_profile.go), not into NewUtlsHTTPClient.
 	if claudeCLIClientHelloProfileID != "claude_cli_clienthello_v1" {
-		t.Fatalf("default profile id = %q", claudeCLIClientHelloProfileID)
+		t.Fatalf("claude-cli profile id = %q", claudeCLIClientHelloProfileID)
 	}
 	got, ok := resolveClaudeClientHelloID(claudeCLIClientHelloProfileID)
 	if !ok || got.Str() != tls.HelloCustom.Str() {
-		t.Fatalf("default profile resolves to %s, want HelloCustom", got.Str())
+		t.Fatalf("claude-cli profile resolves to %s, want HelloCustom", got.Str())
+	}
+}
+
+// TestNewUtlsHTTPClientDefaultDoesNotUseClaudeCLIClientHello guards the B1
+// regression: NewUtlsHTTPClient is consumed only by the codex executor
+// (chatgpt.com), so its default must stay the Chrome-like preset and must NOT
+// emit the claude-cli (HelloCustom) ClientHello, which would misrepresent the
+// codex client.
+func TestNewUtlsHTTPClientDefaultDoesNotUseClaudeCLIClientHello(t *testing.T) {
+	if utlsHTTPClientDefaultProfileID == claudeCLIClientHelloProfileID {
+		t.Fatalf("codex-facing NewUtlsHTTPClient default = %q, must not be the claude-cli ClientHello profile", utlsHTTPClientDefaultProfileID)
+	}
+	got, ok := resolveClaudeClientHelloID(utlsHTTPClientDefaultProfileID)
+	if !ok {
+		t.Fatalf("codex-facing default profile %q does not resolve", utlsHTTPClientDefaultProfileID)
+	}
+	if got.Str() == tls.HelloCustom.Str() {
+		t.Fatalf("codex-facing default profile %q resolves to HelloCustom (claude-cli); want Chrome-like", utlsHTTPClientDefaultProfileID)
+	}
+	if got.Str() != tls.HelloChrome_133.Str() {
+		t.Fatalf("codex-facing default ClientHello = %s, want HelloChrome_133", got.Str())
+	}
+
+	client := NewUtlsHTTPClient(context.Background(), nil, nil, 0)
+	fallback, ok := client.Transport.(*fallbackRoundTripper)
+	if !ok {
+		t.Fatalf("NewUtlsHTTPClient transport = %T, want *fallbackRoundTripper", client.Transport)
+	}
+	utlsRT, ok := fallback.utls.(*utlsRoundTripper)
+	if !ok {
+		t.Fatalf("NewUtlsHTTPClient protected transport = %T, want *utlsRoundTripper", fallback.utls)
+	}
+	if utlsRT.clientHello.Str() == tls.HelloCustom.Str() {
+		t.Fatalf("NewUtlsHTTPClient ClientHello = HelloCustom (claude-cli); codex outbound must not use it")
 	}
 }
 
