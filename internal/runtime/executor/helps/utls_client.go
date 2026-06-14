@@ -373,13 +373,25 @@ func (f *fallbackRoundTripper) RuntimeHelloState() RuntimeHelloState {
 // the real claude-cli (Node/OpenSSL) ClientHello, targeting
 // JA3 e97f5146a7009cc2918b50e903b6ff8d. Cipher suites and the 12 extensions
 // (with their wire order) follow docs/fingerprint/cpa-reqs/03-tls-target.md.
-// No GREASE, no ALPS(17513), no ECH, no padding.
+// No GREASE, no ALPS(17513), no ECH. A trailing conditional RFC7685 padding
+// extension matches Node OpenSSL/BoringSSL behavior (see below).
 //
 // Note: the JA3 target was captured against an IP (no SNI). For production
 // connections to a real host, an SNI(server_name) extension is added first per
 // OpenSSL convention so the handshake succeeds; that adds extension 0 to the
 // JA3 extensions list and flips the JA4 first segment from t13i to t13d, which
 // is expected. The cipher/curve/order structure still matches the target.
+//
+// padding(21/0x15): real claude-cli runs on Node/OpenSSL, which appends an
+// RFC7685 padding extension only when the unpadded ClientHello length falls in
+// [256,511] bytes, padding it up to 512 (BoringSSL t1_lib.c convention). With
+// SNI(api.anthropic.com) the ClientHello lands in that range, so the real
+// client emits padding and its JA3 extension list ends with ...-43-21
+// (with-SNI JA3 d871d02cecbde59abbf8f4806134addf). Without SNI the ClientHello
+// is < 256 bytes, so no padding is emitted and the structural no-SNI JA3 stays
+// e97f5146a7009cc2918b50e903b6ff8d. tls.BoringPaddingStyle reproduces exactly
+// this conditional behavior, so it must NOT be replaced with an always-on pad,
+// which would corrupt the no-SNI fingerprint.
 func newClaudeCLIClientHelloSpec() (*tls.ClientHelloSpec, error) {
 	return &tls.ClientHelloSpec{
 		// JA3 ciphers: 4865-4866-4867-49195-49199-49196-49200-52393-52392-49161-49171-49162-49172-156-157-47-53
@@ -452,6 +464,14 @@ func newClaudeCLIClientHelloSpec() (*tls.ClientHelloSpec, error) {
 				tls.VersionTLS13,
 				tls.VersionTLS12,
 			}},
+			// 13. padding (0x0015 / 21): conditional RFC7685 padding, matching
+			// Node OpenSSL/BoringSSL. BoringPaddingStyle pads to 512 bytes ONLY
+			// when the unpadded ClientHello length is in [256,511]; otherwise it
+			// emits nothing. With SNI the ClientHello lands in that range and
+			// padding(21) appears last (with-SNI JA3 d871d02c...); without SNI
+			// the ClientHello is < 256 bytes and no padding is added (no-SNI JA3
+			// stays e97f5146...). Must stay conditional, never always-on.
+			&tls.UtlsPaddingExtension{GetPaddingLen: tls.BoringPaddingStyle},
 		},
 	}, nil
 }

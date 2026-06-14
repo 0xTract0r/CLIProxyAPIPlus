@@ -171,6 +171,13 @@ func buildStructuralJA3(t *testing.T, spec *tls.ClientHelloSpec) string {
 		if id == 0 { // server_name: only present for real-host handshakes
 			continue
 		}
+		if id == 21 { // padding: conditional (RFC7685), only present when the
+			// marshalled ClientHello length is in [256,511]; absent from the
+			// no-SNI structural fingerprint this test validates. The byte-level
+			// conditional behavior is covered by
+			// TestClaudeCLIClientHelloWithSNIJA3HasConditionalPadding.
+			continue
+		}
 		exts = append(exts, strconv.Itoa(int(id)))
 
 		switch e := ext.(type) {
@@ -227,6 +234,8 @@ func clientHelloExtensionID(ext tls.TLSExtension) (uint16, bool) {
 		return 51, true
 	case *tls.RenegotiationInfoExtension:
 		return 65281, true
+	case *tls.UtlsPaddingExtension:
+		return 21, true
 	default:
 		return 0, false
 	}
