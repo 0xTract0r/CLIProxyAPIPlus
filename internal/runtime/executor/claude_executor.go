@@ -700,6 +700,17 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 	}
 	body = helps.InjectAccountDeviceIDWithOptions(body, countTokensAuthDir, auth, apiKey, false)
 
+	// Account env/cwd normalization (requirement ⑦). Mirror the main messages
+	// path (applyCloaking): gated by the same independent global switch (default
+	// off, nil-cfg safe). When on, the real cwd / home paths inside <env> /
+	// <system-reminder> blocks are rewritten to a per-account canonical path so
+	// the count_tokens fingerprint matches the Execute path. When off the body is
+	// left untouched (zero behavior change); NormalizeAccountEnv is a safe
+	// pass-through on unparsable bodies and a no-op when no env block is present.
+	if config.NormalizeAccountEnvEnabled(e.cfg) {
+		body = helps.NormalizeAccountEnv(body, auth, apiKey)
+	}
+
 	url := fmt.Sprintf("%s/v1/messages/count_tokens?beta=true", baseURL)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
@@ -1066,9 +1077,29 @@ func applyClaudeManagedHeaders(r *http.Request, auth *cliproxyauth.Auth, snapsho
 		return
 	}
 	for _, headerName := range claudeManagedHeaderNames {
+		// X-App is a low-entropy de-anonymization anchor: real claude-cli always
+		// sends "cli". The structured path keeps it pinned to "cli" (its snapshot
+		// is captured after the forced Set above), so the non-structured path must
+		// match and never let an operator header:X-App override leak a non-cli
+		// value. Skip it here; it is re-pinned to "cli" below. Other managed
+		// headers may still be overridden by the operator.
+		if strings.EqualFold(headerName, "X-App") {
+			continue
+		}
 		if value := claudeManagedHeaderValue(auth, headerName); value != "" {
 			r.Header.Set(headerName, value)
 		}
+	}
+	// Re-pin X-App to "cli" only when the operator actually configured a
+	// header:X-App override: ApplyCustomHeadersFromAttrs (run before this) would
+	// otherwise have applied that override (e.g. "browser") to the outgoing
+	// request, which must not survive on the de-anonymization anchor. When no
+	// header:X-App override exists, leave the current X-App untouched so callers
+	// that do not pre-force "cli" (e.g. PrepareRequest passthrough) keep their
+	// prior behavior. This matches the structured snapshot path, where the
+	// snapshot is captured after X-App was forced to "cli".
+	if strings.TrimSpace(claudeManagedHeaderValue(auth, "X-App")) != "" {
+		r.Header.Set("X-App", "cli")
 	}
 }
 
@@ -1312,8 +1343,10 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 	// x-app is a low-entropy A-class identity field: real claude-cli always
 	// sends "cli". Force it instead of using EnsureHeader so a client-supplied
 	// X-App (e.g. "browser") can never leak through and de-anonymize the
-	// account. Per-account managed headers (header:X-App) applied later still
-	// win, since that is an intentional operator override, not client input.
+	// account. X-App stays pinned to "cli" through the managed-header phase too:
+	// the structured path snapshots it after this Set, and the non-structured
+	// path skips X-App, so even a per-account header:X-App override cannot
+	// restore a non-cli value.
 	r.Header.Set("X-App", "cli")
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Retry-Count", "0")
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Runtime", "node")
