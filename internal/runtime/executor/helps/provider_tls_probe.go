@@ -33,6 +33,28 @@ const (
 
 var errProviderTLSProbeRuntimeTransportRequired = errors.New("runtime_transport_required")
 
+// RuntimeHelloObserver is implemented by round trippers that can report the
+// runtime (actually-used) ClientHello state, so the provider TLS probe can
+// distinguish "TLS profile configured/enforced by the builder" from "the
+// fingerprint actually used at runtime". A round tripper that silently
+// downgraded from HelloCustom to the Chrome-like fallback reports Downgraded.
+type RuntimeHelloObserver interface {
+	RuntimeHelloState() RuntimeHelloState
+}
+
+// RuntimeHelloState captures the runtime ClientHello observability for a utls
+// round tripper. ConfiguredHello is the expected ClientHello identifier;
+// LastHandshakeHello is the identifier used by the most recent successful
+// handshake; FallbackCount is how many times a silent downgrade occurred;
+// Downgraded is true when FallbackCount > 0 or LastHandshakeHello differs from
+// ConfiguredHello.
+type RuntimeHelloState struct {
+	ConfiguredHello    string `json:"configured_hello,omitempty"`
+	LastHandshakeHello string `json:"last_handshake_hello,omitempty"`
+	FallbackCount      int64  `json:"fallback_count"`
+	Downgraded         bool   `json:"downgraded"`
+}
+
 type ProviderTLSProbeOptions struct {
 	Timestamp     time.Time
 	CorrelationID string
@@ -65,10 +87,21 @@ type ProviderTLSProbeResult struct {
 	SecretValuesStored           bool                             `json:"secret_values_stored"`
 	RuntimeProfileEnforced       bool                             `json:"runtime_profile_enforced"`
 	RuntimeProfileSource         string                           `json:"runtime_profile_source,omitempty"`
-	Limitations                  []string                         `json:"limitations"`
-	Transport                    ProviderTLSProbeTransportSummary `json:"transport"`
-	EchoFingerprint              *ProviderTLSProbeEchoFingerprint `json:"echo_fingerprint,omitempty"`
-	ProviderEdgeParityScore      ProviderTLSProbeParityScore      `json:"provider_edge_parity_score"`
+	// RuntimeHello* fields report the runtime (actually-used) ClientHello as
+	// observed after the request, independent of TLSEnforced (which only
+	// reflects builder-time assembly). They let an operator notice a configured
+	// HelloCustom that silently downgraded to the Chrome-like fallback at
+	// runtime (e.g. TLSEnforced=true but RuntimeHelloDowngraded=true). Empty
+	// RuntimeHelloLast means the runtime hello could not be observed (no
+	// successful handshake or the transport is not a RuntimeHelloObserver).
+	RuntimeHelloConfigured    string                           `json:"runtime_hello_configured,omitempty"`
+	RuntimeHelloLast          string                           `json:"runtime_hello_last,omitempty"`
+	RuntimeHelloFallbackCount int64                            `json:"runtime_hello_fallback_count"`
+	RuntimeHelloDowngraded    bool                             `json:"runtime_hello_downgraded"`
+	Limitations               []string                         `json:"limitations"`
+	Transport                 ProviderTLSProbeTransportSummary `json:"transport"`
+	EchoFingerprint           *ProviderTLSProbeEchoFingerprint `json:"echo_fingerprint,omitempty"`
+	ProviderEdgeParityScore   ProviderTLSProbeParityScore      `json:"provider_edge_parity_score"`
 }
 
 type ProviderTLSProbeTimestampWindow struct {
@@ -242,6 +275,7 @@ func RunProviderTLSProbe(ctx context.Context, cfg *config.Config, auth *cliproxy
 		Start: start.UTC().Format(time.RFC3339Nano),
 		End:   end.Format(time.RFC3339Nano),
 	}
+	applyRuntimeHelloState(&result, roundTripper)
 	if errDo != nil {
 		result.Error = errDo.Error()
 		result.ProviderEdgeParityScore = providerTLSProbeParityScore(result)
@@ -390,6 +424,22 @@ func providerTLSProbeRuntimeRoundTripper(ctx context.Context, cfg *config.Config
 		status = "runtime transport profile is not configured or unsupported"
 	}
 	return nil, "", fmt.Errorf("%w: %s", errProviderTLSProbeRuntimeTransportRequired, status)
+}
+
+// applyRuntimeHelloState reads back the runtime ClientHello state from the
+// round tripper (if it implements RuntimeHelloObserver) and folds it into the
+// read-only RuntimeHello* result fields. It is a no-op when the transport does
+// not expose runtime hello observability.
+func applyRuntimeHelloState(result *ProviderTLSProbeResult, roundTripper http.RoundTripper) {
+	observer, ok := roundTripper.(RuntimeHelloObserver)
+	if !ok {
+		return
+	}
+	state := observer.RuntimeHelloState()
+	result.RuntimeHelloConfigured = state.ConfiguredHello
+	result.RuntimeHelloLast = state.LastHandshakeHello
+	result.RuntimeHelloFallbackCount = state.FallbackCount
+	result.RuntimeHelloDowngraded = state.Downgraded
 }
 
 func providerTLSProbeRuntimeSummary(evidence AccountRuntimeEvidence) ProviderTLSProbeRuntimeSummary {
@@ -689,22 +739,26 @@ func stringFromJSONMap(payload map[string]any, key string) string {
 
 func logProviderTLSProbeResult(result ProviderTLSProbeResult) {
 	log.WithFields(log.Fields{
-		"correlation_id":       result.CorrelationID,
-		"provider":             result.Provider,
-		"target_host":          result.TargetHost,
-		"outbound_url":         result.OutboundURL,
-		"http_status":          result.HTTPStatus,
-		"error":                result.Error,
-		"authorization_sent":   result.AuthorizationSent,
-		"account_runtime_hash": result.AccountRuntimeEvidenceSHA256,
-		"transport_profile_id": result.AccountRuntimeSummary.TransportProfileID,
-		"tls_profile_id":       result.AccountRuntimeSummary.TLSProfileID,
-		"runtime_http_version": result.AccountRuntimeSummary.HTTPVersion,
-		"core_build_version":   result.CoreBuildHeaders.Version,
-		"core_build_commit":    result.CoreBuildHeaders.Commit,
-		"core_build_date":      result.CoreBuildHeaders.BuildDate,
-		"provider_observed":    result.ProviderObserved,
-		"secret_values_stored": result.SecretValuesStored,
-		"runtime_enforced":     result.RuntimeProfileEnforced,
+		"correlation_id":               result.CorrelationID,
+		"provider":                     result.Provider,
+		"target_host":                  result.TargetHost,
+		"outbound_url":                 result.OutboundURL,
+		"http_status":                  result.HTTPStatus,
+		"error":                        result.Error,
+		"authorization_sent":           result.AuthorizationSent,
+		"account_runtime_hash":         result.AccountRuntimeEvidenceSHA256,
+		"transport_profile_id":         result.AccountRuntimeSummary.TransportProfileID,
+		"tls_profile_id":               result.AccountRuntimeSummary.TLSProfileID,
+		"runtime_http_version":         result.AccountRuntimeSummary.HTTPVersion,
+		"core_build_version":           result.CoreBuildHeaders.Version,
+		"core_build_commit":            result.CoreBuildHeaders.Commit,
+		"core_build_date":              result.CoreBuildHeaders.BuildDate,
+		"provider_observed":            result.ProviderObserved,
+		"secret_values_stored":         result.SecretValuesStored,
+		"runtime_enforced":             result.RuntimeProfileEnforced,
+		"runtime_hello_configured":     result.RuntimeHelloConfigured,
+		"runtime_hello_last":           result.RuntimeHelloLast,
+		"runtime_hello_fallback_count": result.RuntimeHelloFallbackCount,
+		"runtime_hello_downgraded":     result.RuntimeHelloDowngraded,
 	}).Info("provider TLS diagnostic probe completed")
 }
