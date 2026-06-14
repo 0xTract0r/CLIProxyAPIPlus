@@ -37,6 +37,32 @@ const utlsHTTPClientDefaultProfileID = "claude_utls_chrome_133"
 // connection must speak HTTP/1.1 (no HTTP/2, no h2 in ALPN).
 var claudeCLIALPN = []string{"http/1.1"}
 
+// utlsDialAttemptTimeout bounds a single TCP dial (including the socks5 proxy
+// CONNECT) for the uTLS handshake path. The root cause of the claude
+// HelloCustom failures is an occasional slow/unresponsive rotating-residential
+// socks5 proxy: golang.org/x/net/proxy.SOCKS5 dials through proxy.Direct (a
+// net.Dialer with no timeout), so a stuck proxy connect can hang on OS TCP
+// defaults (~30s+). A short per-attempt bound makes that transient failure fail
+// fast so the configured ClientHello can be retried, instead of the request
+// stalling. This is a credential-acquisition-time connection bound (allowed by
+// the executor timeout policy); it is not applied after a connection is
+// established. It is a var (not a const) only so tests can shorten it; it is
+// never mutated in production code.
+var utlsDialAttemptTimeout = 10 * time.Second
+
+// utlsHandshakeMaxAttempts is how many times the configured ClientHello
+// (HelloCustom for claude, the Chrome-like preset for codex) handshake is
+// attempted before giving up. Because the dominant failure mode is a transient
+// proxy dial timeout, retrying the SAME ClientHello spec recovers most of these
+// without ever changing the outbound fingerprint. The first attempt plus up to
+// (utlsHandshakeMaxAttempts-1) retries.
+const utlsHandshakeMaxAttempts = 3
+
+// utlsHandshakeRetryBackoff is the base delay between configured-ClientHello
+// handshake attempts. Backoff is linear (attempt index * base) and small, since
+// the goal is to ride over a brief proxy hiccup, not to wait out a long outage.
+const utlsHandshakeRetryBackoff = 200 * time.Millisecond
+
 // utlsRoundTripper implements http.RoundTripper using utls to replicate a
 // target client TLS fingerprint on protected API hosts. The default profile
 // replicates real claude-cli (HelloCustom + ALPN http/1.1); other profiles
@@ -53,8 +79,19 @@ type utlsRoundTripper struct {
 	configuredHello string
 	// fallbackCount counts how many times the configured HelloCustom handshake
 	// failed and the round tripper silently downgraded to the Chrome-like
-	// fallback. Read/written via sync/atomic only.
+	// fallback. Read/written via sync/atomic only. With disableFallback=true
+	// (the default for the claude HelloCustom profile) this stays 0: the strict
+	// profile never downgrades.
 	fallbackCount int64
+	// retryCount counts how many extra configured-ClientHello handshake attempts
+	// were made beyond the first (i.e. transient-failure retries that reused the
+	// same ClientHello spec, NOT downgrades). Read/written via sync/atomic only.
+	retryCount int64
+	// hardFailCount counts how many times the configured ClientHello exhausted
+	// all retries and returned an error WITHOUT downgrading (strict mode). For
+	// the claude HelloCustom profile this is the "request failed, fingerprint
+	// preserved" counter. Read/written via sync/atomic only.
+	hardFailCount int64
 	// lastHandshakeHello stores (string) the ClientHello identifier actually
 	// used by the most recent successful handshake. Read/written via
 	// atomic.Value only.
@@ -99,11 +136,13 @@ func newDiagnosticUtlsRoundTripper(dialer proxy.Dialer, clientHello tls.ClientHe
 	return rt
 }
 
-// newStrictUtlsRoundTripper builds a utls round tripper that does NOT silently
-// downgrade to the Chrome-like fallback: if the configured HelloCustom
-// handshake fails, dialTLSContext returns the original error. This is a
-// diagnostic / strict-mode variant only; production callers keep the default
-// connectivity-first fallback via newUtlsRoundTripper.
+// newStrictUtlsRoundTripper builds a utls round tripper that does NOT downgrade
+// to the Chrome-like fallback: if the configured HelloCustom handshake fails,
+// dialTLSContext retries the same HelloCustom and, once attempts are exhausted,
+// returns the original error instead of serving a Chrome fingerprint. This is the
+// production path for claude strong-fingerprint profiles (anti-correlation: fail
+// rather than leak a downgraded fingerprint). Codex / Chrome-native profiles keep
+// the connectivity-first fallback via newUtlsRoundTripper.
 func newStrictUtlsRoundTripper(proxyURL string, clientHello tls.ClientHelloID) *utlsRoundTripper {
 	rt := newUtlsRoundTripper(proxyURL, clientHello)
 	rt.disableFallback = true
@@ -125,34 +164,47 @@ func (t *utlsRoundTripper) newHTTP11Transport() *http.Transport {
 
 // dialTLSContext dials the upstream and performs the uTLS handshake. When the
 // configured ClientHello is HelloCustom, it applies the claude-cli ClientHello
-// spec. If the custom handshake fails, it falls back to the prior Chrome-like
-// behavior so connectivity is preserved (global fallback, not per-account).
+// spec. The configured ClientHello is retried up to utlsHandshakeMaxAttempts
+// times (same spec, same fingerprint) to ride over transient proxy dial
+// timeouts, which are the dominant failure mode. After the retries are
+// exhausted:
+//   - disableFallback=true (claude HelloCustom strict profile): return the real
+//     handshake error so the request fails. The configured fingerprint is NEVER
+//     downgraded to Chrome; downgrading would leak that this is not real
+//     claude-cli and defeat the anti-correlation guarantee.
+//   - disableFallback=false (e.g. the codex Chrome-like profile): fall back to
+//     the Chrome-like ClientHello so connectivity is preserved.
 func (t *utlsRoundTripper) dialTLSContext(ctx context.Context, network, addr string) (net.Conn, error) {
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
 		host = addr
 	}
 
-	conn, err := t.handshake(ctx, host, addr, t.clientHello)
+	conn, err := t.handshakeWithRetry(ctx, host, addr)
 	if err == nil {
-		// Primary handshake succeeded with the configured ClientHello.
+		// A configured-ClientHello attempt succeeded (possibly after retries).
 		t.lastHandshakeHello.Store(t.clientHello.Str())
 		return conn, nil
 	}
 
-	// P1.7: handshake failure falls back to the existing Chrome-like
-	// implementation. This is a global behavior, not per-account.
 	fallbackHello := tls.HelloChrome_133
+	// If the configured ClientHello already IS the Chrome-like preset (codex
+	// default), there is nothing to downgrade to: return the error directly.
 	if t.clientHello.Str() == fallbackHello.Str() {
 		return nil, err
 	}
 	if t.disableFallback {
-		// Strict / diagnostic mode: surface the failure instead of silently
+		// Strict mode (claude HelloCustom): surface the failure instead of
 		// downgrading. The configured fingerprint is preserved or nothing.
+		// fallbackCount stays 0; record this as a hard failure so the runtime
+		// state reflects "claude enforced, did not downgrade".
+		atomic.AddInt64(&t.hardFailCount, 1)
+		log.Warnf("utls: claude HelloCustom handshake failed for %s after %d attempt(s); request failing without downgrade to preserve fingerprint (%v)", host, utlsHandshakeMaxAttempts, err)
 		return nil, err
 	}
-	// Make the silent downgrade observable: count it, record the actual
-	// handshake fingerprint, and warn (host only, no credentials/proxy auth).
+	// Connectivity-first mode (non-claude): make the silent downgrade
+	// observable: count it, record the actual handshake fingerprint, and warn
+	// (host only, no credentials/proxy auth).
 	atomic.AddInt64(&t.fallbackCount, 1)
 	log.Warnf("utls: downgraded HelloCustom->HelloChrome_133 for %s: custom ClientHello handshake failed (%v)", host, err)
 	conn, err = t.handshake(ctx, host, addr, fallbackHello)
@@ -160,6 +212,38 @@ func (t *utlsRoundTripper) dialTLSContext(ctx context.Context, network, addr str
 		t.lastHandshakeHello.Store(fallbackHello.Str())
 	}
 	return conn, err
+}
+
+// handshakeWithRetry attempts the configured ClientHello handshake up to
+// utlsHandshakeMaxAttempts times, reusing the SAME ClientHello spec each time so
+// the outbound fingerprint never changes. It retries because the dominant
+// failure is a transient proxy dial timeout, which usually succeeds on a second
+// attempt. Each extra attempt beyond the first increments retryCount. The ctx
+// deadline (if any) is always honored: a cancelled ctx stops the retry loop
+// immediately.
+func (t *utlsRoundTripper) handshakeWithRetry(ctx context.Context, host, addr string) (net.Conn, error) {
+	var lastErr error
+	for attempt := 0; attempt < utlsHandshakeMaxAttempts; attempt++ {
+		if attempt > 0 {
+			atomic.AddInt64(&t.retryCount, 1)
+			// Short linear backoff, but never wait past the ctx deadline.
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(time.Duration(attempt) * utlsHandshakeRetryBackoff):
+			}
+		}
+		conn, err := t.handshake(ctx, host, addr, t.clientHello)
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+		// If the context is done, stop retrying: further attempts cannot help.
+		if ctx.Err() != nil {
+			return nil, lastErr
+		}
+	}
+	return nil, lastErr
 }
 
 // handshake performs a single uTLS handshake with the given ClientHelloID.
@@ -218,8 +302,14 @@ func forceALPNHTTP11(spec *tls.ClientHelloSpec) {
 }
 
 // dialContext dials using the configured proxy dialer, honoring ctx when the
-// dialer supports it.
+// dialer supports it. Each dial is bounded by utlsDialAttemptTimeout so a stuck
+// socks5 proxy connect fails fast and the configured ClientHello can be retried,
+// instead of hanging on OS TCP defaults (~30s+). The derived deadline never
+// extends an already-shorter ctx deadline.
 func (t *utlsRoundTripper) dialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	dialCtx, cancel := context.WithTimeout(ctx, utlsDialAttemptTimeout)
+	defer cancel()
+	ctx = dialCtx
 	if ctxDialer, ok := t.dialer.(proxy.ContextDialer); ok {
 		return ctxDialer.DialContext(ctx, network, addr)
 	}
@@ -262,6 +352,8 @@ func (t *utlsRoundTripper) RuntimeHelloState() RuntimeHelloState {
 		ConfiguredHello:    t.configuredHello,
 		LastHandshakeHello: last,
 		FallbackCount:      count,
+		RetryCount:         atomic.LoadInt64(&t.retryCount),
+		HardFailCount:      atomic.LoadInt64(&t.hardFailCount),
 		Downgraded:         downgraded,
 	}
 }
@@ -402,11 +494,40 @@ func NewUtlsHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyau
 func NewUtlsRoundTripperForProfile(proxyURL string, profileID string) http.RoundTripper {
 	clientHello, ok := resolveClaudeClientHelloID(profileID)
 	if !ok {
+		profileID = claudeCLIClientHelloProfileID
 		clientHello, _ = resolveClaudeClientHelloID(claudeCLIClientHelloProfileID)
 	}
+	var utlsRT *utlsRoundTripper
+	if isClaudeStrictHelloCustomProfile(profileID) {
+		// The claude strong-fingerprint HelloCustom profile must NEVER downgrade
+		// to the Chrome-like fallback: a downgrade would change the outbound
+		// fingerprint away from real claude-cli and leak that this is a proxy,
+		// defeating the anti-correlation guarantee. Build it in strict mode so a
+		// failed handshake (after retries) returns an error instead of falling
+		// back to Chrome. This only affects the claude HelloCustom path; the
+		// codex Chrome-like default (NewUtlsHTTPClient*) keeps the
+		// connectivity-first fallback.
+		utlsRT = newStrictUtlsRoundTripper(proxyURL, clientHello)
+	} else {
+		utlsRT = newUtlsRoundTripper(proxyURL, clientHello)
+	}
 	return &fallbackRoundTripper{
-		utls:     newUtlsRoundTripper(proxyURL, clientHello),
+		utls:     utlsRT,
 		fallback: standardTransportForProxy(proxyURL),
+	}
+}
+
+// isClaudeStrictHelloCustomProfile reports whether the profile is the claude
+// strong-fingerprint HelloCustom profile (claude_cli_clienthello_v1 and its
+// aliases) that must never downgrade to the Chrome-like fallback. It is keyed on
+// the profile identity, not on the resolved ClientHelloID, so other future
+// HelloCustom profiles are not implicitly forced into strict mode.
+func isClaudeStrictHelloCustomProfile(profileID string) bool {
+	switch strings.ToLower(strings.TrimSpace(profileID)) {
+	case claudeCLIClientHelloProfileID, "claude_cli_clienthello", "claude_node_openssl_v1":
+		return true
+	default:
+		return false
 	}
 }
 
