@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	tls "github.com/refraction-networking/utls"
@@ -45,6 +46,24 @@ type utlsRoundTripper struct {
 	clientHello tls.ClientHelloID
 	insecure    bool
 	transport   *http.Transport
+
+	// configuredHello is the ClientHello identifier this round tripper is
+	// expected to use (e.g. ClientHelloID.Str()). It is set at construction
+	// time and never mutated, so it is safe to read concurrently.
+	configuredHello string
+	// fallbackCount counts how many times the configured HelloCustom handshake
+	// failed and the round tripper silently downgraded to the Chrome-like
+	// fallback. Read/written via sync/atomic only.
+	fallbackCount int64
+	// lastHandshakeHello stores (string) the ClientHello identifier actually
+	// used by the most recent successful handshake. Read/written via
+	// atomic.Value only.
+	lastHandshakeHello atomic.Value
+	// disableFallback, when true, makes the configured handshake hard-fail
+	// instead of silently downgrading to the Chrome-like fallback. Default
+	// false preserves the connectivity-first fallback behavior; this is a
+	// diagnostic / strict-mode opt-in only.
+	disableFallback bool
 }
 
 func newUtlsRoundTripper(proxyURL string, clientHello tls.ClientHelloID) *utlsRoundTripper {
@@ -58,8 +77,9 @@ func newUtlsRoundTripper(proxyURL string, clientHello tls.ClientHelloID) *utlsRo
 		}
 	}
 	rt := &utlsRoundTripper{
-		dialer:      dialer,
-		clientHello: clientHello,
+		dialer:          dialer,
+		clientHello:     clientHello,
+		configuredHello: clientHello.Str(),
 	}
 	rt.transport = rt.newHTTP11Transport()
 	return rt
@@ -70,11 +90,23 @@ func newDiagnosticUtlsRoundTripper(dialer proxy.Dialer, clientHello tls.ClientHe
 		dialer = proxy.Direct
 	}
 	rt := &utlsRoundTripper{
-		dialer:      dialer,
-		clientHello: clientHello,
-		insecure:    true,
+		dialer:          dialer,
+		clientHello:     clientHello,
+		configuredHello: clientHello.Str(),
+		insecure:        true,
 	}
 	rt.transport = rt.newHTTP11Transport()
+	return rt
+}
+
+// newStrictUtlsRoundTripper builds a utls round tripper that does NOT silently
+// downgrade to the Chrome-like fallback: if the configured HelloCustom
+// handshake fails, dialTLSContext returns the original error. This is a
+// diagnostic / strict-mode variant only; production callers keep the default
+// connectivity-first fallback via newUtlsRoundTripper.
+func newStrictUtlsRoundTripper(proxyURL string, clientHello tls.ClientHelloID) *utlsRoundTripper {
+	rt := newUtlsRoundTripper(proxyURL, clientHello)
+	rt.disableFallback = true
 	return rt
 }
 
@@ -103,6 +135,8 @@ func (t *utlsRoundTripper) dialTLSContext(ctx context.Context, network, addr str
 
 	conn, err := t.handshake(ctx, host, addr, t.clientHello)
 	if err == nil {
+		// Primary handshake succeeded with the configured ClientHello.
+		t.lastHandshakeHello.Store(t.clientHello.Str())
 		return conn, nil
 	}
 
@@ -112,8 +146,20 @@ func (t *utlsRoundTripper) dialTLSContext(ctx context.Context, network, addr str
 	if t.clientHello.Str() == fallbackHello.Str() {
 		return nil, err
 	}
-	log.Debugf("utls: custom ClientHello handshake to %s failed (%v); falling back to %s", host, err, fallbackHello.Str())
-	return t.handshake(ctx, host, addr, fallbackHello)
+	if t.disableFallback {
+		// Strict / diagnostic mode: surface the failure instead of silently
+		// downgrading. The configured fingerprint is preserved or nothing.
+		return nil, err
+	}
+	// Make the silent downgrade observable: count it, record the actual
+	// handshake fingerprint, and warn (host only, no credentials/proxy auth).
+	atomic.AddInt64(&t.fallbackCount, 1)
+	log.Warnf("utls: downgraded HelloCustom->HelloChrome_133 for %s: custom ClientHello handshake failed (%v)", host, err)
+	conn, err = t.handshake(ctx, host, addr, fallbackHello)
+	if err == nil {
+		t.lastHandshakeHello.Store(fallbackHello.Str())
+	}
+	return conn, err
 }
 
 // handshake performs a single uTLS handshake with the given ClientHelloID.
@@ -201,6 +247,34 @@ func (t *utlsRoundTripper) dialContext(ctx context.Context, network, addr string
 
 func (t *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	return t.transport.RoundTrip(req)
+}
+
+// RuntimeHelloState reports the runtime (actually-used) ClientHello state for
+// this round tripper, so callers can detect a silent HelloCustom->Chrome
+// downgrade. It satisfies RuntimeHelloObserver. The returned Downgraded flag is
+// true when any fallback has occurred or the last successful handshake used a
+// ClientHello other than the configured one.
+func (t *utlsRoundTripper) RuntimeHelloState() RuntimeHelloState {
+	last, _ := t.lastHandshakeHello.Load().(string)
+	count := atomic.LoadInt64(&t.fallbackCount)
+	downgraded := count > 0 || (last != "" && last != t.configuredHello)
+	return RuntimeHelloState{
+		ConfiguredHello:    t.configuredHello,
+		LastHandshakeHello: last,
+		FallbackCount:      count,
+		Downgraded:         downgraded,
+	}
+}
+
+// RuntimeHelloState forwards to the inner utls round tripper so the runtime
+// hello state is observable through the fallback wrapper used by the HTTP
+// clients. It returns false-equivalent zero state when the inner transport is
+// not a utls observer.
+func (f *fallbackRoundTripper) RuntimeHelloState() RuntimeHelloState {
+	if observer, ok := f.utls.(RuntimeHelloObserver); ok {
+		return observer.RuntimeHelloState()
+	}
+	return RuntimeHelloState{}
 }
 
 // newClaudeCLIClientHelloSpec builds the uTLS ClientHelloSpec that replicates
