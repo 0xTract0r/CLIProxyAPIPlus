@@ -24,6 +24,34 @@ const (
 	defaultClaudeFingerprintArch           = "arm64"
 	claudeDeviceProfileTTL                 = 7 * 24 * time.Hour
 	claudeDeviceProfileCleanupPeriod       = time.Hour
+
+	// claudeSanityCeilingMajor / Minor / Patch is the hardcoded, offline,
+	// deterministic upper bound on any claude-cli version we are willing to treat
+	// as a real first-party observation. It defends against the one threat the
+	// high-water model otherwise leaves open: a holder of a valid downstream
+	// account key sending a *fabricated* high version User-Agent (e.g.
+	// "claude-cli/999.0.0"). Without a ceiling such a forged UA would pass the
+	// existing >= static-floor gate, be recorded as a "real observation", and then
+	// become the per-account and global high-water that gets applied to other
+	// zero-observation accounts (cross-account pollution).
+	//
+	// The bound is intentionally generous relative to the current real version
+	// family (2.1.x as of 2026-06) so it never false-rejects a near-future genuine
+	// release — it tolerates a full major bump and a wide minor/patch range — while
+	// still rejecting absurd values. Anything strictly greater than this version is
+	// refused. When npm "latest" has already been fetched (online-update on or a
+	// warm cache) the effective ceiling is raised to that real npm latest (see
+	// claudeObservationSanityCeiling); npm is used here ONLY to validate an upper
+	// bound, never to push the outbound version up (push stays capped to real
+	// observation in claudeFallbackBaseline / claudeOnlineFloorVersion).
+	//
+	// When to bump: if claude-cli legitimately reaches a major version at or beyond
+	// this constant, raise it (and keep it one major ahead of the live family) so
+	// real clients are never rejected. This is a conservative offline backstop, not
+	// a precise version pin.
+	claudeSanityCeilingMajor = 4
+	claudeSanityCeilingMinor = 0
+	claudeSanityCeilingPatch = 0
 )
 
 var (
@@ -109,27 +137,35 @@ func ClaudeDeviceProfileStabilizationEnabled(cfg *config.Config) bool {
 }
 
 // ClaudeDeviceProfileStaleGuardActive reports whether the runtime is in the
-// stale-prone managed-header configuration described in
-// docs/fingerprint/cpa-reqs/07-header-cwd-revised-plan.md §2.6/§4.1: stabilize
-// is enabled, online-update is explicitly disabled, AND no operator baseline
-// User-Agent is configured. In that combination the only floor left is the
-// hardcoded defaultClaudeFingerprintUserAgent constant, which drifts stale as
-// real claude-cli advances. When the observation cache is also empty (e.g.
-// right after start or for a not-yet-seen account), an unparseable/third-party
-// client request would fall back to that frozen constant and could produce an
-// "old UA + new body" mismatch. This predicate lets the resolve path surface a
-// one-time operator warning. It does not change flooring behavior: an
-// explicitly configured baseline is still an intentional, authoritative floor.
+// only remaining stale-prone state under the high-water model (requirement ⑥,
+// plan A): stabilize is enabled, no operator baseline User-Agent is configured,
+// AND no real first-party claude-cli version has been observed yet on ANY account
+// (so the global observed high-water fallback is also empty). In that narrow
+// window the only floor left is the hardcoded defaultClaudeFingerprintUserAgent
+// constant, which can drift stale relative to live clients until the first real
+// client request is seen. The guard self-heals: once any real first-party client
+// is observed, the fallback ceiling becomes that real observed version.
+//
+// online-update is intentionally NOT part of this predicate. Under plan A npm is
+// no longer a ceiling (it can fabricate a version no real client here has sent),
+// so enabling it does not resolve the stale window and is not recommended as a
+// remedy. An operator-configured baseline UA remains an explicit, authoritative
+// floor and suppresses the guard.
 func ClaudeDeviceProfileStaleGuardActive(cfg *config.Config) bool {
 	if !ClaudeDeviceProfileStabilizationEnabled(cfg) {
 		return false
 	}
-	if config.ManagedHeaderOnlineUpdateEnabled(cfg) {
-		return false
-	}
 	// An operator-configured baseline UA is an explicit, authoritative floor;
 	// it is not the stale hardcoded constant, so the guard does not apply.
-	return cfg == nil || strings.TrimSpace(cfg.ClaudeHeaderDefaults.UserAgent) == ""
+	if cfg != nil && strings.TrimSpace(cfg.ClaudeHeaderDefaults.UserAgent) != "" {
+		return false
+	}
+	// Any real first-party observation anywhere provides a non-stale fallback
+	// ceiling, so the guard only applies before the first real client is seen.
+	if _, hasGlobal := globalClaudeObservedHighWaterVersion(); hasGlobal {
+		return false
+	}
+	return true
 }
 
 func ResetClaudeDeviceProfileCache() {
@@ -172,20 +208,135 @@ func defaultClaudeDeviceProfile(cfg *config.Config) ClaudeDeviceProfile {
 		profile.version = version
 		profile.hasVersion = true
 	}
-	if online, ok := resolveManagedHeaderOnlineVersion("claude", cfg); ok {
-		candidateUA := "claude-cli/" + online.Version + " (external, cli)"
-		if candidateVersion, candidateOK := parseClaudeCLIVersion(candidateUA); candidateOK {
-			candidate := profile
-			candidate.UserAgent = candidateUA
-			candidate.version = candidateVersion
-			candidate.hasVersion = true
-			candidate.Source = online.ManagedHeaderProfileSource
-			if shouldUpgradeClaudeDeviceProfile(candidate, profile) {
-				profile = candidate
+	// High-water model: the outbound version ceiling is the account's real
+	// observed first-party claude-cli high-water mark, and we must never claim a
+	// version higher than a real client actually presented. The online registry
+	// (npm "latest") is therefore NOT a ceiling and is intentionally not injected
+	// into the baseline floor here. npm latest can be ahead of every client this
+	// deployment has ever seen; using it as a floor/ceiling would fabricate an
+	// "old body + newer-than-real UA" mismatch on zero-/low-observation accounts.
+	// The baseline returned here is only the absolute lower bound: the operator
+	// configured claude-header-defaults.user-agent when set, otherwise the
+	// hardcoded floor constant. online-update is consulted later, capped to the
+	// real observed high-water, in claudeOnlineFloorVersion.
+	return profile
+}
+
+// claudeObservedHighWaterVersion returns the highest real first-party claude-cli
+// version observed across the supplied observation cache keys (per-account when
+// scoped, global when the caller passes the full key set). It only reflects
+// versions that a real client actually presented to this proxy, so it never
+// fabricates a version that does not exist in the wild for this deployment.
+func claudeObservedHighWaterVersion(cacheKeys []string) (claudeCLIVersion, bool) {
+	claudeDeviceProfileCacheMu.RLock()
+	defer claudeDeviceProfileCacheMu.RUnlock()
+	var best claudeCLIVersion
+	found := false
+	for _, cacheKey := range cacheKeys {
+		for _, entry := range claudeDeviceProfileObservations[cacheKey] {
+			if !entry.profile.hasVersion {
+				continue
+			}
+			if !found || entry.profile.version.Compare(best) > 0 {
+				best = entry.profile.version
+				found = true
 			}
 		}
 	}
-	return profile
+	return best, found
+}
+
+// globalClaudeObservedHighWaterVersion returns the highest real first-party
+// claude-cli version observed across ALL accounts. It is the zero-observation
+// fallback ceiling: a version that some real client genuinely presented to this
+// proxy (just not on this account), which is always safer than npm latest
+// because it is guaranteed to be a version that actually exists in the wild.
+func globalClaudeObservedHighWaterVersion() (claudeCLIVersion, bool) {
+	claudeDeviceProfileCacheMu.RLock()
+	defer claudeDeviceProfileCacheMu.RUnlock()
+	var best claudeCLIVersion
+	found := false
+	for _, entries := range claudeDeviceProfileObservations {
+		for _, entry := range entries {
+			if !entry.profile.hasVersion {
+				continue
+			}
+			if !found || entry.profile.version.Compare(best) > 0 {
+				best = entry.profile.version
+				found = true
+			}
+		}
+	}
+	return best, found
+}
+
+// claudeOnlineFloorVersion consults the online registry (npm latest) ONLY as a
+// floor reference, and caps it to the supplied real observed high-water ceiling.
+// It can never raise the outbound version above what a real client presented.
+// When online-update is disabled (the new default) it returns nothing. The
+// returned version is the min(npm-latest, observed-ceiling), used only to lift a
+// stale static floor toward, but never beyond, real observation.
+func claudeOnlineFloorVersion(cfg *config.Config, ceiling claudeCLIVersion, hasCeiling bool) (claudeCLIVersion, bool) {
+	if !hasCeiling {
+		return claudeCLIVersion{}, false
+	}
+	online, ok := resolveManagedHeaderOnlineVersion("claude", cfg)
+	if !ok {
+		return claudeCLIVersion{}, false
+	}
+	candidateUA := "claude-cli/" + online.Version + " (external, cli)"
+	candidateVersion, candidateOK := parseClaudeCLIVersion(candidateUA)
+	if !candidateOK {
+		return claudeCLIVersion{}, false
+	}
+	// Cap to the real observed ceiling: npm is never allowed above real.
+	if candidateVersion.Compare(ceiling) > 0 {
+		return ceiling, true
+	}
+	return candidateVersion, true
+}
+
+// claudeStaticSanityCeiling returns the hardcoded, offline upper bound on any
+// claude-cli version we will treat as a real first-party observation.
+func claudeStaticSanityCeiling() claudeCLIVersion {
+	return claudeCLIVersion{
+		major: claudeSanityCeilingMajor,
+		minor: claudeSanityCeilingMinor,
+		patch: claudeSanityCeilingPatch,
+	}
+}
+
+// claudeObservationSanityCeiling returns the effective upper bound used to reject
+// fabricated high-version inbound User-Agents before they can pollute the
+// per-account or global observed high-water mark.
+//
+// The ceiling is max(hardcoded static sanity ceiling, npm latest when already
+// available). The static constant guarantees a deterministic offline bound even
+// when online-update is disabled (the default). npm "latest" — only when it has
+// already been fetched/cached — is consulted purely to RAISE the validation
+// ceiling toward the real newest release, so a genuine bleeding-edge client is
+// never false-rejected. npm is never used here to push the outbound version up;
+// that remains capped to real observation elsewhere.
+func claudeObservationSanityCeiling(cfg *config.Config) claudeCLIVersion {
+	ceiling := claudeStaticSanityCeiling()
+	if online, ok := resolveManagedHeaderOnlineVersion("claude", cfg); ok {
+		candidateUA := "claude-cli/" + online.Version + " (external, cli)"
+		if npmVersion, npmOK := parseClaudeCLIVersion(candidateUA); npmOK && npmVersion.Compare(ceiling) > 0 {
+			ceiling = npmVersion
+		}
+	}
+	return ceiling
+}
+
+// claudeObservationWithinSanityCeiling reports whether a candidate observation's
+// version is at or below the effective sanity ceiling. A candidate that exceeds
+// the ceiling is treated as fabricated and must not be adopted (neither recorded
+// into the per-account/global high-water nor emitted as the outbound version).
+func claudeObservationWithinSanityCeiling(candidate ClaudeDeviceProfile, cfg *config.Config) bool {
+	if !candidate.hasVersion {
+		return true
+	}
+	return candidate.version.Compare(claudeObservationSanityCeiling(cfg)) <= 0
 }
 
 // mapStainlessOS maps runtime.GOOS to Stainless SDK OS names.
@@ -505,15 +656,90 @@ func ClaudeDeviceProfileObservations(auth *cliproxyauth.Auth, apiKey string) []C
 	return out
 }
 
+// claudeFallbackBaseline computes the effective floor profile used when an
+// account has no per-request candidate and no valid cached high-water entry.
+//
+// High-water model (requirement ⑥, plan A):
+//   - The absolute lower bound is the static/operator-configured baseline
+//     (defaultClaudeDeviceProfile). The hardcoded floor constant guarantees a
+//     parseable claude-cli version.
+//   - The ceiling is the account's real observed first-party high-water mark.
+//     When the account itself has no observation yet, we fall back to the global
+//     real observed high-water (the highest version any real client presented to
+//     this proxy on any account) — never npm latest, which could fabricate a
+//     version no real client here has ever sent.
+//   - online-update (npm) is consulted only as a floor reference, capped to that
+//     real observed ceiling, so it can lift a stale static floor toward, but
+//     never beyond, real observation.
+//
+// The result is monotonic-up only: the returned version is the maximum of the
+// static floor and any real-observed ceiling, with npm never able to exceed real.
+func claudeFallbackBaseline(auth *cliproxyauth.Auth, apiKey string, cfg *config.Config) ClaudeDeviceProfile {
+	baseline := defaultClaudeDeviceProfile(cfg)
+
+	// Real observed ceiling: prefer this account's observed high-water; if the
+	// account has none, fall back to the global observed high-water.
+	observationKeys := claudeDeviceProfileObservationCacheKeys(auth, apiKey)
+	ceiling, hasCeiling := claudeObservedHighWaterVersion(observationKeys)
+	if !hasCeiling {
+		ceiling, hasCeiling = globalClaudeObservedHighWaterVersion()
+	}
+
+	// Lift the baseline floor up to the real observed ceiling (only upward, never
+	// below the static/operator floor).
+	if hasCeiling && (!baseline.hasVersion || ceiling.Compare(baseline.version) > 0) {
+		baseline = withClaudeFloorVersion(baseline, ceiling, observedManagedHeaderProfileSource())
+	}
+
+	// online-update may lift the floor further, but only within the real observed
+	// ceiling — npm can never raise the outbound version above real observation.
+	if onlineVersion, ok := claudeOnlineFloorVersion(cfg, ceiling, hasCeiling); ok {
+		if !baseline.hasVersion || onlineVersion.Compare(baseline.version) > 0 {
+			source := observedManagedHeaderProfileSource()
+			if online, okOnline := resolveManagedHeaderOnlineVersion("claude", cfg); okOnline && onlineVersion.Compare(ceiling) < 0 {
+				source = online.ManagedHeaderProfileSource
+			}
+			baseline = withClaudeFloorVersion(baseline, onlineVersion, source)
+		}
+	}
+
+	return baseline
+}
+
+// withClaudeFloorVersion returns a copy of the profile with its claimed
+// claude-cli version (and User-Agent) lifted to the supplied version, keeping the
+// rest of the platform/software fingerprint from the baseline. Used to raise the
+// fallback floor toward a real observed high-water without inventing other
+// header values.
+func withClaudeFloorVersion(profile ClaudeDeviceProfile, version claudeCLIVersion, source ManagedHeaderProfileSource) ClaudeDeviceProfile {
+	profile.UserAgent = "claude-cli/" + formatClaudeCLIVersion(version) + " (external, cli)"
+	profile.version = version
+	profile.hasVersion = true
+	profile.Source = source
+	return profile
+}
+
 func ResolveClaudeDeviceProfile(auth *cliproxyauth.Auth, apiKey string, headers http.Header, cfg *config.Config) ClaudeDeviceProfile {
 	claudeDeviceProfileCacheCleanupOnce.Do(startClaudeDeviceProfileCacheCleanup)
 
 	cacheKey := claudeDeviceProfileCacheKey(auth, apiKey)
 	now := time.Now()
-	baseline := defaultClaudeDeviceProfile(cfg)
+	baseline := claudeFallbackBaseline(auth, apiKey, cfg)
 	candidate, hasCandidate := extractClaudeDeviceProfile(headers, cfg)
 	if hasCandidate {
 		candidate = pinClaudeDeviceProfilePlatform(candidate, baseline)
+	}
+	// Sanity-ceiling gate (source-level rejection): a candidate whose claimed
+	// claude-cli version exceeds the effective sanity ceiling is treated as a
+	// fabricated inbound User-Agent. Drop it here, before any observation is
+	// recorded, so a forged high version (e.g. claude-cli/999.0.0 from a holder of
+	// a valid downstream key) can never enter the per-account or global observed
+	// high-water and can never become the outbound version applied to other
+	// accounts. This check runs for both upgrade and non-upgrade candidates,
+	// because a forged version is precisely the case that would otherwise look
+	// like an "upgrade" over the real baseline.
+	if hasCandidate && !claudeObservationWithinSanityCeiling(candidate, cfg) {
+		hasCandidate = false
 	}
 	if hasCandidate && !shouldUpgradeClaudeDeviceProfile(candidate, baseline) {
 		staticBaselineVersion, _ := parseClaudeCLIVersion(defaultClaudeFingerprintUserAgent)

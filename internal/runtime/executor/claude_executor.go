@@ -1197,17 +1197,19 @@ func contextWithClaudeInboundHeaders(ctx context.Context, headers http.Header) c
 var claudeDeviceProfileStaleGuardWarnOnce sync.Once
 
 // warnClaudeDeviceProfileStaleGuard emits a single operator-facing warning when
-// the runtime is in the stale-prone managed-header configuration (stabilize on,
-// online-update explicitly off, no operator baseline UA). In that state the
-// floor is the frozen hardcoded claude-cli version constant, which can drift
-// stale relative to live clients and produce an "old UA + new body" mismatch
-// when the observation cache is empty. See A6.3 in 08-impl-spec.md.
+// the runtime is in the only remaining stale-prone state under the high-water
+// model: stabilize on, no operator baseline UA, and no real first-party
+// claude-cli version observed on any account yet. In that narrow window the floor
+// is the frozen hardcoded claude-cli version constant until the first real client
+// is seen. Enabling online-update is NOT a remedy here because npm latest is no
+// longer used as a ceiling (it could claim a version no real client has sent);
+// the guard self-heals once any real first-party client is observed.
 func warnClaudeDeviceProfileStaleGuard(cfg *config.Config) {
 	if !helps.ClaudeDeviceProfileStaleGuardActive(cfg) {
 		return
 	}
 	claudeDeviceProfileStaleGuardWarnOnce.Do(func() {
-		log.Warn("claude device profile: stabilize-device-profile is enabled but managed-header-profile.online-update is disabled and no claude-header-defaults.user-agent baseline is configured; the device fingerprint falls back to a frozen built-in version constant and may drift stale (old UA + new body). Enable online-update or set claude-header-defaults.user-agent to a current claude-cli version.")
+		log.Warn("claude device profile: stabilize-device-profile is enabled, no claude-header-defaults.user-agent baseline is configured, and no real claude-cli client has been observed yet; the device fingerprint falls back to a frozen built-in version constant until the first real client is seen. Set claude-header-defaults.user-agent to a current claude-cli version to provide an explicit floor, or send one real first-party claude-cli request to seed the observed high-water mark.")
 	})
 }
 

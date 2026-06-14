@@ -3630,11 +3630,16 @@ func TestApplyClaudeHeaders_AnthropicBetaFloorWithoutClient(t *testing.T) {
 	}
 }
 
-// TestClaudeDeviceProfileStaleGuardActive_DetectsStaleProneConfig verifies A6.3
-// detects only the stale-prone configuration: stabilize on, online-update
-// explicitly off, and no operator baseline UA. Any of: stabilize off, online on,
-// or a configured baseline UA, disarms the guard.
+// TestClaudeDeviceProfileStaleGuardActive_DetectsStaleProneConfig verifies the
+// high-water model's only remaining stale-prone state: stabilize on, no operator
+// baseline UA, and no real first-party claude-cli observed on any account yet.
+// Any of: stabilize off, a configured baseline UA, or a real global observation,
+// disarms the guard. online-update is irrelevant under plan A (npm is no longer a
+// ceiling), so toggling it must not change the guard.
 func TestClaudeDeviceProfileStaleGuardActive_DetectsStaleProneConfig(t *testing.T) {
+	resetClaudeDeviceProfileCache()
+	t.Cleanup(resetClaudeDeviceProfileCache)
+
 	stabilize := true
 	online := true
 	offline := false
@@ -3646,7 +3651,17 @@ func TestClaudeDeviceProfileStaleGuardActive_DetectsStaleProneConfig(t *testing.
 		ManagedHeaderProfile: config.ManagedHeaderProfileConfig{OnlineUpdate: &offline},
 	}
 	if !helps.ClaudeDeviceProfileStaleGuardActive(staleCfg) {
-		t.Fatalf("expected guard active for stabilize+online-off+no-baseline")
+		t.Fatalf("expected guard active for stabilize+no-baseline+no-observation")
+	}
+
+	// online-update is no longer part of the predicate under plan A; toggling it
+	// must not change the guard while there is still no real observation.
+	onlineCfg := &config.Config{
+		ClaudeHeaderDefaults: config.ClaudeHeaderDefaults{StabilizeDeviceProfile: &stabilize},
+		ManagedHeaderProfile: config.ManagedHeaderProfileConfig{OnlineUpdate: &online},
+	}
+	if !helps.ClaudeDeviceProfileStaleGuardActive(onlineCfg) {
+		t.Fatalf("guard must stay active regardless of online-update when no real client observed")
 	}
 
 	// Configured baseline UA is an explicit authoritative floor; guard off.
@@ -3661,18 +3676,18 @@ func TestClaudeDeviceProfileStaleGuardActive_DetectsStaleProneConfig(t *testing.
 		t.Fatalf("guard must be off when an operator baseline UA is configured")
 	}
 
-	// Online-update on disarms the guard.
-	onlineCfg := &config.Config{
-		ClaudeHeaderDefaults: config.ClaudeHeaderDefaults{StabilizeDeviceProfile: &stabilize},
-		ManagedHeaderProfile: config.ManagedHeaderProfileConfig{OnlineUpdate: &online},
-	}
-	if helps.ClaudeDeviceProfileStaleGuardActive(onlineCfg) {
-		t.Fatalf("guard must be off when online-update is enabled")
-	}
-
 	// Stabilize off disarms the guard.
 	if helps.ClaudeDeviceProfileStaleGuardActive(&config.Config{}) {
 		t.Fatalf("guard must be off when stabilize is disabled")
+	}
+
+	// A real first-party observation anywhere provides a non-stale fallback
+	// ceiling and disarms the guard.
+	_ = helps.ResolveClaudeDeviceProfile(&cliproxyauth.Auth{ID: "stale-guard-seed", Provider: "claude"}, "", map[string][]string{
+		"User-Agent": {"claude-cli/2.1.158 (external, cli)"},
+	}, &config.Config{})
+	if helps.ClaudeDeviceProfileStaleGuardActive(staleCfg) {
+		t.Fatalf("guard must be off once a real first-party client has been observed")
 	}
 }
 
