@@ -47,11 +47,18 @@ type RuntimeHelloObserver interface {
 // LastHandshakeHello is the identifier used by the most recent successful
 // handshake; FallbackCount is how many times a silent downgrade occurred;
 // Downgraded is true when FallbackCount > 0 or LastHandshakeHello differs from
-// ConfiguredHello.
+// ConfiguredHello. RetryCount is how many extra configured-ClientHello handshake
+// attempts were made (transient-failure retries that reused the same
+// fingerprint). HardFailCount is how many times the configured ClientHello
+// exhausted retries and failed WITHOUT downgrading (strict mode, e.g. the claude
+// HelloCustom no-downgrade profile). For the claude strict profile FallbackCount
+// is always 0 and a failure shows up in HardFailCount instead.
 type RuntimeHelloState struct {
 	ConfiguredHello    string `json:"configured_hello,omitempty"`
 	LastHandshakeHello string `json:"last_handshake_hello,omitempty"`
 	FallbackCount      int64  `json:"fallback_count"`
+	RetryCount         int64  `json:"retry_count"`
+	HardFailCount      int64  `json:"hard_fail_count"`
 	Downgraded         bool   `json:"downgraded"`
 }
 
@@ -97,6 +104,8 @@ type ProviderTLSProbeResult struct {
 	RuntimeHelloConfigured    string                           `json:"runtime_hello_configured,omitempty"`
 	RuntimeHelloLast          string                           `json:"runtime_hello_last,omitempty"`
 	RuntimeHelloFallbackCount int64                            `json:"runtime_hello_fallback_count"`
+	RuntimeHelloRetryCount    int64                            `json:"runtime_hello_retry_count"`
+	RuntimeHelloHardFailCount int64                            `json:"runtime_hello_hard_fail_count"`
 	RuntimeHelloDowngraded    bool                             `json:"runtime_hello_downgraded"`
 	Limitations               []string                         `json:"limitations"`
 	Transport                 ProviderTLSProbeTransportSummary `json:"transport"`
@@ -439,6 +448,8 @@ func applyRuntimeHelloState(result *ProviderTLSProbeResult, roundTripper http.Ro
 	result.RuntimeHelloConfigured = state.ConfiguredHello
 	result.RuntimeHelloLast = state.LastHandshakeHello
 	result.RuntimeHelloFallbackCount = state.FallbackCount
+	result.RuntimeHelloRetryCount = state.RetryCount
+	result.RuntimeHelloHardFailCount = state.HardFailCount
 	result.RuntimeHelloDowngraded = state.Downgraded
 }
 
@@ -739,26 +750,28 @@ func stringFromJSONMap(payload map[string]any, key string) string {
 
 func logProviderTLSProbeResult(result ProviderTLSProbeResult) {
 	log.WithFields(log.Fields{
-		"correlation_id":               result.CorrelationID,
-		"provider":                     result.Provider,
-		"target_host":                  result.TargetHost,
-		"outbound_url":                 result.OutboundURL,
-		"http_status":                  result.HTTPStatus,
-		"error":                        result.Error,
-		"authorization_sent":           result.AuthorizationSent,
-		"account_runtime_hash":         result.AccountRuntimeEvidenceSHA256,
-		"transport_profile_id":         result.AccountRuntimeSummary.TransportProfileID,
-		"tls_profile_id":               result.AccountRuntimeSummary.TLSProfileID,
-		"runtime_http_version":         result.AccountRuntimeSummary.HTTPVersion,
-		"core_build_version":           result.CoreBuildHeaders.Version,
-		"core_build_commit":            result.CoreBuildHeaders.Commit,
-		"core_build_date":              result.CoreBuildHeaders.BuildDate,
-		"provider_observed":            result.ProviderObserved,
-		"secret_values_stored":         result.SecretValuesStored,
-		"runtime_enforced":             result.RuntimeProfileEnforced,
-		"runtime_hello_configured":     result.RuntimeHelloConfigured,
-		"runtime_hello_last":           result.RuntimeHelloLast,
-		"runtime_hello_fallback_count": result.RuntimeHelloFallbackCount,
-		"runtime_hello_downgraded":     result.RuntimeHelloDowngraded,
+		"correlation_id":                result.CorrelationID,
+		"provider":                      result.Provider,
+		"target_host":                   result.TargetHost,
+		"outbound_url":                  result.OutboundURL,
+		"http_status":                   result.HTTPStatus,
+		"error":                         result.Error,
+		"authorization_sent":            result.AuthorizationSent,
+		"account_runtime_hash":          result.AccountRuntimeEvidenceSHA256,
+		"transport_profile_id":          result.AccountRuntimeSummary.TransportProfileID,
+		"tls_profile_id":                result.AccountRuntimeSummary.TLSProfileID,
+		"runtime_http_version":          result.AccountRuntimeSummary.HTTPVersion,
+		"core_build_version":            result.CoreBuildHeaders.Version,
+		"core_build_commit":             result.CoreBuildHeaders.Commit,
+		"core_build_date":               result.CoreBuildHeaders.BuildDate,
+		"provider_observed":             result.ProviderObserved,
+		"secret_values_stored":          result.SecretValuesStored,
+		"runtime_enforced":              result.RuntimeProfileEnforced,
+		"runtime_hello_configured":      result.RuntimeHelloConfigured,
+		"runtime_hello_last":            result.RuntimeHelloLast,
+		"runtime_hello_fallback_count":  result.RuntimeHelloFallbackCount,
+		"runtime_hello_retry_count":     result.RuntimeHelloRetryCount,
+		"runtime_hello_hard_fail_count": result.RuntimeHelloHardFailCount,
+		"runtime_hello_downgraded":      result.RuntimeHelloDowngraded,
 	}).Info("provider TLS diagnostic probe completed")
 }
