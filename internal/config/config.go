@@ -812,7 +812,14 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.AmpCode.RestrictManagementToLocalhost = false // Default to false: API key auth is sufficient
 	cfg.RemoteManagement.PanelGitHubRepository = DefaultPanelGitHubRepository
 	cfg.Claude.SonnetLongContextPolicy = ClaudeSonnetLongContextPolicyFailWithHint
-	managedHeaderOnlineUpdate := true
+	// High-water model (requirement ⑥, plan A): the outbound claude-cli version
+	// ceiling is the account's real observed first-party high-water mark, never
+	// npm "latest". online-update therefore defaults to OFF so the runtime never
+	// claims a version no real client here has presented. Even when an operator
+	// explicitly enables it, the online (npm) version is consulted only as a floor
+	// reference capped to the real observed ceiling (see claudeOnlineFloorVersion);
+	// it can never raise the outbound version above real observation.
+	managedHeaderOnlineUpdate := false
 	cfg.ManagedHeaderProfile.OnlineUpdate = &managedHeaderOnlineUpdate
 	cfg.ManagedHeaderProfile.FetchTimeoutSeconds = 2
 	cfg.ManagedHeaderProfile.CacheTTLSeconds = 6 * 60 * 60
