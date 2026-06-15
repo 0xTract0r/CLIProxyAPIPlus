@@ -670,8 +670,29 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 	body := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, stream)
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 
+	// 反关联修复 A（C1）：count_tokens 必须与 messages 走同一套 cch 签名路径。
+	// 真实 claude-cli 的 count_tokens 与 messages 共用同一个 SDK client，billing-header
+	// 用"cch=00000 占位再 xxHash64 回填"模式，两端点同一套 cch。此前 count_tokens 硬钉
+	// 非签名模式（generateBillingHeader 走 sha256[:5]）且从不调用 signAnthropicMessagesBody，
+	// 导致同一 OAuth 账号 messages=xxHash64 / count_tokens=sha256，成为跨端点分辨信号。
+	// 这里对 OAuth / experimentalCCHSigning 启用与 messages 完全一致的条件与参数：
+	//   - 签名模式占位 cch=00000（与 messages 的 applyCloaking 路径一致）
+	//   - 使用与 messages 相同的 entrypoint（从 UA 解析）/ workload（从 ctx 取）
+	// 真正的 xxHash64 回填在 body 全部规范化（device_id ⑦ env）之后进行（见下方）。
+	oauthToken := isClaudeOAuthToken(apiKey)
+	useCCHSigning := oauthToken || experimentalCCHSigningEnabled(e.cfg, auth)
 	if !strings.HasPrefix(baseModel, "claude-3-5-haiku") {
-		body = checkSystemInstructionsWithVersion(body, false, resolveClaudeBillingVersion(ctx, e.cfg, auth, apiKey))
+		billingVersion := resolveClaudeBillingVersion(ctx, e.cfg, auth, apiKey)
+		if useCCHSigning {
+			clientUserAgent := getClientUserAgent(ctx)
+			entrypoint := parseEntrypointFromUA(clientUserAgent)
+			workload := getWorkloadFromContext(ctx)
+			body = checkSystemInstructionsWithSigningMode(body, false, useCCHSigning, oauthToken, billingVersion, entrypoint, workload)
+		} else {
+			// 非签名（纯 API key）路径保持原状：messages 本来也是非签名 sha256，
+			// count_tokens 维持 sha256 即与 messages 一致，行为零变化。
+			body = checkSystemInstructionsWithVersion(body, false, billingVersion)
+		}
 	}
 
 	// Keep count_tokens requests compatible with Anthropic cache-control constraints too.
@@ -681,7 +702,7 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 	// Extract betas from body and convert to header (for count_tokens too)
 	var extraBetas []string
 	extraBetas, body = extractAndRemoveBetas(body)
-	if isClaudeOAuthToken(apiKey) {
+	if oauthToken {
 		body, _ = prepareClaudeOAuthToolNamesForUpstream(body, claudeToolPrefix, auth.ToolPrefixDisabled())
 	}
 	body = sanitizeClaudeMessagesForClaudeUpstreamWithDebug(ctx, body, baseModel)
@@ -709,6 +730,15 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 	// pass-through on unparsable bodies and a no-op when no env block is present.
 	if config.NormalizeAccountEnvEnabled(e.cfg) {
 		body = helps.NormalizeAccountEnv(body, auth, apiKey)
+	}
+
+	// 反关联修复 A（C1）续：在 body 完成全部规范化（sanitize / device_id ⑦ / env）之后，
+	// 与 messages 路径（Execute :259 / ExecuteStream :439）完全相同地回填 cch。
+	// signAnthropicMessagesBody 会先把 billing-header 的 cch 归一为 00000 再做 xxHash64，
+	// 因此只要上面用签名模式注入了 cch=00000 占位且其余 billing 字段（cc_version /
+	// build / entrypoint / workload）与 messages 一致，同一逻辑请求两端点得到同一 cch。
+	if useCCHSigning {
+		body = signAnthropicMessagesBody(body)
 	}
 
 	url := fmt.Sprintf("%s/v1/messages/count_tokens?beta=true", baseURL)
