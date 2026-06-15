@@ -43,7 +43,7 @@ const (
 	// warm cache) the effective ceiling is raised to that real npm latest (see
 	// claudeObservationSanityCeiling); npm is used here ONLY to validate an upper
 	// bound, never to push the outbound version up (push stays capped to real
-	// observation in claudeFallbackBaseline / claudeOnlineFloorVersion).
+	// observation in claudeFallbackBaseline).
 	//
 	// When to bump: if claude-cli legitimately reaches a major version at or beyond
 	// this constant, raise it (and keep it one major ahead of the live family) so
@@ -217,33 +217,10 @@ func defaultClaudeDeviceProfile(cfg *config.Config) ClaudeDeviceProfile {
 	// "old body + newer-than-real UA" mismatch on zero-/low-observation accounts.
 	// The baseline returned here is only the absolute lower bound: the operator
 	// configured claude-header-defaults.user-agent when set, otherwise the
-	// hardcoded floor constant. online-update is consulted later, capped to the
-	// real observed high-water, in claudeOnlineFloorVersion.
+	// hardcoded floor constant. 反关联修复 B（R5）后，npm online-update 不再用于单独
+	// 抬升 outbound version——因为它只产出版本号、没有配套真实 pkg/runtime，抬 UA 会
+	// 造出不存在的三元组；floor 只在有同一次真实观测的完整三元组时才整体抬升。
 	return profile
-}
-
-// claudeObservedHighWaterVersion returns the highest real first-party claude-cli
-// version observed across the supplied observation cache keys (per-account when
-// scoped, global when the caller passes the full key set). It only reflects
-// versions that a real client actually presented to this proxy, so it never
-// fabricates a version that does not exist in the wild for this deployment.
-func claudeObservedHighWaterVersion(cacheKeys []string) (claudeCLIVersion, bool) {
-	claudeDeviceProfileCacheMu.RLock()
-	defer claudeDeviceProfileCacheMu.RUnlock()
-	var best claudeCLIVersion
-	found := false
-	for _, cacheKey := range cacheKeys {
-		for _, entry := range claudeDeviceProfileObservations[cacheKey] {
-			if !entry.profile.hasVersion {
-				continue
-			}
-			if !found || entry.profile.version.Compare(best) > 0 {
-				best = entry.profile.version
-				found = true
-			}
-		}
-	}
-	return best, found
 }
 
 // globalClaudeObservedHighWaterVersion returns the highest real first-party
@@ -270,30 +247,55 @@ func globalClaudeObservedHighWaterVersion() (claudeCLIVersion, bool) {
 	return best, found
 }
 
-// claudeOnlineFloorVersion consults the online registry (npm latest) ONLY as a
-// floor reference, and caps it to the supplied real observed high-water ceiling.
-// It can never raise the outbound version above what a real client presented.
-// When online-update is disabled (the new default) it returns nothing. The
-// returned version is the min(npm-latest, observed-ceiling), used only to lift a
-// stale static floor toward, but never beyond, real observation.
-func claudeOnlineFloorVersion(cfg *config.Config, ceiling claudeCLIVersion, hasCeiling bool) (claudeCLIVersion, bool) {
-	if !hasCeiling {
-		return claudeCLIVersion{}, false
+// 反关联修复 B（R5）：版本三元组（UA/version、X-Stainless-Package-Version、
+// X-Stainless-Runtime-Version）必须始终取自同一真实来源。此前 high-water 只回传
+// 一个 version 数字，withClaudeFloorVersion 据此合成 UA 却保留 baseline 的旧常量
+// pkg/runtime（0.74.0 / v24.3.0），抬高 floor 时会发出"新 UA + 旧 pkg/runtime"这种
+// 真实世界不存在的三元组。
+//
+// claudeObservedHighWaterProfile 返回最高版本那一次观测的**完整 profile**——即
+// 同一次带完整 pkg/runtime 头的真实观测——使三元组可以作为原子单元一起抬升。
+// 当多条观测同为最高版本时取最近 lastSeen（entries 已按 lastSeen 倒序排过），
+// 保证取到一份内部自洽的真实三元组。
+func claudeObservedHighWaterProfile(cacheKeys []string) (ClaudeDeviceProfile, bool) {
+	claudeDeviceProfileCacheMu.RLock()
+	defer claudeDeviceProfileCacheMu.RUnlock()
+	var best ClaudeDeviceProfile
+	found := false
+	for _, cacheKey := range cacheKeys {
+		for _, entry := range claudeDeviceProfileObservations[cacheKey] {
+			if !entry.profile.hasVersion {
+				continue
+			}
+			if !found || entry.profile.version.Compare(best.version) > 0 {
+				best = entry.profile
+				found = true
+			}
+		}
 	}
-	online, ok := resolveManagedHeaderOnlineVersion("claude", cfg)
-	if !ok {
-		return claudeCLIVersion{}, false
+	return best, found
+}
+
+// globalClaudeObservedHighWaterProfile 是 claudeObservedHighWaterProfile 的全局版本：
+// 当某账号自身零观测时，回退到任一真实客户端在本代理上呈现过的最高版本**完整三元组**，
+// 同样保证 UA/pkg/runtime 来自同一次真实观测，而不是把抬高的 UA 与旧常量拼接。
+func globalClaudeObservedHighWaterProfile() (ClaudeDeviceProfile, bool) {
+	claudeDeviceProfileCacheMu.RLock()
+	defer claudeDeviceProfileCacheMu.RUnlock()
+	var best ClaudeDeviceProfile
+	found := false
+	for _, entries := range claudeDeviceProfileObservations {
+		for _, entry := range entries {
+			if !entry.profile.hasVersion {
+				continue
+			}
+			if !found || entry.profile.version.Compare(best.version) > 0 {
+				best = entry.profile
+				found = true
+			}
+		}
 	}
-	candidateUA := "claude-cli/" + online.Version + " (external, cli)"
-	candidateVersion, candidateOK := parseClaudeCLIVersion(candidateUA)
-	if !candidateOK {
-		return claudeCLIVersion{}, false
-	}
-	// Cap to the real observed ceiling: npm is never allowed above real.
-	if candidateVersion.Compare(ceiling) > 0 {
-		return ceiling, true
-	}
-	return candidateVersion, true
+	return best, found
 }
 
 // claudeStaticSanityCeiling returns the hardcoded, offline upper bound on any
@@ -663,59 +665,61 @@ func ClaudeDeviceProfileObservations(auth *cliproxyauth.Auth, apiKey string) []C
 //   - The absolute lower bound is the static/operator-configured baseline
 //     (defaultClaudeDeviceProfile). The hardcoded floor constant guarantees a
 //     parseable claude-cli version.
-//   - The ceiling is the account's real observed first-party high-water mark.
-//     When the account itself has no observation yet, we fall back to the global
-//     real observed high-water (the highest version any real client presented to
-//     this proxy on any account) — never npm latest, which could fabricate a
-//     version no real client here has ever sent.
-//   - online-update (npm) is consulted only as a floor reference, capped to that
-//     real observed ceiling, so it can lift a stale static floor toward, but
-//     never beyond, real observation.
+//   - The ceiling is the account's real observed first-party high-water mark,
+//     surfaced as a COMPLETE triple (UA/version + pkg + runtime) from the single
+//     real observation that carried it. When the account itself has no observation
+//     yet, we fall back to the global real observed high-water triple — never npm
+//     latest, which could fabricate a version no real client here has ever sent.
+//   - 反关联修复 B（R5）：三元组作为原子单元抬升。npm online-update 只产出版本号、
+//     没有配套真实 pkg/runtime，因此不再用它单独抬 UA（会造出不存在的三元组）；
+//     没有完整真实三元组时，三元组整体停在 baseline。
 //
 // The result is monotonic-up only: the returned version is the maximum of the
-// static floor and any real-observed ceiling, with npm never able to exceed real.
+// static floor and any real-observed ceiling, and the emitted triple is always
+// internally consistent (all three fields from the same real source).
 func claudeFallbackBaseline(auth *cliproxyauth.Auth, apiKey string, cfg *config.Config) ClaudeDeviceProfile {
 	baseline := defaultClaudeDeviceProfile(cfg)
 
-	// Real observed ceiling: prefer this account's observed high-water; if the
-	// account has none, fall back to the global observed high-water.
+	// 反关联修复 B（R5）：抬高 floor 时把版本三元组当原子单元处理。
+	// 优先取本账号观测到的最高版本**完整三元组**；本账号零观测时回退全局最高版本
+	// **完整三元组**。三元组（UA/version + pkg + runtime）全部来自同一次真实观测，
+	// 绝不把抬高的 UA 与 baseline 旧常量 pkg/runtime 拼接。
 	observationKeys := claudeDeviceProfileObservationCacheKeys(auth, apiKey)
-	ceiling, hasCeiling := claudeObservedHighWaterVersion(observationKeys)
+	ceilingProfile, hasCeiling := claudeObservedHighWaterProfile(observationKeys)
 	if !hasCeiling {
-		ceiling, hasCeiling = globalClaudeObservedHighWaterVersion()
+		ceilingProfile, hasCeiling = globalClaudeObservedHighWaterProfile()
 	}
 
-	// Lift the baseline floor up to the real observed ceiling (only upward, never
-	// below the static/operator floor).
-	if hasCeiling && (!baseline.hasVersion || ceiling.Compare(baseline.version) > 0) {
-		baseline = withClaudeFloorVersion(baseline, ceiling, observedManagedHeaderProfileSource())
+	// 只有当存在同一次真实观测的完整三元组、且其版本高于 baseline 时才整体抬升；
+	// 否则三元组整体停在 baseline（baseline 自身是内部自洽的真实发布三元组：
+	// 2.1.63 / 0.74.0 / v24.3.0）。
+	if hasCeiling && (!baseline.hasVersion || ceilingProfile.version.Compare(baseline.version) > 0) {
+		baseline = withClaudeFloorProfile(baseline, ceilingProfile, observedManagedHeaderProfileSource())
 	}
 
-	// online-update may lift the floor further, but only within the real observed
-	// ceiling — npm can never raise the outbound version above real observation.
-	if onlineVersion, ok := claudeOnlineFloorVersion(cfg, ceiling, hasCeiling); ok {
-		if !baseline.hasVersion || onlineVersion.Compare(baseline.version) > 0 {
-			source := observedManagedHeaderProfileSource()
-			if online, okOnline := resolveManagedHeaderOnlineVersion("claude", cfg); okOnline && onlineVersion.Compare(ceiling) < 0 {
-				source = online.ManagedHeaderProfileSource
-			}
-			baseline = withClaudeFloorVersion(baseline, onlineVersion, source)
-		}
-	}
-
+	// online-update（npm latest）只产出一个 version 数字，没有与之配套的真实
+	// pkg/runtime 观测。若据此单独抬 UA，必然造出"新 UA + 旧 pkg/runtime"的不存在
+	// 三元组——这正是 R5 要消除的反关联信号。因此在没有完整真实三元组可依据时，
+	// 不再用 npm 抬 UA；三元组整体停在 baseline。这与 online-update 默认关、不引入
+	// 对外网版本映射拉取的设计一致。
 	return baseline
 }
 
-// withClaudeFloorVersion returns a copy of the profile with its claimed
-// claude-cli version (and User-Agent) lifted to the supplied version, keeping the
-// rest of the platform/software fingerprint from the baseline. Used to raise the
-// fallback floor toward a real observed high-water without inventing other
-// header values.
-func withClaudeFloorVersion(profile ClaudeDeviceProfile, version claudeCLIVersion, source ManagedHeaderProfileSource) ClaudeDeviceProfile {
-	profile.UserAgent = "claude-cli/" + formatClaudeCLIVersion(version) + " (external, cli)"
-	profile.version = version
-	profile.hasVersion = true
-	profile.Source = source
+// withClaudeFloorProfile 返回 profile 的一份拷贝，将其版本三元组
+// （User-Agent/version、PackageVersion、RuntimeVersion）整体替换为 source 这一份
+// 真实观测三元组，平台位（OS/Arch）保持 baseline 不变（由 pin 流程另行统一）。
+// 反关联修复 B（R5）：三元组作为原子单元一起抬升，杜绝"新 UA + 旧常量 pkg/runtime"。
+func withClaudeFloorProfile(profile, source ClaudeDeviceProfile, profileSource ManagedHeaderProfileSource) ClaudeDeviceProfile {
+	profile.UserAgent = source.UserAgent
+	profile.version = source.version
+	profile.hasVersion = source.hasVersion
+	if strings.TrimSpace(source.PackageVersion) != "" {
+		profile.PackageVersion = source.PackageVersion
+	}
+	if strings.TrimSpace(source.RuntimeVersion) != "" {
+		profile.RuntimeVersion = source.RuntimeVersion
+	}
+	profile.Source = profileSource
 	return profile
 }
 
