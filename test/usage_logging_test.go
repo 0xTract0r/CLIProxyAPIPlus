@@ -32,7 +32,7 @@ func TestGeminiExecutorRecordsSuccessfulZeroUsageInQueue(t *testing.T) {
 	defer server.Close()
 
 	executor := runtimeexecutor.NewGeminiExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		Provider: "gemini",
 		Attributes: map[string]string{
 			"api_key":  "test-upstream-key",

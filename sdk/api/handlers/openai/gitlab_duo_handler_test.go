@@ -118,7 +118,7 @@ func registerGitLabDuoOpenAIAuth(t *testing.T, upstreamURL string) *coreauth.Man
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(runtimeexecutor.NewGitLabExecutor(&internalconfig.Config{}))
 
-	auth := &coreauth.Auth{
+	auth := &coreauth.Auth{ProxyURL: "direct",
 		ID:       "gitlab-duo-openai-handler-test",
 		Provider: "gitlab",
 		Status:   coreauth.StatusActive,

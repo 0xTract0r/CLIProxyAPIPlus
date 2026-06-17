@@ -275,7 +275,7 @@ func TestExecuteStreamWithAuthManager_RetriesBeforeFirstByte(t *testing.T) {
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
 
-	auth1 := &coreauth.Auth{
+	auth1 := &coreauth.Auth{ProxyURL: "direct",
 		ID:       "auth1",
 		Provider: "codex",
 		Status:   coreauth.StatusActive,
@@ -285,7 +285,7 @@ func TestExecuteStreamWithAuthManager_RetriesBeforeFirstByte(t *testing.T) {
 		t.Fatalf("manager.Register(auth1): %v", err)
 	}
 
-	auth2 := &coreauth.Auth{
+	auth2 := &coreauth.Auth{ProxyURL: "direct",
 		ID:       "auth2",
 		Provider: "codex",
 		Status:   coreauth.StatusActive,
@@ -341,7 +341,7 @@ func TestExecuteStreamWithAuthManager_HeaderPassthroughDisabledByDefault(t *test
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
 
-	auth1 := &coreauth.Auth{
+	auth1 := &coreauth.Auth{ProxyURL: "direct",
 		ID:       "auth1",
 		Provider: "codex",
 		Status:   coreauth.StatusActive,
@@ -351,7 +351,7 @@ func TestExecuteStreamWithAuthManager_HeaderPassthroughDisabledByDefault(t *test
 		t.Fatalf("manager.Register(auth1): %v", err)
 	}
 
-	auth2 := &coreauth.Auth{
+	auth2 := &coreauth.Auth{ProxyURL: "direct",
 		ID:       "auth2",
 		Provider: "codex",
 		Status:   coreauth.StatusActive,
@@ -401,7 +401,7 @@ func TestExecuteStreamWithAuthManager_DoesNotRetryAfterFirstByte(t *testing.T) {
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
 
-	auth1 := &coreauth.Auth{
+	auth1 := &coreauth.Auth{ProxyURL: "direct",
 		ID:       "auth1",
 		Provider: "codex",
 		Status:   coreauth.StatusActive,
@@ -411,7 +411,7 @@ func TestExecuteStreamWithAuthManager_DoesNotRetryAfterFirstByte(t *testing.T) {
 		t.Fatalf("manager.Register(auth1): %v", err)
 	}
 
-	auth2 := &coreauth.Auth{
+	auth2 := &coreauth.Auth{ProxyURL: "direct",
 		ID:       "auth2",
 		Provider: "codex",
 		Status:   coreauth.StatusActive,
@@ -471,7 +471,7 @@ func TestExecuteStreamWithAuthManager_EnrichesBootstrapRetryAuthUnavailableError
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
 
-	auth1 := &coreauth.Auth{
+	auth1 := &coreauth.Auth{ProxyURL: "direct",
 		ID:       "auth1",
 		Provider: "codex",
 		Status:   coreauth.StatusActive,
@@ -541,7 +541,7 @@ func TestExecuteStreamWithAuthManager_PinnedAuthKeepsSameUpstream(t *testing.T) 
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
 
-	auth1 := &coreauth.Auth{
+	auth1 := &coreauth.Auth{ProxyURL: "direct",
 		ID:       "auth1",
 		Provider: "codex",
 		Status:   coreauth.StatusActive,
@@ -551,7 +551,7 @@ func TestExecuteStreamWithAuthManager_PinnedAuthKeepsSameUpstream(t *testing.T) 
 		t.Fatalf("manager.Register(auth1): %v", err)
 	}
 
-	auth2 := &coreauth.Auth{
+	auth2 := &coreauth.Auth{ProxyURL: "direct",
 		ID:       "auth2",
 		Provider: "codex",
 		Status:   coreauth.StatusActive,
@@ -613,7 +613,7 @@ func TestExecuteStreamWithAuthManager_SelectedAuthCallbackReceivesAuthID(t *test
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
 
-	auth2 := &coreauth.Auth{
+	auth2 := &coreauth.Auth{ProxyURL: "direct",
 		ID:       "auth2",
 		Provider: "codex",
 		Status:   coreauth.StatusActive,
@@ -666,7 +666,7 @@ func TestExecuteStreamWithAuthManager_ValidatesOpenAIResponsesStreamDataJSON(t *
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
 
-	auth1 := &coreauth.Auth{
+	auth1 := &coreauth.Auth{ProxyURL: "direct",
 		ID:       "auth1",
 		Provider: "codex",
 		Status:   coreauth.StatusActive,
@@ -718,7 +718,7 @@ func TestExecuteStreamWithAuthManager_AllowsSplitOpenAIResponsesSSEEventLines(t 
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
 
-	auth1 := &coreauth.Auth{
+	auth1 := &coreauth.Auth{ProxyURL: "direct",
 		ID:       "auth1",
 		Provider: "split-sse",
 		Status:   coreauth.StatusActive,
