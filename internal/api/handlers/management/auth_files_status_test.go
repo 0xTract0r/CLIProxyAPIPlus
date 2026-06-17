@@ -25,7 +25,7 @@ func TestPatchAuthFileStatus_ReEnableClearsModelStatesCooldown(t *testing.T) {
 	manager := coreauth.NewManager(store, nil, nil)
 
 	future := time.Now().Add(30 * time.Minute)
-	record := &coreauth.Auth{
+	record := &coreauth.Auth{ProxyURL: "http://test-proxy:8080",
 		ID:             "stuck.json",
 		FileName:       "stuck.json",
 		Provider:       "claude",

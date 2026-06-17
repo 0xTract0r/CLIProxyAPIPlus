@@ -21,8 +21,8 @@ func newTestAuthDir(t *testing.T) string {
 
 func TestSyntheticDeviceID_DiffersBetweenAccounts(t *testing.T) {
 	dir := newTestAuthDir(t)
-	authA := &cliproxyauth.Auth{FileName: "account-a.json"}
-	authB := &cliproxyauth.Auth{FileName: "account-b.json"}
+	authA := &cliproxyauth.Auth{ProxyURL: "direct", FileName: "account-a.json"}
+	authB := &cliproxyauth.Auth{ProxyURL: "direct", FileName: "account-b.json"}
 
 	idA := SyntheticDeviceID(dir, authA, "")
 	idB := SyntheticDeviceID(dir, authB, "")
@@ -37,7 +37,7 @@ func TestSyntheticDeviceID_DiffersBetweenAccounts(t *testing.T) {
 
 func TestSyntheticDeviceID_StableAcrossAPIKeys(t *testing.T) {
 	dir := newTestAuthDir(t)
-	auth := &cliproxyauth.Auth{FileName: "account-a.json"}
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", FileName: "account-a.json"}
 
 	first := SyntheticDeviceID(dir, auth, "api-key-1")
 	second := SyntheticDeviceID(dir, auth, "api-key-2")
@@ -50,7 +50,7 @@ func TestSyntheticDeviceID_StableAcrossAPIKeys(t *testing.T) {
 
 func TestSyntheticDeviceID_StableAcrossSaltReload(t *testing.T) {
 	dir := newTestAuthDir(t)
-	auth := &cliproxyauth.Auth{ID: "auth-123"}
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", ID: "auth-123"}
 
 	first := SyntheticDeviceID(dir, auth, "")
 
@@ -88,7 +88,7 @@ func assertUserIDIsStringWithInnerJSON(t *testing.T, out []byte) string {
 
 func TestInjectAccountDeviceID_ReplacesOnlyDeviceID(t *testing.T) {
 	dir := newTestAuthDir(t)
-	auth := &cliproxyauth.Auth{FileName: "account-a.json"}
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", FileName: "account-a.json"}
 
 	// The client sends metadata.user_id as a JSON *string* whose content is JSON.
 	payload := []byte(`{"model":"claude","metadata":{"user_id":"{\"device_id\":\"realdevice\",\"account_uuid\":\"acct-uuid\",\"session_id\":\"sess-uuid\"}"},"messages":[{"role":"user","content":"hi"}]}`)
@@ -119,7 +119,7 @@ func TestInjectAccountDeviceID_ReplacesOnlyDeviceID(t *testing.T) {
 
 func TestInjectAccountDeviceID_BuildsStringWhenMissing(t *testing.T) {
 	dir := newTestAuthDir(t)
-	auth := &cliproxyauth.Auth{FileName: "account-a.json"}
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", FileName: "account-a.json"}
 
 	payload := []byte(`{"model":"claude","messages":[]}`)
 	out := InjectAccountDeviceID(payload, dir, auth, "")
@@ -136,7 +136,7 @@ func TestInjectAccountDeviceID_BuildsStringWhenMissing(t *testing.T) {
 
 func TestInjectAccountDeviceID_ReplacesLegacyFlatString(t *testing.T) {
 	dir := newTestAuthDir(t)
-	auth := &cliproxyauth.Auth{FileName: "account-a.json"}
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", FileName: "account-a.json"}
 
 	payload := []byte(`{"metadata":{"user_id":"user_abc_account_x_session_y"}}`)
 	out := InjectAccountDeviceID(payload, dir, auth, "")
@@ -153,7 +153,7 @@ func TestInjectAccountDeviceID_ReplacesLegacyFlatString(t *testing.T) {
 // original bytes so the request is forwarded verbatim (never a 400).
 func TestInjectAccountDeviceID_InvalidPayloadPassesThrough(t *testing.T) {
 	dir := newTestAuthDir(t)
-	auth := &cliproxyauth.Auth{FileName: "account-a.json"}
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", FileName: "account-a.json"}
 
 	invalid := []byte(`{"metadata": this is not json`)
 	out := InjectAccountDeviceID(invalid, dir, auth, "")
@@ -165,7 +165,7 @@ func TestInjectAccountDeviceID_InvalidPayloadPassesThrough(t *testing.T) {
 
 func TestInjectAccountDeviceID_EmptyPayloadPassesThrough(t *testing.T) {
 	dir := newTestAuthDir(t)
-	auth := &cliproxyauth.Auth{FileName: "account-a.json"}
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", FileName: "account-a.json"}
 
 	out := InjectAccountDeviceID(nil, dir, auth, "")
 	if len(out) != 0 {
@@ -179,7 +179,7 @@ func TestInjectAccountDeviceID_EmptyPayloadPassesThrough(t *testing.T) {
 // session_id and account_uuid stay untouched.
 func TestInjectAccountDeviceIDWithOptions_NoFabricate_ReplacesExistingDeviceID(t *testing.T) {
 	dir := newTestAuthDir(t)
-	auth := &cliproxyauth.Auth{FileName: "account-a.json"}
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", FileName: "account-a.json"}
 
 	payload := []byte(`{"model":"claude","metadata":{"user_id":"{\"device_id\":\"realdevice\",\"account_uuid\":\"acct-uuid\",\"session_id\":\"sess-uuid\"}"},"messages":[{"role":"user","content":"hi"}]}`)
 
@@ -212,7 +212,7 @@ func TestInjectAccountDeviceIDWithOptions_NoFabricate_ReplacesExistingDeviceID(t
 // did not send.
 func TestInjectAccountDeviceIDWithOptions_NoFabricate_LeavesMissingUntouched(t *testing.T) {
 	dir := newTestAuthDir(t)
-	auth := &cliproxyauth.Auth{FileName: "account-a.json"}
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", FileName: "account-a.json"}
 
 	payload := []byte(`{"model":"claude","messages":[]}`)
 	out := InjectAccountDeviceIDWithOptions(payload, dir, auth, "", false)
@@ -230,7 +230,7 @@ func TestInjectAccountDeviceIDWithOptions_NoFabricate_LeavesMissingUntouched(t *
 // is disabled.
 func TestInjectAccountDeviceIDWithOptions_NoFabricate_MetadataPresentNoUserID(t *testing.T) {
 	dir := newTestAuthDir(t)
-	auth := &cliproxyauth.Auth{FileName: "account-a.json"}
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", FileName: "account-a.json"}
 
 	payload := []byte(`{"model":"claude","metadata":{"foo":"bar"},"messages":[]}`)
 	out := InjectAccountDeviceIDWithOptions(payload, dir, auth, "", false)
@@ -249,7 +249,7 @@ func TestInjectAccountDeviceIDWithOptions_NoFabricate_MetadataPresentNoUserID(t 
 // field, matching the leader's spec ("非 JSON 扁平串 → 整体换合成 JSON").
 func TestInjectAccountDeviceIDWithOptions_NoFabricate_ReplacesLegacyFlatString(t *testing.T) {
 	dir := newTestAuthDir(t)
-	auth := &cliproxyauth.Auth{FileName: "account-a.json"}
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", FileName: "account-a.json"}
 
 	payload := []byte(`{"metadata":{"user_id":"user_abc_account_x_session_y"}}`)
 	out := InjectAccountDeviceIDWithOptions(payload, dir, auth, "", false)
@@ -265,7 +265,7 @@ func TestInjectAccountDeviceIDWithOptions_NoFabricate_ReplacesLegacyFlatString(t
 // confirms the parse-failure safe pass-through still holds on the count_tokens path.
 func TestInjectAccountDeviceIDWithOptions_NoFabricate_InvalidPayloadPassesThrough(t *testing.T) {
 	dir := newTestAuthDir(t)
-	auth := &cliproxyauth.Auth{FileName: "account-a.json"}
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", FileName: "account-a.json"}
 
 	invalid := []byte(`{"metadata": this is not json`)
 	out := InjectAccountDeviceIDWithOptions(invalid, dir, auth, "", false)
@@ -280,7 +280,7 @@ func TestInjectAccountDeviceIDWithOptions_NoFabricate_InvalidPayloadPassesThroug
 // synthetic metadata.user_id (as a JSON string) when the field is missing.
 func TestInjectAccountDeviceID_MainPathStillFabricates(t *testing.T) {
 	dir := newTestAuthDir(t)
-	auth := &cliproxyauth.Auth{FileName: "account-a.json"}
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", FileName: "account-a.json"}
 
 	payload := []byte(`{"model":"claude","messages":[]}`)
 	out := InjectAccountDeviceID(payload, dir, auth, "")
@@ -297,7 +297,7 @@ func TestInjectAccountDeviceID_MainPathStillFabricates(t *testing.T) {
 // string, fabricated) the emitted metadata.user_id must never be a JSON object.
 func TestInjectAccountDeviceID_EgressUserIDNeverObject(t *testing.T) {
 	dir := newTestAuthDir(t)
-	auth := &cliproxyauth.Auth{FileName: "account-a.json"}
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", FileName: "account-a.json"}
 
 	cases := map[string][]byte{
 		"existing-json-string": []byte(`{"metadata":{"user_id":"{\"device_id\":\"realdevice\",\"account_uuid\":\"\",\"session_id\":\"s1\"}"}}`),
@@ -326,7 +326,7 @@ func TestInjectAccountDeviceID_EgressUserIDNeverObject(t *testing.T) {
 }
 
 func TestSyntheticDeviceID_FallsBackToProcessSaltWithoutAuthDir(t *testing.T) {
-	auth := &cliproxyauth.Auth{FileName: "account-a.json"}
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", FileName: "account-a.json"}
 
 	first := SyntheticDeviceID("", auth, "")
 	second := SyntheticDeviceID("", auth, "")

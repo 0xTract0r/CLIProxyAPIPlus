@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -65,6 +66,11 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 		return "", fmt.Errorf("auth filestore: create dir failed: %w", err)
 	}
 
+	// Snapshot the current on-disk auth JSON before overwriting it, keeping a rolling
+	// window of the most recent versions for recovery. Snapshotting is best-effort:
+	// a snapshot failure must never block persisting the new auth state.
+	snapshotAuthFileHistory(path)
+
 	// metadataSetter is a private interface for TokenStorage implementations that support metadata injection.
 	type metadataSetter interface {
 		SetMetadata(map[string]any)
@@ -116,6 +122,70 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 	}
 
 	return path, nil
+}
+
+// authFileHistoryDirName is the per-auth-directory subfolder that stores rolling
+// whole-file snapshots of auth JSON before each write.
+const authFileHistoryDirName = ".history"
+
+// authFileHistoryKeep is the number of most recent whole-file snapshots retained
+// per auth file. Older snapshots beyond this window are pruned.
+const authFileHistoryKeep = 7
+
+// snapshotAuthFileHistory copies the current contents of an auth JSON file into a
+// permission-tightened history subdirectory before it is overwritten, keeping the
+// most recent authFileHistoryKeep snapshots and pruning older ones. It is
+// best-effort: any error is ignored so it never blocks persisting auth state. A
+// snapshot is only taken when the target file already exists and is non-empty.
+func snapshotAuthFileHistory(path string) {
+	data, err := os.ReadFile(path)
+	if err != nil || len(data) == 0 {
+		return
+	}
+
+	baseName := filepath.Base(path)
+	historyDir := filepath.Join(filepath.Dir(path), authFileHistoryDirName)
+	if errMk := os.MkdirAll(historyDir, 0o700); errMk != nil {
+		return
+	}
+
+	// Snapshot name encodes the source file and a high-resolution timestamp so the
+	// lexical order matches chronological order for pruning.
+	snapshotName := fmt.Sprintf("%s.%s.bak", baseName, time.Now().UTC().Format("20060102T150405.000000000"))
+	snapshotPath := filepath.Join(historyDir, snapshotName)
+	if errWrite := writeFileAtomic(snapshotPath, data, 0o600); errWrite != nil {
+		return
+	}
+
+	pruneAuthFileHistory(historyDir, baseName)
+}
+
+// pruneAuthFileHistory removes snapshots for baseName beyond the retention window,
+// keeping the authFileHistoryKeep most recent entries. Errors are ignored.
+func pruneAuthFileHistory(historyDir, baseName string) {
+	entries, err := os.ReadDir(historyDir)
+	if err != nil {
+		return
+	}
+	prefix := baseName + "."
+	snapshots := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if strings.HasPrefix(name, prefix) && strings.HasSuffix(name, ".bak") {
+			snapshots = append(snapshots, name)
+		}
+	}
+	if len(snapshots) <= authFileHistoryKeep {
+		return
+	}
+	// Names embed a zero-padded timestamp, so ascending lexical order is oldest-first.
+	sort.Strings(snapshots)
+	for _, name := range snapshots[:len(snapshots)-authFileHistoryKeep] {
+		_ = os.Remove(filepath.Join(historyDir, name))
+	}
 }
 
 // writeFileAtomic writes data to path atomically: it creates a temp file in the

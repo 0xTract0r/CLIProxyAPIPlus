@@ -27,7 +27,7 @@ func TestGitLabExecutorExecuteUsesChatEndpoint(t *testing.T) {
 	defer srv.Close()
 
 	exec := NewGitLabExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		Provider: "gitlab",
 		Metadata: map[string]any{
 			"base_url":     srv.URL,
@@ -74,7 +74,7 @@ func TestGitLabExecutorExecuteFallsBackToCodeSuggestions(t *testing.T) {
 	defer srv.Close()
 
 	exec := NewGitLabExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		Provider: "gitlab",
 		Metadata: map[string]any{
 			"base_url":              srv.URL,
@@ -116,7 +116,7 @@ func TestGitLabExecutorExecuteUsesAnthropicGateway(t *testing.T) {
 	defer srv.Close()
 
 	exec := NewGitLabExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		Provider: "gitlab",
 		Metadata: map[string]any{
 			"duo_gateway_base_url": srv.URL,
@@ -179,7 +179,7 @@ func TestGitLabExecutorExecuteUsesOpenAIGateway(t *testing.T) {
 	defer srv.Close()
 
 	exec := NewGitLabExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		Provider: "gitlab",
 		Metadata: map[string]any{
 			"duo_gateway_base_url": srv.URL,
@@ -247,7 +247,7 @@ func TestGitLabExecutorRefreshUpdatesMetadata(t *testing.T) {
 	defer srv.Close()
 
 	exec := NewGitLabExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID:       "gitlab-auth.json",
 		Provider: "gitlab",
 		Metadata: map[string]any{
@@ -298,7 +298,7 @@ func TestGitLabExecutorExecuteStreamUsesCodeSuggestionsSSE(t *testing.T) {
 	defer srv.Close()
 
 	exec := NewGitLabExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		Provider: "gitlab",
 		Metadata: map[string]any{
 			"base_url":     srv.URL,
@@ -364,7 +364,7 @@ func TestGitLabExecutorExecuteStreamFallsBackToSyntheticChat(t *testing.T) {
 	defer srv.Close()
 
 	exec := NewGitLabExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		Provider: "gitlab",
 		Metadata: map[string]any{
 			"base_url":     srv.URL,
@@ -415,7 +415,7 @@ func TestGitLabExecutorExecuteStreamUsesAnthropicGateway(t *testing.T) {
 	defer srv.Close()
 
 	exec := NewGitLabExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		Provider: "gitlab",
 		Metadata: map[string]any{
 			"duo_gateway_base_url": srv.URL,

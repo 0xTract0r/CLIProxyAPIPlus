@@ -72,7 +72,7 @@ func TestGeminiExecutorExecuteCapsMaxOutputTokensBeforeUpstream(t *testing.T) {
 	defer server.Close()
 
 	exec := NewGeminiExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", Attributes: map[string]string{
 		"api_key":  "test-key",
 		"base_url": server.URL,
 	}}

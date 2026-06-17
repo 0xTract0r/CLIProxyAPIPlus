@@ -199,6 +199,123 @@ func TestPatchAuthFileAccountSettings_RewritesRuntimeSnapshotAndStoredSchema(t *
 	}
 }
 
+func TestPatchAuthFileAccountSettings_RejectsEmptyProxyURLForEnabledAccount(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	record := &coreauth.Auth{
+		ID:         "codex.json",
+		FileName:   "codex.json",
+		Provider:   "codex",
+		ProxyURL:   "http://proxy.remote:8080",
+		Attributes: map[string]string{"path": "/tmp/codex.json"},
+		Metadata:   map[string]any{"type": "codex"},
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("failed to register auth record: %v", errRegister)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+
+	// Enabled account with an empty proxy_url must be rejected to prevent IP exposure.
+	body := `{"name":"codex.json","proxy_url":"","disabled":false}`
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/account-settings", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	ctx.Request = req
+	h.PatchAuthFileAccountSettings(ctx)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected status %d for empty proxy_url, got %d with body %s", http.StatusBadRequest, rec.Code, rec.Body.String())
+	}
+
+	// The original proxy_url must remain untouched after the rejected patch.
+	updated, ok := manager.GetByID("codex.json")
+	if !ok || updated == nil {
+		t.Fatalf("expected auth record to still exist")
+	}
+	if updated.ProxyURL != "http://proxy.remote:8080" {
+		t.Fatalf("proxy_url = %q, want unchanged %q", updated.ProxyURL, "http://proxy.remote:8080")
+	}
+}
+
+func TestPatchAuthFileAccountSettings_RejectsInvalidProxyURLForEnabledAccount(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	record := &coreauth.Auth{
+		ID:         "codex.json",
+		FileName:   "codex.json",
+		Provider:   "codex",
+		ProxyURL:   "http://proxy.remote:8080",
+		Attributes: map[string]string{"path": "/tmp/codex.json"},
+		Metadata:   map[string]any{"type": "codex"},
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("failed to register auth record: %v", errRegister)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+
+	// Malformed proxy_url (unsupported scheme) must be rejected.
+	body := `{"name":"codex.json","proxy_url":"ftp://bad-scheme:1","disabled":false}`
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/account-settings", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	ctx.Request = req
+	h.PatchAuthFileAccountSettings(ctx)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected status %d for invalid proxy_url, got %d with body %s", http.StatusBadRequest, rec.Code, rec.Body.String())
+	}
+}
+
+func TestPatchAuthFileAccountSettings_AllowsValidProxyURLForEnabledAccount(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	record := &coreauth.Auth{
+		ID:         "codex.json",
+		FileName:   "codex.json",
+		Provider:   "codex",
+		Attributes: map[string]string{"path": "/tmp/codex.json"},
+		Metadata:   map[string]any{"type": "codex"},
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("failed to register auth record: %v", errRegister)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+
+	// Negative control: a valid proxy_url on an enabled account is accepted.
+	body := `{"name":"codex.json","proxy_url":"socks5://proxy.remote:1080","disabled":false}`
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/account-settings", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	ctx.Request = req
+	h.PatchAuthFileAccountSettings(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d for valid proxy_url, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+	updated, ok := manager.GetByID("codex.json")
+	if !ok || updated == nil {
+		t.Fatalf("expected updated auth record")
+	}
+	if updated.ProxyURL != "socks5://proxy.remote:1080" {
+		t.Fatalf("proxy_url = %q, want %q", updated.ProxyURL, "socks5://proxy.remote:1080")
+	}
+}
+
 func TestPatchAuthFileAccountSettings_DisablesRefreshForAccessTokenOnlyRecords(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
 	gin.SetMode(gin.TestMode)
@@ -226,7 +343,7 @@ func TestPatchAuthFileAccountSettings_DisablesRefreshForAccessTokenOnlyRecords(t
 
 	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
 
-	body := `{"name":"codex-access-token-only.json","disabled":false,"refresh_enabled":false,"extra_headers":{}}`
+	body := `{"name":"codex-access-token-only.json","proxy_url":"http://test-proxy:8080","disabled":false,"refresh_enabled":false,"extra_headers":{}}`
 	rec := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(rec)
 	req := httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/account-settings", strings.NewReader(body))
@@ -1302,7 +1419,7 @@ func TestPatchAuthFileAccountSettings_AppendsRuntimeIdentityHistoryOnProfileChan
 	}
 	initialIdentity := initial.AccountSettings.RuntimeIdentity.Current
 
-	body := `{"name":"codex-runtime-history.json","disabled":false,"extra_headers":{},"transport_profile":{"preset":"provider-default","alpn":["h2"]}}`
+	body := `{"name":"codex-runtime-history.json","proxy_url":"http://test-proxy:8080","disabled":false,"extra_headers":{},"transport_profile":{"preset":"provider-default","alpn":["h2"]}}`
 	rec := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(rec)
 	req := httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/account-settings", strings.NewReader(body))
@@ -1427,7 +1544,7 @@ func TestPatchAuthFileAccountSettings_RejectsManagedHeaderConflicts(t *testing.T
 
 	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
 
-	body := `{"name":"claude-conflict.json","proxy_url":null,"note":null,"disabled":false,"extra_headers":{"User-Agent":"manual-override"}}`
+	body := `{"name":"claude-conflict.json","proxy_url":"http://test-proxy:8080","note":null,"disabled":false,"extra_headers":{"User-Agent":"manual-override"}}`
 	rec := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(rec)
 	req := httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/account-settings", strings.NewReader(body))
@@ -1781,7 +1898,7 @@ func TestPatchAuthFileAccountSettings_SyntheticDeviceIDIsReadOnly(t *testing.T) 
 	}
 
 	// PATCH that attempts to overwrite synthetic_device_id.
-	body := `{"name":"claude-patch-readonly.json","disabled":false,"synthetic_device_id":"aaaa000000000000…"}`
+	body := `{"name":"claude-patch-readonly.json","proxy_url":"http://test-proxy:8080","disabled":false,"synthetic_device_id":"aaaa000000000000…"}`
 	rec := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(rec)
 	req := httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/account-settings", strings.NewReader(body))

@@ -101,6 +101,10 @@ func (s *trackingSelector) Pick(ctx context.Context, provider, model string, opt
 
 func newSchedulerForTest(selector Selector, auths ...*Auth) *authScheduler {
 	scheduler := newAuthScheduler(selector)
+	// These scheduler tests exercise rotation/cooldown semantics, not the missing
+	// proxy_url guard. Treat them as running with a global proxy configured so auths
+	// without an explicit per-account proxy_url stay schedulable.
+	scheduler.setGlobalProxyConfigured(true)
 	scheduler.rebuild(auths)
 	return scheduler
 }
@@ -123,6 +127,82 @@ func exhaustedCodexHeaders(resetAt time.Time) http.Header {
 	headers.Set("X-Codex-Primary-Used-Percent", "100")
 	headers.Set("X-Codex-Primary-Reset-At", strconv.FormatInt(resetAt.Unix(), 10))
 	return headers
+}
+
+func TestScheduler_SkipsAuthWithoutProxyURLWhenNoGlobalProxy(t *testing.T) {
+	t.Parallel()
+
+	registerSchedulerModels(t, "claude", "claude-3", "with-proxy", "no-proxy")
+
+	scheduler := newAuthScheduler(&RoundRobinSelector{})
+	// No global proxy configured (default false): an account without proxy_url has no
+	// safe egress path and must be dropped from scheduling.
+	scheduler.rebuild([]*Auth{
+		{ID: "with-proxy", Provider: "claude", ProxyURL: "http://acc-proxy:8080"},
+		{ID: "no-proxy", Provider: "claude"},
+	})
+
+	seen := map[string]bool{}
+	for i := 0; i < 5; i++ {
+		got, errPick := scheduler.pickSingle(context.Background(), "claude", "claude-3", cliproxyexecutor.Options{}, nil)
+		if errPick != nil {
+			t.Fatalf("pickSingle() #%d error = %v", i, errPick)
+		}
+		if got == nil {
+			t.Fatalf("pickSingle() #%d auth = nil", i)
+		}
+		seen[got.ID] = true
+	}
+	if seen["no-proxy"] {
+		t.Fatal("auth without proxy_url must not be scheduled when no global proxy is configured")
+	}
+	if !seen["with-proxy"] {
+		t.Fatal("auth with proxy_url should remain schedulable")
+	}
+}
+
+func TestScheduler_KeepsAuthWithoutProxyURLWhenGlobalProxyConfigured(t *testing.T) {
+	t.Parallel()
+
+	registerSchedulerModels(t, "claude", "claude-3", "no-proxy-global")
+
+	scheduler := newAuthScheduler(&RoundRobinSelector{})
+	// A global proxy fallback exists, so an account without a per-account proxy_url
+	// still has a safe egress path and remains schedulable.
+	scheduler.setGlobalProxyConfigured(true)
+	scheduler.rebuild([]*Auth{
+		{ID: "no-proxy-global", Provider: "claude"},
+	})
+
+	got, errPick := scheduler.pickSingle(context.Background(), "claude", "claude-3", cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle() error = %v", errPick)
+	}
+	if got == nil || got.ID != "no-proxy-global" {
+		t.Fatalf("expected no-proxy-global to be schedulable with a global proxy, got %v", got)
+	}
+}
+
+func TestScheduler_GlobalProxyToggleReevaluatesSchedulability(t *testing.T) {
+	t.Parallel()
+
+	registerSchedulerModels(t, "claude", "claude-3", "toggle-auth")
+
+	scheduler := newAuthScheduler(&RoundRobinSelector{})
+	scheduler.setGlobalProxyConfigured(true)
+	scheduler.rebuild([]*Auth{
+		{ID: "toggle-auth", Provider: "claude"},
+	})
+
+	if got, errPick := scheduler.pickSingle(context.Background(), "claude", "claude-3", cliproxyexecutor.Options{}, nil); errPick != nil || got == nil {
+		t.Fatalf("auth should be schedulable while global proxy is on (got=%v err=%v)", got, errPick)
+	}
+
+	// Removing the global proxy must drop the now-unprotected proxy-less account.
+	scheduler.setGlobalProxyConfigured(false)
+	if _, errPick := scheduler.pickSingle(context.Background(), "claude", "claude-3", cliproxyexecutor.Options{}, nil); errPick == nil {
+		t.Fatal("auth without proxy_url must become unschedulable after the global proxy is removed")
+	}
 }
 
 func TestSchedulerPick_RoundRobinHighestPriority(t *testing.T) {
@@ -295,6 +375,8 @@ func TestManagerExecute_ClaudeOpusSkipsProEvenWithStaleRegistry(t *testing.T) {
 	registerSchedulerModels(t, "claude", model, "claude-pro-stale", "claude-max-stale")
 
 	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+
+	manager.scheduler.setGlobalProxyConfigured(true)
 	manager.executors["claude"] = schedulerTestExecutor{}
 	for _, auth := range []*Auth{
 		{ID: "claude-pro-stale", Provider: "claude", Attributes: map[string]string{"plan_type": "pro"}},
@@ -325,6 +407,8 @@ func TestManagerExecute_ClaudeOpusAllowsReauthRequiredLastKnownMaxPlan(t *testin
 	registerSchedulerModels(t, "claude", model, "claude-reauth-max-stale")
 
 	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+
+	manager.scheduler.setGlobalProxyConfigured(true)
 	manager.executors["claude"] = schedulerTestExecutor{}
 	for _, auth := range []*Auth{
 		{
@@ -361,6 +445,8 @@ func TestManagerExecute_ClaudeOpusRejectsProOnlyStaleRegistry(t *testing.T) {
 	registerSchedulerModels(t, "claude", model, "claude-pro-only-stale")
 
 	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+
+	manager.scheduler.setGlobalProxyConfigured(true)
 	manager.executors["claude"] = schedulerTestExecutor{}
 	if _, errRegister := manager.Register(ctx, &Auth{
 		ID:       "claude-pro-only-stale",
@@ -390,6 +476,7 @@ func TestManagerExecute_ClaudeOpusLegacySelectorFiltersProBeforePick(t *testing.
 
 	selector := &trackingSelector{}
 	manager := NewManager(nil, selector, nil)
+	manager.scheduler.setGlobalProxyConfigured(true)
 	manager.executors["claude"] = schedulerTestExecutor{}
 	if _, errRegister := manager.Register(ctx, &Auth{
 		ID:       "claude-pro-legacy-stale",
@@ -421,6 +508,8 @@ func TestManagerExecute_CodexSparkSkipsPlusAndUnknownEvenWithStaleRegistry(t *te
 	registerSchedulerModels(t, "codex", model, "codex-plus-stale", "codex-unknown-stale", "codex-pro-stale")
 
 	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+
+	manager.scheduler.setGlobalProxyConfigured(true)
 	manager.executors["codex"] = schedulerTestExecutor{}
 	for _, auth := range []*Auth{
 		{ID: "codex-plus-stale", Provider: "codex", Attributes: map[string]string{"plan_type": "plus"}},
@@ -452,6 +541,8 @@ func TestManagerExecute_CodexSparkAllowsReauthRequiredLastKnownProPlan(t *testin
 	registerSchedulerModels(t, "codex", model, "codex-reauth-pro-stale")
 
 	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+
+	manager.scheduler.setGlobalProxyConfigured(true)
 	manager.executors["codex"] = schedulerTestExecutor{}
 	for _, auth := range []*Auth{
 		{
@@ -489,6 +580,7 @@ func TestManagerExecute_CodexSparkRejectsPlusAndUnknownOnlyStaleRegistry(t *test
 
 	selector := &trackingSelector{}
 	manager := NewManager(nil, selector, nil)
+	manager.scheduler.setGlobalProxyConfigured(true)
 	manager.executors["codex"] = schedulerTestExecutor{}
 	for _, auth := range []*Auth{
 		{ID: "codex-plus-only-stale", Provider: "codex", Attributes: map[string]string{"plan_type": "plus"}},
@@ -580,6 +672,8 @@ func TestManager_PickNextMixed_UsesWeightedProviderRotationBeforeCredentialRotat
 	t.Parallel()
 
 	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+
+	manager.scheduler.setGlobalProxyConfigured(true)
 	manager.executors["gemini"] = schedulerTestExecutor{}
 	manager.executors["claude"] = schedulerTestExecutor{}
 	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "gemini-a", Provider: "gemini"}); errRegister != nil {
@@ -618,6 +712,8 @@ func TestManager_PickNextMixed_DisallowFreeAuthSkipsCodexFreePlan(t *testing.T) 
 	registerSchedulerModels(t, "codex", model, "codex-a-free", "codex-b-plus")
 
 	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+
+	manager.scheduler.setGlobalProxyConfigured(true)
 	manager.executors["codex"] = schedulerTestExecutor{}
 	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "codex-a-free", Provider: "codex", Attributes: map[string]string{"plan_type": "free"}}); errRegister != nil {
 		t.Fatalf("Register(codex-a-free) error = %v", errRegister)
@@ -649,6 +745,7 @@ func TestManagerCustomSelector_FallsBackToLegacyPath(t *testing.T) {
 
 	selector := &trackingSelector{}
 	manager := NewManager(nil, selector, nil)
+	manager.scheduler.setGlobalProxyConfigured(true)
 	manager.executors["gemini"] = schedulerTestExecutor{}
 	manager.auths["auth-a"] = &Auth{ID: "auth-a", Provider: "gemini"}
 	manager.auths["auth-b"] = &Auth{ID: "auth-b", Provider: "gemini"}
@@ -675,6 +772,8 @@ func TestManager_InitializesSchedulerForBuiltInSelector(t *testing.T) {
 	t.Parallel()
 
 	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+
+	manager.scheduler.setGlobalProxyConfigured(true)
 	if manager.scheduler == nil {
 		t.Fatalf("manager.scheduler = nil")
 	}
@@ -692,6 +791,8 @@ func TestManager_SchedulerTracksRegisterAndUpdate(t *testing.T) {
 	t.Parallel()
 
 	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+
+	manager.scheduler.setGlobalProxyConfigured(true)
 	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "auth-b", Provider: "gemini"}); errRegister != nil {
 		t.Fatalf("Register(auth-b) error = %v", errRegister)
 	}
@@ -724,6 +825,8 @@ func TestManager_PickNextMixed_UsesSchedulerRotation(t *testing.T) {
 	t.Parallel()
 
 	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+
+	manager.scheduler.setGlobalProxyConfigured(true)
 	manager.executors["gemini"] = schedulerTestExecutor{}
 	manager.executors["claude"] = schedulerTestExecutor{}
 	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "gemini-a", Provider: "gemini"}); errRegister != nil {
@@ -759,6 +862,8 @@ func TestManager_PickNextMixed_SkipsProvidersWithoutExecutors(t *testing.T) {
 	t.Parallel()
 
 	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+
+	manager.scheduler.setGlobalProxyConfigured(true)
 	manager.executors["claude"] = schedulerTestExecutor{}
 	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "gemini-a", Provider: "gemini"}); errRegister != nil {
 		t.Fatalf("Register(gemini-a) error = %v", errRegister)
@@ -786,6 +891,8 @@ func TestManager_SchedulerTracksMarkResultCooldownAndRecovery(t *testing.T) {
 	t.Parallel()
 
 	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+
+	manager.scheduler.setGlobalProxyConfigured(true)
 	reg := registry.GetGlobalRegistry()
 	reg.RegisterClient("auth-a", "gemini", []*registry.ModelInfo{{ID: "test-model"}})
 	reg.RegisterClient("auth-b", "gemini", []*registry.ModelInfo{{ID: "test-model"}})
@@ -848,6 +955,8 @@ func TestManager_MarkResult_429_NoRetryAfter_TreatedAsTransient(t *testing.T) {
 	t.Parallel()
 
 	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+
+	manager.scheduler.setGlobalProxyConfigured(true)
 	reg := registry.GetGlobalRegistry()
 	reg.RegisterClient("transient-auth", "gemini", []*registry.ModelInfo{{ID: "transient-model"}})
 	t.Cleanup(func() {
@@ -889,6 +998,8 @@ func TestManager_SchedulerSkipsPlanQuotaPlusAndKeepsProAvailable(t *testing.T) {
 	t.Parallel()
 
 	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+
+	manager.scheduler.setGlobalProxyConfigured(true)
 	model := "gpt-5.5"
 	reg := registry.GetGlobalRegistry()
 	for _, id := range []string{"codex-plus-a", "codex-plus-b", "codex-pro"} {
@@ -934,6 +1045,8 @@ func TestManager_StreamChunkUsageLimitMarksPlanQuota(t *testing.T) {
 	t.Parallel()
 
 	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+
+	manager.scheduler.setGlobalProxyConfigured(true)
 	auth := &Auth{ID: "codex-plus-stream", Provider: "codex", Attributes: map[string]string{"plan_type": "plus"}}
 	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
 		t.Fatalf("Register() error = %v", errRegister)
@@ -983,6 +1096,8 @@ func TestManager_StreamSuccessCodexExhaustedHeaderCoolsAuth(t *testing.T) {
 	t.Parallel()
 
 	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+
+	manager.scheduler.setGlobalProxyConfigured(true)
 	model := "gpt-5.5"
 	plusID := "codex-plus-header-exhausted"
 	proID := "codex-pro-header-available"
@@ -1048,6 +1163,8 @@ func TestManager_ExecuteSuccessCodexExhaustedHeaderCoolsAuth(t *testing.T) {
 	t.Parallel()
 
 	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+
+	manager.scheduler.setGlobalProxyConfigured(true)
 	model := "gpt-5.5"
 	plusID := "codex-plus-execute-header-exhausted"
 	proID := "codex-pro-execute-header-available"
@@ -1089,6 +1206,8 @@ func TestManager_ExecuteCountSuccessCodexExhaustedHeaderCoolsAuth(t *testing.T) 
 	t.Parallel()
 
 	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+
+	manager.scheduler.setGlobalProxyConfigured(true)
 	model := "gpt-5.5"
 	plusID := "codex-plus-count-header-exhausted"
 	proID := "codex-pro-count-header-available"
@@ -1148,6 +1267,8 @@ func TestManager_AfterTransient429AllAuths_RecoversWithinShortWindow(t *testing.
 	authIDs := []string{"transient-pool-a", "transient-pool-b", "transient-pool-c"}
 
 	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+
+	manager.scheduler.setGlobalProxyConfigured(true)
 	registerSchedulerModels(t, provider, model, authIDs...)
 	for _, id := range authIDs {
 		if _, errRegister := manager.Register(context.Background(), &Auth{ID: id, Provider: provider}); errRegister != nil {

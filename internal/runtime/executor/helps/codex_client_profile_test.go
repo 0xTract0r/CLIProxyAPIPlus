@@ -18,7 +18,7 @@ func resetCodexClientProfileCache() {
 func TestResolveCodexClientProfile_DefaultFallbackUsesCodexProxyDesktopProfile(t *testing.T) {
 	resetCodexClientProfileCache()
 
-	profile := ResolveCodexClientProfile(&cliproxyauth.Auth{
+	profile := ResolveCodexClientProfile(&cliproxyauth.Auth{ProxyURL: "direct",
 		ID:       "codex-default-auth",
 		Provider: "codex",
 	}, nil, &config.Config{})
@@ -40,7 +40,7 @@ func TestResolveCodexClientProfile_DefaultFallbackUsesCodexProxyDesktopProfile(t
 func TestResolveCodexClientProfile_DefaultPolicyIgnoresObservedCLIHeaders(t *testing.T) {
 	resetCodexClientProfileCache()
 
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID:       "codex-profile-auth",
 		Provider: "codex",
 	}
@@ -91,7 +91,7 @@ func TestResolveCodexClientProfile_DefaultPolicyIgnoresObservedCLIHeaders(t *tes
 func TestResolveCodexClientProfile_ObservedCodexTuiPinsConsistentOriginatorAndUserAgent(t *testing.T) {
 	resetCodexClientProfileCache()
 
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID:       "codex-tui-observed-auth",
 		Provider: "codex",
 	}
@@ -118,7 +118,7 @@ func TestResolveCodexClientProfile_ObservedCodexTuiPinsConsistentOriginatorAndUs
 func TestResolveCodexClientProfile_ReconcilesMismatchedFirstPartyOriginatorAndUserAgent(t *testing.T) {
 	resetCodexClientProfileCache()
 
-	profile := ResolveCodexClientProfile(&cliproxyauth.Auth{
+	profile := ResolveCodexClientProfile(&cliproxyauth.Auth{ProxyURL: "direct",
 		ID:       "codex-mismatched-observed-auth",
 		Provider: "codex",
 	}, http.Header{
@@ -180,7 +180,7 @@ func TestResolveCodexClientProfile_DesktopDefaultDoesNotUseNPMCliVersion(t *test
 		resetManagedHeaderOnlineProfileCacheForTests()
 	})
 
-	profile := ResolveCodexClientProfile(&cliproxyauth.Auth{
+	profile := ResolveCodexClientProfile(&cliproxyauth.Auth{ProxyURL: "direct",
 		ID:       "codex-online-auth",
 		Provider: "codex",
 	}, nil, &config.Config{
@@ -247,7 +247,7 @@ func TestResolveCodexClientProfile_OnlineCodexProxyBundleUpdatesDesktopMarkers(t
 		resetManagedHeaderOnlineProfileCacheForTests()
 	})
 
-	profile := ResolveCodexClientProfile(&cliproxyauth.Auth{
+	profile := ResolveCodexClientProfile(&cliproxyauth.Auth{ProxyURL: "direct",
 		ID:       "codex-online-proxy-auth",
 		Provider: "codex",
 	}, nil, &config.Config{
@@ -302,7 +302,7 @@ func TestResolveCodexClientProfile_OnlineVersionDoesNotOverrideObservedSourceOrO
 		resetManagedHeaderOnlineProfileCacheForTests()
 	})
 
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID:       "codex-observed-online-auth",
 		Provider: "codex",
 	}
@@ -361,7 +361,7 @@ func TestResolveCodexClientProfile_OnlineVersionBumpsPersistedHeaders(t *testing
 		resetManagedHeaderOnlineProfileCacheForTests()
 	})
 
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID:       "codex-online-persisted-auth",
 		Provider: "codex",
 		Metadata: map[string]any{

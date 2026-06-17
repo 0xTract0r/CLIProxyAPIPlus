@@ -63,7 +63,7 @@ func TestRefreshAuthFileStatusClearsStaleWarningOnSuccess(t *testing.T) {
 		},
 	})
 
-	record := &coreauth.Auth{
+	record := &coreauth.Auth{ProxyURL: "http://test-proxy:8080",
 		ID:            "codex-cory2btc@gmail.com-pro.json",
 		FileName:      "codex-cory2btc@gmail.com-pro.json",
 		Provider:      "codex",
@@ -151,7 +151,7 @@ func TestRefreshAuthFileStatusPersistsCurrentFailure(t *testing.T) {
 		},
 	})
 
-	record := &coreauth.Auth{
+	record := &coreauth.Auth{ProxyURL: "http://test-proxy:8080",
 		ID:       "codex-cory2btc@gmail.com-pro.json",
 		FileName: "codex-cory2btc@gmail.com-pro.json",
 		Provider: "codex",
@@ -249,7 +249,7 @@ func TestRefreshAuthFileStatusDoesNotOverwriteConcurrentSuccessOnFailure(t *test
 		},
 	})
 
-	record := &coreauth.Auth{
+	record := &coreauth.Auth{ProxyURL: "http://test-proxy:8080",
 		ID:            "codex-race.json",
 		FileName:      "codex-race.json",
 		Provider:      "codex",
@@ -352,7 +352,7 @@ func TestRefreshAuthFileStatusMarksRefreshTokenReuseReauthRequired(t *testing.T)
 		},
 	})
 
-	record := &coreauth.Auth{
+	record := &coreauth.Auth{ProxyURL: "http://test-proxy:8080",
 		ID:       "codex-reused.json",
 		FileName: "codex-reused.json",
 		Provider: "codex",
@@ -463,7 +463,7 @@ func TestRefreshAuthFileStatusLeavesTransientPreExpiryFailureNonRed(t *testing.T
 		},
 	})
 
-	record := &coreauth.Auth{
+	record := &coreauth.Auth{ProxyURL: "http://test-proxy:8080",
 		ID:       "claude-transient.json",
 		FileName: "claude-transient.json",
 		Provider: "claude",
@@ -582,7 +582,7 @@ func TestRefreshAuthFileStatusKeepsPreExpiryRefreshTokenReusedUsable(t *testing.
 		},
 	})
 
-	record := &coreauth.Auth{
+	record := &coreauth.Auth{ProxyURL: "http://test-proxy:8080",
 		ID:       "codex-reused.json",
 		FileName: "codex-reused.json",
 		Provider: "codex",

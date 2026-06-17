@@ -10,7 +10,7 @@ import (
 )
 
 func authForEnv(fileName string) *cliproxyauth.Auth {
-	return &cliproxyauth.Auth{FileName: fileName}
+	return &cliproxyauth.Auth{ProxyURL: "direct", FileName: fileName}
 }
 
 // TestNormalizeAccountEnv_SystemEnvBlockRewritten covers P2.A7.2: the <env>

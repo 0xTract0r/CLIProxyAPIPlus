@@ -91,7 +91,7 @@ func TestAIStudioExecutorExecuteStartsTTFTBeforeRelayWait(t *testing.T) {
 	plugin := &captureAIStudioUsagePlugin{records: make(chan usage.Record, 16)}
 	usage.RegisterPlugin(plugin)
 	exec := NewAIStudioExecutor(&config.Config{}, "aistudio", relay)
-	_, errExecute := exec.Execute(context.Background(), &cliproxyauth.Auth{ID: authID, Provider: "aistudio"}, cliproxyexecutor.Request{
+	_, errExecute := exec.Execute(context.Background(), &cliproxyauth.Auth{ProxyURL: "direct", ID: authID, Provider: "aistudio"}, cliproxyexecutor.Request{
 		Model:   "gemini-3.1-pro-preview",
 		Payload: []byte(`{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}`),
 	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatGemini})

@@ -108,7 +108,7 @@ func TestGetKiroEndpointConfigs_NilAuth(t *testing.T) {
 }
 
 func TestGetKiroEndpointConfigs_WithRegionFromProfileArn(t *testing.T) {
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		Metadata: map[string]any{
 			"profile_arn": "arn:aws:codewhisperer:ap-southeast-1:123456789012:profile/ABC",
 		},
@@ -127,7 +127,7 @@ func TestGetKiroEndpointConfigs_WithRegionFromProfileArn(t *testing.T) {
 }
 
 func TestGetKiroEndpointConfigs_WithApiRegionOverride(t *testing.T) {
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		Metadata: map[string]any{
 			"api_region":  "eu-central-1",
 			"profile_arn": "arn:aws:codewhisperer:us-east-1:123456789012:profile/ABC",
@@ -188,7 +188,7 @@ func TestGetKiroEndpointConfigs_PreferredEndpoint(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			auth := &cliproxyauth.Auth{
+			auth := &cliproxyauth.Auth{ProxyURL: "direct",
 				Metadata: map[string]any{
 					"preferred_endpoint": tt.preference,
 				},
@@ -205,7 +205,7 @@ func TestGetKiroEndpointConfigs_PreferredEndpoint(t *testing.T) {
 
 func TestGetKiroEndpointConfigs_PreferredEndpointFromAttributes(t *testing.T) {
 	// Test that preferred_endpoint can also come from Attributes
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		Metadata:   map[string]any{},
 		Attributes: map[string]string{"preferred_endpoint": "codewhisperer"},
 	}
@@ -218,7 +218,7 @@ func TestGetKiroEndpointConfigs_PreferredEndpointFromAttributes(t *testing.T) {
 }
 
 func TestGetKiroEndpointConfigs_MetadataTakesPrecedenceOverAttributes(t *testing.T) {
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		Metadata:   map[string]any{"preferred_endpoint": "amazonq"},
 		Attributes: map[string]string{"preferred_endpoint": "codewhisperer"},
 	}
@@ -240,7 +240,7 @@ func TestGetAuthValue(t *testing.T) {
 	}{
 		{
 			name: "From metadata",
-			auth: &cliproxyauth.Auth{
+			auth: &cliproxyauth.Auth{ProxyURL: "direct",
 				Metadata: map[string]any{"test_key": "metadata_value"},
 			},
 			key:      "test_key",
@@ -248,7 +248,7 @@ func TestGetAuthValue(t *testing.T) {
 		},
 		{
 			name: "From attributes (fallback)",
-			auth: &cliproxyauth.Auth{
+			auth: &cliproxyauth.Auth{ProxyURL: "direct",
 				Attributes: map[string]string{"test_key": "attribute_value"},
 			},
 			key:      "test_key",
@@ -256,7 +256,7 @@ func TestGetAuthValue(t *testing.T) {
 		},
 		{
 			name: "Metadata takes precedence",
-			auth: &cliproxyauth.Auth{
+			auth: &cliproxyauth.Auth{ProxyURL: "direct",
 				Metadata:   map[string]any{"test_key": "metadata_value"},
 				Attributes: map[string]string{"test_key": "attribute_value"},
 			},
@@ -265,7 +265,7 @@ func TestGetAuthValue(t *testing.T) {
 		},
 		{
 			name: "Key not found",
-			auth: &cliproxyauth.Auth{
+			auth: &cliproxyauth.Auth{ProxyURL: "direct",
 				Metadata:   map[string]any{"other_key": "value"},
 				Attributes: map[string]string{"another_key": "value"},
 			},
@@ -274,7 +274,7 @@ func TestGetAuthValue(t *testing.T) {
 		},
 		{
 			name: "Nil metadata",
-			auth: &cliproxyauth.Auth{
+			auth: &cliproxyauth.Auth{ProxyURL: "direct",
 				Attributes: map[string]string{"test_key": "attribute_value"},
 			},
 			key:      "test_key",
@@ -282,13 +282,13 @@ func TestGetAuthValue(t *testing.T) {
 		},
 		{
 			name:     "Both nil",
-			auth:     &cliproxyauth.Auth{},
+			auth:     &cliproxyauth.Auth{ProxyURL: "direct"},
 			key:      "test_key",
 			expected: "",
 		},
 		{
 			name: "Value is trimmed and lowercased",
-			auth: &cliproxyauth.Auth{
+			auth: &cliproxyauth.Auth{ProxyURL: "direct",
 				Metadata: map[string]any{"test_key": "  UPPER_VALUE  "},
 			},
 			key:      "test_key",
@@ -296,7 +296,7 @@ func TestGetAuthValue(t *testing.T) {
 		},
 		{
 			name: "Empty string value in metadata - falls back to attributes",
-			auth: &cliproxyauth.Auth{
+			auth: &cliproxyauth.Auth{ProxyURL: "direct",
 				Metadata:   map[string]any{"test_key": ""},
 				Attributes: map[string]string{"test_key": "attribute_value"},
 			},
@@ -305,7 +305,7 @@ func TestGetAuthValue(t *testing.T) {
 		},
 		{
 			name: "Non-string value in metadata - falls back to attributes",
-			auth: &cliproxyauth.Auth{
+			auth: &cliproxyauth.Auth{ProxyURL: "direct",
 				Metadata:   map[string]any{"test_key": 123},
 				Attributes: map[string]string{"test_key": "attribute_value"},
 			},
@@ -332,7 +332,7 @@ func TestGetAccountKey(t *testing.T) {
 	}{
 		{
 			name: "From client_id",
-			auth: &cliproxyauth.Auth{
+			auth: &cliproxyauth.Auth{ProxyURL: "direct",
 				Metadata: map[string]any{
 					"client_id":     "test-client-id-123",
 					"refresh_token": "test-refresh-token-456",
@@ -347,7 +347,7 @@ func TestGetAccountKey(t *testing.T) {
 		},
 		{
 			name: "From refresh_token only",
-			auth: &cliproxyauth.Auth{
+			auth: &cliproxyauth.Auth{ProxyURL: "direct",
 				Metadata: map[string]any{
 					"refresh_token": "test-refresh-token-789",
 				},
@@ -370,7 +370,7 @@ func TestGetAccountKey(t *testing.T) {
 		},
 		{
 			name: "Nil metadata",
-			auth: &cliproxyauth.Auth{},
+			auth: &cliproxyauth.Auth{ProxyURL: "direct"},
 			checkFn: func(t *testing.T, result string) {
 				if len(result) != 16 {
 					t.Errorf("expected 16 char key, got %d chars", len(result))
@@ -379,7 +379,7 @@ func TestGetAccountKey(t *testing.T) {
 		},
 		{
 			name: "Empty metadata",
-			auth: &cliproxyauth.Auth{
+			auth: &cliproxyauth.Auth{ProxyURL: "direct",
 				Metadata: map[string]any{},
 			},
 			checkFn: func(t *testing.T, result string) {

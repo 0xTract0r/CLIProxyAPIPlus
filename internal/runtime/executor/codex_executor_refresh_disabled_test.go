@@ -15,7 +15,7 @@ import (
 // auto-refresh scheduler.
 func TestCodexExecutorRefresh_SkipsWhenRefreshDisabled(t *testing.T) {
 	exec := &CodexExecutor{cfg: &config.Config{}}
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID:       "codex-refresh-disabled.json",
 		Provider: "codex",
 		Metadata: map[string]any{
@@ -31,7 +31,7 @@ func TestCodexExecutorRefresh_SkipsWhenRefreshDisabled(t *testing.T) {
 		t.Fatalf("expected the same auth pointer back when refresh skipped")
 	}
 
-	authViaSettings := &cliproxyauth.Auth{
+	authViaSettings := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID:       "codex-refresh-disabled-via-settings.json",
 		Provider: "codex",
 		Metadata: map[string]any{
@@ -51,7 +51,7 @@ func TestCodexExecutorRefresh_SkipsWhenRefreshDisabled(t *testing.T) {
 }
 
 func TestRefreshFailureLogFieldsUsesAccountRemark(t *testing.T) {
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID:       "codex-user@example.com-plus.json",
 		FileName: "codex-user@example.com-plus.json",
 		Provider: "codex",

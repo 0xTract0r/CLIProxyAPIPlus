@@ -25,7 +25,7 @@ func validCodexReasoningEncryptedContentForTest() string {
 }
 
 func newCodexSignatureTestAuth(serverURL string) *cliproxyauth.Auth {
-	return &cliproxyauth.Auth{Attributes: map[string]string{
+	return &cliproxyauth.Auth{ProxyURL: "direct", Attributes: map[string]string{
 		"base_url": serverURL,
 		"api_key":  "test",
 	}}

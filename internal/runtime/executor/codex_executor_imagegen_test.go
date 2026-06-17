@@ -228,7 +228,7 @@ func TestApplyImageGenerationPolicy_NilCfgStrips(t *testing.T) {
 
 func TestEnsureImageGenerationTool_FreeCodexAuthDoesNotInjectTool(t *testing.T) {
 	body := []byte(`{"model":"gpt-5.4","input":"draw a cat"}`)
-	freeAuth := &cliproxyauth.Auth{
+	freeAuth := &cliproxyauth.Auth{ProxyURL: "direct",
 		Provider:   "codex",
 		Attributes: map[string]string{"plan_type": "free"},
 	}

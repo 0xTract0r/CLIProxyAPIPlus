@@ -75,7 +75,7 @@ func TestCodexExecutor_Transient429AcrossPool_NoPlanQuotaFalsePositive_RecoversA
 	})
 
 	for _, id := range authIDs {
-		auth := &cliproxyauth.Auth{
+		auth := &cliproxyauth.Auth{ProxyURL: "direct",
 			ID:       id,
 			Provider: provider,
 			Attributes: map[string]string{

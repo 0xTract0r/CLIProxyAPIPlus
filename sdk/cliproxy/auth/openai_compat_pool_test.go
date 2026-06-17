@@ -173,7 +173,7 @@ func newOpenAICompatPoolTestManager(t *testing.T, alias string, models []interna
 	}
 	m.RegisterExecutor(executor)
 
-	auth := &Auth{
+	auth := &Auth{ProxyURL: "http://test-proxy:8080",
 		ID:       "pool-auth-" + t.Name(),
 		Provider: "pool",
 		Status:   StatusActive,
@@ -662,7 +662,7 @@ func TestManagerExecute_OpenAICompatAliasPoolBlockedAuthDoesNotConsumeRetryBudge
 	executor := &authScopedOpenAICompatPoolExecutor{id: "pool"}
 	m.RegisterExecutor(executor)
 
-	badAuth := &Auth{
+	badAuth := &Auth{ProxyURL: "http://test-proxy:8080",
 		ID:       "aa-blocked-auth",
 		Provider: "pool",
 		Status:   StatusActive,
@@ -672,7 +672,7 @@ func TestManagerExecute_OpenAICompatAliasPoolBlockedAuthDoesNotConsumeRetryBudge
 			"provider_key": "pool",
 		},
 	}
-	goodAuth := &Auth{
+	goodAuth := &Auth{ProxyURL: "http://test-proxy:8080",
 		ID:       "bb-good-auth",
 		Provider: "pool",
 		Status:   StatusActive,

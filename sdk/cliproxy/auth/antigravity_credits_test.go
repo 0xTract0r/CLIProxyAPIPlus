@@ -97,7 +97,7 @@ func TestManagerExecuteStream_AntigravityCreditsFallbackAfterBootstrap429(t *tes
 	manager.RegisterExecutor(executor)
 	registry.GetGlobalRegistry().RegisterClient("ag-credits", "antigravity", []*registry.ModelInfo{{ID: model}})
 	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient("ag-credits") })
-	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "ag-credits", Provider: "antigravity"}); errRegister != nil {
+	if _, errRegister := manager.Register(context.Background(), &Auth{ProxyURL: "http://test-proxy:8080", ID: "ag-credits", Provider: "antigravity"}); errRegister != nil {
 		t.Fatalf("register auth: %v", errRegister)
 	}
 
@@ -153,10 +153,10 @@ func TestManagerExecuteStream_CodexOnlyDoesNotEnterAntigravityCreditsFallback(t 
 		reg.UnregisterClient("codex-only")
 		reg.UnregisterClient("ag-unrelated")
 	})
-	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "codex-only", Provider: "codex"}); errRegister != nil {
+	if _, errRegister := manager.Register(context.Background(), &Auth{ProxyURL: "http://test-proxy:8080", ID: "codex-only", Provider: "codex"}); errRegister != nil {
 		t.Fatalf("register codex auth: %v", errRegister)
 	}
-	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "ag-unrelated", Provider: "antigravity"}); errRegister != nil {
+	if _, errRegister := manager.Register(context.Background(), &Auth{ProxyURL: "http://test-proxy:8080", ID: "ag-unrelated", Provider: "antigravity"}); errRegister != nil {
 		t.Fatalf("register antigravity auth: %v", errRegister)
 	}
 
@@ -182,7 +182,7 @@ func TestStatusCodeFromError_UnwrapsStreamBootstrap429(t *testing.T) {
 }
 
 func TestIsAuthBlockedForModel_ClaudeWithCreditsStillBlockedDuringCooldown(t *testing.T) {
-	auth := &Auth{
+	auth := &Auth{ProxyURL: "http://test-proxy:8080",
 		ID:       "ag-1",
 		Provider: "antigravity",
 		ModelStates: map[string]*ModelState{
@@ -210,7 +210,7 @@ func TestIsAuthBlockedForModel_ClaudeWithCreditsStillBlockedDuringCooldown(t *te
 }
 
 func TestIsAuthBlockedForModel_KeepsGeminiBlockedWithoutCreditsBypass(t *testing.T) {
-	auth := &Auth{
+	auth := &Auth{ProxyURL: "http://test-proxy:8080",
 		ID:       "ag-2",
 		Provider: "antigravity",
 		ModelStates: map[string]*ModelState{

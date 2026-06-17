@@ -210,7 +210,7 @@ func TestRefreshAuthFileStatusRecordsHistory(t *testing.T) {
 		},
 	})
 
-	record := &coreauth.Auth{
+	record := &coreauth.Auth{ProxyURL: "http://test-proxy:8080",
 		ID:            "codex-route-test.json",
 		FileName:      "codex-route-test.json",
 		Provider:      "codex",

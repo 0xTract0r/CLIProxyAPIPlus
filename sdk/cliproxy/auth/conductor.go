@@ -415,6 +415,9 @@ func (m *Manager) SetConfig(cfg *internalconfig.Config) {
 		cfg = &internalconfig.Config{}
 	}
 	m.runtimeConfig.Store(cfg)
+	if m.scheduler != nil {
+		m.scheduler.setGlobalProxyConfigured(strings.TrimSpace(cfg.ProxyURL) != "")
+	}
 	if !cfg.Home.Enabled {
 		m.clearHomeRuntimeAuths()
 	}

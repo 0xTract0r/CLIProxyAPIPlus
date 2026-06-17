@@ -21,7 +21,7 @@ func TestGitHubCopilotApplyHeaders_AppliesCustomHeaders(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new request: %v", err)
 	}
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		Provider: "github-copilot",
 		Attributes: map[string]string{
 			"header:X-Custom-Foo":         "bar",

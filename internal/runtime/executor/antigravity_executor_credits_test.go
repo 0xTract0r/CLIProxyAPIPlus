@@ -180,7 +180,8 @@ func TestAntigravityExecute_RetriesTransient429ResourceExhausted(t *testing.T) {
 
 	exec := NewAntigravityExecutor(&config.Config{RequestRetry: 1})
 	auth := &cliproxyauth.Auth{
-		ID: "auth-transient-429",
+		ID:       "auth-transient-429",
+		ProxyURL: "direct",
 		Attributes: map[string]string{
 			"base_url": server.URL,
 		},
@@ -235,7 +236,8 @@ func TestAntigravityExecute_CreditsInjectedWhenConductorRequests(t *testing.T) {
 		QuotaExceeded: config.QuotaExceeded{AntigravityCredits: true},
 	})
 	auth := &cliproxyauth.Auth{
-		ID: "auth-credits-conductor",
+		ID:       "auth-credits-conductor",
+		ProxyURL: "direct",
 		Attributes: map[string]string{
 			"base_url": server.URL,
 		},
@@ -289,7 +291,8 @@ func TestAntigravityExecute_NoCreditsWithoutConductorFlag(t *testing.T) {
 		QuotaExceeded: config.QuotaExceeded{AntigravityCredits: true},
 	})
 	auth := &cliproxyauth.Auth{
-		ID: "auth-no-conductor-flag",
+		ID:       "auth-no-conductor-flag",
+		ProxyURL: "direct",
 		Attributes: map[string]string{
 			"base_url": server.URL,
 		},

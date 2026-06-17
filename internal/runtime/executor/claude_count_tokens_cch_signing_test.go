@@ -47,7 +47,7 @@ func TestClaudeExecutorCountTokens_OAuthSignsCCHWithXXHash64(t *testing.T) {
 	defer server.Close()
 
 	executor := NewClaudeExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID: "auth-count-tokens-oauth",
 		Attributes: map[string]string{
 			"api_key":  "sk-ant-oat-test-123",
@@ -103,7 +103,7 @@ func TestClaudeExecutorCountTokens_SameBodyYieldsSameCCHAsMessages(t *testing.T)
 	defer server.Close()
 
 	executor := NewClaudeExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID: "auth-count-tokens-parity",
 		Attributes: map[string]string{
 			"api_key":  "sk-ant-oat-parity",
@@ -157,7 +157,7 @@ func TestClaudeExecutorCountTokens_NonOAuthKeepsSha256(t *testing.T) {
 	defer server.Close()
 
 	executor := NewClaudeExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID: "auth-count-tokens-apikey",
 		Attributes: map[string]string{
 			"api_key":  "sk-plain-api-key-not-oauth",

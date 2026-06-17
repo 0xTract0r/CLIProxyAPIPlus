@@ -83,7 +83,7 @@ func TestManagerRefreshAuth_DisablesRefreshAfterRefreshTokenReused(t *testing.T)
 	}
 	manager.RegisterExecutor(executor)
 
-	auth := &Auth{
+	auth := &Auth{ProxyURL: "http://test-proxy:8080",
 		ID:       "codex-refresh-reused",
 		Provider: "codex",
 		Metadata: map[string]any{
@@ -162,7 +162,7 @@ func TestManagerRefreshAuth_DisablesRefreshAfterInvalidGrant(t *testing.T) {
 	}
 	manager.RegisterExecutor(executor)
 
-	auth := &Auth{
+	auth := &Auth{ProxyURL: "http://test-proxy:8080",
 		ID:       "claude-invalid-grant",
 		Provider: "claude",
 		Metadata: map[string]any{
@@ -229,7 +229,7 @@ func TestManager_RefreshAuthUnauthorizedFailureStopsAutoRefreshRetry(t *testing.
 		schedulerProviderTestExecutor: schedulerProviderTestExecutor{provider: "codex"},
 	})
 
-	auth := &Auth{
+	auth := &Auth{ProxyURL: "http://test-proxy:8080",
 		ID:       "unauthorized-refresh",
 		Provider: "codex",
 		Metadata: map[string]any{
@@ -300,7 +300,7 @@ func TestManager_RefreshSchedulerEntry_RebuildsSupportedModelSetAfterModelRegist
 		testCase := testCase
 		t.Run(testCase.name, func(t *testing.T) {
 			manager := NewManager(nil, &RoundRobinSelector{}, nil)
-			auth := &Auth{
+			auth := &Auth{ProxyURL: "http://test-proxy:8080",
 				ID:       "refresh-entry-" + testCase.name,
 				Provider: "gemini",
 			}
@@ -342,7 +342,7 @@ func TestManager_PickNext_RebuildsSchedulerAfterModelCooldownError(t *testing.T)
 
 	registerSchedulerModels(t, "gemini", "scheduler-cooldown-rebuild-model", "cooldown-stale-old")
 
-	oldAuth := &Auth{
+	oldAuth := &Auth{ProxyURL: "http://test-proxy:8080",
 		ID:       "cooldown-stale-old",
 		Provider: "gemini",
 	}
@@ -360,7 +360,7 @@ func TestManager_PickNext_RebuildsSchedulerAfterModelCooldownError(t *testing.T)
 		RetryAfter: &planQuotaRetry,
 	})
 
-	newAuth := &Auth{
+	newAuth := &Auth{ProxyURL: "http://test-proxy:8080",
 		ID:       "cooldown-stale-new",
 		Provider: "gemini",
 	}

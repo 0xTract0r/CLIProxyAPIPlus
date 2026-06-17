@@ -67,7 +67,7 @@ func TestTestAuthFileMessagePinsSelectedAuth(t *testing.T) {
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
 	for _, id := range []string{targetID, otherID} {
-		if _, err := manager.Register(context.Background(), &coreauth.Auth{
+		if _, err := manager.Register(context.Background(), &coreauth.Auth{ProxyURL: "http://test-proxy:8080",
 			ID:       id,
 			FileName: id,
 			Provider: "codex",
@@ -121,7 +121,7 @@ func TestTestAuthFileMessageUsesProviderDefaultModelWhenNoRegisteredModel(t *tes
 	executor := &testMessageCaptureExecutor{provider: "codex"}
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
-	if _, err := manager.Register(context.Background(), &coreauth.Auth{
+	if _, err := manager.Register(context.Background(), &coreauth.Auth{ProxyURL: "http://test-proxy:8080",
 		ID:       "codex-no-model.json",
 		FileName: "codex-no-model.json",
 		Provider: "codex",
@@ -151,7 +151,7 @@ func TestTestAuthFileMessageUsesProviderDefaultModelWhenNoRegisteredModel(t *tes
 }
 
 func TestDefaultAuthFileTestMessageModel_ClaudeProCreditsDoesNotPickOpus(t *testing.T) {
-	auth := &coreauth.Auth{
+	auth := &coreauth.Auth{ProxyURL: "http://test-proxy:8080",
 		Provider: "claude",
 		Status:   coreauth.StatusActive,
 		Attributes: map[string]string{
@@ -173,7 +173,7 @@ func TestDefaultAuthFileTestMessageModel_ClaudeProCreditsDoesNotPickOpus(t *test
 }
 
 func TestDefaultAuthFileTestMessageModel_ClaudeNestedMaxAllowsOpus(t *testing.T) {
-	auth := &coreauth.Auth{
+	auth := &coreauth.Auth{ProxyURL: "http://test-proxy:8080",
 		Provider: "claude",
 		Status:   coreauth.StatusActive,
 		Metadata: map[string]any{
@@ -208,7 +208,7 @@ func TestTestAuthFileMessageRequiresModelForUnknownProvider(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	manager := coreauth.NewManager(nil, nil, nil)
-	if _, err := manager.Register(context.Background(), &coreauth.Auth{
+	if _, err := manager.Register(context.Background(), &coreauth.Auth{ProxyURL: "http://test-proxy:8080",
 		ID:       "unknown-no-model.json",
 		FileName: "unknown-no-model.json",
 		Provider: "unknown",

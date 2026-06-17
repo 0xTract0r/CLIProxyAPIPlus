@@ -161,7 +161,7 @@ func TestQuotaSnapshotsRefreshPersistsCoreSnapshot(t *testing.T) {
 	manager := coreauth.NewManager(nil, nil, nil)
 	exec := &quotaSnapshotTestExecutor{provider: "codex"}
 	manager.RegisterExecutor(exec)
-	if _, err := manager.Register(context.Background(), &coreauth.Auth{
+	if _, err := manager.Register(context.Background(), &coreauth.Auth{ProxyURL: "http://test-proxy:8080",
 		ID:       "codex-plus",
 		Provider: "codex",
 		Metadata: map[string]any{"plan_type": "plus"},
@@ -236,15 +236,14 @@ func TestQuotaSnapshotsRefreshReturnsPerAccountResults(t *testing.T) {
 		},
 	}
 	manager.RegisterExecutor(exec)
-	if _, err := manager.Register(context.Background(), &coreauth.Auth{
+	if _, err := manager.Register(context.Background(), &coreauth.Auth{ProxyURL: "http://test-proxy:8080",
 		ID:       "codex-ok",
 		Provider: "codex",
 		Metadata: map[string]any{"plan_type": "plus"},
 	}); err != nil {
 		t.Fatalf("Register ok auth error = %v", err)
 	}
-	if _, err := manager.Register(context.Background(), &coreauth.Auth{
-		ID:       "codex-ruleset",
+	if _, err := manager.Register(context.Background(), &coreauth.Auth{ID: "codex-ruleset",
 		Provider: "codex",
 		ProxyURL: "socks5://user:pass@80.174.217.1:12324",
 		Metadata: map[string]any{"plan_type": "plus"},
@@ -300,7 +299,7 @@ func TestQuotaSnapshotRefreshResultClassifiesProviderTimeout(t *testing.T) {
 		},
 	}
 	manager.RegisterExecutor(exec)
-	auth, err := manager.Register(context.Background(), &coreauth.Auth{
+	auth, err := manager.Register(context.Background(), &coreauth.Auth{ProxyURL: "http://test-proxy:8080",
 		ID:       "codex-slow",
 		Provider: "codex",
 		Metadata: map[string]any{"plan_type": "plus"},
@@ -367,7 +366,7 @@ func TestQuotaSnapshotsClaudeUnauthorizedRequiresReauth(t *testing.T) {
 			manager := coreauth.NewManager(nil, nil, nil)
 			exec := &quotaSnapshotTestExecutor{provider: "claude", responses: tt.responses}
 			manager.RegisterExecutor(exec)
-			if _, err := manager.Register(context.Background(), &coreauth.Auth{
+			if _, err := manager.Register(context.Background(), &coreauth.Auth{ProxyURL: "http://test-proxy:8080",
 				ID:       "claude-oauth",
 				Provider: "claude",
 			}); err != nil {
@@ -457,7 +456,7 @@ func TestQuotaSnapshotsCodexUnauthorizedRequiresReauth(t *testing.T) {
 				},
 			}
 			manager.RegisterExecutor(exec)
-			if _, err := manager.Register(context.Background(), &coreauth.Auth{
+			if _, err := manager.Register(context.Background(), &coreauth.Auth{ProxyURL: "http://test-proxy:8080",
 				ID:       "codex-oauth",
 				Provider: "codex",
 			}); err != nil {
@@ -530,7 +529,7 @@ func TestQuotaSnapshotsUnauthorizedDoesNotDecodeErrorBodyAndPreservesLastKnownPl
 		},
 	}
 	manager.RegisterExecutor(exec)
-	if _, err := manager.Register(context.Background(), &coreauth.Auth{
+	if _, err := manager.Register(context.Background(), &coreauth.Auth{ProxyURL: "http://test-proxy:8080",
 		ID:       "codex-stale-pro",
 		Provider: "codex",
 		Metadata: map[string]any{
@@ -588,6 +587,7 @@ func TestQuotaSnapshotsImplicitRefreshSkipsReauthButRefreshesRefreshDisabled(t *
 		{
 			ID:       "claude-reauth",
 			Provider: "claude",
+			ProxyURL: "http://test-proxy:8080",
 			Metadata: map[string]any{
 				quotaRefreshStatusMetadataKey: quotaRefreshStatusReauthRequired,
 				quotaRefreshErrorMetadataKey:  claudeQuotaCredentialUnauthorizedMessage,
@@ -597,6 +597,7 @@ func TestQuotaSnapshotsImplicitRefreshSkipsReauthButRefreshesRefreshDisabled(t *
 		{
 			ID:       "claude-refresh-disabled",
 			Provider: "claude",
+			ProxyURL: "http://test-proxy:8080",
 			Metadata: map[string]any{
 				"refresh_disabled":          true,
 				quotaNextRefreshMetadataKey: past,
@@ -605,6 +606,7 @@ func TestQuotaSnapshotsImplicitRefreshSkipsReauthButRefreshesRefreshDisabled(t *
 		{
 			ID:       "claude-active",
 			Provider: "claude",
+			ProxyURL: "http://test-proxy:8080",
 			Metadata: map[string]any{
 				quotaNextRefreshMetadataKey: past,
 			},
@@ -653,7 +655,7 @@ func TestQuotaSnapshotsImplicitRefreshSkipsReauthButRefreshesRefreshDisabled(t *
 func TestQuotaSnapshotEntryMarksRefreshDisabled(t *testing.T) {
 	t.Parallel()
 
-	entry := quotaSnapshotEntryFromAuth(&coreauth.Auth{
+	entry := quotaSnapshotEntryFromAuth(&coreauth.Auth{ProxyURL: "http://test-proxy:8080",
 		ID:       "claude-access-token-only",
 		Provider: "claude",
 		Metadata: map[string]any{
@@ -671,7 +673,7 @@ func TestQuotaSnapshotEntryMarksRefreshDisabled(t *testing.T) {
 func TestQuotaSnapshotEntryIncludesDisabledFlag(t *testing.T) {
 	t.Parallel()
 
-	entry := quotaSnapshotEntryFromAuth(&coreauth.Auth{
+	entry := quotaSnapshotEntryFromAuth(&coreauth.Auth{ProxyURL: "http://test-proxy:8080",
 		ID:       "claude-disabled",
 		Provider: "claude",
 		Disabled: true,
@@ -690,7 +692,7 @@ func TestQuotaSnapshotResponseOmitsZeroRefreshTimesForReauth(t *testing.T) {
 
 	gin.SetMode(gin.TestMode)
 	manager := coreauth.NewManager(nil, nil, nil)
-	if _, err := manager.Register(context.Background(), &coreauth.Auth{
+	if _, err := manager.Register(context.Background(), &coreauth.Auth{ProxyURL: "http://test-proxy:8080",
 		ID:       "claude-reauth",
 		Provider: "claude",
 		Metadata: map[string]any{
@@ -728,7 +730,7 @@ func TestQuotaSnapshotsBulkRefreshReturnsEntriesWhenAllImplicitTargetsSkipped(t 
 	manager := coreauth.NewManager(nil, nil, nil)
 	exec := &quotaSnapshotTestExecutor{provider: "claude"}
 	manager.RegisterExecutor(exec)
-	if _, err := manager.Register(context.Background(), &coreauth.Auth{
+	if _, err := manager.Register(context.Background(), &coreauth.Auth{ProxyURL: "http://test-proxy:8080",
 		ID:       "claude-reauth",
 		Provider: "claude",
 		Metadata: map[string]any{
@@ -776,7 +778,7 @@ func TestQuotaSnapshotsBackgroundRefreshReprobesRecoveredAuth(t *testing.T) {
 	exec := &quotaSnapshotTestExecutor{provider: "claude"}
 	manager.RegisterExecutor(exec)
 	overdue := time.Now().UTC().Add(-time.Minute).Format(time.RFC3339)
-	if _, err := manager.Register(context.Background(), &coreauth.Auth{
+	if _, err := manager.Register(context.Background(), &coreauth.Auth{ProxyURL: "http://test-proxy:8080",
 		ID:       "claude-recovered",
 		Provider: "claude",
 		Status:   coreauth.StatusActive,
@@ -790,7 +792,7 @@ func TestQuotaSnapshotsBackgroundRefreshReprobesRecoveredAuth(t *testing.T) {
 	}
 	// A still-unavailable credential is not recovered and must stay skipped even
 	// when its next-refresh schedule is due.
-	if _, err := manager.Register(context.Background(), &coreauth.Auth{
+	if _, err := manager.Register(context.Background(), &coreauth.Auth{ProxyURL: "http://test-proxy:8080",
 		ID:          "claude-unavailable",
 		Provider:    "claude",
 		Status:      coreauth.StatusActive,
@@ -845,7 +847,7 @@ func TestQuotaSnapshotsLegacyUnauthorizedErrorMapsToReauthAndRetriesExplicitly(t
 	manager := coreauth.NewManager(nil, nil, nil)
 	exec := &quotaSnapshotTestExecutor{provider: "claude"}
 	manager.RegisterExecutor(exec)
-	if _, err := manager.Register(context.Background(), &coreauth.Auth{
+	if _, err := manager.Register(context.Background(), &coreauth.Auth{ProxyURL: "http://test-proxy:8080",
 		ID:       "claude-legacy",
 		Provider: "claude",
 		FileName: "claude-legacy.json",
@@ -957,7 +959,7 @@ func TestQuotaSnapshotsExplicitReauthRefreshRetriesAndClearsState(t *testing.T) 
 				},
 			}
 			manager.RegisterExecutor(exec)
-			if _, err := manager.Register(context.Background(), &coreauth.Auth{
+			if _, err := manager.Register(context.Background(), &coreauth.Auth{ProxyURL: "http://test-proxy:8080",
 				ID:       "claude-reauth",
 				Provider: "claude",
 				FileName: "claude-main.json",
@@ -1027,7 +1029,7 @@ func TestQuotaSnapshotsRefreshNormalizesANSIWrappedJSON(t *testing.T) {
 		body:     "\x1b[32mhttps://chatgpt.com/backend-api/wham/usage\n{\"rate_limit\":{\"used_percent\":25},\"plan_type\":\"plus\"}\x1b[0m\n",
 	}
 	manager.RegisterExecutor(exec)
-	if _, err := manager.Register(context.Background(), &coreauth.Auth{
+	if _, err := manager.Register(context.Background(), &coreauth.Auth{ProxyURL: "http://test-proxy:8080",
 		ID:       "codex-plus",
 		Provider: "codex",
 		Metadata: map[string]any{"plan_type": "plus"},
@@ -1069,7 +1071,7 @@ func TestQuotaSnapshotsRefreshDecodesBrotliJSON(t *testing.T) {
 		contentEncoding: "br",
 	}
 	manager.RegisterExecutor(exec)
-	if _, err := manager.Register(context.Background(), &coreauth.Auth{
+	if _, err := manager.Register(context.Background(), &coreauth.Auth{ProxyURL: "http://test-proxy:8080",
 		ID:       "codex-plus",
 		Provider: "codex",
 		Metadata: map[string]any{"plan_type": "plus"},
@@ -1160,7 +1162,7 @@ func TestInferCodexPlanTypeUsesCodexNormalizer(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			auth := &coreauth.Auth{}
+			auth := &coreauth.Auth{ProxyURL: "http://test-proxy:8080"}
 			if tt.authPlan != "" {
 				auth.Metadata = map[string]any{"plan_type": tt.authPlan}
 			}
@@ -1224,7 +1226,7 @@ func TestQuotaSnapshotAutoRefreshSchedulesMissingNextOnRegularTick(t *testing.T)
 	manager := coreauth.NewManager(nil, nil, nil)
 	exec := &quotaSnapshotTestExecutor{provider: "codex"}
 	manager.RegisterExecutor(exec)
-	if _, err := manager.Register(context.Background(), &coreauth.Auth{
+	if _, err := manager.Register(context.Background(), &coreauth.Auth{ProxyURL: "http://test-proxy:8080",
 		ID:       "codex-plus",
 		Provider: "codex",
 		Metadata: map[string]any{"plan_type": "plus"},
@@ -1253,7 +1255,7 @@ func TestQuotaSnapshotStartupCatchUpRefreshesMissingNextWhenJitterZero(t *testin
 	manager := coreauth.NewManager(nil, nil, nil)
 	exec := &quotaSnapshotTestExecutor{provider: "codex"}
 	manager.RegisterExecutor(exec)
-	if _, err := manager.Register(context.Background(), &coreauth.Auth{
+	if _, err := manager.Register(context.Background(), &coreauth.Auth{ProxyURL: "http://test-proxy:8080",
 		ID:       "codex-plus",
 		Provider: "codex",
 		Metadata: map[string]any{"plan_type": "plus"},
@@ -1287,7 +1289,7 @@ func TestQuotaSnapshotStartupCatchUpRefreshesStaleSnapshotWithFutureNext(t *test
 	manager.RegisterExecutor(exec)
 	future := time.Now().UTC().Add(defaultQuotaSnapshotRefreshInterval).Format(time.RFC3339)
 	stale := time.Now().UTC().Add(-25 * time.Hour).Format(time.RFC3339)
-	if _, err := manager.Register(context.Background(), &coreauth.Auth{
+	if _, err := manager.Register(context.Background(), &coreauth.Auth{ProxyURL: "http://test-proxy:8080",
 		ID:       "codex-stale",
 		Provider: "codex",
 		Metadata: map[string]any{
@@ -1316,7 +1318,7 @@ func TestQuotaSnapshotStartupCatchUpRefreshesRefreshDisabledOldOKSnapshot(t *tes
 	policy := immediateStartupQuotaSnapshotTestPolicy()
 	stale := time.Now().UTC().Add(-(policy.StartupMaxStaleness + time.Hour)).Format(time.RFC3339)
 	future := time.Now().UTC().Add(defaultQuotaSnapshotRefreshInterval).Format(time.RFC3339)
-	if _, err := manager.Register(context.Background(), &coreauth.Auth{
+	if _, err := manager.Register(context.Background(), &coreauth.Auth{ProxyURL: "http://test-proxy:8080",
 		ID:       "codex-refresh-disabled",
 		Provider: "codex",
 		Metadata: map[string]any{
@@ -1366,7 +1368,7 @@ func TestQuotaSnapshotStartupCatchUpZeroMaxStalenessSkipsOldOKSnapshot(t *testin
 	policy.StartupMaxStaleness = 0
 	old := time.Now().UTC().Add(-72 * time.Hour).Format(time.RFC3339)
 	future := time.Now().UTC().Add(defaultQuotaSnapshotRefreshInterval).Format(time.RFC3339)
-	if _, err := manager.Register(context.Background(), &coreauth.Auth{
+	if _, err := manager.Register(context.Background(), &coreauth.Auth{ProxyURL: "http://test-proxy:8080",
 		ID:       "codex-old-ok",
 		Provider: "codex",
 		Metadata: map[string]any{
@@ -1395,7 +1397,7 @@ func TestQuotaSnapshotStartupReschedulesFutureNextWhenPolicyShortens(t *testing.
 	manager.RegisterExecutor(exec)
 	oldNext := time.Now().UTC().Add(45 * time.Minute).Format(time.RFC3339)
 	last := time.Now().UTC().Add(-5 * time.Minute).Format(time.RFC3339)
-	if _, err := manager.Register(context.Background(), &coreauth.Auth{
+	if _, err := manager.Register(context.Background(), &coreauth.Auth{ProxyURL: "http://test-proxy:8080",
 		ID:       "codex-short-policy",
 		Provider: "codex",
 		Metadata: map[string]any{
@@ -1456,7 +1458,7 @@ func TestQuotaSnapshotMissingExecutorDoesNotPersistUnsupportedForSupportedProvid
 	t.Parallel()
 
 	manager := coreauth.NewManager(nil, nil, nil)
-	if _, err := manager.Register(context.Background(), &coreauth.Auth{
+	if _, err := manager.Register(context.Background(), &coreauth.Auth{ProxyURL: "http://test-proxy:8080",
 		ID:       "codex-plus",
 		Provider: "codex",
 		Metadata: map[string]any{
@@ -1495,7 +1497,7 @@ func TestQuotaSnapshotLegacyUnsupportedProviderErrorIsStaleAndRetried(t *testing
 	exec := &quotaSnapshotTestExecutor{provider: "codex"}
 	manager.RegisterExecutor(exec)
 	future := time.Now().UTC().Add(defaultQuotaSnapshotRefreshInterval).Format(time.RFC3339)
-	if _, err := manager.Register(context.Background(), &coreauth.Auth{
+	if _, err := manager.Register(context.Background(), &coreauth.Auth{ProxyURL: "http://test-proxy:8080",
 		ID:       "codex-plus",
 		Provider: "codex",
 		Metadata: map[string]any{
@@ -1508,7 +1510,7 @@ func TestQuotaSnapshotLegacyUnsupportedProviderErrorIsStaleAndRetried(t *testing
 	}
 	handler := NewHandlerWithoutConfigFilePath(nil, manager)
 
-	entry := quotaSnapshotEntryFromAuth(&coreauth.Auth{
+	entry := quotaSnapshotEntryFromAuth(&coreauth.Auth{ProxyURL: "http://test-proxy:8080",
 		ID:       "codex-plus",
 		Provider: "codex",
 		Metadata: map[string]any{

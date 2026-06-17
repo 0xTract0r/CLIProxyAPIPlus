@@ -67,7 +67,7 @@ func TestCodexExecutorReasoningReplayCacheStoresFinalDoneAndInjectsNextClaudeReq
 	defer server.Close()
 
 	executor := NewCodexExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID: "auth-replay-1",
 		Attributes: map[string]string{
 			"base_url": server.URL,
@@ -225,14 +225,14 @@ func TestCodexExecutorReasoningReplayCacheSharesSameSessionAcrossCodexAuths(t *t
 	defer server.Close()
 
 	executor := NewCodexExecutor(&config.Config{})
-	firstAuth := &cliproxyauth.Auth{
+	firstAuth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID: "auth-replay-session-auth-a",
 		Attributes: map[string]string{
 			"base_url": server.URL,
 			"api_key":  "test-a",
 		},
 	}
-	secondAuth := &cliproxyauth.Auth{
+	secondAuth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID: "auth-replay-session-auth-b",
 		Attributes: map[string]string{
 			"base_url": server.URL,
@@ -301,7 +301,7 @@ func TestCodexExecutorReasoningReplayCacheDoesNotInjectNativeResponsesRequest(t 
 	defer server.Close()
 
 	executor := NewCodexExecutor(&config.Config{})
-	_, err := executor.Execute(context.Background(), &cliproxyauth.Auth{
+	_, err := executor.Execute(context.Background(), &cliproxyauth.Auth{ProxyURL: "direct",
 		ID: "auth-replay-native",
 		Attributes: map[string]string{
 			"base_url": server.URL,
@@ -339,7 +339,7 @@ func TestCodexExecutorReasoningReplayCacheDoesNotStoreNativeResponsesRequest(t *
 	defer server.Close()
 
 	executor := NewCodexExecutor(&config.Config{})
-	_, err := executor.Execute(context.Background(), &cliproxyauth.Auth{
+	_, err := executor.Execute(context.Background(), &cliproxyauth.Auth{ProxyURL: "direct",
 		ID: "auth-replay-native-store",
 		Attributes: map[string]string{
 			"base_url": server.URL,
@@ -382,7 +382,7 @@ func TestCodexExecutorReasoningReplayCacheDoesNotDuplicateClaudeClientReasoning(
 	defer server.Close()
 
 	executor := NewCodexExecutor(&config.Config{})
-	_, err := executor.Execute(context.Background(), &cliproxyauth.Auth{
+	_, err := executor.Execute(context.Background(), &cliproxyauth.Auth{ProxyURL: "direct",
 		ID: "auth-replay-2",
 		Attributes: map[string]string{
 			"base_url": server.URL,
@@ -433,7 +433,7 @@ func TestCodexExecutorReasoningReplayCacheInsertsReasoningBeforeAssistantOutputI
 	defer server.Close()
 
 	executor := NewCodexExecutor(&config.Config{})
-	_, err := executor.Execute(context.Background(), &cliproxyauth.Auth{
+	_, err := executor.Execute(context.Background(), &cliproxyauth.Auth{ProxyURL: "direct",
 		ID: "auth-replay-history",
 		Attributes: map[string]string{
 			"base_url": server.URL,
@@ -497,7 +497,7 @@ func TestCodexExecutorReasoningReplayCacheExecuteStreamStoresFinalDoneForClaude(
 	defer server.Close()
 
 	executor := NewCodexExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID: "auth-replay-stream",
 		Attributes: map[string]string{
 			"base_url": server.URL,
@@ -556,7 +556,7 @@ func TestCodexExecutorReasoningReplayCacheClearsOnNonStreamResponseFailedInvalid
 	defer server.Close()
 
 	executor := NewCodexExecutor(&config.Config{})
-	_, err := executor.Execute(context.Background(), &cliproxyauth.Auth{
+	_, err := executor.Execute(context.Background(), &cliproxyauth.Auth{ProxyURL: "direct",
 		ID: "auth-replay-invalid-nonstream",
 		Attributes: map[string]string{
 			"base_url": server.URL,
@@ -592,7 +592,7 @@ func TestCodexExecutorReasoningReplayCacheClearsOnStreamResponseFailedInvalidSig
 	defer server.Close()
 
 	executor := NewCodexExecutor(&config.Config{})
-	streamResult, err := executor.ExecuteStream(context.Background(), &cliproxyauth.Auth{
+	streamResult, err := executor.ExecuteStream(context.Background(), &cliproxyauth.Auth{ProxyURL: "direct",
 		ID: "auth-replay-invalid-stream",
 		Attributes: map[string]string{
 			"base_url": server.URL,
@@ -645,7 +645,7 @@ func TestCodexExecutorReasoningReplayCacheReplaysFunctionCallForClaudeToolResult
 	defer server.Close()
 
 	executor := NewCodexExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID: "auth-replay-claude-tool",
 		Attributes: map[string]string{
 			"base_url": server.URL,
@@ -785,7 +785,7 @@ func TestCodexExecutorReasoningReplayCacheMatchesShortenedClaudeToolResultCallID
 	defer server.Close()
 
 	executor := NewCodexExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID: "auth-replay-claude-short-tool",
 		Attributes: map[string]string{
 			"base_url": server.URL,
