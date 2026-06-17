@@ -55,7 +55,7 @@ func TestOpenAIResponsesCompactRejectsStream(t *testing.T) {
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
 
-	auth := &coreauth.Auth{ID: "auth1", Provider: executor.Identifier(), Status: coreauth.StatusActive}
+	auth := &coreauth.Auth{ProxyURL: "direct", ID: "auth1", Provider: executor.Identifier(), Status: coreauth.StatusActive}
 	if _, err := manager.Register(context.Background(), auth); err != nil {
 		t.Fatalf("Register auth: %v", err)
 	}
@@ -88,7 +88,7 @@ func TestOpenAIResponsesCompactExecute(t *testing.T) {
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
 
-	auth := &coreauth.Auth{ID: "auth2", Provider: executor.Identifier(), Status: coreauth.StatusActive}
+	auth := &coreauth.Auth{ProxyURL: "direct", ID: "auth2", Provider: executor.Identifier(), Status: coreauth.StatusActive}
 	if _, err := manager.Register(context.Background(), auth); err != nil {
 		t.Fatalf("Register auth: %v", err)
 	}
@@ -127,7 +127,7 @@ func TestOpenAIResponsesCompactDecodesZstdRequestBody(t *testing.T) {
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
 
-	auth := &coreauth.Auth{ID: "auth3", Provider: executor.Identifier(), Status: coreauth.StatusActive}
+	auth := &coreauth.Auth{ProxyURL: "direct", ID: "auth3", Provider: executor.Identifier(), Status: coreauth.StatusActive}
 	if _, err := manager.Register(context.Background(), auth); err != nil {
 		t.Fatalf("Register auth: %v", err)
 	}

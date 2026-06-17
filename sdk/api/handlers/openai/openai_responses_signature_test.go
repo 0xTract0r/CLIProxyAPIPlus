@@ -20,7 +20,7 @@ func TestOpenAIResponsesForwardsInvalidReasoningEncryptedContentToExecutor(t *te
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
 
-	auth := &coreauth.Auth{ID: "signature-auth-responses", Provider: executor.Identifier(), Status: coreauth.StatusActive}
+	auth := &coreauth.Auth{ProxyURL: "direct", ID: "signature-auth-responses", Provider: executor.Identifier(), Status: coreauth.StatusActive}
 	if _, err := manager.Register(context.Background(), auth); err != nil {
 		t.Fatalf("Register auth: %v", err)
 	}
@@ -54,7 +54,7 @@ func TestOpenAIResponsesCompactForwardsInvalidReasoningEncryptedContentToExecuto
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
 
-	auth := &coreauth.Auth{ID: "signature-auth-compact", Provider: executor.Identifier(), Status: coreauth.StatusActive}
+	auth := &coreauth.Auth{ProxyURL: "direct", ID: "signature-auth-compact", Provider: executor.Identifier(), Status: coreauth.StatusActive}
 	if _, err := manager.Register(context.Background(), auth); err != nil {
 		t.Fatalf("Register auth: %v", err)
 	}
