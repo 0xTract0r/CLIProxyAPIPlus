@@ -45,6 +45,7 @@ import (
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/proxyutil"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
@@ -3311,6 +3312,20 @@ func (h *Handler) PatchAuthFileAccountSettings(c *gin.Context) {
 	proxyURL := ""
 	if req.ProxyURL != nil {
 		proxyURL = strings.TrimSpace(*req.ProxyURL)
+	}
+	// Reject saving an account without a usable proxy_url. An empty proxy_url would
+	// force a direct connection to the upstream provider and expose the real server
+	// IP, so the value must be non-empty and a valid proxy setting. The explicit
+	// "direct"/"none" sentinels remain accepted as an intentional operator choice.
+	if !*req.Disabled {
+		if proxyURL == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "proxy_url is required: empty proxy_url would expose the real server IP via direct egress"})
+			return
+		}
+		if _, errProxy := proxyutil.Parse(proxyURL); errProxy != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("invalid proxy_url: %v", errProxy)})
+			return
+		}
 	}
 	noteValue := ""
 	if req.Note != nil {

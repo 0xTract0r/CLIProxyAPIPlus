@@ -90,7 +90,7 @@ func TestApplyClaudeHeaders_UsesConfiguredBaselineFingerprint(t *testing.T) {
 			StabilizeDeviceProfile: &stabilize,
 		},
 	}
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID: "auth-baseline",
 		Attributes: map[string]string{
 			"api_key":                            "key-baseline",
@@ -126,7 +126,7 @@ func TestApplyClaudeHeaders_RecordsClientObservationWhenStabilizationDisabled(t 
 			StabilizeDeviceProfile: &stabilize,
 		},
 	}
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID: "auth-observation-without-stabilization",
 		Attributes: map[string]string{
 			"api_key": "key-observation-without-stabilization",
@@ -161,7 +161,7 @@ func TestResolveClaudeBillingVersionAndApplyHeaders_RecordSingleClientObservatio
 			StabilizeDeviceProfile: &stabilize,
 		},
 	}
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID: "auth-observation-request-cache",
 		Attributes: map[string]string{
 			"api_key": "key-observation-request-cache",
@@ -205,7 +205,7 @@ func TestApplyClaudeHeaders_StructuredAccountSettingsKeepsManagedHeadersAuthorit
 			StabilizeDeviceProfile: &stabilize,
 		},
 	}
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID: "auth-structured-account-settings",
 		Attributes: map[string]string{
 			"api_key":                            "key-structured-account-settings",
@@ -254,7 +254,7 @@ func TestApplyClaudeHeaders_TracksHighestClaudeCLIFingerprint(t *testing.T) {
 			StabilizeDeviceProfile: &stabilize,
 		},
 	}
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID: "auth-upgrade",
 		Attributes: map[string]string{
 			"api_key": "key-upgrade",
@@ -316,7 +316,7 @@ func TestApplyClaudeHeaders_DoesNotDowngradeConfiguredBaselineOnFirstClaudeClien
 			StabilizeDeviceProfile: &stabilize,
 		},
 	}
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID: "auth-baseline-floor",
 		Attributes: map[string]string{
 			"api_key": "key-baseline-floor",
@@ -368,7 +368,7 @@ func TestApplyClaudeHeaders_UpgradesCachedSoftwareFingerprintWhenBaselineAdvance
 			StabilizeDeviceProfile: &stabilize,
 		},
 	}
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID: "auth-baseline-reload",
 		Attributes: map[string]string{
 			"api_key": "key-baseline-reload",
@@ -410,7 +410,7 @@ func TestApplyClaudeHeaders_LearnsOfficialFingerprintAfterCustomBaselineFallback
 			StabilizeDeviceProfile: &stabilize,
 		},
 	}
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID: "auth-custom-baseline-learning",
 		Attributes: map[string]string{
 			"api_key": "key-custom-baseline-learning",
@@ -462,7 +462,7 @@ func TestResolveClaudeDeviceProfile_RechecksCacheBeforeStoringCandidate(t *testi
 			StabilizeDeviceProfile: &stabilize,
 		},
 	}
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID: "auth-racy-upgrade",
 		Attributes: map[string]string{
 			"api_key": "key-racy-upgrade",
@@ -562,7 +562,7 @@ func TestApplyClaudeHeaders_ThirdPartyBaselineThenOfficialUpgradeKeepsPinnedPlat
 			StabilizeDeviceProfile: &stabilize,
 		},
 	}
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID: "auth-third-party-then-official",
 		Attributes: map[string]string{
 			"api_key": "key-third-party-then-official",
@@ -604,7 +604,7 @@ func TestApplyClaudeHeaders_DisableDeviceProfileStabilization(t *testing.T) {
 			StabilizeDeviceProfile: &stabilize,
 		},
 	}
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID: "auth-disable-stability",
 		Attributes: map[string]string{
 			"api_key": "key-disable-stability",
@@ -654,7 +654,7 @@ func TestApplyClaudeHeaders_LegacyModePreservesConfiguredUserAgentOverrideForCla
 			StabilizeDeviceProfile: &stabilize,
 		},
 	}
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID: "auth-legacy-ua-override",
 		Attributes: map[string]string{
 			"api_key":           "key-legacy-ua-override",
@@ -688,7 +688,7 @@ func TestApplyClaudeHeaders_LegacyModeFallsBackToRuntimeOSArchWhenMissing(t *tes
 			StabilizeDeviceProfile: &stabilize,
 		},
 	}
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID: "auth-legacy-runtime-os-arch",
 		Attributes: map[string]string{
 			"api_key": "key-legacy-runtime-os-arch",
@@ -715,7 +715,7 @@ func TestApplyClaudeHeaders_UnsetStabilizationAlsoUsesLegacyRuntimeOSArchFallbac
 			Arch:           "arm64",
 		},
 	}
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID: "auth-unset-runtime-os-arch",
 		Attributes: map[string]string{
 			"api_key": "key-unset-runtime-os-arch",
@@ -989,7 +989,7 @@ func TestClaudeExecutor_ReusesUserIDAcrossModelsWhenCacheEnabled(t *testing.T) {
 			},
 		},
 	})
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", Attributes: map[string]string{
 		"api_key":  "key-123",
 		"base_url": server.URL,
 	}}
@@ -1046,7 +1046,7 @@ func TestClaudeExecutor_DeviceIDIsAccountStableByDefault(t *testing.T) {
 	defer server.Close()
 
 	executor := NewClaudeExecutor(&config.Config{AuthDir: t.TempDir()})
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		FileName: "account-a.json",
 		Attributes: map[string]string{
 			"api_key":  "key-123",
@@ -1164,7 +1164,7 @@ func executeOpenAIChatCompletionThroughClaude(t *testing.T, upstreamBody string)
 	defer server.Close()
 
 	executor := NewClaudeExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", Attributes: map[string]string{
 		"api_key":  "key-123",
 		"base_url": server.URL,
 	}}
@@ -1208,7 +1208,7 @@ func TestClaudeExecutor_Explicit1MAliasUsesOfficialModelWithoutLegacyContextBeta
 	defer server.Close()
 
 	executor := NewClaudeExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", Attributes: map[string]string{
 		"api_key":  "sk-ant-oat-test",
 		"base_url": server.URL,
 	}}
@@ -1276,7 +1276,7 @@ func TestClaudeExecutor_AlignsBillingVersionWithStabilizedUserAgent(t *testing.T
 			StabilizeDeviceProfile: &stabilize,
 		},
 	})
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID: "auth-billing-stabilized",
 		Attributes: map[string]string{
 			"api_key":     "sk-ant-oat-test",
@@ -1335,7 +1335,7 @@ func TestClaudeExecutor_RewritesStaleBillingVersionToStabilizedUserAgent(t *test
 			StabilizeDeviceProfile: &stabilize,
 		},
 	})
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID: "auth-billing-stale-execute",
 		Attributes: map[string]string{
 			"api_key":     "sk-ant-oat-test",
@@ -1382,7 +1382,7 @@ func TestClaudeExecutor_AlignsBillingVersionWithSavedManagedUserAgent(t *testing
 	defer server.Close()
 
 	executor := NewClaudeExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID: "auth-billing-saved-header",
 		Attributes: map[string]string{
 			"api_key":    "sk-ant-oat-test",
@@ -1421,7 +1421,7 @@ func TestClaudeExecutorPrepareRequest_RecordsDirectClientVersionObservation(t *t
 	resetClaudeDeviceProfileCache()
 
 	executor := NewClaudeExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		FileName: "claude-direct-auth.json",
 		Provider: "claude",
 		Attributes: map[string]string{
@@ -1466,7 +1466,7 @@ func TestClaudeExecutor_UsesOptionsHeadersForClientVersionObservation(t *testing
 			StabilizeDeviceProfile: &stabilize,
 		},
 	})
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		FileName: "claude-file-auth.json",
 		Provider: "claude",
 		Attributes: map[string]string{
@@ -1530,7 +1530,7 @@ func TestClaudeExecutorStream_AlignsBillingVersionWithStabilizedUserAgent(t *tes
 			StabilizeDeviceProfile: &stabilize,
 		},
 	})
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID: "auth-billing-stream",
 		Attributes: map[string]string{
 			"api_key":     "sk-ant-oat-test",
@@ -1594,7 +1594,7 @@ func TestClaudeExecutorStream_RewritesStaleBillingVersionToStabilizedUserAgent(t
 			StabilizeDeviceProfile: &stabilize,
 		},
 	})
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID: "auth-billing-stale-stream",
 		Attributes: map[string]string{
 			"api_key":     "sk-ant-oat-test",
@@ -1658,7 +1658,7 @@ func TestClaudeExecutorCountTokens_AlignsBillingVersionWithStabilizedUserAgent(t
 			StabilizeDeviceProfile: &stabilize,
 		},
 	})
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID: "auth-billing-count",
 		Attributes: map[string]string{
 			"api_key":  "sk-ant-oat-test",
@@ -1715,7 +1715,7 @@ func TestClaudeExecutorCountTokens_RewritesStaleBillingVersionToStabilizedUserAg
 			StabilizeDeviceProfile: &stabilize,
 		},
 	})
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID: "auth-billing-stale-count",
 		Attributes: map[string]string{
 			"api_key":  "sk-ant-oat-test",
@@ -1751,7 +1751,7 @@ func TestApplyClaudeHeaders_DoesNotInjectRemoved1MContextBeta(t *testing.T) {
 	req = req.WithContext(contextWithGinHeaders(map[string]string{
 		"X-CPA-CLAUDE-1M": "1",
 	}))
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "sk-ant-oat-test"}}
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", Attributes: map[string]string{"api_key": "sk-ant-oat-test"}}
 
 	applyClaudeHeaders(req, auth, "sk-ant-oat-test", true, nil, nil)
 
@@ -1798,7 +1798,7 @@ func TestApplyClaudeHeaders_PrefersSavedManagedHeadersOverGinHeaders(t *testing.
 		"X-Stainless-Timeout":         "1",
 	}))
 
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		Attributes: map[string]string{
 			"api_key":      "sk-ant-oat-test",
 			"header:X-App": "cli",
@@ -1841,7 +1841,7 @@ func TestApplyClaudeHeaders_PreservesClaudeCloakingDefaultsWithoutSavedHeaders(t
 		"User-Agent": "curl/8.1.2",
 	}))
 
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		Attributes: map[string]string{
 			"api_key": "sk-ant-oat-test",
 		},
@@ -2004,7 +2004,7 @@ func TestClaudeExecutor_CountTokens_AppliesCacheControlGuards(t *testing.T) {
 	defer server.Close()
 
 	executor := NewClaudeExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", Attributes: map[string]string{
 		"api_key":  "key-123",
 		"base_url": server.URL,
 	}}
@@ -2054,7 +2054,7 @@ func TestClaudeExecutor_ExecuteSanitizesSignaturesBeforeUpstream(t *testing.T) {
 	defer server.Close()
 
 	executor := NewClaudeExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", Attributes: map[string]string{
 		"api_key":  "key-123",
 		"base_url": server.URL,
 	}}
@@ -2196,7 +2196,7 @@ func testClaudeExecutorInvalidCompressedErrorBody(
 	defer server.Close()
 
 	executor := NewClaudeExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", Attributes: map[string]string{
 		"api_key":  "key-123",
 		"base_url": server.URL,
 	}}
@@ -2305,7 +2305,7 @@ func TestClaudeExecutor_ExecuteStream_SetsIdentityAcceptEncoding(t *testing.T) {
 	defer server.Close()
 
 	executor := NewClaudeExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", Attributes: map[string]string{
 		"api_key":  "key-123",
 		"base_url": server.URL,
 	}}
@@ -2348,7 +2348,7 @@ func TestClaudeExecutor_Execute_SetsCompressedAcceptEncoding(t *testing.T) {
 	defer server.Close()
 
 	executor := NewClaudeExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", Attributes: map[string]string{
 		"api_key":  "key-123",
 		"base_url": server.URL,
 	}}
@@ -2390,7 +2390,7 @@ func TestClaudeExecutor_ExecuteStream_GzipSuccessBodyDecoded(t *testing.T) {
 	defer server.Close()
 
 	executor := NewClaudeExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", Attributes: map[string]string{
 		"api_key":  "key-123",
 		"base_url": server.URL,
 	}}
@@ -2516,7 +2516,7 @@ func TestClaudeExecutor_ExecuteStream_GzipNoContentEncodingHeader(t *testing.T) 
 	defer server.Close()
 
 	executor := NewClaudeExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", Attributes: map[string]string{
 		"api_key":  "key-123",
 		"base_url": server.URL,
 	}}
@@ -2570,7 +2570,7 @@ func TestClaudeExecutor_Execute_GzipErrorBodyNoContentEncodingHeader(t *testing.
 	defer server.Close()
 
 	executor := NewClaudeExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", Attributes: map[string]string{
 		"api_key":  "key-123",
 		"base_url": server.URL,
 	}}
@@ -2611,7 +2611,7 @@ func TestClaudeExecutor_ExecuteStream_GzipErrorBodyNoContentEncodingHeader(t *te
 	defer server.Close()
 
 	executor := NewClaudeExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", Attributes: map[string]string{
 		"api_key":  "key-123",
 		"base_url": server.URL,
 	}}
@@ -2643,7 +2643,7 @@ func TestClaudeExecutor_ExecuteStream_AcceptEncodingOverrideCannotBypassIdentity
 	defer server.Close()
 
 	executor := NewClaudeExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", Attributes: map[string]string{
 		"api_key":                "key-123",
 		"base_url":               server.URL,
 		"header:Accept-Encoding": "gzip, deflate, br, zstd",
@@ -2693,7 +2693,7 @@ func TestClaudeExecutor_ExecuteStream_RepairsClaudeCodeTextInvokeToToolUse(t *te
 	defer server.Close()
 
 	executor := NewClaudeExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", Attributes: map[string]string{
 		"api_key":  "key-123",
 		"base_url": server.URL,
 	}}
@@ -2762,7 +2762,7 @@ func TestClaudeExecutor_ExecuteStream_DoesNotRepairUnknownTextInvokeTool(t *test
 	defer server.Close()
 
 	executor := NewClaudeExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", Attributes: map[string]string{
 		"api_key":  "key-123",
 		"base_url": server.URL,
 	}}
@@ -2821,7 +2821,7 @@ func TestClaudeExecutor_ExecuteStream_DoesNotRepairInvokeWithTrailingText(t *tes
 	defer server.Close()
 
 	executor := NewClaudeExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", Attributes: map[string]string{
 		"api_key":  "key-123",
 		"base_url": server.URL,
 	}}
@@ -2879,7 +2879,7 @@ func TestClaudeExecutor_ExecuteStream_DoesNotRepairInvokeWithTrailingTextInLater
 	defer server.Close()
 
 	executor := NewClaudeExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", Attributes: map[string]string{
 		"api_key":  "key-123",
 		"base_url": server.URL,
 	}}
@@ -2938,7 +2938,7 @@ func TestClaudeExecutor_ExecuteStream_DoesNotRepairNonClaudeCodeCliHeader(t *tes
 	defer server.Close()
 
 	executor := NewClaudeExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", Attributes: map[string]string{
 		"api_key":  "key-123",
 		"base_url": server.URL,
 	}}
@@ -3104,7 +3104,7 @@ func TestClaudeExecutor_ExperimentalCCHSigningDisabledByDefaultKeepsLegacyHeader
 	defer server.Close()
 
 	executor := NewClaudeExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", Attributes: map[string]string{
 		"api_key":  "key-123",
 		"base_url": server.URL,
 	}}
@@ -3147,7 +3147,7 @@ func TestClaudeExecutor_ExperimentalCCHSigningOptInSignsFinalBody(t *testing.T) 
 			ExperimentalCCHSigning: true,
 		}},
 	})
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", Attributes: map[string]string{
 		"api_key":  "key-123",
 		"base_url": server.URL,
 	}}
@@ -3191,7 +3191,7 @@ func TestApplyCloaking_PreservesConfiguredStrictModeAndSensitiveWordsWhenModeOmi
 			},
 		}},
 	}
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "key-123"}}
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", Attributes: map[string]string{"api_key": "key-123"}}
 	payload := []byte(`{"system":"proxy rules","messages":[{"role":"user","content":[{"type":"text","text":"proxy access"}]}]}`)
 
 	out := applyCloaking(context.Background(), cfg, auth, payload, "claude-3-5-sonnet-20241022", "key-123", "2.1.63")
@@ -3226,7 +3226,7 @@ func ctxWithUserAgent(userAgent string) context.Context {
 // blocks), yet the account-scoped synthetic device_id must still be applied.
 func TestApplyCloaking_InjectsDeviceIDForClaudeCLIButNotSystemBlocks(t *testing.T) {
 	cfg := &config.Config{AuthDir: t.TempDir()}
-	auth := &cliproxyauth.Auth{FileName: "account-a.json", Attributes: map[string]string{"api_key": "key-123"}}
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", FileName: "account-a.json", Attributes: map[string]string{"api_key": "key-123"}}
 	// metadata.user_id is sent by claude-cli as a JSON *string* (not an object);
 	// Anthropic validates it as an opaque string.
 	payload := []byte(`{"system":"original system","metadata":{"user_id":"{\"device_id\":\"realdevice\",\"account_uuid\":\"\",\"session_id\":\"sess-1\"}"},"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
@@ -3268,8 +3268,8 @@ func TestApplyCloaking_DeviceIDDiffersBetweenAccounts(t *testing.T) {
 	payload := []byte(`{"metadata":{"user_id":"{\"device_id\":\"x\",\"account_uuid\":\"\",\"session_id\":\"s\"}"},"messages":[]}`)
 	ctx := ctxWithUserAgent("claude-cli/2.1.60 (external, cli)")
 
-	authA := &cliproxyauth.Auth{FileName: "account-a.json", Attributes: map[string]string{"api_key": "key-a"}}
-	authB := &cliproxyauth.Auth{FileName: "account-b.json", Attributes: map[string]string{"api_key": "key-b"}}
+	authA := &cliproxyauth.Auth{ProxyURL: "direct", FileName: "account-a.json", Attributes: map[string]string{"api_key": "key-a"}}
+	authB := &cliproxyauth.Auth{ProxyURL: "direct", FileName: "account-b.json", Attributes: map[string]string{"api_key": "key-b"}}
 
 	outA := applyCloaking(ctx, cfg, authA, payload, "claude-3-5-sonnet-20241022", "key-a", "2.1.63")
 	outB := applyCloaking(ctx, cfg, authB, payload, "claude-3-5-sonnet-20241022", "key-b", "2.1.63")
@@ -3517,7 +3517,7 @@ func TestApplyClaudeHeaders_ForcesXAppCliRegardlessOfClient(t *testing.T) {
 	req := newClaudeHeaderTestRequest(t, http.Header{
 		"X-App": []string{"foo"},
 	})
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		Attributes: map[string]string{"api_key": "key-xapp"},
 	}
 	applyClaudeHeaders(req, auth, "key-xapp", false, nil, nil)
@@ -3536,7 +3536,7 @@ func TestApplyClaudeHeaders_ManagedXAppStillWins(t *testing.T) {
 	req := newClaudeHeaderTestRequest(t, http.Header{
 		"X-App": []string{"browser"},
 	})
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		Attributes: map[string]string{
 			"api_key":      "key-xapp-managed",
 			"header:X-App": "cli",
@@ -3561,7 +3561,7 @@ func TestApplyClaudeHeaders_AnthropicBetaUnionsClientWithFloor(t *testing.T) {
 	req := newClaudeHeaderTestRequest(t, http.Header{
 		"Anthropic-Beta": []string{"claude-code-20250219,fine-grained-tool-streaming-2025-05-14"},
 	})
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		Attributes: map[string]string{"api_key": "key-beta"},
 	}
 	applyClaudeHeaders(req, auth, "key-beta", false, nil, nil)
@@ -3609,7 +3609,7 @@ func TestApplyClaudeHeaders_AnthropicBetaFloorWithoutClient(t *testing.T) {
 	resetClaudeDeviceProfileCache()
 
 	req := newClaudeHeaderTestRequest(t, http.Header{})
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		Attributes: map[string]string{"api_key": "key-beta-floor"},
 	}
 	applyClaudeHeaders(req, auth, "key-beta-floor", false, nil, nil)
@@ -3683,7 +3683,7 @@ func TestClaudeDeviceProfileStaleGuardActive_DetectsStaleProneConfig(t *testing.
 
 	// A real first-party observation anywhere provides a non-stale fallback
 	// ceiling and disarms the guard.
-	_ = helps.ResolveClaudeDeviceProfile(&cliproxyauth.Auth{ID: "stale-guard-seed", Provider: "claude"}, "", map[string][]string{
+	_ = helps.ResolveClaudeDeviceProfile(&cliproxyauth.Auth{ProxyURL: "direct", ID: "stale-guard-seed", Provider: "claude"}, "", map[string][]string{
 		"User-Agent": {"claude-cli/2.1.158 (external, cli)"},
 	}, &config.Config{})
 	if helps.ClaudeDeviceProfileStaleGuardActive(staleCfg) {
@@ -3708,7 +3708,7 @@ func TestApplyClaudeHeaders_StaleGuardOffPreservesObservedNewerClient(t *testing
 		},
 		ManagedHeaderProfile: config.ManagedHeaderProfileConfig{OnlineUpdate: &offline},
 	}
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID:         "auth-stale-guard",
 		Attributes: map[string]string{"api_key": "key-stale-guard"},
 	}

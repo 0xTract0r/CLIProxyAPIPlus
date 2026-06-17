@@ -30,7 +30,7 @@ func drainStream(t *testing.T, result *cliproxyexecutor.StreamResult) {
 func newCyberPolicyTestExecutor(t *testing.T, serverURL string) (*CodexExecutor, *cliproxyauth.Manager, *cliproxyauth.Auth) {
 	t.Helper()
 	manager := cliproxyauth.NewManager(nil, nil, nil)
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID:       "test-auth-cyber-policy",
 		Provider: "codex",
 		Attributes: map[string]string{
@@ -48,7 +48,7 @@ func newCyberPolicyTestExecutor(t *testing.T, serverURL string) (*CodexExecutor,
 // runCyberPolicyStream 触发一次 ExecuteStream 并返回 manager 内 auth 的最新快照。
 func runCyberPolicyStream(t *testing.T, executor *CodexExecutor, manager *cliproxyauth.Manager, authID, serverURL string) *cliproxyauth.Auth {
 	t.Helper()
-	result, err := executor.ExecuteStream(context.Background(), &cliproxyauth.Auth{
+	result, err := executor.ExecuteStream(context.Background(), &cliproxyauth.Auth{ProxyURL: "direct",
 		ID:       authID,
 		Provider: "codex",
 		Attributes: map[string]string{

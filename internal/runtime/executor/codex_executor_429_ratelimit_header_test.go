@@ -163,7 +163,7 @@ func TestCodexExecutor_RateLimitHeader429_ParksExhaustedAuth_RotatesToHealthy(t 
 	})
 
 	for id, key := range map[string]string{exhaustedID: exhaustedKey, healthyID: healthyKey} {
-		auth := &cliproxyauth.Auth{
+		auth := &cliproxyauth.Auth{ProxyURL: "direct",
 			ID:       id,
 			Provider: provider,
 			Attributes: map[string]string{

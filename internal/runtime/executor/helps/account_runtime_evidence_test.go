@@ -14,7 +14,7 @@ import (
 func TestBuildAccountRuntimeEvidence_CodexA02StyleManagedHeadersAndFallbackTLS(t *testing.T) {
 	resetCodexClientProfileCache()
 	timestamp := time.Date(2026, 4, 30, 10, 0, 0, 0, time.UTC)
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID:       "codex-a02",
 		FileName: "codex-a02.json",
 		Provider: "codex",
@@ -109,7 +109,7 @@ func TestBuildAccountRuntimeEvidence_CodexA02StyleManagedHeadersAndFallbackTLS(t
 
 func TestBuildAccountRuntimeEvidence_ClaudeUsesClaudeManagedPolicyAndUTLSProfile(t *testing.T) {
 	ResetClaudeDeviceProfileCache()
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID:       "claude-runtime",
 		FileName: "claude-runtime.json",
 		Provider: "claude",

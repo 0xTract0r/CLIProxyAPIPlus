@@ -39,7 +39,7 @@ func TestClaudeExecutor_CountTokensNormalizesAccountEnvWhenEnabled(t *testing.T)
 		AuthDir:             t.TempDir(),
 		NormalizeAccountEnv: &on,
 	})
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID: "acct-ct",
 		Attributes: map[string]string{
 			"api_key":  "key-ct",
@@ -97,7 +97,7 @@ func TestClaudeExecutor_CountTokensLeavesEnvUntouchedWhenDisabled(t *testing.T) 
 	defer server.Close()
 
 	executor := NewClaudeExecutor(&config.Config{AuthDir: t.TempDir()}) // switch unset -> off
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID: "acct-ct-off",
 		Attributes: map[string]string{
 			"api_key":  "key-ct-off",
@@ -146,7 +146,7 @@ func TestApplyClaudeHeaders_NonStructuredOperatorXAppCannotLeakNonCli(t *testing
 	})
 	// Attrs-only auth (no account_settings metadata) -> non-structured path. The
 	// operator tries to override X-App to a non-cli value through header:X-App.
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		Attributes: map[string]string{
 			"api_key":      "key-xapp-nonstruct",
 			"header:X-App": "browser",
@@ -172,7 +172,7 @@ func TestApplyClaudeHeaders_NonStructuredOperatorOtherHeaderStillOverrides(t *te
 	req := newClaudeHeaderTestRequest(t, http.Header{
 		"X-App": []string{"cli"},
 	})
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		Attributes: map[string]string{
 			"api_key":                    "key-other-nonstruct",
 			"header:X-Stainless-Timeout": "123",

@@ -48,7 +48,7 @@ func TestResolveClaudeDeviceProfile_OnlineRegistryNeverExceedsRealObservation(t 
 
 	// Zero observation on this account and globally: npm must NOT be used as a
 	// ceiling; the floor stays at the static baseline constant.
-	zeroObs := ResolveClaudeDeviceProfile(&cliproxyauth.Auth{
+	zeroObs := ResolveClaudeDeviceProfile(&cliproxyauth.Auth{ProxyURL: "direct",
 		ID:       "claude-zero-observation-auth",
 		Provider: "claude",
 	}, "", nil, cfg)
@@ -62,14 +62,14 @@ func TestResolveClaudeDeviceProfile_OnlineRegistryNeverExceedsRealObservation(t 
 	// Now observe a real first-party client below npm latest on a different
 	// account; npm must be capped to that real observed high-water (2.1.100),
 	// never lifted to npm latest 2.9.9.
-	_ = ResolveClaudeDeviceProfile(&cliproxyauth.Auth{
+	_ = ResolveClaudeDeviceProfile(&cliproxyauth.Auth{ProxyURL: "direct",
 		ID:       "claude-real-client-auth",
 		Provider: "claude",
 	}, "", map[string][]string{
 		"User-Agent": {"claude-cli/2.1.100 (external, cli)"},
 	}, cfg)
 
-	cappedFallback := ResolveClaudeDeviceProfile(&cliproxyauth.Auth{
+	cappedFallback := ResolveClaudeDeviceProfile(&cliproxyauth.Auth{ProxyURL: "direct",
 		ID:       "claude-zero-observation-auth",
 		Provider: "claude",
 	}, "", nil, cfg)
@@ -110,7 +110,7 @@ func TestResolveClaudeDeviceProfile_PrefersObservedClaudeCLIOverNewerOnlineFallb
 		resetManagedHeaderOnlineProfileCacheForTests()
 	})
 
-	profile := ResolveClaudeDeviceProfile(&cliproxyauth.Auth{
+	profile := ResolveClaudeDeviceProfile(&cliproxyauth.Auth{ProxyURL: "direct",
 		ID:       "claude-observed-auth",
 		Provider: "claude",
 	}, "", map[string][]string{
@@ -146,7 +146,7 @@ func TestResolveClaudeDeviceProfile_AllowsObservedCLIWhenConfiguredFallbackIsNew
 	ResetClaudeDeviceProfileCache()
 	t.Cleanup(ResetClaudeDeviceProfileCache)
 
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		FileName: "claude-configured-fallback.json",
 		Provider: "claude",
 	}
@@ -181,7 +181,7 @@ func TestClaudeDeviceProfileObservations_TracksRecentClientVersionsPerAuth(t *te
 	t.Cleanup(ResetClaudeDeviceProfileCache)
 
 	cfg := &config.Config{}
-	auth := &cliproxyauth.Auth{ID: "claude-observation-auth", Provider: "claude"}
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", ID: "claude-observation-auth", Provider: "claude"}
 
 	_ = ResolveClaudeDeviceProfile(auth, "", map[string][]string{
 		"User-Agent":                  {"claude-cli/2.1.140 (external, cli)"},
@@ -223,7 +223,7 @@ func TestClaudeDeviceProfileObservations_FileBackedAuthVisibleWithoutAPIKey(t *t
 	t.Cleanup(ResetClaudeDeviceProfileCache)
 
 	cfg := &config.Config{}
-	auth := &cliproxyauth.Auth{ID: "runtime-id-from-loader", FileName: "claude-file-auth.json", Provider: "claude"}
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", ID: "runtime-id-from-loader", FileName: "claude-file-auth.json", Provider: "claude"}
 
 	_ = ResolveClaudeDeviceProfile(auth, "runtime-api-key", map[string][]string{
 		"User-Agent":                  {"claude-cli/2.1.142 (external, cli)"},
@@ -242,7 +242,7 @@ func TestClaudeDeviceProfileObservations_FileBackedAuthVisibleWithoutAPIKey(t *t
 		t.Fatalf("request_count = %d, want 1", got)
 	}
 
-	sameFileDifferentRuntimeID := &cliproxyauth.Auth{ID: "management-id-from-loader", FileName: "claude-file-auth.json", Provider: "claude"}
+	sameFileDifferentRuntimeID := &cliproxyauth.Auth{ProxyURL: "direct", ID: "management-id-from-loader", FileName: "claude-file-auth.json", Provider: "claude"}
 	observations = ClaudeDeviceProfileObservations(sameFileDifferentRuntimeID, "")
 	if len(observations) != 1 {
 		t.Fatalf("same file observations length = %d, want 1: %#v", len(observations), observations)
@@ -254,7 +254,7 @@ func TestClaudeDeviceProfileObservations_FileNameAuthIDAliases(t *testing.T) {
 	t.Cleanup(ResetClaudeDeviceProfileCache)
 
 	cfg := &config.Config{}
-	requestAuth := &cliproxyauth.Auth{ID: "claude-file-auth.json", Provider: "claude"}
+	requestAuth := &cliproxyauth.Auth{ProxyURL: "direct", ID: "claude-file-auth.json", Provider: "claude"}
 
 	_ = ResolveClaudeDeviceProfile(requestAuth, "runtime-api-key", map[string][]string{
 		"User-Agent":                  {"claude-cli/2.1.144 (external, cli)"},
@@ -262,7 +262,7 @@ func TestClaudeDeviceProfileObservations_FileNameAuthIDAliases(t *testing.T) {
 		"X-Stainless-Runtime-Version": {"v24.5.0"},
 	}, cfg)
 
-	managementAuth := &cliproxyauth.Auth{FileName: "claude-file-auth.json", Provider: "claude"}
+	managementAuth := &cliproxyauth.Auth{ProxyURL: "direct", FileName: "claude-file-auth.json", Provider: "claude"}
 	observations := ClaudeDeviceProfileObservations(managementAuth, "")
 	if len(observations) != 1 {
 		t.Fatalf("observations length = %d, want 1: %#v", len(observations), observations)
@@ -277,7 +277,7 @@ func TestClaudeDeviceProfileObservations_LabelAlias(t *testing.T) {
 	t.Cleanup(ResetClaudeDeviceProfileCache)
 
 	cfg := &config.Config{}
-	requestAuth := &cliproxyauth.Auth{Label: "bcd898@example.com", Provider: "claude"}
+	requestAuth := &cliproxyauth.Auth{ProxyURL: "direct", Label: "bcd898@example.com", Provider: "claude"}
 
 	_ = ResolveClaudeDeviceProfile(requestAuth, "runtime-api-key", map[string][]string{
 		"User-Agent":                  {"claude-cli/2.1.142 (external, cli)"},
@@ -285,7 +285,7 @@ func TestClaudeDeviceProfileObservations_LabelAlias(t *testing.T) {
 		"X-Stainless-Runtime-Version": {"v24.3.0"},
 	}, cfg)
 
-	managementAuth := &cliproxyauth.Auth{Label: "bcd898@example.com", Provider: "claude"}
+	managementAuth := &cliproxyauth.Auth{ProxyURL: "direct", Label: "bcd898@example.com", Provider: "claude"}
 	observations := ClaudeDeviceProfileObservations(managementAuth, "")
 	if len(observations) != 1 {
 		t.Fatalf("observations length = %d, want 1: %#v", len(observations), observations)
@@ -300,7 +300,7 @@ func TestClaudeDeviceProfileObservations_GlobalFallbackForUnidentifiedAuth(t *te
 	t.Cleanup(ResetClaudeDeviceProfileCache)
 
 	cfg := &config.Config{}
-	requestAuth := &cliproxyauth.Auth{Provider: "claude"}
+	requestAuth := &cliproxyauth.Auth{ProxyURL: "direct", Provider: "claude"}
 
 	_ = ResolveClaudeDeviceProfile(requestAuth, "provider-token", map[string][]string{
 		"User-Agent":                  {"claude-cli/2.1.141 (external, cli)"},
@@ -308,7 +308,7 @@ func TestClaudeDeviceProfileObservations_GlobalFallbackForUnidentifiedAuth(t *te
 		"X-Stainless-Runtime-Version": {"v24.3.0"},
 	}, cfg)
 
-	managementAuth := &cliproxyauth.Auth{FileName: "claude-file-auth.json", Provider: "claude"}
+	managementAuth := &cliproxyauth.Auth{ProxyURL: "direct", FileName: "claude-file-auth.json", Provider: "claude"}
 	observations := ClaudeDeviceProfileObservations(managementAuth, "")
 	if len(observations) != 1 {
 		t.Fatalf("observations length = %d, want 1: %#v", len(observations), observations)
@@ -349,7 +349,7 @@ func TestResolveClaudeDeviceProfile_HighWaterCapsToObservedNotNpm(t *testing.T) 
 	cfg := &config.Config{
 		ManagedHeaderProfile: config.ManagedHeaderProfileConfig{OnlineUpdate: &online},
 	}
-	auth := &cliproxyauth.Auth{ID: "claude-173-auth", Provider: "claude"}
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", ID: "claude-173-auth", Provider: "claude"}
 
 	// First request: real client 2.1.173 is observed and becomes the high-water.
 	first := ResolveClaudeDeviceProfile(auth, "", map[string][]string{
@@ -399,7 +399,7 @@ func TestResolveClaudeDeviceProfile_ZeroObservationDoesNotReportNpmLatest(t *tes
 		ManagedHeaderProfile: config.ManagedHeaderProfileConfig{OnlineUpdate: &online},
 	}
 
-	profile := ResolveClaudeDeviceProfile(&cliproxyauth.Auth{ID: "claude-empty-auth", Provider: "claude"}, "", nil, cfg)
+	profile := ResolveClaudeDeviceProfile(&cliproxyauth.Auth{ProxyURL: "direct", ID: "claude-empty-auth", Provider: "claude"}, "", nil, cfg)
 	if got := profile.VersionString(); got != "2.1.63" {
 		t.Fatalf("zero-observation version = %q, want static floor 2.1.63, never npm latest", got)
 	}
@@ -427,7 +427,7 @@ func TestResolveClaudeDeviceProfile_OnlineUpdateDisabledByDefaultBehavior(t *tes
 	// online-update left unset (nil) => disabled, matching the new loader default.
 	cfg := &config.Config{}
 
-	profile := ResolveClaudeDeviceProfile(&cliproxyauth.Auth{ID: "claude-default-auth", Provider: "claude"}, "", nil, cfg)
+	profile := ResolveClaudeDeviceProfile(&cliproxyauth.Auth{ProxyURL: "direct", ID: "claude-default-auth", Provider: "claude"}, "", nil, cfg)
 	if consulted {
 		t.Fatalf("online registry must not be consulted when online-update is disabled")
 	}
@@ -444,7 +444,7 @@ func TestResolveClaudeDeviceProfile_OnlyUpStillHoldsForNewerRealClient(t *testin
 	t.Cleanup(ResetClaudeDeviceProfileCache)
 
 	cfg := &config.Config{}
-	auth := &cliproxyauth.Auth{ID: "claude-onlyup-auth", Provider: "claude"}
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", ID: "claude-onlyup-auth", Provider: "claude"}
 
 	if got := ResolveClaudeDeviceProfile(auth, "", map[string][]string{
 		"User-Agent": {"claude-cli/2.1.100 (external, cli)"},
@@ -481,8 +481,8 @@ func TestResolveClaudeDeviceProfile_PerAccountHighWaterNotLiftedByGlobal(t *test
 	t.Cleanup(ResetClaudeDeviceProfileCache)
 
 	cfg := &config.Config{}
-	authA := &cliproxyauth.Auth{ID: "acct-a", Provider: "claude"}
-	authB := &cliproxyauth.Auth{ID: "acct-b", Provider: "claude"}
+	authA := &cliproxyauth.Auth{ProxyURL: "direct", ID: "acct-a", Provider: "claude"}
+	authB := &cliproxyauth.Auth{ProxyURL: "direct", ID: "acct-b", Provider: "claude"}
 
 	_ = ResolveClaudeDeviceProfile(authA, "", map[string][]string{
 		"User-Agent": {"claude-cli/2.1.100 (external, cli)"},
@@ -499,7 +499,7 @@ func TestResolveClaudeDeviceProfile_PerAccountHighWaterNotLiftedByGlobal(t *test
 
 	// A brand-new account with no observation of its own DOES use the global
 	// observed high-water (2.1.180) as a safe fallback ceiling.
-	authNew := &cliproxyauth.Auth{ID: "acct-new", Provider: "claude"}
+	authNew := &cliproxyauth.Auth{ProxyURL: "direct", ID: "acct-new", Provider: "claude"}
 	if got := ResolveClaudeDeviceProfile(authNew, "", nil, cfg).VersionString(); got != "2.1.180" {
 		t.Fatalf("acct-new fallback = %q, want global observed high-water 2.1.180", got)
 	}
@@ -516,7 +516,7 @@ func TestResolveClaudeDeviceProfile_SanityCeilingRejectsFabricatedHighUA(t *test
 	t.Cleanup(ResetClaudeDeviceProfileCache)
 
 	cfg := &config.Config{}
-	attacker := &cliproxyauth.Auth{ID: "claude-forged-ua-auth", Provider: "claude"}
+	attacker := &cliproxyauth.Auth{ProxyURL: "direct", ID: "claude-forged-ua-auth", Provider: "claude"}
 
 	// Forged high UA: must not be adopted as the outbound version.
 	forged := ResolveClaudeDeviceProfile(attacker, "", map[string][]string{
@@ -533,7 +533,7 @@ func TestResolveClaudeDeviceProfile_SanityCeilingRejectsFabricatedHighUA(t *test
 
 	// Forged version must not pollute the global observed high-water: a fresh
 	// account with no observation of its own must NOT inherit 999.x.
-	fresh := &cliproxyauth.Auth{ID: "claude-fresh-after-forgery-auth", Provider: "claude"}
+	fresh := &cliproxyauth.Auth{ProxyURL: "direct", ID: "claude-fresh-after-forgery-auth", Provider: "claude"}
 	if got := ResolveClaudeDeviceProfile(fresh, "", nil, cfg).VersionString(); got != "2.1.63" {
 		t.Fatalf("fresh account fallback = %q, want static floor 2.1.63 (forged global high-water must not leak)", got)
 	}
@@ -548,7 +548,7 @@ func TestResolveClaudeDeviceProfile_SanityCeilingAcceptsRealRecentVersion(t *tes
 	t.Cleanup(ResetClaudeDeviceProfileCache)
 
 	cfg := &config.Config{}
-	auth := &cliproxyauth.Auth{ID: "claude-real-recent-auth", Provider: "claude"}
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", ID: "claude-real-recent-auth", Provider: "claude"}
 
 	real := ResolveClaudeDeviceProfile(auth, "", map[string][]string{
 		"User-Agent": {"claude-cli/2.1.180 (external, cli)"},
@@ -602,7 +602,7 @@ func TestResolveClaudeDeviceProfile_SanityCeilingLiftedByNpmStillNotPushed(t *te
 	cfg := &config.Config{
 		ManagedHeaderProfile: config.ManagedHeaderProfileConfig{OnlineUpdate: &online},
 	}
-	auth := &cliproxyauth.Auth{ID: "claude-npm-ceiling-auth", Provider: "claude"}
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", ID: "claude-npm-ceiling-auth", Provider: "claude"}
 
 	// Real observation 2.1.173 with npm latest 4.1.0 available: npm is a ceiling
 	// reference only, so the outbound version stays at the real observed 2.1.173
@@ -631,7 +631,7 @@ func TestResolveClaudeDeviceProfile_SanityCeilingLiftedByNpmStillNotPushed(t *te
 	// rejected by the static 4.0.0 bound alone, is now accepted because npm widened
 	// the validation ceiling. (This account becomes its own high-water at 4.1.0;
 	// the earlier account stays pinned at its own observed 2.1.173.)
-	edge := &cliproxyauth.Auth{ID: "claude-npm-edge-auth", Provider: "claude"}
+	edge := &cliproxyauth.Auth{ProxyURL: "direct", ID: "claude-npm-edge-auth", Provider: "claude"}
 	if got := ResolveClaudeDeviceProfile(edge, "", map[string][]string{
 		"User-Agent": {"claude-cli/4.1.0 (external, cli)"},
 	}, cfg).VersionString(); got != "4.1.0" {
@@ -672,7 +672,7 @@ func TestResolveClaudeDeviceProfile_SanityCeilingOfflineConstantApplies(t *testi
 	}
 
 	// Forged 999.0.0 is rejected offline.
-	auth := &cliproxyauth.Auth{ID: "claude-offline-ceiling-auth", Provider: "claude"}
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", ID: "claude-offline-ceiling-auth", Provider: "claude"}
 	if got := ResolveClaudeDeviceProfile(auth, "", map[string][]string{
 		"User-Agent": {"claude-cli/999.0.0 (external, cli)"},
 	}, cfg).VersionString(); got != "2.1.63" {
@@ -683,7 +683,7 @@ func TestResolveClaudeDeviceProfile_SanityCeilingOfflineConstantApplies(t *testi
 	}
 
 	// A version exactly at the static ceiling boundary (4.0.0) is accepted offline.
-	boundaryAuth := &cliproxyauth.Auth{ID: "claude-offline-boundary-auth", Provider: "claude"}
+	boundaryAuth := &cliproxyauth.Auth{ProxyURL: "direct", ID: "claude-offline-boundary-auth", Provider: "claude"}
 	if got := ResolveClaudeDeviceProfile(boundaryAuth, "", map[string][]string{
 		"User-Agent": {"claude-cli/4.0.0 (external, cli)"},
 	}, cfg).VersionString(); got != "4.0.0" {

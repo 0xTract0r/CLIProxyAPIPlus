@@ -38,7 +38,7 @@ func assertClaudeCLIClientHelloRoundTripper(t *testing.T, rt http.RoundTripper) 
 }
 
 func TestIsRuntimeTransportProfileEnforced_ClaudePreset(t *testing.T) {
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID:       "claude-a",
 		Provider: "claude",
 		Metadata: map[string]any{
@@ -56,7 +56,7 @@ func TestIsRuntimeTransportProfileEnforced_ClaudePreset(t *testing.T) {
 }
 
 func TestIsRuntimeTransportProfileEnforced_CodexPreset(t *testing.T) {
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID:       "codex-a",
 		Provider: "codex",
 		Metadata: map[string]any{
@@ -75,7 +75,7 @@ func TestIsRuntimeTransportProfileEnforced_CodexPreset(t *testing.T) {
 }
 
 func TestIsRuntimeTLSProfileEnforced_ClaudePreset(t *testing.T) {
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID:       "claude-tls",
 		Provider: "claude",
 		Metadata: map[string]any{
@@ -113,7 +113,7 @@ func TestRuntimeTransportProfile_ClaudeChrome133AliasesCanonicalize(t *testing.T
 		{name: "short utls alias", profileID: "chrome_133", tlsProfile: "chrome_133"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			auth := &cliproxyauth.Auth{
+			auth := &cliproxyauth.Auth{ProxyURL: "direct",
 				ID:       "claude-alias-" + tc.name,
 				Provider: "claude",
 				Metadata: map[string]any{
@@ -153,7 +153,7 @@ func TestRuntimeTransportProfile_ClaudeReqwestRustlsAliasesCanonicalize(t *testi
 		{name: "short reqwest alias", profileID: "claude_reqwest_rustls_v1"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			auth := &cliproxyauth.Auth{
+			auth := &cliproxyauth.Auth{ProxyURL: "direct",
 				ID:       "claude-reqwest-" + tc.name,
 				Provider: "claude",
 				Metadata: map[string]any{
@@ -189,7 +189,7 @@ func TestRuntimeTransportProfile_ClaudeReqwestRustlsAliasesCanonicalize(t *testi
 }
 
 func TestRuntimeTransportProfile_ClaudeProviderDefaultDoesNotOptIntoChromeLikeUTLS(t *testing.T) {
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID:       "claude-provider-default",
 		Provider: "claude",
 		Metadata: map[string]any{
@@ -243,7 +243,7 @@ func TestRuntimeTransportProfile_CoreManagedAccountIdentityForEmptyCLIProvider(t
 		{name: "gemini cli", provider: "gemini-cli", profileID: "gemini_cli_native_v1"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			auth := &cliproxyauth.Auth{
+			auth := &cliproxyauth.Auth{ProxyURL: "direct",
 				ID:       tc.provider + "-account",
 				Provider: tc.provider,
 			}
@@ -284,7 +284,7 @@ func TestRuntimeTransportProfile_CoreManagedAccountIdentityForEmptyCLIProvider(t
 func TestRuntimeTransportProfile_ClaudePerAccountTLSProfileOverridesDefault(t *testing.T) {
 	// An explicit per-account tls_profile must win over the new claude-cli
 	// HelloCustom default; the default only applies when no profile is set.
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID:       "claude-explicit-tls",
 		Provider: "claude",
 		Metadata: map[string]any{
@@ -328,7 +328,7 @@ func TestRuntimeTransportProfile_ClaudePerAccountTLSProfileOverridesDefault(t *t
 }
 
 func TestRuntimeTransportProfile_CodexProxyCompatiblePresetUsesCommunityFamilies(t *testing.T) {
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID:       "codex-proxy-compatible",
 		Provider: "codex",
 		Metadata: map[string]any{
@@ -369,7 +369,7 @@ func TestRuntimeTransportProfile_CodexProxyCompatiblePresetUsesCommunityFamilies
 }
 
 func TestRuntimeTransportProfile_CoreManagedCacheKeyIsAccountIsolated(t *testing.T) {
-	authA := &cliproxyauth.Auth{
+	authA := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID:       "claude-file-a",
 		Provider: "claude",
 		Metadata: map[string]any{
@@ -409,7 +409,7 @@ func TestResolveClaudeClientHelloID_DoesNotTreatProviderDefaultAsChrome(t *testi
 }
 
 func TestIsRuntimeTLSProfileEnforced_CodexHTTP11Preset(t *testing.T) {
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID:       "codex-tls",
 		Provider: "codex",
 		Metadata: map[string]any{
@@ -448,7 +448,7 @@ func TestIsRuntimeTLSProfileEnforced_CodexHTTP11Preset(t *testing.T) {
 }
 
 func TestRuntimeTLSProfile_CodexH2PresetDoesNotForceHTTP11(t *testing.T) {
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID:       "codex-h2-tls",
 		Provider: "codex",
 		Metadata: map[string]any{
@@ -485,7 +485,7 @@ func TestRuntimeTLSProfile_CodexH2PresetDoesNotForceHTTP11(t *testing.T) {
 }
 
 func TestRuntimeTLSProfile_ClaudePresetDoesNotForceHTTP11(t *testing.T) {
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID:       "claude-tls-http11-guard",
 		Provider: "claude",
 		Metadata: map[string]any{
@@ -510,7 +510,7 @@ func TestRuntimeTLSProfile_ClaudePresetDoesNotForceHTTP11(t *testing.T) {
 }
 
 func TestRuntimeTransportProfileCacheKey_IncludesAuthAndProfile(t *testing.T) {
-	authA := &cliproxyauth.Auth{
+	authA := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID:       "claude-a",
 		Provider: "claude",
 		Metadata: map[string]any{
@@ -536,7 +536,7 @@ func TestRuntimeTransportProfileCacheKey_IncludesAuthAndProfile(t *testing.T) {
 }
 
 func TestRuntimeTransportProfileCacheKey_IncludesAccount(t *testing.T) {
-	authA := &cliproxyauth.Auth{
+	authA := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID:       "shared-auth-id",
 		Provider: "claude",
 		Metadata: map[string]any{
@@ -572,7 +572,7 @@ func TestRuntimeTransportProfileCacheKey_IncludesAccount(t *testing.T) {
 }
 
 func TestRuntimeTransportProfileCacheKey_IncludesBaseURLHost(t *testing.T) {
-	authA := &cliproxyauth.Auth{
+	authA := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID:       "claude-same-auth",
 		Provider: "claude",
 		Attributes: map[string]string{
@@ -602,7 +602,7 @@ func TestRuntimeTransportProfileCacheKey_IncludesBaseURLHost(t *testing.T) {
 }
 
 func TestRuntimeTransportProfileCacheKey_IncludesTLSProfile(t *testing.T) {
-	authA := &cliproxyauth.Auth{
+	authA := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID:       "claude-same-auth",
 		Provider: "claude",
 		Metadata: map[string]any{
@@ -630,7 +630,7 @@ func TestRuntimeTransportProfileCacheKey_IncludesTLSProfile(t *testing.T) {
 }
 
 func TestRuntimeTransportProfileRejectsProviderMismatch(t *testing.T) {
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID:       "claude-not-codex",
 		Provider: "claude",
 		Metadata: map[string]any{
@@ -670,8 +670,7 @@ func TestRuntimeTransportProfileRejectsProviderMismatch(t *testing.T) {
 }
 
 func TestNewProxyAwareHTTPClient_IsolatesSameProxyDifferentAccount(t *testing.T) {
-	authA := &cliproxyauth.Auth{
-		Provider: "claude",
+	authA := &cliproxyauth.Auth{Provider: "claude",
 		ProxyURL: "http://shared-proxy:8080",
 		Metadata: map[string]any{
 			"auth_method": "oauth",
@@ -683,8 +682,7 @@ func TestNewProxyAwareHTTPClient_IsolatesSameProxyDifferentAccount(t *testing.T)
 			},
 		},
 	}
-	authB := &cliproxyauth.Auth{
-		Provider: "claude",
+	authB := &cliproxyauth.Auth{Provider: "claude",
 		ProxyURL: "http://shared-proxy:8080",
 		Metadata: map[string]any{
 			"auth_method": "oauth",
@@ -713,7 +711,7 @@ func TestNewProxyAwareHTTPClient_IsolatesSameProxyDifferentAccount(t *testing.T)
 }
 
 func TestRuntimeTransportProfileStatus_ProviderSpecificPresets(t *testing.T) {
-	claudeAuth := &cliproxyauth.Auth{
+	claudeAuth := &cliproxyauth.Auth{ProxyURL: "direct",
 		Provider: "claude",
 		Metadata: map[string]any{
 			"account_settings": map[string]any{
@@ -723,7 +721,7 @@ func TestRuntimeTransportProfileStatus_ProviderSpecificPresets(t *testing.T) {
 			},
 		},
 	}
-	codexAuth := &cliproxyauth.Auth{
+	codexAuth := &cliproxyauth.Auth{ProxyURL: "direct",
 		Provider: "codex",
 		Metadata: map[string]any{
 			"account_settings": map[string]any{
@@ -765,7 +763,7 @@ func TestRuntimeTransportProfileStatus_ProviderSpecificPresets(t *testing.T) {
 }
 
 func TestRuntimeTransportProfileStatus_UnknownProfileFallsBack(t *testing.T) {
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		Provider: "claude",
 		Metadata: map[string]any{
 			"account_settings": map[string]any{
@@ -789,8 +787,7 @@ func TestRuntimeTransportProfileStatus_UnknownProfileFallsBack(t *testing.T) {
 }
 
 func TestNewProxyAwareHTTPClient_UsesProfileScopedTransportCache(t *testing.T) {
-	authA := &cliproxyauth.Auth{
-		ID:       "claude-a-cache",
+	authA := &cliproxyauth.Auth{ID: "claude-a-cache",
 		Provider: "claude",
 		ProxyURL: "http://shared-proxy:8080",
 		Metadata: map[string]any{
@@ -823,8 +820,7 @@ func TestNewProxyAwareHTTPClient_UsesProfileScopedTransportCache(t *testing.T) {
 }
 
 func TestNewProxyAwareHTTPClient_UsesCodexProfileScopedTransportCache(t *testing.T) {
-	authA := &cliproxyauth.Auth{
-		ID:       "codex-a-cache",
+	authA := &cliproxyauth.Auth{ID: "codex-a-cache",
 		Provider: "codex",
 		ProxyURL: "http://shared-proxy:8080",
 		Metadata: map[string]any{

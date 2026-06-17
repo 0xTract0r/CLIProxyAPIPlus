@@ -28,7 +28,7 @@ func TestResolveClaudeDeviceProfile_FloorLiftsVersionTripleAtomically(t *testing
 	)
 
 	// 账号 A：观测一份完整的真实三元组（pkg/runtime 都带、且都不同于 baseline 默认）。
-	observed := ResolveClaudeDeviceProfile(&cliproxyauth.Auth{
+	observed := ResolveClaudeDeviceProfile(&cliproxyauth.Auth{ProxyURL: "direct",
 		ID:       "claude-account-A",
 		Provider: "claude",
 	}, "", map[string][]string{
@@ -44,7 +44,7 @@ func TestResolveClaudeDeviceProfile_FloorLiftsVersionTripleAtomically(t *testing
 	}
 
 	// 账号 B：零观测，走 fallback floor，被全局高水位抬升。
-	fallback := ResolveClaudeDeviceProfile(&cliproxyauth.Auth{
+	fallback := ResolveClaudeDeviceProfile(&cliproxyauth.Auth{ProxyURL: "direct",
 		ID:       "claude-account-B-zero-obs",
 		Provider: "claude",
 	}, "", nil, cfg)
@@ -87,7 +87,7 @@ func TestResolveClaudeDeviceProfile_ZeroObservationKeepsConsistentBaselineTriple
 	ResetClaudeDeviceProfileCache()
 	t.Cleanup(ResetClaudeDeviceProfileCache)
 
-	profile := ResolveClaudeDeviceProfile(&cliproxyauth.Auth{
+	profile := ResolveClaudeDeviceProfile(&cliproxyauth.Auth{ProxyURL: "direct",
 		ID:       "claude-account-zero",
 		Provider: "claude",
 	}, "", nil, &config.Config{})
@@ -111,7 +111,7 @@ func TestResolveClaudeDeviceProfile_SameAccountKeepsObservedTripleConsistent(t *
 	t.Cleanup(ResetClaudeDeviceProfileCache)
 
 	cfg := &config.Config{}
-	auth := &cliproxyauth.Auth{ID: "claude-account-consistent", Provider: "claude"}
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", ID: "claude-account-consistent", Provider: "claude"}
 
 	headers := map[string][]string{
 		"User-Agent":                  {"claude-cli/2.1.120 (external, cli)"},

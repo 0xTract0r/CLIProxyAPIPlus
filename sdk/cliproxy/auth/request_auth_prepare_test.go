@@ -88,7 +88,7 @@ func TestManagerExecute_PreparesAndPersistsMissingRequestAuthMetadata(t *testing
 	manager := NewManager(store, nil, nil)
 	manager.RegisterExecutor(executor)
 
-	auth := &Auth{
+	auth := &Auth{ProxyURL: "http://test-proxy:8080",
 		ID:       "auth-request-prepare",
 		Provider: "antigravity",
 		Metadata: map[string]any{"access_token": "token"},

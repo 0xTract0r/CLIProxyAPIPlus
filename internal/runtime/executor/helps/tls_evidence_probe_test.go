@@ -11,7 +11,7 @@ import (
 )
 
 func TestBuildTLSEvidenceProbeRoundTripperReusesRuntimeProfileResolution(t *testing.T) {
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		Provider: "claude",
 		Metadata: map[string]any{
 			"account_settings": map[string]any{
@@ -45,7 +45,7 @@ func TestBuildTLSEvidenceProbeRoundTripperReusesRuntimeProfileResolution(t *test
 }
 
 func TestBuildTLSEvidenceProbeRoundTripperCodex(t *testing.T) {
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		Provider: "codex",
 		Metadata: map[string]any{
 			"account_settings": map[string]any{
@@ -83,7 +83,7 @@ func TestCaptureSyntheticProviderSNIEvidenceCodex(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID:       "synthetic-codex",
 		Provider: "codex",
 		Metadata: map[string]any{
@@ -120,7 +120,7 @@ func TestCaptureSyntheticProviderSNIEvidenceCodexHTTP11Preset(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID:       "synthetic-codex-http11",
 		Provider: "codex",
 		Metadata: map[string]any{
@@ -163,7 +163,7 @@ func TestCaptureSyntheticProviderSNIEvidenceClaude(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID:       "synthetic-claude",
 		Provider: "claude",
 		Metadata: map[string]any{

@@ -44,7 +44,7 @@ func normalizeEnvTestPayload() []byte {
 func TestApplyCloaking_NormalizeAccountEnvSwitchOff(t *testing.T) {
 	resetClaudeDeviceProfileCache()
 	cfg := &config.Config{} // NormalizeAccountEnv unset -> default off
-	auth := &cliproxyauth.Auth{ID: "acct-off"}
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", ID: "acct-off"}
 	payload := normalizeEnvTestPayload()
 
 	// Use a claude-cli UA so the broader cloak transforms are gated out and we
@@ -65,7 +65,7 @@ func TestApplyCloaking_NormalizeAccountEnvSwitchOnRealClaudeCli(t *testing.T) {
 	resetClaudeDeviceProfileCache()
 	on := true
 	cfg := &config.Config{NormalizeAccountEnv: &on}
-	auth := &cliproxyauth.Auth{ID: "acct-on"}
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", ID: "acct-on"}
 	payload := normalizeEnvTestPayload()
 
 	out := applyCloaking(ginContextWithUA("claude-cli/2.1.70 (external, cli)"), cfg, auth, payload, "claude-sonnet-4-5", "key-on", "")

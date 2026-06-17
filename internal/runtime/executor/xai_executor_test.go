@@ -40,7 +40,7 @@ func TestXAIExecutorExecuteShapesResponsesRequest(t *testing.T) {
 	defer server.Close()
 
 	exec := NewXAIExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID:       "xai-auth",
 		Provider: "xai",
 		Attributes: map[string]string{
@@ -171,7 +171,7 @@ func TestXAIExecutorOmitsUnsupportedReasoningEffort(t *testing.T) {
 	defer server.Close()
 
 	exec := NewXAIExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		Provider: "xai",
 		Attributes: map[string]string{
 			"base_url":  server.URL,
@@ -210,7 +210,7 @@ func TestXAIExecutorAppliesThinkingSuffix(t *testing.T) {
 	defer server.Close()
 
 	exec := NewXAIExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		Provider: "xai",
 		Attributes: map[string]string{
 			"base_url":  server.URL,
@@ -252,7 +252,7 @@ func TestXAIExecutorExecuteStreamFiltersToolSearchTool(t *testing.T) {
 	defer server.Close()
 
 	exec := NewXAIExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		Provider:   "xai",
 		Attributes: map[string]string{"base_url": server.URL},
 		Metadata:   map[string]any{"access_token": "xai-token"},
@@ -355,7 +355,7 @@ func TestXAIExecutorExecuteImagesUsesImagesEndpoint(t *testing.T) {
 	defer server.Close()
 
 	exec := NewXAIExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		Provider: "xai",
 		Attributes: map[string]string{
 			"base_url":  server.URL,
@@ -404,7 +404,7 @@ func TestXAIExecutorExecuteImagesUsesEditsEndpoint(t *testing.T) {
 	defer server.Close()
 
 	exec := NewXAIExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		Provider:   "xai",
 		Attributes: map[string]string{"base_url": server.URL},
 		Metadata:   map[string]any{"access_token": "xai-token"},
@@ -450,7 +450,7 @@ func TestXAIExecutorExecuteVideosCreate(t *testing.T) {
 	defer server.Close()
 
 	exec := NewXAIExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		Provider:   "xai",
 		Attributes: map[string]string{"base_url": server.URL},
 		Metadata:   map[string]any{"access_token": "xai-token"},
@@ -501,7 +501,7 @@ func TestXAIExecutorExecuteVideosRetrieve(t *testing.T) {
 	defer server.Close()
 
 	exec := NewXAIExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		Provider:   "xai",
 		Attributes: map[string]string{"base_url": server.URL},
 		Metadata:   map[string]any{"access_token": "xai-token"},
@@ -564,7 +564,7 @@ func TestXAIExecutorExecuteVideosUsesNativeEndpointFromRequestPath(t *testing.T)
 			defer server.Close()
 
 			exec := NewXAIExecutor(&config.Config{})
-			auth := &cliproxyauth.Auth{
+			auth := &cliproxyauth.Auth{ProxyURL: "direct",
 				Provider:   "xai",
 				Attributes: map[string]string{"base_url": server.URL},
 				Metadata:   map[string]any{"access_token": "xai-token"},

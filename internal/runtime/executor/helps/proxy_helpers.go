@@ -2,6 +2,7 @@ package helps
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"strings"
 	"sync"
@@ -12,6 +13,34 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/proxyutil"
 	log "github.com/sirupsen/logrus"
 )
+
+// errAccountProxyURLMissing is returned by the blocking transport installed for
+// accounts that have no resolved proxy_url. It is surfaced verbatim to the caller
+// so that the egress failure reason is unambiguous in logs and error responses.
+var errAccountProxyURLMissing = errors.New("account proxy_url missing: refusing direct egress to prevent IP exposure")
+
+// blockingRoundTripper is an http.RoundTripper that never performs any network
+// I/O. It is installed for account-scoped HTTP clients whose effective proxy_url
+// resolved to empty. Returning an error before any dial guarantees the real
+// client IP is never exposed to the upstream provider via an accidental direct
+// connection. It deliberately has no fallback path.
+type blockingRoundTripper struct{}
+
+// RoundTrip always fails without opening a connection.
+func (blockingRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, errAccountProxyURLMissing
+}
+
+// hasContextRoundTripper reports whether the context carries an explicitly injected
+// RoundTripper. Such a transport is a deliberate caller-controlled egress decision,
+// so it is not treated as the accidental "no proxy at all" direct path.
+func hasContextRoundTripper(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	rt, ok := ctx.Value("cliproxy.roundtripper").(http.RoundTripper)
+	return ok && rt != nil
+}
 
 // httpClientCache caches HTTP clients by derived transport key to enable connection reuse.
 var (
@@ -42,6 +71,34 @@ func newProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 	}
 	if proxyURL == "" && cfg != nil {
 		proxyURL = strings.TrimSpace(cfg.ProxyURL)
+	}
+
+	// Global egress guard. When an account-scoped request resolves to no proxy at
+	// all, the no-proxy fall-through below would build a direct transport (the utls
+	// dialer defaults to proxy.Direct), exposing the real server IP to the upstream
+	// provider (a past incident). Instead, hand back a client whose transport always
+	// errors before any dial, so no network I/O ever happens. This runs before the
+	// runtime transport profile and proxy cache branches.
+	//
+	// The literal "direct"/"none" sentinels stay non-empty here and remain allowed,
+	// because choosing direct egress explicitly is an operator decision. Only the
+	// accidental empty case is blocked.
+	//
+	// auth == nil indicates an infrastructure call (e.g. model registry updates) that
+	// is not account egress; those are intentionally left untouched.
+	//
+	// An explicitly injected context RoundTripper ("cliproxy.roundtripper") is treated
+	// as a deliberate caller-controlled egress path (it carries its own proxy/transport
+	// decision) and is therefore not an accidental direct connection; in that case the
+	// no-proxy fall-through below routes through that RoundTripper instead of a direct
+	// dialer, so it is not blocked here.
+	if auth != nil && proxyURL == "" && !hasContextRoundTripper(ctx) {
+		log.Warnf("blocking account egress: proxy_url missing for auth %q; refusing direct connection to prevent IP exposure", auth.ID)
+		httpClient := &http.Client{Transport: blockingRoundTripper{}}
+		if timeout > 0 {
+			httpClient.Timeout = timeout
+		}
+		return httpClient
 	}
 
 	baseURLHost := RuntimeTransportHostFromContext(ctx)

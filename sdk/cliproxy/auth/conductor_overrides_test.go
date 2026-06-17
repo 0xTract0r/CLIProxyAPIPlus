@@ -22,7 +22,7 @@ func TestManager_ShouldRetryAfterError_RespectsAuthRequestRetryOverride(t *testi
 	model := "test-model"
 	next := time.Now().Add(5 * time.Second)
 
-	auth := &Auth{
+	auth := &Auth{ProxyURL: "http://test-proxy:8080",
 		ID:       "auth-1",
 		Provider: "claude",
 		Metadata: map[string]any{
@@ -78,7 +78,7 @@ func TestManager_ShouldRetryAfterError_UsesOAuthModelAliasForCooldown(t *testing
 	upstreamModel := "deepseek-v3.1"
 	next := time.Now().Add(5 * time.Second)
 
-	auth := &Auth{
+	auth := &Auth{ProxyURL: "http://test-proxy:8080",
 		ID:       "auth-1",
 		Provider: "kimi",
 		ModelStates: map[string]*ModelState{
@@ -262,8 +262,8 @@ func newCredentialRetryLimitTestManager(t *testing.T, maxRetryCredentials int) (
 	m.RegisterExecutor(executor)
 
 	baseID := uuid.NewString()
-	auth1 := &Auth{ID: baseID + "-auth-1", Provider: "claude"}
-	auth2 := &Auth{ID: baseID + "-auth-2", Provider: "claude"}
+	auth1 := &Auth{ProxyURL: "http://test-proxy:8080", ID: baseID + "-auth-1", Provider: "claude"}
+	auth2 := &Auth{ProxyURL: "http://test-proxy:8080", ID: baseID + "-auth-2", Provider: "claude"}
 
 	// Auth selection requires that the global model registry knows each credential supports the model.
 	reg := registry.GetGlobalRegistry()
@@ -349,8 +349,8 @@ func TestManager_ModelSupportBadRequest_FallsBackAndSuspendsAuth(t *testing.T) {
 	m.RegisterExecutor(executor)
 
 	model := "claude-opus-4-6"
-	badAuth := &Auth{ID: "aa-bad-auth", Provider: "claude", Attributes: map[string]string{"plan_type": "max"}}
-	goodAuth := &Auth{ID: "bb-good-auth", Provider: "claude", Attributes: map[string]string{"plan_type": "max"}}
+	badAuth := &Auth{ProxyURL: "http://test-proxy:8080", ID: "aa-bad-auth", Provider: "claude", Attributes: map[string]string{"plan_type": "max"}}
+	goodAuth := &Auth{ProxyURL: "http://test-proxy:8080", ID: "bb-good-auth", Provider: "claude", Attributes: map[string]string{"plan_type": "max"}}
 
 	reg := registry.GetGlobalRegistry()
 	reg.RegisterClient(badAuth.ID, "claude", []*registry.ModelInfo{{ID: model}})
@@ -419,8 +419,8 @@ func TestManagerExecuteStream_ModelSupportBadRequestFallsBackAndSuspendsAuth(t *
 	m.RegisterExecutor(executor)
 
 	model := "claude-opus-4-6"
-	badAuth := &Auth{ID: "aa-bad-auth", Provider: "claude", Attributes: map[string]string{"plan_type": "max"}}
-	goodAuth := &Auth{ID: "bb-good-auth", Provider: "claude", Attributes: map[string]string{"plan_type": "max"}}
+	badAuth := &Auth{ProxyURL: "http://test-proxy:8080", ID: "aa-bad-auth", Provider: "claude", Attributes: map[string]string{"plan_type": "max"}}
+	goodAuth := &Auth{ProxyURL: "http://test-proxy:8080", ID: "bb-good-auth", Provider: "claude", Attributes: map[string]string{"plan_type": "max"}}
 
 	reg := registry.GetGlobalRegistry()
 	reg.RegisterClient(badAuth.ID, "claude", []*registry.ModelInfo{{ID: model}})
@@ -489,7 +489,7 @@ func TestManager_MarkResult_RespectsAuthDisableCoolingOverride(t *testing.T) {
 
 	m := NewManager(nil, nil, nil)
 
-	auth := &Auth{
+	auth := &Auth{ProxyURL: "http://test-proxy:8080",
 		ID:       "auth-1",
 		Provider: "claude",
 		Metadata: map[string]any{
@@ -529,7 +529,7 @@ func TestManager_MarkResult_RespectsAuthDisableCoolingOverride_On403(t *testing.
 
 	m := NewManager(nil, nil, nil)
 
-	auth := &Auth{
+	auth := &Auth{ProxyURL: "http://test-proxy:8080",
 		ID:       "auth-403",
 		Provider: "claude",
 		Metadata: map[string]any{
@@ -577,7 +577,7 @@ func TestManager_MarkResult_CloudflareChallenge_On403(t *testing.T) {
 
 	m := NewManager(nil, nil, nil)
 
-	auth := &Auth{
+	auth := &Auth{ProxyURL: "http://test-proxy:8080",
 		ID:       "auth-cf-403",
 		Provider: "claude",
 	}
@@ -641,7 +641,7 @@ func TestManager_Execute_DisableCooling_DoesNotBlackoutAfter403(t *testing.T) {
 	}
 	m.RegisterExecutor(executor)
 
-	auth := &Auth{
+	auth := &Auth{ProxyURL: "http://test-proxy:8080",
 		ID:       "auth-403-exec",
 		Provider: "claude",
 		Metadata: map[string]any{
@@ -693,7 +693,7 @@ func TestManager_Execute_DisableCooling_DoesNotBlackoutAfter429RetryAfter(t *tes
 	}
 	m.RegisterExecutor(executor)
 
-	auth := &Auth{
+	auth := &Auth{ProxyURL: "http://test-proxy:8080",
 		ID:       "auth-429-exec",
 		Provider: "claude",
 		Metadata: map[string]any{
@@ -761,7 +761,7 @@ func TestManager_Execute_ClaudeLongContextExtraUsageDoesNotCooldownModel(t *test
 	}
 	m.RegisterExecutor(executor)
 
-	auth := &Auth{ID: "auth-claude-extra-usage", Provider: "claude"}
+	auth := &Auth{ProxyURL: "http://test-proxy:8080", ID: "auth-claude-extra-usage", Provider: "claude"}
 	if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
 		t.Fatalf("register auth: %v", errRegister)
 	}
@@ -838,7 +838,7 @@ func TestManager_Execute_DisableCooling_RetriesAfter429RetryAfter(t *testing.T) 
 	}
 	m.RegisterExecutor(executor)
 
-	auth := &Auth{
+	auth := &Auth{ProxyURL: "http://test-proxy:8080",
 		ID:       "auth-429-retryafter-exec",
 		Provider: "claude",
 		Metadata: map[string]any{
@@ -872,7 +872,7 @@ func TestManager_Execute_DisableCooling_RetriesAfter429RetryAfter(t *testing.T) 
 func TestManager_MarkResult_RequestScopedNotFoundDoesNotCooldownAuth(t *testing.T) {
 	m := NewManager(nil, nil, nil)
 
-	auth := &Auth{
+	auth := &Auth{ProxyURL: "http://test-proxy:8080",
 		ID:       "auth-1",
 		Provider: "openai",
 	}
@@ -921,8 +921,8 @@ func TestManager_RequestScopedNotFoundStopsRetryWithoutSuspendingAuth(t *testing
 	m.RegisterExecutor(executor)
 
 	model := "gpt-4.1"
-	badAuth := &Auth{ID: "aa-bad-auth", Provider: "openai"}
-	goodAuth := &Auth{ID: "bb-good-auth", Provider: "openai"}
+	badAuth := &Auth{ProxyURL: "http://test-proxy:8080", ID: "aa-bad-auth", Provider: "openai"}
+	goodAuth := &Auth{ProxyURL: "http://test-proxy:8080", ID: "bb-good-auth", Provider: "openai"}
 
 	reg := registry.GetGlobalRegistry()
 	reg.RegisterClient(badAuth.ID, "openai", []*registry.ModelInfo{{ID: model}})

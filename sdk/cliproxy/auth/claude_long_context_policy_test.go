@@ -16,7 +16,7 @@ func TestManager_Execute_ClaudeSonnetLongContextFailsWithHint(t *testing.T) {
 	executor := &authFallbackExecutor{id: "claude"}
 	m.RegisterExecutor(executor)
 
-	auth := &Auth{ID: "auth-claude-long-context", Provider: "claude"}
+	auth := &Auth{ProxyURL: "http://test-proxy:8080", ID: "auth-claude-long-context", Provider: "claude"}
 	if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
 		t.Fatalf("register auth: %v", errRegister)
 	}
@@ -69,7 +69,7 @@ func TestManager_Execute_ExplicitSonnet1MAliasIsNotRoutedToOpus(t *testing.T) {
 	executor := &authFallbackExecutor{id: "claude"}
 	m.RegisterExecutor(executor)
 
-	auth := &Auth{ID: "auth-claude-explicit-1m", Provider: "claude"}
+	auth := &Auth{ProxyURL: "http://test-proxy:8080", ID: "auth-claude-explicit-1m", Provider: "claude"}
 	if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
 		t.Fatalf("register auth: %v", errRegister)
 	}
@@ -117,7 +117,7 @@ func TestManager_ExecuteStream_ClaudeSonnetLongContextFailsWithHint(t *testing.T
 	executor := &authFallbackExecutor{id: "claude"}
 	m.RegisterExecutor(executor)
 
-	auth := &Auth{ID: "auth-claude-long-context-stream", Provider: "claude"}
+	auth := &Auth{ProxyURL: "http://test-proxy:8080", ID: "auth-claude-long-context-stream", Provider: "claude"}
 	if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
 		t.Fatalf("register auth: %v", errRegister)
 	}
@@ -150,7 +150,7 @@ func TestManager_ExecuteCount_ClaudeSonnetLongContextAllowsTokenCounting(t *test
 	executor := &claudeLongContextCountExecutor{id: "claude"}
 	m.RegisterExecutor(executor)
 
-	auth := &Auth{ID: "auth-claude-long-context-count", Provider: "claude"}
+	auth := &Auth{ProxyURL: "http://test-proxy:8080", ID: "auth-claude-long-context-count", Provider: "claude"}
 	if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
 		t.Fatalf("register auth: %v", errRegister)
 	}
@@ -194,7 +194,7 @@ func TestManager_Execute_ClaudeContextAboveOneMillionRequiresCompact(t *testing.
 	executor := &authFallbackExecutor{id: "claude"}
 	m.RegisterExecutor(executor)
 
-	auth := &Auth{ID: "auth-claude-above-1m", Provider: "claude"}
+	auth := &Auth{ProxyURL: "http://test-proxy:8080", ID: "auth-claude-above-1m", Provider: "claude"}
 	if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
 		t.Fatalf("register auth: %v", errRegister)
 	}

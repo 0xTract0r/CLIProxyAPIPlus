@@ -35,7 +35,7 @@ func testFakeClaudeSignature() string {
 }
 
 func testAntigravityAuth(baseURL string) *cliproxyauth.Auth {
-	return &cliproxyauth.Auth{
+	return &cliproxyauth.Auth{ProxyURL: "direct",
 		Attributes: map[string]string{
 			"base_url": baseURL,
 		},

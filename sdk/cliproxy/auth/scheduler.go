@@ -9,7 +9,20 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	log "github.com/sirupsen/logrus"
 )
+
+// authMissingProxyURL reports whether an account-scoped auth has no proxy_url.
+// Such accounts must not participate in scheduling, because routing traffic to
+// them would force a direct connection to the upstream provider and expose the
+// real server IP. The explicit "direct"/"none" sentinels are non-empty and stay
+// schedulable, since direct egress is then an intentional operator choice.
+func authMissingProxyURL(auth *Auth) bool {
+	if auth == nil {
+		return false
+	}
+	return strings.TrimSpace(auth.ProxyURL) == ""
+}
 
 // schedulerStrategy identifies which built-in routing semantics the scheduler should apply.
 type schedulerStrategy int
@@ -37,6 +50,12 @@ type authScheduler struct {
 	providers     map[string]*providerScheduler
 	authProviders map[string]string
 	mixedCursors  map[string]int
+	// globalProxyConfigured records whether a global proxy_url is set in runtime
+	// config. When true, an account with an empty per-account proxy_url still has a
+	// safe egress path (the global proxy) and stays schedulable. When false, an empty
+	// per-account proxy_url means no proxy at all, so the account is dropped from
+	// scheduling to avoid an IP-exposing direct connection.
+	globalProxyConfigured bool
 }
 
 // providerScheduler stores auth metadata and model shards for a single provider.
@@ -194,6 +213,38 @@ func (s *authScheduler) setSelector(selector Selector) {
 	defer s.mu.Unlock()
 	s.strategy = selectorStrategy(selector)
 	clear(s.mixedCursors)
+}
+
+// setGlobalProxyConfigured records whether a global proxy_url is configured and
+// re-evaluates schedulability of currently tracked auths against the new value.
+// This keeps the missing-proxy skip decision consistent after config reloads.
+func (s *authScheduler) setGlobalProxyConfigured(configured bool) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.globalProxyConfigured == configured {
+		return
+	}
+	s.globalProxyConfigured = configured
+	// Re-evaluate every known auth so accounts move in/out of scheduling as the
+	// global proxy fallback appears or disappears.
+	snapshot := make([]*Auth, 0, len(s.authProviders))
+	for _, providerState := range s.providers {
+		if providerState == nil {
+			continue
+		}
+		for _, meta := range providerState.auths {
+			if meta != nil && meta.auth != nil {
+				snapshot = append(snapshot, meta.auth)
+			}
+		}
+	}
+	now := time.Now()
+	for _, auth := range snapshot {
+		s.upsertAuthLocked(auth, now)
+	}
 }
 
 // rebuild recreates the complete scheduler state from an auth snapshot.
@@ -512,6 +563,21 @@ func (s *authScheduler) upsertAuthLocked(auth *Auth, now time.Time) {
 	authID := strings.TrimSpace(auth.ID)
 	providerKey := strings.ToLower(strings.TrimSpace(auth.Provider))
 	if authID == "" || providerKey == "" || auth.Disabled {
+		s.removeAuthLocked(authID)
+		return
+	}
+	// Accounts without any effective proxy_url are treated as unavailable and kept
+	// out of scheduling, so traffic falls back to healthy proxied accounts instead of
+	// failing the request or risking a direct, IP-exposing connection. When a global
+	// proxy_url is configured, an empty per-account proxy_url still routes through the
+	// global proxy and remains schedulable.
+	if !s.globalProxyConfigured && authMissingProxyURL(auth) {
+		auth.Unavailable = true
+		auth.Status = StatusError
+		if strings.TrimSpace(auth.StatusMessage) == "" {
+			auth.StatusMessage = "missing proxy_url"
+		}
+		log.Warnf("auth %q skipped from scheduling: missing proxy_url", authID)
 		s.removeAuthLocked(authID)
 		return
 	}

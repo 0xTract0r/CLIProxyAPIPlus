@@ -13,7 +13,7 @@ func TestAntigravityPrepareRequest_AppliesCustomHeaders(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new request: %v", err)
 	}
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		Provider: "antigravity",
 		Metadata: map[string]any{
 			"access_token": "fake_token",
