@@ -171,13 +171,32 @@ func TestNormalizeAccountEnv_StringSystemEnvBlock(t *testing.T) {
 	}
 }
 
-// macBaselineCfg returns a config whose stabilized device profile baseline OS is
-// MacOS/arm64 (the default fingerprint), so body OS normalization should target
-// the darwin / Darwin representation. nil cfg resolves to the same default, but an
-// explicit config documents intent.
+// macBaselineCfg returns a config with BOTH normalize-account-env and
+// stabilize-device-profile on, whose stabilized device profile baseline OS is
+// MacOS/arm64 (the default fingerprint). Body OS normalization is gated on
+// stabilize, so it only targets the darwin / Darwin representation when stabilize
+// is enabled — the realistic production posture where the outbound header is also
+// pinned to MacOS.
 func macBaselineCfg() *config.Config {
 	on := true
-	return &config.Config{NormalizeAccountEnv: &on}
+	return &config.Config{
+		NormalizeAccountEnv:  &on,
+		ClaudeHeaderDefaults: config.ClaudeHeaderDefaults{StabilizeDeviceProfile: &on},
+	}
+}
+
+// normalizeOnStabilizeOffCfg returns a config with normalize-account-env on but
+// stabilize-device-profile OFF. In this state the outbound X-Stainless-Os header
+// passes through the real host OS, so body OS rewrite must NOT run (rewriting body
+// to the MacOS baseline would contradict the real-OS header). cwd normalization
+// still runs because it is independent of stabilize.
+func normalizeOnStabilizeOffCfg() *config.Config {
+	on := true
+	off := false
+	return &config.Config{
+		NormalizeAccountEnv:  &on,
+		ClaudeHeaderDefaults: config.ClaudeHeaderDefaults{StabilizeDeviceProfile: &off},
+	}
 }
 
 // realMarkdownEnvPayload mirrors the production claude-code 2.1.181 body shape:
@@ -254,9 +273,46 @@ func TestNormalizeAccountEnv_RealMarkdownEnvOSAligned(t *testing.T) {
 	}
 }
 
+// TestNormalizeAccountEnv_StabilizeOffLeavesBodyOSButNormalizesCwd covers the T053
+// stabilize-on gate: with normalize-account-env ON but stabilize-device-profile
+// OFF, the outbound X-Stainless-Os header passes through the real host OS, so the
+// body Platform / OS Version lines must be LEFT as the real values (rewriting them
+// to the MacOS baseline would itself create a body(Mac) vs header(real-Linux)
+// contradiction). cwd is still normalized because that goal is independent of
+// stabilize.
+func TestNormalizeAccountEnv_StabilizeOffLeavesBodyOSButNormalizesCwd(t *testing.T) {
+	cfg := normalizeOnStabilizeOffCfg()
+	auth := authForEnv("acct-stabilize-off.json")
+	out := NormalizeAccountEnv(realMarkdownEnvPayload(), auth, "", cfg)
+
+	got := gjson.GetBytes(out, "system.0.text").String()
+	canonical := AccountCanonicalCwd(auth, "")
+
+	// cwd IS still normalized (independent of stabilize).
+	if strings.Contains(got, "/tmp/prodsess1") {
+		t.Fatalf("cwd must still be normalized when stabilize is off: %q", got)
+	}
+	if !strings.Contains(got, "Primary working directory: "+canonical) {
+		t.Fatalf("expected canonical cwd %q when stabilize off, got: %q", canonical, got)
+	}
+
+	// Body OS lines must be LEFT as the real host values (NOT rewritten to the
+	// MacOS baseline) because the header still carries the real OS.
+	if !strings.Contains(got, "Platform: linux") {
+		t.Fatalf("body Platform must stay real (linux) when stabilize off, got: %q", got)
+	}
+	if !strings.Contains(got, "OS Version: Linux 6.8.0-111-generic") {
+		t.Fatalf("body OS Version must stay real when stabilize off, got: %q", got)
+	}
+	// And must NOT have been pushed to the MacOS baseline.
+	if strings.Contains(got, "Platform: darwin") || strings.Contains(got, "Darwin 24.6.0") {
+		t.Fatalf("body OS must not be rewritten to MacOS baseline when stabilize off, got: %q", got)
+	}
+}
+
 // TestNormalizeAccountEnv_LegacyXMLEnvStillCompatible covers backward
 // compatibility: the historical <env> XML block path is unchanged — cwd is still
-// normalized (and, when OS lines are present, OS is aligned too).
+// normalized (and, when OS lines are present and stabilize is on, OS is aligned too).
 func TestNormalizeAccountEnv_LegacyXMLEnvStillCompatible(t *testing.T) {
 	payload := []byte(`{
 		"system": [

@@ -36,18 +36,24 @@ import (
 //
 // When several employees share one upstream account, these real paths leak each
 // machine's identity and let Anthropic correlate the account back to multiple
-// distinct developers. In addition, the stabilize-device-profile path rewrites
-// the outbound HTTP fingerprint headers (X-Stainless-Os / X-Stainless-Arch) to a
-// single per-account baseline OS, so a body that still reports the real host OS
-// ("Platform: linux" / "OS Version: Linux ...") contradicts a header that claims
-// MacOS — a self-inconsistent "claims Mac but reports Linux" signal Anthropic can
-// cross-check. NormalizeAccountEnv therefore rewrites, inside the environment
-// block only:
+// distinct developers. Separately, the INDEPENDENT stabilize-device-profile path
+// rewrites the outbound HTTP fingerprint headers (X-Stainless-Os /
+// X-Stainless-Arch) to a single per-account baseline OS; only then does a body
+// that still reports the real host OS ("Platform: linux" / "OS Version: Linux ...")
+// contradict a header that claims MacOS — a self-inconsistent "claims Mac but
+// reports Linux" signal Anthropic can cross-check. NormalizeAccountEnv therefore
+// rewrites, inside the environment block only:
 //   - every real cwd / home path (key-anchored) to a per-account canonical path
 //     that is deterministic for a given upstream account, stable across requests,
-//     and different between distinct accounts; and
-//   - the body Platform / OS Version lines to the SAME baseline OS that the
-//     outbound headers advertise, so body and header describe one identity.
+//     and different between distinct accounts. This is UNCONDITIONAL under
+//     normalize-account-env: not leaking the real cwd does not depend on the
+//     header path.
+//   - the body Platform / OS Version lines to the baseline OS the outbound headers
+//     advertise, but ONLY when stabilize-device-profile is also on. The two
+//     switches are independent: when stabilize is off the header passes through
+//     the real OS, so rewriting the body OS would itself create the body/header
+//     contradiction this normalization exists to avoid; the body OS lines are then
+//     left untouched.
 //
 // Scope discipline (the key to not breaking tool calls):
 //   - Only the text *inside* an <env> / <system-reminder> span or a
@@ -186,14 +192,18 @@ type envRewriteParams struct {
 	hasBodyOS    bool
 }
 
-// NormalizeAccountEnv rewrites real cwd / home paths and the host OS lines inside
-// the environment block (both the "# Environment" Markdown form emitted by real
-// claude-code 2.1.181 and the legacy <env> / <system-reminder> XML form) of the
-// system field and the messages content. cwd is rewritten to the per-account
-// canonical path; Platform / OS Version are rewritten to the baseline OS derived
-// from the same defaultClaudeDeviceProfile(cfg) the outbound header path uses, so
-// body and header describe one OS. It returns the payload unchanged when the body
-// is unparseable or contains no matching block.
+// NormalizeAccountEnv rewrites real cwd / home paths and (conditionally) the host
+// OS lines inside the environment block (both the "# Environment" Markdown form
+// emitted by real claude-code 2.1.181 and the legacy <env> / <system-reminder> XML
+// form) of the system field and the messages content. cwd is always rewritten to
+// the per-account canonical path. Platform / OS Version are rewritten to the
+// baseline OS derived from the same defaultClaudeDeviceProfile(cfg) the outbound
+// header path uses ONLY when stabilize-device-profile is enabled — that is the
+// only state in which the outbound X-Stainless-Os header is also pinned to that
+// baseline, so body and header describe one OS. When stabilize is off the header
+// carries the real OS and the body OS lines are left untouched to avoid creating a
+// body/header mismatch. It returns the payload unchanged when the body is
+// unparseable or contains no matching block.
 func NormalizeAccountEnv(payload []byte, auth *cliproxyauth.Auth, apiKey string, cfg *config.Config) []byte {
 	if !gjson.ValidBytes(payload) {
 		// Never attempt to rewrite an unparseable body; pass it through (no 400).
@@ -201,13 +211,23 @@ func NormalizeAccountEnv(payload []byte, auth *cliproxyauth.Auth, apiKey string,
 	}
 
 	params := envRewriteParams{canonicalCwd: AccountCanonicalCwd(auth, apiKey)}
-	// Baseline OS comes from the single device-profile source of truth so the body
-	// OS matches the outbound X-Stainless-Os header; no second OS decision lives
-	// here. When stabilize-device-profile is off the baseline still resolves to the
-	// configured/default fingerprint OS, keeping body and header aligned regardless.
-	if bodyOS, ok := baselineBodyOSFor(defaultClaudeDeviceProfile(cfg).OS); ok {
-		params.bodyOS = bodyOS
-		params.hasBodyOS = true
+	// Body OS rewrite is gated on stabilize-device-profile, which is an INDEPENDENT
+	// switch from normalize-account-env. The outbound X-Stainless-Os header is only
+	// pinned to defaultClaudeDeviceProfile(cfg).OS when stabilize is on; when
+	// stabilize is off the header passes through the REAL host OS. So body and header
+	// agree only when stabilize is on:
+	//   - stabilize on:  header is pinned to the baseline OS, so rewriting the body
+	//     Platform / OS Version to that same baseline keeps body == header (T052).
+	//   - stabilize off: header carries the real OS (e.g. Linux); rewriting the body
+	//     to the baseline (e.g. MacOS) would create a body(Mac) vs header(Linux)
+	//     contradiction, so the body OS lines are left untouched here.
+	// cwd normalization above is unconditional under normalize-account-env: not
+	// leaking the real cwd is an independent goal that does not depend on stabilize.
+	if ClaudeDeviceProfileStabilizationEnabled(cfg) {
+		if bodyOS, ok := baselineBodyOSFor(defaultClaudeDeviceProfile(cfg).OS); ok {
+			params.bodyOS = bodyOS
+			params.hasBodyOS = true
+		}
 	}
 
 	rewrite := func(text string) string {
@@ -249,11 +269,13 @@ func normalizeEnvText(text string, params envRewriteParams) string {
 //     anchored on the key so any path root (including /tmp/...) is covered;
 //   - any remaining embedded home path (e.g. memory / CLAUDE.md paths not on a
 //     recognized key line) is collapsed onto the same canonical path;
-//   - the Platform / OS Version lines are rewritten to the baseline body OS so
-//     they agree with the outbound X-Stainless-Os header.
+//   - the Platform / OS Version lines are rewritten to the baseline body OS so they
+//     agree with the outbound X-Stainless-Os header — but only when params.hasBodyOS
+//     is set, which the caller gates on stabilize-device-profile (the OS lines are
+//     left untouched when stabilize is off, since the header then carries the real OS).
 //
-// The block no longer leaks the real machine identity and no longer contradicts
-// the stabilized header OS.
+// The block no longer leaks the real machine identity, and when stabilize is on it
+// no longer contradicts the stabilized header OS.
 func rewriteEnvBlock(block string, params envRewriteParams) string {
 	// Key-anchored cwd normalization first (covers arbitrary path roots).
 	block = cwdKeyValuePattern.ReplaceAllString(block, "${1}"+params.canonicalCwd)
