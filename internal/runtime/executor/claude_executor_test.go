@@ -75,6 +75,29 @@ func billingVersionFromBody(t *testing.T, body []byte) string {
 	return match[1]
 }
 
+func billingEntrypointFromBody(t *testing.T, body []byte) string {
+	t.Helper()
+	billingHeader := gjson.GetBytes(body, "system.0.text").String()
+	match := regexp.MustCompile(`cc_entrypoint=([^;]+);`).FindStringSubmatch(billingHeader)
+	if len(match) != 2 {
+		t.Fatalf("expected billing cc_entrypoint in body, got system.0.text=%q body=%s", billingHeader, string(body))
+	}
+	return strings.TrimSpace(match[1])
+}
+
+func userAgentSuffixEntrypoint(userAgent string) string {
+	start := strings.Index(userAgent, "(")
+	end := strings.LastIndex(userAgent, ")")
+	if start < 0 || end <= start {
+		return ""
+	}
+	parts := strings.Split(userAgent[start+1:end], ",")
+	if len(parts) >= 2 {
+		return strings.TrimSpace(parts[1])
+	}
+	return ""
+}
+
 func TestApplyClaudeHeaders_UsesConfiguredBaselineFingerprint(t *testing.T) {
 	resetClaudeDeviceProfileCache()
 	stabilize := true
@@ -394,6 +417,78 @@ func TestApplyClaudeHeaders_UpgradesCachedSoftwareFingerprintWhenBaselineAdvance
 	})
 	applyClaudeHeaders(thirdPartyReq, auth, "key-baseline-reload", false, nil, newCfg)
 	assertClaudeFingerprint(t, thirdPartyReq.Header, "claude-cli/2.1.77 (external, cli)", "0.87.0", "v24.8.0", "MacOS", "arm64")
+}
+
+// TestApplyClaudeHeaders_AlignsUserAgentSuffixWithInboundEntrypoint pins the
+// anti-correlation fix (T050): the stabilized outbound UA parenthetical suffix
+// must mirror the current inbound claude-code client's "(USER_TYPE, ENTRYPOINT)"
+// block (same source cc_entrypoint is derived from), while the version stays at
+// the high-water mark. The bug: a frozen high-water device profile seeded by a
+// "claude --print" / SDK request (UA suffix "(external, sdk-cli)") would keep
+// emitting "sdk-cli" on every later interactive request even though that request's
+// cc_entrypoint is "cli" — a UA/entrypoint pair real claude-code never produces.
+func TestApplyClaudeHeaders_AlignsUserAgentSuffixWithInboundEntrypoint(t *testing.T) {
+	resetClaudeDeviceProfileCache()
+	stabilize := true
+
+	cfg := &config.Config{
+		ClaudeHeaderDefaults: config.ClaudeHeaderDefaults{
+			UserAgent:              "claude-cli/2.1.60 (external, cli)",
+			PackageVersion:         "0.70.0",
+			RuntimeVersion:         "v22.0.0",
+			OS:                     "MacOS",
+			Arch:                   "arm64",
+			StabilizeDeviceProfile: &stabilize,
+		},
+	}
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
+		ID: "auth-ua-suffix-align",
+		Attributes: map[string]string{
+			"api_key": "key-ua-suffix-align",
+		},
+	}
+
+	// First request is a "claude --print" / SDK invocation: it seeds the per-account
+	// high-water device profile with a high version AND the sdk-cli entrypoint
+	// suffix. The outbound suffix on this request mirrors the inbound sdk-cli.
+	sdkSeedReq := newClaudeHeaderTestRequest(t, http.Header{
+		"User-Agent":                  []string{"claude-cli/2.1.180 (external, sdk-cli)"},
+		"X-Stainless-Package-Version": []string{"0.90.0"},
+		"X-Stainless-Runtime-Version": []string{"v24.9.0"},
+		"X-Stainless-Os":              []string{"Linux"},
+		"X-Stainless-Arch":            []string{"x64"},
+	})
+	applyClaudeHeaders(sdkSeedReq, auth, "key-ua-suffix-align", false, nil, cfg)
+	// High-water version 2.1.180 adopted; OS/Arch pinned to baseline; suffix mirrors
+	// this request's sdk-cli inbound.
+	assertClaudeFingerprint(t, sdkSeedReq.Header, "claude-cli/2.1.180 (external, sdk-cli)", "0.90.0", "v24.9.0", "MacOS", "arm64")
+
+	// Second request is an interactive TUI invocation at a LOWER version with the
+	// cli entrypoint. The version stays at the 2.1.180 high-water mark (only-up),
+	// but the suffix MUST realign to the current inbound "(external, cli)" so the
+	// outbound UA suffix matches cc_entrypoint=cli. OS/Arch stay pinned to baseline.
+	interactiveReq := newClaudeHeaderTestRequest(t, http.Header{
+		"User-Agent":                  []string{"claude-cli/2.1.63 (external, cli)"},
+		"X-Stainless-Package-Version": []string{"0.75.0"},
+		"X-Stainless-Runtime-Version": []string{"v24.4.0"},
+		"X-Stainless-Os":              []string{"Windows"},
+		"X-Stainless-Arch":            []string{"x64"},
+	})
+	applyClaudeHeaders(interactiveReq, auth, "key-ua-suffix-align", false, nil, cfg)
+	assertClaudeFingerprint(t, interactiveReq.Header, "claude-cli/2.1.180 (external, cli)", "0.90.0", "v24.9.0", "MacOS", "arm64")
+
+	// Third request: inbound is a non-claude client (api-key/curl). cc_entrypoint
+	// defaults to "cli", so the outbound suffix must default to "(external, cli)"
+	// too, while the high-water version/pkg/runtime/OS/Arch stay stable.
+	nonClaudeReq := newClaudeHeaderTestRequest(t, http.Header{
+		"User-Agent":                  []string{"curl/8.7.1"},
+		"X-Stainless-Package-Version": []string{"0.10.0"},
+		"X-Stainless-Runtime-Version": []string{"v18.0.0"},
+		"X-Stainless-Os":              []string{"Linux"},
+		"X-Stainless-Arch":            []string{"x64"},
+	})
+	applyClaudeHeaders(nonClaudeReq, auth, "key-ua-suffix-align", false, nil, cfg)
+	assertClaudeFingerprint(t, nonClaudeReq.Header, "claude-cli/2.1.180 (external, cli)", "0.90.0", "v24.9.0", "MacOS", "arm64")
 }
 
 func TestApplyClaudeHeaders_LearnsOfficialFingerprintAfterCustomBaselineFallback(t *testing.T) {
@@ -1365,6 +1460,105 @@ func TestClaudeExecutor_RewritesStaleBillingVersionToStabilizedUserAgent(t *test
 	}
 	if got := billingVersionFromBody(t, captured.body); got != "2.1.83" {
 		t.Fatalf("billing cc_version = %q, want %q", got, "2.1.83")
+	}
+}
+
+// TestClaudeExecutor_OutboundUserAgentSuffixMatchesCCEntrypoint is the
+// end-to-end (full Execute) regression for the T050 anti-correlation bug: with a
+// device profile high-water frozen on the sdk-cli entrypoint, an interactive
+// inbound request (cc_entrypoint=cli) must produce an outbound UA whose
+// parenthetical suffix is "cli" — i.e. the outbound UA suffix and the billing
+// cc_entrypoint must reference the same inbound-derived entrypoint and never
+// diverge. The high-water version is still emitted in the UA.
+func TestClaudeExecutor_OutboundUserAgentSuffixMatchesCCEntrypoint(t *testing.T) {
+	resetClaudeDeviceProfileCache()
+	stabilize := true
+
+	var captured capturedRequestForBilling
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		captured = capturedRequestForBilling{
+			body:      bytes.Clone(body),
+			userAgent: r.Header.Get("User-Agent"),
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","model":"claude-sonnet-4-6","role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer server.Close()
+
+	cfg := &config.Config{
+		ClaudeHeaderDefaults: config.ClaudeHeaderDefaults{
+			UserAgent:              "claude-cli/2.1.70 (external, cli)",
+			PackageVersion:         "0.80.0",
+			RuntimeVersion:         "v24.5.0",
+			OS:                     "MacOS",
+			Arch:                   "arm64",
+			StabilizeDeviceProfile: &stabilize,
+		},
+	}
+	executor := NewClaudeExecutor(cfg)
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
+		ID: "auth-ua-entrypoint-e2e",
+		Attributes: map[string]string{
+			"api_key":     "sk-ant-oat-test",
+			"base_url":    server.URL,
+			"cloak_mode":  "always",
+			"tool_prefix": "disabled",
+		},
+	}
+	payload := []byte(`{"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.63.abc; cc_entrypoint=cli; cch=12345;"},{"type":"text","text":"existing"}],"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
+
+	// Seed the high-water device profile with an SDK ("claude --print") request:
+	// high version + sdk-cli entrypoint suffix get frozen.
+	sdkCtx := contextWithGinHeaders(map[string]string{
+		"User-Agent":                  "claude-cli/2.1.180 (external, sdk-cli)",
+		"X-Stainless-Package-Version": "0.90.0",
+		"X-Stainless-Runtime-Version": "v24.9.0",
+		"X-Stainless-Os":              "Linux",
+		"X-Stainless-Arch":            "x64",
+	})
+	if _, err := executor.Execute(sdkCtx, auth, cliproxyexecutor.Request{
+		Model:   "claude-sonnet-4-6",
+		Payload: payload,
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")}); err != nil {
+		t.Fatalf("Execute() sdk-seed error = %v", err)
+	}
+
+	// Now an interactive TUI request: inbound entrypoint is cli, lower version.
+	cliCtx := contextWithGinHeaders(map[string]string{
+		"User-Agent":                  "claude-cli/2.1.63 (external, cli)",
+		"X-Stainless-Package-Version": "0.75.0",
+		"X-Stainless-Runtime-Version": "v24.4.0",
+		"X-Stainless-Os":              "Windows",
+		"X-Stainless-Arch":            "x64",
+	})
+	if _, err := executor.Execute(cliCtx, auth, cliproxyexecutor.Request{
+		Model:   "claude-sonnet-4-6",
+		Payload: payload,
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")}); err != nil {
+		t.Fatalf("Execute() cli error = %v", err)
+	}
+
+	// Outbound UA keeps the 2.1.180 high-water version but the suffix realigns to
+	// the inbound cli entrypoint.
+	if captured.userAgent != "claude-cli/2.1.180 (external, cli)" {
+		t.Fatalf("outbound User-Agent = %q, want %q", captured.userAgent, "claude-cli/2.1.180 (external, cli)")
+	}
+	uaEntrypoint := userAgentSuffixEntrypoint(captured.userAgent)
+	ccEntrypoint := billingEntrypointFromBody(t, captured.body)
+	if uaEntrypoint != "cli" {
+		t.Fatalf("outbound UA suffix entrypoint = %q, want cli", uaEntrypoint)
+	}
+	if ccEntrypoint != "cli" {
+		t.Fatalf("billing cc_entrypoint = %q, want cli", ccEntrypoint)
+	}
+	// The core invariant: outbound UA suffix == cc_entrypoint (no divergence).
+	if uaEntrypoint != ccEntrypoint {
+		t.Fatalf("UA suffix entrypoint %q != cc_entrypoint %q; anti-correlation mismatch", uaEntrypoint, ccEntrypoint)
+	}
+	// High-water version is still emitted in the billing header.
+	if got := billingVersionFromBody(t, captured.body); got != "2.1.180" {
+		t.Fatalf("billing cc_version = %q, want %q", got, "2.1.180")
 	}
 }
 
