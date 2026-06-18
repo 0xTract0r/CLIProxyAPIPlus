@@ -729,7 +729,7 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 	// left untouched (zero behavior change); NormalizeAccountEnv is a safe
 	// pass-through on unparsable bodies and a no-op when no env block is present.
 	if config.NormalizeAccountEnvEnabled(e.cfg) {
-		body = helps.NormalizeAccountEnv(body, auth, apiKey)
+		body = helps.NormalizeAccountEnv(body, auth, apiKey, e.cfg)
 	}
 
 	// 反关联修复 A（C1）续：在 body 完成全部规范化（sanitize / device_id ⑦ / env）之后，
@@ -2250,7 +2250,7 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 	// inside <env> / <system-reminder> blocks are rewritten to a per-account
 	// canonical path.
 	if config.NormalizeAccountEnvEnabled(cfg) {
-		payload = helps.NormalizeAccountEnv(payload, auth, apiKey)
+		payload = helps.NormalizeAccountEnv(payload, auth, apiKey, cfg)
 	}
 
 	// Determine if the remaining (broader) cloak transformations should be applied.
