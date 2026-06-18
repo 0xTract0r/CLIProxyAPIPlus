@@ -1403,6 +1403,15 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 	// User-Agent/package/runtime tuples to upgrade the software fingerprint.
 	if stabilizeDeviceProfile {
 		helps.ApplyClaudeDeviceProfileHeaders(r, deviceProfile)
+		// Align the outbound UA parenthetical suffix "(USER_TYPE, ENTRYPOINT)" with
+		// the inbound claude-code client UA, keeping the high-water
+		// "claude-cli/<version>" prefix. cc_entrypoint is derived from the same
+		// inbound UA (parseEntrypointFromUA(getClientUserAgent(ctx))), so without
+		// this the frozen device-profile UA suffix (which one "claude --print" can
+		// seed to "sdk-cli") can diverge from cc_entrypoint and produce a
+		// UA/entrypoint pair real claude-code never emits. ginHeaders.Get reads the
+		// same inbound request header source as getClientUserAgent.
+		helps.AlignClaudeDeviceProfileUserAgentSuffix(r, ginHeaders.Get("User-Agent"))
 	} else {
 		helps.ApplyClaudeLegacyDeviceHeaders(r, ginHeaders, cfg)
 	}

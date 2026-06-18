@@ -822,6 +822,71 @@ func ApplyClaudeDeviceProfileHeaders(r *http.Request, profile ClaudeDeviceProfil
 	r.Header.Set("X-Stainless-Arch", profile.Arch)
 }
 
+// defaultClaudeFingerprintUserAgentSuffix is the parenthetical suffix
+// "(external, cli)" used by real interactive claude-cli. It is also the suffix
+// implied by the default cc_entrypoint ("cli") derived from a non-claude-code
+// inbound client. Outbound UA suffix and cc_entrypoint must reference the same
+// inbound-derived entrypoint, so this default is shared by both.
+const defaultClaudeFingerprintUserAgentSuffix = "(external, cli)"
+
+// claudeUserAgentSuffixPattern captures the first parenthetical block of a
+// claude-cli User-Agent, e.g. the "(external, cli)" in
+// "claude-cli/2.1.63 (external, cli)".
+var claudeUserAgentSuffixPattern = regexp.MustCompile(`\([^)]*\)`)
+
+// claudeClientUserAgentSuffix returns the parenthetical "(USER_TYPE, ENTRYPOINT)"
+// block of an inbound claude-code client User-Agent. When the inbound client is
+// not a claude-code client, or carries no parenthetical block, it returns the
+// default "(external, cli)" suffix — which is exactly the suffix that matches the
+// default cc_entrypoint ("cli") produced for such clients. This keeps the
+// outbound UA suffix and the billing cc_entrypoint derived from the same source.
+func claudeClientUserAgentSuffix(clientUA string) string {
+	clientUA = strings.TrimSpace(clientUA)
+	if !isClaudeCodeClient(clientUA) {
+		return defaultClaudeFingerprintUserAgentSuffix
+	}
+	if match := claudeUserAgentSuffixPattern.FindString(clientUA); match != "" {
+		return match
+	}
+	return defaultClaudeFingerprintUserAgentSuffix
+}
+
+// AlignClaudeDeviceProfileUserAgentSuffix rewrites the parenthetical suffix of the
+// stabilized outbound User-Agent so it mirrors the inbound claude-code client's
+// "(USER_TYPE, ENTRYPOINT)" block, while preserving the high-water
+// "claude-cli/<version>" prefix and all other stabilized fingerprint fields.
+//
+// Anti-correlation invariant: the outbound UA suffix and the billing
+// cc_entrypoint are both derived from the same inbound client User-Agent
+// (parseEntrypointFromUA in the executor reads the same source). Without this
+// alignment the outbound UA suffix comes from a frozen high-water device profile
+// (which a single "claude --print" can seed to "sdk-cli") while cc_entrypoint is
+// derived per request, producing a UA/entrypoint pair (e.g. "(external, sdk-cli)"
+// + cc_entrypoint=cli) that real claude-code never emits and that Anthropic can
+// detect. After this call the suffix and cc_entrypoint can no longer diverge.
+//
+// Only the parenthetical suffix is rewritten; the version, package version,
+// runtime version, OS and arch fields stay at their stabilized high-water values.
+func AlignClaudeDeviceProfileUserAgentSuffix(r *http.Request, clientUA string) {
+	if r == nil {
+		return
+	}
+	outboundUA := strings.TrimSpace(r.Header.Get("User-Agent"))
+	if outboundUA == "" || !isClaudeCodeClient(outboundUA) {
+		return
+	}
+	desiredSuffix := claudeClientUserAgentSuffix(clientUA)
+	if claudeUserAgentSuffixPattern.MatchString(outboundUA) {
+		aligned := claudeUserAgentSuffixPattern.ReplaceAllString(outboundUA, desiredSuffix)
+		r.Header.Set("User-Agent", aligned)
+		return
+	}
+	// Outbound UA has no parenthetical block (unexpected for stabilized profiles,
+	// but be defensive): append the desired suffix so it stays paired with
+	// cc_entrypoint.
+	r.Header.Set("User-Agent", outboundUA+" "+desiredSuffix)
+}
+
 // DefaultClaudeVersion returns the version string (e.g. "2.1.63") from the
 // current baseline device profile. It extracts the version from the User-Agent.
 func DefaultClaudeVersion(cfg *config.Config) string {
