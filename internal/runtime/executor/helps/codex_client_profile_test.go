@@ -395,3 +395,131 @@ func TestResolveCodexClientProfile_OnlineVersionBumpsPersistedHeaders(t *testing
 		t.Fatalf("Source = %q, want codex-proxy", got)
 	}
 }
+
+// TestExtractCodexClientProfile_SanityCeilingRejectsFabricatedHighVersion 覆盖 A-2：
+// 持有合法下游 key 的人伪造荒谬高版本（CLI 家族 999.0.0 / Desktop 家族 999.999.99999）
+// 必须在源级被拒，不进入观测，避免污染 high-water 并被当成出站版本。
+func TestExtractCodexClientProfile_SanityCeilingRejectsFabricatedHighVersion(t *testing.T) {
+	cfg := &config.Config{}
+
+	cliForged := http.Header{
+		"User-Agent": []string{"codex_cli_rs/999.0.0 (Mac OS 15.5.0; arm64) iTerm.app/3.5.0"},
+		"Version":    []string{"999.0.0"},
+		"Originator": []string{"codex_cli_rs"},
+	}
+	if profile, ok := extractCodexClientProfile(cliForged, cfg); ok {
+		t.Fatalf("forged codex_cli_rs/999.0.0 accepted as observation %#v, want rejected", profile)
+	}
+
+	desktopForged := http.Header{
+		"User-Agent": []string{"Codex Desktop/999.999.99999 (darwin; arm64)"},
+		"Version":    []string{"999.999.99999"},
+		"Originator": []string{"Codex Desktop"},
+	}
+	if profile, ok := extractCodexClientProfile(desktopForged, cfg); ok {
+		t.Fatalf("forged Codex Desktop/999.999.99999 accepted as observation %#v, want rejected", profile)
+	}
+}
+
+// TestExtractCodexClientProfile_SanityCeilingAcceptsRealRecentVersion 覆盖 A-2：
+// 真实近期版本（仍在静态上限以内）必须被接受，确保 ceiling 不误拒正常客户端。
+func TestExtractCodexClientProfile_SanityCeilingAcceptsRealRecentVersion(t *testing.T) {
+	cfg := &config.Config{}
+
+	cliReal := http.Header{
+		"User-Agent": []string{"codex_cli_rs/0.140.0 (Mac OS 15.5.0; arm64) iTerm.app/3.5.0"},
+		"Version":    []string{"0.140.0"},
+		"Originator": []string{"codex_cli_rs"},
+	}
+	profile, ok := extractCodexClientProfile(cliReal, cfg)
+	if !ok {
+		t.Fatalf("real codex_cli_rs/0.140.0 rejected, want accepted")
+	}
+	if got := profile.Version; got != "0.140.0" {
+		t.Fatalf("accepted CLI Version = %q, want 0.140.0", got)
+	}
+
+	desktopReal := http.Header{
+		"User-Agent": []string{"Codex Desktop/26.318.11754 (darwin; arm64)"},
+		"Version":    []string{"26.318.11754"},
+		"Originator": []string{"Codex Desktop"},
+	}
+	if _, ok := extractCodexClientProfile(desktopReal, cfg); !ok {
+		t.Fatalf("real Codex Desktop/26.318.11754 rejected, want accepted")
+	}
+}
+
+// TestCodexObservationSanityCeiling_LiftedByOnlineLatest 覆盖 A-2 线上抬 ceiling 分支：
+// 当 codex online latest 高于静态上限时，有效 ceiling 应被抬到线上 latest，
+// 让真正的前沿真实客户端不被误拒；但只抬上限，不改出站版本。
+func TestCodexObservationSanityCeiling_LiftedByOnlineLatest(t *testing.T) {
+	resetManagedHeaderOnlineProfileCacheForTests()
+	online := true
+	oldOverride := ManagedHeaderOnlineFetchOverride
+	ManagedHeaderOnlineFetchOverride = func(provider string, cfg *config.Config) (ManagedHeaderOnlineVersion, bool) {
+		if provider != "codex" {
+			return ManagedHeaderOnlineVersion{}, false
+		}
+		// 线上 latest 高于 CLI 静态上限 1.0.0。
+		return ManagedHeaderOnlineVersion{
+			Version: "2.5.0",
+			ManagedHeaderProfileSource: ManagedHeaderProfileSource{
+				Source:    managedHeaderProfileSourceNPM,
+				SourceURL: codexNPMURL,
+				CheckedAt: "2026-04-29T12:00:00Z",
+			},
+		}, true
+	}
+	t.Cleanup(func() {
+		ManagedHeaderOnlineFetchOverride = oldOverride
+		resetManagedHeaderOnlineProfileCacheForTests()
+	})
+
+	cfg := &config.Config{
+		ManagedHeaderProfile: config.ManagedHeaderProfileConfig{OnlineUpdate: &online},
+	}
+	cliProfile := CodexClientProfile{Originator: "codex_cli_rs", UserAgentProduct: "codex_cli_rs"}
+	ceiling := codexObservationSanityCeiling(cliProfile, cfg)
+	if ceiling.Compare(codexStaticSanityCeiling(cliProfile)) <= 0 {
+		t.Fatalf("online-raised CLI ceiling %+v must exceed static ceiling %+v", ceiling, codexStaticSanityCeiling(cliProfile))
+	}
+
+	// candidate 2.4.0 在线上抬升后的上限内，应被接受。
+	withinHeader := http.Header{
+		"User-Agent": []string{"codex_cli_rs/2.4.0 (Mac OS 15.5.0; arm64) iTerm.app/3.5.0"},
+		"Version":    []string{"2.4.0"},
+		"Originator": []string{"codex_cli_rs"},
+	}
+	if _, ok := extractCodexClientProfile(withinHeader, cfg); !ok {
+		t.Fatalf("codex_cli_rs/2.4.0 rejected under online-raised ceiling, want accepted")
+	}
+}
+
+// TestCodexObservationSanityCeiling_OfflineConstantApplies 覆盖 A-2 离线分支：
+// online-update 未开启时，有效 ceiling 等于硬编码静态上限，超界值离线即被拒。
+func TestCodexObservationSanityCeiling_OfflineConstantApplies(t *testing.T) {
+	cfg := &config.Config{}
+	cliProfile := CodexClientProfile{Originator: "codex_cli_rs", UserAgentProduct: "codex_cli_rs"}
+	if ceiling := codexObservationSanityCeiling(cliProfile, cfg); ceiling.Compare(codexStaticSanityCeiling(cliProfile)) != 0 {
+		t.Fatalf("offline CLI ceiling = %+v, want static ceiling %+v", ceiling, codexStaticSanityCeiling(cliProfile))
+	}
+	desktopProfile := CodexClientProfile{Originator: "Codex Desktop", UserAgentProduct: "Codex Desktop"}
+	if ceiling := codexObservationSanityCeiling(desktopProfile, cfg); ceiling.Compare(codexStaticSanityCeiling(desktopProfile)) != 0 {
+		t.Fatalf("offline Desktop ceiling = %+v, want static ceiling %+v", ceiling, codexStaticSanityCeiling(desktopProfile))
+	}
+}
+
+// TestIsFirstPartyCodexOriginator_Whitelist 覆盖 A-1 白名单的导出包装：合法 first-party
+// Originator 通过，伪造/路人值被拒。executor 侧据此决定是否保留客户端 Originator。
+func TestIsFirstPartyCodexOriginator_Whitelist(t *testing.T) {
+	for _, ok := range []string{"codex-tui", "codex_cli_rs", "codex_vscode", "codex_exec", "Codex Desktop"} {
+		if !IsFirstPartyCodexOriginator(ok) {
+			t.Fatalf("IsFirstPartyCodexOriginator(%q) = false, want true", ok)
+		}
+	}
+	for _, bad := range []string{"", "evil-client", "curl/8.1", "Codex", "codex"} {
+		if IsFirstPartyCodexOriginator(bad) {
+			t.Fatalf("IsFirstPartyCodexOriginator(%q) = true, want false", bad)
+		}
+	}
+}

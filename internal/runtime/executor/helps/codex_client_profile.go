@@ -19,6 +19,29 @@ const (
 	defaultCodexManagedChromium    = "144"
 	codexClientProfileCacheTTL     = 7 * 24 * time.Hour
 	codexClientProfileCleanupEvery = time.Hour
+
+	// fork(anticorr A-2): codex 版本 sanity ceiling（仿 claude claudeStaticSanityCeiling）。
+	//
+	// 背景：extractCodexClientProfile 旧逻辑只校验 version.valid，对版本上限不设防。
+	// 持有合法下游 key 的人伪造 "Codex Desktop/999.999.99999" 这类荒谬高版本，会被
+	// 当成合法观测，污染 per-account + 全局 high-water（bumpCodexVersionMarkers 的
+	// only-up 单调递增），并被当成出站版本应用到其它账号。这里加一个静态上限把超界
+	// 观测在录入 high-water 前直接拒掉。
+	//
+	// codex 有两个版本家族，第一段不可线性比较，必须分家族设上限：
+	//   - Desktop：真实 "Codex Desktop/26.318.11754"（year.day-of-year.build），
+	//     首段约 26。ceiling 取 28（领先真实 year-major 约两年），允许正常年度增长
+	//     但挡住荒谬值。
+	//   - CLI（codex_cli_rs / codex-tui / codex_vscode / codex_exec）：真实约
+	//     "0.140.0"，主版本仍是 0。ceiling 取 "1.0.0"（领先一个主版本，仿 claude
+	//     "领先 live family 一个 major" 的余量），允许 0.x 任意小幅增长但挡住 999.x。
+	//
+	// 何时上调：若 codex 客户端某家族合法跨过这里的常量，按对应家族上调（并保持领先
+	// live family 一档），避免误拒真实新客户端。这是保守离线兜底，不是精确版本锁。
+	// 线上 latest 抬 ceiling 见 codexObservationSanityCeiling（接 codex 已有的
+	// resolveManagedHeaderOnlineVersion("codex")，仅用于抬上限，从不用于推高出站版本）。
+	codexDesktopSanityCeilingVersion = "28.0.0"
+	codexCLISanityCeilingVersion     = "1.0.0"
 )
 
 var (
@@ -549,6 +572,42 @@ func bumpCodexTailVersionMarker(tail string, product string, version string) str
 	})
 }
 
+// codexStaticSanityCeiling 返回对应家族的硬编码离线版本上限。Desktop 与 CLI 两个
+// 家族第一段不可线性比较，必须按家族取不同上限（见常量处说明）。
+func codexStaticSanityCeiling(profile CodexClientProfile) codexVersionMarker {
+	if profile.isCodexDesktopLike() {
+		return parseCodexVersion(codexDesktopSanityCeilingVersion)
+	}
+	return parseCodexVersion(codexCLISanityCeilingVersion)
+}
+
+// codexObservationSanityCeiling 返回用于拒绝伪造高版本的有效上限：
+// max(静态家族常量, 已缓存线上 latest)。静态常量保证离线时的确定性下界；线上 latest
+// 仅在 codex online-update 已开启且 latest 已缓存时被读取，且只用于「抬高」校验上限，
+// 让真正的前沿真实客户端不被误拒——从不用于推高出站版本（出站版本另有 only-up high-water
+// 约束）。线上 latest 仅对同家族（与 candidate 同 Desktop/CLI 归属）才有意义；codex 线上源
+// 默认就是 codex-proxy desktop bundle / codex npm，归属可能与 candidate 不同，
+// 因此只有线上 latest 解析为合法版本且高于静态上限时才抬升，否则维持静态上限。
+func codexObservationSanityCeiling(profile CodexClientProfile, cfg *config.Config) codexVersionMarker {
+	ceiling := codexStaticSanityCeiling(profile)
+	if online, ok := resolveManagedHeaderOnlineVersion("codex", cfg); ok {
+		if onlineVersion := parseCodexVersion(strings.TrimSpace(online.Version)); onlineVersion.valid && onlineVersion.Compare(ceiling) > 0 {
+			ceiling = onlineVersion
+		}
+	}
+	return ceiling
+}
+
+// codexObservationWithinSanityCeiling 判定 candidate 观测版本是否在有效上限以内。
+// 超界的 candidate 视为伪造，必须在录入 per-account/全局 high-water 之前拒掉，
+// 既不进观测，也不会成为应用到其它账号的出站版本。
+func codexObservationWithinSanityCeiling(candidate CodexClientProfile, cfg *config.Config) bool {
+	if !candidate.version.valid {
+		return true
+	}
+	return candidate.version.Compare(codexObservationSanityCeiling(candidate, cfg)) <= 0
+}
+
 func extractCodexClientProfile(headers http.Header, cfg *config.Config) (CodexClientProfile, bool) {
 	if headers == nil {
 		return CodexClientProfile{}, false
@@ -583,6 +642,12 @@ func extractCodexClientProfile(headers http.Header, cfg *config.Config) (CodexCl
 	}
 	profile = normalizeCodexClientProfile(profile, defaultCodexClientProfile(cfg))
 	if !profile.version.valid {
+		return CodexClientProfile{}, false
+	}
+	// fork(anticorr A-2): sanity-ceiling 源级拒绝。版本超过有效上限的 candidate 视为
+	// 伪造的入站观测，在任何 high-water 录入前丢弃，伪造高版本无法污染 per-account/
+	// 全局观测，也无法成为应用到其它账号的出站版本。
+	if !codexObservationWithinSanityCeiling(profile, cfg) {
 		return CodexClientProfile{}, false
 	}
 	return profile, true
@@ -639,6 +704,12 @@ func buildCodexUserAgent(product string, version string, platform string, tail s
 func buildCodexSecCHUA(chromiumVersion string) string {
 	chromiumVersion = firstNonEmptyString(chromiumVersion, defaultCodexManagedChromium)
 	return `"Chromium";v="` + chromiumVersion + `", "Not:A-Brand";v="24"`
+}
+
+// IsFirstPartyCodexOriginator 是 isFirstPartyCodexOriginator 的导出包装，供 executor
+// 侧（A-1 Originator 钉死）判断客户端传入的 Originator 是否落在合法 first-party 白名单内。
+func IsFirstPartyCodexOriginator(originator string) bool {
+	return isFirstPartyCodexOriginator(originator)
 }
 
 func isFirstPartyCodexOriginator(originator string) bool {
