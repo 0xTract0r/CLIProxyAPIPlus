@@ -43,7 +43,12 @@ func (m *LogFormatter) Format(entry *log.Entry) ([]byte, error) {
 
 	// 人看的日志统一用显示时区（默认 UTC+8）。这是 logrus 标准日志 + gin access log
 	// 的统一格式化器，覆盖面最大。出站时间字段不经过这里。
-	timestamp := entry.Time.In(DisplayLocation()).Format("2006-01-02 15:04:05")
+	//
+	// 末尾 `-07:00` 占位符按 displayLoc 输出固定偏移后缀（UTC+8 -> ` +08:00`，
+	// UTC-5 -> ` -05:00`，UTC -> ` +00:00`），让人一眼看出日志时间属于哪个时区。
+	// 前 19 字符仍是 `2006-01-02 15:04:05`，读侧 logs.go 的 parseTimestamp 只取
+	// line[:19]，偏移后缀落在第 20 字符之后，不进入解析 candidate，读写口径保持一致。
+	timestamp := entry.Time.In(DisplayLocation()).Format("2006-01-02 15:04:05 -07:00")
 	message := strings.TrimRight(entry.Message, "\r\n")
 
 	reqID := "--------"
