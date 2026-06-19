@@ -146,34 +146,99 @@ func TestClaudeStrictProfileWiredFromProfileID(t *testing.T) {
 	}
 }
 
-// TestCodexChromeProfileStillFallsBack verifies the no-downgrade (strict) change
-// does not leak into the codex path: NewUtlsHTTPClient (codex's only production
-// caller) keeps disableFallback=false so the connectivity-first behavior is
-// unchanged. After Wave10-C the codex default ClientHello is the codex-rs
-// HelloCustom (replacing the previously misconfigured Chrome133), but it must
-// stay NON-strict — the no-downgrade enforcement is claude-only.
-func TestCodexChromeProfileStillFallsBack(t *testing.T) {
+// TestCodexProfileWiredNoDowngrade verifies the codex production path is now
+// fail-closed: NewUtlsHTTPClient (codex's only production caller) and the
+// explicit-profile NewUtlsHTTPClientForProfile(CodexRustlsClientHelloProfileID)
+// both build with disableFallback=true. The codex-rs ClientHello is paired with a
+// codex-rs UA; downgrading to Chrome133 would re-create the UA/TLS mismatch this
+// profile exists to remove, so the codex path must never downgrade.
+func TestCodexProfileWiredNoDowngrade(t *testing.T) {
 	t.Parallel()
 
-	client := NewUtlsHTTPClient(context.Background(), nil, nil, 0)
+	for _, tc := range []struct {
+		name   string
+		client *http.Client
+	}{
+		{"default", NewUtlsHTTPClient(context.Background(), nil, nil, 0)},
+		{"explicit-profile", NewUtlsHTTPClientForProfile(context.Background(), nil, nil, 0, CodexRustlsClientHelloProfileID)},
+	} {
+		fb, ok := tc.client.Transport.(*fallbackRoundTripper)
+		if !ok {
+			t.Fatalf("[%s] expected *fallbackRoundTripper, got %T", tc.name, tc.client.Transport)
+		}
+		inner, ok := fb.utls.(*utlsRoundTripper)
+		if !ok {
+			t.Fatalf("[%s] expected inner *utlsRoundTripper, got %T", tc.name, fb.utls)
+		}
+		if !inner.disableFallback {
+			t.Fatalf("[%s] codex profile must be built with disableFallback=true (never downgrade codex-rs->Chrome133)", tc.name)
+		}
+		// codex default resolves to the codex-rs HelloCustom + codex spec, not
+		// the claude-cli spec and not Chrome133.
+		if inner.configuredHello != utls.HelloCustom.Str() {
+			t.Fatalf("[%s] configuredHello = %q, want HelloCustom %q (codex-rs default)", tc.name, inner.configuredHello, utls.HelloCustom.Str())
+		}
+		if inner.customSpecID != codexRustlsClientHelloProfileID {
+			t.Fatalf("[%s] codex customSpecID = %q, want codex-rs %q", tc.name, inner.customSpecID, codexRustlsClientHelloProfileID)
+		}
+	}
+}
+
+// TestDialTLSContextCodexNeverDowngradesAfterRetriesExhausted is the codex
+// counterpart to TestDialTLSContextClaudeNeverDowngradesAfterRetriesExhausted:
+// when the codex-rs HelloCustom handshake cannot complete even after retries,
+// dialTLSContext returns an error and NEVER downgrades to Chrome133. This guards
+// the core PR #35 fix — a codex-rs UA must never be served over a Chrome133 TLS
+// fingerprint. FallbackCount stays 0, the last handshake hello is never Chrome,
+// and the failure is recorded as a hard fail.
+func TestDialTLSContextCodexNeverDowngradesAfterRetriesExhausted(t *testing.T) {
+	t.Parallel()
+
+	// Build the codex round tripper the same way the production codex path does,
+	// then force every dial to fail so all retries are exhausted.
+	client := NewUtlsHTTPClientForProfile(context.Background(), nil, nil, 0, CodexRustlsClientHelloProfileID)
 	fb, ok := client.Transport.(*fallbackRoundTripper)
 	if !ok {
 		t.Fatalf("expected *fallbackRoundTripper, got %T", client.Transport)
 	}
-	inner, ok := fb.utls.(*utlsRoundTripper)
+	rt, ok := fb.utls.(*utlsRoundTripper)
 	if !ok {
 		t.Fatalf("expected inner *utlsRoundTripper, got %T", fb.utls)
 	}
-	if inner.disableFallback {
-		t.Fatal("codex default must keep disableFallback=false (no-downgrade is claude-only)")
+	rt.dialer = failingDialer{}
+
+	conn, err := rt.dialTLSContext(context.Background(), "tcp", "chatgpt.com:443")
+	if err == nil {
+		if conn != nil {
+			_ = conn.Close()
+		}
+		t.Fatal("expected codex strict mode to return an error, not a downgraded connection")
 	}
-	// codex default now resolves to the codex-rs HelloCustom + codex spec, not
-	// the strict claude-cli path and not Chrome133.
-	if inner.configuredHello != utls.HelloCustom.Str() {
-		t.Fatalf("configuredHello = %q, want HelloCustom %q (codex-rs default)", inner.configuredHello, utls.HelloCustom.Str())
+
+	state := rt.RuntimeHelloState()
+	if state.FallbackCount != 0 {
+		t.Fatalf("FallbackCount = %d, want 0 (codex profile must never downgrade)", state.FallbackCount)
 	}
-	if inner.customSpecID != codexRustlsClientHelloProfileID {
-		t.Fatalf("codex default customSpecID = %q, want codex-rs %q", inner.customSpecID, codexRustlsClientHelloProfileID)
+	if state.Downgraded {
+		t.Fatal("Downgraded = true, want false (codex profile must never downgrade)")
+	}
+	if state.LastHandshakeHello == utls.HelloChrome_133.Str() {
+		t.Fatalf("LastHandshakeHello = %q, must never be Chrome133 for the codex profile", state.LastHandshakeHello)
+	}
+	if state.LastHandshakeHello != "" {
+		t.Fatalf("LastHandshakeHello = %q, want empty (no successful handshake)", state.LastHandshakeHello)
+	}
+	if state.RetryCount != int64(utlsHandshakeMaxAttempts-1) {
+		t.Fatalf("RetryCount = %d, want %d (all retries attempted)", state.RetryCount, utlsHandshakeMaxAttempts-1)
+	}
+	if state.HardFailCount != 1 {
+		t.Fatalf("HardFailCount = %d, want 1 (one hard failure with fingerprint preserved)", state.HardFailCount)
+	}
+	if state.ConfiguredHello != utls.HelloCustom.Str() {
+		t.Fatalf("ConfiguredHello = %q, want HelloCustom %q", state.ConfiguredHello, utls.HelloCustom.Str())
+	}
+	if rt.customSpecID != codexRustlsClientHelloProfileID {
+		t.Fatalf("customSpecID = %q, want codex-rs %q (must fail on codex spec, not claude spec)", rt.customSpecID, codexRustlsClientHelloProfileID)
 	}
 }
 
