@@ -853,6 +853,8 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	body, _ = sjson.DeleteBytes(body, "safety_identifier")
 	body, _ = sjson.DeleteBytes(body, "stream_options")
 	body = normalizeCodexInstructions(body)
+	// fork(anticorr ⑦-codex): 无条件归一出站 body 里的真实 cwd/git/CODEX_HOME 路径。
+	body = helps.NormalizeCodexPaths(body, auth, apiKey)
 	// fork: 默认剥离 image_generation 工具（applyImageGenerationPolicy 内部默认 strip）。
 	// upstream 的多档禁用语义保留在 helps.ApplyPayloadConfigWithRequest 中。
 	body = applyImageGenerationPolicy(e.cfg, body, baseModel, auth)
@@ -1020,6 +1022,8 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 	body, _ = sjson.DeleteBytes(body, "stream")
 	body = normalizeCodexInstructions(body)
+	// fork(anticorr ⑦-codex): 无条件归一出站 body 里的真实 cwd/git/CODEX_HOME 路径。
+	body = helps.NormalizeCodexPaths(body, auth, apiKey)
 	// fork: 默认剥离 image_generation 工具。
 	body = applyImageGenerationPolicy(e.cfg, body, baseModel, auth)
 	body = sanitizeOpenAIResponsesReasoningEncryptedContent(ctx, "codex executor", body)
@@ -1127,6 +1131,8 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	body, _ = sjson.DeleteBytes(body, "stream_options")
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 	body = normalizeCodexInstructions(body)
+	// fork(anticorr ⑦-codex): 无条件归一出站 body 里的真实 cwd/git/CODEX_HOME 路径。
+	body = helps.NormalizeCodexPaths(body, auth, apiKey)
 	// fork: 默认剥离 image_generation 工具。
 	body = applyImageGenerationPolicy(e.cfg, body, baseModel, auth)
 	body = sanitizeOpenAIResponsesReasoningEncryptedContent(ctx, "codex executor", body)
@@ -1698,6 +1704,9 @@ func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, s
 		profile = helps.ResolveCodexClientProfile(auth, ginHeaders, cfg)
 	}
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Codex-Turn-Metadata", "")
+	// fork(anticorr ⑦-codex): 无条件归一 turn-metadata header 里的真实 cwd/git。
+	// 与 body #2 复用同一组派生值，保证 header/body 跨位置一致。token 即 apiKey。
+	helps.NormalizeCodexTurnMetadataHeader(r.Header, "X-Codex-Turn-Metadata", auth, token)
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Client-Request-Id", "")
 	if strings.TrimSpace(ginHeaders.Get("Version")) != "" {
 		misc.EnsureHeader(r.Header, ginHeaders, "Version", "")
