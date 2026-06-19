@@ -25,12 +25,31 @@ import (
 // only production caller is the codex executor (chatgpt.com).
 const claudeCLIClientHelloProfileID = "claude_cli_clienthello_v1"
 
+// codexRustlsClientHelloProfileID is the project profile that replicates the
+// real codex-rs (Rust/rustls) ClientHello, targeting
+// JA3 e4d448cdfe06dc1243c1eb026c74ac9a. Like the claude-cli profile it resolves
+// to uTLS HelloCustom, but it builds a DIFFERENT spec
+// (newCodexRustlsClientHelloSpec): a TLS1.2-only ClientHello with no GREASE / no
+// ALPN / no key_share / no supported_versions. Because both custom profiles map
+// onto HelloCustom (identical ClientHelloID.Str()), the round tripper must
+// remember which custom spec to build via utlsRoundTripper.customSpecID; the
+// ClientHelloID alone cannot disambiguate them.
+const codexRustlsClientHelloProfileID = "codex_rustls_native_v1"
+
+// CodexRustlsClientHelloProfileID is the exported codex-rs ClientHello profile,
+// used by the codex executor's outbound HTTP clients so codex traffic explicitly
+// selects the codex-rs (rustls) fingerprint instead of relying on the package
+// default. It must stay in sync with codexRustlsClientHelloProfileID.
+const CodexRustlsClientHelloProfileID = codexRustlsClientHelloProfileID
+
 // utlsHTTPClientDefaultProfileID is the default ClientHello profile for
 // NewUtlsHTTPClient. Its only production caller is the codex executor
-// (host chatgpt.com), so the default must stay the Chrome-like preset used
-// before the claude-cli ClientHello work; routing codex outbound through the
-// claude-cli HelloCustom fingerprint would misrepresent the codex client.
-const utlsHTTPClientDefaultProfileID = "claude_utls_chrome_133"
+// (host chatgpt.com), so the default replicates the real codex-rs (rustls)
+// ClientHello. It must NOT be the claude-cli HelloCustom profile (that would
+// misrepresent the codex client) and must NOT stay the previously misconfigured
+// Chrome-like preset (claude_utls_chrome_133), which does not match the real
+// codex-rs JA3.
+const utlsHTTPClientDefaultProfileID = codexRustlsClientHelloProfileID
 
 // claudeCLIALPN is the only ALPN protocol real claude-cli advertises.
 // claude-cli negotiates http/1.1 and never offers h2, so the outbound
@@ -51,11 +70,11 @@ var claudeCLIALPN = []string{"http/1.1"}
 var utlsDialAttemptTimeout = 10 * time.Second
 
 // utlsHandshakeMaxAttempts is how many times the configured ClientHello
-// (HelloCustom for claude, the Chrome-like preset for codex) handshake is
-// attempted before giving up. Because the dominant failure mode is a transient
-// proxy dial timeout, retrying the SAME ClientHello spec recovers most of these
-// without ever changing the outbound fingerprint. The first attempt plus up to
-// (utlsHandshakeMaxAttempts-1) retries.
+// (HelloCustom: the claude-cli spec for claude, the codex-rs spec for codex)
+// handshake is attempted before giving up. Because the dominant failure mode is
+// a transient proxy dial timeout, retrying the SAME ClientHello spec recovers
+// most of these without ever changing the outbound fingerprint. The first
+// attempt plus up to (utlsHandshakeMaxAttempts-1) retries.
 const utlsHandshakeMaxAttempts = 3
 
 // utlsHandshakeRetryBackoff is the base delay between configured-ClientHello
@@ -64,9 +83,11 @@ const utlsHandshakeMaxAttempts = 3
 const utlsHandshakeRetryBackoff = 200 * time.Millisecond
 
 // utlsRoundTripper implements http.RoundTripper using utls to replicate a
-// target client TLS fingerprint on protected API hosts. The default profile
-// replicates real claude-cli (HelloCustom + ALPN http/1.1); other profiles
-// keep the prior Chrome-like presets. Transport is HTTP/1.1 only.
+// target client TLS fingerprint on protected API hosts. The two production
+// profiles both resolve to HelloCustom + ALPN http/1.1 and are disambiguated by
+// customSpecID: real claude-cli (claude->anthropic) and real codex-rs
+// (codex->chatgpt.com). Legacy Chrome-like presets remain only as the strict-mode
+// fallback target and for non-production callers. Transport is HTTP/1.1 only.
 type utlsRoundTripper struct {
 	dialer      proxy.Dialer
 	clientHello tls.ClientHelloID
@@ -101,6 +122,15 @@ type utlsRoundTripper struct {
 	// false preserves the connectivity-first fallback behavior; this is a
 	// diagnostic / strict-mode opt-in only.
 	disableFallback bool
+	// customSpecID selects WHICH HelloCustom ClientHelloSpec to build when the
+	// configured ClientHelloID is tls.HelloCustom. Both the claude-cli and the
+	// codex-rs profiles resolve to HelloCustom (identical ClientHelloID.Str()),
+	// so the ID alone cannot tell them apart; this profile string does. Empty
+	// (the default) means the claude-cli spec (newClaudeCLIClientHelloSpec),
+	// preserving the historical behavior of every existing HelloCustom caller
+	// (claude outbound, the TLS evidence probe and capture paths). Only the
+	// codex outbound path sets it to codexRustlsClientHelloProfileID.
+	customSpecID string
 }
 
 func newUtlsRoundTripper(proxyURL string, clientHello tls.ClientHelloID) *utlsRoundTripper {
@@ -140,9 +170,10 @@ func newDiagnosticUtlsRoundTripper(dialer proxy.Dialer, clientHello tls.ClientHe
 // to the Chrome-like fallback: if the configured HelloCustom handshake fails,
 // dialTLSContext retries the same HelloCustom and, once attempts are exhausted,
 // returns the original error instead of serving a Chrome fingerprint. This is the
-// production path for claude strong-fingerprint profiles (anti-correlation: fail
-// rather than leak a downgraded fingerprint). Codex / Chrome-native profiles keep
-// the connectivity-first fallback via newUtlsRoundTripper.
+// production path for strong-fingerprint profiles (the claude-cli and codex-rs
+// HelloCustom profiles; anti-correlation: fail rather than leak a downgraded
+// fingerprint). Only non-strict profiles keep the connectivity-first fallback via
+// newUtlsRoundTripper.
 func newStrictUtlsRoundTripper(proxyURL string, clientHello tls.ClientHelloID) *utlsRoundTripper {
 	rt := newUtlsRoundTripper(proxyURL, clientHello)
 	rt.disableFallback = true
@@ -163,17 +194,18 @@ func (t *utlsRoundTripper) newHTTP11Transport() *http.Transport {
 }
 
 // dialTLSContext dials the upstream and performs the uTLS handshake. When the
-// configured ClientHello is HelloCustom, it applies the claude-cli ClientHello
-// spec. The configured ClientHello is retried up to utlsHandshakeMaxAttempts
-// times (same spec, same fingerprint) to ride over transient proxy dial
-// timeouts, which are the dominant failure mode. After the retries are
-// exhausted:
-//   - disableFallback=true (claude HelloCustom strict profile): return the real
-//     handshake error so the request fails. The configured fingerprint is NEVER
-//     downgraded to Chrome; downgrading would leak that this is not real
-//     claude-cli and defeat the anti-correlation guarantee.
-//   - disableFallback=false (e.g. the codex Chrome-like profile): fall back to
-//     the Chrome-like ClientHello so connectivity is preserved.
+// configured ClientHello is HelloCustom, it applies the claude-cli or codex-rs
+// ClientHello spec (selected by customSpecID). The configured ClientHello is
+// retried up to utlsHandshakeMaxAttempts times (same spec, same fingerprint) to
+// ride over transient proxy dial timeouts, which are the dominant failure mode.
+// After the retries are exhausted:
+//   - disableFallback=true (the claude-cli and codex-rs HelloCustom strict
+//     profiles): return the real handshake error so the request fails. The
+//     configured fingerprint is NEVER downgraded to Chrome; downgrading would
+//     leak that this is not the real client (claude-cli / codex-rs) and defeat
+//     the anti-correlation guarantee.
+//   - disableFallback=false (non-strict callers): fall back to the Chrome-like
+//     ClientHello so connectivity is preserved.
 func (t *utlsRoundTripper) dialTLSContext(ctx context.Context, network, addr string) (net.Conn, error) {
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
@@ -188,18 +220,18 @@ func (t *utlsRoundTripper) dialTLSContext(ctx context.Context, network, addr str
 	}
 
 	fallbackHello := tls.HelloChrome_133
-	// If the configured ClientHello already IS the Chrome-like preset (codex
-	// default), there is nothing to downgrade to: return the error directly.
+	// If the configured ClientHello already IS the Chrome-like preset, there is
+	// nothing to downgrade to: return the error directly.
 	if t.clientHello.Str() == fallbackHello.Str() {
 		return nil, err
 	}
 	if t.disableFallback {
-		// Strict mode (claude HelloCustom): surface the failure instead of
-		// downgrading. The configured fingerprint is preserved or nothing.
-		// fallbackCount stays 0; record this as a hard failure so the runtime
-		// state reflects "claude enforced, did not downgrade".
+		// Strict mode (claude-cli or codex-rs HelloCustom): surface the failure
+		// instead of downgrading. The configured fingerprint is preserved or
+		// nothing. fallbackCount stays 0; record this as a hard failure so the
+		// runtime state reflects "strict profile enforced, did not downgrade".
 		atomic.AddInt64(&t.hardFailCount, 1)
-		log.Warnf("utls: claude HelloCustom handshake failed for %s after %d attempt(s); request failing without downgrade to preserve fingerprint (%v)", host, utlsHandshakeMaxAttempts, err)
+		log.Warnf("utls: strict HelloCustom handshake failed for %s after %d attempt(s); request failing without downgrade to preserve fingerprint (%v)", host, utlsHandshakeMaxAttempts, err)
 		return nil, err
 	}
 	// Connectivity-first mode (non-claude): make the silent downgrade
@@ -281,6 +313,13 @@ func (t *utlsRoundTripper) handshake(ctx context.Context, host, addr string, cli
 // http/1.1 only, so the fallback path also speaks HTTP/1.1 cleanly.
 func (t *utlsRoundTripper) clientHelloSpec(clientHelloID tls.ClientHelloID) (*tls.ClientHelloSpec, error) {
 	if clientHelloID.Str() == tls.HelloCustom.Str() {
+		// Both the claude-cli and codex-rs profiles use HelloCustom, so the
+		// ClientHelloID cannot disambiguate them; dispatch on the configured
+		// customSpecID. Only the codex outbound path sets it; every other
+		// HelloCustom caller falls through to the claude-cli spec unchanged.
+		if t.customSpecID == codexRustlsClientHelloProfileID {
+			return newCodexRustlsClientHelloSpec()
+		}
 		return newClaudeCLIClientHelloSpec()
 	}
 	spec, err := tls.UTLSIdToSpec(clientHelloID)
@@ -476,6 +515,96 @@ func newClaudeCLIClientHelloSpec() (*tls.ClientHelloSpec, error) {
 	}, nil
 }
 
+// newCodexRustlsClientHelloSpec builds the uTLS ClientHelloSpec that replicates
+// the real codex-rs (Rust/rustls) ClientHello captured from codex-rs 0.140.0,
+// targeting JA3 e4d448cdfe06dc1243c1eb026c74ac9a (stable across multiple
+// captures). It is deliberately TLS1.2-only and minimal:
+//
+//   - TLSVersMin/Max are pinned to VersionTLS12. Because no
+//     SupportedVersionsExtension is listed, uTLS keeps client_version at 0x0303
+//     and emits NO supported_versions extension (TLS1.3 is never advertised).
+//   - 22 ordered cipher suites starting with the SCSV (0x00ff). The empty
+//     renegotiation info is carried as the SCSV cipher, NOT as a
+//     renegotiation_info(0xff01) extension, matching the capture.
+//   - exactly 7 ordered extensions: server_name(0), supported_groups(10),
+//     ec_point_formats(11), signature_algorithms(13), status_request(5),
+//     SCT(18), extended_master_secret(23).
+//   - supported_groups are secp256r1/secp384r1/secp521r1 only (NO x25519).
+//   - NO GREASE, NO ALPN(16), NO key_share(51), NO psk_key_exchange_modes(45),
+//     NO session_ticket(35), NO padding(21). Listing any of those, or a
+//     SupportedVersionsExtension, would make uTLS emit extra fields and break
+//     the JA3 match, so they are intentionally absent.
+//
+// The capture was taken against 127.0.0.1 WITH SNI, so the target JA3 already
+// includes extension 0 (server_name); the SNI value is filled from
+// tls.Config.ServerName by ApplyPreset for real-host handshakes.
+func newCodexRustlsClientHelloSpec() (*tls.ClientHelloSpec, error) {
+	return &tls.ClientHelloSpec{
+		// TLS1.2 only: pin both bounds so uTLS does not default to advertising
+		// TLS1.3 via a supported_versions extension.
+		TLSVersMin: tls.VersionTLS12,
+		TLSVersMax: tls.VersionTLS12,
+		// 有序 cipher suites，对应真实 codex-rs 抓样（首位为 SCSV 0x00ff）。
+		// JA3 ciphers: 255-49196-49195-49188-49187-49162-49161-49160-49200-49199-49192-49191-49172-49171-49170-157-156-61-60-53-47-10
+		CipherSuites: []uint16{
+			tls.FAKE_TLS_EMPTY_RENEGOTIATION_INFO_SCSV,           // 0x00ff (SCSV)
+			tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,          // 0xc02c
+			tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,          // 0xc02b
+			tls.DISABLED_TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA384, // 0xc024
+			tls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256,          // 0xc023
+			tls.TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA,             // 0xc00a
+			tls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA,             // 0xc009
+			tls.FAKE_TLS_ECDHE_ECDSA_WITH_3DES_EDE_CBC_SHA,       // 0xc008
+			tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,            // 0xc030
+			tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,            // 0xc02f
+			tls.DISABLED_TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA384,   // 0xc028
+			tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256,            // 0xc027
+			tls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,               // 0xc014
+			tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,               // 0xc013
+			tls.TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA,              // 0xc012
+			tls.TLS_RSA_WITH_AES_256_GCM_SHA384,                  // 0x009d
+			tls.TLS_RSA_WITH_AES_128_GCM_SHA256,                  // 0x009c
+			tls.DISABLED_TLS_RSA_WITH_AES_256_CBC_SHA256,         // 0x003d
+			tls.TLS_RSA_WITH_AES_128_CBC_SHA256,                  // 0x003c
+			tls.TLS_RSA_WITH_AES_256_CBC_SHA,                     // 0x0035
+			tls.TLS_RSA_WITH_AES_128_CBC_SHA,                     // 0x002f
+			tls.TLS_RSA_WITH_3DES_EDE_CBC_SHA,                    // 0x000a
+		},
+		CompressionMethods: []byte{0x00}, // null
+		Extensions: []tls.TLSExtension{
+			// 有序扩展：0,10,11,13,5,18,23（与真实 codex-rs 抓样一致）。
+			// 1. server_name (0x0000 / 0): SNI 值由 ApplyPreset 从 ServerName 填充。
+			&tls.SNIExtension{},
+			// 2. supported_groups (0x000a / 10): secp256r1, secp384r1, secp521r1
+			//    （无 x25519）。
+			&tls.SupportedCurvesExtension{Curves: []tls.CurveID{
+				tls.CurveP256, // 23 (0x17)
+				tls.CurveP384, // 24 (0x18)
+				tls.CurveP521, // 25 (0x19)
+			}},
+			// 3. ec_point_formats (0x000b / 11): uncompressed
+			&tls.SupportedPointsExtension{SupportedPoints: []uint8{0x00}},
+			// 4. signature_algorithms (0x000d / 13)
+			&tls.SignatureAlgorithmsExtension{SupportedSignatureAlgorithms: []tls.SignatureScheme{
+				tls.PKCS1WithSHA256,        // 0x0401
+				tls.PKCS1WithSHA1,          // 0x0201
+				tls.PKCS1WithSHA384,        // 0x0501
+				tls.PKCS1WithSHA512,        // 0x0601
+				tls.ECDSAWithP256AndSHA256, // 0x0403
+				tls.ECDSAWithSHA1,          // 0x0203
+				tls.ECDSAWithP384AndSHA384, // 0x0503
+				tls.ECDSAWithP521AndSHA512, // 0x0603
+			}},
+			// 5. status_request / OCSP (0x0005 / 5)
+			&tls.StatusRequestExtension{},
+			// 6. signed_certificate_timestamp / SCT (0x0012 / 18)
+			&tls.SCTExtension{},
+			// 7. extended_master_secret (0x0017 / 23)
+			&tls.ExtendedMasterSecretExtension{},
+		},
+	}, nil
+}
+
 // utlsProtectedHosts contains the hosts that should use the utls replicated TLS
 // fingerprint to match the claimed client identity on protected upstreams.
 var utlsProtectedHosts = map[string]struct{}{
@@ -499,14 +628,17 @@ func (f *fallbackRoundTripper) RoundTrip(req *http.Request) (*http.Response, err
 	return f.fallback.RoundTrip(req)
 }
 
-// NewUtlsHTTPClient creates an HTTP client using a Chrome-like uTLS preset for
-// protected API hosts. This is a project-managed preset, not an official Claude
-// Code TLS fingerprint or provider-edge parity claim. Its only production
-// caller is the codex executor (chatgpt.com); the claude->anthropic default
-// outbound path replicates the claude-cli ClientHello separately via the
-// core-managed runtime transport profile. Falls back to the standard transport
-// for non-HTTPS requests. A round tripper injected via the
-// "cliproxy.roundtripper" context value is honored when no explicit proxy is set.
+// NewUtlsHTTPClient creates an HTTP client that replicates the real codex-rs
+// (rustls) ClientHello for protected API hosts. This is a project-managed
+// fingerprint, not an official provider-edge parity claim. Its only production
+// caller is the codex executor (chatgpt.com), so the default profile is the
+// codex-rs HelloCustom profile and runs in no-downgrade (strict) mode: a failed
+// handshake fails the request rather than downgrading to a Chrome133 ClientHello
+// that would mismatch the codex-rs UA. The claude->anthropic default outbound
+// path replicates the claude-cli ClientHello separately via the core-managed
+// runtime transport profile. Falls back to the standard transport for non-HTTPS
+// requests. A round tripper injected via the "cliproxy.roundtripper" context
+// value is honored when no explicit proxy is set.
 func NewUtlsHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, timeout time.Duration) *http.Client {
 	return NewUtlsHTTPClientForProfile(ctx, cfg, auth, timeout, utlsHTTPClientDefaultProfileID)
 }
@@ -518,23 +650,36 @@ func NewUtlsRoundTripperForProfile(proxyURL string, profileID string) http.Round
 		clientHello, _ = resolveClaudeClientHelloID(claudeCLIClientHelloProfileID)
 	}
 	var utlsRT *utlsRoundTripper
-	if isClaudeStrictHelloCustomProfile(profileID) {
-		// The claude strong-fingerprint HelloCustom profile must NEVER downgrade
-		// to the Chrome-like fallback: a downgrade would change the outbound
-		// fingerprint away from real claude-cli and leak that this is a proxy,
-		// defeating the anti-correlation guarantee. Build it in strict mode so a
-		// failed handshake (after retries) returns an error instead of falling
-		// back to Chrome. This only affects the claude HelloCustom path; the
-		// codex Chrome-like default (NewUtlsHTTPClient*) keeps the
-		// connectivity-first fallback.
+	if profileRequiresNoDowngrade(profileID) {
+		// The claude strong-fingerprint HelloCustom profile AND the codex-rs
+		// HelloCustom profile must NEVER downgrade to the Chrome-like fallback: a
+		// downgrade would change the outbound TLS fingerprint to Chrome133 while
+		// the UA still claims claude-cli / codex-rs, leaking that this is a proxy
+		// and defeating the anti-correlation guarantee. Build it in strict mode so
+		// a failed handshake (after retries) returns an error instead of falling
+		// back to Chrome. Profiles outside this set keep the connectivity-first
+		// fallback.
 		utlsRT = newStrictUtlsRoundTripper(proxyURL, clientHello)
 	} else {
 		utlsRT = newUtlsRoundTripper(proxyURL, clientHello)
 	}
+	utlsRT.customSpecID = codexCustomSpecID(profileID)
 	return &fallbackRoundTripper{
 		utls:     utlsRT,
 		fallback: standardTransportForProxy(proxyURL),
 	}
+}
+
+// codexCustomSpecID returns the customSpecID a round tripper should use for the
+// given profile. It only recognizes the codex-rs HelloCustom profile; every
+// other profile (claude HelloCustom, Chrome presets, etc.) returns "" so the
+// HelloCustom path keeps building the claude-cli spec, leaving claude outbound
+// completely unaffected.
+func codexCustomSpecID(profileID string) string {
+	if strings.EqualFold(strings.TrimSpace(profileID), codexRustlsClientHelloProfileID) {
+		return codexRustlsClientHelloProfileID
+	}
+	return ""
 }
 
 // isClaudeStrictHelloCustomProfile reports whether the profile is the claude
@@ -551,6 +696,29 @@ func isClaudeStrictHelloCustomProfile(profileID string) bool {
 	}
 }
 
+// isCodexNoDowngradeProfile reports whether the profile is the codex-rs
+// HelloCustom profile (codex_rustls_native_v1) that must also never downgrade to
+// the Chrome-like fallback. The codex-rs ClientHello is paired with a codex-rs
+// User-Agent; downgrading to a Chrome133 ClientHello while still sending the
+// codex-rs UA would re-create exactly the UA/TLS mismatch this profile exists to
+// eliminate. Like the claude predicate it is keyed on the profile identity, not
+// the resolved ClientHelloID (both custom profiles resolve to HelloCustom).
+func isCodexNoDowngradeProfile(profileID string) bool {
+	return strings.EqualFold(strings.TrimSpace(profileID), codexRustlsClientHelloProfileID)
+}
+
+// profileRequiresNoDowngrade reports whether the profile must run in strict
+// (fail-closed) mode: a failed configured handshake returns an error instead of
+// silently downgrading to the Chrome-like ClientHello. This covers BOTH the
+// claude strong-fingerprint HelloCustom profile and the codex-rs HelloCustom
+// profile, because in both cases the outbound User-Agent identifies a specific
+// client and a downgraded Chrome133 TLS fingerprint would leak the proxy by
+// mismatching that UA. Profiles outside this set keep the connectivity-first
+// fallback. Request failure is preferred over a mismatched (leaked) fingerprint.
+func profileRequiresNoDowngrade(profileID string) bool {
+	return isClaudeStrictHelloCustomProfile(profileID) || isCodexNoDowngradeProfile(profileID)
+}
+
 func NewUtlsHTTPClientForProfile(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, timeout time.Duration, profileID string) *http.Client {
 	var proxyURL string
 	if auth != nil {
@@ -560,8 +728,15 @@ func NewUtlsHTTPClientForProfile(ctx context.Context, cfg *config.Config, auth *
 		proxyURL = strings.TrimSpace(cfg.ProxyURL)
 	}
 
+	// effectiveProfileID is the profile actually used to resolve the
+	// ClientHelloID. When the requested profile is unknown it falls back to the
+	// codex-facing default, so the customSpecID must track that same fallback;
+	// otherwise an unknown profile would resolve to the codex HelloCustom ID but
+	// build the claude-cli spec, leaking the wrong fingerprint.
+	effectiveProfileID := profileID
 	clientHello, ok := resolveClaudeClientHelloID(profileID)
 	if !ok {
+		effectiveProfileID = utlsHTTPClientDefaultProfileID
 		clientHello, _ = resolveClaudeClientHelloID(utlsHTTPClientDefaultProfileID)
 	}
 
@@ -570,7 +745,20 @@ func NewUtlsHTTPClientForProfile(ctx context.Context, cfg *config.Config, auth *
 		ctxRoundTripper, _ = ctx.Value("cliproxy.roundtripper").(http.RoundTripper)
 	}
 
-	var utlsRT http.RoundTripper = newUtlsRoundTripper(proxyURL, clientHello)
+	baseUtlsRT := newUtlsRoundTripper(proxyURL, clientHello)
+	baseUtlsRT.customSpecID = codexCustomSpecID(effectiveProfileID)
+	if profileRequiresNoDowngrade(effectiveProfileID) {
+		// fail-closed (no-downgrade) for strong-fingerprint profiles. This is the
+		// production codex path (4 codex executor call sites pass
+		// CodexRustlsClientHelloProfileID): if the codex-rs HelloCustom handshake
+		// fails after retries, return the error rather than serving a Chrome133
+		// ClientHello under a codex-rs UA. Request failure is preferred over
+		// leaking a mismatched fingerprint. The claude HelloCustom profile is also
+		// covered here for consistency, though claude outbound uses the
+		// core-managed transport profile rather than this client.
+		baseUtlsRT.disableFallback = true
+	}
+	var utlsRT http.RoundTripper = baseUtlsRT
 	standardTransport := standardTransportForProxy(proxyURL)
 	if proxyURL == "" && ctxRoundTripper != nil {
 		utlsRT = ctxRoundTripper
@@ -608,6 +796,10 @@ func resolveClaudeClientHelloID(profileID string) (tls.ClientHelloID, bool) {
 	switch strings.ToLower(strings.TrimSpace(profileID)) {
 	case claudeCLIClientHelloProfileID, "claude_cli_clienthello", "claude_node_openssl_v1":
 		// P1.5: replicate real claude-cli (Node/OpenSSL) ClientHello.
+		return tls.HelloCustom, true
+	case codexRustlsClientHelloProfileID:
+		// Replicate real codex-rs (Rust/rustls) ClientHello. Also HelloCustom;
+		// the spec is selected by utlsRoundTripper.customSpecID, not the ID.
 		return tls.HelloCustom, true
 	case "claude_utls_chrome_133", "claude_chrome_like_mac_v3", "chrome_133":
 		return tls.HelloChrome_133, true

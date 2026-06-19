@@ -808,7 +808,9 @@ func (e *CodexExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth
 	if err := e.PrepareRequest(httpReq, auth); err != nil {
 		return nil, err
 	}
-	httpClient := helps.NewUtlsHTTPClient(ctx, e.cfg, auth, 0)
+	// codex 出站显式选用 codex-rs(rustls) ClientHello 指纹，不依赖包默认常量，
+	// 避免与 claude 的 Chrome133 路径耦合（替换此前错套的 Chrome133）。
+	httpClient := helps.NewUtlsHTTPClientForProfile(ctx, e.cfg, auth, 0, helps.CodexRustlsClientHelloProfileID)
 	return httpClient.Do(httpReq)
 }
 
@@ -887,7 +889,9 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		AuthType:  authType,
 		AuthValue: authValue,
 	})
-	httpClient := helps.NewUtlsHTTPClient(ctx, e.cfg, auth, 0)
+	// codex 出站显式选用 codex-rs(rustls) ClientHello 指纹，不依赖包默认常量，
+	// 避免与 claude 的 Chrome133 路径耦合（替换此前错套的 Chrome133）。
+	httpClient := helps.NewUtlsHTTPClientForProfile(ctx, e.cfg, auth, 0, helps.CodexRustlsClientHelloProfileID)
 	httpClient = reporter.TrackHTTPClient(httpClient)
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
@@ -1054,7 +1058,9 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 		AuthType:  authType,
 		AuthValue: authValue,
 	})
-	httpClient := helps.NewUtlsHTTPClient(ctx, e.cfg, auth, 0)
+	// codex 出站显式选用 codex-rs(rustls) ClientHello 指纹，不依赖包默认常量，
+	// 避免与 claude 的 Chrome133 路径耦合（替换此前错套的 Chrome133）。
+	httpClient := helps.NewUtlsHTTPClientForProfile(ctx, e.cfg, auth, 0, helps.CodexRustlsClientHelloProfileID)
 	httpClient = reporter.TrackHTTPClient(httpClient)
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
@@ -1165,7 +1171,9 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		AuthValue: authValue,
 	})
 
-	httpClient := helps.NewUtlsHTTPClient(ctx, e.cfg, auth, 0)
+	// codex 出站显式选用 codex-rs(rustls) ClientHello 指纹，不依赖包默认常量，
+	// 避免与 claude 的 Chrome133 路径耦合（替换此前错套的 Chrome133）。
+	httpClient := helps.NewUtlsHTTPClientForProfile(ctx, e.cfg, auth, 0, helps.CodexRustlsClientHelloProfileID)
 	httpClient = reporter.TrackHTTPClient(httpClient)
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {

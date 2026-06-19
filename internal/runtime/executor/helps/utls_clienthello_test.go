@@ -59,23 +59,25 @@ func TestClaudeCLIClientHelloProfileResolvesToCustom(t *testing.T) {
 }
 
 // TestNewUtlsHTTPClientDefaultDoesNotUseClaudeCLIClientHello guards the B1
-// regression: NewUtlsHTTPClient is consumed only by the codex executor
-// (chatgpt.com), so its default must stay the Chrome-like preset and must NOT
-// emit the claude-cli (HelloCustom) ClientHello, which would misrepresent the
-// codex client.
+// regression plus the Wave10-C fix: NewUtlsHTTPClient is consumed only by the
+// codex executor (chatgpt.com), so its default must NOT emit the claude-cli
+// (HelloCustom + claude spec) ClientHello (which would misrepresent codex), and
+// it must now replicate the real codex-rs (rustls) ClientHello via the codex
+// profile (HelloCustom + codex spec), replacing the previously misconfigured
+// Chrome133 preset. The claude-vs-codex spec is disambiguated by customSpecID.
 func TestNewUtlsHTTPClientDefaultDoesNotUseClaudeCLIClientHello(t *testing.T) {
 	if utlsHTTPClientDefaultProfileID == claudeCLIClientHelloProfileID {
 		t.Fatalf("codex-facing NewUtlsHTTPClient default = %q, must not be the claude-cli ClientHello profile", utlsHTTPClientDefaultProfileID)
+	}
+	if utlsHTTPClientDefaultProfileID != codexRustlsClientHelloProfileID {
+		t.Fatalf("codex-facing default = %q, want codex-rs profile %q", utlsHTTPClientDefaultProfileID, codexRustlsClientHelloProfileID)
 	}
 	got, ok := resolveClaudeClientHelloID(utlsHTTPClientDefaultProfileID)
 	if !ok {
 		t.Fatalf("codex-facing default profile %q does not resolve", utlsHTTPClientDefaultProfileID)
 	}
-	if got.Str() == tls.HelloCustom.Str() {
-		t.Fatalf("codex-facing default profile %q resolves to HelloCustom (claude-cli); want Chrome-like", utlsHTTPClientDefaultProfileID)
-	}
-	if got.Str() != tls.HelloChrome_133.Str() {
-		t.Fatalf("codex-facing default ClientHello = %s, want HelloChrome_133", got.Str())
+	if got.Str() != tls.HelloCustom.Str() {
+		t.Fatalf("codex-facing default ClientHello = %s, want HelloCustom (codex-rs)", got.Str())
 	}
 
 	client := NewUtlsHTTPClient(context.Background(), nil, nil, 0)
@@ -87,8 +89,10 @@ func TestNewUtlsHTTPClientDefaultDoesNotUseClaudeCLIClientHello(t *testing.T) {
 	if !ok {
 		t.Fatalf("NewUtlsHTTPClient protected transport = %T, want *utlsRoundTripper", fallback.utls)
 	}
-	if utlsRT.clientHello.Str() == tls.HelloCustom.Str() {
-		t.Fatalf("NewUtlsHTTPClient ClientHello = HelloCustom (claude-cli); codex outbound must not use it")
+	// codex outbound must select the codex-rs spec, never fall through to the
+	// claude-cli spec (empty customSpecID).
+	if utlsRT.customSpecID != codexRustlsClientHelloProfileID {
+		t.Fatalf("NewUtlsHTTPClient customSpecID = %q, want codex-rs %q (must not use claude-cli spec)", utlsRT.customSpecID, codexRustlsClientHelloProfileID)
 	}
 }
 
