@@ -27,6 +27,9 @@ const (
 	DefaultErrorLogsMaxFiles     = 10
 	DefaultLogsCompressAfterDays = 7
 	DefaultLogsDeleteAfterDays   = 30
+	// DefaultLoggingDisplayTimezoneOffsetHours 是「人看的日志」默认显示时区偏移（小时）。
+	// 默认 8 = UTC+8（东八区）。只影响日志显示/解析，不影响出站时间字段。
+	DefaultLoggingDisplayTimezoneOffsetHours = 8
 )
 
 const (
@@ -89,6 +92,13 @@ type Config struct {
 	// LogsDeleteAfterDays deletes log files older than this many days.
 	// Applies to both plain `.log` files and compressed `.log.gz` files. Set to 0 to disable age-based deletion.
 	LogsDeleteAfterDays int `yaml:"logs-delete-after-days" json:"logs-delete-after-days"`
+
+	// LoggingDisplayTimezoneOffsetHours 控制「人看的后端日志」时间显示时区偏移（小时）。
+	// 默认 8 表示 UTC+8（东八区），方便本地运维直接读懂日志时间。它只影响日志显示
+	// 与后台日志查询解析，不影响任何出站到上游的时间字段（Kiro 注入的
+	// `[Context: Current time is ...]` 等指纹时间保持原口径，绝不经过本设置）。
+	// 取值范围 [-12, 14]；超出范围会被钳回默认值 8。
+	LoggingDisplayTimezoneOffsetHours int `yaml:"logging-display-timezone-offset-hours" json:"logging-display-timezone-offset-hours"`
 
 	// ErrorLogsMaxFiles limits the number of error log files retained when request logging is disabled.
 	// When exceeded, the oldest error log files are deleted. Default is 10. Set to 0 to disable cleanup.
@@ -795,6 +805,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.LogsMaxTotalSizeMB = 0
 	cfg.LogsCompressAfterDays = DefaultLogsCompressAfterDays
 	cfg.LogsDeleteAfterDays = DefaultLogsDeleteAfterDays
+	cfg.LoggingDisplayTimezoneOffsetHours = DefaultLoggingDisplayTimezoneOffsetHours
 	cfg.ErrorLogsMaxFiles = DefaultErrorLogsMaxFiles
 	cfg.UsageStatisticsEnabled = false
 	cfg.RedisUsageQueueRetentionSeconds = 60
@@ -882,6 +893,11 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 
 	if cfg.LogsDeleteAfterDays < 0 {
 		cfg.LogsDeleteAfterDays = DefaultLogsDeleteAfterDays
+	}
+
+	// 显示时区偏移仅用于日志显示/解析；超出 [-12, 14] 视为非法，钳回默认 UTC+8。
+	if cfg.LoggingDisplayTimezoneOffsetHours < -12 || cfg.LoggingDisplayTimezoneOffsetHours > 14 {
+		cfg.LoggingDisplayTimezoneOffsetHours = DefaultLoggingDisplayTimezoneOffsetHours
 	}
 
 	if cfg.ErrorLogsMaxFiles < 0 {

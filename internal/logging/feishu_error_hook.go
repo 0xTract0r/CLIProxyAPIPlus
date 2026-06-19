@@ -176,7 +176,8 @@ func buildFeishuErrorAlertText(entry *log.Entry) string {
 	lines := []string{
 		"[CLIProxyAPI] error log",
 		fmt.Sprintf("level=%s", entry.Level.String()),
-		fmt.Sprintf("time=%s", timestamp.Format(time.RFC3339)),
+		// 飞书告警里给人看的时间，统一用显示时区（默认 UTC+8）。出站时间不经过这里。
+		fmt.Sprintf("time=%s", timestamp.In(DisplayLocation()).Format(time.RFC3339)),
 	}
 	if hostname, err := os.Hostname(); err == nil && strings.TrimSpace(hostname) != "" {
 		lines = append(lines, "host="+sanitizeAlertText(hostname, feishuErrorAlertMaxValueLen))

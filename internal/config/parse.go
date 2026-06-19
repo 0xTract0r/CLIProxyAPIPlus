@@ -21,6 +21,7 @@ func ParseConfigBytes(data []byte) (*Config, error) {
 	cfg.Host = "" // Default empty: binds to all interfaces (IPv4 + IPv6)
 	cfg.LoggingToFile = false
 	cfg.LogsMaxTotalSizeMB = 0
+	cfg.LoggingDisplayTimezoneOffsetHours = DefaultLoggingDisplayTimezoneOffsetHours
 	cfg.ErrorLogsMaxFiles = 10
 	cfg.UsageStatisticsEnabled = false
 	cfg.RedisUsageQueueRetentionSeconds = 60
@@ -60,6 +61,11 @@ func ParseConfigBytes(data []byte) (*Config, error) {
 
 	if cfg.ErrorLogsMaxFiles < 0 {
 		cfg.ErrorLogsMaxFiles = 10
+	}
+
+	// 显示时区偏移仅用于日志显示/解析；超出 [-12, 14] 钳回默认 UTC+8。
+	if cfg.LoggingDisplayTimezoneOffsetHours < -12 || cfg.LoggingDisplayTimezoneOffsetHours > 14 {
+		cfg.LoggingDisplayTimezoneOffsetHours = DefaultLoggingDisplayTimezoneOffsetHours
 	}
 
 	if cfg.RedisUsageQueueRetentionSeconds <= 0 {

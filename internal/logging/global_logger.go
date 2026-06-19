@@ -41,7 +41,9 @@ func (m *LogFormatter) Format(entry *log.Entry) ([]byte, error) {
 		buffer = &bytes.Buffer{}
 	}
 
-	timestamp := entry.Time.Format("2006-01-02 15:04:05")
+	// 人看的日志统一用显示时区（默认 UTC+8）。这是 logrus 标准日志 + gin access log
+	// 的统一格式化器，覆盖面最大。出站时间字段不经过这里。
+	timestamp := entry.Time.In(DisplayLocation()).Format("2006-01-02 15:04:05")
 	message := strings.TrimRight(entry.Message, "\r\n")
 
 	reqID := "--------"
@@ -148,6 +150,10 @@ func ResolveLogDirectory(cfg *config.Config) string {
 // for the logs directory.
 func ConfigureLogOutput(cfg *config.Config) error {
 	SetupBaseLogger()
+
+	// 应用「人看的日志」显示时区（默认 UTC+8，可由 config 覆盖）。
+	// 启动和配置热重载都会经过这里，因此两条路径都会生效。
+	ApplyDisplayTimezone(cfg)
 
 	writerMu.Lock()
 	defer writerMu.Unlock()

@@ -92,7 +92,8 @@ func (f *HomeAppLogForwarder) Fire(entry *log.Entry) error {
 	payload := homeAppLogPayload{
 		Line:      line,
 		Level:     entry.Level.String(),
-		Timestamp: entry.Time.Format(time.RFC3339Nano),
+		// 转发给 home 的人看日志时间，统一用显示时区（默认 UTC+8）。出站时间不经过这里。
+		Timestamp: entry.Time.In(DisplayLocation()).Format(time.RFC3339Nano),
 		RequestID: appLogRequestID(entry),
 	}
 	select {

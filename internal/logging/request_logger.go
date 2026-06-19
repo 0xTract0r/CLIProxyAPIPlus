@@ -762,8 +762,12 @@ func (l *FileRequestLogger) generateFilename(url string, requestID ...string) st
 	// Sanitize path for filename
 	sanitized := l.sanitizeForFilename(path)
 
-	// Add timestamp
-	timestamp := time.Now().Format("2006-01-02T150405")
+	// Add timestamp.
+	// 人看的 per-request 抓包日志文件名时间戳，统一用显示时区（默认 UTC+8）。
+	// 该格式（2006-01-02T150405，无分隔）仅作人看的可排序标签，全仓无任何代码反向
+	// 解析它（lumberjack 轮转文件名走 2006-01-02T15-04-05 另一套，不受影响），
+	// 因此切到 displayLoc 不存在读侧错位。出站时间字段不经过这里。
+	timestamp := time.Now().In(DisplayLocation()).Format("2006-01-02T150405")
 
 	// Use request ID if provided, otherwise use sequential ID
 	var idPart string
@@ -965,7 +969,7 @@ func writeRequestInfoWithBody(
 			return errWrite
 		}
 	}
-	if _, errWrite := io.WriteString(w, fmt.Sprintf("Timestamp: %s\n", timestamp.Format(time.RFC3339Nano))); errWrite != nil {
+	if _, errWrite := io.WriteString(w, fmt.Sprintf("Timestamp: %s\n", timestamp.In(DisplayLocation()).Format(time.RFC3339Nano))); errWrite != nil {
 		return errWrite
 	}
 	if errWrite := writeSectionSpacing(w, 1); errWrite != nil {
@@ -1136,7 +1140,7 @@ func writeAPISection(w io.Writer, sectionHeader string, sectionPrefix string, pa
 			return errWrite
 		}
 		if !timestamp.IsZero() {
-			if _, errWrite := io.WriteString(w, fmt.Sprintf("Timestamp: %s\n", timestamp.Format(time.RFC3339Nano))); errWrite != nil {
+			if _, errWrite := io.WriteString(w, fmt.Sprintf("Timestamp: %s\n", timestamp.In(DisplayLocation()).Format(time.RFC3339Nano))); errWrite != nil {
 				return errWrite
 			}
 		}
@@ -1164,7 +1168,7 @@ func writeAPISectionWithSource(w io.Writer, sectionHeader string, sectionPrefix 
 		return errWrite
 	}
 	if !timestamp.IsZero() {
-		if _, errWrite := io.WriteString(w, fmt.Sprintf("Timestamp: %s\n", timestamp.Format(time.RFC3339Nano))); errWrite != nil {
+		if _, errWrite := io.WriteString(w, fmt.Sprintf("Timestamp: %s\n", timestamp.In(DisplayLocation()).Format(time.RFC3339Nano))); errWrite != nil {
 			return errWrite
 		}
 	}
@@ -1535,7 +1539,8 @@ func (l *FileRequestLogger) formatRequestInfo(url, method string, headers map[st
 	if strings.TrimSpace(upstreamTransport) != "" {
 		content.WriteString(fmt.Sprintf("Upstream Transport: %s\n", upstreamTransport))
 	}
-	content.WriteString(fmt.Sprintf("Timestamp: %s\n", time.Now().Format(time.RFC3339Nano)))
+	// 人看的 request log 内容时间戳，统一用显示时区（默认 UTC+8）。出站时间不经过这里。
+	content.WriteString(fmt.Sprintf("Timestamp: %s\n", time.Now().In(DisplayLocation()).Format(time.RFC3339Nano)))
 	content.WriteString("\n")
 
 	content.WriteString("=== HEADERS ===\n")
