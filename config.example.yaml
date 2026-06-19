@@ -73,6 +73,13 @@ logs-compress-after-days: 7
 # Set to 0 to disable age-based deletion.
 logs-delete-after-days: 30
 
+# Timezone offset (hours) used ONLY for human-facing backend log display and
+# backend log query parsing. Default 8 = UTC+8. This never affects any outbound
+# time field sent upstream (Kiro's injected `[Context: Current time is ...]`
+# fingerprint time keeps its own basis and is unaffected). Valid range [-12, 14];
+# out-of-range values fall back to 8.
+logging-display-timezone-offset-hours: 8
+
 # Maximum number of error log files retained when request logging is disabled.
 # When exceeded, the oldest error log files are deleted. Default is 10. Set to 0 to disable cleanup.
 error-logs-max-files: 10
