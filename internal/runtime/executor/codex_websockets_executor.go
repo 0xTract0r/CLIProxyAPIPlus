@@ -209,6 +209,8 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	body, _ = sjson.DeleteBytes(body, "prompt_cache_retention")
 	body, _ = sjson.DeleteBytes(body, "safety_identifier")
 	body = normalizeCodexInstructions(body)
+	// fork(anticorr ⑦-codex): 无条件归一出站 body 里的真实 cwd/git/CODEX_HOME 路径。
+	body = helps.NormalizeCodexPaths(body, auth, apiKey)
 	if e.cfg != nil && e.cfg.DisableImageGeneration == config.DisableImageGenerationOff {
 		body = ensureImageGenerationTool(body, baseModel, auth)
 	}
@@ -424,6 +426,8 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	requestPath := helps.PayloadRequestPath(opts)
 	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", body, body, requestedModel, requestPath, opts.Headers)
 	body = normalizeCodexInstructions(body)
+	// fork(anticorr ⑦-codex): 无条件归一出站 body 里的真实 cwd/git/CODEX_HOME 路径。
+	body = helps.NormalizeCodexPaths(body, auth, apiKey)
 	if e.cfg != nil && e.cfg.DisableImageGeneration == config.DisableImageGenerationOff {
 		body = ensureImageGenerationTool(body, baseModel, auth)
 	}
@@ -875,6 +879,9 @@ func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *
 	ensureHeaderWithPriority(headers, ginHeaders, "x-codex-beta-features", cfgBetaFeatures, "")
 	misc.EnsureHeader(headers, ginHeaders, "x-codex-turn-state", "")
 	misc.EnsureHeader(headers, ginHeaders, "x-codex-turn-metadata", "")
+	// fork(anticorr ⑦-codex): 无条件归一 turn-metadata header 里的真实 cwd/git。
+	// ws 侧 header key 小写，helper 大小写不敏感；token 即 apiKey。
+	helps.NormalizeCodexTurnMetadataHeader(headers, "x-codex-turn-metadata", auth, token)
 	misc.EnsureHeader(headers, ginHeaders, "x-client-request-id", "")
 	misc.EnsureHeader(headers, ginHeaders, "x-responsesapi-include-timing-metrics", "")
 	if strings.TrimSpace(ginHeaders.Get("Version")) != "" {
