@@ -146,12 +146,12 @@ func TestClaudeStrictProfileWiredFromProfileID(t *testing.T) {
 	}
 }
 
-// TestCodexChromeProfileStillFallsBack verifies the no-downgrade change does not
-// leak into the codex / Chrome-native path: NewUtlsHTTPClient (codex's only
-// production caller, default Chrome-like profile) keeps disableFallback=false so
-// the connectivity-first behavior is unchanged. Because its configured
-// ClientHello already IS Chrome, a failure surfaces directly (nothing to
-// downgrade to), but it is NOT in strict mode.
+// TestCodexChromeProfileStillFallsBack verifies the no-downgrade (strict) change
+// does not leak into the codex path: NewUtlsHTTPClient (codex's only production
+// caller) keeps disableFallback=false so the connectivity-first behavior is
+// unchanged. After Wave10-C the codex default ClientHello is the codex-rs
+// HelloCustom (replacing the previously misconfigured Chrome133), but it must
+// stay NON-strict — the no-downgrade enforcement is claude-only.
 func TestCodexChromeProfileStillFallsBack(t *testing.T) {
 	t.Parallel()
 
@@ -165,10 +165,15 @@ func TestCodexChromeProfileStillFallsBack(t *testing.T) {
 		t.Fatalf("expected inner *utlsRoundTripper, got %T", fb.utls)
 	}
 	if inner.disableFallback {
-		t.Fatal("codex Chrome-like default must keep disableFallback=false (no-downgrade is claude-only)")
+		t.Fatal("codex default must keep disableFallback=false (no-downgrade is claude-only)")
 	}
-	if inner.configuredHello != utls.HelloChrome_133.Str() {
-		t.Fatalf("configuredHello = %q, want Chrome_133 %q (codex default profile unchanged)", inner.configuredHello, utls.HelloChrome_133.Str())
+	// codex default now resolves to the codex-rs HelloCustom + codex spec, not
+	// the strict claude-cli path and not Chrome133.
+	if inner.configuredHello != utls.HelloCustom.Str() {
+		t.Fatalf("configuredHello = %q, want HelloCustom %q (codex-rs default)", inner.configuredHello, utls.HelloCustom.Str())
+	}
+	if inner.customSpecID != codexRustlsClientHelloProfileID {
+		t.Fatalf("codex default customSpecID = %q, want codex-rs %q", inner.customSpecID, codexRustlsClientHelloProfileID)
 	}
 }
 
