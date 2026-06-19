@@ -509,6 +509,8 @@ func parseTimestamp(line string) int64 {
 	if len(line) < 19 {
 		return 0
 	}
+	// 日志行前缀形如 `[2026-06-19 13:02:35 +08:00] ...`，前 19 字符是
+	// `2006-01-02 15:04:05`，其后的 ` +08:00` 时区后缀仅给人看，不进入 candidate。
 	candidate := line[:19]
 	// 关键耦合：日志行前缀时间由 logging.LogFormatter 用 displayLoc（默认 UTC+8）写出，
 	// 这里必须用同一个 displayLoc 解析，否则后台日志查询的时间会按本机时区错位。
