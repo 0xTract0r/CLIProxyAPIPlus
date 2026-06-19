@@ -1562,8 +1562,15 @@ func applyCodexIdentityConfuseBody(cfg *config.Config, auth *cliproxyauth.Auth, 
 		state.promptCacheKey = codexIdentityConfuseUUID(auth.ID, "prompt-cache", promptCacheKey)
 		rawJSON, _ = sjson.SetBytes(rawJSON, "prompt_cache_key", state.promptCacheKey)
 	}
+	// fork(anticorr A-3): installation_id 缺省每账号稳定派生兜底。
+	// 旧逻辑仅当 body 已带 x-codex-installation-id 时才改写；客户端没传则字段缺失/空，
+	// 出站缺这个字段（与真实 codex 客户端不一致，且无法做到每账号稳定）。现在缺失/空时
+	// 用固定种子 "default" 按 auth.ID 派生兜底注入，保证同账号跨请求稳定、跨账号不同；
+	// 客户端有传时仍按原值派生，行为不变。
 	if installationID := strings.TrimSpace(gjson.GetBytes(userPayload, "client_metadata.x-codex-installation-id").String()); installationID != "" {
 		rawJSON, _ = sjson.SetBytes(rawJSON, "client_metadata.x-codex-installation-id", codexIdentityConfuseUUID(auth.ID, "installation", installationID))
+	} else {
+		rawJSON, _ = sjson.SetBytes(rawJSON, "client_metadata.x-codex-installation-id", codexIdentityConfuseUUID(auth.ID, "installation", "default"))
 	}
 	if turnMetadata := strings.TrimSpace(gjson.GetBytes(rawJSON, "client_metadata.x-codex-turn-metadata").String()); turnMetadata != "" {
 		rawJSON, _ = sjson.SetBytes(rawJSON, "client_metadata.x-codex-turn-metadata", applyCodexTurnMetadataIdentityConfuse(turnMetadata, &state))
@@ -1726,13 +1733,27 @@ func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, s
 			isAPIKey = true
 		}
 	}
-	if originator := strings.TrimSpace(ginHeaders.Get("Originator")); originator != "" {
-		r.Header.Set("Originator", originator)
-	} else if auth != nil && !isAPIKey && strings.TrimSpace(profile.Originator) != "" {
-		originator := strings.TrimSpace(profile.Originator)
-		r.Header.Set("Originator", originator)
-	} else if !isAPIKey {
-		r.Header.Set("Originator", helps.DefaultCodexManagedOriginator())
+	// fork(anticorr A-1): managed（非 api-key）codex 账号的 Originator 钉死。
+	// 旧逻辑无条件第一优先透传客户端 Originator，客户端可任意覆盖出站身份（伪造污染）。
+	// 现在对 managed 账号只接受白名单内的 first-party Originator（codex-tui /
+	// codex_cli_rs / codex_vscode / codex_exec / "Codex " 前缀），其余一律钉死为
+	// profile.Originator（无则 DefaultCodexManagedOriginator），不可被下游覆盖。
+	// api-key 账号沿用旧行为（透传客户端 Originator），不在本次加固范围内。
+	clientOriginator := strings.TrimSpace(ginHeaders.Get("Originator"))
+	if isAPIKey {
+		if clientOriginator != "" {
+			r.Header.Set("Originator", clientOriginator)
+		}
+	} else {
+		pinnedOriginator := strings.TrimSpace(profile.Originator)
+		if pinnedOriginator == "" {
+			pinnedOriginator = helps.DefaultCodexManagedOriginator()
+		}
+		// 只接受白名单内的客户端值；其余覆盖为 managed 钉死值。
+		if clientOriginator != "" && helps.IsFirstPartyCodexOriginator(clientOriginator) {
+			pinnedOriginator = clientOriginator
+		}
+		r.Header.Set("Originator", pinnedOriginator)
 	}
 	if !isAPIKey {
 		if auth != nil && auth.Metadata != nil {

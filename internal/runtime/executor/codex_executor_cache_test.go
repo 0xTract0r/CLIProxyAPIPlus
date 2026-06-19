@@ -3,12 +3,14 @@ package executor
 import (
 	"context"
 	"io"
+	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
@@ -236,6 +238,101 @@ func TestApplyCodexHeadersUsesAccountHeaderForOAuth(t *testing.T) {
 
 	if got := httpReq.Header.Get("Chatgpt-Account-Id"); got != "acct-1" {
 		t.Fatalf("Chatgpt-Account-Id = %q, want acct-1", got)
+	}
+}
+
+// newCodexHeadersTestRequest 构造一个携带指定客户端 header（含 Originator）的 gin 上下文
+// 请求，供 A-1 Originator 钉死测试驱动 applyCodexHeaders。
+func newCodexHeadersTestRequest(t *testing.T, clientHeaders map[string]string) *http.Request {
+	t.Helper()
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginCtx.Request = httptest.NewRequest("POST", "/v1/responses", nil)
+	for name, value := range clientHeaders {
+		ginCtx.Request.Header.Set(name, value)
+	}
+	ctx := context.WithValue(context.Background(), "gin", ginCtx)
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", "https://example.com/responses", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	return httpReq
+}
+
+// TestApplyCodexHeaders_ManagedOriginatorPinnedAgainstForgedClientValue 覆盖 A-1：
+// managed（非 api-key）账号下，客户端传入的非法 Originator 必须被钉死覆盖为 managed 值，
+// 不能透传污染出站身份。
+func TestApplyCodexHeaders_ManagedOriginatorPinnedAgainstForgedClientValue(t *testing.T) {
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", ID: "managed-codex-auth", Provider: "codex"}
+	httpReq := newCodexHeadersTestRequest(t, map[string]string{"Originator": "evil-client"})
+
+	applyCodexHeaders(httpReq, auth, "oauth-token", true, nil)
+
+	if got := httpReq.Header.Get("Originator"); got == "evil-client" {
+		t.Fatalf("forged client Originator %q leaked outbound, want managed value pinned", got)
+	}
+	if got := httpReq.Header.Get("Originator"); got != helps.DefaultCodexManagedOriginator() {
+		t.Fatalf("Originator = %q, want managed default %q", got, helps.DefaultCodexManagedOriginator())
+	}
+}
+
+// TestApplyCodexHeaders_ManagedOriginatorAcceptsWhitelistedClientValue 覆盖 A-1 白名单：
+// managed 账号下，客户端传入的合法 first-party Originator 允许保留。
+func TestApplyCodexHeaders_ManagedOriginatorAcceptsWhitelistedClientValue(t *testing.T) {
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", ID: "managed-codex-auth-wl", Provider: "codex"}
+	httpReq := newCodexHeadersTestRequest(t, map[string]string{"Originator": "codex_cli_rs"})
+
+	applyCodexHeaders(httpReq, auth, "oauth-token", true, nil)
+
+	if got := httpReq.Header.Get("Originator"); got != "codex_cli_rs" {
+		t.Fatalf("whitelisted client Originator = %q, want codex_cli_rs preserved", got)
+	}
+}
+
+// TestApplyCodexHeaders_ApiKeyOriginatorStillPassthrough 覆盖 A-1 边界：api-key 账号
+// 不在本次加固范围内，仍按旧行为透传客户端 Originator。
+func TestApplyCodexHeaders_ApiKeyOriginatorStillPassthrough(t *testing.T) {
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", ID: "apikey-codex-auth", Provider: "codex",
+		Attributes: map[string]string{"api_key": "k"},
+	}
+	httpReq := newCodexHeadersTestRequest(t, map[string]string{"Originator": "evil-client"})
+
+	applyCodexHeaders(httpReq, auth, "oauth-token", true, nil)
+
+	if got := httpReq.Header.Get("Originator"); got != "evil-client" {
+		t.Fatalf("api-key Originator = %q, want passthrough evil-client (unchanged behavior)", got)
+	}
+}
+
+// TestApplyCodexIdentityConfuseBody_DerivesInstallationIDWhenMissing 覆盖 A-3：
+// 客户端 body 没带 x-codex-installation-id 时，必须用每账号稳定派生兜底注入，
+// 且同账号跨请求稳定、跨账号不同。
+func TestApplyCodexIdentityConfuseBody_DerivesInstallationIDWhenMissing(t *testing.T) {
+	cfg := &config.Config{
+		Routing: config.RoutingConfig{Strategy: "fill-first"},
+		Codex:   config.CodexConfig{IdentityConfuse: true},
+	}
+	authA := &cliproxyauth.Auth{ProxyURL: "direct", ID: "auth-A", Provider: "codex"}
+	authB := &cliproxyauth.Auth{ProxyURL: "direct", ID: "auth-B", Provider: "codex"}
+	body := []byte(`{"model":"gpt-5-codex","client_metadata":{}}`)
+
+	outA, _ := applyCodexIdentityConfuseBody(cfg, authA, body, body)
+	gotA := gjson.GetBytes(outA, "client_metadata.x-codex-installation-id").String()
+	wantA := codexIdentityConfuseUUID("auth-A", "installation", "default")
+	if gotA != wantA {
+		t.Fatalf("derived installation id = %q, want %q", gotA, wantA)
+	}
+
+	// 同账号再来一次，结果稳定。
+	outA2, _ := applyCodexIdentityConfuseBody(cfg, authA, body, body)
+	if got := gjson.GetBytes(outA2, "client_metadata.x-codex-installation-id").String(); got != wantA {
+		t.Fatalf("installation id not stable across requests: %q vs %q", got, wantA)
+	}
+
+	// 跨账号不同。
+	outB, _ := applyCodexIdentityConfuseBody(cfg, authB, body, body)
+	if got := gjson.GetBytes(outB, "client_metadata.x-codex-installation-id").String(); got == wantA {
+		t.Fatalf("installation id collides across accounts: %q", got)
 	}
 }
 
