@@ -12,20 +12,19 @@ type SDKConfig struct {
 	// DisableImageGeneration controls whether the built-in image_generation tool is injected/allowed
 	// on the Codex chat/responses path.
 	//
-	// This fork strips the tool by default (mode "chat") as a conservative default. Codex image
-	// generation requires a non-free account and an upstream that still accepts the built-in tool for
-	// the requested model; when that does not hold the request fails (a 400 image_generation_user_error
-	// such as "The model 'gpt-image-2' does not exist." has been observed). That 400 is classified
-	// request-level in conductor.go so it does not rotate accounts. This switch is independent of the
-	// /v1/images/* auth eligibility, which separately rejects free-tier Codex accounts (disallow_free_auth).
+	// The default is Off (config "false"): the built-in image_generation tool is injected on the Codex
+	// chat/responses path, matching upstream. Image generation still only succeeds for non-free accounts
+	// on an upstream that accepts the tool for the requested model; free-tier Codex accounts are skipped
+	// on injection and separately rejected on /v1/images/* via disallow_free_auth, and any resulting 400
+	// image_generation_user_error is classified request-level in conductor.go so it does not rotate accounts.
 	//
 	// Supported values:
-	//   - false (default): in this fork the image_generation tool is stripped from request
-	//     payloads before forwarding and never injected; if removing it empties the tools
-	//     array, the tools field is dropped to avoid empty-tools upstream errors.
+	//   - false (default): inject the built-in image_generation tool on the Codex chat/responses path
+	//     (free-tier and "spark" auths are still skipped); /v1/images/generations and /v1/images/edits
+	//     stay enabled.
 	//   - true: image_generation is disabled everywhere. The server stops injecting it, removes it from request payloads,
 	//     and returns 404 for /v1/images/generations and /v1/images/edits.
-	//   - "chat": disable image_generation injection for all non-images endpoints (e.g. /v1/responses, /v1/chat/completions),
+	//   - "chat": strip image_generation injection for all non-images endpoints (e.g. /v1/responses, /v1/chat/completions),
 	//     while keeping /v1/images/generations and /v1/images/edits enabled and preserving image_generation there.
 	DisableImageGeneration DisableImageGenerationMode `yaml:"disable-image-generation" json:"disable-image-generation"`
 

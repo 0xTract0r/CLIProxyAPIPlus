@@ -2,6 +2,8 @@ package config
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"gopkg.in/yaml.v3"
@@ -72,5 +74,25 @@ func TestDisableImageGenerationMode_UnmarshalJSON(t *testing.T) {
 		if v != DisableImageGenerationChat {
 			t.Fatalf("chat => %v, want %v", v, DisableImageGenerationChat)
 		}
+	}
+}
+
+// When disable-image-generation is omitted, the default is Off (inject), matching
+// upstream — image generation is enabled by default. Free-tier/spark auths are still
+// skipped at injection time, and /v1/images independently rejects free auths.
+func TestLoadConfigOptional_DisableImageGenerationDefaultsToOff(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(configPath, []byte("debug: false\n"), 0o600); err != nil {
+		t.Fatalf("failed to write config: %v", err)
+	}
+
+	cfg, err := LoadConfigOptional(configPath, false)
+	if err != nil {
+		t.Fatalf("LoadConfigOptional() error = %v", err)
+	}
+
+	if cfg.DisableImageGeneration != DisableImageGenerationOff {
+		t.Fatalf("default DisableImageGeneration = %v, want %v (Off)", cfg.DisableImageGeneration, DisableImageGenerationOff)
 	}
 }

@@ -826,7 +826,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.QuotaSnapshotRefresh.Jitter = DefaultQuotaSnapshotRefreshJitterString
 	cfg.QuotaSnapshotRefresh.StartupCatchUp = &quotaSnapshotRefreshStartupCatchUp
 	cfg.QuotaSnapshotRefresh.StartupMaxStaleness = DefaultQuotaSnapshotRefreshStartupMaxStalenessString
-	cfg.DisableImageGeneration = DisableImageGenerationChat
+	cfg.DisableImageGeneration = DisableImageGenerationOff
 	cfg.Pprof.Enable = false
 	cfg.Pprof.Addr = DefaultPprofAddr
 	cfg.AmpCode.RestrictManagementToLocalhost = false // Default to false: API key auth is sufficient
