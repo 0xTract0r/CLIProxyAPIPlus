@@ -2062,11 +2062,10 @@ func stripImageGenerationTool(body []byte) []byte {
 //	DisableImageGenerationAll  (config "true")  → strip the tool.
 //	DisableImageGenerationChat (config "chat")  → strip on this Codex (chat-style) path.
 //
-// This fork keeps stripping by default: the loaded config default is "chat" (see
-// config defaults), so 201 — which serves unverified-org ChatGPT accounts — strips
-// the Codex image_generation tool without any configuration while /v1/images endpoints
-// stay available. Only an explicit disable-image-generation: false (Off) re-injects.
-// nil cfg also strips, defensively.
+// The loaded config default is Off (see config defaults), so by default the Codex
+// image_generation tool is injected on this chat-style path (matching upstream), while
+// free-plan and "spark" auths are still skipped inside ensureImageGenerationTool. Set
+// disable-image-generation: chat or true to strip. nil cfg strips, defensively.
 func applyImageGenerationPolicy(cfg *config.Config, body []byte, baseModel string, auth *cliproxyauth.Auth) []byte {
 	if cfg != nil && cfg.DisableImageGeneration == config.DisableImageGenerationOff {
 		return ensureImageGenerationTool(body, baseModel, auth)
