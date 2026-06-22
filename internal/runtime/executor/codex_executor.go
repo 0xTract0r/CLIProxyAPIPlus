@@ -1522,7 +1522,11 @@ type codexIdentityConfuseState struct {
 	authID                 string
 	originalPromptCacheKey string
 	promptCacheKey         string
-	turnIDs                []codexIdentityReplacement
+	// installationID 是本请求派生出的混淆 installation_id（与 body
+	// client_metadata.x-codex-installation-id 同一个派生值）。turn-metadata
+	// header/body 副本里的 installation_id 都用它改写，保证处处一致、且不泄漏真机值。
+	installationID string
+	turnIDs        []codexIdentityReplacement
 }
 
 type codexIdentityReplacement struct {
@@ -1560,7 +1564,10 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Form
 		return nil, nil, codexIdentityConfuseState{}, err
 	}
 	if cache.ID != "" {
-		httpReq.Header.Set("Session_id", cache.ID)
+		// fork(anticorr): 对齐真实 codex 出站头名 session-id（小写连字符），
+		// 而非旧的 Session_id（下划线）。Header.Set 会规范化成 Session-Id，
+		// 故用 case-preserved 直写 map key。
+		setHeaderCasePreserved(httpReq.Header, "session-id", cache.ID)
 	}
 	return httpReq, rawJSON, identityState, nil
 }
@@ -1582,10 +1589,11 @@ func applyCodexIdentityConfuseBody(cfg *config.Config, auth *cliproxyauth.Auth, 
 	// 用固定种子 "default" 按 auth.ID 派生兜底注入，保证同账号跨请求稳定、跨账号不同；
 	// 客户端有传时仍按原值派生，行为不变。
 	if installationID := strings.TrimSpace(gjson.GetBytes(userPayload, "client_metadata.x-codex-installation-id").String()); installationID != "" {
-		rawJSON, _ = sjson.SetBytes(rawJSON, "client_metadata.x-codex-installation-id", codexIdentityConfuseUUID(auth.ID, "installation", installationID))
+		state.installationID = codexIdentityConfuseUUID(auth.ID, "installation", installationID)
 	} else {
-		rawJSON, _ = sjson.SetBytes(rawJSON, "client_metadata.x-codex-installation-id", codexIdentityConfuseUUID(auth.ID, "installation", "default"))
+		state.installationID = codexIdentityConfuseUUID(auth.ID, "installation", "default")
 	}
+	rawJSON, _ = sjson.SetBytes(rawJSON, "client_metadata.x-codex-installation-id", state.installationID)
 	if turnMetadata := strings.TrimSpace(gjson.GetBytes(rawJSON, "client_metadata.x-codex-turn-metadata").String()); turnMetadata != "" {
 		rawJSON, _ = sjson.SetBytes(rawJSON, "client_metadata.x-codex-turn-metadata", applyCodexTurnMetadataIdentityConfuse(turnMetadata, &state))
 	}
@@ -1613,12 +1621,15 @@ func applyCodexIdentityConfuseHeaders(headers http.Header, state *codexIdentityC
 		return
 	}
 
-	setCodexSessionHeaderCasePreserved(headers, "Session_id", state.promptCacheKey)
+	// fork(anticorr): 出站头名对齐真实 codex —— session-id / thread-id 均为
+	// 小写连字符（旧实现是 Session_id 下划线 + Thread-Id 大写）。Header.Set 会
+	// 规范化成 Session-Id / Thread-Id，故对这两个头用 case-preserved 直写 map key。
+	setCodexLowerSessionHeader(headers, state.promptCacheKey)
 	if headerValueCaseInsensitive(headers, "Conversation_id") != "" {
 		setHeaderCasePreserved(headers, "Conversation_id", state.promptCacheKey)
 	}
 	headers.Set("X-Client-Request-Id", state.promptCacheKey)
-	headers.Set("Thread-Id", state.promptCacheKey)
+	setHeaderCasePreserved(headers, "thread-id", state.promptCacheKey)
 	headers.Set("X-Codex-Window-Id", state.promptCacheKey+":0")
 }
 
@@ -1626,6 +1637,12 @@ func applyCodexTurnMetadataIdentityConfuse(rawTurnMetadata string, state *codexI
 	updatedTurnMetadata := rawTurnMetadata
 	if state == nil || !state.enabled {
 		return updatedTurnMetadata
+	}
+	// installation_id 与 client_metadata.x-codex-installation-id 用同一个派生值改写，
+	// 避免 turn-metadata（header + body 副本）里残留真机 installation_id 或与
+	// client_metadata 那个混淆值发散。
+	if state.installationID != "" && gjson.Get(updatedTurnMetadata, "installation_id").Exists() {
+		updatedTurnMetadata, _ = sjson.Set(updatedTurnMetadata, "installation_id", state.installationID)
 	}
 	if state.promptCacheKey != "" && gjson.Get(rawTurnMetadata, "prompt_cache_key").Exists() {
 		updatedTurnMetadata, _ = sjson.Set(updatedTurnMetadata, "prompt_cache_key", state.promptCacheKey)
@@ -1716,14 +1733,10 @@ func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, s
 	// 与 body #2 复用同一组派生值，保证 header/body 跨位置一致。token 即 apiKey。
 	helps.NormalizeCodexTurnMetadataHeader(r.Header, "X-Codex-Turn-Metadata", auth, token)
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Client-Request-Id", "")
-	if strings.TrimSpace(ginHeaders.Get("Version")) != "" {
-		misc.EnsureHeader(r.Header, ginHeaders, "Version", "")
-	} else if auth != nil && strings.TrimSpace(profile.Version) != "" {
-		version := strings.TrimSpace(profile.Version)
-		r.Header.Set("Version", version)
-	} else {
-		misc.EnsureHeader(r.Header, ginHeaders, "Version", "")
-	}
+	// fork(anticorr): 真实 codex 出站没有独立 Version 头，版本只体现在 UA 里。
+	// 旧实现会从客户端或 device-profile 注入 Version，是 CPA 独有指纹，删除（含
+	// 客户端透传值），不再回写。
+	deleteHeaderCaseInsensitive(r.Header, "Version")
 	if auth != nil && strings.TrimSpace(profile.UserAgent) != "" {
 		userAgent := strings.TrimSpace(profile.UserAgent)
 		r.Header.Set("User-Agent", userAgent)
@@ -1734,7 +1747,9 @@ func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, s
 	applyCodexCommunityDesktopHeaders(r.Header, profile)
 
 	if strings.Contains(r.Header.Get("User-Agent"), "Mac OS") {
-		misc.EnsureHeader(r.Header, ginHeaders, "Session_id", uuid.NewString())
+		// fork(anticorr): 出站 session 头名对齐真实 codex 的 session-id（小写连字符）。
+		// 缺失时优先沿用客户端值，否则生成 uuid。已有任意大小写变体则不覆盖。
+		ensureCodexLowerSessionHeader(r.Header, ginHeaders, uuid.NewString())
 	}
 
 	if stream {
@@ -1742,7 +1757,8 @@ func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, s
 	} else {
 		r.Header.Set("Accept", "application/json")
 	}
-	r.Header.Set("Connection", "Keep-Alive")
+	// fork(anticorr): 真实 codex 出站不带 Connection 头（由 Go transport 自行管理
+	// keep-alive），旧实现写死 Connection: Keep-Alive 是 CPA 独有指纹，删除。
 
 	isAPIKey := false
 	if auth != nil && auth.Attributes != nil {
@@ -1808,6 +1824,10 @@ func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, s
 	// （CLI snapshot 不含 sec-ch-ua），无法挡住。这里在 CLI 画像（profile 非 Desktop）下
 	// 显式删除，确保出站不带 sec-ch-ua 系列，与 CLI body/TLS 自洽。
 	stripCodexDesktopOnlyHeadersForCLIProfile(r.Header, profile)
+	// fork(anticorr): 兜底再删一次 Version —— 真实 codex 出站无独立 Version 头。
+	// 上面的自定义 header（header:Version 属性）可能在 snapshot 恢复后又写回 Version，
+	// 这里最终统一剥离，确保出站任何来源的 Version 都不上线。
+	deleteHeaderCaseInsensitive(r.Header, "Version")
 }
 
 // stripCodexDesktopOnlyHeadersForCLIProfile 在 CLI 画像下删除 Desktop 专属指纹头。

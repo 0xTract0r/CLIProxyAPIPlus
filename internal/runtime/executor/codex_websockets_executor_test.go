@@ -206,8 +206,9 @@ func TestApplyCodexWebsocketHeadersPassesThroughClientIdentityHeaders(t *testing
 	if got := headers.Get("Originator"); got != "Codex Desktop" {
 		t.Fatalf("Originator = %s, want %s", got, "Codex Desktop")
 	}
-	if got := headers.Get("Version"); got != "0.115.0-alpha.27" {
-		t.Fatalf("Version = %s, want %s", got, "0.115.0-alpha.27")
+	// fork(anticorr): 真实 codex 出站无独立 Version 头，客户端透传的 Version 也被删除。
+	if got := headers.Get("Version"); got != "" {
+		t.Fatalf("Version = %q, want empty (出站不带 Version 头)", got)
 	}
 	if got := headers.Get("X-Codex-Turn-Metadata"); got != `{"turn_id":"turn-1"}` {
 		t.Fatalf("X-Codex-Turn-Metadata = %s, want %s", got, `{"turn_id":"turn-1"}`)
@@ -358,8 +359,12 @@ func TestApplyCodexPromptCacheHeadersSetsSessionIDAndLegacyConversation(t *testi
 
 	_, headers := applyCodexPromptCacheHeaders("openai-response", req, []byte(`{"model":"gpt-5-codex"}`))
 
-	if got := headers["session_id"]; len(got) != 1 || got[0] != "cache-1" {
-		t.Fatalf("session_id = %#v, want [cache-1]", got)
+	// 出站 session 头名对齐真实 codex 的 session-id（小写连字符）。
+	if got := headers["session-id"]; len(got) != 1 || got[0] != "cache-1" {
+		t.Fatalf("session-id = %#v, want [cache-1]", got)
+	}
+	if got := headers["session_id"]; len(got) != 0 {
+		t.Fatalf("session_id（legacy 下划线）= %#v, want empty", got)
 	}
 	if got := headers.Get("Session-Id"); got != "" {
 		t.Fatalf("Session-Id = %s, want empty", got)
@@ -396,11 +401,11 @@ func TestApplyCodexPromptCacheHeadersClaudeUsesClaudeCodeSessionID(t *testing.T)
 	if secondKey != firstKey {
 		t.Fatalf("same Claude Code session_id produced different websocket prompt_cache_key: first=%q second=%q", firstKey, secondKey)
 	}
-	if got := firstHeaders["session_id"]; len(got) != 1 || got[0] != firstKey {
-		t.Fatalf("first session_id = %#v, want [%q]", got, firstKey)
+	if got := firstHeaders["session-id"]; len(got) != 1 || got[0] != firstKey {
+		t.Fatalf("first session-id = %#v, want [%q]", got, firstKey)
 	}
-	if got := secondHeaders["session_id"]; len(got) != 1 || got[0] != firstKey {
-		t.Fatalf("second session_id = %#v, want [%q]", got, firstKey)
+	if got := secondHeaders["session-id"]; len(got) != 1 || got[0] != firstKey {
+		t.Fatalf("second session-id = %#v, want [%q]", got, firstKey)
 	}
 }
 
@@ -414,6 +419,9 @@ func TestApplyCodexPromptCacheHeadersClaudeRejectsBareUserID(t *testing.T) {
 
 	if got := gjson.GetBytes(body, "prompt_cache_key").String(); got != "" {
 		t.Fatalf("bare metadata.user_id must not create websocket prompt_cache_key, got %q; body=%s", got, string(body))
+	}
+	if got := headers["session-id"]; len(got) != 0 {
+		t.Fatalf("bare metadata.user_id must not create websocket session-id, got %#v", got)
 	}
 	if got := headers["session_id"]; len(got) != 0 {
 		t.Fatalf("bare metadata.user_id must not create websocket session_id, got %#v", got)
@@ -451,8 +459,12 @@ func TestApplyCodexWebsocketHeadersIdentityConfuseRemapsPromptCacheKey(t *testin
 	if gotKey := gjson.GetBytes(body, "prompt_cache_key").String(); gotKey != expectedPromptCacheKey {
 		t.Fatalf("prompt_cache_key = %q, want %q", gotKey, expectedPromptCacheKey)
 	}
-	if gotSession := headers["session_id"]; len(gotSession) != 1 || gotSession[0] != expectedPromptCacheKey {
-		t.Fatalf("session_id = %#v, want [%q]", gotSession, expectedPromptCacheKey)
+	// session-id / thread-id 均为真实 codex 的小写连字符头名（直写 map key）。
+	if gotSession := headers["session-id"]; len(gotSession) != 1 || gotSession[0] != expectedPromptCacheKey {
+		t.Fatalf("session-id = %#v, want [%q]", gotSession, expectedPromptCacheKey)
+	}
+	if gotUnderscore := headers["session_id"]; len(gotUnderscore) != 0 {
+		t.Fatalf("session_id（legacy 下划线）= %#v, want empty", gotUnderscore)
 	}
 	if gotCanonicalSession := headers.Get("Session-Id"); gotCanonicalSession != "" {
 		t.Fatalf("Session-Id = %q, want empty", gotCanonicalSession)
@@ -460,8 +472,11 @@ func TestApplyCodexWebsocketHeadersIdentityConfuseRemapsPromptCacheKey(t *testin
 	if gotRequestID := headers.Get("X-Client-Request-Id"); gotRequestID != expectedPromptCacheKey {
 		t.Fatalf("X-Client-Request-Id = %q, want %q", gotRequestID, expectedPromptCacheKey)
 	}
-	if gotThreadID := headers.Get("Thread-Id"); gotThreadID != expectedPromptCacheKey {
-		t.Fatalf("Thread-Id = %q, want %q", gotThreadID, expectedPromptCacheKey)
+	if gotThreadID := headers["thread-id"]; len(gotThreadID) != 1 || gotThreadID[0] != expectedPromptCacheKey {
+		t.Fatalf("thread-id = %#v, want [%q]", gotThreadID, expectedPromptCacheKey)
+	}
+	if gotCanonicalThread := headers.Get("Thread-Id"); gotCanonicalThread != "" {
+		t.Fatalf("Thread-Id（规范化大写）= %q, want empty", gotCanonicalThread)
 	}
 	if gotConversation := headers.Get("Conversation_id"); gotConversation != expectedPromptCacheKey {
 		t.Fatalf("Conversation_id = %q, want %q", gotConversation, expectedPromptCacheKey)
@@ -665,8 +680,9 @@ func TestApplyCodexHeadersPassesThroughClientIdentityHeaders(t *testing.T) {
 	if got := req.Header.Get("Originator"); got != "Codex Desktop" {
 		t.Fatalf("Originator = %s, want %s", got, "Codex Desktop")
 	}
-	if got := req.Header.Get("Version"); got != "0.115.0-alpha.27" {
-		t.Fatalf("Version = %s, want %s", got, "0.115.0-alpha.27")
+	// fork(anticorr): 真实 codex 出站无独立 Version 头，客户端透传的 Version 被删除。
+	if got := req.Header.Get("Version"); got != "" {
+		t.Fatalf("Version = %q, want empty (出站不带 Version 头)", got)
 	}
 	if got := req.Header.Get("X-Codex-Turn-Metadata"); got != `{"turn_id":"turn-1"}` {
 		t.Fatalf("X-Codex-Turn-Metadata = %s, want %s", got, `{"turn_id":"turn-1"}`)
@@ -734,8 +750,10 @@ func TestApplyCodexWebsocketHeaders_StructuredAccountSettingsKeepsManagedHeaders
 
 	headers := applyCodexWebsocketHeaders(ctx, http.Header{}, auth, "", nil)
 
-	if got := headers.Get("Version"); got != "0.120.0" {
-		t.Fatalf("Version = %s, want %s", got, "0.120.0")
+	// fork(anticorr): 真实 codex 出站无独立 Version 头。无论来自 gin 透传还是
+	// header:Version 自定义属性，最终都被剥离；X-Trace-Id 等非 Version 自定义头不受影响。
+	if got := headers.Get("Version"); got != "" {
+		t.Fatalf("Version = %q, want empty (出站不带 Version 头)", got)
 	}
 	if got := headers.Get("X-Trace-Id"); got != "trace-456" {
 		t.Fatalf("X-Trace-Id = %s, want %s", got, "trace-456")

@@ -50,8 +50,13 @@ func TestCodexExecutorCacheHelper_OpenAIChatCompletions_StablePromptCacheKeyFrom
 	if gotConversation := httpReq.Header.Get("Conversation_id"); gotConversation != "" {
 		t.Fatalf("Conversation_id = %q, want empty", gotConversation)
 	}
-	if gotSession := httpReq.Header["Session_id"]; len(gotSession) != 1 || gotSession[0] != expectedKey {
-		t.Fatalf("Session_id = %#v, want [%q]", gotSession, expectedKey)
+	// 出站 session 头名对齐真实 codex 的 session-id（小写连字符），旧的 Session_id /
+	// 规范化 Session-Id 均不应出现。
+	if gotSession := httpReq.Header["session-id"]; len(gotSession) != 1 || gotSession[0] != expectedKey {
+		t.Fatalf("session-id = %#v, want [%q]", gotSession, expectedKey)
+	}
+	if gotUnderscore := httpReq.Header["Session_id"]; len(gotUnderscore) != 0 {
+		t.Fatalf("Session_id = %#v, want empty (legacy underscore 已弃用)", gotUnderscore)
 	}
 	if gotCanonicalSession := httpReq.Header.Get("Session-Id"); gotCanonicalSession != "" {
 		t.Fatalf("Session-Id = %q, want empty", gotCanonicalSession)
@@ -118,11 +123,11 @@ func TestCodexExecutorCacheHelper_ClaudeUsesClaudeCodeSessionID(t *testing.T) {
 	if secondKey != firstKey {
 		t.Fatalf("same Claude Code session_id produced different prompt_cache_key: first=%q second=%q", firstKey, secondKey)
 	}
-	if gotSession := firstHTTPReq.Header["Session_id"]; len(gotSession) != 1 || gotSession[0] != firstKey {
-		t.Fatalf("first Session_id = %#v, want [%q]", gotSession, firstKey)
+	if gotSession := firstHTTPReq.Header["session-id"]; len(gotSession) != 1 || gotSession[0] != firstKey {
+		t.Fatalf("first session-id = %#v, want [%q]", gotSession, firstKey)
 	}
-	if gotSession := secondHTTPReq.Header["Session_id"]; len(gotSession) != 1 || gotSession[0] != firstKey {
-		t.Fatalf("second Session_id = %#v, want [%q]", gotSession, firstKey)
+	if gotSession := secondHTTPReq.Header["session-id"]; len(gotSession) != 1 || gotSession[0] != firstKey {
+		t.Fatalf("second session-id = %#v, want [%q]", gotSession, firstKey)
 	}
 }
 
@@ -144,6 +149,9 @@ func TestCodexExecutorCacheHelper_ClaudeRejectsBareUserID(t *testing.T) {
 	}
 	if got := gjson.GetBytes(body, "prompt_cache_key").String(); got != "" {
 		t.Fatalf("bare metadata.user_id must not create prompt_cache_key, got %q; body=%s", got, string(body))
+	}
+	if got := httpReq.Header["session-id"]; len(got) != 0 {
+		t.Fatalf("bare metadata.user_id must not create session-id, got %#v", got)
 	}
 	if got := httpReq.Header["Session_id"]; len(got) != 0 {
 		t.Fatalf("bare metadata.user_id must not create Session_id, got %#v", got)
@@ -202,13 +210,22 @@ func TestCodexExecutorCacheHelper_IdentityConfuseRemapsBodyAndHeaders(t *testing
 	if gotWindowID := gjson.GetBytes(body, "client_metadata.x-codex-window-id").String(); gotWindowID != expectedPromptCacheKey+":0" {
 		t.Fatalf("client_metadata.x-codex-window-id = %q, want %q", gotWindowID, expectedPromptCacheKey+":0")
 	}
-	if gotHeader := httpReq.Header["Session_id"]; len(gotHeader) != 1 || gotHeader[0] != expectedPromptCacheKey {
-		t.Fatalf("Session_id = %#v, want [%q]", gotHeader, expectedPromptCacheKey)
+	// session-id / thread-id 均为真实 codex 的小写连字符头名（直写 map key，
+	// Header.Get 取不到）。
+	if gotHeader := httpReq.Header["session-id"]; len(gotHeader) != 1 || gotHeader[0] != expectedPromptCacheKey {
+		t.Fatalf("session-id = %#v, want [%q]", gotHeader, expectedPromptCacheKey)
 	}
-	for _, headerName := range []string{"X-Client-Request-Id", "Thread-Id"} {
-		if gotHeader := httpReq.Header.Get(headerName); gotHeader != expectedPromptCacheKey {
-			t.Fatalf("%s = %q, want %q", headerName, gotHeader, expectedPromptCacheKey)
-		}
+	if gotHeader := httpReq.Header["thread-id"]; len(gotHeader) != 1 || gotHeader[0] != expectedPromptCacheKey {
+		t.Fatalf("thread-id = %#v, want [%q]", gotHeader, expectedPromptCacheKey)
+	}
+	if gotHeader := httpReq.Header.Get("X-Client-Request-Id"); gotHeader != expectedPromptCacheKey {
+		t.Fatalf("X-Client-Request-Id = %q, want %q", gotHeader, expectedPromptCacheKey)
+	}
+	if gotCanonicalThread := httpReq.Header.Get("Thread-Id"); gotCanonicalThread != "" {
+		t.Fatalf("Thread-Id（规范化大写）= %q, want empty", gotCanonicalThread)
+	}
+	if gotUnderscore := httpReq.Header["Session_id"]; len(gotUnderscore) != 0 {
+		t.Fatalf("Session_id = %#v, want empty (legacy underscore 已弃用)", gotUnderscore)
 	}
 	if gotCanonicalSession := httpReq.Header.Get("Session-Id"); gotCanonicalSession != "" {
 		t.Fatalf("Session-Id = %q, want empty", gotCanonicalSession)
@@ -239,6 +256,93 @@ func TestApplyCodexHeadersUsesAccountHeaderForOAuth(t *testing.T) {
 
 	if got := httpReq.Header.Get("Chatgpt-Account-Id"); got != "acct-1" {
 		t.Fatalf("Chatgpt-Account-Id = %q, want acct-1", got)
+	}
+}
+
+// TestCodexIdentityConfuse_InstallationIDConsistentAcrossTurnMetadata 验证 anticorr 项 1：
+// turn-metadata（header + body client_metadata 副本）里的 installation_id 必须被改写成
+// 与 client_metadata.x-codex-installation-id 同一个派生值，真机 installation_id 完全消失，
+// 且 header 与 body 两处一致。
+func TestCodexIdentityConfuse_InstallationIDConsistentAcrossTurnMetadata(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginCtx.Request = httptest.NewRequest("POST", "/v1/responses", nil)
+	// header turn-metadata 携带真机 installation_id。
+	realInstallationID := "6a9aea66-9c05-4a26-8c27-038f82fabaed"
+	ginCtx.Request.Header.Set("X-Codex-Turn-Metadata",
+		`{"installation_id":"`+realInstallationID+`","prompt_cache_key":"cache-1","turn_id":"turn-1"}`)
+	ctx := context.WithValue(context.Background(), "gin", ginCtx)
+
+	executor := &CodexExecutor{cfg: &config.Config{
+		Routing: config.RoutingConfig{Strategy: "fill-first"},
+		Codex:   config.CodexConfig{IdentityConfuse: true},
+	}}
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", ID: "auth-1", Provider: "codex"}
+	// body client_metadata 副本也带同一个真机 installation_id + turn-metadata 副本。
+	rawJSON := []byte(`{"model":"gpt-5-codex","stream":true,"client_metadata":{"x-codex-installation-id":"` + realInstallationID + `","x-codex-turn-metadata":"{\"installation_id\":\"` + realInstallationID + `\",\"prompt_cache_key\":\"cache-1\",\"turn_id\":\"turn-1\"}"}}`)
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5-codex",
+		Payload: []byte(`{"model":"gpt-5-codex","prompt_cache_key":"cache-1","client_metadata":{"x-codex-installation-id":"` + realInstallationID + `"}}`),
+	}
+
+	httpReq, body, identityState, err := executor.cacheHelper(ctx, sdktranslator.FromString("openai-response"), "https://example.com/responses", auth, req, req.Payload, rawJSON)
+	if err != nil {
+		t.Fatalf("cacheHelper error: %v", err)
+	}
+	applyCodexHeaders(httpReq, auth, "oauth-token", true, executor.cfg)
+	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
+
+	expectedInstallationID := codexIdentityConfuseUUID("auth-1", "installation", realInstallationID)
+
+	// client_metadata.x-codex-installation-id。
+	if got := gjson.GetBytes(body, "client_metadata.x-codex-installation-id").String(); got != expectedInstallationID {
+		t.Fatalf("client_metadata.x-codex-installation-id = %q, want %q", got, expectedInstallationID)
+	}
+	// body client_metadata.x-codex-turn-metadata 里的 installation_id。
+	bodyTM := gjson.GetBytes(body, "client_metadata.x-codex-turn-metadata").String()
+	if got := gjson.Get(bodyTM, "installation_id").String(); got != expectedInstallationID {
+		t.Fatalf("body turn-metadata.installation_id = %q, want %q", got, expectedInstallationID)
+	}
+	// header X-Codex-Turn-Metadata 里的 installation_id。
+	headerTM := httpReq.Header.Get("X-Codex-Turn-Metadata")
+	if got := gjson.Get(headerTM, "installation_id").String(); got != expectedInstallationID {
+		t.Fatalf("header turn-metadata.installation_id = %q, want %q", got, expectedInstallationID)
+	}
+	// 真机 installation_id 在 body / header 任何位置都不应残留。
+	if strings.Contains(string(body), realInstallationID) {
+		t.Fatalf("real installation_id 仍残留于 body:\n%s", body)
+	}
+	if strings.Contains(headerTM, realInstallationID) {
+		t.Fatalf("real installation_id 仍残留于 header turn-metadata: %s", headerTM)
+	}
+	// 派生值是 UUID 形态，不等于真机值。
+	if expectedInstallationID == realInstallationID {
+		t.Fatalf("派生 installation_id 等于真机值，未混淆")
+	}
+}
+
+// TestApplyCodexHeaders_NoConnectionNoVersionKeepsAccountID 验证 anticorr 项 2：
+// 出站不带 Connection 头、不带 Version 头（含客户端透传的 Version），但保留
+// Chatgpt-Account-Id（CPA→上游路由账号必需）。
+func TestApplyCodexHeaders_NoConnectionNoVersionKeepsAccountID(t *testing.T) {
+	httpReq := newCodexHeadersTestRequest(t, map[string]string{
+		"Version": "0.140.0",
+	})
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
+		Provider: "codex",
+		Metadata: map[string]any{"account_id": "acct-1"},
+	}
+
+	applyCodexHeaders(httpReq, auth, "oauth-token", true, nil)
+
+	if got := httpReq.Header.Values("Connection"); len(got) != 0 {
+		t.Fatalf("Connection = %#v, want absent（真实 codex 不发 Connection）", got)
+	}
+	if got := httpReq.Header.Get("Version"); got != "" {
+		t.Fatalf("Version = %q, want empty（真实 codex 无独立 Version 头）", got)
+	}
+	if got := httpReq.Header.Get("Chatgpt-Account-Id"); got != "acct-1" {
+		t.Fatalf("Chatgpt-Account-Id = %q, want acct-1（路由账号必需，保留）", got)
 	}
 }
 

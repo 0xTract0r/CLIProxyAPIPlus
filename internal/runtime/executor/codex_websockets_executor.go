@@ -851,7 +851,9 @@ func applyCodexPromptCacheHeaders(from sdktranslator.Format, req cliproxyexecuto
 
 	if cache.ID != "" {
 		rawJSON, _ = sjson.SetBytes(rawJSON, "prompt_cache_key", cache.ID)
-		setHeaderCasePreserved(headers, "session_id", cache.ID)
+		// fork(anticorr): 出站 session 头名对齐真实 codex 的 session-id（小写连字符），
+		// 而非旧的 session_id（下划线）。
+		setCodexLowerSessionHeader(headers, cache.ID)
 		headers.Set("Conversation_id", cache.ID)
 	}
 
@@ -884,14 +886,9 @@ func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *
 	helps.NormalizeCodexTurnMetadataHeader(headers, "x-codex-turn-metadata", auth, token)
 	misc.EnsureHeader(headers, ginHeaders, "x-client-request-id", "")
 	misc.EnsureHeader(headers, ginHeaders, "x-responsesapi-include-timing-metrics", "")
-	if strings.TrimSpace(ginHeaders.Get("Version")) != "" {
-		misc.EnsureHeader(headers, ginHeaders, "Version", "")
-	} else if auth != nil && strings.TrimSpace(profile.Version) != "" {
-		version := strings.TrimSpace(profile.Version)
-		headers.Set("Version", version)
-	} else {
-		misc.EnsureHeader(headers, ginHeaders, "Version", "")
-	}
+	// fork(anticorr): 真实 codex 出站没有独立 Version 头，版本只体现在 UA。删除任何
+	// 客户端透传或 device-profile 注入的 Version（CPA 独有指纹）。
+	deleteHeaderCaseInsensitive(headers, "Version")
 	applyCodexCommunityDesktopHeaders(headers, profile)
 
 	betaHeader := strings.TrimSpace(headers.Get("OpenAI-Beta"))
@@ -903,7 +900,8 @@ func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *
 	}
 	headers.Set("OpenAI-Beta", betaHeader)
 	if strings.Contains(headers.Get("User-Agent"), "Mac OS") {
-		misc.EnsureHeader(headers, ginHeaders, "Session_id", uuid.NewString())
+		// fork(anticorr): 出站 session 头名对齐真实 codex 的 session-id（小写连字符）。
+		ensureCodexLowerSessionHeader(headers, ginHeaders, uuid.NewString())
 	}
 
 	isAPIKey := codexAuthUsesAPIKey(auth)
@@ -955,6 +953,9 @@ func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *
 	if cliproxyauth.HasStructuredAccountSettingsMetadata(auth) {
 		applyManagedHeaderSnapshot(headers, managedHeaderSnapshot)
 	}
+	// fork(anticorr): 兜底再删一次 Version —— 真实 codex 出站无独立 Version 头。
+	// header:Version 自定义属性可能在 snapshot 恢复后又写回，这里最终统一剥离。
+	deleteHeaderCaseInsensitive(headers, "Version")
 
 	return headers
 }
@@ -977,7 +978,7 @@ func ensureCodexWebsocketSessionHeader(target http.Header, source http.Header, f
 }
 
 func codexSessionHeaderValue(headers http.Header) string {
-	for _, key := range []string{"Session-Id", "Session_id", "session_id"} {
+	for _, key := range []string{"session-id", "Session-Id", "Session_id", "session_id"} {
 		if value := strings.TrimSpace(headerValueCaseInsensitive(headers, key)); value != "" {
 			return value
 		}
@@ -1062,6 +1063,47 @@ func setCodexSessionHeaderCasePreserved(headers http.Header, fallbackKey string,
 func codexSessionHeaderKey(key string) bool {
 	normalized := strings.ToLower(strings.TrimSpace(key))
 	return normalized == "session_id" || normalized == "session-id"
+}
+
+// setCodexLowerSessionHeader 把出站 session 头钉成真实 codex 的小写连字符
+// session-id（删除任何 Session_id / Session-Id 等大小写/下划线变体），并直写 map
+// key 防止 Header.Set 规范化成 Session-Id。
+func setCodexLowerSessionHeader(headers http.Header, value string) {
+	if headers == nil {
+		return
+	}
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return
+	}
+	for existingKey := range headers {
+		if codexSessionHeaderKey(existingKey) {
+			delete(headers, existingKey)
+		}
+	}
+	headers["session-id"] = []string{value}
+}
+
+// ensureCodexLowerSessionHeader 在出站缺少任何 session 头变体时，按 source 优先、
+// 否则 fallback 注入小写连字符 session-id；已有变体则统一收敛成 session-id 不改值。
+func ensureCodexLowerSessionHeader(target http.Header, source http.Header, fallbackValue string) {
+	if target == nil {
+		return
+	}
+	if existing := strings.TrimSpace(codexSessionHeaderValue(target)); existing != "" {
+		setCodexLowerSessionHeader(target, existing)
+		return
+	}
+	value := ""
+	if source != nil {
+		value = strings.TrimSpace(codexSessionHeaderValue(source))
+	}
+	if value == "" {
+		value = strings.TrimSpace(fallbackValue)
+	}
+	if value != "" {
+		setCodexLowerSessionHeader(target, value)
+	}
 }
 
 func codexSessionHeaderKeyUsesUnderscore(key string) bool {
