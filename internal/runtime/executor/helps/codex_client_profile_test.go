@@ -125,6 +125,154 @@ func TestResolveCodexClientProfile_ObservedCodexTuiPinsCLIOriginator(t *testing.
 	}
 }
 
+// TestEnforceCodexManagedFamily_PersistedDesktopVersionFallsBackToCLIFloor 覆盖本次
+// 修复的核心缺口：账号 persisted/cached 了历史 Desktop bundle，其 Version 是
+// year.day.build 的 26.318.11753；CLI baseline 下经 enforceCodexManagedFamily 时，
+// 旧逻辑用纯数值 max（26>0）把 Desktop 版本保留，导致出站 Version=26.318.11753、
+// UA=codex_cli_rs/26.318.11753（CLI 身份配 Desktop 版本号，自相矛盾）。
+// 修复后必须丢弃 Desktop 版本，回落 CLI floor 0.140.0，UA 不含 26.x。
+func TestEnforceCodexManagedFamily_PersistedDesktopVersionFallsBackToCLIFloor(t *testing.T) {
+	baseline := defaultCodexClientProfile(&config.Config{})
+	if baseline.isCodexDesktopLike() {
+		t.Fatalf("baseline should be CLI family, got Desktop-like: %#v", baseline)
+	}
+
+	// persisted 的历史 Desktop 受管 bundle（Originator=Codex Desktop、Version=26.318.11753）。
+	persisted := normalizeCodexClientProfile(CodexClientProfile{
+		UserAgent:  "Codex Desktop/26.318.11753 (darwin; arm64)",
+		Version:    "26.318.11753",
+		Originator: "Codex Desktop",
+	}, baseline)
+	if got := persisted.Version; got != "26.318.11753" {
+		t.Fatalf("persisted Version setup = %q, want 26.318.11753", got)
+	}
+
+	coerced := enforceCodexManagedFamily(persisted, baseline)
+
+	if got := coerced.Version; got != "0.140.0" {
+		t.Fatalf("Version = %q, want CLI floor 0.140.0 (Desktop 26.x must not be kept)", got)
+	}
+	if got := coerced.UserAgentVersion; got != "0.140.0" {
+		t.Fatalf("UserAgentVersion = %q, want 0.140.0", got)
+	}
+	if got := coerced.Originator; got != "codex_cli_rs" {
+		t.Fatalf("Originator = %q, want codex_cli_rs", got)
+	}
+	if strings.Contains(coerced.UserAgent, "26") {
+		t.Fatalf("User-Agent still contains Desktop 26.x version: %q", coerced.UserAgent)
+	}
+	if !strings.HasPrefix(coerced.UserAgent, "codex_cli_rs/0.140.0") {
+		t.Fatalf("User-Agent = %q, want codex_cli_rs/0.140.0 prefix", coerced.UserAgent)
+	}
+	if got := coerced.SecCHUA; got != "" {
+		t.Fatalf("sec-ch-ua = %q, want empty for CLI profile", got)
+	}
+}
+
+// TestEnforceCodexManagedFamily_RealCLIObservationBumps 确认家族门不误伤真实 CLI 观测：
+// 同家族、ceiling 以内的 CLI 版本（0.141.0 > floor 0.140.0）必须能正常抬升 high-water。
+func TestEnforceCodexManagedFamily_RealCLIObservationBumps(t *testing.T) {
+	baseline := defaultCodexClientProfile(&config.Config{})
+
+	observed := normalizeCodexClientProfile(CodexClientProfile{
+		UserAgent:  "codex_cli_rs/0.141.0 (Mac OS 15.5.0; arm64) iTerm.app/3.5.0 (codex_cli_rs; 0.141.0)",
+		Version:    "0.141.0",
+		Originator: "codex_cli_rs",
+	}, baseline)
+
+	coerced := enforceCodexManagedFamily(observed, baseline)
+	if got := coerced.Version; got != "0.141.0" {
+		t.Fatalf("Version = %q, want bumped CLI high-water 0.141.0", got)
+	}
+	if !strings.Contains(coerced.UserAgent, "codex_cli_rs/0.141.0") {
+		t.Fatalf("User-Agent = %q, want codex_cli_rs/0.141.0", coerced.UserAgent)
+	}
+}
+
+// TestEnforceCodexManagedFamily_OverCeilingCLIVersionFallsBackToFloor 确认超 CLI
+// ceiling(1.0.0) 的同家族版本（如伪造的 2.5.0）也被丢弃回落 floor，不污染出站。
+func TestEnforceCodexManagedFamily_OverCeilingCLIVersionFallsBackToFloor(t *testing.T) {
+	baseline := defaultCodexClientProfile(&config.Config{})
+
+	overCeiling := normalizeCodexClientProfile(CodexClientProfile{
+		UserAgent:  "codex_cli_rs/2.5.0 (Mac OS 15.5.0; arm64) iTerm.app/3.5.0 (codex_cli_rs; 2.5.0)",
+		Version:    "2.5.0",
+		Originator: "codex_cli_rs",
+	}, baseline)
+
+	coerced := enforceCodexManagedFamily(overCeiling, baseline)
+	if got := coerced.Version; got != "0.140.0" {
+		t.Fatalf("Version = %q, want CLI floor 0.140.0 (over-ceiling 2.5.0 must be dropped)", got)
+	}
+	if strings.Contains(coerced.UserAgent, "2.5.0") {
+		t.Fatalf("User-Agent still contains over-ceiling version: %q", coerced.UserAgent)
+	}
+}
+
+// TestResolveCodexClientProfile_PersistedDesktopBundleVersionDoesNotContaminateCLI
+// 端到端覆盖：账号 metadata.headers 残留 Desktop bundle（Version=26.318.11753），
+// 经完整 ResolveCodexClientProfile 后出站 Version 必须是 CLI floor 0.140.0、
+// UA=codex_cli_rs/0.140.0（不出现 26.x），Originator 钉死 codex_cli_rs、无 sec-ch-ua。
+func TestResolveCodexClientProfile_PersistedDesktopBundleVersionDoesNotContaminateCLI(t *testing.T) {
+	resetCodexClientProfileCache()
+
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
+		ID:       "codex-persisted-desktop-auth",
+		Provider: "codex",
+		Metadata: map[string]any{
+			"headers": map[string]any{
+				"User-Agent": "Codex Desktop/26.318.11753 (darwin; arm64)",
+				"Version":    "26.318.11753",
+				"Originator": "Codex Desktop",
+			},
+		},
+	}
+
+	profile := ResolveCodexClientProfile(auth, nil, &config.Config{})
+
+	if got := profile.Version; got != "0.140.0" {
+		t.Fatalf("Version = %q, want CLI floor 0.140.0 (persisted Desktop 26.x must not leak)", got)
+	}
+	if got := profile.Originator; got != "codex_cli_rs" {
+		t.Fatalf("Originator = %q, want codex_cli_rs", got)
+	}
+	if strings.Contains(profile.UserAgent, "26") {
+		t.Fatalf("User-Agent still contains Desktop 26.x version: %q", profile.UserAgent)
+	}
+	if strings.Contains(profile.UserAgent, "Codex Desktop") {
+		t.Fatalf("User-Agent must not be Desktop: %q", profile.UserAgent)
+	}
+	if !strings.HasPrefix(profile.UserAgent, "codex_cli_rs/0.140.0") {
+		t.Fatalf("User-Agent = %q, want codex_cli_rs/0.140.0 prefix", profile.UserAgent)
+	}
+	if got := profile.SecCHUA; got != "" {
+		t.Fatalf("sec-ch-ua = %q, want empty for CLI profile", got)
+	}
+}
+
+// TestBumpCodexVersionMarkers_DesktopCandidateDoesNotBumpCLI 覆盖要点2：current 是 CLI
+// 家族时，Desktop 家族 candidate（26.318.11753）不得把 CLI high-water 抬高。
+func TestBumpCodexVersionMarkers_DesktopCandidateDoesNotBumpCLI(t *testing.T) {
+	current := defaultCodexClientProfile(&config.Config{}) // CLI floor 0.140.0
+
+	desktopCandidate := normalizeCodexClientProfile(CodexClientProfile{
+		UserAgent:  "Codex Desktop/26.318.11753 (darwin; arm64)",
+		Version:    "26.318.11753",
+		Originator: "Codex Desktop",
+	}, current)
+
+	next := bumpCodexVersionMarkers(desktopCandidate, current)
+	if got := next.Version; got != "0.140.0" {
+		t.Fatalf("Version = %q, want unchanged CLI floor 0.140.0 (Desktop candidate must not bump CLI)", got)
+	}
+	if got := next.Originator; got != "codex_cli_rs" {
+		t.Fatalf("Originator = %q, want codex_cli_rs", got)
+	}
+	if strings.Contains(next.UserAgent, "26") {
+		t.Fatalf("User-Agent contaminated by Desktop version: %q", next.UserAgent)
+	}
+}
+
 func TestCodexManagedHeaders_IncludeStructuredVersionAndOriginator(t *testing.T) {
 	headers := CodexManagedHeaders(CodexClientProfile{
 		UserAgent:    "codex-tui/0.124.0 (Mac OS 26.3.1; arm64) iTerm.app/3.6.9 (codex-tui; 0.124.0)",

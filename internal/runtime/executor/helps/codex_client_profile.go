@@ -267,12 +267,41 @@ func enforceCodexManagedFamily(profile CodexClientProfile, baseline CodexClientP
 	//   - 同家族但平台/终端不同（如 Ghostty / Mac OS 15.6.0）——稳定 pin 到 baseline。
 	// 并显式清掉 Desktop 专属指纹字段（CLI 不发 sec-ch-ua / sec-fetch-* / Accept-*）。
 	//
-	// 版本取 max(观测, baseline floor)：baseline 是 floor（0.140.0 或 config/online 抬升后的
-	// 高水位），observed 只能向上抬，不能把出站降级到 floor 以下（only-up high-water）。
-	version := firstNonEmptyString(strings.TrimSpace(profile.Version), strings.TrimSpace(baseline.Version))
-	observedVersion := parseCodexVersion(version)
-	if baseline.version.valid && (!observedVersion.valid || observedVersion.Compare(baseline.version) < 0) {
-		version = firstNonEmptyString(strings.TrimSpace(baseline.Version), version)
+	// 版本取 max(观测, baseline floor)，但必须先做「家族 + ceiling 门」过滤（要点1/2）：
+	//
+	// 背景 bug（Wave10-D 残留）：账号 persisted/cached 的 Desktop bundle 版本是
+	// year.day.build（如 26.318.11753），与 CLI 家族 0.x 不可线性比较。旧逻辑用纯数值
+	// max(观测, baseline)：26.318.11753 因首段 26>0 被判为「更高」而保留，于是出站
+	// Version=26.318.11753、UA=codex_cli_rs/26.318.11753——CLI 身份配 Desktop 版本号，
+	// 自相矛盾，反成新破绽。
+	//
+	// 修法：CLI baseline 下，incoming（profile）版本只有「同属 CLI 家族且不超 CLI ceiling
+	// (1.0.0)」才允许参与 high-water 抬升；否则视为 Desktop 残留或伪造超界值，整体丢弃，
+	// 回落 baseline（floor 0.140.0，或 config/online 抬升后的 CLI 高水位）。
+	//   - profile 仍是 Desktop 家族（isCodexDesktopLike）→ 丢弃（year.day.build 不可比）。
+	//   - profile 版本超过 CLI ceiling（codexCLISanityCeilingVersion=1.0.0）→ 丢弃
+	//     （Desktop 26.x 自然超界；伪造的 CLI 2.x 也在此被拒回 floor）。
+	// 复用既有家族判定 isCodexDesktopLike 与 ceiling 常量 codexCLISanityCeilingVersion，
+	// 不另造一套。
+	cliCeiling := parseCodexVersion(codexCLISanityCeilingVersion)
+	incomingVersion := parseCodexVersion(strings.TrimSpace(profile.Version))
+	incomingUsable := strings.TrimSpace(profile.Version) != "" &&
+		incomingVersion.valid &&
+		!profile.isCodexDesktopLike() &&
+		incomingVersion.Compare(cliCeiling) <= 0
+
+	version := strings.TrimSpace(baseline.Version)
+	if incomingUsable {
+		// incoming 是合法 CLI 家族版本：走 only-up high-water，max(观测, baseline floor)。
+		version = firstNonEmptyString(strings.TrimSpace(profile.Version), version)
+		observedVersion := parseCodexVersion(version)
+		if baseline.version.valid && (!observedVersion.valid || observedVersion.Compare(baseline.version) < 0) {
+			version = firstNonEmptyString(strings.TrimSpace(baseline.Version), version)
+		}
+	}
+	// incoming 不可用（Desktop 残留 / 超 ceiling）时 version 已回落到 baseline，不污染 CLI。
+	if strings.TrimSpace(version) == "" {
+		version = firstNonEmptyString(strings.TrimSpace(profile.Version), strings.TrimSpace(baseline.Version))
 	}
 
 	coerced := baseline
@@ -724,6 +753,18 @@ func bumpCodexVersionMarkers(candidate CodexClientProfile, current CodexClientPr
 	current = normalizeCodexClientProfile(current, defaultCodexClientProfile(nil))
 	if !candidate.version.valid {
 		return current
+	}
+	// fork(anticorr 要点2)：跨家族 bump 门。current 是 CLI 家族时，绝不让 Desktop 家族
+	// 版本（year.day.build，如 26.318.11753）或超 CLI ceiling(1.0.0) 的伪造版本把 CLI
+	// high-water 抬高。Desktop 版本首段约 26，纯数值 Compare 会误判为「更高」并 bump，
+	// 于是 CLI 出站 Version 被污染成 26.x（CLI 身份配 Desktop 版本号，自相矛盾）。
+	// observed Desktop 26.x 虽能过 extract 的 Desktop ceiling(28)，但跨家族不可线性比较，
+	// 在此拒绝 bump CLI 家族。复用 isCodexDesktopLike 与 codexCLISanityCeilingVersion。
+	if !current.isCodexDesktopLike() {
+		cliCeiling := parseCodexVersion(codexCLISanityCeilingVersion)
+		if candidate.isCodexDesktopLike() || candidate.version.Compare(cliCeiling) > 0 {
+			return current
+		}
 	}
 	if current.version.valid {
 		switch candidate.version.Compare(current.version) {
