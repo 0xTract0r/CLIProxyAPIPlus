@@ -67,18 +67,12 @@ func TestBuildAccountRuntimeEvidence_CodexA02StyleManagedHeadersAndFallbackTLS(t
 	if evidence.ManagedHeaders.Strategy != "core-managed/structured-account-settings" {
 		t.Fatalf("managed strategy = %q", evidence.ManagedHeaders.Strategy)
 	}
+	// fork(anticorr Wave10-D)：CLI 画像（codex_cli_rs）出站只带 Originator/User-Agent/Version，
+	// 不再带 Desktop 专属的 sec-ch-ua / sec-fetch-* / Accept-* 系列。
 	assertManagedHeaderDigestNames(t, evidence.ManagedHeaders.Headers, []string{
-		"Accept-Encoding",
-		"Accept-Language",
 		"Originator",
 		"User-Agent",
 		"Version",
-		"sec-ch-ua",
-		"sec-ch-ua-mobile",
-		"sec-ch-ua-platform",
-		"sec-fetch-dest",
-		"sec-fetch-mode",
-		"sec-fetch-site",
 	})
 	if evidence.TransportProfile.ProfileID != "provider-default" || !evidence.TransportProfile.RuntimeEnforced {
 		t.Fatalf("transport evidence = %#v, want provider-default runtime-enforced", evidence.TransportProfile)

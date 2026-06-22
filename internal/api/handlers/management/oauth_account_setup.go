@@ -436,7 +436,33 @@ func managedHeaderBrandOrderVariantName(slot int) string {
 	return fmt.Sprintf("slot-%d", slot%3)
 }
 
+// isCodexCLIManagedProjection 判定基线投影是否是 Wave10-D 的 CLI 画像（codex_cli_rs）。
+// CLI 画像不带 Desktop 专属 sec-ch-ua，Originator/UA 是 codex_cli_rs 家族。
+func isCodexCLIManagedProjection(projection authFileManagedHeaderProjection) bool {
+	originator := strings.TrimSpace(projection.StableIdentity["Originator"])
+	if originator == "" {
+		originator = strings.TrimSpace(projection.SummaryHeaders["Originator"])
+	}
+	ua := strings.TrimSpace(projection.SummaryHeaders["User-Agent"])
+	if strings.EqualFold(originator, "Codex Desktop") || strings.HasPrefix(ua, "Codex Desktop/") {
+		return false
+	}
+	// CLI 家族：Originator 是 codex_* 之一，或 UA 以 codex_/codex- 开头。
+	return strings.HasPrefix(originator, "codex_") || strings.HasPrefix(originator, "codex-") ||
+		strings.HasPrefix(ua, "codex_") || strings.HasPrefix(ua, "codex-")
+}
+
 func personalizeCodexManagedHeaderProjection(projection authFileManagedHeaderProjection, variant accountManagedHeaderVariant) authFileManagedHeaderProjection {
+	// fork(anticorr Wave10-D)：CLI 画像下 codex 出站是单一自洽的 codex_cli_rs 版本，
+	// 不再做 Desktop 时代的 per-account 版本偏移与 sec-ch-ua 变体（CLI 不发 sec-ch-ua）。
+	// 投影保持与真实 egress 一致：像 claude 一样停在 coherent CLI baseline，不注入变体。
+	// 仅当 operator 用 config 配回 Desktop 画像时，才走旧的 Desktop 变体逻辑（兼容）。
+	if isCodexCLIManagedProjection(projection) {
+		projection.VariantPolicy = managedHeaderVariantPolicyNearLatestV1
+		projection.VersionVariant = managedHeaderVersionVariantName(0)
+		projection.BrandOrderVariant = ""
+		return projection
+	}
 	headers := cloneStringMap(projection.SummaryHeaders)
 	sourceVersion := firstNonEmptyHeaderString(headers["Version"], projection.VersionedCapabilities["Version"])
 	if strings.TrimSpace(headers["Version"]) == "" && sourceVersion != "" {

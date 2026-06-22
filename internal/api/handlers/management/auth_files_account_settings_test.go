@@ -159,8 +159,9 @@ func TestPatchAuthFileAccountSettings_RewritesRuntimeSnapshotAndStoredSchema(t *
 	if got := headersMeta["Version"]; got != "1.2.3" {
 		t.Fatalf("metadata.headers.Version = %#v, want %q", got, "1.2.3")
 	}
-	if got := headersMeta["Originator"]; got != "Codex Desktop" {
-		t.Fatalf("metadata.headers.Originator = %#v, want %q", got, "Codex Desktop")
+	// fork(anticorr Wave10-D)：config UA 非 first-party 时，Originator 回退到 CLI 默认 codex_cli_rs。
+	if got := headersMeta["Originator"]; got != "codex_cli_rs" {
+		t.Fatalf("metadata.headers.Originator = %#v, want %q", got, "codex_cli_rs")
 	}
 	if got := headersMeta["X-Codex-Beta-Features"]; got != "feature-a,feature-b" {
 		t.Fatalf("metadata.headers.X-Codex-Beta-Features = %#v, want %q", got, "feature-a,feature-b")
@@ -191,8 +192,8 @@ func TestPatchAuthFileAccountSettings_RewritesRuntimeSnapshotAndStoredSchema(t *
 	if got := resp.AccountSettings.ManagedHeaders["Version"]; got != "1.2.3" {
 		t.Fatalf("response managed Version = %q, want %q", got, "1.2.3")
 	}
-	if got := resp.AccountSettings.ManagedHeaders["Originator"]; got != "Codex Desktop" {
-		t.Fatalf("response managed Originator = %q, want %q", got, "Codex Desktop")
+	if got := resp.AccountSettings.ManagedHeaders["Originator"]; got != "codex_cli_rs" {
+		t.Fatalf("response managed Originator = %q, want %q", got, "codex_cli_rs")
 	}
 	if resp.AccountSettings.ManagedHeaderState == nil || resp.AccountSettings.ManagedHeaderState.Current == nil {
 		t.Fatalf("expected managed_header_state.current to be present")
@@ -413,27 +414,30 @@ func TestGetAuthFileAccountSettings_PersistsCodexManagedHeaderHistoryAcrossVersi
 			},
 			"account_settings": map[string]any{
 				"schema_version": 1,
+				// fork(anticorr Wave10-D)：CLI 画像下 codex 出站身份钉死 codex_cli_rs，
+				// 平台/终端稳定 pin（Mac OS 15.7.4; arm64 / iTerm.app/3.6.8），版本走 floor
+				// 0.140.0 之上的 high-water。持久化态用 CLI 身份与高于 floor 的版本。
 				"managed_header_state": map[string]any{
 					"policy_version": "codex-managed/v2",
 					"current": map[string]any{
 						"generated_at": "2026-04-24T10:00:00Z",
 						"summary_headers": map[string]any{
-							"User-Agent":            "codex-tui/0.118.0 (Mac OS 26.3.1; arm64) iTerm.app/3.6.9 (codex-tui; 0.118.0)",
-							"Version":               "0.118.0",
-							"Originator":            "codex-tui",
+							"User-Agent":            "codex_cli_rs/0.145.0 (Mac OS 15.7.4; arm64) iTerm.app/3.6.8 (codex_cli_rs; 0.145.0)",
+							"Version":               "0.145.0",
+							"Originator":            "codex_cli_rs",
 							"X-Codex-Beta-Features": "feature-a",
 						},
 						"versioned_capabilities": map[string]any{
-							"User-Agent":            "codex-tui/0.118.0 (Mac OS 26.3.1; arm64) iTerm.app/3.6.9 (codex-tui; 0.118.0)",
-							"Version":               "0.118.0",
+							"User-Agent":            "codex_cli_rs/0.145.0 (Mac OS 15.7.4; arm64) iTerm.app/3.6.8 (codex_cli_rs; 0.145.0)",
+							"Version":               "0.145.0",
 							"X-Codex-Beta-Features": "feature-a",
 						},
 						"stable_identity": map[string]any{
-							"Originator": "codex-tui",
+							"Originator": "codex_cli_rs",
 						},
 						"runtime_fingerprint": map[string]any{
-							"platform": "Mac OS 26.3.1; arm64",
-							"terminal": "iTerm.app/3.6.9 (codex-tui; 0.118.0)",
+							"platform": "Mac OS 15.7.4; arm64",
+							"terminal": "iTerm.app/3.6.8 (codex_cli_rs; 0.145.0)",
 						},
 					},
 				},
@@ -492,12 +496,12 @@ func TestGetAuthFileAccountSettings_PersistsCodexManagedHeaderHistoryAcrossVersi
 		return stored.ManagedHeaderState
 	}
 
-	projectCodexVersion("0.124.0", "Ghostty/1.0.0")
+	projectCodexVersion("0.150.0", "Ghostty/1.0.0")
 	firstResp := getAccountSettings()
-	if got := firstResp.AccountSettings.ManagedHeaders["Version"]; got != "0.124.0" {
-		t.Fatalf("managed Version = %q, want %q", got, "0.124.0")
+	if got := firstResp.AccountSettings.ManagedHeaders["Version"]; got != "0.150.0" {
+		t.Fatalf("managed Version = %q, want %q", got, "0.150.0")
 	}
-	if got := firstResp.AccountSettings.ManagedHeaders["User-Agent"]; !strings.Contains(got, "codex-tui/0.124.0") {
+	if got := firstResp.AccountSettings.ManagedHeaders["User-Agent"]; !strings.Contains(got, "codex_cli_rs/0.150.0") {
 		t.Fatalf("managed User-Agent did not bump version marker: %q", got)
 	}
 	if got := firstResp.AccountSettings.ManagedHeaders["User-Agent"]; strings.Contains(got, "Ghostty/1.0.0") {
@@ -513,37 +517,37 @@ func TestGetAuthFileAccountSettings_PersistsCodexManagedHeaderHistoryAcrossVersi
 	if got := firstHistory.ChangedFields; !reflect.DeepEqual(got, []string{"User-Agent", "Version", "terminal"}) {
 		t.Fatalf("first changed_fields = %#v, want only version markers", got)
 	}
-	if got := firstHistory.PreviousSummaryHeaders["User-Agent"]; got != "codex-tui/0.118.0 (Mac OS 26.3.1; arm64) iTerm.app/3.6.9 (codex-tui; 0.118.0)" {
+	if got := firstHistory.PreviousSummaryHeaders["User-Agent"]; got != "codex_cli_rs/0.145.0 (Mac OS 15.7.4; arm64) iTerm.app/3.6.8 (codex_cli_rs; 0.145.0)" {
 		t.Fatalf("previous summary User-Agent = %q", got)
 	}
 	if got := firstHistory.NextSummaryHeaders["User-Agent"]; got != firstResp.AccountSettings.ManagedHeaders["User-Agent"] {
 		t.Fatalf("next summary User-Agent = %q, want current managed User-Agent", got)
 	}
-	if got := firstHistory.PreviousVersionedCapabilities["Version"]; got != "0.118.0" {
-		t.Fatalf("previous Version = %q, want %q", got, "0.118.0")
+	if got := firstHistory.PreviousVersionedCapabilities["Version"]; got != "0.145.0" {
+		t.Fatalf("previous Version = %q, want %q", got, "0.145.0")
 	}
-	if got := firstHistory.NextVersionedCapabilities["Version"]; got != "0.124.0" {
-		t.Fatalf("next Version = %q, want %q", got, "0.124.0")
+	if got := firstHistory.NextVersionedCapabilities["Version"]; got != "0.150.0" {
+		t.Fatalf("next Version = %q, want %q", got, "0.150.0")
 	}
-	if got := firstHistory.PreviousStableIdentity["Originator"]; got != "codex-tui" {
-		t.Fatalf("previous stable Originator = %q, want codex-tui", got)
+	if got := firstHistory.PreviousStableIdentity["Originator"]; got != "codex_cli_rs" {
+		t.Fatalf("previous stable Originator = %q, want codex_cli_rs", got)
 	}
-	if got := firstHistory.NextStableIdentity["Originator"]; got != "codex-tui" {
-		t.Fatalf("next stable Originator = %q, want codex-tui", got)
+	if got := firstHistory.NextStableIdentity["Originator"]; got != "codex_cli_rs" {
+		t.Fatalf("next stable Originator = %q, want codex_cli_rs", got)
 	}
-	if got := firstHistory.PreviousRuntimeFingerprint["terminal"]; got != "iTerm.app/3.6.9 (codex-tui; 0.118.0)" {
+	if got := firstHistory.PreviousRuntimeFingerprint["terminal"]; got != "iTerm.app/3.6.8 (codex_cli_rs; 0.145.0)" {
 		t.Fatalf("previous runtime terminal = %q", got)
 	}
-	if got := firstHistory.NextRuntimeFingerprint["terminal"]; got != "iTerm.app/3.6.9 (codex-tui; 0.124.0)" {
+	if got := firstHistory.NextRuntimeFingerprint["terminal"]; got != "iTerm.app/3.6.8 (codex_cli_rs; 0.150.0)" {
 		t.Fatalf("next runtime terminal = %q", got)
 	}
-	if got := firstResp.AccountSettings.ManagedHeaderState.Current.StableIdentity["Originator"]; got != "codex-tui" {
-		t.Fatalf("stable identity Originator = %q, want %q", got, "codex-tui")
+	if got := firstResp.AccountSettings.ManagedHeaderState.Current.StableIdentity["Originator"]; got != "codex_cli_rs" {
+		t.Fatalf("stable identity Originator = %q, want %q", got, "codex_cli_rs")
 	}
-	if got := firstResp.AccountSettings.ManagedHeaderState.Current.RuntimeFingerprint["platform"]; got != "Mac OS 26.3.1; arm64" {
+	if got := firstResp.AccountSettings.ManagedHeaderState.Current.RuntimeFingerprint["platform"]; got != "Mac OS 15.7.4; arm64" {
 		t.Fatalf("runtime fingerprint platform = %q, want pinned baseline", got)
 	}
-	if got := firstResp.AccountSettings.ManagedHeaderState.Current.RuntimeFingerprint["terminal"]; got != "iTerm.app/3.6.9 (codex-tui; 0.124.0)" {
+	if got := firstResp.AccountSettings.ManagedHeaderState.Current.RuntimeFingerprint["terminal"]; got != "iTerm.app/3.6.8 (codex_cli_rs; 0.150.0)" {
 		t.Fatalf("runtime fingerprint terminal = %q, want preserved terminal identity with bumped version", got)
 	}
 	if got := firstResp.AccountSettings.ManagedHeaderState.Current.RuntimeFingerprint["terminal"]; strings.Contains(got, "Ghostty/1.0.0") {
@@ -554,7 +558,7 @@ func TestGetAuthFileAccountSettings_PersistsCodexManagedHeaderHistoryAcrossVersi
 		t.Fatalf("stored history length = %d, want 1", len(firstStoredState.History))
 	}
 
-	projectCodexVersion("0.125.0", "Warp/2.0.0")
+	projectCodexVersion("0.151.0", "Warp/2.0.0")
 	secondResp := getAccountSettings()
 	if secondResp.AccountSettings.ManagedHeaderState == nil {
 		t.Fatalf("expected second managed_header_state to be present")
@@ -569,22 +573,22 @@ func TestGetAuthFileAccountSettings_PersistsCodexManagedHeaderHistoryAcrossVersi
 	if got := secondHistory.ChangedFields; !reflect.DeepEqual(got, []string{"User-Agent", "Version", "terminal"}) {
 		t.Fatalf("second changed_fields = %#v, want only version markers", got)
 	}
-	if got := secondHistory.PreviousVersionedCapabilities["Version"]; got != "0.124.0" {
-		t.Fatalf("second previous Version = %q, want %q", got, "0.124.0")
+	if got := secondHistory.PreviousVersionedCapabilities["Version"]; got != "0.150.0" {
+		t.Fatalf("second previous Version = %q, want %q", got, "0.150.0")
 	}
-	if got := secondHistory.NextVersionedCapabilities["Version"]; got != "0.125.0" {
-		t.Fatalf("second next Version = %q, want %q", got, "0.125.0")
+	if got := secondHistory.NextVersionedCapabilities["Version"]; got != "0.151.0" {
+		t.Fatalf("second next Version = %q, want %q", got, "0.151.0")
 	}
-	if got := secondResp.AccountSettings.ManagedHeaderState.Current.VersionedCapabilities["Version"]; got != "0.125.0" {
-		t.Fatalf("current Version = %q, want %q", got, "0.125.0")
+	if got := secondResp.AccountSettings.ManagedHeaderState.Current.VersionedCapabilities["Version"]; got != "0.151.0" {
+		t.Fatalf("current Version = %q, want %q", got, "0.151.0")
 	}
-	if got := secondResp.AccountSettings.ManagedHeaderState.Current.StableIdentity["Originator"]; got != "codex-tui" {
-		t.Fatalf("second stable identity Originator = %q, want %q", got, "codex-tui")
+	if got := secondResp.AccountSettings.ManagedHeaderState.Current.StableIdentity["Originator"]; got != "codex_cli_rs" {
+		t.Fatalf("second stable identity Originator = %q, want %q", got, "codex_cli_rs")
 	}
-	if got := secondResp.AccountSettings.ManagedHeaderState.Current.RuntimeFingerprint["platform"]; got != "Mac OS 26.3.1; arm64" {
+	if got := secondResp.AccountSettings.ManagedHeaderState.Current.RuntimeFingerprint["platform"]; got != "Mac OS 15.7.4; arm64" {
 		t.Fatalf("second runtime fingerprint platform = %q, want pinned baseline", got)
 	}
-	if got := secondResp.AccountSettings.ManagedHeaderState.Current.RuntimeFingerprint["terminal"]; !strings.Contains(got, "iTerm.app/3.6.9") {
+	if got := secondResp.AccountSettings.ManagedHeaderState.Current.RuntimeFingerprint["terminal"]; !strings.Contains(got, "iTerm.app/3.6.8") {
 		t.Fatalf("second runtime fingerprint terminal = %q, want preserved iTerm identity", got)
 	}
 	if got := secondResp.AccountSettings.ManagedHeaderState.Current.RuntimeFingerprint["terminal"]; strings.Contains(got, "Warp/2.0.0") {
@@ -666,11 +670,16 @@ func TestGetAuthFileAccountSettings_MigratesLegacyCodexHeadersToManagedState(t *
 	if state == nil || state.Current == nil {
 		t.Fatalf("expected migrated managed_header_state.current")
 	}
-	if got := state.Current.Source; got != "community:codex-proxy" {
-		t.Fatalf("current source = %q, want community:codex-proxy", got)
+	// fork(anticorr Wave10-D)：CLI 画像默认来源是 static:codex-cli；持久化 codex-tui 0.124.0
+	// 与 online 0.130.0 都低于 floor 0.140.0，出站身份钉死 codex_cli_rs、版本停在 floor。
+	if got := state.Current.Source; got != "static:codex-cli" {
+		t.Fatalf("current source = %q, want static:codex-cli", got)
 	}
-	if got := resp.AccountSettings.ManagedHeaders["Version"]; got != "26.318.11754" {
-		t.Fatalf("managed Version = %q, want Codex Desktop app version", got)
+	if got := resp.AccountSettings.ManagedHeaders["Version"]; got != "0.140.0" {
+		t.Fatalf("managed Version = %q, want CLI floor 0.140.0", got)
+	}
+	if got := resp.AccountSettings.ManagedHeaders["Originator"]; got != "codex_cli_rs" {
+		t.Fatalf("managed Originator = %q, want codex_cli_rs", got)
 	}
 	updated, ok := manager.GetByID("codex-legacy-managed-state.json")
 	if !ok || updated == nil {
@@ -686,7 +695,8 @@ func TestGetAuthFileAccountSettings_UsesOnlineManagedHeaderSourceAndRecordsHisto
 	t.Setenv("MANAGEMENT_PASSWORD", "")
 	gin.SetMode(gin.TestMode)
 
-	onlineVersion := "0.130.0"
+	// fork(anticorr Wave10-D)：online npm latest 高于 CLI floor 0.140.0 才抬高出站版本。
+	onlineVersion := "0.150.0"
 	checkedAt := "2026-04-29T12:00:00Z"
 	online := true
 	oldOverride := runtimehelps.ManagedHeaderOnlineFetchOverride
@@ -783,17 +793,14 @@ func TestGetAuthFileAccountSettings_UsesOnlineManagedHeaderSourceAndRecordsHisto
 	}
 
 	firstResp := getAccountSettings()
-	if got := firstResp.AccountSettings.ManagedHeaders["Version"]; got != "26.318.11754" {
-		t.Fatalf("managed Version = %q, want Codex Desktop app version", got)
+	if got := firstResp.AccountSettings.ManagedHeaders["Version"]; got != "0.150.0" {
+		t.Fatalf("managed Version = %q, want online CLI version 0.150.0", got)
 	}
-	if got := firstResp.AccountSettings.ManagedHeaderState.Current.Source; got != "community:codex-proxy" {
-		t.Fatalf("current source = %q, want community:codex-proxy", got)
+	if got := firstResp.AccountSettings.ManagedHeaderState.Current.Source; got != "online:npm" {
+		t.Fatalf("current source = %q, want online:npm", got)
 	}
-	if got := firstResp.AccountSettings.ManagedHeaderState.Current.SourceURL; got != "https://github.com/icebear0828/codex-proxy" {
+	if got := firstResp.AccountSettings.ManagedHeaderState.Current.SourceURL; got != "https://registry.npmjs.org/@openai%2fcodex/latest" {
 		t.Fatalf("current source_url = %q", got)
-	}
-	if got := firstResp.AccountSettings.ManagedHeaderState.Current.CheckedAt; got != "" {
-		t.Fatalf("current checked_at = %q, want empty for static community profile", got)
 	}
 	if len(firstResp.AccountSettings.ManagedHeaderState.History) != 1 {
 		t.Fatalf("history length = %d, want 1: %#v", len(firstResp.AccountSettings.ManagedHeaderState.History), firstResp.AccountSettings.ManagedHeaderState.History)
@@ -802,45 +809,47 @@ func TestGetAuthFileAccountSettings_UsesOnlineManagedHeaderSourceAndRecordsHisto
 	if got := firstHistory.PreviousSource; got != "default" {
 		t.Fatalf("previous source = %q, want default", got)
 	}
-	if got := firstHistory.NextSource; got != "community:codex-proxy" {
-		t.Fatalf("next source = %q, want community:codex-proxy", got)
+	if got := firstHistory.NextSource; got != "online:npm" {
+		t.Fatalf("next source = %q, want online:npm", got)
 	}
 	if got := firstHistory.PreviousVersionedCapabilities["Version"]; got != "0.124.0" {
 		t.Fatalf("previous Version = %q, want 0.124.0", got)
 	}
-	if got := firstHistory.NextVersionedCapabilities["Version"]; got != "26.318.11754" {
-		t.Fatalf("next Version = %q, want 26.318.11754", got)
+	if got := firstHistory.NextVersionedCapabilities["Version"]; got != "0.150.0" {
+		t.Fatalf("next Version = %q, want 0.150.0", got)
 	}
-	if got := firstResp.AccountSettings.ManagedHeaderState.Current.StableIdentity["Originator"]; got != "Codex Desktop" {
-		t.Fatalf("stable identity Originator = %q, want Codex Desktop", got)
+	if got := firstResp.AccountSettings.ManagedHeaderState.Current.StableIdentity["Originator"]; got != "codex_cli_rs" {
+		t.Fatalf("stable identity Originator = %q, want codex_cli_rs", got)
 	}
-	if got := firstResp.AccountSettings.ManagedHeaderState.Current.RuntimeFingerprint["platform"]; got != "darwin; arm64" {
-		t.Fatalf("platform fingerprint = %q, want Codex Desktop platform", got)
+	if got := firstResp.AccountSettings.ManagedHeaderState.Current.RuntimeFingerprint["platform"]; got != "Mac OS 15.7.4; arm64" {
+		t.Fatalf("platform fingerprint = %q, want pinned CLI platform", got)
 	}
-	if got := firstResp.AccountSettings.ManagedHeaderState.Current.RuntimeFingerprint["terminal"]; got != "" {
-		t.Fatalf("terminal fingerprint = %q, want empty Codex Desktop terminal", got)
+	if got := firstResp.AccountSettings.ManagedHeaderState.Current.RuntimeFingerprint["terminal"]; got != "iTerm.app/3.6.8 (codex_cli_rs; 0.150.0)" {
+		t.Fatalf("terminal fingerprint = %q, want pinned CLI terminal", got)
 	}
 
-	onlineVersion = "0.131.0"
+	// 第二次 online 仍是 0.151.0（高于当前 0.150.0 会再抬一次）；这里保持低于当前以验证
+	// online 再升到 0.152.0（高于当前 0.150.0），出站 high-water 再抬一档，history append。
+	onlineVersion = "0.152.0"
 	checkedAt = "2026-04-29T13:00:00Z"
 	secondResp := getAccountSettings()
-	if got := secondResp.AccountSettings.ManagedHeaders["Version"]; got != "26.318.11754" {
-		t.Fatalf("second managed Version = %q, want Codex Desktop app version", got)
+	if got := secondResp.AccountSettings.ManagedHeaders["Version"]; got != "0.152.0" {
+		t.Fatalf("second managed Version = %q, want bumped high-water 0.152.0", got)
 	}
-	if len(secondResp.AccountSettings.ManagedHeaderState.History) != 1 {
-		t.Fatalf("second history length = %d, want 1", len(secondResp.AccountSettings.ManagedHeaderState.History))
+	if len(secondResp.AccountSettings.ManagedHeaderState.History) != 2 {
+		t.Fatalf("second history length = %d, want 2", len(secondResp.AccountSettings.ManagedHeaderState.History))
 	}
 	if !reflect.DeepEqual(secondResp.AccountSettings.ManagedHeaderState.History[0], firstHistory) {
 		t.Fatalf("history should append only; first entry changed: %#v", secondResp.AccountSettings.ManagedHeaderState.History)
 	}
-	if got := secondResp.AccountSettings.ManagedHeaderState.Current.StableIdentity["Originator"]; got != "Codex Desktop" {
-		t.Fatalf("stable identity Originator = %q, want Codex Desktop", got)
+	if got := secondResp.AccountSettings.ManagedHeaderState.Current.StableIdentity["Originator"]; got != "codex_cli_rs" {
+		t.Fatalf("stable identity Originator = %q, want codex_cli_rs", got)
 	}
-	if got := secondResp.AccountSettings.ManagedHeaderState.Current.RuntimeFingerprint["platform"]; got != "darwin; arm64" {
-		t.Fatalf("platform fingerprint = %q, want Codex Desktop platform", got)
+	if got := secondResp.AccountSettings.ManagedHeaderState.Current.RuntimeFingerprint["platform"]; got != "Mac OS 15.7.4; arm64" {
+		t.Fatalf("platform fingerprint = %q, want pinned CLI platform", got)
 	}
-	if got := secondResp.AccountSettings.ManagedHeaderState.Current.RuntimeFingerprint["terminal"]; got != "" {
-		t.Fatalf("second terminal fingerprint = %q, want empty Codex Desktop terminal", got)
+	if got := secondResp.AccountSettings.ManagedHeaderState.Current.RuntimeFingerprint["terminal"]; got != "iTerm.app/3.6.8 (codex_cli_rs; 0.152.0)" {
+		t.Fatalf("second terminal fingerprint = %q, want pinned CLI terminal", got)
 	}
 }
 
@@ -955,17 +964,23 @@ func TestGetAuthFileAccountSettings_UsesOnlineCodexProxyBundleAndRecordsHistory(
 	if state == nil || state.Current == nil {
 		t.Fatalf("expected managed header state")
 	}
-	if got := resp.AccountSettings.ManagedHeaders["Version"]; got != "26.400.1" {
-		t.Fatalf("managed Version = %q, want online codex-proxy version", got)
+	// fork(anticorr Wave10-D 要点2)：持久化的 Codex Desktop bundle 在 CLI 策略下被压回 CLI
+	// 出站：online codex-proxy Desktop bundle（26.400.1）不会把家族切回 Desktop，出站身份
+	// 钉死 codex_cli_rs、版本停在 floor 0.140.0、不带 sec-ch-ua。
+	if got := resp.AccountSettings.ManagedHeaders["Version"]; got != "0.140.0" {
+		t.Fatalf("managed Version = %q, want CLI floor 0.140.0 (Desktop bundle must not contaminate)", got)
 	}
-	if got := state.Current.CheckedAt; got != "2026-05-09T02:00:00Z" {
-		t.Fatalf("checked_at = %q", got)
+	if got := resp.AccountSettings.ManagedHeaders["Originator"]; got != "codex_cli_rs" {
+		t.Fatalf("managed Originator = %q, want codex_cli_rs", got)
 	}
-	if got := state.Current.Completeness; got != "online-coherent-bundle" {
-		t.Fatalf("completeness = %q", got)
+	if strings.Contains(resp.AccountSettings.ManagedHeaders["User-Agent"], "Codex Desktop") {
+		t.Fatalf("managed User-Agent leaked Codex Desktop: %q", resp.AccountSettings.ManagedHeaders["User-Agent"])
 	}
-	if got := state.Current.StableIdentity["sec-ch-ua"]; !strings.Contains(got, `"Chromium";v="145"`) {
-		t.Fatalf("sec-ch-ua = %q, want Chromium 145", got)
+	if got := state.Current.StableIdentity["sec-ch-ua"]; got != "" {
+		t.Fatalf("sec-ch-ua = %q, want empty for CLI profile (Desktop bundle must not leak)", got)
+	}
+	if got := state.Current.StableIdentity["Originator"]; got != "codex_cli_rs" {
+		t.Fatalf("stable identity Originator = %q, want codex_cli_rs", got)
 	}
 	if len(state.History) != 1 {
 		t.Fatalf("history length = %d, want 1: %#v", len(state.History), state.History)
@@ -974,11 +989,11 @@ func TestGetAuthFileAccountSettings_UsesOnlineCodexProxyBundleAndRecordsHistory(
 	if got := history.PreviousVersionedCapabilities["Version"]; got != "26.318.11754" {
 		t.Fatalf("previous version = %q", got)
 	}
-	if got := history.NextVersionedCapabilities["Version"]; got != "26.400.1" {
-		t.Fatalf("next version = %q", got)
+	if got := history.NextVersionedCapabilities["Version"]; got != "0.140.0" {
+		t.Fatalf("next version = %q, want CLI floor 0.140.0", got)
 	}
-	if !containsString(history.ChangedFields, "Version") || !containsString(history.ChangedFields, "sec-ch-ua") {
-		t.Fatalf("changed fields = %#v, want version and sec-ch-ua changes", history.ChangedFields)
+	if !containsString(history.ChangedFields, "Version") {
+		t.Fatalf("changed fields = %#v, want version change", history.ChangedFields)
 	}
 }
 

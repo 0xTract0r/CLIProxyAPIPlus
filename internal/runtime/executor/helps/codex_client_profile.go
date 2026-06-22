@@ -12,10 +12,31 @@ import (
 )
 
 const (
-	defaultCodexManagedOriginator  = "Codex Desktop"
-	defaultCodexManagedVersion     = "26.318.11754"
-	defaultCodexManagedPlatform    = "darwin; arm64"
-	defaultCodexManagedTerminal    = ""
+	// fork(anticorr Wave10-D): codex 出站画像从冻结的 community "Codex Desktop" 受管画像
+	// 改成扮真实 codex-rs CLI（codex_cli_rs）。
+	//
+	// 背景：真实出站流量的 body 一直是 codex CLI 格式，C 又把 TLS 改成 codex-rs CLI 的
+	// rustls（JA3 e4d448cd）；但 UA/Originator 还停在冻结 "Codex Desktop/26.x" + Chromium
+	// sec-ch-ua，于是 body/TLS 是 CLI、UA 却是 Desktop，三者互相矛盾，UA 成异类。
+	// 这里把代码默认 originator/UA/版本全切到 codex_cli_rs CLI 家族，让 body/UA/TLS/版本
+	// 自洽；TLS（C）不动。
+	//
+	// 选 codex_cli_rs 而不是 codex_exec：interactive 通用入口，isFirstPartyCodexOriginator
+	// 两者都接受；真实样本 codex_exec/0.140.0 是 exec 子命令，codex_cli_rs 覆盖更广。
+	//
+	// 版本走观测 high-water（extractCodexClientProfile→bumpCodexVersionMarkers→online ceiling），
+	// 这里 0.140.0 只是离线 floor（接观测高水位起点），不是出站锁。改成 CLI 家族后，
+	// isCodexDesktopLike()==false，会解除 ResolveCodexClientProfile 的 Desktop 短路，high-water
+	// 链路才接得上。
+	//
+	// OS/arch/terminal 稳定 pin（仿 claude pinClaudeDeviceProfilePlatform）：固定
+	// Mac OS 15.7.4 / arm64 / iTerm.app 3.6.8，不透传真实环境，每账号稳定一致、可 config 覆盖。
+	defaultCodexManagedOriginator  = "codex_cli_rs"
+	defaultCodexManagedVersion     = "0.140.0"
+	defaultCodexManagedPlatform    = "Mac OS 15.7.4; arm64"
+	defaultCodexManagedTerminalApp = "iTerm.app/3.6.8"
+	defaultCodexManagedOS          = "Mac OS 15.7.4"
+	defaultCodexManagedArch        = "arm64"
 	defaultCodexManagedChromium    = "144"
 	codexClientProfileCacheTTL     = 7 * 24 * time.Hour
 	codexClientProfileCleanupEvery = time.Hour
@@ -95,13 +116,35 @@ func DefaultCodexManagedVersion() string {
 	return defaultCodexManagedVersion
 }
 
+// defaultCodexManagedTerminalTail 构造 CLI 家族默认 UA 的尾段
+// （terminal + "(originator; version)"），例如
+// "iTerm.app/3.6.8 (codex_cli_rs; 0.140.0)"。originator/version 跟随当前画像，
+// 后续 high-water 抬版本时由 bumpCodexTailVersionMarker 同步刷新尾段内的版本。
+func defaultCodexManagedTerminalTail(originator string, version string) string {
+	terminal := strings.TrimSpace(defaultCodexManagedTerminalApp)
+	originator = strings.TrimSpace(firstNonEmptyString(originator, defaultCodexManagedOriginator))
+	version = strings.TrimSpace(firstNonEmptyString(version, defaultCodexManagedVersion))
+	if terminal == "" {
+		return ""
+	}
+	return terminal + " (" + originator + "; " + version + ")"
+}
+
 func DefaultCodexManagedUserAgent() string {
 	return buildCodexUserAgent(
 		defaultCodexManagedOriginator,
 		defaultCodexManagedVersion,
 		defaultCodexManagedPlatform,
-		defaultCodexManagedTerminal,
+		defaultCodexManagedTerminalTail(defaultCodexManagedOriginator, defaultCodexManagedVersion),
 	)
+}
+
+// ResetCodexClientProfileCacheForTests 清空 per-account 画像缓存，供跨包测试隔离。
+// 仅用于测试场景下保证 high-water / 默认画像断言不被上一个用例的缓存污染。
+func ResetCodexClientProfileCacheForTests() {
+	codexClientProfileCacheMu.Lock()
+	codexClientProfileCache = make(map[string]codexClientProfileCacheEntry)
+	codexClientProfileCacheMu.Unlock()
 }
 
 func ResolveCodexClientProfile(auth *cliproxyauth.Auth, headers http.Header, cfg *config.Config) CodexClientProfile {
@@ -112,11 +155,25 @@ func ResolveCodexClientProfile(auth *cliproxyauth.Auth, headers http.Header, cfg
 	if defaultProfile.isCodexDesktopLike() && !codexHeaderDefaultsUserAgentOverridden(cfg) {
 		return defaultProfile
 	}
+	// fork(anticorr Wave10-D)：operator 通过 config 配了一个「非 codex 三段式 / 非 first-party」
+	// 的自定义 UA（例如自研代理标识）时，该 UA 是权威原样值，不参与 CLI 家族强制/平台 pin
+	// /high-water 改写。只有这种「不可解析成 codex UA」的覆盖才走短路；config 配的是正常
+	// codex UA（含默认 CLI UA）时仍走完整 resolve，保留 per-account high-water。
+	if codexHeaderDefaultsUserAgentOverridden(cfg) && !codexHeaderDefaultsUserAgentIsCodexLike(cfg) {
+		if _, hasObserved := extractCodexClientProfile(headers, cfg); !hasObserved {
+			return defaultProfile
+		}
+	}
 	persistedProfile, hasPersisted := codexClientProfileFromAuth(auth, cfg)
 
 	current := defaultProfile
 	if hasPersisted {
-		current = normalizeCodexClientProfile(persistedProfile, defaultProfile)
+		// fork(anticorr Wave10-D 要点2)：persisted bundle 可能仍是历史 "Codex Desktop"
+		// 受管 bundle（测试端账号 metadata.headers / managed_header_state 残留）。当代码
+		// 默认策略已是 CLI 家族时，必须把 persisted 的 Desktop 身份压回 CLI，避免
+		// Desktop Originator / sec-ch-ua 经 baseline 优先（normalizeCodexClientProfile:447）
+		// 漏回出站。只保留 high-water 版本，不保留 Desktop 身份。
+		current = enforceCodexManagedFamily(normalizeCodexClientProfile(persistedProfile, defaultProfile), defaultProfile)
 	}
 
 	cacheKey := codexClientProfileCacheKey(auth)
@@ -125,7 +182,7 @@ func ResolveCodexClientProfile(auth *cliproxyauth.Auth, headers http.Header, cfg
 	cachedValid := hasCached && entry.expire.After(now) && strings.TrimSpace(entry.profile.UserAgent) != ""
 	codexClientProfileCacheMu.RUnlock()
 	if cachedValid {
-		current = normalizeCodexClientProfile(entry.profile, current)
+		current = enforceCodexManagedFamily(normalizeCodexClientProfile(entry.profile, current), defaultProfile)
 	}
 
 	candidate, hasCandidate := extractCodexClientProfile(headers, cfg)
@@ -136,6 +193,10 @@ func ResolveCodexClientProfile(auth *cliproxyauth.Auth, headers http.Header, cfg
 		} else {
 			next = normalizeCodexClientProfile(candidate, current)
 		}
+		// fork(anticorr Wave10-D 要点2)：客户端可能上报 Originator=Codex Desktop（仍是
+		// first-party 白名单值）。CLI 策略下出站身份钉死为 CLI 家族，只采纳观测版本，
+		// 不让下游把出站 Originator/sec-ch-ua 切回 Desktop，同时 OS/arch/terminal 稳定 pin。
+		next = enforceCodexManagedFamily(next, defaultProfile)
 		codexClientProfileCacheMu.Lock()
 		codexClientProfileCache[cacheKey] = codexClientProfileCacheEntry{
 			profile: next,
@@ -157,7 +218,9 @@ func ResolveCodexClientProfile(auth *cliproxyauth.Auth, headers http.Header, cfg
 		codexClientProfileCacheMu.Unlock()
 	}
 
-	if online, ok := resolveManagedHeaderOnlineVersion("codex", cfg); ok && !current.isCodexDesktopLike() {
+	// 只有非 bundle 的 online latest（npm CLI 同家族版本）才能抬高 CLI 出站版本；codex-proxy
+	// Desktop bundle 的版本与 CLI 0.x 不可线性比较，绝不让其污染 CLI 家族版本（要点1/2）。
+	if online, ok := resolveManagedHeaderOnlineVersion("codex", cfg); ok && online.CodexProxyBundle == nil && !current.isCodexDesktopLike() {
 		candidate := current
 		candidate.Version = online.Version
 		candidate.UserAgentVersion = online.Version
@@ -172,7 +235,71 @@ func ResolveCodexClientProfile(auth *cliproxyauth.Auth, headers http.Header, cfg
 		current = bumpCodexVersionMarkers(candidate, current)
 	}
 
-	return normalizeCodexClientProfile(current, defaultProfile)
+	return enforceCodexManagedFamily(normalizeCodexClientProfile(current, defaultProfile), defaultProfile)
+}
+
+// enforceCodexManagedFamily 把 profile 的出站身份钉死到 baseline 受管家族（Wave10-D
+// 起 baseline 默认是 codex_cli_rs CLI 家族），做两件事：
+//
+//  1. 家族强制（要点2）：当 baseline 是 CLI 家族而 profile 仍是残留的 "Codex Desktop"
+//     身份时，重写 Originator / UA product 为 CLI baseline，并清掉 Desktop 专属的
+//     sec-ch-ua / sec-fetch-* / Accept-* 字段（CLI 不发这些），只保留更高的 high-water
+//     版本。这样 persisted/cached/observed 的 Desktop bundle 不会把 Desktop Originator
+//     或 sec-ch-ua 漏回 CLI 出站。
+//  2. OS/arch/terminal 稳定 pin（仿 claude pinClaudeDeviceProfilePlatform）：CLI baseline
+//     下无条件把 PlatformToken（Mac OS/arch）与 terminal 尾段钉到 baseline，不透传客户端
+//     上报的真实环境（如 Ghostty / Mac OS 15.6.0），每账号稳定一致、可 config 覆盖。
+//     版本部分跟随 high-water 在尾段刷新。
+//
+// 若 baseline 自身仍是 Desktop（例如 operator 用 config 把 UA 配回 Desktop），不改动，
+// 保持向后兼容。
+func enforceCodexManagedFamily(profile CodexClientProfile, baseline CodexClientProfile) CodexClientProfile {
+	if baseline.isCodexDesktopLike() {
+		// baseline 仍是 Desktop（兼容旧 config）：完全不强制。
+		return profile
+	}
+
+	// CLI baseline 下：出站身份（Originator / UA product / platform / terminal）一律钉死
+	// 到 baseline 受管画像；只采纳观测到的更高版本（high-water）。这统一覆盖三种残留：
+	//   - persisted/cached/observed 的 Codex Desktop bundle；
+	//   - 其它 first-party CLI 终端（如 codex-tui / codex_exec）——也回退到 baseline
+	//     codex_cli_rs，不把观测终端身份暴露给上游；
+	//   - 同家族但平台/终端不同（如 Ghostty / Mac OS 15.6.0）——稳定 pin 到 baseline。
+	// 并显式清掉 Desktop 专属指纹字段（CLI 不发 sec-ch-ua / sec-fetch-* / Accept-*）。
+	//
+	// 版本取 max(观测, baseline floor)：baseline 是 floor（0.140.0 或 config/online 抬升后的
+	// 高水位），observed 只能向上抬，不能把出站降级到 floor 以下（only-up high-water）。
+	version := firstNonEmptyString(strings.TrimSpace(profile.Version), strings.TrimSpace(baseline.Version))
+	observedVersion := parseCodexVersion(version)
+	if baseline.version.valid && (!observedVersion.valid || observedVersion.Compare(baseline.version) < 0) {
+		version = firstNonEmptyString(strings.TrimSpace(baseline.Version), version)
+	}
+
+	coerced := baseline
+	coerced.Version = version
+	coerced.UserAgentVersion = version
+	coerced.TailToken = bumpCodexTailVersionMarker(baseline.TailToken, coerced.UserAgentProduct, version)
+	coerced.ChromiumVersion = ""
+	coerced.SecCHUA = ""
+	coerced.SecCHUAMobile = ""
+	coerced.SecCHUAPlatform = ""
+	coerced.AcceptEncoding = ""
+	coerced.AcceptLanguage = ""
+	coerced.SecFetchSite = ""
+	coerced.SecFetchMode = ""
+	coerced.SecFetchDest = ""
+	coerced.UserAgent = buildCodexUserAgent(
+		coerced.UserAgentProduct,
+		coerced.UserAgentVersion,
+		coerced.PlatformToken,
+		coerced.TailToken,
+	)
+	coerced.version = parseCodexVersion(version)
+	// BetaFeatures 是请求能力声明（非身份指纹），保留 profile 观测值。
+	if strings.TrimSpace(profile.BetaFeatures) != "" {
+		coerced.BetaFeatures = profile.BetaFeatures
+	}
+	return coerced
 }
 
 func CodexManagedHeaders(profile CodexClientProfile) map[string]string {
@@ -277,28 +404,68 @@ func codexClientProfileFromAuth(auth *cliproxyauth.Auth, cfg *config.Config) (Co
 }
 
 func defaultCodexClientProfile(cfg *config.Config) CodexClientProfile {
-	userAgent := DefaultCodexManagedUserAgent()
+	// fork(anticorr Wave10-D)：CLI 画像默认值，允许 config 的 originator/os/arch/terminal
+	// 字段覆盖（不透传真实环境，每账号稳定一致）。未直接配置完整 UserAgent 时，用这些
+	// pin 字段构造稳定 CLI UA。
+	originator := defaultCodexManagedOriginator
+	osToken := defaultCodexManagedOS
+	arch := defaultCodexManagedArch
+	terminal := defaultCodexManagedTerminalApp
 	betaFeatures := ""
 	if cfg != nil {
-		if trimmed := strings.TrimSpace(cfg.CodexHeaderDefaults.UserAgent); trimmed != "" {
-			userAgent = trimmed
+		if v := strings.TrimSpace(cfg.CodexHeaderDefaults.Originator); v != "" && isFirstPartyCodexOriginator(v) {
+			originator = v
+		}
+		if v := strings.TrimSpace(cfg.CodexHeaderDefaults.OS); v != "" {
+			osToken = v
+		}
+		if v := strings.TrimSpace(cfg.CodexHeaderDefaults.Arch); v != "" {
+			arch = v
+		}
+		if v := strings.TrimSpace(cfg.CodexHeaderDefaults.Terminal); v != "" {
+			terminal = v
 		}
 		betaFeatures = strings.TrimSpace(cfg.CodexHeaderDefaults.BetaFeatures)
+	}
+	platform := strings.TrimSpace(osToken + "; " + arch)
+	tail := ""
+	if strings.TrimSpace(terminal) != "" {
+		tail = strings.TrimSpace(terminal) + " (" + originator + "; " + defaultCodexManagedVersion + ")"
+	}
+	userAgent := buildCodexUserAgent(originator, defaultCodexManagedVersion, platform, tail)
+	if cfg != nil {
+		if trimmed := strings.TrimSpace(cfg.CodexHeaderDefaults.UserAgent); trimmed != "" {
+			// 完整 UserAgent 覆盖优先级最高（兼容旧 config，也允许配回 Desktop）。
+			userAgent = trimmed
+		}
+	}
+	// fork(anticorr Wave10-D)：默认家族切到 CLI 后，default profile 用专门的 CLI 静态
+	// 来源标记，而不是 community codex-proxy（那是 Desktop bundle 来源）。
+	defaultSource := codexCLIManagedHeaderProfileSource()
+	if codexHeaderDefaultsUserAgentOverridden(cfg) && isCodexDesktopUserAgent(userAgent) {
+		// operator 用 config 显式配回 Desktop UA：沿用 community 来源，保持旧行为。
+		defaultSource = codexProxyManagedHeaderProfileSource()
 	}
 	profile := CodexClientProfile{
 		UserAgent:    userAgent,
 		BetaFeatures: betaFeatures,
-		Originator:   defaultCodexManagedOriginator,
-		Source:       codexProxyManagedHeaderProfileSource(),
+		Originator:   codexOriginatorForUserAgent(userAgent, cfg),
+		Source:       defaultSource,
 	}
 	profile = normalizeCodexClientProfile(profile, CodexClientProfile{})
 	if online, ok := resolveManagedHeaderOnlineVersion("codex", cfg); ok {
-		if online.CodexProxyBundle != nil {
+		// fork(anticorr Wave10-D)：online codex-proxy bundle 是 Desktop 身份（Originator/
+		// sec-ch-ua）。仅当 default 仍是 Desktop 家族时才整体采纳该 bundle；CLI 家族下
+		// 不让 Desktop bundle 把身份切回 Desktop，CLI 的版本高水位走下面非 bundle 分支。
+		if online.CodexProxyBundle != nil && profile.isCodexDesktopLike() {
 			candidate := codexProfileFromProxyBundle(profile, *online.CodexProxyBundle, online.ManagedHeaderProfileSource)
 			if candidate.version.valid && (!profile.version.valid || candidate.version.Compare(profile.version) >= 0) {
 				profile = candidate
 			}
-		} else if !profile.isCodexDesktopLike() {
+		} else if online.CodexProxyBundle == nil && !profile.isCodexDesktopLike() {
+			// 只有非 bundle 的 online latest（npm CLI 版本，与 CLI 同家族）才能抬高 CLI 出站
+			// 版本；codex-proxy Desktop bundle 的版本（year.day.build）与 CLI 0.x 不可线性比较，
+			// 绝不让它污染 CLI 家族版本。
 			candidate := profile
 			candidate.Version = online.Version
 			candidate.UserAgentVersion = online.Version
@@ -425,7 +592,7 @@ func normalizeCodexClientProfile(profile CodexClientProfile, baseline CodexClien
 		profile.PlatformToken = firstNonEmptyString(baseline.PlatformToken, defaultCodexManagedPlatform)
 	}
 	if strings.TrimSpace(profile.TailToken) == "" && originalUserAgent == "" {
-		profile.TailToken = firstNonEmptyString(baseline.TailToken, defaultCodexManagedTerminal)
+		profile.TailToken = firstNonEmptyString(baseline.TailToken, defaultCodexManagedTerminalTail(profile.Originator, profile.Version))
 	}
 	profile = alignCodexFirstPartyIdentity(profile)
 	if profile.isCodexDesktopLike() {
@@ -484,6 +651,40 @@ func (profile CodexClientProfile) isCodexDesktopLike() bool {
 	return strings.EqualFold(strings.TrimSpace(profile.Originator), "Codex Desktop") ||
 		strings.EqualFold(strings.TrimSpace(profile.UserAgentProduct), "Codex Desktop") ||
 		strings.HasPrefix(strings.TrimSpace(profile.UserAgent), "Codex Desktop/")
+}
+
+// IsCodexDesktopProfile 是 isCodexDesktopLike 的导出包装，供 executor 侧（Wave10-D
+// sec-ch-ua 剥离）判断当前出站画像是否仍是 Desktop 家族。
+func IsCodexDesktopProfile(profile CodexClientProfile) bool {
+	return profile.isCodexDesktopLike()
+}
+
+// isCodexDesktopUserAgent 判定一个原始 UA 字符串是否是 Desktop 家族（product=Codex Desktop）。
+// 用于 operator 通过 config 覆盖 UA 时回推默认家族与来源标记。
+func isCodexDesktopUserAgent(userAgent string) bool {
+	product, _, _, _, ok := parseCodexUserAgent(userAgent)
+	if !ok {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(product), "Codex Desktop")
+}
+
+// codexOriginatorForUserAgent 从默认（或 config 覆盖的）UA 推导出 default profile 的
+// Originator。无覆盖时用代码默认 codex_cli_rs；有覆盖且 UA product 是合法 first-party
+// 值时跟随 UA product，否则回退到代码默认。
+func codexOriginatorForUserAgent(userAgent string, cfg *config.Config) string {
+	if !codexHeaderDefaultsUserAgentOverridden(cfg) {
+		return defaultCodexManagedOriginator
+	}
+	product, _, _, _, ok := parseCodexUserAgent(userAgent)
+	if !ok {
+		return defaultCodexManagedOriginator
+	}
+	product = strings.TrimSpace(product)
+	if isFirstPartyCodexOriginator(product) {
+		return product
+	}
+	return defaultCodexManagedOriginator
 }
 
 func alignCodexFirstPartyIdentity(profile CodexClientProfile) CodexClientProfile {
@@ -662,6 +863,21 @@ func cfgCodexBetaFeatures(cfg *config.Config) string {
 
 func codexHeaderDefaultsUserAgentOverridden(cfg *config.Config) bool {
 	return cfg != nil && strings.TrimSpace(cfg.CodexHeaderDefaults.UserAgent) != ""
+}
+
+// codexHeaderDefaultsUserAgentIsCodexLike 判定 config 覆盖的 UA 是否是「可解析的 codex
+// 家族 UA」（product 落在 first-party 白名单或 Desktop）。是的话仍按受管画像走完整
+// resolve（含 high-water）；否则视为 operator 想要的自定义原样 UA，走短路返回。
+func codexHeaderDefaultsUserAgentIsCodexLike(cfg *config.Config) bool {
+	if !codexHeaderDefaultsUserAgentOverridden(cfg) {
+		return false
+	}
+	product, _, _, _, ok := parseCodexUserAgent(strings.TrimSpace(cfg.CodexHeaderDefaults.UserAgent))
+	if !ok {
+		return false
+	}
+	product = strings.TrimSpace(product)
+	return isFirstPartyCodexOriginator(product) || strings.EqualFold(product, "Codex Desktop")
 }
 
 func parseCodexUserAgent(userAgent string) (product string, version string, platform string, tail string, ok bool) {

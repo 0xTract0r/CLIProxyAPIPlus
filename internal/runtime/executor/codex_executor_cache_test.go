@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -301,6 +302,121 @@ func TestApplyCodexHeaders_ApiKeyOriginatorStillPassthrough(t *testing.T) {
 
 	if got := httpReq.Header.Get("Originator"); got != "evil-client" {
 		t.Fatalf("api-key Originator = %q, want passthrough evil-client (unchanged behavior)", got)
+	}
+}
+
+// TestApplyCodexHeaders_CLIDefaultProfileOutbound 覆盖 Wave10-D ①：默认 managed codex
+// 账号（无残留 bundle）出站应是 codex_cli_rs CLI 画像（三段式 UA、floor 0.140.0），
+// 且不带 Desktop 专属 sec-ch-ua / sec-fetch-* 系列。
+func TestApplyCodexHeaders_CLIDefaultProfileOutbound(t *testing.T) {
+	helps.ResetCodexClientProfileCacheForTests()
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", ID: "codex-cli-default", Provider: "codex"}
+	httpReq := newCodexHeadersTestRequest(t, nil)
+
+	applyCodexHeaders(httpReq, auth, "oauth-token", true, &config.Config{})
+
+	if got := httpReq.Header.Get("Originator"); got != "codex_cli_rs" {
+		t.Fatalf("Originator = %q, want codex_cli_rs", got)
+	}
+	ua := httpReq.Header.Get("User-Agent")
+	if !strings.HasPrefix(ua, "codex_cli_rs/0.140.0 (Mac OS 15.7.4; arm64) iTerm.app/3.6.8 (codex_cli_rs; 0.140.0)") {
+		t.Fatalf("User-Agent = %q, want codex_cli_rs CLI three-segment UA", ua)
+	}
+	for _, name := range []string{"sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform", "sec-fetch-site", "sec-fetch-mode", "sec-fetch-dest"} {
+		if got := httpReq.Header.Get(name); got != "" {
+			t.Fatalf("%s = %q, want empty for CLI profile", name, got)
+		}
+	}
+}
+
+// TestApplyCodexHeaders_PersistedDesktopBundleDoesNotPolluteCLIOutbound 是本 PR 最关键的
+// 正确性测试（Wave10-D 要点2/4）。模拟测试端 codex 账号：metadata.headers + 顶层
+// header:* 属性仍是历史 "Codex Desktop" bundle（Desktop UA/Originator + sec-ch-ua 系列），
+// 并带结构化 account_settings。断言出站被 CLI 画像压过：
+//   - Originator = codex_cli_rs（不是 Codex Desktop）
+//   - User-Agent = codex_cli_rs/...（不含 Codex Desktop）
+//   - 完全不带 sec-ch-ua / sec-ch-ua-platform 等 Desktop 专属指纹头
+func TestApplyCodexHeaders_PersistedDesktopBundleDoesNotPolluteCLIOutbound(t *testing.T) {
+	helps.ResetCodexClientProfileCacheForTests()
+	desktopBundle := map[string]any{
+		"User-Agent":         "Codex Desktop/26.318.11754 (darwin; arm64)",
+		"Version":            "26.318.11754",
+		"Originator":         "Codex Desktop",
+		"sec-ch-ua":          `"Chromium";v="144", "Not:A-Brand";v="24"`,
+		"sec-ch-ua-mobile":   "?0",
+		"sec-ch-ua-platform": `"macOS"`,
+		"sec-fetch-site":     "same-origin",
+		"sec-fetch-mode":     "cors",
+		"sec-fetch-dest":     "empty",
+	}
+	auth := &cliproxyauth.Auth{
+		ProxyURL: "direct",
+		ID:       "codex-desktop-residue",
+		Provider: "codex",
+		Metadata: map[string]any{
+			"auth_method": "oauth",
+			"headers":     desktopBundle,
+			"account_settings": map[string]any{
+				"schema_version": 1,
+			},
+		},
+		// 模拟真实 loader：metadata.headers 被投影成 header:* 属性，
+		// ApplyCustomHeadersFromAttrs 会把它们 set 回出站请求。
+		Attributes: map[string]string{
+			"header:User-Agent":         "Codex Desktop/26.318.11754 (darwin; arm64)",
+			"header:Version":            "26.318.11754",
+			"header:Originator":         "Codex Desktop",
+			"header:sec-ch-ua":          `"Chromium";v="144", "Not:A-Brand";v="24"`,
+			"header:sec-ch-ua-mobile":   "?0",
+			"header:sec-ch-ua-platform": `"macOS"`,
+			"header:sec-fetch-site":     "same-origin",
+			"header:sec-fetch-mode":     "cors",
+			"header:sec-fetch-dest":     "empty",
+		},
+	}
+
+	httpReq := newCodexHeadersTestRequest(t, nil)
+	applyCodexHeaders(httpReq, auth, "oauth-token", true, &config.Config{})
+
+	if got := httpReq.Header.Get("Originator"); got != "codex_cli_rs" {
+		t.Fatalf("Originator = %q, persisted Desktop bundle leaked, want codex_cli_rs", got)
+	}
+	ua := httpReq.Header.Get("User-Agent")
+	if strings.Contains(ua, "Codex Desktop") {
+		t.Fatalf("User-Agent = %q leaked Codex Desktop, want codex_cli_rs CLI UA", ua)
+	}
+	if !strings.HasPrefix(ua, "codex_cli_rs/") {
+		t.Fatalf("User-Agent = %q, want codex_cli_rs CLI UA", ua)
+	}
+	for _, name := range []string{"sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform", "sec-fetch-site", "sec-fetch-mode", "sec-fetch-dest"} {
+		if got := httpReq.Header.Get(name); got != "" {
+			t.Fatalf("%s = %q leaked from Desktop bundle, want stripped for CLI profile", name, got)
+		}
+	}
+}
+
+// TestApplyCodexHeaders_OSArchTerminalPinnedAcrossObservedClients 覆盖 Wave10-D ⑤：
+// 不同客户端上报不同 OS/terminal 时，出站 UA 的 OS/arch/terminal 稳定 pin 到 baseline。
+func TestApplyCodexHeaders_OSArchTerminalPinnedAcrossObservedClients(t *testing.T) {
+	helps.ResetCodexClientProfileCacheForTests()
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", ID: "codex-pin", Provider: "codex"}
+	httpReq := newCodexHeadersTestRequest(t, map[string]string{
+		"User-Agent": "codex_cli_rs/0.145.0 (Mac OS 14.0.0; arm64) Ghostty/9.9.9 (codex_cli_rs; 0.145.0)",
+		"Version":    "0.145.0",
+		"Originator": "codex_cli_rs",
+	})
+
+	applyCodexHeaders(httpReq, auth, "oauth-token", true, &config.Config{})
+
+	ua := httpReq.Header.Get("User-Agent")
+	if !strings.Contains(ua, "Mac OS 15.7.4; arm64") {
+		t.Fatalf("User-Agent = %q, want pinned Mac OS 15.7.4; arm64", ua)
+	}
+	if strings.Contains(ua, "Ghostty") || strings.Contains(ua, "Mac OS 14.0.0") {
+		t.Fatalf("User-Agent = %q leaked observed OS/terminal, want pinned", ua)
+	}
+	if !strings.Contains(ua, "iTerm.app/3.6.8 (codex_cli_rs; 0.145.0)") {
+		t.Fatalf("User-Agent = %q, want pinned terminal with bumped version 0.145.0", ua)
 	}
 }
 
