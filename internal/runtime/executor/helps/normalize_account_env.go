@@ -68,7 +68,13 @@ import (
 // onto. The per-account distinction lives in the workspace directory suffix, so
 // all accounts share an identical, machine-neutral home shape while remaining
 // individually consistent.
-const canonicalHomeRoot = "/home/agent"
+//
+// fork(anticorr): 取 macOS 风格 /Users/agent（而非旧的 Linux 风格 /home/agent）。
+// claude/codex 的出站 UA 基线都是 MacOS（X-Stainless-Os=MacOS / codex UA "Mac OS"），
+// 路径若用 /home（Linux 形态）会和 UA 自相矛盾，构成"自称 Mac 但路径是 Linux"的
+// 反关联信号。改成 /Users 后 body 路径与 header OS 画像一致。这是 claude+codex 共用
+// 的 helper，两边出站 cwd / CODEX_HOME 都随之变成 /Users/agent 前缀。
+const canonicalHomeRoot = "/Users/agent"
 
 // baselineBodyOS describes how a given Stainless baseline OS name (the value of
 // X-Stainless-Os emitted by ResolveClaudeDeviceProfile) is represented inside the

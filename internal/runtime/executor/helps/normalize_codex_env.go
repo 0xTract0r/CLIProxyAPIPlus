@@ -32,17 +32,23 @@ import (
 // 归一目标（每请求只算一次派生值，header 与 body 处处用同一组值，保证一致 +
 // 幂等 + 跨账号不同）：
 //   - canonical cwd        = AccountCanonicalCwd(auth, apiKey)
-//   - canonical CODEX_HOME = /home/agent/codex-home-<hex8>
+//   - canonical CODEX_HOME = /Users/agent/codex-home-<hex8>
 //   - git commit hash      = 合法 40-hex
 //   - git remote           = git@github.com:<hex8>/<hex8>.git
 //
 // 全部归一都是无条件的（不依赖任何开关），与 claude⑦ 的 cwd 无条件归一一致。
 //
-// 指纹边界（绝不改动）：<timezone> / <shell> / <current_date>、UA、出站时间、
-// Kiro 相关字段一律原样透传。#3/#4/#5 的 body 自由文本只对"探测到的真实
-// cwd / 真实 CODEX_HOME"两个已知字面串做精确替换，不对 AGENTS.md / 用户
-// prompt 正文做宽泛 /Users|/home 正则 sweep（正文可能含他人合法绝对路径，
-// 宽泛 sweep 有误改风险）。
+// environment_context 归一（anticorr 决策）：
+//   - <timezone> → 固定 America/Los_Angeles
+//   - <shell>    → 固定 zsh
+// 这两个字段会随真实开发机的本地化设置变化，多人共用同一上游账号时泄漏各自时区/
+// shell，与 macOS 美区基线画像（UA Mac OS / 路径 /Users）发散，故钉成统一基线值。
+//
+// 指纹边界（绝不改动）：<current_date>、UA、出站真实时间、Kiro 相关字段一律原样
+// 透传——current_date 属于"出站时间不改"语义，不在归一范围。
+// #3/#4/#5 的 body 自由文本只对"探测到的真实 cwd / 真实 CODEX_HOME"两个已知字面
+// 串做精确替换，不对 AGENTS.md / 用户 prompt 正文做宽泛 /Users|/home 正则 sweep
+// （正文可能含他人合法绝对路径，宽泛 sweep 有误改风险）。
 
 // codexCanonicalValues 是一次请求派生出的全部归一目标值。同一请求里 header 与
 // body 共用同一个实例，保证 #1/#2 逐值一致。
@@ -73,7 +79,7 @@ func resolveCodexCanonicalValues(auth *cliproxyauth.Auth, apiKey string) codexCa
 }
 
 // canonicalCodexHome 派生每账号 canonical CODEX_HOME，复用 canonicalHomeRoot 根，
-// 形如 /home/agent/codex-home-<hex8>。
+// 形如 /Users/agent/codex-home-<hex8>。
 func canonicalCodexHome(scopeKey string) string {
 	sum := sha256.Sum256([]byte("cliproxy-canonical-codex-home\x00" + scopeKey))
 	id := binary.BigEndian.Uint32(sum[:4])
@@ -112,6 +118,18 @@ var codexAgentsHeaderPattern = regexp.MustCompile(`AGENTS\.md instructions for (
 // group 1 是 skills 之前的目录前缀（即真实 CODEX_HOME）。只匹配 .system 内置
 // skill 路径，避免抓到 cwd 下的 .codex/skills 用户 skill。
 var codexSkillFilePattern = regexp.MustCompile(`\(file:\s*(\S+?)/skills/\.system/`)
+
+// codexShellTagPattern / codexTimezoneTagPattern 抓 environment_context 里的
+// <shell>...</shell> / <timezone>...</timezone>，归一成统一基线值（见文件头注）。
+// 非贪婪、允许标签内出现属性外的任意内部文本；不动 <current_date>。
+var codexShellTagPattern = regexp.MustCompile(`(?s)<shell>.*?</shell>`)
+var codexTimezoneTagPattern = regexp.MustCompile(`(?s)<timezone>.*?</timezone>`)
+
+// codexCanonicalShell / codexCanonicalTimezone 是归一后的基线值（macOS 美区画像）。
+const (
+	codexCanonicalShell    = "zsh"
+	codexCanonicalTimezone = "America/Los_Angeles"
+)
 
 // NormalizeCodexTurnMetadataHeader 归一一个 turn-metadata header（#1）。header key
 // 大小写不敏感取值；归一后写回同一 key。无解析失败即原样返回（不抛错、不丢 header）。
@@ -219,7 +237,8 @@ func NormalizeCodexPaths(body []byte, auth *cliproxyauth.Auth, apiKey string) []
 		}
 	}
 
-	// #3/#4/#5 在自由文本字段里：instructions（string）+ input[].content[].text。
+	// #3/#4/#5 在自由文本字段里：instructions（string）+ input[].content[].text
+	// + input[].text（直挂文本）+ input[].output（function_call_output 工具输出回显）。
 	body = normalizeCodexBodyText(body, "instructions", vals)
 	body = normalizeCodexInputText(body, vals)
 	return body
@@ -239,39 +258,62 @@ func normalizeCodexBodyText(body []byte, path string, vals codexCanonicalValues)
 	return body
 }
 
-// normalizeCodexInputText 遍历 input[].content[].text 并归一每段文本。
+// normalizeCodexInputText 遍历 input[] 并归一其中的自由文本字段：
+//   - content（string）/ content[].text：会话文本块；
+//   - text（string）：input 项直挂文本字段（G1 扩展）；
+//   - output（string）：function_call_output 工具输出回显（G1 扩展，真实 cwd /
+//     CODEX_HOME 会随工具输出回显到上游）。
+//
+// 三类字段各自独立 sweep，互不影响；非 string 类型一律跳过；解析失败原样返回。
 func normalizeCodexInputText(body []byte, vals codexCanonicalValues) []byte {
 	input := gjson.GetBytes(body, "input")
 	if !input.Exists() || !input.IsArray() {
 		return body
 	}
 	input.ForEach(func(inKey, item gjson.Result) bool {
-		content := item.Get("content")
-		if !content.Exists() {
-			return true
-		}
 		basePath := "input." + inKey.String()
-		if content.Type == gjson.String {
-			text := content.String()
-			rewritten := rewriteCodexText(text, vals)
-			if rewritten != text {
-				body, _ = sjson.SetBytes(body, basePath+".content", rewritten)
-			}
-			return true
-		}
-		if content.IsArray() {
-			content.ForEach(func(cKey, block gjson.Result) bool {
-				t := block.Get("text")
-				if t.Type != gjson.String {
-					return true
-				}
-				text := t.String()
+
+		// content（string）/ content[].text。
+		content := item.Get("content")
+		if content.Exists() {
+			if content.Type == gjson.String {
+				text := content.String()
 				rewritten := rewriteCodexText(text, vals)
 				if rewritten != text {
-					body, _ = sjson.SetBytes(body, basePath+".content."+cKey.String()+".text", rewritten)
+					body, _ = sjson.SetBytes(body, basePath+".content", rewritten)
 				}
-				return true
-			})
+			} else if content.IsArray() {
+				content.ForEach(func(cKey, block gjson.Result) bool {
+					t := block.Get("text")
+					if t.Type != gjson.String {
+						return true
+					}
+					text := t.String()
+					rewritten := rewriteCodexText(text, vals)
+					if rewritten != text {
+						body, _ = sjson.SetBytes(body, basePath+".content."+cKey.String()+".text", rewritten)
+					}
+					return true
+				})
+			}
+		}
+
+		// input[].text（直挂文本，G1）。
+		if t := item.Get("text"); t.Type == gjson.String {
+			text := t.String()
+			rewritten := rewriteCodexText(text, vals)
+			if rewritten != text {
+				body, _ = sjson.SetBytes(body, basePath+".text", rewritten)
+			}
+		}
+
+		// input[].output（function_call_output 工具输出回显，G1）。
+		if o := item.Get("output"); o.Type == gjson.String {
+			text := o.String()
+			rewritten := rewriteCodexText(text, vals)
+			if rewritten != text {
+				body, _ = sjson.SetBytes(body, basePath+".output", rewritten)
+			}
 		}
 		return true
 	})
@@ -304,6 +346,16 @@ func rewriteCodexText(text string, vals codexCanonicalValues) string {
 		if cwd != "" && cwd != vals.cwd {
 			text = strings.ReplaceAll(text, cwd, vals.cwd)
 		}
+	}
+
+	// environment_context 的 <shell> / <timezone> 归一成统一基线值（<current_date>
+	// 不动）。仅当文本含 environment_context 标签时才替换，避免误改正文里出现的同名
+	// 字面。幂等：已是基线值时正则替换结果不变。
+	if strings.Contains(text, "<shell>") {
+		text = codexShellTagPattern.ReplaceAllString(text, "<shell>"+codexCanonicalShell+"</shell>")
+	}
+	if strings.Contains(text, "<timezone>") {
+		text = codexTimezoneTagPattern.ReplaceAllString(text, "<timezone>"+codexCanonicalTimezone+"</timezone>")
 	}
 	return text
 }

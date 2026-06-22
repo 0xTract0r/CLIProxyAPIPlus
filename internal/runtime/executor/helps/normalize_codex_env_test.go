@@ -121,7 +121,9 @@ func TestNormalizeCodexPaths_GitFieldsDerived(t *testing.T) {
 	}
 }
 
-// TestNormalizeCodexPaths_FingerprintBoundaryUntouched：指纹边界字段原样不变。
+// TestNormalizeCodexPaths_FingerprintBoundaryUntouched：current_date（指纹边界）原样
+// 不变；shell/timezone 归一到基线值（fixture 本就是基线 zsh / America/Los_Angeles，
+// 归一后仍是这两个值，非基线值的归一另见 TestNormalizeCodexPaths_ShellTimezoneNormalized）。
 func TestNormalizeCodexPaths_FingerprintBoundaryUntouched(t *testing.T) {
 	auth := codexAuth("codex-a.json")
 	out := NormalizeCodexPaths(codexBodyFixture(t), auth, "key-1")
@@ -129,13 +131,17 @@ func TestNormalizeCodexPaths_FingerprintBoundaryUntouched(t *testing.T) {
 	// 裸字节）。
 	got := gjson.GetBytes(out, "input.0.content.0.text").String()
 
+	// current_date 必须原样保留（出站时间不改）。
+	if !strings.Contains(got, "<current_date>2026-06-19</current_date>") {
+		t.Fatalf("current_date 被改动:\n%s", got)
+	}
+	// shell/timezone 归一后为基线值。
 	for _, marker := range []string{
 		"<shell>zsh</shell>",
-		"<current_date>2026-06-19</current_date>",
 		"<timezone>America/Los_Angeles</timezone>",
 	} {
 		if !strings.Contains(got, marker) {
-			t.Fatalf("指纹边界字段被改动，缺 %q:\n%s", marker, got)
+			t.Fatalf("shell/timezone 基线值缺失，缺 %q:\n%s", marker, got)
 		}
 	}
 }
@@ -212,6 +218,105 @@ func TestNormalizeCodexPaths_CodexHomeLiteralProbe(t *testing.T) {
 	}
 	if !strings.HasPrefix(canonicalHome, canonicalHomeRoot+"/codex-home-") {
 		t.Fatalf("canonical CODEX_HOME 格式非法: %q", canonicalHome)
+	}
+}
+
+// TestNormalizeCodexPaths_ShellTimezoneNormalized 验证 anticorr 项 5：非基线的
+// <shell> / <timezone> 被归一成 zsh / America/Los_Angeles，<current_date> 原样不动。
+func TestNormalizeCodexPaths_ShellTimezoneNormalized(t *testing.T) {
+	auth := codexAuth("codex-a.json")
+	// 用一个非基线时区/shell 的 environment_context（模拟另一名共用账号的开发机）。
+	envCtx := "<environment_context>\n  <cwd>/Users/corylin/Project/ai/cliproxy-stack/.worktrees/anticorr-hardening</cwd>\n  <shell>bash</shell>\n  <current_date>2026-06-19</current_date>\n  <timezone>Asia/Shanghai</timezone>\n</environment_context>"
+	root := map[string]any{
+		"model": "gpt-5",
+		"input": []any{
+			map[string]any{
+				"type":    "message",
+				"role":    "user",
+				"content": []any{map[string]any{"type": "input_text", "text": "hi\n\n" + envCtx}},
+			},
+		},
+	}
+	raw, err := json.Marshal(root)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	out := NormalizeCodexPaths(raw, auth, "key-1")
+	got := gjson.GetBytes(out, "input.0.content.0.text").String()
+
+	if !strings.Contains(got, "<shell>zsh</shell>") {
+		t.Fatalf("shell 未归一成 zsh:\n%s", got)
+	}
+	if !strings.Contains(got, "<timezone>America/Los_Angeles</timezone>") {
+		t.Fatalf("timezone 未归一成 America/Los_Angeles:\n%s", got)
+	}
+	if strings.Contains(got, "<shell>bash</shell>") || strings.Contains(got, "Asia/Shanghai") {
+		t.Fatalf("真实 shell/timezone 仍残留:\n%s", got)
+	}
+	// current_date 属于"出站时间不改"，原样保留。
+	if !strings.Contains(got, "<current_date>2026-06-19</current_date>") {
+		t.Fatalf("current_date 被改动:\n%s", got)
+	}
+	// 幂等：再跑一次 byte-equal。
+	twice := NormalizeCodexPaths(append([]byte(nil), out...), auth, "key-1")
+	if string(out) != string(twice) {
+		t.Fatalf("shell/timezone 归一非幂等")
+	}
+}
+
+// TestNormalizeCodexPaths_FunctionCallOutputAndInputText 验证 anticorr 项 6（G1）：
+// function_call_output.output 与 input[].text 直挂字段里的真实 cwd / CODEX_HOME 同样归一。
+func TestNormalizeCodexPaths_FunctionCallOutputAndInputText(t *testing.T) {
+	auth := codexAuth("codex-a.json")
+	canonical := AccountCanonicalCwd(auth, "key-1")
+
+	// input 同时含：function_call_output（output 直挂工具回显）+ 一个 input 项的
+	// text 直挂字段，两者都带真实 cwd / CODEX_HOME。沿用与 instructions 同一套保守
+	// sweep：cwd 必须由 <cwd>/<root>/AGENTS.md 锚点探测（不做宽泛 /Users sweep），
+	// CODEX_HOME 由 skills/.system 文件路径反推。
+	toolOutput := "<root>" + codexRealCwd + "</root> (file: " + codexRealHome + "/skills/.system/x/SKILL.md)"
+	directText := "# AGENTS.md instructions for " + codexRealCwd
+	root := map[string]any{
+		"model": "gpt-5",
+		"input": []any{
+			map[string]any{"type": "function_call_output", "call_id": "c1", "output": toolOutput},
+			map[string]any{"type": "input_text", "text": directText},
+		},
+	}
+	raw, err := json.Marshal(root)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	out := NormalizeCodexPaths(raw, auth, "key-1")
+
+	gotOutput := gjson.GetBytes(out, "input.0.output").String()
+	if strings.Contains(gotOutput, codexRealCwd) {
+		t.Fatalf("function_call_output.output 真实 cwd 仍残留:\n%s", gotOutput)
+	}
+	if strings.Contains(gotOutput, codexRealHome) {
+		t.Fatalf("function_call_output.output 真实 CODEX_HOME 仍残留:\n%s", gotOutput)
+	}
+	if !strings.Contains(gotOutput, canonical) {
+		t.Fatalf("function_call_output.output 缺 canonical cwd:\n%s", gotOutput)
+	}
+
+	gotText := gjson.GetBytes(out, "input.1.text").String()
+	if strings.Contains(gotText, codexRealCwd) {
+		t.Fatalf("input[].text 真实 cwd 仍残留:\n%s", gotText)
+	}
+	if !strings.Contains(gotText, canonical) {
+		t.Fatalf("input[].text 缺 canonical cwd:\n%s", gotText)
+	}
+
+	// 幂等。
+	twice := NormalizeCodexPaths(append([]byte(nil), out...), auth, "key-1")
+	if string(out) != string(twice) {
+		t.Fatalf("G1 归一非幂等")
+	}
+	if !gjson.ValidBytes(out) {
+		t.Fatalf("归一后 body 非合法 JSON:\n%s", out)
 	}
 }
 
