@@ -74,7 +74,8 @@ func TestApplyOAuthAccountSetupToRecordPersistsRuntimeIdentity(t *testing.T) {
 		t.Fatalf("runtime identity missing: %#v", stored.RuntimeIdentityState)
 	}
 	current := stored.RuntimeIdentityState.Current
-	if current.ProfileID != "codex_proxy_compatible_v1" || current.TLSProfileID != "codex_proxy_compatible_v1" {
+	// codex 核心托管默认出站真实是 codex_rustls_native_v1（uTLS 复刻 codex-rs rustls）。
+	if current.ProfileID != "codex_rustls_native_v1" || current.TLSProfileID != "codex_rustls_native_v1" {
 		t.Fatalf("profile IDs = (%q,%q)", current.ProfileID, current.TLSProfileID)
 	}
 	if !current.CoreManaged || !current.RuntimeEnforced {
