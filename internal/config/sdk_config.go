@@ -9,13 +9,15 @@ type SDKConfig struct {
 	// ProxyURL is the URL of an optional proxy server to use for outbound requests.
 	ProxyURL string `yaml:"proxy-url" json:"proxy-url"`
 
-	// DisableImageGeneration controls whether the built-in image_generation tool is injected/allowed.
+	// DisableImageGeneration controls whether the built-in image_generation tool is injected/allowed
+	// on the Codex chat/responses path.
 	//
-	// This fork mainly serves unverified ChatGPT accounts, for which the hosted
-	// image_generation tool is harmful (OpenAI rejects it with
-	// image_generation_user_error "The model 'gpt-image-2' does not exist."), so the
-	// default behavior strips it. The tri-state mode keeps that default while letting
-	// verified users opt back into image generation.
+	// This fork strips the tool by default (mode "chat") as a conservative default. Codex image
+	// generation requires a non-free account and an upstream that still accepts the built-in tool for
+	// the requested model; when that does not hold the request fails (a 400 image_generation_user_error
+	// such as "The model 'gpt-image-2' does not exist." has been observed). That 400 is classified
+	// request-level in conductor.go so it does not rotate accounts. This switch is independent of the
+	// /v1/images/* auth eligibility, which separately rejects free-tier Codex accounts (disallow_free_auth).
 	//
 	// Supported values:
 	//   - false (default): in this fork the image_generation tool is stripped from request
