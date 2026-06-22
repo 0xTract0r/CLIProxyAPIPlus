@@ -1335,8 +1335,19 @@ func TestGetAuthFileAccountSettings_PersistsCoreManagedRuntimeIdentity(t *testin
 	if firstIdentity.IdentityID == "" {
 		t.Fatalf("identity_id should be generated")
 	}
-	if firstIdentity.ProfileID != "codex_proxy_compatible_v1" || firstIdentity.TLSProfileID != "codex_proxy_compatible_v1" {
-		t.Fatalf("profile IDs = (%q, %q), want codex_proxy_compatible_v1", firstIdentity.ProfileID, firstIdentity.TLSProfileID)
+	// codex 核心托管默认出站真实是 codex_rustls_native_v1（uTLS 复刻 codex-rs rustls），
+	// 摘要必须如实反映，不再是 stale 的 codex_proxy_compatible_v1。
+	if firstIdentity.ProfileID != "codex_rustls_native_v1" || firstIdentity.TLSProfileID != "codex_rustls_native_v1" {
+		t.Fatalf("profile IDs = (%q, %q), want codex_rustls_native_v1", firstIdentity.ProfileID, firstIdentity.TLSProfileID)
+	}
+	if got := firstIdentity.Family; got != "codex-rustls-native" {
+		t.Fatalf("codex family = %q, want codex-rustls-native", got)
+	}
+	if got := firstIdentity.TLSFamily; got != "rustls-native" {
+		t.Fatalf("codex tls_family = %q, want rustls-native", got)
+	}
+	if tlsStatus := firstIdentity.RuntimeSemantics["tls"]; strings.Contains(tlsStatus, "Go approximation") || !strings.Contains(tlsStatus, "codex_rustls_native_v1") {
+		t.Fatalf("codex runtime_semantics.tls = %q, want real codex_rustls native (no Go approximation)", tlsStatus)
 	}
 	if !firstIdentity.CoreManaged || !firstIdentity.RuntimeEnforced {
 		t.Fatalf("identity core/runtime flags = core:%v enforced:%v", firstIdentity.CoreManaged, firstIdentity.RuntimeEnforced)

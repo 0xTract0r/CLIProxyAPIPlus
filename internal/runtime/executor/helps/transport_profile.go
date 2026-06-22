@@ -177,7 +177,12 @@ func coreManagedRuntimeTransportProfile(provider string) *RuntimeTransportProfil
 		// ResolveRuntimeTransportProfile before this function is reached).
 		profileID = claudeCLIClientHelloProfileID
 	case "codex":
-		profileID = "codex_proxy_compatible_v1"
+		// codex->chatgpt.com 的核心托管默认出站，真实出站 TLS 由 codex_executor 的 4 个
+		// call site 显式钉死 NewUtlsHTTPClientForProfile(CodexRustlsClientHelloProfileID)，
+		// 也就是 uTLS HelloCustom 复刻真实 codex-rs(rustls) ClientHello（JA3 e4d448cd）。
+		// 摘要必须如实反映这个真实出站 profile，而不是早期 stale 的
+		// codex_proxy_compatible_v1（那是社区 Go-proxy 兼容近似，不是真实出站）。
+		profileID = CodexRustlsClientHelloProfileID
 	case "gemini-cli":
 		profileID = "gemini_cli_native_v1"
 	}
@@ -187,8 +192,11 @@ func coreManagedRuntimeTransportProfile(provider string) *RuntimeTransportProfil
 		family = "utls"
 		tlsFamily = "utls"
 	} else if provider == "codex" {
-		family = "codex-proxy-compatible"
-		tlsFamily = "rustls-compatible"
+		// 真实出站是 uTLS HelloCustom 复刻 codex-rs 的 rustls 指纹，不是 Go 近似，
+		// 因此 family/tls_family 用 rustls-native 口径，避免 "compatible/approximation"
+		// 这类把真实指纹说成兼容近似的 stale 误导文案。
+		family = "codex-rustls-native"
+		tlsFamily = "rustls-native"
 	}
 	profile := &RuntimeTransportProfile{
 		Provider:            provider,
@@ -403,7 +411,9 @@ func (p *RuntimeTransportProfile) SupportsTransportRuntime() bool {
 		if p.isCLINativeProfile() {
 			return true
 		}
-		if p.Family != "" && p.Family != "standard" && p.Family != "codex-proxy-compatible" {
+		// codex-rustls-native 是核心托管默认出站的真实 family（uTLS 复刻 codex-rs rustls）；
+		// codex-proxy-compatible 保留给显式社区 preset。
+		if p.Family != "" && p.Family != "standard" && p.Family != "codex-proxy-compatible" && p.Family != "codex-rustls-native" {
 			return false
 		}
 		switch p.ProfileID {
@@ -456,7 +466,9 @@ func (p *RuntimeTransportProfile) SupportsTLSRuntime() bool {
 		if p.isCLINativeProfile() {
 			return true
 		}
-		if p.TLSFamily != "" && p.TLSFamily != "go-tls" && p.TLSFamily != "standard" && p.TLSFamily != "rustls-compatible" {
+		// rustls-native 是核心托管默认出站的真实 tls_family（uTLS HelloCustom 复刻
+		// codex-rs rustls 指纹）；rustls-compatible 保留给显式社区 preset 的 Go 近似口径。
+		if p.TLSFamily != "" && p.TLSFamily != "go-tls" && p.TLSFamily != "standard" && p.TLSFamily != "rustls-compatible" && p.TLSFamily != "rustls-native" {
 			return false
 		}
 		switch p.TLSProfileID {
@@ -524,6 +536,9 @@ func (p *RuntimeTransportProfile) runtimeTransportStatus() string {
 			if p.Provider == "claude" && p.Family == "claude-reqwest-compatible" {
 				return fmt.Sprintf("%s core-managed Claude reqwest/rustls-compatible Go transport identity %q is runtime-enforced", provider, profileID)
 			}
+			if p.Provider == "codex" && p.Family == "codex-rustls-native" {
+				return fmt.Sprintf("%s core-managed codex-rs (rustls) native outbound transport identity %q is runtime-enforced", provider, profileID)
+			}
 			if p.Provider == "codex" && p.Family == "codex-proxy-compatible" {
 				return fmt.Sprintf("%s core-managed Codex-Proxy-compatible Go transport identity %q is runtime-enforced", provider, profileID)
 			}
@@ -559,6 +574,11 @@ func (p *RuntimeTransportProfile) runtimeTLSStatus() string {
 		if p.CoreManaged {
 			if p.Provider == "claude" && p.TLSFamily == "rustls-compatible" {
 				return fmt.Sprintf("%s core-managed Claude reqwest/rustls-compatible TLS target %q is runtime-enforced via Go approximation", provider, profileID)
+			}
+			if p.Provider == "codex" && p.TLSFamily == "rustls-native" {
+				// 真实出站：uTLS HelloCustom 复刻真实 codex-rs(rustls) ClientHello
+				// （JA3 e4d448cdfe06dc1243c1eb026c74ac9a），不是 Go 近似。
+				return fmt.Sprintf("%s core-managed codex-rs (rustls) native TLS target %q is runtime-enforced via uTLS HelloCustom replicating the real codex-rs ClientHello (JA3 e4d448cdfe06dc1243c1eb026c74ac9a)", provider, profileID)
 			}
 			if p.Provider == "codex" && p.TLSFamily == "rustls-compatible" {
 				return fmt.Sprintf("%s core-managed Codex-Proxy-compatible TLS target %q is runtime-enforced via Go approximation", provider, profileID)

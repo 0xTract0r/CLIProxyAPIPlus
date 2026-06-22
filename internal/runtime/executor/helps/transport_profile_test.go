@@ -238,7 +238,9 @@ func TestRuntimeTransportProfile_CoreManagedAccountIdentityForEmptyCLIProvider(t
 		// claude default (no tls_profile) now replicates the real claude-cli
 		// ClientHello via uTLS HelloCustom, not the prior reqwest/rustls preset.
 		{name: "claude", provider: "claude", profileID: "claude_cli_clienthello_v1"},
-		{name: "codex", provider: "codex", profileID: "codex_proxy_compatible_v1"},
+		// codex 核心托管默认出站真实是 codex_rustls_native_v1（uTLS 复刻 codex-rs rustls，
+		// JA3 e4d448cd），不再是 stale 的 codex_proxy_compatible_v1。
+		{name: "codex", provider: "codex", profileID: "codex_rustls_native_v1"},
 		{name: "gemini", provider: "gemini", profileID: "gemini_cli_native_v1"},
 		{name: "gemini cli", provider: "gemini-cli", profileID: "gemini_cli_native_v1"},
 	} {
@@ -258,8 +260,25 @@ func TestRuntimeTransportProfile_CoreManagedAccountIdentityForEmptyCLIProvider(t
 			if profile.ProfileID != tc.profileID || profile.TLSProfileID != tc.profileID {
 				t.Fatalf("profile IDs = (%q, %q), want %q", profile.ProfileID, profile.TLSProfileID, tc.profileID)
 			}
-			if tc.provider == "codex" && (profile.Family != "codex-proxy-compatible" || profile.TLSFamily != "rustls-compatible") {
-				t.Fatalf("codex managed families = (%q, %q), want codex-proxy-compatible/rustls-compatible", profile.Family, profile.TLSFamily)
+			if tc.provider == "codex" && (profile.Family != "codex-rustls-native" || profile.TLSFamily != "rustls-native") {
+				t.Fatalf("codex managed families = (%q, %q), want codex-rustls-native/rustls-native", profile.Family, profile.TLSFamily)
+			}
+			if tc.provider == "codex" {
+				// 运行 Profile 摘要的 tls_status 必须如实反映真实出站（uTLS 复刻
+				// codex-rs rustls 指纹），不能再出现 stale 的 "Go approximation"
+				// 或 codex_proxy_compatible_v1 误导文案。
+				if strings.Contains(profile.TLSStatus, "Go approximation") {
+					t.Fatalf("codex tls_status still claims Go approximation: %q", profile.TLSStatus)
+				}
+				if strings.Contains(profile.TLSStatus, "codex_proxy_compatible_v1") {
+					t.Fatalf("codex tls_status still references stale codex_proxy_compatible_v1: %q", profile.TLSStatus)
+				}
+				if !strings.Contains(profile.TLSStatus, "codex_rustls_native_v1") {
+					t.Fatalf("codex tls_status should reference real codex_rustls_native_v1: %q", profile.TLSStatus)
+				}
+				if !strings.Contains(profile.TLSStatus, "e4d448cd") {
+					t.Fatalf("codex tls_status should cite the real codex-rs JA3: %q", profile.TLSStatus)
+				}
 			}
 			if tc.provider == "claude" && (profile.Family != "utls" || profile.TLSFamily != "utls") {
 				t.Fatalf("claude managed families = (%q, %q), want utls/utls", profile.Family, profile.TLSFamily)
