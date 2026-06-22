@@ -101,8 +101,13 @@ func TestPrepareOAuthSetupRuntimeAuthCanBeReusedForSavedRecord(t *testing.T) {
 		t.Fatalf("exchange managed_header_seed missing: %#v", exchangeAuth.Metadata)
 	}
 	exchangeHeaders := coreauth.ExtractCustomHeadersFromMetadata(exchangeAuth.Metadata)
-	if exchangeHeaders["User-Agent"] == "" || exchangeHeaders["Version"] == "" || exchangeHeaders["sec-ch-ua"] == "" {
+	// fork(anticorr Wave10-D)：codex CLI 画像出站只带 User-Agent/Version/Originator，
+	// 不再带 Desktop 专属 sec-ch-ua。
+	if exchangeHeaders["User-Agent"] == "" || exchangeHeaders["Version"] == "" {
 		t.Fatalf("exchange identity headers incomplete: %#v", exchangeHeaders)
+	}
+	if got := exchangeHeaders["sec-ch-ua"]; got != "" {
+		t.Fatalf("codex exchange sec-ch-ua = %q, want empty for CLI profile", got)
 	}
 
 	record := &coreauth.Auth{
@@ -203,14 +208,20 @@ func TestApplyOAuthAccountSetupToRecordGeneratesPerAccountManagedHeaders(t *test
 			t.Fatalf("%s User-Agent missing: first=%#v", provider, firstHeaders)
 		}
 		if provider == "codex" {
-			if firstHeaders["User-Agent"] == secondHeaders["User-Agent"] {
-				t.Fatalf("codex User-Agent should use fixed near-latest account variants, first=%q second=%q", firstHeaders["User-Agent"], secondHeaders["User-Agent"])
+			// fork(anticorr Wave10-D)：codex 切到 CLI 画像后，出站是单一自洽的 codex_cli_rs
+			// 版本，不再做 per-account Desktop 变体；像 claude 一样停在 coherent CLI baseline，
+			// 也不带 sec-ch-ua。
+			if firstHeaders["User-Agent"] != secondHeaders["User-Agent"] {
+				t.Fatalf("codex User-Agent should stay on coherent CLI baseline, first=%q second=%q", firstHeaders["User-Agent"], secondHeaders["User-Agent"])
 			}
-			if firstHeaders["Version"] == secondHeaders["Version"] {
-				t.Fatalf("codex Version should use fixed near-latest account variants, first=%q second=%q", firstHeaders["Version"], secondHeaders["Version"])
+			if firstHeaders["Version"] != secondHeaders["Version"] {
+				t.Fatalf("codex Version should stay on coherent CLI baseline, first=%q second=%q", firstHeaders["Version"], secondHeaders["Version"])
 			}
-			if firstHeaders["sec-ch-ua"] == secondHeaders["sec-ch-ua"] {
-				t.Fatalf("codex sec-ch-ua should retain account-level variance without mutating app version, first=%q second=%q", firstHeaders["sec-ch-ua"], secondHeaders["sec-ch-ua"])
+			if firstHeaders["sec-ch-ua"] != "" || secondHeaders["sec-ch-ua"] != "" {
+				t.Fatalf("codex CLI profile should not emit sec-ch-ua, first=%q second=%q", firstHeaders["sec-ch-ua"], secondHeaders["sec-ch-ua"])
+			}
+			if firstHeaders["Originator"] != "codex_cli_rs" {
+				t.Fatalf("codex Originator = %q, want codex_cli_rs", firstHeaders["Originator"])
 			}
 		} else if provider == "claude" {
 			if firstHeaders["User-Agent"] != secondHeaders["User-Agent"] {
@@ -238,8 +249,9 @@ func TestApplyOAuthAccountSetupToRecordGeneratesPerAccountManagedHeaders(t *test
 			t.Fatalf("%s second version variant should be persisted: %#v", provider, secondStored.ManagedHeaderState)
 		}
 		if provider == "codex" {
-			if firstStored.ManagedHeaderState.Current.BrandOrderVariant == "" || secondStored.ManagedHeaderState.Current.BrandOrderVariant == "" {
-				t.Fatalf("codex brand order variants should be persisted: first=%#v second=%#v", firstStored.ManagedHeaderState.Current, secondStored.ManagedHeaderState.Current)
+			// CLI 画像下不再做版本偏移，version variant 固定为 latest。
+			if firstStored.ManagedHeaderState.Current.VersionVariant != "latest" || secondStored.ManagedHeaderState.Current.VersionVariant != "latest" {
+				t.Fatalf("codex CLI version variants should stay latest: first=%#v second=%#v", firstStored.ManagedHeaderState.Current, secondStored.ManagedHeaderState.Current)
 			}
 		} else if provider == "claude" {
 			if firstStored.ManagedHeaderState.Current.VersionVariant != "latest" || secondStored.ManagedHeaderState.Current.VersionVariant != "latest" {
@@ -273,19 +285,18 @@ func TestApplyOAuthAccountSetupToRecordPreservesExistingManagedHeaderVariantSlot
 
 	h.applyOAuthAccountSetupToRecord(record, nil)
 
+	// fork(anticorr Wave10-D)：codex 切到 CLI 画像后，历史 Desktop 变体槽（latest-1 /
+	// slot-1）不再被应用——出站固定为自洽的 codex_cli_rs CLI baseline（floor 0.140.0），
+	// 不带 Desktop sec-ch-ua。
 	headers := coreauth.ExtractCustomHeadersFromMetadata(record.Metadata)
-	if got := headers["Version"]; got != "26.318.11753" {
-		t.Fatalf("Version = %q, want persisted latest-1 slot applied to default baseline", got)
+	if got := headers["Version"]; got != "0.140.0" {
+		t.Fatalf("Version = %q, want coherent CLI baseline 0.140.0 (Desktop slot must not apply)", got)
 	}
-	if got := headers["sec-ch-ua"]; got != `"Not=A?Brand";v="24", "Chromium";v="144", "Codex";v="144"` {
-		t.Fatalf("sec-ch-ua = %q, want persisted slot-1 order", got)
+	if !strings.HasPrefix(headers["User-Agent"], "codex_cli_rs/0.140.0") {
+		t.Fatalf("User-Agent = %q, want codex_cli_rs CLI baseline", headers["User-Agent"])
 	}
-	stored := readAccountSettingsMetadata(record, h.cfg)
-	if stored.ManagedHeaderState == nil || stored.ManagedHeaderState.Current == nil {
-		t.Fatalf("managed header state missing: %#v", stored.ManagedHeaderState)
-	}
-	if stored.ManagedHeaderState.Current.VersionVariant != "latest-1" || stored.ManagedHeaderState.Current.BrandOrderVariant != "slot-1" {
-		t.Fatalf("variant slots changed: %#v", stored.ManagedHeaderState.Current)
+	if got := headers["sec-ch-ua"]; got != "" {
+		t.Fatalf("sec-ch-ua = %q, want empty for CLI profile (Desktop slot must not apply)", got)
 	}
 }
 

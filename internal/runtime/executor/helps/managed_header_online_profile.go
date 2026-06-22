@@ -16,6 +16,7 @@ import (
 const (
 	managedHeaderProfileSourceDefault    = "default"
 	managedHeaderProfileSourceCodexProxy = "community:codex-proxy"
+	managedHeaderProfileSourceCodexCLI   = "static:codex-cli"
 	managedHeaderProfileSourceNPM        = "online:npm"
 	managedHeaderProfileSourceRequest    = "observed:first_party"
 
@@ -82,6 +83,17 @@ func codexProxyManagedHeaderProfileSource() ManagedHeaderProfileSource {
 		Source:       managedHeaderProfileSourceCodexProxy,
 		SourceURL:    "https://github.com/icebear0828/codex-proxy",
 		Completeness: "static-coherent-bundle",
+	}
+}
+
+// codexCLIManagedHeaderProfileSource 是 Wave10-D 起 codex 默认 CLI 画像
+// （codex_cli_rs）的静态来源标记。它表示出站身份来自代码内置的 codex-rs CLI 画像，
+// 而非 community codex-proxy Desktop bundle。
+func codexCLIManagedHeaderProfileSource() ManagedHeaderProfileSource {
+	return ManagedHeaderProfileSource{
+		Source:       managedHeaderProfileSourceCodexCLI,
+		SourceURL:    "https://github.com/openai/codex",
+		Completeness: "static-cli-persona",
 	}
 }
 

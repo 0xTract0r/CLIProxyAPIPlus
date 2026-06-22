@@ -15,7 +15,10 @@ func resetCodexClientProfileCache() {
 	codexClientProfileCacheMu.Unlock()
 }
 
-func TestResolveCodexClientProfile_DefaultFallbackUsesCodexProxyDesktopProfile(t *testing.T) {
+// fork(anticorr Wave10-D)：默认画像从冻结 "Codex Desktop" 改成 codex_cli_rs CLI。
+// default fallback 出站应是 CLI 家族（Originator=codex_cli_rs、UA 三段式、floor 0.140.0），
+// 且不带 Desktop 专属 sec-ch-ua。
+func TestResolveCodexClientProfile_DefaultFallbackUsesCodexCLIProfile(t *testing.T) {
 	resetCodexClientProfileCache()
 
 	profile := ResolveCodexClientProfile(&cliproxyauth.Auth{ProxyURL: "direct",
@@ -23,21 +26,23 @@ func TestResolveCodexClientProfile_DefaultFallbackUsesCodexProxyDesktopProfile(t
 		Provider: "codex",
 	}, nil, &config.Config{})
 
-	if got := profile.Originator; got != "Codex Desktop" {
-		t.Fatalf("Originator = %q, want Codex Desktop community fallback", got)
+	if got := profile.Originator; got != "codex_cli_rs" {
+		t.Fatalf("Originator = %q, want codex_cli_rs CLI default", got)
 	}
-	if !strings.HasPrefix(profile.UserAgent, "Codex Desktop/26.318.11754 (darwin; arm64)") {
-		t.Fatalf("User-Agent = %q, want Codex Desktop product", profile.UserAgent)
+	if !strings.HasPrefix(profile.UserAgent, "codex_cli_rs/0.140.0 (Mac OS 15.7.4; arm64) iTerm.app/3.6.8 (codex_cli_rs; 0.140.0)") {
+		t.Fatalf("User-Agent = %q, want codex_cli_rs CLI product", profile.UserAgent)
 	}
-	if got := profile.SecCHUA; !strings.Contains(got, `"Chromium";v="144"`) {
-		t.Fatalf("sec-ch-ua = %q, want Codex-Proxy Chromium 144 marker", got)
+	if got := profile.SecCHUA; got != "" {
+		t.Fatalf("sec-ch-ua = %q, want empty for CLI profile", got)
 	}
-	if got := profile.Source.Source; got != managedHeaderProfileSourceCodexProxy {
-		t.Fatalf("Source = %q, want codex-proxy community source", got)
+	if got := profile.Source.Source; got != managedHeaderProfileSourceCodexCLI {
+		t.Fatalf("Source = %q, want static codex-cli source", got)
 	}
 }
 
-func TestResolveCodexClientProfile_DefaultPolicyIgnoresObservedCLIHeaders(t *testing.T) {
+// fork(anticorr Wave10-D)：CLI 策略下接观测高水位，但 OS/arch/terminal 稳定 pin，
+// 不透传客户端真实环境（Ghostty / Mac OS 15.6.0）。
+func TestResolveCodexClientProfile_CLIPolicyTracksVersionHighWaterButPinsPlatform(t *testing.T) {
 	resetCodexClientProfileCache()
 
 	auth := &cliproxyauth.Auth{ProxyURL: "direct",
@@ -47,48 +52,50 @@ func TestResolveCodexClientProfile_DefaultPolicyIgnoresObservedCLIHeaders(t *tes
 	cfg := &config.Config{}
 
 	firstProfile := ResolveCodexClientProfile(auth, http.Header{
-		"User-Agent": []string{"codex_cli_rs/0.124.0 (Mac OS 15.5.0; arm64) iTerm.app/3.5.0"},
-		"Version":    []string{"0.124.0"},
+		"User-Agent": []string{"codex_cli_rs/0.141.0 (Mac OS 15.5.0; arm64) iTerm.app/3.5.0"},
+		"Version":    []string{"0.141.0"},
 		"Originator": []string{"codex_cli_rs"},
 	}, cfg)
 
-	if got := firstProfile.UserAgent; !strings.HasPrefix(got, "Codex Desktop/26.318.11754") {
-		t.Fatalf("first profile User-Agent = %q, want Codex Desktop policy", got)
+	if got := firstProfile.Originator; got != "codex_cli_rs" {
+		t.Fatalf("first profile Originator = %q, want codex_cli_rs", got)
 	}
-	if got := firstProfile.Originator; got != "Codex Desktop" {
-		t.Fatalf("first profile Originator = %q, want Codex Desktop", got)
+	if got := firstProfile.Version; got != "0.141.0" {
+		t.Fatalf("first profile Version = %q, want observed high-water 0.141.0", got)
 	}
-	if got := firstProfile.Version; got != "26.318.11754" {
-		t.Fatalf("first profile Version = %q, want Codex Desktop app version", got)
+	if !strings.Contains(firstProfile.UserAgent, "Mac OS 15.7.4; arm64") {
+		t.Fatalf("first profile User-Agent did not keep pinned platform: %q", firstProfile.UserAgent)
 	}
-	if got := firstProfile.Source.Source; got != managedHeaderProfileSourceCodexProxy {
-		t.Fatalf("first profile Source = %q, want codex-proxy", got)
+	if strings.Contains(firstProfile.UserAgent, "Mac OS 15.5.0") {
+		t.Fatalf("first profile leaked observed platform: %q", firstProfile.UserAgent)
 	}
 
 	upgradedProfile := ResolveCodexClientProfile(auth, http.Header{
-		"User-Agent": []string{"codex_cli_rs/0.125.0 (Mac OS 15.6.0; arm64) Ghostty/1.0.0"},
-		"Version":    []string{"0.125.0"},
+		"User-Agent": []string{"codex_cli_rs/0.142.0 (Mac OS 15.6.0; arm64) Ghostty/1.0.0"},
+		"Version":    []string{"0.142.0"},
 		"Originator": []string{"codex_cli_rs"},
 	}, cfg)
 
-	if got := upgradedProfile.Version; got != "26.318.11754" {
-		t.Fatalf("upgraded profile Version = %q, want Codex Desktop app version", got)
+	if got := upgradedProfile.Version; got != "0.142.0" {
+		t.Fatalf("upgraded profile Version = %q, want bumped high-water 0.142.0", got)
 	}
-	if got := upgradedProfile.Originator; got != "Codex Desktop" {
-		t.Fatalf("upgraded profile Originator = %q, want Codex Desktop", got)
+	if got := upgradedProfile.Originator; got != "codex_cli_rs" {
+		t.Fatalf("upgraded profile Originator = %q, want codex_cli_rs", got)
 	}
 	if strings.Contains(upgradedProfile.UserAgent, "Ghostty/1.0.0") {
-		t.Fatalf("upgraded User-Agent unexpectedly changed terminal fingerprint: %q", upgradedProfile.UserAgent)
+		t.Fatalf("upgraded User-Agent leaked observed terminal fingerprint: %q", upgradedProfile.UserAgent)
 	}
 	if strings.Contains(upgradedProfile.UserAgent, "Mac OS 15.6.0") {
-		t.Fatalf("upgraded User-Agent unexpectedly changed platform fingerprint: %q", upgradedProfile.UserAgent)
+		t.Fatalf("upgraded User-Agent leaked observed platform fingerprint: %q", upgradedProfile.UserAgent)
 	}
-	if !strings.Contains(upgradedProfile.UserAgent, "Codex Desktop/26.318.11754") {
-		t.Fatalf("upgraded User-Agent did not keep Codex Desktop marker: %q", upgradedProfile.UserAgent)
+	if !strings.Contains(upgradedProfile.UserAgent, "iTerm.app/3.6.8 (codex_cli_rs; 0.142.0)") {
+		t.Fatalf("upgraded User-Agent did not keep pinned terminal with bumped version: %q", upgradedProfile.UserAgent)
 	}
 }
 
-func TestResolveCodexClientProfile_ObservedCodexTuiPinsConsistentOriginatorAndUserAgent(t *testing.T) {
+// fork(anticorr Wave10-D)：观测到 codex-tui first-party 时，CLI 策略钉死出站 Originator
+// 为 codex_cli_rs（受管家族），只采纳版本，不暴露 codex-tui 终端身份给上游。
+func TestResolveCodexClientProfile_ObservedCodexTuiPinsCLIOriginator(t *testing.T) {
 	resetCodexClientProfileCache()
 
 	auth := &cliproxyauth.Auth{ProxyURL: "direct",
@@ -96,45 +103,25 @@ func TestResolveCodexClientProfile_ObservedCodexTuiPinsConsistentOriginatorAndUs
 		Provider: "codex",
 	}
 	profile := ResolveCodexClientProfile(auth, http.Header{
-		"User-Agent": []string{"codex-tui/0.126.0 (Mac OS 26.3.1; arm64) iTerm.app/3.6.9 (codex-tui; 0.126.0)"},
-		"Version":    []string{"0.126.0"},
+		"User-Agent": []string{"codex-tui/0.143.0 (Mac OS 26.3.1; arm64) iTerm.app/3.6.9 (codex-tui; 0.143.0)"},
+		"Version":    []string{"0.143.0"},
 		"Originator": []string{"codex-tui"},
 	}, &config.Config{})
 
-	if got := profile.Originator; got != "Codex Desktop" {
-		t.Fatalf("Originator = %q, want Codex Desktop policy", got)
+	if got := profile.Originator; got != "codex_cli_rs" {
+		t.Fatalf("Originator = %q, want codex_cli_rs CLI policy", got)
 	}
-	if got := profile.UserAgentProduct; got != "Codex Desktop" {
-		t.Fatalf("UserAgentProduct = %q, want Codex Desktop", got)
+	if got := profile.UserAgentProduct; got != "codex_cli_rs" {
+		t.Fatalf("UserAgentProduct = %q, want codex_cli_rs", got)
 	}
 	if strings.Contains(profile.UserAgent, "codex-tui") {
-		t.Fatalf("User-Agent should not expose observed codex-tui under default policy: %q", profile.UserAgent)
+		t.Fatalf("User-Agent should not expose observed codex-tui under CLI policy: %q", profile.UserAgent)
 	}
-	if got := profile.Source.Source; got != managedHeaderProfileSourceCodexProxy {
-		t.Fatalf("Source = %q, want codex-proxy", got)
+	if got := profile.Version; got != "0.143.0" {
+		t.Fatalf("Version = %q, want observed high-water 0.143.0", got)
 	}
-}
-
-func TestResolveCodexClientProfile_ReconcilesMismatchedFirstPartyOriginatorAndUserAgent(t *testing.T) {
-	resetCodexClientProfileCache()
-
-	profile := ResolveCodexClientProfile(&cliproxyauth.Auth{ProxyURL: "direct",
-		ID:       "codex-mismatched-observed-auth",
-		Provider: "codex",
-	}, http.Header{
-		"User-Agent": []string{"codex_cli_rs/0.126.0 (Mac OS 26.3.1; arm64) iTerm.app/3.6.9 (codex_cli_rs; 0.126.0)"},
-		"Version":    []string{"0.126.0"},
-		"Originator": []string{"codex-tui"},
-	}, &config.Config{})
-
-	if got := profile.Originator; got != "Codex Desktop" {
-		t.Fatalf("Originator = %q, want Codex Desktop policy", got)
-	}
-	if got := profile.UserAgentProduct; got != "Codex Desktop" {
-		t.Fatalf("UserAgentProduct = %q, want Codex Desktop", got)
-	}
-	if strings.Contains(profile.UserAgent, "codex_cli_rs/") || strings.Contains(profile.UserAgent, "codex-tui") {
-		t.Fatalf("User-Agent should not use observed CLI identity under default policy: %q", profile.UserAgent)
+	if got := profile.SecCHUA; got != "" {
+		t.Fatalf("sec-ch-ua = %q, want empty for CLI profile", got)
 	}
 }
 
@@ -157,7 +144,61 @@ func TestCodexManagedHeaders_IncludeStructuredVersionAndOriginator(t *testing.T)
 	}
 }
 
-func TestResolveCodexClientProfile_DesktopDefaultDoesNotUseNPMCliVersion(t *testing.T) {
+// fork(anticorr Wave10-D)：未观测到任何客户端时，CLI 出站版本是 floor 0.140.0，不被
+// 低于 floor 的观测降级。
+func TestResolveCodexClientProfile_CLIFloorVersion(t *testing.T) {
+	resetCodexClientProfileCache()
+
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", ID: "codex-floor-auth", Provider: "codex"}
+	cfg := &config.Config{}
+
+	floor := ResolveCodexClientProfile(auth, nil, cfg)
+	if got := floor.Version; got != "0.140.0" {
+		t.Fatalf("default Version = %q, want floor 0.140.0", got)
+	}
+
+	// 观测到低于 floor 的版本（0.120.0），出站不应被降级到 0.120.0。
+	lower := ResolveCodexClientProfile(auth, http.Header{
+		"User-Agent": []string{"codex_cli_rs/0.120.0 (Mac OS 15.5.0; arm64) iTerm.app/3.5.0 (codex_cli_rs; 0.120.0)"},
+		"Version":    []string{"0.120.0"},
+		"Originator": []string{"codex_cli_rs"},
+	}, cfg)
+	if got := lower.Version; got != "0.140.0" {
+		t.Fatalf("Version after lower observation = %q, want floor 0.140.0 (only-up high-water)", got)
+	}
+}
+
+// fork(anticorr Wave10-D)：CLI 画像可 config pin OS/arch/terminal/originator。
+func TestResolveCodexClientProfile_ConfigPinsOSArchTerminal(t *testing.T) {
+	resetCodexClientProfileCache()
+
+	cfg := &config.Config{
+		CodexHeaderDefaults: config.CodexHeaderDefaults{
+			Originator: "codex_cli_rs",
+			OS:         "Mac OS 15.6.1",
+			Arch:       "arm64",
+			Terminal:   "WezTerm/20240203",
+		},
+	}
+	profile := ResolveCodexClientProfile(&cliproxyauth.Auth{ProxyURL: "direct", ID: "codex-cfg-pin", Provider: "codex"}, nil, cfg)
+
+	if got := profile.Originator; got != "codex_cli_rs" {
+		t.Fatalf("Originator = %q, want codex_cli_rs", got)
+	}
+	if !strings.Contains(profile.UserAgent, "Mac OS 15.6.1; arm64") {
+		t.Fatalf("User-Agent = %q, want config-pinned OS/arch", profile.UserAgent)
+	}
+	if !strings.Contains(profile.UserAgent, "WezTerm/20240203 (codex_cli_rs; 0.140.0)") {
+		t.Fatalf("User-Agent = %q, want config-pinned terminal", profile.UserAgent)
+	}
+	if got := profile.SecCHUA; got != "" {
+		t.Fatalf("sec-ch-ua = %q, want empty for CLI profile", got)
+	}
+}
+
+// fork(anticorr Wave10-D)：CLI 默认下，npm CLI online latest 高于 floor 时抬高出站
+// CLI 版本（high-water），且保持 codex_cli_rs 身份与 CLI UA 三段式。
+func TestResolveCodexClientProfile_CLIDefaultBumpsToNPMCliVersion(t *testing.T) {
 	resetCodexClientProfileCache()
 	resetManagedHeaderOnlineProfileCacheForTests()
 	online := true
@@ -167,7 +208,7 @@ func TestResolveCodexClientProfile_DesktopDefaultDoesNotUseNPMCliVersion(t *test
 			return managedHeaderOnlineVersion{}, false
 		}
 		return managedHeaderOnlineVersion{
-			Version: "0.130.0",
+			Version: "0.150.0",
 			ManagedHeaderProfileSource: ManagedHeaderProfileSource{
 				Source:    managedHeaderProfileSourceNPM,
 				SourceURL: codexNPMURL,
@@ -189,24 +230,26 @@ func TestResolveCodexClientProfile_DesktopDefaultDoesNotUseNPMCliVersion(t *test
 		},
 	})
 
-	if got := profile.Version; got != "26.318.11754" {
-		t.Fatalf("Version = %q, want Desktop app version to remain pinned", got)
+	if got := profile.Version; got != "0.150.0" {
+		t.Fatalf("Version = %q, want bumped npm CLI version 0.150.0", got)
 	}
-	if !strings.Contains(profile.UserAgent, "Codex Desktop/26.318.11754") {
-		t.Fatalf("User-Agent did not keep Codex Desktop app marker: %q", profile.UserAgent)
+	if got := profile.Originator; got != "codex_cli_rs" {
+		t.Fatalf("Originator = %q, want codex_cli_rs", got)
 	}
-	if strings.Contains(profile.UserAgent, "codex_cli_rs/0.130.0") {
-		t.Fatalf("Desktop profile must not mix npm CLI package marker into UA: %q", profile.UserAgent)
+	if !strings.Contains(profile.UserAgent, "codex_cli_rs/0.150.0") {
+		t.Fatalf("User-Agent did not pick up bumped CLI version: %q", profile.UserAgent)
 	}
-	if got := profile.Source.Source; got != managedHeaderProfileSourceCodexProxy {
-		t.Fatalf("Source = %q, want codex-proxy community source", got)
+	if strings.Contains(profile.UserAgent, "Codex Desktop") {
+		t.Fatalf("CLI profile must not mix Codex Desktop into UA: %q", profile.UserAgent)
 	}
-	if got := profile.Source.SourceURL; got != "https://github.com/icebear0828/codex-proxy" {
-		t.Fatalf("SourceURL = %q, want codex-proxy URL", got)
+	if got := profile.SecCHUA; got != "" {
+		t.Fatalf("sec-ch-ua = %q, want empty for CLI profile", got)
 	}
 }
 
-func TestResolveCodexClientProfile_OnlineCodexProxyBundleUpdatesDesktopMarkers(t *testing.T) {
+// fork(anticorr Wave10-D 要点1/2)：online codex-proxy Desktop bundle 不得把 CLI 默认画像
+// 切回 Desktop。出站必须保持 codex_cli_rs / 无 sec-ch-ua。
+func TestResolveCodexClientProfile_OnlineCodexProxyBundleDoesNotSwitchCLIToDesktop(t *testing.T) {
 	resetCodexClientProfileCache()
 	resetManagedHeaderOnlineProfileCacheForTests()
 	online := true
@@ -233,11 +276,6 @@ func TestResolveCodexClientProfile_OnlineCodexProxyBundleUpdatesDesktopMarkers(t
 					"sec-ch-ua":          `"Chromium";v="145", "Not A(Brand";v="24"`,
 					"sec-ch-ua-mobile":   "?0",
 					"sec-ch-ua-platform": `"macOS"`,
-					"Accept-Encoding":    "gzip, deflate, br, zstd",
-					"Accept-Language":    "en-US,en;q=0.9",
-					"sec-fetch-site":     "same-origin",
-					"sec-fetch-mode":     "cors",
-					"sec-fetch-dest":     "empty",
 				},
 			},
 		}, true
@@ -256,26 +294,17 @@ func TestResolveCodexClientProfile_OnlineCodexProxyBundleUpdatesDesktopMarkers(t
 		},
 	})
 
-	if got := profile.Version; got != "26.400.1" {
-		t.Fatalf("Version = %q, want online codex-proxy app version", got)
+	if got := profile.Originator; got != "codex_cli_rs" {
+		t.Fatalf("Originator = %q, want codex_cli_rs (Desktop bundle must not switch family)", got)
 	}
-	if !strings.Contains(profile.UserAgent, "Codex Desktop/26.400.1") {
-		t.Fatalf("User-Agent = %q, want online Codex Desktop app marker", profile.UserAgent)
+	if strings.Contains(profile.UserAgent, "Codex Desktop") {
+		t.Fatalf("User-Agent must not be Desktop: %q", profile.UserAgent)
 	}
-	if got := profile.PlatformToken; got != "darwin; arm64" {
-		t.Fatalf("PlatformToken = %q, want darwin; arm64", got)
+	if got := profile.SecCHUA; got != "" {
+		t.Fatalf("sec-ch-ua = %q, want empty (Desktop bundle sec-ch-ua must not leak)", got)
 	}
-	if got := profile.SecCHUA; !strings.Contains(got, `"Chromium";v="145"`) {
-		t.Fatalf("sec-ch-ua = %q, want online chromium marker", got)
-	}
-	if got := profile.Source.Source; got != managedHeaderProfileSourceCodexProxy {
-		t.Fatalf("Source = %q, want codex-proxy", got)
-	}
-	if got := profile.Source.CheckedAt; got != "2026-05-09T02:00:00Z" {
-		t.Fatalf("CheckedAt = %q", got)
-	}
-	if got := profile.Source.Completeness; got != "online-coherent-bundle" {
-		t.Fatalf("Completeness = %q", got)
+	if got := profile.Version; got == "26.400.1" {
+		t.Fatalf("Version = %q, Desktop bundle version must not contaminate CLI family", got)
 	}
 }
 
@@ -312,29 +341,30 @@ func TestResolveCodexClientProfile_OnlineVersionDoesNotOverrideObservedSourceOrO
 		},
 	}
 	observed := ResolveCodexClientProfile(auth, http.Header{
-		"User-Agent": []string{"codex-tui/0.124.0 (Mac OS 26.3.1; arm64) iTerm.app/3.6.9 (codex-tui; 0.124.0)"},
-		"Version":    []string{"0.124.0"},
+		"User-Agent": []string{"codex-tui/0.141.0 (Mac OS 26.3.1; arm64) iTerm.app/3.6.9 (codex-tui; 0.141.0)"},
+		"Version":    []string{"0.141.0"},
 		"Originator": []string{"codex-tui"},
 	}, cfg)
-	if got := observed.Source.Source; got != managedHeaderProfileSourceCodexProxy {
-		t.Fatalf("observed Source = %q, want codex-proxy", got)
+	// fork(anticorr Wave10-D)：CLI 策略下出站 Originator 钉死 codex_cli_rs，版本采纳观测。
+	if got := observed.Originator; got != "codex_cli_rs" {
+		t.Fatalf("observed Originator = %q, want codex_cli_rs", got)
+	}
+	if got := observed.Version; got != "0.141.0" {
+		t.Fatalf("observed Version = %q, want 0.141.0 high-water", got)
 	}
 
 	profile := ResolveCodexClientProfile(auth, nil, cfg)
-	if got := profile.Version; got != "26.318.11754" {
-		t.Fatalf("Version = %q, want Codex Desktop app version", got)
+	if got := profile.Originator; got != "codex_cli_rs" {
+		t.Fatalf("Originator = %q, want codex_cli_rs", got)
 	}
-	if got := profile.Originator; got != "Codex Desktop" {
-		t.Fatalf("Originator = %q, want Codex Desktop", got)
+	if got := profile.UserAgentProduct; got != "codex_cli_rs" {
+		t.Fatalf("UserAgentProduct = %q, want codex_cli_rs", got)
 	}
-	if got := profile.UserAgentProduct; got != "Codex Desktop" {
-		t.Fatalf("UserAgentProduct = %q, want Codex Desktop", got)
+	if strings.Contains(profile.UserAgent, "Codex Desktop") {
+		t.Fatalf("User-Agent must not be Desktop: %q", profile.UserAgent)
 	}
-	if got := profile.Source.Source; got != managedHeaderProfileSourceCodexProxy {
-		t.Fatalf("Source = %q, want codex-proxy", got)
-	}
-	if !strings.Contains(profile.UserAgent, "Codex Desktop/26.318.11754") {
-		t.Fatalf("User-Agent did not keep Codex Desktop identity: %q", profile.UserAgent)
+	if got := profile.SecCHUA; got != "" {
+		t.Fatalf("sec-ch-ua = %q, want empty for CLI profile", got)
 	}
 }
 
@@ -348,7 +378,7 @@ func TestResolveCodexClientProfile_OnlineVersionBumpsPersistedHeaders(t *testing
 			return ManagedHeaderOnlineVersion{}, false
 		}
 		return ManagedHeaderOnlineVersion{
-			Version: "0.130.0",
+			Version: "0.151.0",
 			ManagedHeaderProfileSource: ManagedHeaderProfileSource{
 				Source:    managedHeaderProfileSourceNPM,
 				SourceURL: codexNPMURL,
@@ -361,6 +391,8 @@ func TestResolveCodexClientProfile_OnlineVersionBumpsPersistedHeaders(t *testing
 		resetManagedHeaderOnlineProfileCacheForTests()
 	})
 
+	// persisted CLI bundle（codex-tui）+ npm online 抬版本：出站身份钉死 codex_cli_rs，
+	// 版本走 high-water（online 0.151.0 高于 floor 0.140.0 与 persisted 0.124.0）。
 	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID:       "codex-online-persisted-auth",
 		Provider: "codex",
@@ -379,20 +411,20 @@ func TestResolveCodexClientProfile_OnlineVersionBumpsPersistedHeaders(t *testing
 		},
 	})
 
-	if got := profile.Version; got != "26.318.11754" {
-		t.Fatalf("Version = %q, want Codex Desktop app version", got)
+	if got := profile.Version; got != "0.151.0" {
+		t.Fatalf("Version = %q, want online npm CLI high-water 0.151.0", got)
 	}
-	if !strings.Contains(profile.UserAgent, "Codex Desktop/26.318.11754") {
-		t.Fatalf("User-Agent did not keep Codex Desktop marker: %q", profile.UserAgent)
+	if !strings.Contains(profile.UserAgent, "codex_cli_rs/0.151.0") {
+		t.Fatalf("User-Agent did not pick up bumped CLI version: %q", profile.UserAgent)
 	}
 	if strings.Contains(profile.UserAgent, "iTerm.app/3.6.9") {
-		t.Fatalf("User-Agent should not keep legacy terminal fingerprint under default policy: %q", profile.UserAgent)
+		t.Fatalf("User-Agent should not keep persisted terminal fingerprint: %q", profile.UserAgent)
 	}
-	if got := profile.Originator; got != "Codex Desktop" {
-		t.Fatalf("Originator = %q, want Codex Desktop", got)
+	if got := profile.Originator; got != "codex_cli_rs" {
+		t.Fatalf("Originator = %q, want codex_cli_rs", got)
 	}
-	if got := profile.Source.Source; got != managedHeaderProfileSourceCodexProxy {
-		t.Fatalf("Source = %q, want codex-proxy", got)
+	if got := profile.SecCHUA; got != "" {
+		t.Fatalf("sec-ch-ua = %q, want empty for CLI profile", got)
 	}
 }
 

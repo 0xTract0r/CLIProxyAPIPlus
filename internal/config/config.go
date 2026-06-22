@@ -275,6 +275,15 @@ type ClaudeConfig struct {
 type CodexHeaderDefaults struct {
 	UserAgent    string `yaml:"user-agent" json:"user-agent"`
 	BetaFeatures string `yaml:"beta-features" json:"beta-features"`
+	// fork(anticorr Wave10-D)：codex CLI 画像可选 pin 杠杆。无配置时用代码内置的
+	// codex_cli_rs CLI 默认（Originator=codex_cli_rs，OS/arch/terminal 稳定 pin）。
+	// 这些字段允许 operator 覆盖默认 CLI 画像（不透传真实环境，每账号稳定一致）。
+	// Originator 为空时用代码默认 codex_cli_rs；OS/Arch/Terminal 用于构造稳定 UA 平台段
+	// 与 terminal 尾段，仅在未直接配置 UserAgent 时生效。
+	Originator string `yaml:"originator,omitempty" json:"originator,omitempty"`
+	OS         string `yaml:"os,omitempty" json:"os,omitempty"`
+	Arch       string `yaml:"arch,omitempty" json:"arch,omitempty"`
+	Terminal   string `yaml:"terminal,omitempty" json:"terminal,omitempty"`
 }
 
 // ManagedHeaderProfileConfig controls whether core can consult public online
@@ -1041,6 +1050,10 @@ func (cfg *Config) SanitizeCodexHeaderDefaults() {
 	}
 	cfg.CodexHeaderDefaults.UserAgent = strings.TrimSpace(cfg.CodexHeaderDefaults.UserAgent)
 	cfg.CodexHeaderDefaults.BetaFeatures = strings.TrimSpace(cfg.CodexHeaderDefaults.BetaFeatures)
+	cfg.CodexHeaderDefaults.Originator = strings.TrimSpace(cfg.CodexHeaderDefaults.Originator)
+	cfg.CodexHeaderDefaults.OS = strings.TrimSpace(cfg.CodexHeaderDefaults.OS)
+	cfg.CodexHeaderDefaults.Arch = strings.TrimSpace(cfg.CodexHeaderDefaults.Arch)
+	cfg.CodexHeaderDefaults.Terminal = strings.TrimSpace(cfg.CodexHeaderDefaults.Terminal)
 }
 
 // SanitizeClaudeHeaderDefaults trims surrounding whitespace from the

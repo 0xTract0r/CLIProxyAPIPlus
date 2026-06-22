@@ -1801,6 +1801,31 @@ func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, s
 	if cliproxyauth.HasStructuredAccountSettingsMetadata(auth) {
 		applyManagedHeaderSnapshot(r.Header, managedHeaderSnapshot)
 	}
+	// fork(anticorr Wave10-D 要点4)：CLI 画像下兜底剥离 Desktop 专属指纹头。
+	// 账号 metadata.headers / header:* 属性里可能残留历史 Desktop bundle 的
+	// sec-ch-ua / sec-ch-ua-* （真实 codex-rs CLI 不发这些）。ApplyCustomHeadersFromAttrs
+	// 会把这些残留 set 回 r.Header，而 managed snapshot 只恢复 snapshot 内已有的名字
+	// （CLI snapshot 不含 sec-ch-ua），无法挡住。这里在 CLI 画像（profile 非 Desktop）下
+	// 显式删除，确保出站不带 sec-ch-ua 系列，与 CLI body/TLS 自洽。
+	stripCodexDesktopOnlyHeadersForCLIProfile(r.Header, profile)
+}
+
+// stripCodexDesktopOnlyHeadersForCLIProfile 在 CLI 画像下删除 Desktop 专属指纹头。
+// 仅当 profile 非 Desktop 家族（即 CLI 画像）时生效；Desktop 画像不受影响，保持兼容。
+func stripCodexDesktopOnlyHeadersForCLIProfile(headers http.Header, profile helps.CodexClientProfile) {
+	if headers == nil || helps.IsCodexDesktopProfile(profile) {
+		return
+	}
+	for _, name := range []string{
+		"sec-ch-ua",
+		"sec-ch-ua-mobile",
+		"sec-ch-ua-platform",
+		"sec-fetch-site",
+		"sec-fetch-mode",
+		"sec-fetch-dest",
+	} {
+		headers.Del(name)
+	}
 }
 
 func applyCodexCommunityDesktopHeaders(headers http.Header, profile helps.CodexClientProfile) {
