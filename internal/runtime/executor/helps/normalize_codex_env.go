@@ -32,7 +32,7 @@ import (
 // 归一目标（每请求只算一次派生值，header 与 body 处处用同一组值，保证一致 +
 // 幂等 + 跨账号不同）：
 //   - canonical cwd        = AccountCanonicalCwd(auth, apiKey)
-//   - canonical CODEX_HOME = /home/agent/codex-home-<hex8>
+//   - canonical CODEX_HOME = /Users/agent/codex-home-<hex8>
 //   - git commit hash      = 合法 40-hex
 //   - git remote           = git@github.com:<hex8>/<hex8>.git
 //
@@ -79,7 +79,7 @@ func resolveCodexCanonicalValues(auth *cliproxyauth.Auth, apiKey string) codexCa
 }
 
 // canonicalCodexHome 派生每账号 canonical CODEX_HOME，复用 canonicalHomeRoot 根，
-// 形如 /home/agent/codex-home-<hex8>。
+// 形如 /Users/agent/codex-home-<hex8>。
 func canonicalCodexHome(scopeKey string) string {
 	sum := sha256.Sum256([]byte("cliproxy-canonical-codex-home\x00" + scopeKey))
 	id := binary.BigEndian.Uint32(sum[:4])

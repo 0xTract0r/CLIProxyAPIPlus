@@ -1028,38 +1028,6 @@ func setHeaderCasePreserved(headers http.Header, key string, value string) {
 	headers[key] = []string{value}
 }
 
-func setCodexSessionHeaderCasePreserved(headers http.Header, fallbackKey string, value string) {
-	if headers == nil {
-		return
-	}
-	fallbackKey = strings.TrimSpace(fallbackKey)
-	value = strings.TrimSpace(value)
-	if fallbackKey == "" || value == "" {
-		return
-	}
-
-	selectedKey := ""
-	if _, ok := headers[fallbackKey]; ok && codexSessionHeaderKeyUsesUnderscore(fallbackKey) {
-		selectedKey = fallbackKey
-	} else {
-		for existingKey := range headers {
-			if codexSessionHeaderKeyUsesUnderscore(existingKey) {
-				selectedKey = existingKey
-				break
-			}
-		}
-	}
-	if selectedKey == "" {
-		selectedKey = fallbackKey
-	}
-	for existingKey := range headers {
-		if codexSessionHeaderKey(existingKey) && existingKey != selectedKey {
-			delete(headers, existingKey)
-		}
-	}
-	headers[selectedKey] = []string{value}
-}
-
 func codexSessionHeaderKey(key string) bool {
 	normalized := strings.ToLower(strings.TrimSpace(key))
 	return normalized == "session_id" || normalized == "session-id"
@@ -1104,10 +1072,6 @@ func ensureCodexLowerSessionHeader(target http.Header, source http.Header, fallb
 	if value != "" {
 		setCodexLowerSessionHeader(target, value)
 	}
-}
-
-func codexSessionHeaderKeyUsesUnderscore(key string) bool {
-	return strings.ToLower(strings.TrimSpace(key)) == "session_id"
 }
 
 func headerValueCaseInsensitive(headers http.Header, key string) string {
