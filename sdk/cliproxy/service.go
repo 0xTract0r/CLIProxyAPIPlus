@@ -473,7 +473,7 @@ func (s *Service) ensureExecutorsForAuthWithMode(a *coreauth.Auth, forceReplace 
 	case "antigravity":
 		s.coreManager.RegisterExecutor(executor.NewAntigravityExecutor(s.cfg))
 	case "claude":
-		s.coreManager.RegisterExecutor(executor.NewClaudeExecutor(s.cfg))
+		s.coreManager.RegisterExecutor(executor.NewClaudeExecutorWithManager(s.cfg, s.coreManager))
 	case "kimi":
 		s.coreManager.RegisterExecutor(executor.NewKimiExecutor(s.cfg))
 	case "kiro":
@@ -639,7 +639,7 @@ func (s *Service) registerHomeExecutors() {
 	// Register baseline executors so home-dispatched auth entries can execute without
 	// requiring any local auth-dir credentials.
 	s.coreManager.RegisterExecutor(executor.NewCodexAutoExecutor(s.cfg))
-	s.coreManager.RegisterExecutor(executor.NewClaudeExecutor(s.cfg))
+	s.coreManager.RegisterExecutor(executor.NewClaudeExecutorWithManager(s.cfg, s.coreManager))
 	s.coreManager.RegisterExecutor(executor.NewGeminiExecutor(s.cfg))
 	s.coreManager.RegisterExecutor(executor.NewGeminiVertexExecutor(s.cfg))
 	s.coreManager.RegisterExecutor(executor.NewGeminiCLIExecutor(s.cfg))

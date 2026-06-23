@@ -41,7 +41,8 @@ import (
 // ClaudeExecutor is a stateless executor for Anthropic Claude over the messages API.
 // If api_key is unavailable on auth, it falls back to legacy via ClientAdapter.
 type ClaudeExecutor struct {
-	cfg *config.Config
+	cfg         *config.Config
+	authManager *cliproxyauth.Manager
 }
 
 // claudeToolPrefix is empty to match real Claude Code behavior (no tool name prefix).
@@ -121,6 +122,15 @@ const claudeClientSafeTransportErrorMessage = "upstream transport error"
 
 func NewClaudeExecutor(cfg *config.Config) *ClaudeExecutor { return &ClaudeExecutor{cfg: cfg} }
 
+// NewClaudeExecutorWithManager wires the auth manager so the per-account claude
+// client device-profile high-water can be persisted into the auth record
+// (auth.Metadata[claude_device_high_water]). Without a manager the high-water
+// write-back degrades to a no-op, preserving the prior in-memory-only behavior
+// for any caller still using NewClaudeExecutor.
+func NewClaudeExecutorWithManager(cfg *config.Config, manager *cliproxyauth.Manager) *ClaudeExecutor {
+	return &ClaudeExecutor{cfg: cfg, authManager: manager}
+}
+
 func (e *ClaudeExecutor) Identifier() string { return "claude" }
 
 func claudeUpstreamTransportError(err error) error {
@@ -151,6 +161,11 @@ func (e *ClaudeExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Au
 	if helps.ClaudeDeviceProfileStabilizationEnabled(e.cfg) {
 		helps.ApplyClaudeDeviceProfileHeaders(req, deviceProfile)
 	}
+	// claude 版本高水位持久化：ResolveClaudeDeviceProfile 已把本次合法候选记入内存观测
+	// （伪造超高版本在 sanity-ceiling gate 已被丢弃，不会进入观测）。这里把当前账号的
+	// 观测高水位三元组透出给 auth manager，由 RaiseClaudeDeviceHighWater 做"仅单调抬升才
+	// 写盘"。无 manager 时降级为 no-op，不破坏 NewClaudeExecutor 调用方。
+	e.persistClaudeDeviceHighWater(auth, apiKey)
 	useAPIKey := auth != nil && auth.Attributes != nil && strings.TrimSpace(auth.Attributes["api_key"]) != ""
 	isAnthropicBase := req.URL != nil && strings.EqualFold(req.URL.Scheme, "https") && strings.EqualFold(req.URL.Host, "api.anthropic.com")
 	if isAnthropicBase && useAPIKey {
@@ -164,6 +179,32 @@ func (e *ClaudeExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Au
 	util.ApplyCustomHeadersFromAttrs(req, authAttrs(auth))
 	applyClaudeManagedHeaders(req, auth, managedHeaderSnapshot)
 	return nil
+}
+
+// persistClaudeDeviceHighWater reads the account's current observed claude client
+// device-profile high-water and asks the auth manager to monotonically raise the
+// persisted high-water (auth.Metadata[claude_device_high_water]). It is a no-op
+// when no manager is wired, when the auth has no ID, or when no real observation
+// exists yet. The manager performs the strict-increase comparison, so calling
+// this every request is safe and writes to disk only on an actual raise.
+func (e *ClaudeExecutor) persistClaudeDeviceHighWater(auth *cliproxyauth.Auth, apiKey string) {
+	if e == nil || e.authManager == nil || auth == nil {
+		return
+	}
+	authID := strings.TrimSpace(auth.ID)
+	if authID == "" {
+		return
+	}
+	highWater, ok := helps.ClaudeObservedHighWaterForAuth(auth, apiKey)
+	if !ok {
+		return
+	}
+	if _, err := e.authManager.RaiseClaudeDeviceHighWater(context.Background(), authID, highWater); err != nil {
+		log.WithError(err).WithFields(log.Fields{
+			"component": "claude_device_high_water",
+			"auth_id":   authID,
+		}).Warn("claude executor: failed to persist device-profile high-water")
+	}
 }
 
 // HttpRequest injects Claude credentials into the request and executes it.
