@@ -308,6 +308,13 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		return resp, err
 	}
 	applyClaudeHeaders(httpReq, auth, apiKey, false, extraBetas, e.cfg)
+	// claude 版本高水位持久化（真实 serving 路径）：applyClaudeHeaders 内部的
+	// resolveClaudeDeviceProfileForRequest -> ResolveClaudeDeviceProfile 已把本次真实
+	// 请求的合法高水位候选记入内存观测。这里把当前账号的观测高水位透出给 auth
+	// manager，由 RaiseClaudeDeviceHighWater 做"仅单调抬升才写盘"。PrepareRequest 只服务
+	// HttpRequest adapter 旁路，真实 /v1/messages 服务走 Execute/ExecuteStream/CountTokens，
+	// 因此写回必须挂在这些 serving 方法上，否则持久化永不触发（重启回落到 floor）。
+	e.persistClaudeDeviceHighWater(auth, apiKey)
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
@@ -488,6 +495,9 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		return nil, err
 	}
 	applyClaudeHeaders(httpReq, auth, apiKey, true, extraBetas, e.cfg)
+	// claude 版本高水位持久化（真实 serving 流式路径）：同 Execute，applyClaudeHeaders 已记入
+	// 内存观测，这里把观测高水位透出给 auth manager 做单调抬升写盘。
+	e.persistClaudeDeviceHighWater(auth, apiKey)
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
@@ -788,6 +798,9 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 		return cliproxyexecutor.Response{}, err
 	}
 	applyClaudeHeaders(httpReq, auth, apiKey, false, extraBetas, e.cfg)
+	// claude 版本高水位持久化（真实 serving count_tokens 路径）：count_tokens 也经 applyClaudeHeaders
+	// 记入内存观测，接上写回更全且单调抬升幂等无害（稳态零写盘）。
+	e.persistClaudeDeviceHighWater(auth, apiKey)
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
