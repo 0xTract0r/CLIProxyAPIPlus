@@ -1326,6 +1326,87 @@ func (m *Manager) IncrementCyberPolicyCount(ctx context.Context, authID string) 
 	return newCount, now, nil
 }
 
+// RaiseClaudeDeviceHighWater monotonically raises the persisted claude client
+// device-profile high-water mark stored under
+// ClaudeDeviceHighWaterMetadataKey, then persists the change. It is the write
+// side of "claude version high-water persistence": after a restart the floor
+// computation seeds from this metadata instead of falling back to the static
+// 2.1.63 floor.
+//
+// Concurrency mirrors IncrementCyberPolicyCount: the read-compare-write of the
+// high-water entry happens entirely under m.mu so concurrent observations cannot
+// lose a raise, and persistence (store + hooks) runs after the lock is released
+// to avoid re-entrant locking inside persist.
+//
+// Monotonic-up only: the metadata is updated ONLY when the incoming triple's
+// version is strictly greater than the currently persisted version. This makes
+// the call a no-op (and emits no disk write) in steady state, so no additional
+// time-based debounce is needed. Same-version and lower-version observations are
+// ignored.
+//
+// Whole-map replacement (anti shallow-copy hazard): the high-water value written
+// into auth.Metadata is always a freshly allocated map[string]any, never an
+// in-place mutation of a pre-existing nested map. Auth.Clone shallow-copies
+// Metadata top-level entries, so reusing a nested map would let a clone observe
+// a half-written triple; allocating a new map each raise keeps every snapshot
+// internally consistent.
+//
+// The incoming profile must already be a real, sanity-ceiling-validated
+// observation; this method does no version sanity gating of its own beyond the
+// monotonic comparison. Returns whether the high-water was raised, plus a
+// persistence error if any. When the auth cannot be located or the incoming
+// triple is unusable it returns (false, nil).
+func (m *Manager) RaiseClaudeDeviceHighWater(ctx context.Context, authID string, profile ClaudeDeviceHighWater) (bool, error) {
+	if m == nil {
+		return false, nil
+	}
+	authID = strings.TrimSpace(authID)
+	if authID == "" || !profile.valid() {
+		return false, nil
+	}
+	incomingVersion, ok := profile.parsedVersion()
+	if !ok {
+		return false, nil
+	}
+
+	m.mu.Lock()
+	existing, ok := m.auths[authID]
+	if !ok || existing == nil {
+		m.mu.Unlock()
+		return false, nil
+	}
+
+	// Compare the incoming version against the currently persisted high-water and
+	// only raise on a strict increase (天然防抖：稳态零写盘).
+	if current, hasCurrent := ClaudeDeviceHighWaterFromMetadata(existing.Metadata); hasCurrent {
+		if currentVersion, currentOK := current.parsedVersion(); currentOK {
+			if incomingVersion.compare(currentVersion) <= 0 {
+				m.mu.Unlock()
+				return false, nil
+			}
+		}
+	}
+
+	if existing.Metadata == nil {
+		existing.Metadata = make(map[string]any)
+	}
+	// Whole-map replacement: assign a brand-new map so a subsequent Clone never
+	// shares this nested map with the live auth.
+	existing.Metadata[ClaudeDeviceHighWaterMetadataKey] = claudeDeviceHighWaterToMetadataMap(profile)
+	snapshot := existing.Clone()
+	m.mu.Unlock()
+
+	if snapshot == nil {
+		return true, nil
+	}
+	// Persist outside the lock: surface the error so callers can log it, but the
+	// in-memory high-water is already raised.
+	if err := m.persist(ctx, snapshot); err != nil {
+		return true, err
+	}
+	return true, nil
+}
+
 // Remove deletes an auth from runtime state without persisting.
 // Disk and token-store deletion must be handled by the caller.
 func (m *Manager) Remove(ctx context.Context, id string) {

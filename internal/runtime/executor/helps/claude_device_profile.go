@@ -298,6 +298,73 @@ func globalClaudeObservedHighWaterProfile() (ClaudeDeviceProfile, bool) {
 	return best, found
 }
 
+// claudePersistedHighWaterProfile reconstructs a ClaudeDeviceProfile from the
+// high-water triple persisted into auth.Metadata by
+// Manager.RaiseClaudeDeviceHighWater. It is the read-seed half of claude version
+// high-water persistence: after a restart the in-memory observation maps are
+// empty, so claudeFallbackBaseline consults this persisted triple (and takes the
+// max with any live observation) instead of falling back to the static floor.
+//
+// The returned profile carries the COMPLETE triple (UA/version + pkg + runtime)
+// from the same real observation that was persisted, so it can be adopted as an
+// atomic floor unit just like a live observation. A persisted entry whose
+// UserAgent does not parse to a version is rejected (returns false).
+func claudePersistedHighWaterProfile(auth *cliproxyauth.Auth) (ClaudeDeviceProfile, bool) {
+	if auth == nil {
+		return ClaudeDeviceProfile{}, false
+	}
+	hw, ok := cliproxyauth.ClaudeDeviceHighWaterFromMetadata(auth.Metadata)
+	if !ok {
+		return ClaudeDeviceProfile{}, false
+	}
+	version, ok := parseClaudeCLIVersion(hw.UserAgent)
+	if !ok {
+		return ClaudeDeviceProfile{}, false
+	}
+	profile := ClaudeDeviceProfile{
+		UserAgent:      strings.TrimSpace(hw.UserAgent),
+		PackageVersion: strings.TrimSpace(hw.PackageVersion),
+		RuntimeVersion: strings.TrimSpace(hw.RuntimeVersion),
+		OS:             strings.TrimSpace(hw.OS),
+		Arch:           strings.TrimSpace(hw.Arch),
+		Source:         observedManagedHeaderProfileSource(),
+		version:        version,
+		hasVersion:     true,
+	}
+	return profile, true
+}
+
+// ClaudeObservedHighWaterForAuth returns the account's current in-memory observed
+// high-water mark as a serializable triple, suitable for passing to
+// Manager.RaiseClaudeDeviceHighWater. It returns the per-account observed
+// high-water when present, otherwise the global observed high-water.
+//
+// Because only candidates that already passed the sanity-ceiling gate are ever
+// recorded into the observation maps (ResolveClaudeDeviceProfile drops forged
+// high versions before recording), the returned triple is guaranteed to be a
+// real, sanity-validated observation — a forged "claude-cli/999.0.0" can never
+// surface here. Returns false when no observation exists yet.
+func ClaudeObservedHighWaterForAuth(auth *cliproxyauth.Auth, apiKey string) (cliproxyauth.ClaudeDeviceHighWater, bool) {
+	observationKeys := claudeDeviceProfileObservationCacheKeys(auth, apiKey)
+	profile, ok := claudeObservedHighWaterProfile(observationKeys)
+	if !ok {
+		profile, ok = globalClaudeObservedHighWaterProfile()
+	}
+	if !ok || profile.UserAgent == "" || !profile.hasVersion {
+		return cliproxyauth.ClaudeDeviceHighWater{}, false
+	}
+	return cliproxyauth.ClaudeDeviceHighWater{
+		UserAgent:      profile.UserAgent,
+		Version:        profile.VersionString(),
+		PackageVersion: profile.PackageVersion,
+		RuntimeVersion: profile.RuntimeVersion,
+		OS:             profile.OS,
+		Arch:           profile.Arch,
+		Source:         profile.Source.Source,
+		LastSeenAt:     time.Now().UTC().Format(time.RFC3339),
+	}, true
+}
+
 // claudeStaticSanityCeiling returns the hardcoded, offline upper bound on any
 // claude-cli version we will treat as a real first-party observation.
 func claudeStaticSanityCeiling() claudeCLIVersion {
@@ -688,6 +755,18 @@ func claudeFallbackBaseline(auth *cliproxyauth.Auth, apiKey string, cfg *config.
 	ceilingProfile, hasCeiling := claudeObservedHighWaterProfile(observationKeys)
 	if !hasCeiling {
 		ceilingProfile, hasCeiling = globalClaudeObservedHighWaterProfile()
+	}
+
+	// claude 版本高水位持久化：重启/部署后内存观测被清空，会回落到 floor 2.1.63。
+	// 这里把上一次 persist 进 auth.Metadata 的高水位三元组作为额外的 ceiling 候选，
+	// 与内存观测取 max。persisted 三元组本身来自上一进程里已过 sanity-ceiling gate 的
+	// 真实观测（写回点在 RaiseClaudeDeviceHighWater 之前已做 sanity 校验），因此不会
+	// 固化伪造超高版本。第一笔请求即可从 persisted 值起步，而非回 floor。
+	if persisted, hasPersisted := claudePersistedHighWaterProfile(auth); hasPersisted {
+		if !hasCeiling || persisted.version.Compare(ceilingProfile.version) > 0 {
+			ceilingProfile = persisted
+			hasCeiling = true
+		}
 	}
 
 	// 只有当存在同一次真实观测的完整三元组、且其版本高于 baseline 时才整体抬升；
