@@ -1716,11 +1716,18 @@ func accountSettingsRefreshEnabled(auth *coreauth.Auth, stored authFileAccountSe
 	return true
 }
 
+// refreshEnabledStorageValue always returns a non-nil pointer so the stored
+// account_settings.refresh_enabled faithfully echoes the user's explicit intent.
+//
+// Returning nil for enabled=true would drop the stored value (omitempty) and force
+// accountSettingsRefreshEnabled to fall back to RefreshDisabled() inference. When a
+// record carries reauth-required locks (e.g. refresh_status=reauth_required), that
+// inference would keep reporting refresh_enabled=false even after the user manually
+// re-enabled refresh, so the toggle would not persist on GET/view. Persisting the
+// explicit true is safe: account_settings.refresh_enabled=true is checked as !parsed
+// in refreshDisabledFromMetadata, so it does not itself trigger RefreshDisabled.
 func refreshEnabledStorageValue(enabled bool) *bool {
-	if enabled {
-		return nil
-	}
-	value := false
+	value := enabled
 	return &value
 }
 
@@ -1736,11 +1743,61 @@ func applyAuthRefreshEnabledMetadata(auth *coreauth.Auth, enabled bool) {
 		delete(auth.Metadata, "disable_refresh")
 		delete(auth.Metadata, "auto_refresh_disabled")
 		delete(auth.Metadata, "refresh_enabled")
+		// Re-enabling refresh must also release any terminal reauth-required lock
+		// written by markRefreshReauthRequiredWithReason. Otherwise refresh gating
+		// keeps skipping this account and the management UI keeps showing it as
+		// reauth-required even though the user explicitly opted back in. If the
+		// underlying token is truly dead, the next refresh attempt will re-write
+		// the lock, which is the correct feedback path.
+		clearAuthReauthRequiredLock(auth)
 		return
 	}
 	auth.Metadata["refresh_disabled"] = true
 	auth.Metadata["refresh_enabled"] = false
 	auth.NextRefreshAfter = time.Time{}
+}
+
+// clearAuthReauthRequiredLock releases the terminal reauth-required state that
+// markRefreshReauthRequiredWithReason (sdk/cliproxy/auth/types.go) writes when a
+// refresh token is rejected. It removes the metadata lock keys, normalizes any
+// refresh_disabled-style attributes that would still make RefreshDisabled() true,
+// and resets the runtime status fields only when they specifically represent a
+// reauth_required state. Non-reauth states (e.g. disabled-via-management) are left
+// untouched so this stays scoped to "user re-enabled refresh on a reauth account".
+func clearAuthReauthRequiredLock(auth *coreauth.Auth) {
+	if auth == nil {
+		return
+	}
+	if auth.Metadata != nil {
+		for _, key := range []string{
+			"reauth_required",
+			"refresh_status",
+			"refresh_error_code",
+			"refresh_disabled_reason",
+		} {
+			delete(auth.Metadata, key)
+		}
+	}
+	if len(auth.Attributes) > 0 {
+		for _, key := range []string{"refresh_disabled", "disable_refresh", "auto_refresh_disabled"} {
+			delete(auth.Attributes, key)
+		}
+		// Only flip attribute values that already exist; do not introduce new keys.
+		for _, key := range []string{"refresh_enabled", "auto_refresh", "auto_refresh_enabled"} {
+			if _, ok := auth.Attributes[key]; ok {
+				auth.Attributes[key] = "true"
+			}
+		}
+	}
+	if auth.StatusMessage == "reauth_required" {
+		auth.StatusMessage = ""
+		if auth.Status == coreauth.StatusError {
+			auth.Status = coreauth.StatusActive
+		}
+		if auth.LastError != nil && auth.LastError.Code == "reauth_required" {
+			auth.LastError = nil
+		}
+	}
 }
 
 func buildAuthFileAccountSettingsView(auth *coreauth.Auth, cfg *config.Config) authFileAccountSettingsView {

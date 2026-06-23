@@ -1958,6 +1958,225 @@ func TestPatchAuthFileAccountSettings_SyntheticDeviceIDIsReadOnly(t *testing.T) 
 	}
 }
 
+// TestApplyAuthRefreshEnabledMetadata_EnabledClearsReauthRequiredLock verifies that
+// re-enabling refresh on a record that carries the full terminal reauth-required
+// lock (metadata keys + Attributes refresh_enabled=false + Status/StatusMessage/
+// LastError set by markRefreshReauthRequiredWithReason) releases every gating lock
+// so RefreshDisabled() reports false afterwards.
+func TestApplyAuthRefreshEnabledMetadata_EnabledClearsReauthRequiredLock(t *testing.T) {
+	auth := &coreauth.Auth{
+		ID:       "codex-reauth.json",
+		FileName: "codex-reauth.json",
+		Provider: "codex",
+		Attributes: map[string]string{
+			"path":            "/tmp/codex-reauth.json",
+			"refresh_enabled": "false",
+		},
+		Metadata: map[string]any{
+			"type":                    "codex",
+			"refresh_disabled":        true,
+			"refresh_status":          "reauth_required",
+			"refresh_error_code":      "refresh_token_reused",
+			"refresh_disabled_reason": "reauth_required",
+			"reauth_required":         true,
+		},
+	}
+	// Drive the real terminal-lock path so the runtime Status/StatusMessage/LastError
+	// fields are populated exactly as production does, then confirm we clear them.
+	auth.Status = coreauth.StatusError
+	auth.StatusMessage = "reauth_required"
+	auth.LastError = &coreauth.Error{
+		Code:    "reauth_required",
+		Message: "refresh token was already used; sign in again to reconnect this account",
+	}
+
+	if !auth.RefreshDisabled() {
+		t.Fatalf("precondition: auth should be refresh-disabled before re-enable")
+	}
+
+	applyAuthRefreshEnabledMetadata(auth, true)
+
+	for _, key := range []string{
+		"refresh_disabled",
+		"disable_refresh",
+		"auto_refresh_disabled",
+		"refresh_enabled",
+		"reauth_required",
+		"refresh_status",
+		"refresh_error_code",
+		"refresh_disabled_reason",
+	} {
+		if _, ok := auth.Metadata[key]; ok {
+			t.Fatalf("metadata key %q should be cleared after re-enable, got %#v", key, auth.Metadata[key])
+		}
+	}
+	if got := auth.Attributes["refresh_enabled"]; got != "true" {
+		t.Fatalf("Attributes refresh_enabled = %q, want true", got)
+	}
+	for _, key := range []string{"refresh_disabled", "disable_refresh", "auto_refresh_disabled"} {
+		if _, ok := auth.Attributes[key]; ok {
+			t.Fatalf("Attributes key %q should be cleared after re-enable", key)
+		}
+	}
+	if auth.StatusMessage != "" {
+		t.Fatalf("StatusMessage = %q, want empty after reauth lock cleared", auth.StatusMessage)
+	}
+	if auth.Status != coreauth.StatusActive {
+		t.Fatalf("Status = %q, want %q after reauth lock cleared", auth.Status, coreauth.StatusActive)
+	}
+	if auth.LastError != nil {
+		t.Fatalf("LastError = %#v, want nil after reauth lock cleared", auth.LastError)
+	}
+	if auth.RefreshDisabled() {
+		t.Fatalf("RefreshDisabled() = true after re-enable, want false")
+	}
+}
+
+// TestApplyAuthRefreshEnabledMetadata_EnabledPreservesNonReauthStatus verifies that
+// re-enabling refresh does not clobber unrelated runtime status fields (e.g. an
+// account disabled via management) that are not reauth_required.
+func TestApplyAuthRefreshEnabledMetadata_EnabledPreservesNonReauthStatus(t *testing.T) {
+	auth := &coreauth.Auth{
+		ID:            "codex-other.json",
+		Provider:      "codex",
+		Status:        coreauth.StatusError,
+		StatusMessage: "disabled-via-management",
+		LastError: &coreauth.Error{
+			Code:    "disabled",
+			Message: "account disabled",
+		},
+		Metadata: map[string]any{"type": "codex"},
+	}
+
+	applyAuthRefreshEnabledMetadata(auth, true)
+
+	if auth.StatusMessage != "disabled-via-management" {
+		t.Fatalf("StatusMessage = %q, want preserved non-reauth message", auth.StatusMessage)
+	}
+	if auth.Status != coreauth.StatusError {
+		t.Fatalf("Status = %q, want preserved StatusError", auth.Status)
+	}
+	if auth.LastError == nil || auth.LastError.Code != "disabled" {
+		t.Fatalf("LastError = %#v, want preserved non-reauth error", auth.LastError)
+	}
+}
+
+// TestApplyAuthRefreshEnabledMetadata_DisabledStillLocks is a regression guard that
+// the enabled=false path is unchanged: it writes the refresh_disabled lock, sets
+// refresh_enabled=false, and zeroes NextRefreshAfter.
+func TestApplyAuthRefreshEnabledMetadata_DisabledStillLocks(t *testing.T) {
+	auth := &coreauth.Auth{
+		ID:               "codex-disable.json",
+		Provider:         "codex",
+		NextRefreshAfter: time.Now().Add(time.Hour),
+		Metadata:         map[string]any{"type": "codex"},
+	}
+
+	applyAuthRefreshEnabledMetadata(auth, false)
+
+	if parsed, ok := auth.Metadata["refresh_disabled"].(bool); !ok || !parsed {
+		t.Fatalf("refresh_disabled = %#v, want true", auth.Metadata["refresh_disabled"])
+	}
+	if parsed, ok := auth.Metadata["refresh_enabled"].(bool); !ok || parsed {
+		t.Fatalf("refresh_enabled = %#v, want false", auth.Metadata["refresh_enabled"])
+	}
+	if !auth.NextRefreshAfter.IsZero() {
+		t.Fatalf("NextRefreshAfter = %s, want zero", auth.NextRefreshAfter)
+	}
+	if !auth.RefreshDisabled() {
+		t.Fatalf("RefreshDisabled() = false after disable, want true")
+	}
+}
+
+// TestPatchAuthFileAccountSettings_ReauthRequiredReenableRoundTrips is the end-to-end
+// regression for the persistence bug: a reauth_required account that the user
+// re-enables via PATCH must report refresh_enabled=true on the subsequent GET/view.
+func TestPatchAuthFileAccountSettings_ReauthRequiredReenableRoundTrips(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	record := &coreauth.Auth{
+		ID:       "codex-reauth-roundtrip.json",
+		FileName: "codex-reauth-roundtrip.json",
+		Provider: "codex",
+		Status:   coreauth.StatusError,
+		Attributes: map[string]string{
+			"path": "/tmp/codex-reauth-roundtrip.json",
+		},
+		Metadata: map[string]any{
+			"type":                    "codex",
+			"access_token":            "access-token",
+			"refresh_token":           "rotated-out-token",
+			"email":                   "codex@example.test",
+			"refresh_disabled":        true,
+			"refresh_status":          "reauth_required",
+			"refresh_error_code":      "refresh_token_reused",
+			"refresh_disabled_reason": "reauth_required",
+			"reauth_required":         true,
+		},
+	}
+	record.StatusMessage = "reauth_required"
+	record.LastError = &coreauth.Error{Code: "reauth_required", Message: "refresh token was already used; sign in again to reconnect this account"}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("failed to register auth record: %v", errRegister)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+
+	// Sanity: before re-enable the view reports refresh_enabled=false.
+	if got := accountSettingsRefreshEnabled(record, readAccountSettingsMetadata(record, &config.Config{})); got {
+		t.Fatalf("precondition: reauth_required account should view as refresh_enabled=false")
+	}
+
+	body := `{"name":"codex-reauth-roundtrip.json","proxy_url":"http://test-proxy:8080","disabled":false,"refresh_enabled":true,"extra_headers":{}}`
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/account-settings", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	ctx.Request = req
+	h.PatchAuthFileAccountSettings(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PATCH: expected %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+
+	var patchResp authFileAccountSettingsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &patchResp); err != nil {
+		t.Fatalf("failed to decode patch response: %v", err)
+	}
+	if !patchResp.AccountSettings.RefreshEnabled {
+		t.Fatalf("PATCH response refresh_enabled = false, want true")
+	}
+
+	updated, ok := manager.GetByID("codex-reauth-roundtrip.json")
+	if !ok || updated == nil {
+		t.Fatalf("expected updated auth record")
+	}
+	if updated.RefreshDisabled() {
+		t.Fatalf("updated record still refresh-disabled after re-enable")
+	}
+
+	// Subsequent GET/view must persist refresh_enabled=true.
+	getRec := httptest.NewRecorder()
+	getCtx, _ := gin.CreateTestContext(getRec)
+	getReq := httptest.NewRequest(http.MethodGet, "/v0/management/auth-files/account-settings?name=codex-reauth-roundtrip.json", nil)
+	getCtx.Request = getReq
+	h.GetAuthFileAccountSettings(getCtx)
+
+	if getRec.Code != http.StatusOK {
+		t.Fatalf("GET: expected %d, got %d with body %s", http.StatusOK, getRec.Code, getRec.Body.String())
+	}
+	var getResp authFileAccountSettingsResponse
+	if err := json.Unmarshal(getRec.Body.Bytes(), &getResp); err != nil {
+		t.Fatalf("failed to decode get response: %v", err)
+	}
+	if !getResp.AccountSettings.RefreshEnabled {
+		t.Fatalf("GET refresh_enabled = false after re-enable, want true (persistence regression)")
+	}
+}
+
 func containsString(values []string, want string) bool {
 	for _, value := range values {
 		if value == want {
