@@ -164,6 +164,14 @@ func ResolveCodexClientProfile(auth *cliproxyauth.Auth, headers http.Header, cfg
 			return defaultProfile
 		}
 	}
+	// codex 版本高水位持久化（读种子）：重启/部署后 per-account 画像缓存被清空，会回落
+	// 到静态 floor 0.140.0。这里把上一次 persist 进 auth.Metadata 的高水位版本作为额外的
+	// floor 候选，与静态/online floor 取 max，整体抬高 baseline 后再进入 candidate/cache
+	// 比较。persisted 版本来自上一进程里已过 family+ceiling gate 的真实 CLI 观测，不会
+	// 固化伪造超界值或 Desktop 残留。第一笔请求即可从 persisted 值起步，而非回 floor。
+	if persistedVersion, hasPersistedVersion := codexPersistedHighWaterProfile(auth); hasPersistedVersion {
+		defaultProfile = applyCodexFloorVersion(defaultProfile, persistedVersion)
+	}
 	persistedProfile, hasPersisted := codexClientProfileFromAuth(auth, cfg)
 
 	current := defaultProfile
@@ -394,6 +402,109 @@ func CodexManagedRuntimeFingerprint(profile CodexClientProfile) map[string]strin
 		"platform": profile.PlatformToken,
 		"terminal": profile.TailToken,
 	})
+}
+
+// codexPersistedHighWaterProfile reconstructs a version-bearing CodexClientProfile
+// from the high-water entry persisted into auth.Metadata by
+// Manager.RaiseCodexDeviceHighWater. It is the read-seed half of codex version
+// high-water persistence: after a restart the in-memory per-account profile cache
+// is empty, so applyCodexFloorVersion consults this persisted entry (and takes the
+// max with the static floor / online latest) instead of falling back only to the
+// static 0.140.0 floor.
+//
+// The persisted entry already came from a real serving observation that passed the
+// family/ceiling gate before being written, so it cannot reintroduce a forged
+// high version or a cross-family Desktop residue here. An entry whose version does
+// not parse is rejected (returns false).
+func codexPersistedHighWaterProfile(auth *cliproxyauth.Auth) (codexVersionMarker, bool) {
+	if auth == nil {
+		return codexVersionMarker{}, false
+	}
+	hw, ok := cliproxyauth.CodexDeviceHighWaterFromMetadata(auth.Metadata)
+	if !ok {
+		return codexVersionMarker{}, false
+	}
+	version := strings.TrimSpace(hw.Version)
+	if version == "" {
+		if _, uaVersion, _, _, parsed := parseCodexUserAgent(strings.TrimSpace(hw.UserAgent)); parsed {
+			version = strings.TrimSpace(uaVersion)
+		}
+	}
+	marker := parseCodexVersion(version)
+	if !marker.valid {
+		return codexVersionMarker{}, false
+	}
+	return marker, true
+}
+
+// applyCodexFloorVersion raises baseline's version floor to the persisted CLI
+// high-water when it is strictly higher, so the first request after a restart
+// starts from the persisted observation rather than the static 0.140.0 floor.
+//
+// It only applies inside the CLI family (baseline not Desktop-like) and only when
+// the persisted version is within the CLI sanity ceiling — the persisted entry is
+// already family/ceiling-validated, but this guards against any future schema
+// drift. Desktop-family baselines (operator configured UA back to Desktop) are
+// left untouched, mirroring enforceCodexManagedFamily's family discipline.
+func applyCodexFloorVersion(baseline CodexClientProfile, persisted codexVersionMarker) CodexClientProfile {
+	if !persisted.valid || baseline.isCodexDesktopLike() {
+		return baseline
+	}
+	cliCeiling := parseCodexVersion(codexCLISanityCeilingVersion)
+	if persisted.Compare(cliCeiling) > 0 {
+		return baseline
+	}
+	if baseline.version.valid && persisted.Compare(baseline.version) <= 0 {
+		return baseline
+	}
+	raised := baseline
+	raised.Version = persisted.raw
+	raised.UserAgentVersion = persisted.raw
+	raised.TailToken = bumpCodexTailVersionMarker(raised.TailToken, raised.UserAgentProduct, persisted.raw)
+	raised.UserAgent = buildCodexUserAgent(
+		raised.UserAgentProduct,
+		raised.UserAgentVersion,
+		raised.PlatformToken,
+		raised.TailToken,
+	)
+	raised.version = persisted
+	return raised
+}
+
+// CodexObservedHighWaterForAuth resolves the account's current outbound codex
+// client profile and returns its version-bearing identity as a serializable
+// high-water entry, suitable for passing to Manager.RaiseCodexDeviceHighWater.
+//
+// The resolved profile already folds in the per-request observation, the cached
+// per-account high-water, the persisted floor and the static/online floor, and it
+// has already passed the family + sanity-ceiling gates (forged "999.x" or
+// cross-family Desktop versions are dropped before they become the resolved CLI
+// version). So the returned entry is guaranteed to be a real, validated CLI
+// observation. Returns false when no usable version could be resolved.
+func CodexObservedHighWaterForAuth(auth *cliproxyauth.Auth, headers http.Header, cfg *config.Config) (cliproxyauth.CodexDeviceHighWater, bool) {
+	if auth == nil {
+		return cliproxyauth.CodexDeviceHighWater{}, false
+	}
+	profile := ResolveCodexClientProfile(auth, headers, cfg)
+	if profile.isCodexDesktopLike() {
+		// Desktop family versions (year.day.build) are not part of the CLI
+		// high-water line and must not be persisted as a CLI floor.
+		return cliproxyauth.CodexDeviceHighWater{}, false
+	}
+	version := strings.TrimSpace(profile.Version)
+	if version == "" {
+		version = strings.TrimSpace(profile.UserAgentVersion)
+	}
+	if !parseCodexVersion(version).valid || strings.TrimSpace(profile.UserAgent) == "" {
+		return cliproxyauth.CodexDeviceHighWater{}, false
+	}
+	return cliproxyauth.CodexDeviceHighWater{
+		UserAgent:  strings.TrimSpace(profile.UserAgent),
+		Version:    version,
+		Originator: strings.TrimSpace(profile.Originator),
+		Source:     profile.Source.Source,
+		LastSeenAt: time.Now().UTC().Format(time.RFC3339),
+	}, true
 }
 
 func codexClientProfileFromAuth(auth *cliproxyauth.Auth, cfg *config.Config) (CodexClientProfile, bool) {
