@@ -1298,6 +1298,17 @@ func warnClaudeDeviceProfileStaleGuard(cfg *config.Config) {
 }
 
 func resolveClaudeDeviceProfileForRequest(ctx context.Context, auth *cliproxyauth.Auth, apiKey string, headers http.Header, cfg *config.Config) helps.ClaudeDeviceProfile {
+	// Re-seed the in-memory observation map from this auth's persisted
+	// high-water before the stale-guard predicate runs. After a restart the
+	// in-memory observation map is empty while auth.Metadata still carries the
+	// persisted high-water triple; the outbound floor path already reads that
+	// triple directly (so the outbound UA is correct), but the stale-guard
+	// warning predicate only inspects the in-memory map and would otherwise emit
+	// a misleading "falls back to frozen floor" warning on the first request.
+	// Seeding aligns the warning's view with the disk/outbound view without
+	// changing outbound timing; it is only-up (the persisted triple was already
+	// sanity-validated and the global high-water always takes the max).
+	helps.SeedClaudeObservedHighWaterFromAuth(auth)
 	warnClaudeDeviceProfileStaleGuard(cfg)
 	ginCtx := ginContextFromContext(ctx)
 	if ginCtx != nil {
