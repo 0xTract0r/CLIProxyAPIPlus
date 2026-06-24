@@ -1518,7 +1518,14 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 }
 
 type codexIdentityConfuseState struct {
-	enabled                bool
+	// enabled 表示 identity-confuse 开关分支生效（受 codexIdentityConfuseEnabled
+	// 门控），仅驱动 prompt_cache_key / window_id 这两个字段的混淆。
+	enabled bool
+	// identityNormalize 表示真机身份字段（installation_id / turn_id /
+	// session_id / thread_id）的无条件归一生效。它与 enabled 解耦：只要 authID
+	// 有效就为 true，无论 identity-confuse 开关如何，都对这 4 个字段做归一，
+	// 避免生产关掉 identity-confuse 时裸泄漏真机指纹（anticorr 方案A）。
+	identityNormalize      bool
 	authID                 string
 	originalPromptCacheKey string
 	promptCacheKey         string
@@ -1573,16 +1580,29 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Form
 }
 
 func applyCodexIdentityConfuseBody(cfg *config.Config, auth *cliproxyauth.Auth, userPayload []byte, rawJSON []byte) ([]byte, codexIdentityConfuseState) {
-	if !codexIdentityConfuseEnabled(cfg) || auth == nil || strings.TrimSpace(auth.ID) == "" || len(rawJSON) == 0 {
+	if auth == nil || strings.TrimSpace(auth.ID) == "" || len(rawJSON) == 0 {
 		return rawJSON, codexIdentityConfuseState{}
 	}
 
-	state := codexIdentityConfuseState{enabled: true, authID: strings.TrimSpace(auth.ID)}
-	if promptCacheKey := strings.TrimSpace(gjson.GetBytes(userPayload, "prompt_cache_key").String()); promptCacheKey != "" {
-		state.originalPromptCacheKey = promptCacheKey
-		state.promptCacheKey = codexIdentityConfuseUUID(auth.ID, "prompt-cache", promptCacheKey)
-		rawJSON, _ = sjson.SetBytes(rawJSON, "prompt_cache_key", state.promptCacheKey)
+	// identityNormalize 永远生效（与 identity-confuse 开关解耦）：只要 authID 有效，
+	// 就对真机身份字段做无条件归一。enabled 仅在 identity-confuse 门控通过时为 true，
+	// 额外驱动 prompt_cache_key / window_id 的混淆。
+	state := codexIdentityConfuseState{
+		identityNormalize: true,
+		enabled:           codexIdentityConfuseEnabled(cfg),
+		authID:            strings.TrimSpace(auth.ID),
 	}
+
+	// prompt_cache_key（受 identity-confuse 门控，保持开关语义）。
+	if state.enabled {
+		if promptCacheKey := strings.TrimSpace(gjson.GetBytes(userPayload, "prompt_cache_key").String()); promptCacheKey != "" {
+			state.originalPromptCacheKey = promptCacheKey
+			state.promptCacheKey = codexIdentityConfuseUUID(auth.ID, "prompt-cache", promptCacheKey)
+			rawJSON, _ = sjson.SetBytes(rawJSON, "prompt_cache_key", state.promptCacheKey)
+		}
+	}
+
+	// fork(anticorr 方案A): installation_id 真机身份字段无条件归一（与开关解耦）。
 	// fork(anticorr A-3): installation_id 缺省每账号稳定派生兜底。
 	// 旧逻辑仅当 body 已带 x-codex-installation-id 时才改写；客户端没传则字段缺失/空，
 	// 出站缺这个字段（与真实 codex 客户端不一致，且无法做到每账号稳定）。现在缺失/空时
@@ -1594,10 +1614,15 @@ func applyCodexIdentityConfuseBody(cfg *config.Config, auth *cliproxyauth.Auth, 
 		state.installationID = codexIdentityConfuseUUID(auth.ID, "installation", "default")
 	}
 	rawJSON, _ = sjson.SetBytes(rawJSON, "client_metadata.x-codex-installation-id", state.installationID)
+
+	// turn-metadata（body client_metadata 副本）：installation_id / turn_id /
+	// session_id / thread_id 无条件归一；prompt_cache_key / window_id 仅在门控开时。
 	if turnMetadata := strings.TrimSpace(gjson.GetBytes(rawJSON, "client_metadata.x-codex-turn-metadata").String()); turnMetadata != "" {
 		rawJSON, _ = sjson.SetBytes(rawJSON, "client_metadata.x-codex-turn-metadata", applyCodexTurnMetadataIdentityConfuse(turnMetadata, &state))
 	}
-	if state.promptCacheKey != "" {
+
+	// window_id（受 identity-confuse 门控，保持开关语义）。
+	if state.enabled && state.promptCacheKey != "" {
 		if windowID := strings.TrimSpace(gjson.GetBytes(rawJSON, "client_metadata.x-codex-window-id").String()); windowID != "" {
 			rawJSON, _ = sjson.SetBytes(rawJSON, "client_metadata.x-codex-window-id", state.promptCacheKey+":0")
 		}
@@ -1610,14 +1635,19 @@ func applyCodexIdentityConfuseHeaders(headers http.Header, state *codexIdentityC
 	if headers == nil {
 		return
 	}
-	if state == nil || !state.enabled {
+	if state == nil {
 		return
 	}
 
-	if rawTurnMetadata := strings.TrimSpace(headers.Get("X-Codex-Turn-Metadata")); rawTurnMetadata != "" {
-		headers.Set("X-Codex-Turn-Metadata", applyCodexTurnMetadataIdentityConfuse(rawTurnMetadata, state))
+	// header X-Codex-Turn-Metadata 里的真机身份字段无条件归一（与开关解耦）；
+	// 内部 applyCodexTurnMetadataIdentityConfuse 会按 identityNormalize / enabled
+	// 分别处理身份字段与 prompt_cache_key / window_id。
+	if state.identityNormalize && strings.TrimSpace(state.authID) != "" {
+		if rawTurnMetadata := strings.TrimSpace(headers.Get("X-Codex-Turn-Metadata")); rawTurnMetadata != "" {
+			headers.Set("X-Codex-Turn-Metadata", applyCodexTurnMetadataIdentityConfuse(rawTurnMetadata, state))
+		}
 	}
-	if state.promptCacheKey == "" {
+	if !state.enabled || state.promptCacheKey == "" {
 		return
 	}
 
@@ -1635,22 +1665,41 @@ func applyCodexIdentityConfuseHeaders(headers http.Header, state *codexIdentityC
 
 func applyCodexTurnMetadataIdentityConfuse(rawTurnMetadata string, state *codexIdentityConfuseState) string {
 	updatedTurnMetadata := rawTurnMetadata
-	if state == nil || !state.enabled {
+	if state == nil {
 		return updatedTurnMetadata
 	}
-	// installation_id 与 client_metadata.x-codex-installation-id 用同一个派生值改写，
-	// 避免 turn-metadata（header + body 副本）里残留真机 installation_id 或与
-	// client_metadata 那个混淆值发散。
-	if state.installationID != "" && gjson.Get(updatedTurnMetadata, "installation_id").Exists() {
-		updatedTurnMetadata, _ = sjson.Set(updatedTurnMetadata, "installation_id", state.installationID)
+
+	// 真机身份字段（installation_id / turn_id / session_id / thread_id）无条件归一，
+	// 与 identity-confuse 开关解耦（anticorr 方案A）。只要 identityNormalize 且
+	// authID 有效就改写，避免生产关掉 identity-confuse 时这些字段裸泄漏真机指纹。
+	if state.identityNormalize && strings.TrimSpace(state.authID) != "" {
+		// installation_id 与 client_metadata.x-codex-installation-id 用同一个派生值改写，
+		// 避免 turn-metadata（header + body 副本）里残留真机 installation_id 或与
+		// client_metadata 那个混淆值发散。
+		if state.installationID != "" && gjson.Get(updatedTurnMetadata, "installation_id").Exists() {
+			updatedTurnMetadata, _ = sjson.Set(updatedTurnMetadata, "installation_id", state.installationID)
+		}
+		// turn_id 存在才改写（缺失不注入），并登记到 turnIDs 供上游 SSE 回换真值。
+		if turnID := strings.TrimSpace(gjson.Get(rawTurnMetadata, "turn_id").String()); turnID != "" {
+			updatedTurnMetadata, _ = sjson.Set(updatedTurnMetadata, "turn_id", state.confuseTurnID(turnID))
+		}
+		// session_id / thread_id：request 单向、不回显 → 只改写、不回换。存在才改、缺失不注入。
+		if sessionID := strings.TrimSpace(gjson.Get(rawTurnMetadata, "session_id").String()); sessionID != "" {
+			updatedTurnMetadata, _ = sjson.Set(updatedTurnMetadata, "session_id", codexIdentityConfuseUUID(state.authID, "session", sessionID))
+		}
+		if threadID := strings.TrimSpace(gjson.Get(rawTurnMetadata, "thread_id").String()); threadID != "" {
+			updatedTurnMetadata, _ = sjson.Set(updatedTurnMetadata, "thread_id", codexIdentityConfuseUUID(state.authID, "thread", threadID))
+		}
+	}
+
+	// prompt_cache_key / window_id 仍受 identity-confuse 门控（保持开关语义）。
+	if !state.enabled {
+		return updatedTurnMetadata
 	}
 	if state.promptCacheKey != "" && gjson.Get(rawTurnMetadata, "prompt_cache_key").Exists() {
 		updatedTurnMetadata, _ = sjson.Set(updatedTurnMetadata, "prompt_cache_key", state.promptCacheKey)
 	} else if state.promptCacheKey != "" && state.originalPromptCacheKey != "" {
 		updatedTurnMetadata = strings.ReplaceAll(updatedTurnMetadata, state.originalPromptCacheKey, state.promptCacheKey)
-	}
-	if turnID := strings.TrimSpace(gjson.Get(rawTurnMetadata, "turn_id").String()); turnID != "" {
-		updatedTurnMetadata, _ = sjson.Set(updatedTurnMetadata, "turn_id", state.confuseTurnID(turnID))
 	}
 	if state.promptCacheKey != "" && gjson.Get(rawTurnMetadata, "window_id").Exists() {
 		updatedTurnMetadata, _ = sjson.Set(updatedTurnMetadata, "window_id", state.promptCacheKey+":0")
@@ -1676,7 +1725,8 @@ func applyCodexIdentityExposeResponsePayload(payload []byte, state codexIdentity
 
 func (state *codexIdentityConfuseState) confuseTurnID(turnID string) string {
 	turnID = strings.TrimSpace(turnID)
-	if state == nil || !state.enabled || strings.TrimSpace(state.authID) == "" || turnID == "" {
+	// turn_id 归一与 identity-confuse 开关解耦：identityNormalize 生效即处理（anticorr 方案A）。
+	if state == nil || !state.identityNormalize || strings.TrimSpace(state.authID) == "" || turnID == "" {
 		return turnID
 	}
 	for _, replacement := range state.turnIDs {
