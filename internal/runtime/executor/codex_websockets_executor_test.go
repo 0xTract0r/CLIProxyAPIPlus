@@ -503,6 +503,7 @@ func TestApplyCodexWebsocketHeadersIdentityConfuseRemapsPromptCacheKey(t *testin
 func TestCodexIdentityConfuseResponsePayloadHidesUpstreamAndRestoresClient(t *testing.T) {
 	state := codexIdentityConfuseState{
 		enabled:                true,
+		identityNormalize:      true,
 		authID:                 "auth-ws-1",
 		originalPromptCacheKey: "cache-ws-1",
 		promptCacheKey:         codexIdentityConfuseUUID("auth-ws-1", "prompt-cache", "cache-ws-1"),
