@@ -796,6 +796,45 @@ func (e *CodexExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Aut
 	return nil
 }
 
+// persistCodexDeviceHighWater resolves the account's current outbound codex
+// client profile (the same resolution applyCodexHeaders / applyCodexWebsocketHeaders
+// just performed) and asks the auth manager to monotonically raise the persisted
+// high-water (auth.Metadata[codex_device_high_water]).
+//
+// It is a no-op when no manager is wired, when the auth has no ID, or when no
+// usable CLI version could be resolved. The manager performs the strict-increase
+// comparison, so calling this every request is safe and writes to disk only on an
+// actual raise.
+//
+// 与 claude 的 persistClaudeDeviceHighWater 对称。挂点必须在真实 serving 路径上
+// （Execute/executeCompact/ExecuteStream + WS 出站），紧挨 applyCodexHeaders 之后，
+// 不挂 PrepareRequest——codex PrepareRequest 只服务 HttpRequest adapter 旁路、不解析
+// 客户端画像，挂在那里写回永不触发，重启回落 floor。ctx 携带 gin headers，
+// CodexObservedHighWaterForAuth 复用同一组入站 header 解析观测版本。
+func (e *CodexExecutor) persistCodexDeviceHighWater(ctx context.Context, auth *cliproxyauth.Auth) {
+	if e == nil || e.authManager == nil || auth == nil {
+		return
+	}
+	authID := strings.TrimSpace(auth.ID)
+	if authID == "" {
+		return
+	}
+	var ginHeaders http.Header
+	if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
+		ginHeaders = ginCtx.Request.Header
+	}
+	highWater, ok := helps.CodexObservedHighWaterForAuth(auth, ginHeaders, e.cfg)
+	if !ok {
+		return
+	}
+	if _, err := e.authManager.RaiseCodexDeviceHighWater(ctx, authID, highWater); err != nil {
+		log.WithError(err).WithFields(log.Fields{
+			"component": "codex_device_high_water",
+			"auth_id":   authID,
+		}).Warn("codex executor: failed to persist device-profile high-water")
+	}
+}
+
 // HttpRequest injects Codex credentials into the request and executes it.
 func (e *CodexExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth, req *http.Request) (*http.Response, error) {
 	if req == nil {
@@ -871,6 +910,12 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		return resp, err
 	}
 	applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg)
+	// codex 版本高水位持久化（真实 serving 路径）：applyCodexHeaders 内部的
+	// ResolveCodexClientProfile 已把本次真实请求的合法 CLI 高水位候选解析为出站画像。
+	// 这里把当前账号的观测高水位透出给 auth manager，由 RaiseCodexDeviceHighWater 做
+	// "仅单调抬升才写盘"。挂在真实 serving 出站点（非 PrepareRequest），否则持久化永不
+	// 触发，重启回落 floor 0.140.0。
+	e.persistCodexDeviceHighWater(httpReq.Context(), auth)
 	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
@@ -1040,6 +1085,8 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 		return resp, err
 	}
 	applyCodexHeaders(httpReq, auth, apiKey, false, e.cfg)
+	// codex 版本高水位持久化（真实 serving 路径：/responses/compact）。见 Execute 注释。
+	e.persistCodexDeviceHighWater(httpReq.Context(), auth)
 	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
@@ -1152,6 +1199,8 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		return nil, err
 	}
 	applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg)
+	// codex 版本高水位持久化（真实 serving 路径：ExecuteStream 主对话流）。见 Execute 注释。
+	e.persistCodexDeviceHighWater(httpReq.Context(), auth)
 	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
 	var authID, authLabel, authType, authValue string
 	if auth != nil {

@@ -1407,6 +1407,89 @@ func (m *Manager) RaiseClaudeDeviceHighWater(ctx context.Context, authID string,
 	return true, nil
 }
 
+// RaiseCodexDeviceHighWater monotonically raises the persisted codex client
+// device-profile high-water mark stored under CodexDeviceHighWaterMetadataKey,
+// then persists the change. It is the write side of "codex version high-water
+// persistence": before this existed codex had only a read-seed (from persisted
+// headers/attributes + floor 0.140.0) but never wrote runtime observations back,
+// so an observed higher CLI version was lost on restart. After this, the read
+// seed picks the max(persisted high-water, floor) and the loop is closed.
+//
+// Concurrency mirrors RaiseClaudeDeviceHighWater / IncrementCyberPolicyCount: the
+// read-compare-write of the high-water entry happens entirely under m.mu so
+// concurrent observations cannot lose a raise, and persistence (store + hooks)
+// runs after the lock is released to avoid re-entrant locking inside persist.
+//
+// Monotonic-up only: the metadata is updated ONLY when the incoming version is
+// strictly greater than the currently persisted version. This makes the call a
+// no-op (and emits no disk write) in steady state, so no additional time-based
+// debounce is needed. Same-version and lower-version observations are ignored.
+//
+// Whole-map replacement (anti shallow-copy hazard): the high-water value written
+// into auth.Metadata is always a freshly allocated map[string]any, never an
+// in-place mutation of a pre-existing nested map. Auth.Clone shallow-copies
+// Metadata top-level entries, so reusing a nested map would let a clone observe
+// a half-written entry; allocating a new map each raise keeps every snapshot
+// internally consistent.
+//
+// The incoming profile must already be a real, family/ceiling-validated serving
+// observation (ResolveCodexClientProfile drops forged high versions and
+// cross-family Desktop residue before they become the resolved CLI version);
+// this method does no version sanity gating of its own beyond the monotonic
+// comparison. Returns whether the high-water was raised, plus a persistence error
+// if any. When the auth cannot be located or the incoming entry is unusable it
+// returns (false, nil).
+func (m *Manager) RaiseCodexDeviceHighWater(ctx context.Context, authID string, profile CodexDeviceHighWater) (bool, error) {
+	if m == nil {
+		return false, nil
+	}
+	authID = strings.TrimSpace(authID)
+	if authID == "" || !profile.valid() {
+		return false, nil
+	}
+	incomingVersion, ok := profile.parsedVersion()
+	if !ok {
+		return false, nil
+	}
+
+	m.mu.Lock()
+	existing, ok := m.auths[authID]
+	if !ok || existing == nil {
+		m.mu.Unlock()
+		return false, nil
+	}
+
+	// Compare the incoming version against the currently persisted high-water and
+	// only raise on a strict increase (天然防抖：稳态零写盘).
+	if current, hasCurrent := CodexDeviceHighWaterFromMetadata(existing.Metadata); hasCurrent {
+		if currentVersion, currentOK := current.parsedVersion(); currentOK {
+			if incomingVersion.compare(currentVersion) <= 0 {
+				m.mu.Unlock()
+				return false, nil
+			}
+		}
+	}
+
+	if existing.Metadata == nil {
+		existing.Metadata = make(map[string]any)
+	}
+	// Whole-map replacement: assign a brand-new map so a subsequent Clone never
+	// shares this nested map with the live auth.
+	existing.Metadata[CodexDeviceHighWaterMetadataKey] = codexDeviceHighWaterToMetadataMap(profile)
+	snapshot := existing.Clone()
+	m.mu.Unlock()
+
+	if snapshot == nil {
+		return true, nil
+	}
+	// Persist outside the lock: surface the error so callers can log it, but the
+	// in-memory high-water is already raised.
+	if err := m.persist(ctx, snapshot); err != nil {
+		return true, err
+	}
+	return true, nil
+}
+
 // Remove deletes an auth from runtime state without persisting.
 // Disk and token-store deletion must be handled by the caller.
 func (m *Manager) Remove(ctx context.Context, id string) {

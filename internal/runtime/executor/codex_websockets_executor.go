@@ -228,6 +228,10 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	upstreamBody, identityState := applyCodexIdentityConfuseBody(e.cfg, auth, originalPayloadSource, body)
 	reporter.SetTranslatedReasoningEffort(clientBody, to.String())
 	wsHeaders = applyCodexWebsocketHeaders(ctx, wsHeaders, auth, apiKey, e.cfg)
+	// codex 版本高水位持久化（真实 serving 路径：WS Execute 出站）。applyCodexWebsocketHeaders
+	// 内部的 ResolveCodexClientProfile 已解析出本次 CLI 高水位画像；这里透出给 auth manager
+	// 做"仅单调抬升才写盘"，与 HTTP serving 路径对称。ctx 携带 gin headers。
+	e.persistCodexDeviceHighWater(ctx, auth)
 	applyCodexIdentityConfuseHeaders(wsHeaders, &identityState)
 
 	var authID, authLabel, authType, authValue string
@@ -445,6 +449,8 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	upstreamBody, identityState := applyCodexIdentityConfuseBody(e.cfg, auth, userPayload, body)
 	reporter.SetTranslatedReasoningEffort(clientBody, to.String())
 	wsHeaders = applyCodexWebsocketHeaders(ctx, wsHeaders, auth, apiKey, e.cfg)
+	// codex 版本高水位持久化（真实 serving 路径：WS ExecuteStream 出站）。见 WS Execute 注释。
+	e.persistCodexDeviceHighWater(ctx, auth)
 	applyCodexIdentityConfuseHeaders(wsHeaders, &identityState)
 
 	var authID, authLabel, authType, authValue string
