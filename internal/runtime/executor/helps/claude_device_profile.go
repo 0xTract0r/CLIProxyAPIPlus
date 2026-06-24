@@ -334,6 +334,47 @@ func claudePersistedHighWaterProfile(auth *cliproxyauth.Auth) (ClaudeDeviceProfi
 	return profile, true
 }
 
+// SeedClaudeObservedHighWaterFromAuth re-seeds the in-memory observation map from
+// an auth's persisted claude_device_high_water triple. It is the startup/auth-load
+// half of high-water persistence on the *observation* side.
+//
+// Background: two code paths consume the persisted high-water but read different
+// sources. The outbound floor path (claudeFallbackBaseline) already reads the
+// persisted triple from auth.Metadata directly, so the outbound version is correct
+// from the very first request after a restart. The operator-facing stale-guard
+// warning predicate (ClaudeDeviceProfileStaleGuardActive ->
+// globalClaudeObservedHighWaterVersion) instead consults ONLY the in-memory
+// observation map, which is empty right after a restart. That mismatch makes the
+// guard emit a "no real claude-cli observed, falling back to frozen floor 2.1.63"
+// warning on the first request even though the real outbound UA is the (correct)
+// persisted version — a misleading false positive that self-heals only after the
+// first live observation lands.
+//
+// Seeding the persisted triple back into the in-memory observation map makes the
+// warning predicate's view consistent with the disk/outbound view, eliminating the
+// false-positive log without changing outbound timing. The persisted triple was
+// already sanity-ceiling-validated when it was first observed (the write side runs
+// the gate before RaiseClaudeDeviceHighWater), so re-seeding cannot fabricate a
+// forged high version. recordClaudeDeviceProfileObservation is additive/dedup and
+// globalClaudeObservedHighWaterVersion always takes the max, so this stays strictly
+// only-up: re-seeding a value that is lower than a live observation does not lower
+// the high-water. The triple is recorded under the shared "global" observation key
+// so it acts as the zero-observation global fallback ceiling, exactly as a live
+// cross-account observation would. Returns false when the auth carries no usable
+// persisted triple.
+func SeedClaudeObservedHighWaterFromAuth(auth *cliproxyauth.Auth) bool {
+	profile, ok := claudePersistedHighWaterProfile(auth)
+	if !ok {
+		return false
+	}
+	sum := sha256.Sum256([]byte("global"))
+	globalKey := hex.EncodeToString(sum[:])
+	claudeDeviceProfileCacheMu.Lock()
+	recordClaudeDeviceProfileObservation(globalKey, profile, time.Now())
+	claudeDeviceProfileCacheMu.Unlock()
+	return true
+}
+
 // ClaudeObservedHighWaterForAuth returns the account's current in-memory observed
 // high-water mark as a serializable triple, suitable for passing to
 // Manager.RaiseClaudeDeviceHighWater. It returns the per-account observed
