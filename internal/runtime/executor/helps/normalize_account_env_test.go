@@ -1,6 +1,7 @@
 package helps
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -9,6 +10,18 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
+
+// systemTextPayload builds a {"system":[{"type":"text","text":<text>}]} body with
+// the text JSON-escaped, so callers can embed backticks and newlines (as in the
+// real "# auto memory" sentence) without hand-escaping a raw JSON literal.
+func systemTextPayload(t *testing.T, text string) []byte {
+	t.Helper()
+	quoted, err := json.Marshal(text)
+	if err != nil {
+		t.Fatalf("marshal system text: %v", err)
+	}
+	return []byte(`{"system":[{"type":"text","text":` + string(quoted) + `}]}`)
+}
 
 func authForEnv(fileName string) *cliproxyauth.Auth {
 	return &cliproxyauth.Auth{ProxyURL: "direct", FileName: fileName}
@@ -388,6 +401,116 @@ func TestNormalizeAccountEnv_MarkdownEnvDoesNotTouchToolBlocks(t *testing.T) {
 	// tool_result content must be byte-identical (real paths/OS untouched).
 	tr := gjson.GetBytes(out, "messages.1.content.0.content").String()
 	if !strings.Contains(tr, "/tmp/prodsess1") || !strings.Contains(tr, "Platform: linux") {
+		t.Fatalf("tool_result content must not be rewritten: %q", tr)
+	}
+}
+
+// TestNormalizeAccountEnv_AutoMemoryHeadingPathNormalized covers the leak observed
+// in the measured outbound body: the "# auto memory" sentence lives under its OWN
+// Markdown heading (separate from "# Environment"), so the env-block rewriter never
+// reaches it and the real memory path used to leak unchanged. After the fix the
+// embedded path is collapsed onto the per-account canonical memory directory.
+func TestNormalizeAccountEnv_AutoMemoryHeadingPathNormalized(t *testing.T) {
+	text := strings.Join([]string{
+		"You are Claude Code.",
+		"",
+		"# Environment",
+		"You have been invoked in the following environment:",
+		" - Primary working directory: /Users/realuser/Project/app",
+		" - Platform: darwin",
+		" - OS Version: Darwin 24.6.0",
+		"",
+		"# auto memory",
+		"",
+		"You have a persistent, file-based memory system at `/Users/realuser/.claude/projects/-Users-realuser-Project-app/memory/`. This directory already exists.",
+	}, "\n")
+	payload := systemTextPayload(t, text)
+	auth := authForEnv("acct-memory.json")
+	out := NormalizeAccountEnv(payload, auth, "k", macBaselineCfg())
+
+	got := gjson.GetBytes(out, "system.0.text").String()
+	if strings.Contains(got, "/Users/realuser") {
+		t.Fatalf("real memory/cwd path leaked: %q", got)
+	}
+	canonicalMem := accountCanonicalMemoryPath(AccountCanonicalCwd(auth, "k"))
+	if !strings.Contains(got, "memory system at `"+canonicalMem+"`") {
+		t.Fatalf("expected canonical memory path %q in %q", canonicalMem, got)
+	}
+}
+
+// TestNormalizeAccountEnv_AutoMemoryInsideSystemReminder covers the same memory
+// sentence when it is wrapped in a <system-reminder> span. The path must still be
+// normalized, and it must match regardless of whether the env-block rewriter also
+// touched the span.
+func TestNormalizeAccountEnv_AutoMemoryInsideSystemReminder(t *testing.T) {
+	text := strings.Join([]string{
+		"<system-reminder>",
+		"You have a persistent, file-based memory system at `/home/dev/.claude/projects/-home-dev-svc/memory/`. Write to it directly.",
+		"</system-reminder>",
+	}, "\n")
+	payload := systemTextPayload(t, text)
+	auth := authForEnv("acct-memory-sr.json")
+	out := NormalizeAccountEnv(payload, auth, "", macBaselineCfg())
+
+	got := gjson.GetBytes(out, "system.0.text").String()
+	if strings.Contains(got, "/home/dev") {
+		t.Fatalf("real memory path leaked: %q", got)
+	}
+	canonicalMem := accountCanonicalMemoryPath(AccountCanonicalCwd(auth, ""))
+	if !strings.Contains(got, canonicalMem) {
+		t.Fatalf("expected canonical memory path %q in %q", canonicalMem, got)
+	}
+}
+
+// TestNormalizeAccountEnv_AutoMemoryIsolatedTmpRoot covers the test-isolation
+// shape where the HOME is an isolated /tmp dir: the path ROOT is /tmp (not a home prefix) so a
+// /Users|/home sweep would miss it, but the projects subdirectory STILL encodes
+// the real user name ("-Users-corylin-..."). The key-anchored memory normalizer
+// must collapse the whole backtick path regardless of its root.
+func TestNormalizeAccountEnv_AutoMemoryIsolatedTmpRoot(t *testing.T) {
+	text := strings.Join([]string{
+		"# auto memory",
+		"",
+		"You have a persistent, file-based memory system at `/tmp/claude-iso-gcecT2/.claude/projects/-Users-corylin-Project-ai-cliproxy-stack/memory/`. This directory already exists.",
+	}, "\n")
+	payload := systemTextPayload(t, text)
+	auth := authForEnv("acct-memory-tmp.json")
+	out := NormalizeAccountEnv(payload, auth, "", macBaselineCfg())
+
+	got := gjson.GetBytes(out, "system.0.text").String()
+	if strings.Contains(got, "corylin") || strings.Contains(got, "claude-iso-gcecT2") {
+		t.Fatalf("real user/iso path leaked: %q", got)
+	}
+	canonicalMem := accountCanonicalMemoryPath(AccountCanonicalCwd(auth, ""))
+	if !strings.Contains(got, canonicalMem) {
+		t.Fatalf("expected canonical memory path %q in %q", canonicalMem, got)
+	}
+}
+
+// TestNormalizeAccountEnv_MemoryNormalizationDoesNotTouchToolBlocks guards the
+// scope discipline: a tool_use input arg and a tool_result content that happen to
+// contain the literal "memory system at `...`" phrase are NOT environment text and
+// must pass through byte-for-byte. Only system / plain-text message blocks are
+// visited by the normalizer, so these never reach the memory pattern.
+func TestNormalizeAccountEnv_MemoryNormalizationDoesNotTouchToolBlocks(t *testing.T) {
+	payload := []byte(`{
+		"messages": [
+			{"role": "assistant", "content": [
+				{"type": "tool_use", "id": "t1", "name": "Read", "input": {"path": "/Users/realuser/.claude/projects/-Users-realuser-x/memory/notes.md"}}
+			]},
+			{"role": "user", "content": [
+				{"type": "tool_result", "tool_use_id": "t1", "content": "file-based memory system at ` + "`" + `/Users/realuser/.claude/projects/-Users-realuser-x/memory/` + "`" + `"}
+			]}
+		]
+	}`)
+	auth := authForEnv("acct-memory-tool.json")
+	out := NormalizeAccountEnv(payload, auth, "", macBaselineCfg())
+
+	if gjson.GetBytes(out, "messages.0.content.0.input.path").String() != "/Users/realuser/.claude/projects/-Users-realuser-x/memory/notes.md" {
+		t.Fatalf("tool_use input must not be rewritten: %s", out)
+	}
+	tr := gjson.GetBytes(out, "messages.1.content.0.content").String()
+	if !strings.Contains(tr, "/Users/realuser/.claude/projects/-Users-realuser-x/memory/") {
 		t.Fatalf("tool_result content must not be rewritten: %q", tr)
 	}
 }
