@@ -21,6 +21,7 @@ import (
 	"github.com/andybalholm/brotli"
 	"github.com/klauspost/compress/zstd"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	log "github.com/sirupsen/logrus"
 )
@@ -71,8 +72,16 @@ func NewCodexAuthWithProxyURL(cfg *config.Config, proxyURL string) *CodexAuth {
 		}
 	}
 	sdkCfg.ProxyURL = effectiveProxyURL
+	// Anti-correlation (leak 03117a8e): OAuth token exchange/refresh must present
+	// the SAME replicated codex-rs (Rust/rustls) ClientHello that serving uses for
+	// the codex outbound path, not a Go-default TLS fingerprint. util.SetProxy is
+	// kept only for the management/defensive path (NewCodexAuthWithHTTPClient); the
+	// bare refresh client here uses the serving uTLS profile
+	// (codex_rustls_native_v1), strict no-downgrade, HTTP/1.1 only, with the same
+	// per-account proxy. timeout=0 preserves the prior context-governed behavior
+	// (the bare client had no http.Client.Timeout).
 	return &CodexAuth{
-		httpClient: util.SetProxy(&sdkCfg, &http.Client{}),
+		httpClient: helps.NewOAuthRefreshUtlsHTTPClient(effectiveProxyURL, helps.CodexRustlsClientHelloProfileID, 0),
 		userAgent:  codexOAuthUserAgent,
 	}
 }

@@ -22,6 +22,7 @@ import (
 	"github.com/andybalholm/brotli"
 	"github.com/klauspost/compress/zstd"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/sync/singleflight"
 )
@@ -191,10 +192,18 @@ func NewClaudeAuthWithProxyURL(cfg *config.Config, proxyURL string) *ClaudeAuth 
 		sdkCfg = &sdkCfgCopy
 	}
 
-	// Use custom HTTP client with Firefox TLS fingerprint to bypass
-	// Cloudflare's bot detection on Anthropic domains
+	// Anti-correlation (leak 03117a8e): OAuth token exchange/refresh must present
+	// the SAME replicated claude-cli (Node/OpenSSL) ClientHello that serving uses
+	// for api.anthropic.com, not a Go-default TLS fingerprint. NewAnthropicHttpClient
+	// (Go-default transport) is kept only for the management/defensive path; the
+	// bare refresh client here uses the serving uTLS profile (claude_cli_clienthello_v1),
+	// strict no-downgrade, HTTP/1.1 only, with the same per-account proxy.
+	proxyForUtls := ""
+	if sdkCfg != nil {
+		proxyForUtls = strings.TrimSpace(sdkCfg.ProxyURL)
+	}
 	return &ClaudeAuth{
-		httpClient: NewAnthropicHttpClient(sdkCfg),
+		httpClient: helps.NewOAuthRefreshUtlsHTTPClient(proxyForUtls, helps.ClaudeCLIClientHelloProfileID, anthropicHTTPClientTimeout),
 		userAgent:  claudeOAuthUserAgent,
 	}
 }
