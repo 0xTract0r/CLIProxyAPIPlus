@@ -146,6 +146,29 @@ var markdownEnvBlockPattern = regexp.MustCompile(`(?m)^#[ \t]+Environment[ \t]*$
 // recognized key line; unrelated absolute paths (e.g. /usr, /etc) are left alone.
 var realPathPattern = regexp.MustCompile(`/(?:Users|home)/[^/\s"'<>` + "`" + `]+(?:/[^\s"'<>` + "`" + `]*)?`)
 
+// memoryPathPattern matches the claude-code "auto memory" sentence that embeds
+// the real on-disk memory directory, e.g.:
+//
+//	You have a persistent, file-based memory system at `/Users/<user>/.claude/projects/<encoded-cwd>/memory/`.
+//
+// This sentence lives under a SEPARATE "# auto memory" Markdown heading, not the
+// "# Environment" block, so the env-block rewriter (markdownEnvBlockPattern,
+// which terminates at the next "#" heading) never reaches it. The leak is real in
+// production: the path root is the real home (/Users/<user>/ or /home/<user>/),
+// and even when the HOME is an isolated /tmp dir, the projects subdirectory name
+// URL-encodes the real working directory ("-Users-corylin-Project-..."), so the
+// real machine user name leaks regardless of the root.
+//
+// Because this normalization is anchored on the literal "memory system at `...`"
+// phrase (not on a path prefix), it cannot touch tool_use args, tool_result
+// content or arbitrary conversational paths the way a blind /Users|/home full-text
+// sweep would — preserving the scope discipline the realPathPattern comment warns
+// about. Capture group 1 is the text up to and including the opening backtick;
+// group 2 is the backtick-quoted path body (any root, including /tmp/...); group 3
+// is the closing backtick. The path body is collapsed onto a single per-account
+// canonical memory path.
+var memoryPathPattern = regexp.MustCompile("(?i)(file-based memory system at\\s+`)([^`]*)(`)")
+
 // cwdKeyValuePattern matches an environment key line whose value is the working
 // directory, anchored on the key rather than the path prefix so it normalizes any
 // path (including /tmp/... or other non-home roots that the realPathPattern sweep
@@ -179,6 +202,21 @@ func AccountCanonicalCwd(auth *cliproxyauth.Auth, apiKey string) string {
 	return canonicalHomeRoot + "/workspace-" + uint32ToHex(id)
 }
 
+// accountCanonicalMemoryPath derives the canonical replacement for the claude-code
+// "auto memory" directory. The real path is
+// <home>/.claude/projects/<url-encoded-cwd>/memory/, where both the home root and
+// the encoded-cwd segment leak the real machine identity. We collapse it onto a
+// machine-neutral, per-account path that is derived from the same canonical cwd
+// (so it stays consistent with the rewritten Environment cwd) and carries the
+// canonical workspace name in the projects segment instead of the real one. The
+// result is deterministic for a given account, stable across requests, and free of
+// any real user name. canonicalCwd is e.g. "/Users/agent/workspace-<id>"; the
+// encoded projects segment mirrors claude-code's own "-"-joined path encoding.
+func accountCanonicalMemoryPath(canonicalCwd string) string {
+	encoded := strings.ReplaceAll(strings.TrimPrefix(canonicalCwd, "/"), "/", "-")
+	return canonicalCwd + "/.claude/projects/-" + encoded + "/memory/"
+}
+
 // uint32ToHex renders a uint32 as a fixed-width 8-char lowercase hex string.
 func uint32ToHex(v uint32) string {
 	const hexDigits = "0123456789abcdef"
@@ -191,11 +229,13 @@ func uint32ToHex(v uint32) string {
 }
 
 // envRewriteParams bundles the per-account/per-config values used to rewrite an
-// environment block: the canonical cwd and the baseline body OS representation.
+// environment block: the canonical cwd, the canonical "auto memory" path and the
+// baseline body OS representation.
 type envRewriteParams struct {
-	canonicalCwd string
-	bodyOS       baselineBodyOS
-	hasBodyOS    bool
+	canonicalCwd       string
+	canonicalMemoryDir string
+	bodyOS             baselineBodyOS
+	hasBodyOS          bool
 }
 
 // NormalizeAccountEnv rewrites real cwd / home paths and (conditionally) the host
@@ -216,7 +256,11 @@ func NormalizeAccountEnv(payload []byte, auth *cliproxyauth.Auth, apiKey string,
 		return payload
 	}
 
-	params := envRewriteParams{canonicalCwd: AccountCanonicalCwd(auth, apiKey)}
+	canonicalCwd := AccountCanonicalCwd(auth, apiKey)
+	params := envRewriteParams{
+		canonicalCwd:       canonicalCwd,
+		canonicalMemoryDir: accountCanonicalMemoryPath(canonicalCwd),
+	}
 	// Body OS rewrite is gated on stabilize-device-profile, which is an INDEPENDENT
 	// switch from normalize-account-env. The outbound X-Stainless-Os header is only
 	// pinned to defaultClaudeDeviceProfile(cfg).OS when stabilize is on; when
@@ -246,14 +290,19 @@ func NormalizeAccountEnv(payload []byte, auth *cliproxyauth.Auth, apiKey string,
 }
 
 // normalizeEnvText rewrites every environment block (XML or Markdown) found in
-// text, leaving everything outside those blocks untouched.
+// text plus the "# auto memory" path that lives under its own heading, leaving
+// everything else untouched.
 func normalizeEnvText(text string, params envRewriteParams) string {
 	if text == "" {
 		return text
 	}
 	hasXML := strings.Contains(text, "<env>") || strings.Contains(text, "<system-reminder>")
 	hasMarkdown := strings.Contains(text, "# Environment")
-	if !hasXML && !hasMarkdown {
+	// The "auto memory" sentence is matched independently of the env block: it
+	// lives under a separate "# auto memory" heading, so it is NOT inside an <env>
+	// span or the "# Environment" Markdown block and would otherwise leak through.
+	hasMemory := strings.Contains(text, "memory system at")
+	if !hasXML && !hasMarkdown && !hasMemory {
 		return text
 	}
 	if hasXML {
@@ -265,6 +314,12 @@ func normalizeEnvText(text string, params envRewriteParams) string {
 		text = markdownEnvBlockPattern.ReplaceAllStringFunc(text, func(block string) string {
 			return rewriteEnvBlock(block, params)
 		})
+	}
+	if hasMemory {
+		// Anchored on the literal "memory system at `...`" phrase: only the
+		// backtick-quoted path body (group 2) is replaced, so tool_use args,
+		// tool_result content and ordinary conversational paths are never touched.
+		text = memoryPathPattern.ReplaceAllString(text, "${1}"+params.canonicalMemoryDir+"${3}")
 	}
 	return text
 }
