@@ -97,37 +97,36 @@ func TestCodexBareClientAppliesServingUserAgentOnRefresh(t *testing.T) {
 	}
 }
 
-func TestNewCodexAuthWithProxyURL_OverrideDirectDisablesProxy(t *testing.T) {
-	cfg := &config.Config{SDKConfig: config.SDKConfig{ProxyURL: "http://proxy.example.com:8080"}}
-	auth := NewCodexAuthWithProxyURL(cfg, "direct")
+// TestNewCodexAuthWithProxyURL_UsesUtlsRefreshTransport asserts the bare codex
+// OAuth refresh client no longer uses a Go-default *http.Transport (the
+// anti-correlation leak 03117a8e signature) but the serving uTLS refresh round
+// tripper (codex_rustls_native_v1). The deep profile/proxy/strict assertions live
+// in the helps package test (oauth_refresh_utls_client_test.go).
+func TestNewCodexAuthWithProxyURL_UsesUtlsRefreshTransport(t *testing.T) {
+	cfg := &config.Config{SDKConfig: config.SDKConfig{ProxyURL: "socks5://proxy.example.com:1080"}}
+	auth := NewCodexAuthWithProxyURL(cfg, "")
 
-	transport, ok := auth.httpClient.Transport.(*http.Transport)
-	if !ok || transport == nil {
-		t.Fatalf("expected http.Transport, got %T", auth.httpClient.Transport)
+	if auth.httpClient == nil || auth.httpClient.Transport == nil {
+		t.Fatal("expected non-nil refresh http client and transport")
 	}
-	if transport.Proxy != nil {
-		t.Fatal("expected direct transport to disable proxy function")
+	if _, isStdlib := auth.httpClient.Transport.(*http.Transport); isStdlib {
+		t.Fatal("codex refresh transport is *http.Transport (Go-default TLS); want serving uTLS refresh transport to avoid anti-correlation leak")
 	}
 }
 
-func TestNewCodexAuthWithProxyURL_OverrideProxyTakesPrecedence(t *testing.T) {
-	cfg := &config.Config{SDKConfig: config.SDKConfig{ProxyURL: "http://global.example.com:8080"}}
-	auth := NewCodexAuthWithProxyURL(cfg, "http://override.example.com:8081")
+// TestNewCodexAuthWithProxyURL_DirectOverrideStillConstructs asserts the "direct"
+// proxy override is accepted and yields a usable uTLS refresh client (resolved to
+// ModeDirect by proxyutil inside the round tripper's dialer). Proxy-vs-direct
+// dialer correctness is asserted in the helps test.
+func TestNewCodexAuthWithProxyURL_DirectOverrideStillConstructs(t *testing.T) {
+	cfg := &config.Config{SDKConfig: config.SDKConfig{ProxyURL: "socks5://proxy.example.com:1080"}}
+	auth := NewCodexAuthWithProxyURL(cfg, "direct")
 
-	transport, ok := auth.httpClient.Transport.(*http.Transport)
-	if !ok || transport == nil {
-		t.Fatalf("expected http.Transport, got %T", auth.httpClient.Transport)
+	if auth.httpClient == nil || auth.httpClient.Transport == nil {
+		t.Fatal("expected non-nil refresh http client and transport for direct override")
 	}
-	req, errReq := http.NewRequest(http.MethodGet, "https://example.com", nil)
-	if errReq != nil {
-		t.Fatalf("new request: %v", errReq)
-	}
-	proxyURL, errProxy := transport.Proxy(req)
-	if errProxy != nil {
-		t.Fatalf("proxy func: %v", errProxy)
-	}
-	if proxyURL == nil || proxyURL.String() != "http://override.example.com:8081" {
-		t.Fatalf("proxy URL = %v, want http://override.example.com:8081", proxyURL)
+	if _, isStdlib := auth.httpClient.Transport.(*http.Transport); isStdlib {
+		t.Fatal("codex refresh (direct override) transport is *http.Transport; want serving uTLS refresh transport")
 	}
 }
 

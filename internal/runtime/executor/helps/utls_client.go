@@ -42,6 +42,13 @@ const codexRustlsClientHelloProfileID = "codex_rustls_native_v1"
 // default. It must stay in sync with codexRustlsClientHelloProfileID.
 const CodexRustlsClientHelloProfileID = codexRustlsClientHelloProfileID
 
+// ClaudeCLIClientHelloProfileID is the exported claude-cli ClientHello profile,
+// used by the claude->anthropic OAuth refresh client so token refresh presents
+// the same replicated claude-cli (Node/OpenSSL) ClientHello as serving instead
+// of a Go-default TLS fingerprint. It must stay in sync with
+// claudeCLIClientHelloProfileID.
+const ClaudeCLIClientHelloProfileID = claudeCLIClientHelloProfileID
+
 // utlsHTTPClientDefaultProfileID is the default ClientHello profile for
 // NewUtlsHTTPClient. Its only production caller is the codex executor
 // (host chatgpt.com), so the default replicates the real codex-rs (rustls)
@@ -810,4 +817,87 @@ func resolveClaudeClientHelloID(profileID string) (tls.ClientHelloID, bool) {
 	default:
 		return tls.ClientHelloID{}, false
 	}
+}
+
+// oauthRefreshRoundTripper routes every HTTPS request through the configured
+// strict uTLS round tripper, with a standard-transport fallback only for
+// non-HTTPS requests. Unlike fallbackRoundTripper it does NOT consult
+// utlsProtectedHosts: the OAuth refresh clients are constructed per provider and
+// only ever talk to that provider's OAuth token endpoint
+// (api.anthropic.com / auth.openai.com), so the host gate is unnecessary and,
+// for auth.openai.com (not in utlsProtectedHosts), would otherwise silently
+// route refresh back onto a Go-default TLS fingerprint and re-introduce the
+// anti-correlation leak this client exists to close.
+type oauthRefreshRoundTripper struct {
+	utls     http.RoundTripper
+	fallback http.RoundTripper
+}
+
+func (r *oauthRefreshRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.URL != nil && req.URL.Scheme == "https" {
+		return r.utls.RoundTrip(req)
+	}
+	return r.fallback.RoundTrip(req)
+}
+
+// NewOAuthRefreshUtlsHTTPClient builds the HTTP client used by the
+// claude->anthropic and codex->openai OAuth token exchange/refresh paths so that
+// token refresh presents the SAME replicated client ClientHello as serving
+// (claude_cli_clienthello_v1 / codex_rustls_native_v1) instead of a Go-default
+// TLS fingerprint.
+//
+// Anti-correlation: a real claude-cli / codex-rs binary uses a single TLS stack
+// for both serving and token refresh. When refresh used Go-default TLS while
+// serving used the replicated uTLS ClientHello, the same account produced two
+// distinguishable TLS fingerprints against the same upstream (api.anthropic.com
+// for claude; the same OpenAI identity for codex), which can be correlated. This
+// client closes that gap.
+//
+// Strict (no-downgrade) mode: both production profiles run fail-closed. A failed
+// configured handshake is retried with the SAME ClientHello (utlsHandshakeMaxAttempts)
+// and, if still failing, returns an error rather than downgrading to a Chrome133
+// ClientHello. Downgrading would emit a Chrome TLS fingerprint under a
+// claude-cli / codex-rs User-Agent, which is a worse leak than the original
+// Go-default mismatch. A hard handshake failure is preferred (and surfaced via
+// hardFailCount + a warn log) over a leaked fingerprint; the caller's own retry
+// layer (RefreshTokensWithRetry / claude refresh backoff) absorbs transient
+// hiccups using the correct fingerprint.
+//
+// HTTP/1.1 only: the round tripper advertises ALPN http/1.1 exclusively and
+// disables ForceAttemptHTTP2, so it never negotiates HTTP/2. This structurally
+// avoids the historical uTLS-only HTTP/2 path that left remote Management Center
+// re-auth stuck.
+//
+// proxyURL is the per-account outbound proxy (empty for direct). profileID
+// selects the provider ClientHello; unknown profiles fall back to the codex-rs
+// default, matching NewUtlsHTTPClientForProfile. timeout, when > 0, bounds the
+// whole request.
+func NewOAuthRefreshUtlsHTTPClient(proxyURL string, profileID string, timeout time.Duration) *http.Client {
+	proxyURL = strings.TrimSpace(proxyURL)
+
+	effectiveProfileID := profileID
+	clientHello, ok := resolveClaudeClientHelloID(profileID)
+	if !ok {
+		effectiveProfileID = utlsHTTPClientDefaultProfileID
+		clientHello, _ = resolveClaudeClientHelloID(utlsHTTPClientDefaultProfileID)
+	}
+
+	var utlsRT *utlsRoundTripper
+	if profileRequiresNoDowngrade(effectiveProfileID) {
+		utlsRT = newStrictUtlsRoundTripper(proxyURL, clientHello)
+	} else {
+		utlsRT = newUtlsRoundTripper(proxyURL, clientHello)
+	}
+	utlsRT.customSpecID = codexCustomSpecID(effectiveProfileID)
+
+	client := &http.Client{
+		Transport: &oauthRefreshRoundTripper{
+			utls:     utlsRT,
+			fallback: standardTransportForProxy(proxyURL),
+		},
+	}
+	if timeout > 0 {
+		client.Timeout = timeout
+	}
+	return client
 }
