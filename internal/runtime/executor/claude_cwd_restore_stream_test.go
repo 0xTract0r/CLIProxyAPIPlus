@@ -120,6 +120,94 @@ func collectTextDelta(out string) string {
 	return b.String()
 }
 
+// TestClaudeCwdStreamRestorer_FlushDrainsTruncatedToolUse is the F1 truncation red
+// line: a tool_use block emits several input_json_delta fragments but the stream
+// ends (upstream cut / client disconnect / EOF) BEFORE content_block_stop. Flush()
+// must re-emit the buffered, fake→real-restored arguments plus a synthetic
+// content_block_stop instead of silently dropping the tool call's input.
+func TestClaudeCwdStreamRestorer_FlushDrainsTruncatedToolUse(t *testing.T) {
+	fake := "/Users/agent/workspace-deadbeef"
+	real := "/Users/alice/Project/app"
+	pairs := []helps.CwdRestorePair{{Fake: fake, Real: real}}
+
+	// A tool_use block opens and buffers its argument fragments, but NO
+	// content_block_stop arrives before the stream ends.
+	lines := []string{
+		`data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"Read","input":{}}}`,
+		``,
+		`data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"file_path\":\"` + fake + `/main"}}`,
+		``,
+		`data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":".go\"}"}}`,
+		``,
+		// stream ends here: no content_block_stop.
+	}
+
+	out := feedClaudeStreamRestorer(newClaudeCwdStreamRestorer(pairs), lines)
+
+	// The buffered, restored arguments must have been emitted by Flush (not lost).
+	arg := collectToolUseArg(out, "file_path")
+	if arg != real+"/main.go" {
+		t.Fatalf("truncated tool_use args lost or unrestored: got %q want %q\nfull:\n%s", arg, real+"/main.go", out)
+	}
+	// Flush must also emit a synthetic content_block_stop so the block is well-formed.
+	if !strings.Contains(out, `"type":"content_block_stop"`) {
+		t.Fatalf("Flush did not emit a synthetic content_block_stop for the truncated block:\n%s", out)
+	}
+	// No fake root may survive anywhere in the output.
+	if strings.Contains(out, fake) {
+		t.Fatalf("fake root survived truncated flush:\n%s", out)
+	}
+}
+
+// TestClaudeCwdStreamRestorer_BackslashRealCwdStaysValidJSON is the F2 escaping red
+// line for the streaming path: when the real cwd contains a backslash (Windows
+// C:\Users\bob), the re-emitted input_json_delta must remain VALID JSON (the
+// backslash must be JSON-escaped, not injected raw) and decode to the real path.
+func TestClaudeCwdStreamRestorer_BackslashRealCwdStaysValidJSON(t *testing.T) {
+	fake := "/Users/agent/workspace-deadbeef"
+	real := `C:\Users\bob` // backslashes: a literal swap would corrupt the JSON.
+	pairs := []helps.CwdRestorePair{{Fake: fake, Real: real}}
+
+	lines := []string{
+		`data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"Read","input":{}}}`,
+		``,
+		`data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"file_path\":\"` + fake + `/main.go\"}"}}`,
+		``,
+		`data: {"type":"content_block_stop","index":1}`,
+		``,
+	}
+
+	out := feedClaudeStreamRestorer(newClaudeCwdStreamRestorer(pairs), lines)
+
+	// Locate the re-emitted input_json_delta and assert its partial_json is valid JSON
+	// (so the backslash was escaped, not injected raw).
+	var pj string
+	for _, raw := range strings.Split(out, "\n") {
+		raw = strings.TrimSpace(raw)
+		if !strings.HasPrefix(raw, "data:") {
+			continue
+		}
+		payload := strings.TrimSpace(strings.TrimPrefix(raw, "data:"))
+		root := gjson.Parse(payload)
+		if root.Get("type").String() == "content_block_delta" && root.Get("delta.type").String() == "input_json_delta" {
+			if v := root.Get("delta.partial_json").String(); v != "" {
+				pj = v
+			}
+		}
+	}
+	if pj == "" {
+		t.Fatalf("no reassembled input_json_delta emitted:\n%s", out)
+	}
+	if !gjson.Valid(pj) {
+		t.Fatalf("re-emitted partial_json is not valid JSON (backslash injected raw): %q", pj)
+	}
+	got := gjson.Get(pj, "file_path").String()
+	want := `C:\Users\bob/main.go`
+	if got != want {
+		t.Fatalf("file_path not restored to real backslash path: got %q want %q", got, want)
+	}
+}
+
 // TestClaudeCwdStreamRestorer_NoPairsPassthrough verifies the gate-off path: a
 // nil restorer (no captured mappings) forwards every line unchanged.
 func TestClaudeCwdStreamRestorer_NoPairsPassthrough(t *testing.T) {

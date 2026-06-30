@@ -69,6 +69,112 @@ func TestRestoreClaudeToolUseCwdInResponse_RestoresOnlyToolUse(t *testing.T) {
 	}
 }
 
+// TestRestoreClaudeToolUseCwdInResponse_BackslashRealCwdStaysValidJSON is the F2
+// escaping red line for the claude non-stream path: when the real cwd contains a
+// backslash (Windows C:\Users\bob), restoring it inside tool_use.input must keep
+// the response VALID JSON (the backslash JSON-escaped, not injected raw) and the
+// parsed file_path must equal the real backslash path.
+func TestRestoreClaudeToolUseCwdInResponse_BackslashRealCwdStaysValidJSON(t *testing.T) {
+	fake := "/Users/agent/workspace-deadbeef"
+	real := `C:\Users\bob`
+	pairs := []CwdRestorePair{{Fake: fake, Real: real}}
+
+	body := []byte(`{"content":[` +
+		`{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":"` + fake + `/main.go","note":"plain"}}` +
+		`]}`)
+
+	out := RestoreClaudeToolUseCwdInResponse(pairs, body)
+
+	if !gjson.ValidBytes(out) {
+		t.Fatalf("restored body is not valid JSON (backslash injected raw):\n%s", out)
+	}
+	got := gjson.GetBytes(out, "content.0.input.file_path").String()
+	want := `C:\Users\bob/main.go`
+	if got != want {
+		t.Fatalf("file_path not restored to real backslash path: got %q want %q", got, want)
+	}
+	if strings.Contains(string(out), fake) {
+		t.Fatalf("fake root survived:\n%s", out)
+	}
+}
+
+// TestRestoreClaudeToolUseCwdInResponse_QuoteAndControlRealCwdStaysValidJSON
+// covers the F2 escaping red line for a real cwd containing a double quote and a
+// tab. A literal swap would inject an unescaped quote and break the JSON; the
+// structural restore must escape both and keep the document valid.
+func TestRestoreClaudeToolUseCwdInResponse_QuoteAndControlRealCwdStaysValidJSON(t *testing.T) {
+	fake := "/Users/agent/workspace-deadbeef"
+	real := "/Users/a\"b\tc/app" // embedded quote and tab.
+	pairs := []CwdRestorePair{{Fake: fake, Real: real}}
+
+	body := []byte(`{"content":[` +
+		`{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":"` + fake + `/main.go"}}` +
+		`]}`)
+
+	out := RestoreClaudeToolUseCwdInResponse(pairs, body)
+	if !gjson.ValidBytes(out) {
+		t.Fatalf("restored body is not valid JSON (quote/control injected raw):\n%s", out)
+	}
+	got := gjson.GetBytes(out, "content.0.input.file_path").String()
+	want := real + "/main.go"
+	if got != want {
+		t.Fatalf("file_path not restored: got %q want %q", got, want)
+	}
+}
+
+// TestRestoreCwdInToolUseInputRaw_NestedAndArrays verifies the structural restore
+// descends into nested objects and arrays (a path argument at any depth), while
+// never rewriting object KEYS, and leaves non-string leaves untouched.
+func TestRestoreCwdInToolUseInputRaw_NestedAndArrays(t *testing.T) {
+	fake := "/Users/agent/workspace-deadbeef"
+	real := "/Users/alice/Project/app"
+	pairs := []CwdRestorePair{{Fake: fake, Real: real}}
+
+	raw := `{"opts":{"cwd":"` + fake + `"},"paths":["` + fake + `/a.go","` + fake + `/b.go"],"count":2,"flag":true}`
+	out := RestoreCwdInToolUseInputRaw(pairs, raw)
+
+	if !gjson.Valid(out) {
+		t.Fatalf("structural restore produced invalid JSON: %s", out)
+	}
+	if got := gjson.Get(out, "opts.cwd").String(); got != real {
+		t.Fatalf("nested object value not restored: got %q", got)
+	}
+	if got := gjson.Get(out, "paths.0").String(); got != real+"/a.go" {
+		t.Fatalf("array[0] not restored: got %q", got)
+	}
+	if got := gjson.Get(out, "paths.1").String(); got != real+"/b.go" {
+		t.Fatalf("array[1] not restored: got %q", got)
+	}
+	if got := gjson.Get(out, "count").Int(); got != 2 {
+		t.Fatalf("number leaf changed: %d", got)
+	}
+	if got := gjson.Get(out, "flag").Bool(); got != true {
+		t.Fatalf("bool leaf changed: %v", got)
+	}
+}
+
+// TestRestoreCwdInToolUseInputRaw_DoesNotRewriteKeys is the scope red line: a fake
+// root that appears as an object KEY (not a value) must NOT be rewritten — only
+// string values carry tool-call path arguments.
+func TestRestoreCwdInToolUseInputRaw_DoesNotRewriteKeys(t *testing.T) {
+	fake := "/Users/agent/workspace-deadbeef"
+	real := "/Users/alice/Project/app"
+	pairs := []CwdRestorePair{{Fake: fake, Real: real}}
+
+	raw := `{"` + fake + `":"keep-key","file_path":"` + fake + `/main.go"}`
+	out := RestoreCwdInToolUseInputRaw(pairs, raw)
+
+	if !gjson.Valid(out) {
+		t.Fatalf("invalid JSON: %s", out)
+	}
+	if got := gjson.Get(out, "file_path").String(); got != real+"/main.go" {
+		t.Fatalf("value not restored: got %q", got)
+	}
+	if !gjson.Get(out, escapeSjsonKey(fake)).Exists() {
+		t.Fatalf("object key was rewritten (red line violation): %s", out)
+	}
+}
+
 // TestRestoreClaudeToolUseCwdInResponse_NoPairsIsNoop verifies the gate-off
 // behavior: with no captured mappings the response bytes are returned unchanged.
 func TestRestoreClaudeToolUseCwdInResponse_NoPairsIsNoop(t *testing.T) {
@@ -114,15 +220,112 @@ func TestNormalizeCodexPathsWithRestore_CapturesAndRestores(t *testing.T) {
 	}
 
 	// Simulate a streamed function_call argument echoed back with the fake roots
-	// (the assembled .done event form). Restoration must yield the real roots.
+	// (the assembled .done event form). Structural restoration must yield the real
+	// roots while keeping the result valid JSON.
 	respLine := []byte(`data: {"type":"response.output_item.done","item":{"type":"function_call",` +
 		`"name":"shell","arguments":"{\"command\":\"cat ` + canonicalCwd + `/main.go\",\"workdir\":\"` + canonicalCwd + `\"}"}}`)
-	restored := RestoreCwdInBytes(pairs, respLine)
+	restored, changed := RestoreCodexFunctionCallCwdInResponse(pairs, respLine)
+	if !changed {
+		t.Fatalf("expected a restore change, got none:\n%s", restored)
+	}
 	if strings.Contains(string(restored), canonicalCwd) {
 		t.Fatalf("fake cwd still present after restore:\n%s", restored)
 	}
 	if !strings.Contains(string(restored), codexRealCwd) {
 		t.Fatalf("real cwd missing after restore:\n%s", restored)
+	}
+	// The "data: " prefix must be preserved and the JSON portion must stay valid.
+	if !strings.HasPrefix(string(restored), "data: ") {
+		t.Fatalf("SSE data prefix lost:\n%s", restored)
+	}
+	jsonPart := strings.TrimPrefix(string(restored), "data: ")
+	if !gjson.Valid(jsonPart) {
+		t.Fatalf("restored SSE JSON is invalid:\n%s", jsonPart)
+	}
+	// The arguments string must decode to the real workdir.
+	argStr := gjson.Get(jsonPart, "item.arguments").String()
+	if got := gjson.Get(argStr, "workdir").String(); got != codexRealCwd {
+		t.Fatalf("workdir not restored: got %q want %q", got, codexRealCwd)
+	}
+}
+
+// TestRestoreCodexFunctionCallCwdInResponse_BackslashStaysValidJSON is the F2
+// escaping red line for codex: a real cwd containing a backslash, restored inside
+// function_call.arguments (itself a JSON string), must keep BOTH the outer
+// response JSON and the inner arguments JSON valid.
+func TestRestoreCodexFunctionCallCwdInResponse_BackslashStaysValidJSON(t *testing.T) {
+	fakeCwd := "/Users/agent/codex-ws-abcdef01"
+	realCwd := `C:\Users\bob\proj`
+	pairs := []CwdRestorePair{{Fake: fakeCwd, Real: realCwd}}
+
+	respLine := []byte(`data: {"type":"response.output_item.done","item":{"type":"function_call",` +
+		`"name":"shell","arguments":"{\"workdir\":\"` + fakeCwd + `\"}"}}`)
+
+	restored, changed := RestoreCodexFunctionCallCwdInResponse(pairs, respLine)
+	if !changed {
+		t.Fatalf("expected change, got none:\n%s", restored)
+	}
+	jsonPart := strings.TrimPrefix(string(restored), "data: ")
+	if !gjson.Valid(jsonPart) {
+		t.Fatalf("outer JSON invalid after backslash restore:\n%s", jsonPart)
+	}
+	argStr := gjson.Get(jsonPart, "item.arguments").String()
+	if !gjson.Valid(argStr) {
+		t.Fatalf("inner arguments JSON invalid after backslash restore: %q", argStr)
+	}
+	if got := gjson.Get(argStr, "workdir").String(); got != realCwd {
+		t.Fatalf("workdir not restored to real backslash path: got %q want %q", got, realCwd)
+	}
+}
+
+// TestRestoreCodexFunctionCallCwdInResponse_OnlyToolArgsRestored is the scope red
+// line for codex: a fake root that appears in conversational reasoning / output
+// text must NOT be restored; only function_call.arguments are restored.
+func TestRestoreCodexFunctionCallCwdInResponse_OnlyToolArgsRestored(t *testing.T) {
+	fakeCwd := "/Users/agent/codex-ws-abcdef01"
+	realCwd := "/Users/corylin/proj"
+	pairs := []CwdRestorePair{{Fake: fakeCwd, Real: realCwd}}
+
+	// A completed payload: one reasoning item (must stay fake) + one function_call
+	// (arguments must restore).
+	body := []byte(`{"type":"response.completed","response":{"output":[` +
+		`{"type":"reasoning","summary":[{"type":"summary_text","text":"working in ` + fakeCwd + ` now"}]},` +
+		`{"type":"function_call","name":"shell","arguments":"{\"workdir\":\"` + fakeCwd + `\"}"}` +
+		`]}}`)
+
+	restored, changed := RestoreCodexFunctionCallCwdInResponse(pairs, body)
+	if !changed {
+		t.Fatalf("expected function_call restore, got none:\n%s", restored)
+	}
+	if !gjson.ValidBytes(restored) {
+		t.Fatalf("restored payload invalid JSON:\n%s", restored)
+	}
+	// Reasoning text must still contain the FAKE root (not restored).
+	reasoning := gjson.GetBytes(restored, "response.output.0.summary.0.text").String()
+	if !strings.Contains(reasoning, fakeCwd) || strings.Contains(reasoning, realCwd) {
+		t.Fatalf("reasoning text was restored (scope red line violation): %q", reasoning)
+	}
+	// function_call arguments must be restored to the real root.
+	argStr := gjson.GetBytes(restored, "response.output.1.arguments").String()
+	if got := gjson.Get(argStr, "workdir").String(); got != realCwd {
+		t.Fatalf("function_call workdir not restored: got %q", got)
+	}
+}
+
+// TestRestoreCodexFunctionCallCwdInResponse_DeltaLineUnchanged confirms a streamed
+// function_call_arguments.delta fragment (display-only, no function_call item) is
+// returned unchanged — the authoritative .done/.completed event carries the whole
+// argument and is the one that gets restored.
+func TestRestoreCodexFunctionCallCwdInResponse_DeltaLineUnchanged(t *testing.T) {
+	fakeCwd := "/Users/agent/codex-ws-abcdef01"
+	pairs := []CwdRestorePair{{Fake: fakeCwd, Real: "/Users/corylin/proj"}}
+	line := []byte(`data: {"type":"response.function_call_arguments.delta","delta":"` + fakeCwd + `"}`)
+	out, changed := RestoreCodexFunctionCallCwdInResponse(pairs, line)
+	if changed {
+		t.Fatalf("delta line should be unchanged (no function_call item), got change:\n%s", out)
+	}
+	if string(out) != string(line) {
+		t.Fatalf("delta line mutated:\n got %s\nwant %s", out, line)
 	}
 }
 

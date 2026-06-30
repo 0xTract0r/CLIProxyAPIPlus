@@ -2,6 +2,7 @@ package executor
 
 import (
 	"bytes"
+	"sort"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	translatorcommon "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/common"
@@ -74,14 +75,41 @@ func (r *claudeCwdStreamRestorer) ProcessLine(line []byte) [][]byte {
 }
 
 // Flush emits any trailing buffered frame (a stream that ended without a final
-// blank line). A nil restorer has nothing to flush.
+// blank line) AND drains every tool_use argument buffer that never saw its
+// content_block_stop. A nil restorer has nothing to flush.
+//
+// Draining the buffers is the truncation red line: if the upstream stream ends
+// (upstream cut, client disconnect, scanner error, normal EOF without a trailing
+// stop) while a tool_use block's input_json_delta fragments are still buffered,
+// those reassembled arguments would otherwise be lost and the client would receive
+// a tool_use with no input. Here we re-emit the restored arguments plus a synthetic
+// content_block_stop for each still-open tool_use index so the call stays usable.
 func (r *claudeCwdStreamRestorer) Flush() [][]byte {
-	if r == nil || len(r.frame) == 0 {
+	if r == nil {
 		return nil
 	}
-	frame := r.frame
-	r.frame = nil
-	return r.processFrame(frame)
+	var out [][]byte
+	// First flush any trailing partial frame (may itself open/close a tool_use).
+	if len(r.frame) != 0 {
+		frame := r.frame
+		r.frame = nil
+		out = append(out, r.processFrame(frame)...)
+	}
+	// Then drain any tool_use buffers left open (no content_block_stop arrived).
+	// Iterate in ascending index order for deterministic output.
+	if len(r.buffers) != 0 {
+		indexes := make([]int64, 0, len(r.buffers))
+		for index := range r.buffers {
+			indexes = append(indexes, index)
+		}
+		sort.Slice(indexes, func(i, j int) bool { return indexes[i] < indexes[j] })
+		for _, index := range indexes {
+			out = append(out, r.emitRestoredToolUse(nil, index)...)
+			delete(r.toolUseIndex, index)
+			delete(r.buffers, index)
+		}
+	}
+	return out
 }
 
 func (r *claudeCwdStreamRestorer) processFrame(frame [][]byte) [][]byte {
@@ -131,7 +159,12 @@ func (r *claudeCwdStreamRestorer) processFrame(frame [][]byte) [][]byte {
 
 // emitRestoredToolUse builds the re-emitted [delta, stop] frames for a tool_use
 // block: one input_json_delta carrying the reassembled fake→real-restored
-// arguments, followed by the original content_block_stop frame.
+// arguments, followed by the content_block_stop frame.
+//
+// stopFrame is the original content_block_stop SSE frame when called from the
+// content_block_stop branch; it is nil when called from Flush() to drain a
+// truncated block, in which case a synthetic content_block_stop for index is
+// emitted so the client still sees a well-formed end of the tool_use block.
 func (r *claudeCwdStreamRestorer) emitRestoredToolUse(stopFrame [][]byte, index int64) [][]byte {
 	var args string
 	if buf := r.buffers[index]; buf != nil {
@@ -139,7 +172,17 @@ func (r *claudeCwdStreamRestorer) emitRestoredToolUse(stopFrame [][]byte, index 
 	}
 	out := make([][]byte, 0, 2)
 	if args != "" {
-		restored := helps.RestoreCwdInString(r.pairs, args)
+		// The reassembled args form a complete tool_use input JSON object, so use the
+		// structural JSON-safe restore (decode string values, swap fake→real, re-escape
+		// on write-back). This keeps the re-emitted partial_json valid even when the
+		// real cwd contains backslashes/quotes/control chars. If args is not a parseable
+		// JSON object (e.g. a truncated fragment), RestoreCwdInToolUseInputRaw returns it
+		// unchanged; fall back to a literal swap so a fake root is never re-emitted
+		// verbatim.
+		restored := helps.RestoreCwdInToolUseInputRaw(r.pairs, args)
+		if restored == args {
+			restored = helps.RestoreCwdInString(r.pairs, args)
+		}
 		delta := []byte(`{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":""}}`)
 		delta, _ = sjson.SetBytes(delta, "index", index)
 		delta, _ = sjson.SetBytes(delta, "delta.partial_json", restored)
@@ -147,7 +190,14 @@ func (r *claudeCwdStreamRestorer) emitRestoredToolUse(stopFrame [][]byte, index 
 		// upstream content_block_delta framing.
 		out = append(out, translatorcommon.AppendSSEEventBytes(nil, "content_block_delta", delta, 2))
 	}
-	out = append(out, encodeClaudeFrame(stopFrame))
+	if stopFrame != nil {
+		out = append(out, encodeClaudeFrame(stopFrame))
+		return out
+	}
+	// Synthetic content_block_stop for a truncated (never-stopped) tool_use block.
+	stop := []byte(`{"type":"content_block_stop","index":0}`)
+	stop, _ = sjson.SetBytes(stop, "index", index)
+	out = append(out, translatorcommon.AppendSSEEventBytes(nil, "content_block_stop", stop, 2))
 	return out
 }
 

@@ -276,20 +276,31 @@ func (e *CodexExecutor) normalizeCodexPaths(ctx context.Context, body []byte, au
 	return helps.NormalizeCodexPathsWithRestore(ctx, body, auth, apiKey)
 }
 
-// restoreCodexResponseCwd restores fake→real cwd / CODEX_HOME inside a codex
-// response payload (OpenAI-responses JSON or one streamed SSE line). The fake
-// roots are fixed literals, so a whole-payload literal swap is used, mirroring
-// replaceCodexIdentityResponsePayload. The complete function_call arguments are
-// carried by response.output_item.done / response.completed events, so the
+// restoreCodexResponseCwd restores fake→real cwd / CODEX_HOME inside the tool-call
+// (function_call / custom_tool_call) "arguments" of a codex response payload
+// (OpenAI-responses JSON or one streamed SSE line). The complete arguments are
+// carried by response.output_item.done / response.completed events, so the fixed
 // literal is whole there; incremental function_call_arguments.delta fragments are
-// display-only and the authoritative .done event is restored. Returns payload
-// unchanged when nothing was captured.
+// display-only and the authoritative .done event is restored.
+//
+// Restoration is STRUCTURAL and JSON-safe: the arguments string is parsed and only
+// its decoded string values are rewritten, then re-escaped on write-back, so a real
+// cwd containing backslashes/quotes/control chars cannot corrupt the JSON. It is
+// also scope-disciplined like the claude tool_use restore: ONLY tool-call arguments
+// are restored, never conversational text / reasoning / tool outputs. (This is safe
+// against second-turn leakage because the reasoning-replay cache is populated from
+// the pre-restore upstream payload, so the cache only ever holds fake roots; see
+// the call sites around cacheCodexReasoningReplayFromCompleted.)
+//
+// Returns payload unchanged when nothing was captured or no tool-call argument
+// carries a fake root.
 func restoreCodexResponseCwd(ctx context.Context, payload []byte) []byte {
 	collector := helps.CwdRestoreCollectorFromContext(ctx)
 	if collector == nil {
 		return payload
 	}
-	return helps.RestoreCwdInBytes(collector.Pairs(), payload)
+	restored, _ := helps.RestoreCodexFunctionCallCwdInResponse(collector.Pairs(), payload)
+	return restored
 }
 
 // NewCodexExecutorWithManager wires the auth manager so cyber_policy hits are
@@ -1888,7 +1899,10 @@ func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, s
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Codex-Turn-Metadata", "")
 	// fork(anticorr ⑦-codex): 无条件归一 turn-metadata header 里的真实 cwd/git。
 	// 与 body #2 复用同一组派生值，保证 header/body 跨位置一致。token 即 apiKey。
-	helps.NormalizeCodexTurnMetadataHeader(r.Header, "X-Codex-Turn-Metadata", auth, token)
+	// WithRestore captures the header's real cwd into the response-restore collector
+	// (when one is attached to the request ctx), so tool-call paths are restored even
+	// if the real cwd is exposed only in the header and not in the body text.
+	helps.NormalizeCodexTurnMetadataHeaderWithRestore(r.Context(), r.Header, "X-Codex-Turn-Metadata", auth, token)
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Client-Request-Id", "")
 	// fork(anticorr): 真实 codex 出站没有独立 Version 头，版本只体现在 UA 里。
 	// 旧实现会从客户端或 device-profile 注入 Version，是 CPA 独有指纹，删除（含

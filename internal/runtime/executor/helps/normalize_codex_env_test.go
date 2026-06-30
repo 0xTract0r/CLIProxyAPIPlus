@@ -1,6 +1,7 @@
 package helps
 
 import (
+	"context"
 	"encoding/json"
 	"encoding/xml"
 	"regexp"
@@ -362,5 +363,55 @@ func TestNormalizeCodexTurnMetadataHeader_ConsistentWithBody(t *testing.T) {
 	}
 	if strings.Contains(headerTM, codexRealCwd) || strings.Contains(headerTM, codexRealGitCommit) || strings.Contains(headerTM, codexRealGitRemote) {
 		t.Fatalf("header 真实值仍残留: %s", headerTM)
+	}
+}
+
+// TestNormalizeCodexTurnMetadataHeaderWithRestore_CapturesHeaderOnlyCwd is the F4
+// red line: when the real cwd is exposed ONLY in the turn-metadata header (the
+// body carries no <cwd>/<root>/AGENTS text), the header normalization must still
+// capture the canonicalCwd→realCwd mapping into the ctx collector so the response
+// side can restore tool-call paths. Without this, a header-only real cwd would
+// produce no mapping and restoration would silently fail.
+func TestNormalizeCodexTurnMetadataHeaderWithRestore_CapturesHeaderOnlyCwd(t *testing.T) {
+	auth := codexAuth("codex-header-only.json")
+	ctx, collector := ContextWithCwdRestoreCollector(context.Background())
+
+	headers := map[string][]string{
+		"X-Codex-Turn-Metadata": {codexTurnMetadataFixture},
+	}
+	NormalizeCodexTurnMetadataHeaderWithRestore(ctx, headers, "x-codex-turn-metadata", auth, "key-1")
+
+	// The header must be normalized (no real cwd survives).
+	headerTM := headers["X-Codex-Turn-Metadata"][0]
+	if strings.Contains(headerTM, codexRealCwd) {
+		t.Fatalf("header real cwd not normalized: %s", headerTM)
+	}
+
+	// The collector must hold the canonicalCwd→realCwd mapping captured from the
+	// header workspaces KEY, even though no body text was processed.
+	canonical := AccountCanonicalCwd(auth, "key-1")
+	var sawCwd bool
+	for _, p := range collector.Pairs() {
+		if p.Fake == canonical && p.Real == codexRealCwd {
+			sawCwd = true
+		}
+	}
+	if !sawCwd {
+		t.Fatalf("header-only real cwd not captured into collector: %+v", collector.Pairs())
+	}
+}
+
+// TestNormalizeCodexTurnMetadataHeader_NoCollectorNoCapture confirms the plain
+// (non-restore) header API does not require a collector and captures nothing,
+// matching the gate-off behavior.
+func TestNormalizeCodexTurnMetadataHeader_NoCollectorNoCapture(t *testing.T) {
+	auth := codexAuth("codex-no-collector.json")
+	headers := map[string][]string{
+		"X-Codex-Turn-Metadata": {codexTurnMetadataFixture},
+	}
+	// Must not panic without a collector and must still normalize the header.
+	NormalizeCodexTurnMetadataHeader(headers, "x-codex-turn-metadata", auth, "key-1")
+	if strings.Contains(headers["X-Codex-Turn-Metadata"][0], codexRealCwd) {
+		t.Fatalf("header real cwd not normalized by plain API")
 	}
 }
