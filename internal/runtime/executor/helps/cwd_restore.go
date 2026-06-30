@@ -3,6 +3,7 @@ package helps
 import (
 	"bytes"
 	"context"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -131,10 +132,11 @@ func RestoreCwdInString(pairs []CwdRestorePair, s string) string {
 	return s
 }
 
-// RestoreCwdInBytes is the []byte form of RestoreCwdInString. It is used by the
-// codex response paths (whose fake roots are fixed literals appearing anywhere in
-// the OpenAI-responses payload, mirroring replaceCodexIdentityResponsePayload's
-// whole-payload swap).
+// RestoreCwdInBytes is the []byte form of RestoreCwdInString (a literal whole-buffer
+// fake→real swap). It is retained as a low-level utility; the codex response path no
+// longer uses it for tool-call argument restoration (that now goes through the
+// structural, JSON-safe RestoreCodexFunctionCallCwdInResponse to avoid corrupting
+// JSON when the real cwd contains backslashes/quotes/control chars).
 func RestoreCwdInBytes(pairs []CwdRestorePair, b []byte) []byte {
 	for _, p := range pairs {
 		if p.Fake == "" || p.Real == "" || p.Fake == p.Real {
@@ -146,6 +148,104 @@ func RestoreCwdInBytes(pairs []CwdRestorePair, b []byte) []byte {
 		}
 	}
 	return b
+}
+
+// hasAnyFakeRoot reports whether s contains any captured fake root. Used to skip
+// the (more expensive) structural restore when there is nothing to do.
+func hasAnyFakeRoot(pairs []CwdRestorePair, s string) bool {
+	for _, p := range pairs {
+		if p.Fake == "" || p.Real == "" || p.Fake == p.Real {
+			continue
+		}
+		if strings.Contains(s, p.Fake) {
+			return true
+		}
+	}
+	return false
+}
+
+// RestoreCwdInToolUseInputRaw restores fake→real cwd inside a tool-call input
+// object given as a raw JSON string (Anthropic tool_use.input / OpenAI-responses
+// function_call.arguments). Unlike the literal RestoreCwdInString swap, the
+// substitution happens STRUCTURALLY: the object is parsed, every string value is
+// decoded, fake→real is applied to the decoded value, then the value is written
+// back with sjson.Set, which re-escapes JSON metacharacters. This keeps the result
+// valid JSON even when the real cwd contains backslashes (Windows C:\Users\bob),
+// quotes, or control characters — a literal text swap would otherwise inject those
+// raw bytes and corrupt the JSON. Only string VALUES are rewritten; object keys
+// are never touched. Returns raw unchanged when it is not a JSON object, when no
+// fake root occurs, or when there are no pairs.
+//
+// Nested objects/arrays are walked recursively so a path argument at any depth is
+// restored. The walk only descends into objects and arrays; numbers, bools, and
+// null are left as-is.
+func RestoreCwdInToolUseInputRaw(pairs []CwdRestorePair, raw string) string {
+	if len(pairs) == 0 || raw == "" {
+		return raw
+	}
+	if !hasAnyFakeRoot(pairs, raw) {
+		return raw
+	}
+	parsed := gjson.Parse(raw)
+	if !parsed.IsObject() && !parsed.IsArray() {
+		return raw
+	}
+	out := raw
+	out = restoreCwdInJSONValue(pairs, out, "", parsed)
+	if !gjson.Valid(out) {
+		// Defensive: never emit invalid JSON. If the structural rewrite somehow
+		// produced an invalid document, fall back to the original raw (no restore)
+		// rather than corrupting the downstream parser.
+		return raw
+	}
+	return out
+}
+
+// restoreCwdInJSONValue walks one JSON value at sjson path basePath inside doc and
+// returns doc with every descendant string value fake→real restored. basePath is
+// "" for the document root. Only string leaves are rewritten (via sjson.Set, which
+// escapes correctly); keys are never rewritten.
+func restoreCwdInJSONValue(pairs []CwdRestorePair, doc, basePath string, value gjson.Result) string {
+	switch {
+	case value.IsObject():
+		value.ForEach(func(key, child gjson.Result) bool {
+			childPath := joinSjsonPath(basePath, escapeSjsonKey(key.String()))
+			doc = restoreCwdInJSONValue(pairs, doc, childPath, gjson.Get(doc, childPath))
+			return true
+		})
+	case value.IsArray():
+		arr := value.Array()
+		for i := range arr {
+			childPath := joinSjsonPath(basePath, intToSjsonIndex(i))
+			doc = restoreCwdInJSONValue(pairs, doc, childPath, gjson.Get(doc, childPath))
+		}
+	default:
+		if value.Type == gjson.String {
+			s := value.String()
+			restored := RestoreCwdInString(pairs, s)
+			if restored != s {
+				// sjson.Set on a string value escapes JSON metacharacters in the
+				// value, so backslashes/quotes/control chars in the real cwd are
+				// encoded correctly and the document stays valid JSON.
+				doc, _ = sjson.Set(doc, basePath, restored)
+			}
+		}
+	}
+	return doc
+}
+
+// joinSjsonPath joins a base sjson path with a child segment, handling the root
+// (empty base) case.
+func joinSjsonPath(base, child string) string {
+	if base == "" {
+		return child
+	}
+	return base + "." + child
+}
+
+// intToSjsonIndex renders an array index as its sjson path segment.
+func intToSjsonIndex(i int) string {
+	return strconv.Itoa(i)
 }
 
 // RestoreClaudeToolUseCwdInResponse restores fake→real cwd inside the path
@@ -171,7 +271,10 @@ func RestoreClaudeToolUseCwdInResponse(pairs []CwdRestorePair, body []byte) []by
 			return true
 		}
 		raw := input.Raw
-		restored := RestoreCwdInString(pairs, raw)
+		// Structural, JSON-safe restore: rewrite fake→real on the DECODED string
+		// values inside the input object and re-escape on write-back, so a real cwd
+		// containing backslashes/quotes/control chars cannot corrupt the JSON.
+		restored := RestoreCwdInToolUseInputRaw(pairs, raw)
 		if restored != raw {
 			path := "content." + index.String() + ".input"
 			body, _ = sjson.SetRawBytes(body, path, []byte(restored))
@@ -179,4 +282,112 @@ func RestoreClaudeToolUseCwdInResponse(pairs []CwdRestorePair, body []byte) []by
 		return true
 	})
 	return body
+}
+
+// codexFunctionCallTypes are the codex response item types whose "arguments"
+// (a JSON-encoded string) carry tool-call path arguments to restore.
+var codexFunctionCallTypes = map[string]bool{
+	"function_call":    true,
+	"custom_tool_call": true,
+}
+
+// RestoreCodexFunctionCallCwdInResponse restores fake→real cwd / CODEX_HOME inside
+// the "arguments" of codex tool-call items, JSON-safely and scoped to tool-call
+// arguments only (mirroring the claude tool_use.input discipline).
+//
+// It handles both response shapes the codex executor restores:
+//   - a single streamed item at "item" (response.output_item.done), and
+//   - the full "response.output" array (buffered response.completed).
+//
+// For each function_call / custom_tool_call item it parses the "arguments" string
+// (itself a JSON object), structurally restores every string value, and writes the
+// re-encoded arguments back with sjson (which re-escapes), so a real cwd containing
+// backslashes/quotes/control chars cannot corrupt the JSON. Conversational text,
+// reasoning, and tool outputs are NEVER rewritten here — that is the scope
+// discipline the response-side restore must honor.
+//
+// When payload contains no recognizable function_call item (e.g. an SSE delta line
+// or a non-JSON frame), it returns payload unchanged. Callers handle the literal
+// fallback for unparseable payloads separately.
+func RestoreCodexFunctionCallCwdInResponse(pairs []CwdRestorePair, payload []byte) ([]byte, bool) {
+	if len(pairs) == 0 || len(payload) == 0 {
+		return payload, false
+	}
+	body := payload
+	// Streamed line frames are prefixed with "data: "; strip it so the JSON parses,
+	// then re-attach on return.
+	prefix := []byte(nil)
+	if bytes.HasPrefix(body, []byte("data: ")) {
+		prefix = []byte("data: ")
+		body = body[len(prefix):]
+	} else if bytes.HasPrefix(body, []byte("data:")) {
+		prefix = []byte("data:")
+		body = body[len(prefix):]
+	}
+	if !gjson.ValidBytes(body) {
+		return payload, false
+	}
+	changed := false
+	// Shape A: top-level single item (response.output_item.done).
+	if item := gjson.GetBytes(body, "item"); item.Exists() {
+		if newBody, ok := restoreCodexFunctionCallArgsAt(pairs, body, "item", item); ok {
+			body = newBody
+			changed = true
+		}
+	}
+	// Shape B: full output array (response.completed).
+	if output := gjson.GetBytes(body, "response.output"); output.IsArray() {
+		output.ForEach(func(idx, item gjson.Result) bool {
+			path := "response.output." + idx.String()
+			if newBody, ok := restoreCodexFunctionCallArgsAt(pairs, body, path, item); ok {
+				body = newBody
+				changed = true
+			}
+			return true
+		})
+	}
+	if !changed {
+		return payload, false
+	}
+	if len(prefix) != 0 {
+		out := make([]byte, 0, len(prefix)+len(body))
+		out = append(out, prefix...)
+		out = append(out, body...)
+		return out, true
+	}
+	return body, true
+}
+
+// restoreCodexFunctionCallArgsAt restores the "arguments" of one item (at sjson
+// path itemPath inside body) when it is a function_call / custom_tool_call. The
+// arguments value is a JSON-encoded string; it is parsed, structurally restored,
+// and written back with sjson.Set (which escapes the value). Returns the updated
+// body and whether anything changed.
+func restoreCodexFunctionCallArgsAt(pairs []CwdRestorePair, body []byte, itemPath string, item gjson.Result) ([]byte, bool) {
+	if !codexFunctionCallTypes[strings.TrimSpace(item.Get("type").String())] {
+		return body, false
+	}
+	args := item.Get("arguments")
+	if args.Type != gjson.String {
+		return body, false
+	}
+	argStr := args.String()
+	if !hasAnyFakeRoot(pairs, argStr) {
+		return body, false
+	}
+	restored := RestoreCwdInToolUseInputRaw(pairs, argStr)
+	if restored == argStr {
+		// Not a parseable JSON object (or nothing changed structurally); fall back to
+		// a literal swap on the decoded string so a fake root is never left verbatim.
+		// sjson.Set still re-escapes the value on write-back, keeping valid JSON.
+		restored = RestoreCwdInString(pairs, argStr)
+		if restored == argStr {
+			return body, false
+		}
+	}
+	newBody, err := sjson.SetBytes(body, itemPath+".arguments", restored)
+	if err != nil {
+		return body, false
+	}
+	return newBody, true
 }

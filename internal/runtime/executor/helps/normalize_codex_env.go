@@ -139,6 +139,20 @@ const (
 // NormalizeCodexTurnMetadataHeader 归一一个 turn-metadata header（#1）。header key
 // 大小写不敏感取值；归一后写回同一 key。无解析失败即原样返回（不抛错、不丢 header）。
 func NormalizeCodexTurnMetadataHeader(headers map[string][]string, headerKey string, auth *cliproxyauth.Auth, apiKey string) {
+	normalizeCodexTurnMetadataHeader(headers, headerKey, auth, apiKey, nil)
+}
+
+// NormalizeCodexTurnMetadataHeaderWithRestore behaves like
+// NormalizeCodexTurnMetadataHeader but also captures the real cwd exposed in the
+// header's workspaces KEY into the CwdRestoreCollector attached to ctx (if any), so
+// the response side can restore tool-call paths when the real cwd is exposed ONLY
+// in the header and never in the body text. When no collector is attached the
+// behavior is identical to NormalizeCodexTurnMetadataHeader.
+func NormalizeCodexTurnMetadataHeaderWithRestore(ctx context.Context, headers map[string][]string, headerKey string, auth *cliproxyauth.Auth, apiKey string) {
+	normalizeCodexTurnMetadataHeader(headers, headerKey, auth, apiKey, CwdRestoreCollectorFromContext(ctx))
+}
+
+func normalizeCodexTurnMetadataHeader(headers map[string][]string, headerKey string, auth *cliproxyauth.Auth, apiKey string, collector *CwdRestoreCollector) {
 	if headers == nil {
 		return
 	}
@@ -158,6 +172,7 @@ func NormalizeCodexTurnMetadataHeader(headers map[string][]string, headerKey str
 		return
 	}
 	vals := resolveCodexCanonicalValues(auth, apiKey)
+	vals.collector = collector
 	for i, v := range values {
 		if strings.TrimSpace(v) == "" {
 			continue
@@ -192,7 +207,14 @@ func normalizeCodexTurnMetadataJSON(raw string, vals codexCanonicalValues) strin
 	var entries []wsEntry
 	var realKeys []string
 	workspaces.ForEach(func(key, value gjson.Result) bool {
-		realKeys = append(realKeys, key.String())
+		realKey := key.String()
+		realKeys = append(realKeys, realKey)
+		// Capture the real cwd (the workspace KEY) → canonical cwd mapping so the
+		// response side can restore tool-call paths even when the real cwd is only
+		// exposed in the turn-metadata header (not in the body <cwd>/<root>/AGENTS
+		// text). vals.collector is non-nil only on the WithRestore paths; Add is a
+		// safe no-op otherwise and de-duplicates on the canonical (fake) key.
+		vals.collector.Add(vals.cwd, realKey)
 		ws := value.Raw
 		// git commit。
 		if gjson.Get(ws, "latest_git_commit_hash").Exists() {
