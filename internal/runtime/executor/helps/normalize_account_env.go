@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
@@ -179,6 +180,25 @@ var memoryPathPattern = regexp.MustCompile("(?i)(file-based memory system at\\s+
 // including the ": " separator; group 2 is the value to replace.
 var cwdKeyValuePattern = regexp.MustCompile(`(?im)^([ \t]*-?[ \t]*(?:Primary working directory|Working directory|Current working directory):[ \t]*)(\S.*?)[ \t]*$`)
 
+// additionalDirsHeadingPattern matches the claude-code "Additional working
+// directories:" heading line. Unlike the cwd key lines above, the real paths it
+// introduces are NOT on this line: they live on the subsequent indented Markdown
+// list items ("  - <path>"), which carry no key and would therefore be missed by
+// cwdKeyValuePattern and, when their root is not /Users|/home (e.g. /tmp, /var),
+// also by the realPathPattern home-only sweep. additionalDirItemPattern matches
+// each such list item so every additional directory — at any root — is normalized.
+// Capture group 1 is the "- " bullet prefix (with indentation); group 2 is the
+// directory path value.
+//
+// additionalDirItemPattern deliberately requires the list-item value to be an
+// ABSOLUTE path (POSIX "/..." or Windows "<drive>:\..."). Sibling env fields in the
+// same flat Markdown list ("- Is a git repository: false", "- Platform: linux") are
+// also "- <text>" lines but are NOT absolute paths, so they do not match and the
+// additional-directories run terminates at the first such field — never rewriting a
+// non-path env field as if it were a directory.
+var additionalDirsHeadingPattern = regexp.MustCompile(`(?im)^[ \t]*-?[ \t]*Additional working directories:[ \t]*$`)
+var additionalDirItemPattern = regexp.MustCompile(`(?m)^([ \t]*-[ \t]*)((?:/|[A-Za-z]:\\)\S.*?)[ \t]*$`)
+
 // platformKeyValuePattern matches the body "Platform:" line (Node
 // process.platform). Capture group 1 is the key prefix; group 2 is the value.
 var platformKeyValuePattern = regexp.MustCompile(`(?im)^([ \t]*-?[ \t]*Platform:[ \t]*)(\S.*?)[ \t]*$`)
@@ -199,6 +219,24 @@ func AccountCanonicalCwd(auth *cliproxyauth.Auth, apiKey string) string {
 	scopeKey := ClaudeAccountScopeKey(auth, apiKey)
 	sum := sha256.Sum256([]byte("cliproxy-canonical-cwd\x00" + scopeKey))
 	// Use the first 4 bytes as a stable, opaque per-account workspace id.
+	id := binary.BigEndian.Uint32(sum[:4])
+	return canonicalHomeRoot + "/workspace-" + uint32ToHex(id)
+}
+
+// derivedFakeWorkspaceRoot derives a deterministic, machine-neutral fake root for
+// an ADDITIONAL real working directory (one that is distinct from the primary cwd).
+// The primary cwd maps to AccountCanonicalCwd (stable per account); a request may,
+// however, declare several distinct additional directories, each of which is a
+// different real path that must map to its OWN fake root so the response side can
+// restore each one back to the correct real directory. We seed the derivation on
+// the real path itself (not the account) so the same real additional directory
+// always yields the same fake root within and across requests, while leaking no
+// real-path information: only the sha256 of the real path is used. The shape mirrors
+// AccountCanonicalCwd (canonicalHomeRoot + "/workspace-<hex8>") so an upstream
+// observer sees a uniform, machine-neutral workspace path indistinguishable from the
+// primary one.
+func derivedFakeWorkspaceRoot(realPath string) string {
+	sum := sha256.Sum256([]byte("cliproxy-canonical-additional-cwd\x00" + realPath))
 	id := binary.BigEndian.Uint32(sum[:4])
 	return canonicalHomeRoot + "/workspace-" + uint32ToHex(id)
 }
@@ -306,7 +344,157 @@ func normalizeAccountEnv(payload []byte, auth *cliproxyauth.Auth, apiKey string,
 
 	payload = normalizeSystemEnvBlocks(payload, rewrite)
 	payload = normalizeMessagesEnvBlocks(payload, rewrite)
+	// CONTROLLED EXCEPTION to the "tool_result is never rewritten" scope rule.
+	// The env-block passes above have populated the collector with the exact real
+	// cwd literals seen in THIS request (env declaration blocks) and their fake
+	// roots. A tool_result for `pwd` / `git rev-parse --show-toplevel` / `ls` / an
+	// error message echoes those same real cwds straight back upstream every turn,
+	// re-leaking the real machine path/user the env-block rewrite just hid. We close
+	// that one channel by rewriting real→fake inside tool_result content, but ONLY
+	// for paths that exactly match (by path-prefix) a real cwd the collector already
+	// captured. This is safe and minimal: it never does a generalized /Users sweep,
+	// only the already-known real→fake mappings are applied, so an unrelated absolute
+	// path in a tool_result is left untouched. The model is already fed the fake root,
+	// so making the tool_result agree with it improves consistency without breaking
+	// the agent. symlink divergence (/tmp vs /private/tmp) is accepted best-effort.
+	payload = normalizeToolResultKnownCwds(payload, collector)
 	return payload
+}
+
+// normalizeToolResultKnownCwds rewrites real→fake cwd literals inside tool_result
+// content, restricted to the real cwds the collector captured while rewriting this
+// request's env blocks. This is the CONTROLLED exception documented at the call
+// site: it is the inverse of the response-side restore (fake→real) and uses the same
+// pair set, so only known mappings are touched — never an arbitrary path. When the
+// collector is nil or empty (no env block was rewritten, so no real cwd is known)
+// it is a no-op and tool_result is left byte-for-byte unchanged.
+func normalizeToolResultKnownCwds(payload []byte, collector *CwdRestoreCollector) []byte {
+	pairs := collector.Pairs()
+	if len(pairs) == 0 {
+		return payload
+	}
+	messages := gjson.GetBytes(payload, "messages")
+	if !messages.Exists() || !messages.IsArray() {
+		return payload
+	}
+	messages.ForEach(func(msgKey, msg gjson.Result) bool {
+		content := msg.Get("content")
+		if !content.Exists() || !content.IsArray() {
+			return true
+		}
+		msgPath := "messages." + msgKey.String()
+		content.ForEach(func(blockKey, block gjson.Result) bool {
+			if block.Get("type").String() != "tool_result" {
+				return true
+			}
+			// tool_result.content is either a plain string or an array of content
+			// blocks (each typically {type:"text", text:...}). Rewrite real→fake only
+			// inside those string values; everything else is left untouched.
+			tr := block.Get("content")
+			blockBase := msgPath + ".content." + blockKey.String()
+			if tr.Type == gjson.String {
+				rewritten := rewriteKnownRealToFake(pairs, tr.String())
+				if rewritten != tr.String() {
+					payload, _ = sjson.SetBytes(payload, blockBase+".content", rewritten)
+				}
+			} else if tr.IsArray() {
+				tr.ForEach(func(innerKey, inner gjson.Result) bool {
+					t := inner.Get("text")
+					if t.Type != gjson.String {
+						return true
+					}
+					rewritten := rewriteKnownRealToFake(pairs, t.String())
+					if rewritten != t.String() {
+						payload, _ = sjson.SetBytes(payload, blockBase+".content."+innerKey.String()+".text", rewritten)
+					}
+					return true
+				})
+			}
+			return true
+		})
+		return true
+	})
+	return payload
+}
+
+// rewriteKnownRealToFake replaces each captured real cwd root with its fake root
+// inside s, by path-prefix-safe literal substitution (so "<real>/sub" becomes
+// "<fake>/sub"). Only the exact captured real roots are matched; no generalized path
+// replacement is performed. Pairs are applied longest-real-first so a more specific
+// (longer) real root wins over a shorter one that is its prefix.
+func rewriteKnownRealToFake(pairs []CwdRestorePair, s string) string {
+	if len(pairs) == 0 || s == "" {
+		return s
+	}
+	ordered := make([]CwdRestorePair, len(pairs))
+	copy(ordered, pairs)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		return len(ordered[i].Real) > len(ordered[j].Real)
+	})
+	for _, p := range ordered {
+		if p.Fake == "" || p.Real == "" || p.Fake == p.Real {
+			continue
+		}
+		s = replaceRealPrefix(s, p.Real, p.Fake)
+	}
+	return s
+}
+
+// replaceRealPrefix replaces every occurrence of the real cwd root with the fake
+// root, but only when the match is a whole path segment boundary: the byte after
+// the match is either the end of string, a path separator ("/"), or a non-path
+// character (whitespace, quote, control char, etc.). This makes "<real>" and
+// "<real>/sub" match while "<real>extra" (e.g. /Users/corylin/Project vs
+// /Users/corylin/ProjectOther) does NOT, so the substitution stays scoped to the
+// captured directory and never bleeds into an unrelated sibling path. This is the
+// path-prefix-safe rule the controlled tool_result exception requires; it is
+// deliberately stricter than the literal whole-buffer swap the (response-side)
+// restore uses.
+func replaceRealPrefix(s, real, fake string) string {
+	if !strings.Contains(s, real) {
+		return s
+	}
+	var b strings.Builder
+	for {
+		idx := strings.Index(s, real)
+		if idx < 0 {
+			b.WriteString(s)
+			break
+		}
+		end := idx + len(real)
+		// Boundary check: the char immediately after the match must not be a path
+		// continuation char (an unbroken filename byte), otherwise this is a longer
+		// unrelated path that merely starts with the real root's text.
+		boundary := end >= len(s) || !isPathContinuationByte(s[end])
+		b.WriteString(s[:idx])
+		if boundary {
+			b.WriteString(fake)
+		} else {
+			b.WriteString(real)
+		}
+		s = s[end:]
+	}
+	return b.String()
+}
+
+// isPathContinuationByte reports whether c can be part of the same path segment
+// immediately following a directory root (i.e. would make "<real>c" a different,
+// longer filename rather than a child path). A following "/" is a child path and is
+// allowed (treated as a boundary); only bytes that extend the final segment of the
+// root itself block the match.
+func isPathContinuationByte(c byte) bool {
+	switch {
+	case c >= 'a' && c <= 'z':
+		return true
+	case c >= 'A' && c <= 'Z':
+		return true
+	case c >= '0' && c <= '9':
+		return true
+	case c == '-' || c == '_' || c == '.':
+		return true
+	default:
+		return false
+	}
 }
 
 // normalizeEnvText rewrites every environment block (XML or Markdown) found in
@@ -369,14 +557,97 @@ func rewriteEnvBlock(block string, params envRewriteParams) string {
 		}
 		return line
 	})
-	// Secondary sweep for embedded home-rooted paths not on a cwd key line.
-	block = realPathPattern.ReplaceAllString(block, params.canonicalCwd)
+	// "Additional working directories:" heading + its indented list items. The
+	// real paths are on the list items (no key), so cwdKeyValuePattern misses them
+	// and the home-only realPathPattern sweep below misses any non-/Users|/home root
+	// (e.g. /tmp, /var). Each additional directory is a DISTINCT real path, so each
+	// is mapped to its OWN deterministic fake root (derivedFakeWorkspaceRoot) and the
+	// fake→real pair recorded for response-side restoration of that directory.
+	block = rewriteAdditionalWorkingDirs(block, params)
+	// Secondary sweep for embedded home-rooted paths not on a cwd key line. Paths
+	// already under canonicalHomeRoot are left alone: they are the canonical cwd and
+	// the per-directory derived fake roots produced just above, which must NOT be
+	// collapsed onto canonicalCwd (that would destroy the distinct additional-dir
+	// mappings the response side needs). canonicalCwd is itself under canonicalHomeRoot,
+	// so a re-matched canonical cwd is also (harmlessly) left unchanged.
+	block = realPathPattern.ReplaceAllStringFunc(block, func(p string) string {
+		if strings.HasPrefix(p, canonicalHomeRoot+"/") || p == canonicalHomeRoot {
+			return p
+		}
+		return params.canonicalCwd
+	})
 	// OS normalization: align body Platform / OS Version with the baseline OS.
 	if params.hasBodyOS {
 		block = platformKeyValuePattern.ReplaceAllString(block, "${1}"+params.bodyOS.platform)
 		block = osVersionKeyValuePattern.ReplaceAllString(block, "${1}"+params.bodyOS.osVersion)
 	}
 	return block
+}
+
+// rewriteAdditionalWorkingDirs normalizes the directories listed under an
+// "Additional working directories:" heading inside an environment block. claude-code
+// emits the heading followed by an indented Markdown list, one directory per
+// "  - <path>" item; those items carry no key, so the key-anchored cwd pattern does
+// not reach them, and the home-only realPathPattern sweep misses non-/Users|/home
+// roots (e.g. /tmp, /var). Each item is a DISTINCT real directory, so each gets its
+// own deterministic fake root via derivedFakeWorkspaceRoot and a fake→real pair is
+// recorded for response-side restoration of that specific directory.
+//
+// Scope: only the contiguous run of list items immediately following the heading is
+// rewritten. The run terminates at the first line that is not an indented list item
+// (a blank line, a new key line, or a heading), so unrelated content is untouched.
+func rewriteAdditionalWorkingDirs(block string, params envRewriteParams) string {
+	loc := additionalDirsHeadingPattern.FindStringIndex(block)
+	if loc == nil {
+		return block
+	}
+	head := block[:loc[1]]
+	rest := block[loc[1]:]
+	// rest begins right after the heading line (before its trailing newline). Walk
+	// it line by line, rewriting consecutive list items and stopping at the first
+	// non-list-item line.
+	var out strings.Builder
+	out.WriteString(head)
+	i := 0
+	stopped := false
+	for i < len(rest) {
+		nl := strings.IndexByte(rest[i:], '\n')
+		var line string
+		var sep string
+		if nl < 0 {
+			line = rest[i:]
+			i = len(rest)
+		} else {
+			line = rest[i : i+nl]
+			sep = "\n"
+			i += nl + 1
+		}
+		if !stopped {
+			if m := additionalDirItemPattern.FindStringSubmatch(line); len(m) == 3 {
+				realPath := strings.TrimSpace(m[2])
+				fake := derivedFakeWorkspaceRoot(realPath)
+				params.collector.Add(fake, realPath)
+				out.WriteString(m[1])
+				out.WriteString(fake)
+				out.WriteString(sep)
+				continue
+			}
+			if strings.TrimSpace(line) == "" {
+				// Blank line (including the empty fragment immediately after the
+				// heading, since FindStringIndex stops before the heading's newline)
+				// does not terminate the list run; emit it and keep scanning.
+				out.WriteString(line)
+				out.WriteString(sep)
+				continue
+			}
+			// First non-blank, non-list line ends the additional-directories run;
+			// everything after it is emitted verbatim.
+			stopped = true
+		}
+		out.WriteString(line)
+		out.WriteString(sep)
+	}
+	return out.String()
 }
 
 // normalizeSystemEnvBlocks applies the env rewriter to the system field. It reuses

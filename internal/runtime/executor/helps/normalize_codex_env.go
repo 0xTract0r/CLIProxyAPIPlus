@@ -64,6 +64,15 @@ type codexCanonicalValues struct {
 	gitCommit string
 	// gitRemote 是每账号派生的 git remote URL。
 	gitRemote string
+	// primaryCwd is the request's PRIMARY real working directory — the codex
+	// client's actual cwd, which both keys the turn-metadata workspaces object and
+	// appears in the body <cwd> tag. It maps to the per-account canonical cwd
+	// (vals.cwd); any OTHER distinct real cwd in the same body (extra <root> entries,
+	// a differing AGENTS.md header) is an ADDITIONAL directory that maps to its own
+	// derived fake root instead, so each real cwd restores 1:1. Empty when the body
+	// exposes no primary cwd (then every detected real cwd is treated as primary →
+	// vals.cwd, preserving the prior single-cwd behavior).
+	primaryCwd string
 	// collector, when non-nil, records the fake→real cwd / CODEX_HOME mappings
 	// captured during body rewrite for response-side restoration. It never alters
 	// the outbound rewrite itself.
@@ -268,6 +277,12 @@ func normalizeCodexPaths(body []byte, auth *cliproxyauth.Auth, apiKey string, co
 	}
 	vals := resolveCodexCanonicalValues(auth, apiKey)
 	vals.collector = collector
+	// Resolve the PRIMARY real cwd up front so every text pass agrees on which real
+	// cwd maps to vals.cwd vs a derived fake (C-fix). The authoritative primary is the
+	// turn-metadata workspaces KEY (the codex client's actual cwd, which also keys the
+	// header/body workspace object); the body <cwd> tag is the fallback. Probed from
+	// the ORIGINAL body before any rewrite so it still carries the real values.
+	vals.primaryCwd = resolveCodexPrimaryCwd(body)
 
 	// #2 body client_metadata["x-codex-turn-metadata"]（#1 逐字副本，复用同一
 	// 派生值，保证 header/body 跨位置一致）。
@@ -282,7 +297,106 @@ func normalizeCodexPaths(body []byte, auth *cliproxyauth.Auth, apiKey string, co
 	// + input[].text（直挂文本）+ input[].output（function_call_output 工具输出回显）。
 	body = normalizeCodexBodyText(body, "instructions", vals)
 	body = normalizeCodexInputText(body, vals)
+	// CONTROLLED EXCEPTION (codex analog of the claude tool_result real→fake rule):
+	// a function_call_output (input[].output) echoes raw tool output (pwd / git
+	// rev-parse / ls / errors). The text passes above only rewrite real cwds DETECTED
+	// in that same text via <cwd>/<root>/AGENTS headers, so a bare real cwd in a tool
+	// output with no such markers slips through and re-leaks the real path every turn.
+	// We close that channel by applying ONLY the real→fake mappings the collector
+	// already captured this request (known env/header cwds + CODEX_HOME), path-prefix
+	// safe; no generalized /Users|/home sweep is performed, so unrelated absolute
+	// paths in tool output are left untouched.
+	body = normalizeCodexToolOutputKnownCwds(body, collector)
 	return body
+}
+
+// normalizeCodexToolOutputKnownCwds rewrites real→fake inside input[].output (codex
+// function_call_output tool-output echoes), restricted to the real cwds / CODEX_HOME
+// the collector captured while normalizing this request. It is the codex counterpart
+// of normalizeToolResultKnownCwds and the inverse of the response-side restore, so
+// only known mappings are applied — never an arbitrary path. No-op when the collector
+// is nil/empty.
+func normalizeCodexToolOutputKnownCwds(body []byte, collector *CwdRestoreCollector) []byte {
+	pairs := collector.Pairs()
+	if len(pairs) == 0 {
+		return body
+	}
+	input := gjson.GetBytes(body, "input")
+	if !input.Exists() || !input.IsArray() {
+		return body
+	}
+	input.ForEach(func(inKey, item gjson.Result) bool {
+		o := item.Get("output")
+		if o.Type != gjson.String {
+			return true
+		}
+		rewritten := rewriteKnownRealToFake(pairs, o.String())
+		if rewritten != o.String() {
+			body, _ = sjson.SetBytes(body, "input."+inKey.String()+".output", rewritten)
+		}
+		return true
+	})
+	return body
+}
+
+// resolveCodexPrimaryCwd probes the ORIGINAL (pre-rewrite) body for the primary
+// real cwd: the turn-metadata workspaces KEY if present (authoritative — it keys the
+// header/body workspace object and the codex client's actual cwd), otherwise the
+// first <cwd> tag found in instructions or input text. Returns "" when neither is
+// present, in which case rewriteCodexText falls back to "first detected real cwd is
+// primary" so single-cwd behavior is unchanged.
+func resolveCodexPrimaryCwd(body []byte) string {
+	// Turn-metadata copy in the body (#2) carries the workspaces object whose first
+	// key is the real primary cwd.
+	if tm := gjson.GetBytes(body, "client_metadata.x-codex-turn-metadata"); tm.Type == gjson.String {
+		if ws := gjson.Get(tm.String(), "workspaces"); ws.IsObject() {
+			primary := ""
+			ws.ForEach(func(key, _ gjson.Result) bool {
+				primary = strings.TrimSpace(key.String())
+				return false // first key only
+			})
+			if primary != "" {
+				return primary
+			}
+		}
+	}
+	// Fallback: the <cwd> tag in instructions or any input text block.
+	if instr := gjson.GetBytes(body, "instructions"); instr.Type == gjson.String {
+		if m := codexEnvCwdTagPattern.FindStringSubmatch(instr.String()); len(m) == 2 {
+			if c := strings.TrimSpace(m[1]); c != "" {
+				return c
+			}
+		}
+	}
+	primary := ""
+	if input := gjson.GetBytes(body, "input"); input.IsArray() {
+		input.ForEach(func(_, item gjson.Result) bool {
+			texts := []string{}
+			if c := item.Get("content"); c.Type == gjson.String {
+				texts = append(texts, c.String())
+			} else if c.IsArray() {
+				c.ForEach(func(_, block gjson.Result) bool {
+					if t := block.Get("text"); t.Type == gjson.String {
+						texts = append(texts, t.String())
+					}
+					return true
+				})
+			}
+			if t := item.Get("text"); t.Type == gjson.String {
+				texts = append(texts, t.String())
+			}
+			for _, txt := range texts {
+				if m := codexEnvCwdTagPattern.FindStringSubmatch(txt); len(m) == 2 {
+					if c := strings.TrimSpace(m[1]); c != "" {
+						primary = c
+						return false
+					}
+				}
+			}
+			return true
+		})
+	}
+	return primary
 }
 
 // normalizeCodexBodyText 归一一个 string 字段（如 instructions）。
@@ -386,12 +500,38 @@ func rewriteCodexText(text string, vals codexCanonicalValues) string {
 			vals.collector.Add(vals.codexHome, home)
 		}
 	}
+	// C-fix: a single codex request body can declare SEVERAL distinct real cwds
+	// (multiple <root> entries in workspace_roots, or an AGENTS.md header for a
+	// different directory than <cwd>). Mapping them all onto the one vals.cwd fake
+	// root made them indistinguishable on the wire AND, because the restore collector
+	// de-dups on the fake root (first-seen wins), dropped every real cwd after the
+	// first — so a tool path under the second real cwd was restored to the WRONG
+	// (first) real directory. Each distinct real cwd therefore gets its OWN fake root:
+	// the PRIMARY cwd keeps vals.cwd for header/body consistency (it also keys the
+	// turn-metadata workspaces object); any ADDITIONAL distinct real cwd gets a
+	// deterministic derivedFakeWorkspaceRoot so it maps 1:1 and the response side
+	// restores each path to the correct directory.
+	primary := vals.primaryCwd
+	if primary == "" && len(realCwds) > 0 {
+		// No authoritative primary was resolved from the body/header; fall back to the
+		// first detected real cwd so the single-cwd case still maps to vals.cwd exactly
+		// as before (preserving header/body consistency).
+		primary = realCwds[0]
+	}
 	for _, cwd := range realCwds {
-		if cwd != "" && cwd != vals.cwd {
-			text = strings.ReplaceAll(text, cwd, vals.cwd)
-			// Capture fake→real (canonical cwd → real cwd) for response-side restore.
-			vals.collector.Add(vals.cwd, cwd)
+		if cwd == "" {
+			continue
 		}
+		fake := vals.cwd
+		if cwd != primary {
+			fake = derivedFakeWorkspaceRoot(cwd)
+		}
+		if cwd == fake {
+			continue
+		}
+		text = strings.ReplaceAll(text, cwd, fake)
+		// Capture fake→real for response-side restore (1:1 per distinct real cwd).
+		vals.collector.Add(fake, cwd)
 	}
 
 	// environment_context 的 <shell> / <timezone> 归一成统一基线值（<current_date>
