@@ -261,6 +261,37 @@ type CodexExecutor struct {
 
 func NewCodexExecutor(cfg *config.Config) *CodexExecutor { return &CodexExecutor{cfg: cfg} }
 
+// normalizeCodexPaths gates the outbound codex cwd / CODEX_HOME normalization
+// (requirement ⑦-codex) behind the SAME global switch that controls claude's
+// NormalizeAccountEnv, and captures the fake→real mapping for response-side
+// restoration. Previously codex normalization was unconditional (always-on),
+// which broke local agents that received fake-rooted tool-call paths with no way
+// to restore them. Both halves now share one switch: when off, the outbound body
+// is left untouched and the response is unchanged; when on, paths are normalized
+// outbound and restored inbound.
+func (e *CodexExecutor) normalizeCodexPaths(ctx context.Context, body []byte, auth *cliproxyauth.Auth, apiKey string) []byte {
+	if !config.NormalizeAccountEnvEnabled(e.cfg) {
+		return body
+	}
+	return helps.NormalizeCodexPathsWithRestore(ctx, body, auth, apiKey)
+}
+
+// restoreCodexResponseCwd restores fake→real cwd / CODEX_HOME inside a codex
+// response payload (OpenAI-responses JSON or one streamed SSE line). The fake
+// roots are fixed literals, so a whole-payload literal swap is used, mirroring
+// replaceCodexIdentityResponsePayload. The complete function_call arguments are
+// carried by response.output_item.done / response.completed events, so the
+// literal is whole there; incremental function_call_arguments.delta fragments are
+// display-only and the authoritative .done event is restored. Returns payload
+// unchanged when nothing was captured.
+func restoreCodexResponseCwd(ctx context.Context, payload []byte) []byte {
+	collector := helps.CwdRestoreCollectorFromContext(ctx)
+	if collector == nil {
+		return payload
+	}
+	return helps.RestoreCwdInBytes(collector.Pairs(), payload)
+}
+
 // NewCodexExecutorWithManager wires the auth manager so cyber_policy hits are
 // persisted into the auth record (CyberPolicyFlagCount / LastCyberPolicyAt).
 func NewCodexExecutorWithManager(cfg *config.Config, manager *cliproxyauth.Manager) *CodexExecutor {
@@ -860,6 +891,11 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	if isCodexOpenAIImageRequest(opts) {
 		return e.executeOpenAIImage(ctx, auth, req, opts)
 	}
+	// Attach a cwd-restore collector when normalization is on so the response can
+	// restore fake→real tool-call paths (requirement ⑦-codex, restore half).
+	if config.NormalizeAccountEnvEnabled(e.cfg) {
+		ctx, _ = helps.ContextWithCwdRestoreCollector(ctx)
+	}
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
 	apiKey, baseURL := codexCreds(auth)
@@ -894,8 +930,10 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	body, _ = sjson.DeleteBytes(body, "safety_identifier")
 	body, _ = sjson.DeleteBytes(body, "stream_options")
 	body = normalizeCodexInstructions(body)
-	// fork(anticorr ⑦-codex): 无条件归一出站 body 里的真实 cwd/git/CODEX_HOME 路径。
-	body = helps.NormalizeCodexPaths(body, auth, apiKey)
+	// fork(anticorr ⑦-codex): normalize the real cwd/git/CODEX_HOME paths in the
+	// outbound body, gated by the shared normalize-account-env switch (capturing
+	// the fake→real mapping for response-side restoration).
+	body = e.normalizeCodexPaths(ctx, body, auth, apiKey)
 	// fork: 默认剥离 image_generation 工具（applyImageGenerationPolicy 内部默认 strip）。
 	// upstream 的多档禁用语义保留在 helps.ApplyPayloadConfigWithRequest 中。
 	body = applyImageGenerationPolicy(e.cfg, body, baseModel, auth)
@@ -1032,6 +1070,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 
 		var param any
 		clientCompletedData := applyCodexIdentityExposeResponsePayload(completedData, identityState)
+		clientCompletedData = restoreCodexResponseCwd(ctx, clientCompletedData)
 		out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, originalPayload, body, clientCompletedData, &param)
 		resp = cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}
 		return resp, nil
@@ -1041,6 +1080,11 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 }
 
 func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
+	// Attach a cwd-restore collector when normalization is on so the compact
+	// response can restore fake→real tool-call paths (requirement ⑦-codex).
+	if config.NormalizeAccountEnvEnabled(e.cfg) {
+		ctx, _ = helps.ContextWithCwdRestoreCollector(ctx)
+	}
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
 	apiKey, baseURL := codexCreds(auth)
@@ -1071,8 +1115,10 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 	body, _ = sjson.DeleteBytes(body, "stream")
 	body = normalizeCodexInstructions(body)
-	// fork(anticorr ⑦-codex): 无条件归一出站 body 里的真实 cwd/git/CODEX_HOME 路径。
-	body = helps.NormalizeCodexPaths(body, auth, apiKey)
+	// fork(anticorr ⑦-codex): normalize the real cwd/git/CODEX_HOME paths in the
+	// outbound body, gated by the shared normalize-account-env switch (capturing
+	// the fake→real mapping for response-side restoration).
+	body = e.normalizeCodexPaths(ctx, body, auth, apiKey)
 	// fork: 默认剥离 image_generation 工具。
 	body = applyImageGenerationPolicy(e.cfg, body, baseModel, auth)
 	body = sanitizeOpenAIResponsesReasoningEncryptedContent(ctx, "codex executor", body)
@@ -1139,6 +1185,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	reporter.EnsurePublished(ctx)
 	var param any
 	clientData := applyCodexIdentityExposeResponsePayload(upstreamData, identityState)
+	clientData = restoreCodexResponseCwd(ctx, clientData)
 	out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, originalPayload, body, clientData, &param)
 	resp = cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}
 	return resp, nil
@@ -1150,6 +1197,11 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	}
 	if isCodexOpenAIImageRequest(opts) {
 		return e.executeOpenAIImageStream(ctx, auth, req, opts)
+	}
+	// Attach a cwd-restore collector when normalization is on so the streamed
+	// response can restore fake→real tool-call paths (requirement ⑦-codex).
+	if config.NormalizeAccountEnvEnabled(e.cfg) {
+		ctx, _ = helps.ContextWithCwdRestoreCollector(ctx)
 	}
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
@@ -1184,8 +1236,10 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	body, _ = sjson.DeleteBytes(body, "stream_options")
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 	body = normalizeCodexInstructions(body)
-	// fork(anticorr ⑦-codex): 无条件归一出站 body 里的真实 cwd/git/CODEX_HOME 路径。
-	body = helps.NormalizeCodexPaths(body, auth, apiKey)
+	// fork(anticorr ⑦-codex): normalize the real cwd/git/CODEX_HOME paths in the
+	// outbound body, gated by the shared normalize-account-env switch (capturing
+	// the fake→real mapping for response-side restoration).
+	body = e.normalizeCodexPaths(ctx, body, auth, apiKey)
 	// fork: 默认剥离 image_generation 工具。
 	body = applyImageGenerationPolicy(e.cfg, body, baseModel, auth)
 	body = sanitizeOpenAIResponsesReasoningEncryptedContent(ctx, "codex executor", body)
@@ -1302,6 +1356,10 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			}
 
 			translatedLine = applyCodexIdentityExposeResponsePayload(translatedLine, identityState)
+			// Restore fake→real cwd / CODEX_HOME in tool-call (function_call) path
+			// arguments. The .done/.completed events carry the complete arguments, so
+			// the fixed-literal fake root is whole there; per-line restoration applies.
+			translatedLine = restoreCodexResponseCwd(ctx, translatedLine)
 			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, originalPayload, body, translatedLine, &param)
 			for i := range chunks {
 				select {

@@ -1,6 +1,7 @@
 package helps
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -63,6 +64,10 @@ type codexCanonicalValues struct {
 	gitCommit string
 	// gitRemote 是每账号派生的 git remote URL。
 	gitRemote string
+	// collector, when non-nil, records the fake→real cwd / CODEX_HOME mappings
+	// captured during body rewrite for response-side restoration. It never alters
+	// the outbound rewrite itself.
+	collector *CwdRestoreCollector
 }
 
 // resolveCodexCanonicalValues 从账号作用域派生出全部归一目标值。结果对同一账号
@@ -223,10 +228,24 @@ func escapeSjsonKey(key string) string {
 // NormalizeCodexPaths 归一 codex 出站 body 里的全部路径泄漏点（#2/#3/#4/#5）。
 // 无条件执行；解析失败或无匹配时原样返回。
 func NormalizeCodexPaths(body []byte, auth *cliproxyauth.Auth, apiKey string) []byte {
+	return normalizeCodexPaths(body, auth, apiKey, nil)
+}
+
+// NormalizeCodexPathsWithRestore behaves like NormalizeCodexPaths but additionally
+// captures the fake→real mappings it applied (canonical cwd → real cwd, canonical
+// CODEX_HOME → real CODEX_HOME) into the CwdRestoreCollector attached to ctx (if
+// any), so the response side can restore tool-call (function_call) path arguments.
+// When no collector is attached the behavior is identical to NormalizeCodexPaths.
+func NormalizeCodexPathsWithRestore(ctx context.Context, body []byte, auth *cliproxyauth.Auth, apiKey string) []byte {
+	return normalizeCodexPaths(body, auth, apiKey, CwdRestoreCollectorFromContext(ctx))
+}
+
+func normalizeCodexPaths(body []byte, auth *cliproxyauth.Auth, apiKey string, collector *CwdRestoreCollector) []byte {
 	if len(body) == 0 || !gjson.ValidBytes(body) {
 		return body
 	}
 	vals := resolveCodexCanonicalValues(auth, apiKey)
+	vals.collector = collector
 
 	// #2 body client_metadata["x-codex-turn-metadata"]（#1 逐字副本，复用同一
 	// 派生值，保证 header/body 跨位置一致）。
@@ -340,11 +359,16 @@ func rewriteCodexText(text string, vals codexCanonicalValues) string {
 	for _, home := range realHomes {
 		if home != "" && home != vals.codexHome {
 			text = strings.ReplaceAll(text, home, vals.codexHome)
+			// Capture fake→real (canonical CODEX_HOME → real CODEX_HOME) so the
+			// response side can restore function_call path arguments.
+			vals.collector.Add(vals.codexHome, home)
 		}
 	}
 	for _, cwd := range realCwds {
 		if cwd != "" && cwd != vals.cwd {
 			text = strings.ReplaceAll(text, cwd, vals.cwd)
+			// Capture fake→real (canonical cwd → real cwd) for response-side restore.
+			vals.collector.Add(vals.cwd, cwd)
 		}
 	}
 

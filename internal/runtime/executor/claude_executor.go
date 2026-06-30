@@ -226,6 +226,14 @@ func (e *ClaudeExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Aut
 
 func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
 	ctx = contextWithClaudeInboundHeaders(ctx, opts.Headers)
+	// Account cwd normalization (requirement ⑦) is response-restorable: attach a
+	// collector so applyCloaking's NormalizeAccountEnvWithRestore can record the
+	// fake→real cwd mapping this request applies, and restore it in tool_use path
+	// arguments on the response. Only attached when the switch is on.
+	var cwdRestore *helps.CwdRestoreCollector
+	if config.NormalizeAccountEnvEnabled(e.cfg) {
+		ctx, cwdRestore = helps.ContextWithCwdRestoreCollector(ctx)
+	}
 	if opts.Alt == "responses/compact" {
 		return resp, statusErr{code: http.StatusNotImplemented, msg: "/responses/compact not supported"}
 	}
@@ -402,6 +410,18 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		reporter.Publish(ctx, helps.ParseClaudeUsage(data))
 	}
 	data = restoreClaudeOAuthToolNamesFromResponse(data, claudeToolPrefix, auth.ToolPrefixDisabled(), oauthToolNamesReverseMap)
+	// Restore the fake→real cwd inside tool_use path arguments before translation,
+	// the response-side half of account cwd normalization (requirement ⑦). The
+	// non-stream JSON form uses the tool_use input walker; a buffered upstream
+	// stream blob (from != to) is restored line-by-line. Conversational text is
+	// never touched.
+	if pairs := cwdRestore.Pairs(); len(pairs) > 0 {
+		if stream {
+			data = restoreClaudeStreamCwdBlob(pairs, data)
+		} else {
+			data = helps.RestoreClaudeToolUseCwdInResponse(pairs, data)
+		}
+	}
 	var param any
 	out := sdktranslator.TranslateNonStream(
 		ctx,
@@ -419,6 +439,12 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 
 func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
 	ctx = contextWithClaudeInboundHeaders(ctx, opts.Headers)
+	// Attach a cwd-restore collector when normalization is on so the streamed
+	// response can restore tool_use path arguments (requirement ⑦, restore half).
+	var cwdRestore *helps.CwdRestoreCollector
+	if config.NormalizeAccountEnvEnabled(e.cfg) {
+		ctx, cwdRestore = helps.ContextWithCwdRestoreCollector(ctx)
+	}
 	if opts.Alt == "responses/compact" {
 		return nil, statusErr{code: http.StatusNotImplemented, msg: "/responses/compact not supported"}
 	}
@@ -571,6 +597,21 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		// If from == to (Claude → Claude), directly forward the SSE stream without translation
 		if from == to {
 			invokeRepairer := newClaudeInvokeRepairer(ginHeadersFromContext(ctx), bodyForTranslation)
+			// cwd restorer runs BEFORE the invoke repairer so native tool_use blocks
+			// (input_json_delta) get their fake→real path arguments restored; the
+			// repairer then passes those restored frames through untouched. nil when
+			// nothing was captured (transparent pass-through).
+			cwdRestorer := newClaudeCwdStreamRestorer(cwdRestore.Pairs())
+			emitRepaired := func(line []byte) bool {
+				for _, chunk := range invokeRepairer.ProcessLine(line) {
+					select {
+					case out <- cliproxyexecutor.StreamChunk{Payload: chunk}:
+					case <-ctx.Done():
+						return false
+					}
+				}
+				return true
+			}
 			scanner := bufio.NewScanner(decodedBody)
 			scanner.Buffer(nil, 52_428_800) // 50MB
 			for scanner.Scan() {
@@ -580,10 +621,17 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 					reporter.Publish(ctx, detail)
 				}
 				line = restoreClaudeOAuthToolNamesFromStreamLine(line, claudeToolPrefix, auth.ToolPrefixDisabled(), oauthToolNamesReverseMap)
-				for _, chunk := range invokeRepairer.ProcessLine(line) {
-					select {
-					case out <- cliproxyexecutor.StreamChunk{Payload: chunk}:
-					case <-ctx.Done():
+				for _, chunk := range cwdRestorer.ProcessLine(line) {
+					for _, sub := range claudeChunkLines(chunk) {
+						if !emitRepaired(sub) {
+							return
+						}
+					}
+				}
+			}
+			for _, chunk := range cwdRestorer.Flush() {
+				for _, sub := range claudeChunkLines(chunk) {
+					if !emitRepaired(sub) {
 						return
 					}
 				}
@@ -607,16 +655,15 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		}
 
 		// For other formats, use translation
+		// cwd restorer runs on the raw upstream Anthropic lines BEFORE translation
+		// so tool_use path arguments are restored while still in Anthropic shape
+		// (the translator never needs to know about cwd restoration). nil when
+		// nothing was captured.
+		cwdRestorer := newClaudeCwdStreamRestorer(cwdRestore.Pairs())
 		scanner := bufio.NewScanner(decodedBody)
 		scanner.Buffer(nil, 52_428_800) // 50MB
 		var param any
-		for scanner.Scan() {
-			line := scanner.Bytes()
-			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
-			if detail, ok := helps.ParseClaudeStreamUsage(line); ok {
-				reporter.Publish(ctx, detail)
-			}
-			line = restoreClaudeOAuthToolNamesFromStreamLine(line, claudeToolPrefix, auth.ToolPrefixDisabled(), oauthToolNamesReverseMap)
+		translateAndEmit := func(line []byte) bool {
 			chunks := sdktranslator.TranslateStream(
 				ctx,
 				to,
@@ -631,6 +678,29 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				select {
 				case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
 				case <-ctx.Done():
+					return false
+				}
+			}
+			return true
+		}
+		for scanner.Scan() {
+			line := scanner.Bytes()
+			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
+			if detail, ok := helps.ParseClaudeStreamUsage(line); ok {
+				reporter.Publish(ctx, detail)
+			}
+			line = restoreClaudeOAuthToolNamesFromStreamLine(line, claudeToolPrefix, auth.ToolPrefixDisabled(), oauthToolNamesReverseMap)
+			for _, chunk := range cwdRestorer.ProcessLine(line) {
+				for _, sub := range claudeChunkLines(chunk) {
+					if !translateAndEmit(sub) {
+						return
+					}
+				}
+			}
+		}
+		for _, chunk := range cwdRestorer.Flush() {
+			for _, sub := range claudeChunkLines(chunk) {
+				if !translateAndEmit(sub) {
 					return
 				}
 			}
@@ -2315,7 +2385,11 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 	// inside <env> / <system-reminder> blocks are rewritten to a per-account
 	// canonical path.
 	if config.NormalizeAccountEnvEnabled(cfg) {
-		payload = helps.NormalizeAccountEnv(payload, auth, apiKey, cfg)
+		// WithRestore captures the fake→real cwd mapping into the collector attached
+		// to ctx (when present) so the response side can restore tool_use path
+		// arguments. When no collector is attached this is identical to the plain
+		// NormalizeAccountEnv (zero behavior change).
+		payload = helps.NormalizeAccountEnvWithRestore(ctx, payload, auth, apiKey, cfg)
 	}
 
 	// Determine if the remaining (broader) cloak transformations should be applied.
