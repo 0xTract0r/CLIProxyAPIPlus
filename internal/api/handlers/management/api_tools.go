@@ -16,6 +16,7 @@ import (
 	"github.com/fxamacker/cbor/v2"
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/geminicli"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/proxyutil"
@@ -734,9 +735,90 @@ func (h *Handler) authByIndex(authIndex string) *coreauth.Auth {
 	return nil
 }
 
+// apiCallTransport returns the outbound RoundTripper used by every management
+// APICall (and its OAuth/quota helpers). For claude / codex accounts it routes
+// through the SAME per-provider uTLS round tripper that serving and OAuth refresh
+// use (helps.NewUtlsRoundTripperForProfile with the provider's ClientHello profile),
+// so an account's api-call traffic presents the replicated claude-cli / codex-rs
+// ClientHello instead of the
+// Go-default TLS fingerprint (JA3 03117a8e). This closes the anti-correlation leak
+// where the management dashboard's periodic chatgpt.com / api.anthropic.com usage
+// probes carried a real account token over a distinguishable Go TLS stack.
+//
+// The uTLS round tripper is strict (no-downgrade) for both production profiles and
+// handles its own proxy dialing (incl. socks5) and dial timeout, so it bypasses the
+// hardenedDialer / socks5 special-casing on the standard-library path. For every
+// other provider (gemini, copilot/github, api_key, openai-compatibility) or when
+// auth is nil, apiCallUtlsRoundTripper declines and we fall back to the
+// existing hardened standard-library transport (which keeps the socks5 DialContext
+// handling and the AGENTS.md-allowed timeout exception).
 func (h *Handler) apiCallTransport(auth *coreauth.Auth) http.RoundTripper {
+	if rt, ok := h.apiCallUtlsRoundTripper(auth); ok && rt != nil {
+		return rt
+	}
 	transport, _ := h.apiCallTransportWithDialer(auth)
 	return transport
+}
+
+// apiCallUtlsRoundTripper resolves the serving-grade per-provider uTLS round
+// tripper for an account whose provider is runtime-enforced (claude / codex). It
+// reuses the SAME proxy-candidate priority as apiCallTransportWithDialer
+// (auth.ProxyURL -> per-account api-key proxy -> global cfg.ProxyURL) and passes
+// the resolved proxy to helps so helps does not re-resolve a different proxy.
+// Returns ok=false for non-uTLS providers / nil auth so the caller keeps the
+// existing hardened standard-library transport.
+func (h *Handler) apiCallUtlsRoundTripper(auth *coreauth.Auth) (http.RoundTripper, bool) {
+	if auth == nil {
+		return nil, false
+	}
+	// Select the per-provider ClientHello profile and route through the SAME real
+	// uTLS constructor serving/refresh use. Do NOT use BuildRuntimeTransportRoundTripper:
+	// its codex branch returns NewCodexTransportRoundTripperForProfile, which ignores
+	// the profile and clones a Go-default *http.Transport (NOT uTLS), so codex would
+	// keep leaking JA3 03117a8e. NewUtlsRoundTripperForProfile resolves the codex
+	// profile to a strict (no-downgrade) HelloCustom codex-rs round tripper, matching
+	// codex_executor.go's NewUtlsHTTPClientForProfile(CodexRustlsClientHelloProfileID).
+	// Only claude / codex have a serving uTLS fingerprint that api-call must match;
+	// unrelated providers (gemini cli-native, copilot, api_key) keep today's transport.
+	var profileID string
+	switch strings.ToLower(strings.TrimSpace(auth.Provider)) {
+	case "claude":
+		profileID = helps.ClaudeCLIClientHelloProfileID
+	case "codex":
+		profileID = helps.CodexRustlsClientHelloProfileID
+	default:
+		return nil, false
+	}
+	proxyURL := h.apiCallResolvedProxyURL(auth)
+	rt := helps.NewUtlsRoundTripperForProfile(proxyURL, profileID)
+	if rt == nil {
+		return nil, false
+	}
+	return rt, true
+}
+
+// apiCallResolvedProxyURL computes the same proxy-candidate priority chain used by
+// apiCallTransportWithDialer and returns the first non-empty candidate (empty means
+// direct egress, preserving api-call's documented "Direct connect" priority-3
+// behavior). Factored out so the uTLS and standard-library paths resolve identical
+// proxies.
+func (h *Handler) apiCallResolvedProxyURL(auth *coreauth.Auth) string {
+	if auth != nil {
+		if proxyStr := strings.TrimSpace(auth.ProxyURL); proxyStr != "" {
+			return proxyStr
+		}
+		if h != nil && h.cfg != nil {
+			if proxyStr := strings.TrimSpace(proxyURLFromAPIKeyConfig(h.cfg, auth)); proxyStr != "" {
+				return proxyStr
+			}
+		}
+	}
+	if h != nil && h.cfg != nil {
+		if proxyStr := strings.TrimSpace(h.cfg.ProxyURL); proxyStr != "" {
+			return proxyStr
+		}
+	}
+	return ""
 }
 
 // apiCallTransportWithDialer returns the configured outbound transport along

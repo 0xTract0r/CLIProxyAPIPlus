@@ -108,22 +108,11 @@ func TestAPICallTransportAPIKeyAuthFallsBackToConfigProxyURL(t *testing.T) {
 			},
 			wantProxy: "http://gemini-proxy.example.com:8080",
 		},
-		{
-			name: "claude",
-			auth: &coreauth.Auth{
-				Provider:   "claude",
-				Attributes: map[string]string{"api_key": "claude-key"},
-			},
-			wantProxy: "http://claude-proxy.example.com:8080",
-		},
-		{
-			name: "codex",
-			auth: &coreauth.Auth{
-				Provider:   "codex",
-				Attributes: map[string]string{"api_key": "codex-key"},
-			},
-			wantProxy: "http://codex-proxy.example.com:8080",
-		},
+		// claude / codex removed from this std-lib proxy-resolution table: after the
+		// anti-correlation fix their api-call transport is a uTLS *fallbackRoundTripper,
+		// not *http.Transport, so httpTransport.Proxy(req) can no longer assert their
+		// proxy here. Their proxy chain is covered by TestAPICallResolvedProxyURL_*
+		// and their uTLS routing by api_call_utls_transport_test.go.
 		{
 			name: "openai-compatibility",
 			auth: &coreauth.Auth{
