@@ -1,6 +1,7 @@
 package helps
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"regexp"
@@ -236,6 +237,10 @@ type envRewriteParams struct {
 	canonicalMemoryDir string
 	bodyOS             baselineBodyOS
 	hasBodyOS          bool
+	// collector, when non-nil, records the fake→real cwd mapping captured while
+	// rewriting cwd key lines, for response-side restoration. It is never used to
+	// alter the outbound rewrite itself.
+	collector *CwdRestoreCollector
 }
 
 // NormalizeAccountEnv rewrites real cwd / home paths and (conditionally) the host
@@ -251,6 +256,20 @@ type envRewriteParams struct {
 // body/header mismatch. It returns the payload unchanged when the body is
 // unparseable or contains no matching block.
 func NormalizeAccountEnv(payload []byte, auth *cliproxyauth.Auth, apiKey string, cfg *config.Config) []byte {
+	return normalizeAccountEnv(payload, auth, apiKey, cfg, nil)
+}
+
+// NormalizeAccountEnvWithRestore behaves like NormalizeAccountEnv but additionally
+// captures the fake→real cwd mapping it applied into the CwdRestoreCollector
+// attached to ctx (if any). The captured fake root is the per-account canonical
+// cwd; the real root is the working directory probed from the request body. The
+// response side later uses this mapping to restore tool-call path arguments. When
+// no collector is attached the behavior is identical to NormalizeAccountEnv.
+func NormalizeAccountEnvWithRestore(ctx context.Context, payload []byte, auth *cliproxyauth.Auth, apiKey string, cfg *config.Config) []byte {
+	return normalizeAccountEnv(payload, auth, apiKey, cfg, CwdRestoreCollectorFromContext(ctx))
+}
+
+func normalizeAccountEnv(payload []byte, auth *cliproxyauth.Auth, apiKey string, cfg *config.Config, collector *CwdRestoreCollector) []byte {
 	if !gjson.ValidBytes(payload) {
 		// Never attempt to rewrite an unparseable body; pass it through (no 400).
 		return payload
@@ -260,6 +279,7 @@ func NormalizeAccountEnv(payload []byte, auth *cliproxyauth.Auth, apiKey string,
 	params := envRewriteParams{
 		canonicalCwd:       canonicalCwd,
 		canonicalMemoryDir: accountCanonicalMemoryPath(canonicalCwd),
+		collector:          collector,
 	}
 	// Body OS rewrite is gated on stabilize-device-profile, which is an INDEPENDENT
 	// switch from normalize-account-env. The outbound X-Stainless-Os header is only
@@ -338,8 +358,17 @@ func normalizeEnvText(text string, params envRewriteParams) string {
 // The block no longer leaks the real machine identity, and when stabilize is on it
 // no longer contradicts the stabilized header OS.
 func rewriteEnvBlock(block string, params envRewriteParams) string {
-	// Key-anchored cwd normalization first (covers arbitrary path roots).
-	block = cwdKeyValuePattern.ReplaceAllString(block, "${1}"+params.canonicalCwd)
+	// Key-anchored cwd normalization first (covers arbitrary path roots). The
+	// matched value (group 2) is the real working directory; capture the
+	// canonicalCwd→realCwd mapping for response-side restoration before replacing.
+	block = cwdKeyValuePattern.ReplaceAllStringFunc(block, func(line string) string {
+		m := cwdKeyValuePattern.FindStringSubmatch(line)
+		if len(m) == 3 {
+			params.collector.Add(params.canonicalCwd, strings.TrimSpace(m[2]))
+			return m[1] + params.canonicalCwd
+		}
+		return line
+	})
 	// Secondary sweep for embedded home-rooted paths not on a cwd key line.
 	block = realPathPattern.ReplaceAllString(block, params.canonicalCwd)
 	// OS normalization: align body Platform / OS Version with the baseline OS.

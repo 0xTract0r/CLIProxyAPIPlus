@@ -177,6 +177,11 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	if opts.Alt == "responses/compact" {
 		return e.CodexExecutor.executeCompact(ctx, auth, req, opts)
 	}
+	// Attach a cwd-restore collector when normalization is on so the websocket
+	// response can restore fake→real tool-call paths (requirement ⑦-codex).
+	if config.NormalizeAccountEnvEnabled(e.cfg) {
+		ctx, _ = helps.ContextWithCwdRestoreCollector(ctx)
+	}
 
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 	apiKey, baseURL := codexCreds(auth)
@@ -209,8 +214,10 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	body, _ = sjson.DeleteBytes(body, "prompt_cache_retention")
 	body, _ = sjson.DeleteBytes(body, "safety_identifier")
 	body = normalizeCodexInstructions(body)
-	// fork(anticorr ⑦-codex): 无条件归一出站 body 里的真实 cwd/git/CODEX_HOME 路径。
-	body = helps.NormalizeCodexPaths(body, auth, apiKey)
+	// fork(anticorr ⑦-codex): normalize the real cwd/git/CODEX_HOME paths in the
+	// outbound body, gated by the shared normalize-account-env switch (capturing
+	// the fake→real mapping for response-side restoration).
+	body = e.normalizeCodexPaths(ctx, body, auth, apiKey)
 	if e.cfg != nil && e.cfg.DisableImageGeneration == config.DisableImageGenerationOff {
 		body = ensureImageGenerationTool(body, baseModel, auth)
 	}
@@ -388,6 +395,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 			}
 			var param any
 			clientPayload := applyCodexIdentityExposeResponsePayload(payload, identityState)
+			clientPayload = restoreCodexResponseCwd(ctx, clientPayload)
 			out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, originalPayload, clientBody, clientPayload, &param)
 			resp = cliproxyexecutor.Response{Payload: out}
 			return resp, nil
@@ -402,6 +410,11 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	}
 	if opts.Alt == "responses/compact" {
 		return nil, statusErr{code: http.StatusBadRequest, msg: "streaming not supported for /responses/compact"}
+	}
+	// Attach a cwd-restore collector when normalization is on so the streamed
+	// websocket response can restore fake→real tool-call paths (requirement ⑦-codex).
+	if config.NormalizeAccountEnvEnabled(e.cfg) {
+		ctx, _ = helps.ContextWithCwdRestoreCollector(ctx)
 	}
 
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
@@ -430,8 +443,10 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	requestPath := helps.PayloadRequestPath(opts)
 	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", body, body, requestedModel, requestPath, opts.Headers)
 	body = normalizeCodexInstructions(body)
-	// fork(anticorr ⑦-codex): 无条件归一出站 body 里的真实 cwd/git/CODEX_HOME 路径。
-	body = helps.NormalizeCodexPaths(body, auth, apiKey)
+	// fork(anticorr ⑦-codex): normalize the real cwd/git/CODEX_HOME paths in the
+	// outbound body, gated by the shared normalize-account-env switch (capturing
+	// the fake→real mapping for response-side restoration).
+	body = e.normalizeCodexPaths(ctx, body, auth, apiKey)
 	if e.cfg != nil && e.cfg.DisableImageGeneration == config.DisableImageGenerationOff {
 		body = ensureImageGenerationTool(body, baseModel, auth)
 	}
@@ -661,6 +676,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			}
 
 			clientPayload := applyCodexIdentityExposeResponsePayload(payload, identityState)
+			clientPayload = restoreCodexResponseCwd(ctx, clientPayload)
 			line := encodeCodexWebsocketAsSSE(clientPayload)
 			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, clientBody, clientBody, line, &param)
 			for i := range chunks {
