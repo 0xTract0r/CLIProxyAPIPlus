@@ -852,6 +852,32 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 		return nil, fmt.Errorf("failed to parse config file: %w", err)
 	}
 
+	// fork(anticorr): DORMANT — account env/cwd normalization (requirement ⑦) is
+	// disabled. After a byte-level re-verification + community research + a
+	// production incident, the whole cwd-normalization chain (body <env>/<cwd>
+	// rewrite + memory paths + body OS/Platform normalization + response-side
+	// path restore + codex turn-metadata header cwd/git rewrite) was decided to be
+	// turned off in favor of透传 (pass the real values through unchanged).
+	//
+	// To make the runtime switch always-off AND to prevent an accidental re-enable
+	// via config.yaml (`normalize-account-env: true`), we neutralize the loaded
+	// value here right after unmarshal: whatever the file says, the effective
+	// runtime value is nil (off). NormalizeAccountEnvEnabled therefore always
+	// returns false in production.
+	//
+	// Why neutralize here (not in NormalizeAccountEnvEnabled): keeping the gate
+	// function honest lets function-level unit tests construct a Config with the
+	// pointer set to true and still exercise the (dormant, not deleted) normalize
+	// implementations directly. Only the "enabled through the config file" path is
+	// severed. The normalize/restore implementations are intentionally left in
+	// place (helps/normalize_account_env.go, helps/normalize_codex_env.go,
+	// helps/cwd_restore.go, helps/claude_cwd_restore_stream.go) so a future
+	// re-enable is a single, reversible change: delete this neutralization block
+	// (and, if the codex turn-metadata header should follow the switch again,
+	// re-check the two gated call sites in codex_executor.go /
+	// codex_websockets_executor.go).
+	cfg.NormalizeAccountEnv = nil
+
 	// NOTE: Startup legacy key migration is intentionally disabled.
 	// Reason: avoid mutating config.yaml during server startup.
 	// Re-enable the block below if automatic startup migration is needed again.
@@ -1118,7 +1144,16 @@ func ManagedHeaderOnlineUpdateEnabled(cfg *Config) bool {
 
 // NormalizeAccountEnvEnabled reports whether the global account env/cwd
 // normalization switch (requirement ⑦) is on. It defaults to false when the
-// pointer is unset, so the body is never rewritten unless an operator opts in.
+// pointer is unset.
+//
+// fork(anticorr): DORMANT. LoadConfig neutralizes NormalizeAccountEnv to nil
+// right after unmarshal (see LoadConfigOptional), so in production this always
+// returns false regardless of what config.yaml says — cwd normalization is
+// turned off and real cwd/home paths are passed through unchanged. The pointer
+// is still honored here on purpose so function-level unit tests can construct a
+// Config with the switch on and exercise the dormant normalize implementations
+// directly. Do not add extra suppression here; the single reversible off-switch
+// lives in LoadConfig.
 func NormalizeAccountEnvEnabled(cfg *Config) bool {
 	return cfg != nil &&
 		cfg.NormalizeAccountEnv != nil &&

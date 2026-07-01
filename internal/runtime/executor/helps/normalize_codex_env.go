@@ -16,6 +16,16 @@ import (
 
 // Codex 出站 cwd / git / CODEX_HOME 路径归一（需求 ⑦-codex，对齐 claude⑦）。
 //
+// fork(anticorr): DORMANT. Codex cwd/git/CODEX_HOME normalization (body #2..#5 and
+// the turn-metadata header #1) is turned off in production — the body call sites
+// are gated by config.NormalizeAccountEnvEnabled (forced off in LoadConfig) and
+// the two turn-metadata header call sites in codex_executor.go /
+// codex_websockets_executor.go are now gated by the same switch. Real cwd/git
+// values pass through unchanged. Codex identity normalization
+// (applyCodexTurnMetadataIdentityConfuse: installation_id / turn_id / session_id /
+// prompt_cache_key) is a separate, still-active fingerprint measure and is NOT
+// affected. Kept (not deleted) for a single reversible re-enable.
+//
 // Codex 客户端在出站请求里会泄漏开发机的真实身份路径，与 claude 的
 // environment block 同源风险：多名员工共用同一个上游账号时，这些真实路径让
 // OpenAI 能把单一账号反关联到多台不同开发机。泄漏点共 5 处：

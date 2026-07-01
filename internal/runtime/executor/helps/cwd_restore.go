@@ -13,6 +13,12 @@ import (
 
 // Response-side fake-root → real-root restoration (requirement ⑦, restore half).
 //
+// fork(anticorr): DORMANT. The restore half only matters when the outbound cwd
+// normalization runs; since that is turned off in production (see LoadConfig +
+// NormalizeAccountEnvEnabled), no collector is attached and these restore paths
+// are effectively inert. Kept (not deleted) so re-enabling normalization also
+// re-enables restore as a single reversible change.
+//
 // NormalizeAccountEnv / NormalizeCodexPaths rewrite the developer machine's real
 // working directory (and the codex CODEX_HOME) in the OUTBOUND request to a
 // per-account canonical "fake" root so several employees sharing one upstream

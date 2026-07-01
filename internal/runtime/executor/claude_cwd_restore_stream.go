@@ -14,6 +14,12 @@ import (
 // path arguments of Anthropic streaming tool_use blocks, the response-side half
 // of the account cwd normalization (requirement ⑦).
 //
+// fork(anticorr): DORMANT. This runs only when outbound cwd normalization is on
+// (a restore collector is attached). Production has that switch forced off (see
+// config.LoadConfig / NormalizeAccountEnvEnabled), so there is no fake→real
+// mapping to restore and this restorer is a no-op on the serving path. Kept (not
+// deleted) so re-enabling normalization restores streaming tool paths too.
+//
 // On the wire a tool_use block's arguments arrive as a sequence of
 // content_block_delta / input_json_delta.partial_json fragments between a
 // content_block_start (type "tool_use") and a content_block_stop. The fake root

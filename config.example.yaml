@@ -275,13 +275,14 @@ nonstream-keepalive-interval: 0
 # claude:
 #   sonnet_long_context_policy: fail_with_hint  # fail_with_hint | route_to_opus_1m | compact_required
 
-# Global account env/cwd normalization switch (default false). When enabled, the
-# real working directory, user name and home path inside <env> / <system-reminder>
-# blocks of the Claude request body are rewritten to a per-account canonical path,
-# so multiple clients sharing one upstream account present as one machine. It only
-# touches those environment-description blocks (never tool_use / tool_result args
-# or ordinary conversation) and is independent of cloak / device-profile settings.
-# Off = body unchanged (safe gray rollout; roll back by setting it false again).
+# Global account env/cwd normalization switch. DISABLED / DORMANT — do NOT enable.
+# The cwd-normalization chain (rewriting the real working directory, user name and
+# home path in the request body + response-side path restore + codex turn-metadata
+# header cwd/git) was retired after a production incident and community research:
+# real cwd/home paths are now passed through unchanged. The runtime forces this off
+# regardless of what is set here, so setting `normalize-account-env: true` has no
+# effect. Other fingerprint measures (TLS/JA3, UA suffix, device_id, device-profile
+# stabilization) are unaffected and stay active.
 # normalize-account-env: false
 
 # Default headers for Codex OAuth model requests.
