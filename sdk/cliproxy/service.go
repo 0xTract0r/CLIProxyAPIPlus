@@ -629,6 +629,12 @@ func forceHomeRuntimeConfig(cfg *config.Config) {
 	cfg.EnableGeminiCLIEndpoint = false
 	cfg.RemoteManagement.AllowRemote = false
 	cfg.RemoteManagement.DisableControlPanel = true
+	// fork(anticorr): DORMANT double-safeguard — account env/cwd normalization
+	// (requirement ⑦) must never re-enable via the home remote config path. The
+	// primary neutralization already happens in config.ParseConfigBytes /
+	// LoadConfigOptional; re-assert nil here (the dedicated home runtime-field
+	// cleaner) so any future home overlay that reintroduces the pointer stays off.
+	cfg.NormalizeAccountEnv = nil
 }
 
 func (s *Service) registerHomeExecutors() {

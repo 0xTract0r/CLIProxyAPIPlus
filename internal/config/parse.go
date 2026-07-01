@@ -79,6 +79,19 @@ func ParseConfigBytes(data []byte) (*Config, error) {
 		cfg.MaxRetryCredentials = 0
 	}
 
+	// fork(anticorr): DORMANT — mirror the LoadConfigOptional neutralization here so
+	// account env/cwd normalization (requirement ⑦) stays off on EVERY runtime config
+	// load path, not just the on-disk file. ParseConfigBytes is the parser used for the
+	// home remote config overlay (sdk/cliproxy/service.go StartConfigSubscriber ->
+	// applyHomeOverlay), so without this a remotely-pushed `normalize-account-env: true`
+	// could re-enable the retired cwd-normalization chain even though the file path is
+	// already severed. Whatever the payload says, the effective runtime value is nil
+	// (off); NormalizeAccountEnvEnabled therefore always returns false. Kept here (right
+	// after unmarshal) rather than in the gate function for the same reason as
+	// LoadConfigOptional: unit tests can still build a Config with the pointer set and
+	// exercise the dormant normalize implementations directly.
+	cfg.NormalizeAccountEnv = nil
+
 	// Apply the same sanitization pipeline.
 	cfg.SanitizeGeminiKeys()
 	cfg.SanitizeVertexCompatKeys()
