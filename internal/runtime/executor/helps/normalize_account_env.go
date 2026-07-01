@@ -18,6 +18,15 @@ import (
 
 // Account env/cwd normalization (requirement ⑦).
 //
+// fork(anticorr): DORMANT. This whole cwd-normalization family is turned off in
+// production — LoadConfig neutralizes NormalizeAccountEnv to nil, so
+// config.NormalizeAccountEnvEnabled is always false and none of these functions
+// run on the serving path (real cwd/home paths pass through unchanged). The code
+// is intentionally kept (not deleted) so a future re-enable is a single reversible
+// change; unit tests still call these directly. Other fingerprint measures
+// (uTLS/JA3, UA suffix, synthetic device_id, header-level device-profile
+// stabilization) are independent and remain fully active.
+//
 // Claude Code embeds the developer machine's working directory, real user name,
 // home path and host OS into the request body inside an "environment" block. As
 // of claude-code 2.1.181 (production, measured) that block is a Markdown section,

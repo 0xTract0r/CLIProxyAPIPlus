@@ -1897,12 +1897,21 @@ func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, s
 		profile = helps.ResolveCodexClientProfile(auth, ginHeaders, cfg)
 	}
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Codex-Turn-Metadata", "")
-	// fork(anticorr ⑦-codex): 无条件归一 turn-metadata header 里的真实 cwd/git。
-	// 与 body #2 复用同一组派生值，保证 header/body 跨位置一致。token 即 apiKey。
-	// WithRestore captures the header's real cwd into the response-restore collector
-	// (when one is attached to the request ctx), so tool-call paths are restored even
-	// if the real cwd is exposed only in the header and not in the body text.
-	helps.NormalizeCodexTurnMetadataHeaderWithRestore(r.Context(), r.Header, "X-Codex-Turn-Metadata", auth, token)
+	// fork(anticorr ⑦-codex): turn-metadata header cwd/git normalization is now
+	// DORMANT and gated by the same account-env switch as the body path. This used
+	// to be unconditional, but with body-side cwd normalization turned off the
+	// header must NOT rewrite the real cwd/git either — otherwise the header (fake)
+	// and body (real) would contradict each other. NormalizeAccountEnvEnabled is
+	// forced off in LoadConfig, so this branch never runs in production and the
+	// header carries the real cwd/git through unchanged (透传). Identity fields
+	// (installation_id / turn_id / session_id / prompt_cache_key) are handled
+	// separately by applyCodexTurnMetadataIdentityConfuse and stay active.
+	if config.NormalizeAccountEnvEnabled(cfg) {
+		// WithRestore captures the header's real cwd into the response-restore
+		// collector (when attached to the request ctx), so tool-call paths are
+		// restored even if the real cwd is exposed only in the header.
+		helps.NormalizeCodexTurnMetadataHeaderWithRestore(r.Context(), r.Header, "X-Codex-Turn-Metadata", auth, token)
+	}
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Client-Request-Id", "")
 	// fork(anticorr): 真实 codex 出站没有独立 Version 头，版本只体现在 UA 里。
 	// 旧实现会从客户端或 device-profile 注入 Version，是 CPA 独有指纹，删除（含
