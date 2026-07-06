@@ -4882,6 +4882,32 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 					"instance_id":    processInstanceID(),
 					"classification": classifyTerminalRefreshFailure(code),
 				}).Error("terminal refresh failure: reauth required")
+				// #163 semi-automatic reauth alert: fires on the same
+				// untracked->locked edge as the diagnostic log above (this
+				// whole branch is only reached once per actual lock
+				// transition; RefreshDisabled() short-circuits repeats
+				// before refreshAuth() reaches here), so this alert also
+				// fires exactly once per lock event, never per retry.
+				// Only Claude has an auth-scoped one-click reauth endpoint
+				// today (GET /v0/management/anthropic-auth-url?auth_name=),
+				// so the URL is only attached for that provider; other
+				// providers still get the WARN so the lock isn't silent,
+				// just without a clickable link.
+				alertFields := log.Fields{
+					"auth_ref":       current.ID,
+					"provider":       current.Provider,
+					"error_code":     code,
+					"instance_id":    processInstanceID(),
+					"classification": classifyTerminalRefreshFailure(code),
+				}
+				alertMessage := "reauth required: credential locked, manual re-authentication needed"
+				if strings.EqualFold(strings.TrimSpace(current.Provider), "claude") {
+					if reauthURL := reauthAlertURL(current.ID); reauthURL != "" {
+						alertFields["reauth_url"] = reauthURL
+						alertMessage = "reauth required: credential locked, generate a fresh sign-in link via " + reauthURL
+					}
+				}
+				logEntryWithRequestID(ctx).WithFields(alertFields).Warn(alertMessage)
 				current.markRefreshReauthRequiredWithReason(now, code)
 				reauthSnapshot = current.Clone()
 			} else {

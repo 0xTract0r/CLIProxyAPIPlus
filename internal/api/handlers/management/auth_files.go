@@ -660,6 +660,19 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 	if websockets, ok := authWebsocketsValue(auth); ok {
 		entry["websockets"] = websockets
 	}
+	// #163: surface a directly actionable one-click reauth link when this
+	// record carries the automatic terminal reauth-required lock (never for
+	// an operator's explicit account_settings.refresh_enabled = false, which
+	// coreauth.IsReauthRequiredMetadata does not treat as locked). Only
+	// "claude" has an auth-scoped reauth-URL-generation endpoint today
+	// (GET /v0/management/anthropic-auth-url?auth_name=), so the field is
+	// only populated for that provider; this reuses the exact same relative
+	// path builder as the conductor.go alert log so the two stay consistent.
+	if strings.EqualFold(providerKey(auth), "claude") && coreauth.IsReauthRequiredMetadata(auth.Metadata) {
+		if reauthURL := coreauth.ReauthAlertURL(auth.ID); reauthURL != "" {
+			entry["reauth_url"] = reauthURL
+		}
+	}
 	return entry
 }
 

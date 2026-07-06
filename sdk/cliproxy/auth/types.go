@@ -784,6 +784,41 @@ func processInstanceID() string {
 	return processInstanceIDVal
 }
 
+// anthropicReauthEndpointPath is the existing management API route that
+// generates a fresh Anthropic OAuth authorization URL scoped to a single
+// existing Claude auth record (see internal/api/handlers/management ->
+// RequestAnthropicToken, registered at GET /v0/management/anthropic-auth-url).
+// It is kept as a relative path (no host/scheme) because this package has no
+// knowledge of the operator-facing external host/port the management API is
+// actually served on (only the management package computes that, via
+// managementCallbackURL); the operator (or the caller of this log line) is
+// expected to prefix it with the reachable management base URL.
+const anthropicReauthEndpointPath = "/v0/management/anthropic-auth-url"
+
+// reauthAlertURL builds the copy-pasteable relative path (path+query only,
+// see anthropicReauthEndpointPath) for the existing "generate a fresh
+// Anthropic OAuth authorization URL for this exact auth record" management
+// endpoint. It is only meaningful for the "claude" provider today (the only
+// provider with a name-scoped anthropic-auth-url route); callers should not
+// emit it for other providers. The id is URL-escaped since auth IDs may
+// contain characters (spaces, punctuation from an operator label) that are
+// not valid in a raw query string.
+func reauthAlertURL(id string) string {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return ""
+	}
+	return anthropicReauthEndpointPath + "?auth_name=" + url.QueryEscape(id)
+}
+
+// ReauthAlertURL is the exported form of reauthAlertURL so callers outside
+// this package (e.g. the management API's auth-file listing) can surface the
+// same relative reauth-URL-generation endpoint path without duplicating the
+// query-escaping/endpoint-path logic. See reauthAlertURL for details.
+func ReauthAlertURL(id string) string {
+	return reauthAlertURL(id)
+}
+
 // reauthMessageForCode returns the sanitized, user-facing message persisted for
 // a given terminal refresh error code.
 func reauthMessageForCode(code string) string {
