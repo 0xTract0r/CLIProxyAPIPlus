@@ -69,6 +69,131 @@ func TestTerminalRefreshAuthError(t *testing.T) {
 	}
 }
 
+// TestClassifyTerminalRefreshFailure covers the #164 diagnostic classification
+// label derived from the already-sanitized terminal refresh error code: it
+// must distinguish the RFC 9700 §4.14 rotation-replay/race signal
+// (refresh_token_reused) from a bare RFC 6749 §5.2 invalid_grant (ambiguous
+// expired/revoked), and fall back safely for any future/unknown code.
+func TestClassifyTerminalRefreshFailure(t *testing.T) {
+	cases := []struct {
+		code string
+		want string
+	}{
+		{code: "refresh_token_reused", want: classConcurrentReuseRace},
+		{code: "invalid_grant", want: classExpiredOrRevokedGeneric},
+		{code: "", want: classUnknownTerminal},
+		{code: "some_future_code", want: classUnknownTerminal},
+	}
+	for _, tc := range cases {
+		t.Run(tc.code, func(t *testing.T) {
+			if got := classifyTerminalRefreshFailure(tc.code); got != tc.want {
+				t.Fatalf("classifyTerminalRefreshFailure(%q) = %q, want %q", tc.code, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestClassifyTerminalRefreshFailure_EndToEndFromError exercises the full
+// path a real refresh error takes: terminalRefreshAuthError first derives the
+// sanitized code, then classifyTerminalRefreshFailure labels it. This is the
+// "given invalid_grant error -> classified as revoked/expired" acceptance
+// case called out in the task, plus its reuse-race counterpart.
+func TestClassifyTerminalRefreshFailure_EndToEndFromError(t *testing.T) {
+	cases := []struct {
+		name         string
+		err          error
+		wantClass    string
+		wantTerminal bool
+	}{
+		{
+			name:         "invalid_grant classified as expired_or_revoked_generic",
+			err:          errors.New(`token refresh failed: status=400 body_preview="{\"error\":\"invalid_grant\",\"error_description\":\"Refresh token not found or invalid\"}"`),
+			wantClass:    classExpiredOrRevokedGeneric,
+			wantTerminal: true,
+		},
+		{
+			name:         "refresh token reuse classified as concurrent_reuse_race",
+			err:          errors.New(`{"error":"invalid_grant","error_description":"Refresh token has already been used"}`),
+			wantClass:    classConcurrentReuseRace,
+			wantTerminal: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			code, terminal := terminalRefreshAuthError(tc.err)
+			if terminal != tc.wantTerminal {
+				t.Fatalf("terminal = %v, want %v", terminal, tc.wantTerminal)
+			}
+			if got := classifyTerminalRefreshFailure(code); got != tc.wantClass {
+				t.Fatalf("classifyTerminalRefreshFailure(%q) = %q, want %q", code, got, tc.wantClass)
+			}
+		})
+	}
+}
+
+// TestCredentialFingerprint verifies the #164 diagnostic fingerprint helper:
+// it must never return the plaintext secret, must be deterministic for the
+// same input (so the same physical token correlates across restarts), must
+// differ for different inputs, and must return "" for an empty secret.
+func TestCredentialFingerprint(t *testing.T) {
+	const secret = "super-secret-refresh-token-value"
+	fp := credentialFingerprint(secret)
+	if fp == "" {
+		t.Fatal("credentialFingerprint(secret) = \"\", want non-empty")
+	}
+	if strings.Contains(fp, secret) {
+		t.Fatalf("credentialFingerprint leaked plaintext: %q", fp)
+	}
+	if len(fp) != 16 {
+		t.Fatalf("credentialFingerprint length = %d, want 16 (truncated sha256 hex)", len(fp))
+	}
+	if got := credentialFingerprint(secret); got != fp {
+		t.Fatalf("credentialFingerprint not deterministic: %q vs %q", got, fp)
+	}
+	if other := credentialFingerprint("a-different-secret"); other == fp {
+		t.Fatalf("credentialFingerprint collided for different secrets: %q", fp)
+	}
+	if empty := credentialFingerprint(""); empty != "" {
+		t.Fatalf("credentialFingerprint(\"\") = %q, want \"\"", empty)
+	}
+}
+
+// TestRefreshTokenFingerprintFromMetadata verifies the metadata-reading
+// wrapper never returns the raw token and degrades to "" when metadata is
+// missing/malformed rather than panicking.
+func TestRefreshTokenFingerprintFromMetadata(t *testing.T) {
+	meta := map[string]any{"refresh_token": "plaintext-token-abc"}
+	fp := refreshTokenFingerprintFromMetadata(meta)
+	if fp == "" || strings.Contains(fp, "plaintext-token-abc") {
+		t.Fatalf("refreshTokenFingerprintFromMetadata = %q, want non-empty fingerprint without plaintext", fp)
+	}
+	if got := refreshTokenFingerprintFromMetadata(nil); got != "" {
+		t.Fatalf("refreshTokenFingerprintFromMetadata(nil) = %q, want \"\"", got)
+	}
+	if got := refreshTokenFingerprintFromMetadata(map[string]any{}); got != "" {
+		t.Fatalf("refreshTokenFingerprintFromMetadata(empty) = %q, want \"\"", got)
+	}
+	if got := refreshTokenFingerprintFromMetadata(map[string]any{"refresh_token": 12345}); got != "" {
+		t.Fatalf("refreshTokenFingerprintFromMetadata(non-string) = %q, want \"\"", got)
+	}
+}
+
+// TestProcessInstanceID verifies the #164 diagnostic instance identifier is
+// non-empty and stable within the process (so repeated log lines from the
+// same instance correlate), and looks like "host:pid".
+func TestProcessInstanceID(t *testing.T) {
+	first := processInstanceID()
+	if first == "" {
+		t.Fatal("processInstanceID() = \"\", want non-empty")
+	}
+	if !strings.Contains(first, ":") {
+		t.Fatalf("processInstanceID() = %q, want host:pid shape", first)
+	}
+	if second := processInstanceID(); second != first {
+		t.Fatalf("processInstanceID() not stable: %q vs %q", first, second)
+	}
+}
+
 // TestMarkRefreshReauthRequiredWithReason verifies the persisted terminal state
 // carries the supplied code and a sanitized message that never echoes a raw
 // provider body or token.

@@ -268,3 +268,147 @@ func TestSaveTokenRecord_DropsStaleQuotaRuntimeStateOnReauth(t *testing.T) {
 		}
 	}
 }
+
+// TestSaveTokenRecord_ClearsAutomaticReauthLockOnReauth asserts the bcd898
+// stopgap fix (#154): a credential that was automatically locked by
+// markRefreshReauthRequiredWithReason (reauth_required / refresh_status /
+// refresh_error_code / refresh_disabled_reason / refresh_disabled /
+// refresh_disabled_at / last_refresh_error, plus StatusMessage
+// "reauth_required") must have that whole lock cleared by a completed reauth,
+// so RefreshDisabled() flips back to false and automatic refresh resumes
+// without the operator also having to flip the management UI toggle by hand.
+func TestSaveTokenRecord_ClearsAutomaticReauthLockOnReauth(t *testing.T) {
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	previous := &coreauth.Auth{
+		ID:            "claude-user@example.com.json",
+		FileName:      "claude-user@example.com.json",
+		Provider:      "claude",
+		Status:        coreauth.StatusError,
+		StatusMessage: "reauth_required",
+		LastError: &coreauth.Error{
+			Code:    "reauth_required",
+			Message: "refresh token is no longer valid; sign in again to reconnect this account",
+		},
+		Metadata: map[string]any{
+			"type":  "claude",
+			"email": "user@example.com",
+			// operator-controlled, must still be inherited across reauth
+			"note": "managed account",
+			// automatic lock written by markRefreshReauthRequiredWithReason; must
+			// be fully cleared by a completed reauth, not carried forward
+			"refresh_disabled":        true,
+			"refresh_status":          "reauth_required",
+			"refresh_error_code":      "invalid_grant",
+			"refresh_disabled_reason": "reauth_required",
+			"reauth_required":         true,
+			"refresh_disabled_at":     "2026-07-01T00:00:00Z",
+			"last_refresh_error":      "refresh token is no longer valid; sign in again to reconnect this account",
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), previous); errRegister != nil {
+		t.Fatalf("failed to register previous auth: %v", errRegister)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+	h.tokenStore = store
+
+	record := &coreauth.Auth{
+		ID:       "claude-user@example.com.json",
+		FileName: "claude-user@example.com.json",
+		Provider: "claude",
+		Metadata: map[string]any{
+			"type":          "claude",
+			"email":         "user@example.com",
+			"access_token":  "NEW_TOKEN",
+			"refresh_token": "NEW_REFRESH",
+		},
+	}
+	if _, errSave := h.saveTokenRecord(context.Background(), record); errSave != nil {
+		t.Fatalf("saveTokenRecord returned error: %v", errSave)
+	}
+
+	// Operator metadata still inherited.
+	if got, _ := record.Metadata["note"].(string); got != "managed account" {
+		t.Fatalf("note = %q, want inherited %q", got, "managed account")
+	}
+
+	// Every automatic lock key must be gone.
+	for _, key := range []string{
+		"refresh_disabled",
+		"refresh_status",
+		"refresh_error_code",
+		"refresh_disabled_reason",
+		"reauth_required",
+		"refresh_disabled_at",
+		"last_refresh_error",
+	} {
+		if _, ok := record.Metadata[key]; ok {
+			t.Fatalf("metadata[%q] survived reauth, want cleared: %#v", key, record.Metadata[key])
+		}
+	}
+	if record.StatusMessage != "" {
+		t.Fatalf("StatusMessage = %q, want cleared", record.StatusMessage)
+	}
+	if record.LastError != nil {
+		t.Fatalf("LastError = %#v, want cleared", record.LastError)
+	}
+	if record.RefreshDisabled() {
+		t.Fatalf("RefreshDisabled() = true after reauth, want false (automatic refresh should resume)")
+	}
+}
+
+// TestSaveTokenRecord_KeepsOperatorDisableAcrossReauth asserts the other side
+// of #154's fix boundary: a credential the operator explicitly disabled via
+// account_settings.refresh_enabled = false (no automatic lock markers) must
+// stay disabled after reauth. clearStaleReauthLockOnSave must not touch it.
+func TestSaveTokenRecord_KeepsOperatorDisableAcrossReauth(t *testing.T) {
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	previous := &coreauth.Auth{
+		ID:       "claude-user@example.com.json",
+		FileName: "claude-user@example.com.json",
+		Provider: "claude",
+		Metadata: map[string]any{
+			"type":  "claude",
+			"email": "user@example.com",
+			"note":  "managed account",
+			"account_settings": map[string]any{
+				"schema_version":  1,
+				"refresh_enabled": false,
+			},
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), previous); errRegister != nil {
+		t.Fatalf("failed to register previous auth: %v", errRegister)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+	h.tokenStore = store
+
+	record := &coreauth.Auth{
+		ID:       "claude-user@example.com.json",
+		FileName: "claude-user@example.com.json",
+		Provider: "claude",
+		Metadata: map[string]any{
+			"type":          "claude",
+			"email":         "user@example.com",
+			"access_token":  "NEW_TOKEN",
+			"refresh_token": "NEW_REFRESH",
+		},
+	}
+	if _, errSave := h.saveTokenRecord(context.Background(), record); errSave != nil {
+		t.Fatalf("saveTokenRecord returned error: %v", errSave)
+	}
+
+	settings, ok := record.Metadata["account_settings"].(map[string]any)
+	if !ok {
+		t.Fatalf("account_settings missing or wrong type: %T", record.Metadata["account_settings"])
+	}
+	if got, _ := settings["refresh_enabled"].(bool); got {
+		t.Fatalf("account_settings.refresh_enabled = %v, want false (operator disable must survive reauth)", got)
+	}
+	if !record.RefreshDisabled() {
+		t.Fatalf("RefreshDisabled() = false after reauth, want true (operator explicitly disabled refresh)")
+	}
+}

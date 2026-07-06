@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -624,6 +625,17 @@ func isReauthRequiredMetadata(meta map[string]any) bool {
 	return false
 }
 
+// IsReauthRequiredMetadata reports whether the supplied metadata carries the
+// terminal reauth-required lock written by markRefreshReauthRequiredWithReason
+// (reauth_required / refresh_status / refresh_error_code / refresh_disabled_reason
+// == "reauth_required"). It is exported so callers outside this package (e.g.
+// the management API's re-auth save path) can distinguish an automatic
+// refresh-failure lock from an operator's explicit account_settings.refresh_enabled
+// = false, which does not set any of these keys.
+func IsReauthRequiredMetadata(meta map[string]any) bool {
+	return isReauthRequiredMetadata(meta)
+}
+
 func isRefreshTokenReuseError(err error) bool {
 	if err == nil {
 		return false
@@ -685,6 +697,126 @@ func terminalRefreshAuthError(err error) (string, bool) {
 func IsTerminalRefreshAuthError(err error) bool {
 	_, terminal := terminalRefreshAuthError(err)
 	return terminal
+}
+
+// Terminal refresh failure classification labels used for structured
+// diagnostics (see #164). These are derived purely from the already-computed
+// terminalRefreshAuthError code, never from a fresh signal, so they stay
+// consistent with the persisted refresh_error_code metadata.
+const (
+	// classConcurrentReuseRace marks a refresh_token_reused terminal failure:
+	// per RFC 9700 §4.14 this is the rotation-replay/race signal for
+	// single-use refresh tokens (e.g. two processes refreshing the same
+	// credential concurrently, or a retried request after rotation).
+	classConcurrentReuseRace = "concurrent_reuse_race"
+	// classExpiredOrRevokedGeneric marks a bare invalid_grant terminal
+	// failure not recognized as a reuse signature. RFC 6749 §5.2 defines
+	// invalid_grant ambiguously (expired/revoked/invalid); no Anthropic
+	// public doc distinguishes them, so this label intentionally does not
+	// claim more precision than the upstream response provides.
+	classExpiredOrRevokedGeneric = "expired_or_revoked_generic"
+	// classUnknownTerminal is a defensive fallback for any future terminal
+	// code that isn't one of the two recognized above.
+	classUnknownTerminal = "unknown_terminal"
+)
+
+// classifyTerminalRefreshFailure derives a coarse, human-legible diagnostic
+// label from the sanitized terminal refresh error code already computed by
+// terminalRefreshAuthError. It never inspects the raw error string itself so
+// it cannot introduce a new, undocumented distinction.
+func classifyTerminalRefreshFailure(code string) string {
+	switch code {
+	case "refresh_token_reused":
+		return classConcurrentReuseRace
+	case "invalid_grant":
+		return classExpiredOrRevokedGeneric
+	default:
+		return classUnknownTerminal
+	}
+}
+
+// credentialFingerprint returns a short, irreversible fingerprint for a
+// credential secret (e.g. a refresh token) so diagnostic logs and alerts can
+// correlate the same physical credential across restarts/instances without
+// ever exposing the plaintext value. Returns "" for an empty secret.
+//
+// The returned digest is intentionally truncated (first 16 hex chars of a
+// SHA-256 sum, i.e. 64 bits) — enough to correlate occurrences of the same
+// token without materially aiding an offline guess of the original secret.
+func credentialFingerprint(secret string) string {
+	if secret == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(secret))
+	return hex.EncodeToString(sum[:])[:16]
+}
+
+// refreshTokenFingerprintFromMetadata extracts a credentialFingerprint for
+// the refresh token stored in auth metadata, if any. It only ever reads the
+// value to hash it; the plaintext token is never returned or logged.
+func refreshTokenFingerprintFromMetadata(meta map[string]any) string {
+	if len(meta) == 0 {
+		return ""
+	}
+	if token, ok := meta["refresh_token"].(string); ok {
+		return credentialFingerprint(token)
+	}
+	return ""
+}
+
+var (
+	processInstanceIDOnce sync.Once
+	processInstanceIDVal  string
+)
+
+// processInstanceID returns a cheap, stable-for-the-process-lifetime
+// identifier (hostname:pid) used to distinguish which running instance
+// observed a diagnostic event when multiple processes share the same auth
+// store. It intentionally avoids introducing new persisted state.
+func processInstanceID() string {
+	processInstanceIDOnce.Do(func() {
+		host, err := os.Hostname()
+		if err != nil || host == "" {
+			host = "unknown-host"
+		}
+		processInstanceIDVal = host + ":" + strconv.Itoa(os.Getpid())
+	})
+	return processInstanceIDVal
+}
+
+// anthropicReauthEndpointPath is the existing management API route that
+// generates a fresh Anthropic OAuth authorization URL scoped to a single
+// existing Claude auth record (see internal/api/handlers/management ->
+// RequestAnthropicToken, registered at GET /v0/management/anthropic-auth-url).
+// It is kept as a relative path (no host/scheme) because this package has no
+// knowledge of the operator-facing external host/port the management API is
+// actually served on (only the management package computes that, via
+// managementCallbackURL); the operator (or the caller of this log line) is
+// expected to prefix it with the reachable management base URL.
+const anthropicReauthEndpointPath = "/v0/management/anthropic-auth-url"
+
+// reauthAlertURL builds the copy-pasteable relative path (path+query only,
+// see anthropicReauthEndpointPath) for the existing "generate a fresh
+// Anthropic OAuth authorization URL for this exact auth record" management
+// endpoint. It is only meaningful for the "claude" provider today (the only
+// provider with a name-scoped anthropic-auth-url route); callers should not
+// emit it for other providers. The id is URL-escaped since auth IDs may
+// contain characters (spaces, punctuation from an operator label) that are
+// not valid in a raw query string.
+func reauthAlertURL(id string) string {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return ""
+	}
+	return anthropicReauthEndpointPath + "?auth_name=" + url.QueryEscape(id)
+}
+
+// ReauthAlertURL is the exported form of reauthAlertURL so callers outside
+// this package (e.g. the management API's auth-file listing) can surface the
+// same relative reauth-URL-generation endpoint path without duplicating the
+// query-escaping/endpoint-path logic. See reauthAlertURL for details.
+func ReauthAlertURL(id string) string {
+	return reauthAlertURL(id)
 }
 
 // reauthMessageForCode returns the sanitized, user-facing message persisted for
