@@ -1800,6 +1800,51 @@ func clearAuthReauthRequiredLock(auth *coreauth.Auth) {
 	}
 }
 
+// clearStaleReauthLockOnSave releases an automatic reauth-required lock that
+// re-auth (management "reauth" action) or an OAuth callback is about to
+// persist on record. markRefreshReauthRequiredWithReason
+// (sdk/cliproxy/auth/types.go) writes reauth_required / refresh_status /
+// refresh_error_code / refresh_disabled_reason / refresh_disabled /
+// refresh_disabled_at / last_refresh_error onto a credential the first time a
+// refresh is rejected as terminal. Before this fix, a completed reauth /
+// OAuth callback still carried that lock forward:
+//   - mergeUserDefinedAuthMetadataInto treats refresh_disabled as an
+//     operator-controlled key and copies it from the previous record when the
+//     new record does not already set it, and every other lock key
+//     (reauth_required, refresh_status, refresh_error_code,
+//     refresh_disabled_reason, refresh_disabled_at, last_refresh_error) falls
+//     through its generic "not token/runtime owned -> inherit as custom
+//     operator data" branch.
+//   - cloneClaudeReauthMetadata (Claude's own reauth path) only strips
+//     token-owned keys, so the same lock keys and the record's
+//     StatusMessage ("reauth_required") survive into the freshly-built
+//     record even before the merge above runs.
+//
+// The credential therefore kept RefreshDisabled() == true after a successful
+// reauth, forcing an operator to also flip the management UI toggle by hand
+// (two-step recovery). This helper runs on the final record right before
+// store.Save so it always sees the fully merged metadata, and only clears the
+// lock when the record still carries the automatic markers
+// (coreauth.IsReauthRequiredMetadata). An operator's explicit
+// account_settings.refresh_enabled = false never sets those markers, so that
+// case is left untouched and recovery stays a no-op for it.
+func clearStaleReauthLockOnSave(record *coreauth.Auth) {
+	if record == nil || !coreauth.IsReauthRequiredMetadata(record.Metadata) {
+		return
+	}
+	clearAuthReauthRequiredLock(record)
+	// clearAuthReauthRequiredLock intentionally only clears the lock keys it
+	// shares with the account-settings "re-enable refresh" path. The reauth
+	// save path also owns two additional breadcrumb keys that
+	// markRefreshReauthRequiredWithReason writes and that account-settings
+	// never touches, plus the refresh_disabled boolean itself (account-settings
+	// clears that one via applyAuthRefreshEnabledMetadata before calling
+	// clearAuthReauthRequiredLock; the reauth path must do the same here).
+	delete(record.Metadata, "refresh_disabled")
+	delete(record.Metadata, "refresh_disabled_at")
+	delete(record.Metadata, "last_refresh_error")
+}
+
 func buildAuthFileAccountSettingsView(auth *coreauth.Auth, cfg *config.Config) authFileAccountSettingsView {
 	stored := readAccountSettingsMetadata(auth, cfg)
 	projection := managedHeaderProjectionForAuth(auth, cfg)
@@ -3808,6 +3853,13 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 		mergeUserDefinedAuthMetadataInto(record, previous)
 		inheritUserDefinedAuthAttributesInto(record, previous)
 	}
+
+	// Bug fix: a successful reauth / OAuth callback must clear any automatic
+	// reauth-required lock it is about to persist so recovery is one step
+	// instead of two (reauth + manually re-enabling refresh in the management
+	// UI). See clearStaleReauthLockOnSave for why the lock survives the merge
+	// above without this.
+	clearStaleReauthLockOnSave(record)
 
 	if h.postAuthHook != nil {
 		if err := h.postAuthHook(ctx, record); err != nil {

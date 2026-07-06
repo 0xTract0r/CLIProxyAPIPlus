@@ -624,6 +624,17 @@ func isReauthRequiredMetadata(meta map[string]any) bool {
 	return false
 }
 
+// IsReauthRequiredMetadata reports whether the supplied metadata carries the
+// terminal reauth-required lock written by markRefreshReauthRequiredWithReason
+// (reauth_required / refresh_status / refresh_error_code / refresh_disabled_reason
+// == "reauth_required"). It is exported so callers outside this package (e.g.
+// the management API's re-auth save path) can distinguish an automatic
+// refresh-failure lock from an operator's explicit account_settings.refresh_enabled
+// = false, which does not set any of these keys.
+func IsReauthRequiredMetadata(meta map[string]any) bool {
+	return isReauthRequiredMetadata(meta)
+}
+
 func isRefreshTokenReuseError(err error) bool {
 	if err == nil {
 		return false
