@@ -4869,6 +4869,19 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 				// and retrying may trip provider reuse detection. Persist the
 				// reauth-required state so the failure is visible after a restart and
 				// the auto-refresh loop stops hammering a dead token.
+				//
+				// This branch is edge-triggered: once RefreshDisabled() is true a
+				// later refreshAuth call short-circuits above (before reaching this
+				// point), so the diagnostic log below fires exactly once per actual
+				// terminal event, not once per retry (#164 - no log spam).
+				logEntryWithRequestID(ctx).WithFields(log.Fields{
+					"auth_ref":       current.ID,
+					"provider":       current.Provider,
+					"error_code":     code,
+					"cred_fp":        refreshTokenFingerprintFromMetadata(current.Metadata),
+					"instance_id":    processInstanceID(),
+					"classification": classifyTerminalRefreshFailure(code),
+				}).Error("terminal refresh failure: reauth required")
 				current.markRefreshReauthRequiredWithReason(now, code)
 				reauthSnapshot = current.Clone()
 			} else {
