@@ -833,7 +833,7 @@ func (s *Service) Run(ctx context.Context) error {
 		redisqueue.SetUsageStatisticsEnabled(true)
 	}
 
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer shutdownCancel()
 	defer func() {
 		if err := s.Shutdown(shutdownCtx); err != nil {
