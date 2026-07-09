@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -1050,11 +1051,49 @@ func enrichAuthSelectionError(err error, providers []string, model string) error
 	}
 }
 
+// defaultAuthUnavailableRetryAfterSeconds is the conservative back-off hint used
+// when the auth pool is fully exhausted. A short, fixed window keeps clients from
+// hammering an empty pool while still letting them recover quickly once auth
+// becomes available again. The auth-selection error carried here (a fresh
+// *coreauth.Error built by enrichAuthSelectionError) never exposes a cooldown /
+// RetryAfter hint of its own, so a fixed 30s is always used.
+const defaultAuthUnavailableRetryAfterSeconds = 30
+
+// authUnavailableRetryAfter reports the Retry-After hint (in seconds) that should
+// accompany an auth_unavailable / auth_not_found style 503 response. This is a
+// server-generated back-pressure hint, independent of upstream passthrough
+// headers. It returns the hint and true only for auth-selection 503 errors;
+// unrelated errors return "" and false so their responses stay untouched.
+func authUnavailableRetryAfter(err error) (string, bool) {
+	if err == nil {
+		return "", false
+	}
+	var authErr *coreauth.Error
+	if !errors.As(err, &authErr) || authErr == nil {
+		return "", false
+	}
+	code := strings.TrimSpace(authErr.Code)
+	if code != "auth_not_found" && code != "auth_unavailable" {
+		return "", false
+	}
+	return strconv.Itoa(defaultAuthUnavailableRetryAfterSeconds), true
+}
+
 // WriteErrorResponse writes an error message to the response writer using the HTTP status embedded in the message.
 func (h *BaseAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.ErrorMessage) {
 	status := http.StatusInternalServerError
 	if msg != nil && msg.StatusCode > 0 {
 		status = msg.StatusCode
+	}
+	if msg != nil {
+		// Retry-After for auth-selection 503s is a server-generated back-pressure
+		// hint (the pool is exhausted), not an upstream passthrough header. Emit it
+		// directly from the error code so clients back off correctly even when
+		// passthrough-headers is disabled. This is independent of msg.Addon, so it
+		// never relaxes the passthrough gate that governs Addon headers below.
+		if retryAfter, ok := authUnavailableRetryAfter(msg.Error); ok {
+			c.Writer.Header().Set("Retry-After", retryAfter)
+		}
 	}
 	if msg != nil && msg.Addon != nil && PassthroughHeadersEnabled(h.Cfg) {
 		for key, values := range msg.Addon {
