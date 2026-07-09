@@ -1094,7 +1094,10 @@ func (s *Service) Shutdown(ctx context.Context) error {
 		// no legacy clients to persist
 
 		if s.server != nil {
-			shutdownCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			// Cap the HTTP drain at 90s to match the outer graceful-shutdown
+			// window (see Start's shutdownCtx); a shorter inner cap would cut
+			// long-lived streaming requests before the outer window elapses.
+			shutdownCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
 			defer cancel()
 			if err := s.server.Stop(shutdownCtx); err != nil {
 				log.Errorf("error stopping API server: %v", err)
