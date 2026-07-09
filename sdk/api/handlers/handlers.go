@@ -619,7 +619,6 @@ func (h *BaseAPIHandler) executeWithAuthManager(ctx context.Context, handlerType
 				addon = hdr.Clone()
 			}
 		}
-		addon = mergeRetryAfterAddon(addon, err)
 		return nil, nil, &interfaces.ErrorMessage{StatusCode: status, Error: err, Addon: addon}
 	}
 	if !PassthroughHeadersEnabled(h.Cfg) {
@@ -670,7 +669,6 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 				addon = hdr.Clone()
 			}
 		}
-		addon = mergeRetryAfterAddon(addon, err)
 		return nil, nil, &interfaces.ErrorMessage{StatusCode: status, Error: err, Addon: addon}
 	}
 	if !PassthroughHeadersEnabled(h.Cfg) {
@@ -735,7 +733,6 @@ func (h *BaseAPIHandler) executeStreamWithAuthManager(ctx context.Context, handl
 				addon = hdr.Clone()
 			}
 		}
-		addon = mergeRetryAfterAddon(addon, err)
 		errChan <- &interfaces.ErrorMessage{StatusCode: status, Error: err, Addon: addon}
 		close(errChan)
 		return nil, nil, errChan
@@ -848,7 +845,6 @@ func (h *BaseAPIHandler) executeStreamWithAuthManager(ctx context.Context, handl
 							addon = hdr.Clone()
 						}
 					}
-					addon = mergeRetryAfterAddon(addon, streamErr)
 					_ = sendErr(&interfaces.ErrorMessage{StatusCode: status, Error: streamErr, Addon: addon})
 					return
 				}
@@ -1056,67 +1052,31 @@ func enrichAuthSelectionError(err error, providers []string, model string) error
 }
 
 // defaultAuthUnavailableRetryAfterSeconds is the conservative back-off hint used
-// when the auth pool is fully exhausted and no natural reset time is known.
-// A short, fixed window keeps clients from hammering an empty pool while still
-// letting them recover quickly once auth becomes available again.
+// when the auth pool is fully exhausted. A short, fixed window keeps clients from
+// hammering an empty pool while still letting them recover quickly once auth
+// becomes available again. The auth-selection error carried here (a fresh
+// *coreauth.Error built by enrichAuthSelectionError) never exposes a cooldown /
+// RetryAfter hint of its own, so a fixed 30s is always used.
 const defaultAuthUnavailableRetryAfterSeconds = 30
 
-// retryAfterHeaderForAuthError returns HTTP headers carrying a Retry-After hint
-// for auth_unavailable / auth_not_found style 503 responses. It performs no
-// server-side retry; it only tells the client how long to back off. If the
-// underlying error already carries a cooldown/RetryAfter hint it is converted to
-// whole seconds (rounded up, minimum 1); otherwise a conservative default is
-// used. Non auth-selection errors return nil so unrelated responses are
-// untouched.
-func retryAfterHeaderForAuthError(err error) http.Header {
+// authUnavailableRetryAfter reports the Retry-After hint (in seconds) that should
+// accompany an auth_unavailable / auth_not_found style 503 response. This is a
+// server-generated back-pressure hint, independent of upstream passthrough
+// headers. It returns the hint and true only for auth-selection 503 errors;
+// unrelated errors return "" and false so their responses stay untouched.
+func authUnavailableRetryAfter(err error) (string, bool) {
 	if err == nil {
-		return nil
+		return "", false
 	}
 	var authErr *coreauth.Error
 	if !errors.As(err, &authErr) || authErr == nil {
-		return nil
+		return "", false
 	}
 	code := strings.TrimSpace(authErr.Code)
 	if code != "auth_not_found" && code != "auth_unavailable" {
-		return nil
+		return "", false
 	}
-
-	seconds := defaultAuthUnavailableRetryAfterSeconds
-	type retryAfterProvider interface {
-		RetryAfter() *time.Duration
-	}
-	var rap retryAfterProvider
-	if errors.As(err, &rap) && rap != nil {
-		if d := rap.RetryAfter(); d != nil && *d > 0 {
-			// Round up to the next whole second, minimum 1.
-			s := int((*d + time.Second - 1) / time.Second)
-			if s < 1 {
-				s = 1
-			}
-			seconds = s
-		}
-	}
-
-	h := make(http.Header, 1)
-	h.Set("Retry-After", strconv.Itoa(seconds))
-	return h
-}
-
-// mergeRetryAfterAddon augments the given addon header set with a Retry-After
-// hint derived from err (if err is an auth-selection 503). Existing addon
-// headers are preserved; Retry-After is only added when not already present.
-func mergeRetryAfterAddon(addon http.Header, err error) http.Header {
-	retryHdr := retryAfterHeaderForAuthError(err)
-	if retryHdr == nil {
-		return addon
-	}
-	if addon == nil {
-		addon = make(http.Header, 1)
-	}
-	if addon.Get("Retry-After") == "" {
-		addon.Set("Retry-After", retryHdr.Get("Retry-After"))
-	}
-	return addon
+	return strconv.Itoa(defaultAuthUnavailableRetryAfterSeconds), true
 }
 
 // WriteErrorResponse writes an error message to the response writer using the HTTP status embedded in the message.
@@ -1125,22 +1085,19 @@ func (h *BaseAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.Erro
 	if msg != nil && msg.StatusCode > 0 {
 		status = msg.StatusCode
 	}
-	if msg != nil && msg.Addon != nil {
-		// Retry-After is a server-generated back-pressure hint (e.g. for 503
-		// auth_unavailable when the pool is exhausted), not an upstream
-		// passthrough header. Always emit it so clients back off correctly even
-		// when passthrough-headers is disabled.
-		if retryAfter := strings.TrimSpace(msg.Addon.Get("Retry-After")); retryAfter != "" {
+	if msg != nil {
+		// Retry-After for auth-selection 503s is a server-generated back-pressure
+		// hint (the pool is exhausted), not an upstream passthrough header. Emit it
+		// directly from the error code so clients back off correctly even when
+		// passthrough-headers is disabled. This is independent of msg.Addon, so it
+		// never relaxes the passthrough gate that governs Addon headers below.
+		if retryAfter, ok := authUnavailableRetryAfter(msg.Error); ok {
 			c.Writer.Header().Set("Retry-After", retryAfter)
 		}
 	}
 	if msg != nil && msg.Addon != nil && PassthroughHeadersEnabled(h.Cfg) {
 		for key, values := range msg.Addon {
 			if len(values) == 0 {
-				continue
-			}
-			if http.CanonicalHeaderKey(key) == "Retry-After" {
-				// Already emitted above, unconditionally.
 				continue
 			}
 			c.Writer.Header().Del(key)

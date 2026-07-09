@@ -78,6 +78,52 @@ func TestWriteErrorResponse_AddonHeadersDisabledByDefault(t *testing.T) {
 	}
 }
 
+func TestWriteErrorResponse_AuthUnavailableRetryAfterEmittedWhenPassthroughDisabled(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	for _, code := range []string{"auth_unavailable", "auth_not_found"} {
+		t.Run(code, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodGet, "/", nil)
+
+			// Passthrough is disabled (nil config) and no Addon headers are set:
+			// the Retry-After hint must still be emitted because it is derived from
+			// the auth-selection error code, not from a passthrough header.
+			handler := NewBaseAPIHandlers(nil, nil)
+			handler.WriteErrorResponse(c, &interfaces.ErrorMessage{
+				StatusCode: http.StatusServiceUnavailable,
+				Error:      &coreauth.Error{Code: code, Message: "no auth available"},
+			})
+
+			if recorder.Code != http.StatusServiceUnavailable {
+				t.Fatalf("status = %d, want %d", recorder.Code, http.StatusServiceUnavailable)
+			}
+			if got := recorder.Header().Get("Retry-After"); got != "30" {
+				t.Fatalf("Retry-After = %q, want %q", got, "30")
+			}
+		})
+	}
+}
+
+func TestWriteErrorResponse_NonAuthErrorNoRetryAfter(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/", nil)
+
+	// A non auth-selection error must not receive a synthesized Retry-After.
+	handler := NewBaseAPIHandlers(nil, nil)
+	handler.WriteErrorResponse(c, &interfaces.ErrorMessage{
+		StatusCode: http.StatusServiceUnavailable,
+		Error:      &coreauth.Error{Code: "upstream_error", Message: "boom"},
+	})
+
+	if got := recorder.Header().Get("Retry-After"); got != "" {
+		t.Fatalf("Retry-After should be empty for non auth-selection errors, got %q", got)
+	}
+}
+
 func TestWriteErrorResponse_AddonHeadersEnabled(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()
