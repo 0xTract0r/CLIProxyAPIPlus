@@ -28,6 +28,15 @@ type usageExportPayload struct {
 	Version    int                      `json:"version"`
 	ExportedAt time.Time                `json:"exported_at"`
 	Usage      usage.StatisticsSnapshot `json:"usage"`
+	// HasMore indicates the export was windowed (since/limit) and truncated
+	// per-model request details remain beyond NextSince. Absent/false for a
+	// full, unwindowed export (backward compatible default).
+	HasMore bool `json:"has_more,omitempty"`
+	// NextSince is the cursor callers should pass as `since` on the next
+	// export call to continue pulling remaining details in stable order.
+	// RFC3339Nano precision to avoid losing sub-second records at the
+	// window boundary. Empty when HasMore is false.
+	NextSince string `json:"next_since,omitempty"`
 }
 
 type usageImportPayload struct {
@@ -99,17 +108,75 @@ func parseUsageSnapshotOptions(c *gin.Context) (usage.SnapshotOptions, error) {
 	return options, nil
 }
 
-// ExportUsageStatistics returns a complete usage snapshot for backup/migration.
+// ExportUsageStatistics returns a usage snapshot for backup/migration or
+// incremental sync. Without query parameters it returns the full snapshot
+// (backward compatible). With `since` and/or `limit`, it returns a windowed
+// page of request details plus `has_more`/`next_since` pagination cursors so
+// callers (e.g. cpamp) can pull large histories in stable, gap-free batches.
 func (h *Handler) ExportUsageStatistics(c *gin.Context) {
-	var snapshot usage.StatisticsSnapshot
-	if h != nil && h.usageStats != nil {
-		snapshot = h.usageStats.Snapshot()
+	options, err := parseUsageExportOptions(c)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
 	}
-	c.JSON(http.StatusOK, usageExportPayload{
+
+	var page usage.SnapshotPage
+	if h != nil && h.usageStats != nil {
+		page = h.usageStats.SnapshotPageWithOptions(options)
+	}
+
+	payload := usageExportPayload{
 		Version:    2,
 		ExportedAt: time.Now().UTC(),
-		Usage:      snapshot,
-	})
+		Usage:      page.Snapshot,
+		HasMore:    page.HasMore,
+	}
+	if page.HasMore && !page.NextSince.IsZero() {
+		payload.NextSince = page.NextSince.UTC().Format(time.RFC3339Nano)
+	}
+	c.JSON(http.StatusOK, payload)
+}
+
+// parseUsageExportOptions parses the `since` and `limit` query parameters for
+// /usage/export. `since` accepts RFC3339 (e.g. 2026-01-01T00:00:00Z) or a
+// Unix timestamp in milliseconds. `limit` is the maximum number of request
+// details to return per model (0 or absent means unlimited, i.e. full
+// export). Unlike parseUsageSnapshotOptions (used by the live statistics
+// endpoint), no upper bound is imposed on `limit` here: export callers
+// explicitly control batch size for their own sync cadence.
+func parseUsageExportOptions(c *gin.Context) (usage.SnapshotOptions, error) {
+	options := usage.SnapshotOptions{}
+	if c == nil {
+		return options, nil
+	}
+	if raw := strings.TrimSpace(c.Query("since")); raw != "" {
+		since, err := parseUsageExportSince(raw)
+		if err != nil {
+			return options, err
+		}
+		options.Since = since
+	}
+	if raw := strings.TrimSpace(c.Query("limit")); raw != "" {
+		limit, err := strconv.Atoi(raw)
+		if err != nil || limit < 0 {
+			return options, fmt.Errorf("limit must be a non-negative integer")
+		}
+		options.DetailLimit = limit
+	}
+	return options, nil
+}
+
+// parseUsageExportSince parses `since` as RFC3339 first, then falls back to a
+// Unix millisecond timestamp.
+func parseUsageExportSince(raw string) (time.Time, error) {
+	if since, err := time.Parse(time.RFC3339, raw); err == nil {
+		return since, nil
+	}
+	millis, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("since must be RFC3339 or a unix millisecond timestamp")
+	}
+	return time.UnixMilli(millis).UTC(), nil
 }
 
 // ImportUsageStatistics merges a previously exported usage snapshot into memory.

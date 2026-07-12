@@ -6,12 +6,14 @@ package usage
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	internallogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 )
 
@@ -111,10 +113,14 @@ type modelStats struct {
 
 // RequestDetail stores the timestamp, latency, and token usage for a single request.
 type RequestDetail struct {
-	Timestamp     time.Time  `json:"timestamp"`
-	LatencyMs     int64      `json:"latency_ms"`
-	Source        string     `json:"source"`
-	AuthIndex     string     `json:"auth_index"`
+	Timestamp time.Time `json:"timestamp"`
+	LatencyMs int64     `json:"latency_ms"`
+	Source    string    `json:"source"`
+	AuthIndex string    `json:"auth_index"`
+	// RequestID is the per-request correlation id (see internal/logging.GetRequestID).
+	// It may be empty when the producing context did not carry a request id
+	// (e.g. synthetic/imported records); omitempty preserves compatibility.
+	RequestID     string     `json:"request_id,omitempty"`
 	Tokens        TokenStats `json:"tokens"`
 	Failed        bool       `json:"failed"`
 	CostUSD       float64    `json:"cost_usd,omitempty"`
@@ -187,6 +193,22 @@ type SnapshotOptions struct {
 	DetailLimit    int
 }
 
+// SnapshotPage wraps a StatisticsSnapshot together with pagination cursors for
+// callers windowing exports by DetailLimit/Since (e.g. incremental sync clients).
+type SnapshotPage struct {
+	Snapshot StatisticsSnapshot
+	// HasMore is true when at least one model's request-detail list was
+	// truncated by DetailLimit, meaning older windowed calls with NextSince
+	// as Since would surface additional details.
+	HasMore bool
+	// NextSince is the cursor to pass as Since on the following call to
+	// continue pulling remaining details in stable, gap-free chronological
+	// order. It is the earliest "last included" detail timestamp across all
+	// truncated model detail lists, formatted with nanosecond precision so
+	// sub-second bursts are not truncated at the boundary.
+	NextSince time.Time
+}
+
 var defaultRequestStatistics = NewRequestStatistics()
 
 // GetRequestStatistics returns the shared statistics store.
@@ -250,6 +272,7 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 		LatencyMs: normaliseLatency(record.Latency),
 		Source:    record.Source,
 		AuthIndex: record.AuthIndex,
+		RequestID: strings.TrimSpace(internallogging.GetRequestID(ctx)),
 		Tokens:    detail,
 		Failed:    failed,
 		CostUSD:   microsToUSD(pricing.CostMicros),
@@ -320,9 +343,21 @@ func (s *RequestStatistics) Snapshot() StatisticsSnapshot {
 // SnapshotWithOptions returns a copy of aggregated metrics and can omit or
 // window per-request details for latency-sensitive management UI reads.
 func (s *RequestStatistics) SnapshotWithOptions(options SnapshotOptions) StatisticsSnapshot {
+	page := s.SnapshotPageWithOptions(options)
+	return page.Snapshot
+}
+
+// SnapshotPageWithOptions returns a copy of aggregated metrics along with
+// pagination cursors (HasMore/NextSince) describing whether any per-model
+// request-detail list was truncated by DetailLimit. Callers that need to
+// pull all details across multiple windowed calls (e.g. incremental sync)
+// should keep calling this with Since=previous NextSince until HasMore is
+// false.
+func (s *RequestStatistics) SnapshotPageWithOptions(options SnapshotOptions) SnapshotPage {
 	result := StatisticsSnapshot{}
+	page := SnapshotPage{Snapshot: result}
 	if s == nil {
-		return result
+		return page
 	}
 
 	s.mu.RLock()
@@ -340,6 +375,9 @@ func (s *RequestStatistics) SnapshotWithOptions(options SnapshotOptions) Statist
 		pricingStateForCounts(result.TotalRequests, result.UnpricedRequestCount, result.UnfinalizedRequestCount),
 	)
 
+	var hasMore bool
+	var nextSince time.Time
+
 	result.APIs = make(map[string]APISnapshot, len(s.apis))
 	for apiName, stats := range s.apis {
 		apiSnapshot := APISnapshot{
@@ -353,7 +391,13 @@ func (s *RequestStatistics) SnapshotWithOptions(options SnapshotOptions) Statist
 			Models:                  make(map[string]ModelSnapshot, len(stats.Models)),
 		}
 		for modelName, modelStatsValue := range stats.Models {
-			requestDetails := snapshotRequestDetails(modelStatsValue.Details, options)
+			requestDetails, truncated, lastIncluded := snapshotRequestDetails(modelStatsValue.Details, options)
+			if truncated {
+				hasMore = true
+				if nextSince.IsZero() || lastIncluded.Before(nextSince) {
+					nextSince = lastIncluded
+				}
+			}
 			apiSnapshot.Models[modelName] = ModelSnapshot{
 				TotalRequests:           modelStatsValue.TotalRequests,
 				TotalTokens:             modelStatsValue.TotalTokens,
@@ -407,28 +451,64 @@ func (s *RequestStatistics) SnapshotWithOptions(options SnapshotOptions) Statist
 		result.CostByHour[key] = microsToUSD(v)
 	}
 
-	return result
+	page.Snapshot = result
+	page.HasMore = hasMore
+	page.NextSince = nextSince
+	return page
 }
 
-func snapshotRequestDetails(details []RequestDetail, options SnapshotOptions) []RequestDetail {
+// snapshotRequestDetails filters/windows a model's request details for a
+// snapshot read. Details are not guaranteed to be stored in timestamp order
+// (concurrent writers, imports/merges), so this sorts by Timestamp ascending
+// (stable, ties broken by original insertion order) before applying the
+// Since cutoff (strictly greater-than, so a boundary record already synced
+// by a caller is not re-included) and DetailLimit (keep the earliest
+// `DetailLimit` records after the cutoff, i.e. "the next page after Since").
+//
+// Returns the windowed details, whether the result was truncated by
+// DetailLimit (more records remain beyond what was returned), and the
+// timestamp of the last included record (meaningful only when truncated;
+// used by callers as the next Since cursor).
+func snapshotRequestDetails(details []RequestDetail, options SnapshotOptions) ([]RequestDetail, bool, time.Time) {
 	if options.ExcludeDetails {
-		return []RequestDetail{}
+		return []RequestDetail{}, false, time.Time{}
 	}
-	filtered := details
+
+	// Copy before sorting: modelStatsValue.Details is the live backing slice
+	// guarded by s.mu, and callers must not observe or retain a sorted
+	// mutation of it.
+	ordered := make([]RequestDetail, len(details))
+	copy(ordered, details)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		return ordered[i].Timestamp.Before(ordered[j].Timestamp)
+	})
+
+	filtered := ordered
 	if !options.Since.IsZero() {
-		filtered = make([]RequestDetail, 0, len(details))
-		for _, detail := range details {
-			if !detail.Timestamp.Before(options.Since) {
+		filtered = make([]RequestDetail, 0, len(ordered))
+		for _, detail := range ordered {
+			// Strictly after Since: a record exactly at the previous page's
+			// NextSince cursor was already the last item returned there, so
+			// re-including it here would duplicate it across pages.
+			if detail.Timestamp.After(options.Since) {
 				filtered = append(filtered, detail)
 			}
 		}
 	}
+
+	truncated := false
+	var lastIncluded time.Time
 	if options.DetailLimit > 0 && len(filtered) > options.DetailLimit {
-		filtered = filtered[len(filtered)-options.DetailLimit:]
+		// Keep the earliest DetailLimit records after the cutoff: this is
+		// "the next page starting at Since", not the most recent records.
+		filtered = filtered[:options.DetailLimit]
+		truncated = true
+		lastIncluded = filtered[len(filtered)-1].Timestamp
 	}
+
 	requestDetails := make([]RequestDetail, len(filtered))
 	copy(requestDetails, filtered)
-	return requestDetails
+	return requestDetails, truncated, lastIncluded
 }
 
 type MergeResult struct {

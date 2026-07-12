@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	internallogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 )
 
@@ -246,6 +247,137 @@ func TestRequestStatisticsPersistenceRoundTrip(t *testing.T) {
 	}
 	if details[0].LatencyMs != 750 {
 		t.Fatalf("latency_ms = %d, want 750", details[0].LatencyMs)
+	}
+}
+
+func TestRequestStatisticsRecordCapturesRequestID(t *testing.T) {
+	stats := NewRequestStatistics()
+	ctx := internallogging.WithRequestID(context.Background(), "req-abc123")
+	stats.Record(ctx, coreusage.Record{
+		APIKey: "test-key",
+		Model:  "gpt-5.4",
+		Detail: coreusage.Detail{
+			InputTokens:  10,
+			OutputTokens: 20,
+			TotalTokens:  30,
+		},
+	})
+
+	snapshot := stats.Snapshot()
+	details := snapshot.APIs["test-key"].Models["gpt-5.4"].Details
+	if len(details) != 1 {
+		t.Fatalf("details len = %d, want 1", len(details))
+	}
+	if details[0].RequestID != "req-abc123" {
+		t.Fatalf("RequestID = %q, want %q", details[0].RequestID, "req-abc123")
+	}
+}
+
+func TestRequestStatisticsRecordRequestIDEmptyWithoutContext(t *testing.T) {
+	stats := NewRequestStatistics()
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey: "test-key",
+		Model:  "gpt-5.4",
+		Detail: coreusage.Detail{
+			InputTokens:  10,
+			OutputTokens: 20,
+			TotalTokens:  30,
+		},
+	})
+
+	snapshot := stats.Snapshot()
+	details := snapshot.APIs["test-key"].Models["gpt-5.4"].Details
+	if len(details) != 1 {
+		t.Fatalf("details len = %d, want 1", len(details))
+	}
+	if details[0].RequestID != "" {
+		t.Fatalf("RequestID = %q, want empty", details[0].RequestID)
+	}
+}
+
+func TestSnapshotPageWithOptionsOrdersFiltersAndPaginatesOutOfOrderDetails(t *testing.T) {
+	stats := NewRequestStatistics()
+	base := time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC)
+	// Record out of chronological order to exercise the stable sort path.
+	timestamps := []time.Time{
+		base.Add(3 * time.Minute),
+		base.Add(1 * time.Minute),
+		base.Add(4 * time.Minute),
+		base.Add(2 * time.Minute),
+		base.Add(5 * time.Minute),
+	}
+	for _, ts := range timestamps {
+		stats.Record(context.Background(), coreusage.Record{
+			APIKey:      "test-key",
+			Model:       "gpt-5.4",
+			RequestedAt: ts,
+			Detail: coreusage.Detail{
+				InputTokens:  1,
+				OutputTokens: 1,
+				TotalTokens:  2,
+			},
+		})
+	}
+
+	// First page: since=base (exclusive), limit=2 -> earliest two after base: +1m, +2m.
+	page := stats.SnapshotPageWithOptions(SnapshotOptions{Since: base, DetailLimit: 2})
+	details := page.Snapshot.APIs["test-key"].Models["gpt-5.4"].Details
+	if len(details) != 2 {
+		t.Fatalf("page1 details len = %d, want 2", len(details))
+	}
+	if !details[0].Timestamp.Equal(base.Add(time.Minute)) || !details[1].Timestamp.Equal(base.Add(2*time.Minute)) {
+		t.Fatalf("page1 details out of order: %+v", details)
+	}
+	if !page.HasMore {
+		t.Fatalf("page1 HasMore = false, want true")
+	}
+	wantNextSince := base.Add(2 * time.Minute)
+	if !page.NextSince.Equal(wantNextSince) {
+		t.Fatalf("page1 NextSince = %s, want %s", page.NextSince, wantNextSince)
+	}
+
+	// Second page resumes from NextSince (exclusive) with the same limit.
+	page2 := stats.SnapshotPageWithOptions(SnapshotOptions{Since: page.NextSince, DetailLimit: 2})
+	details2 := page2.Snapshot.APIs["test-key"].Models["gpt-5.4"].Details
+	if len(details2) != 2 {
+		t.Fatalf("page2 details len = %d, want 2", len(details2))
+	}
+	if !details2[0].Timestamp.Equal(base.Add(3*time.Minute)) || !details2[1].Timestamp.Equal(base.Add(4*time.Minute)) {
+		t.Fatalf("page2 details out of order: %+v", details2)
+	}
+	if !page2.HasMore {
+		t.Fatalf("page2 HasMore = false, want true")
+	}
+
+	// Third page drains the remainder and reports HasMore=false.
+	page3 := stats.SnapshotPageWithOptions(SnapshotOptions{Since: page2.NextSince, DetailLimit: 2})
+	details3 := page3.Snapshot.APIs["test-key"].Models["gpt-5.4"].Details
+	if len(details3) != 1 {
+		t.Fatalf("page3 details len = %d, want 1", len(details3))
+	}
+	if !details3[0].Timestamp.Equal(base.Add(5 * time.Minute)) {
+		t.Fatalf("page3 detail timestamp = %s, want %s", details3[0].Timestamp, base.Add(5*time.Minute))
+	}
+	if page3.HasMore {
+		t.Fatalf("page3 HasMore = true, want false")
+	}
+	if !page3.NextSince.IsZero() {
+		t.Fatalf("page3 NextSince = %s, want zero", page3.NextSince)
+	}
+
+	// No params: full snapshot in ascending order, no pagination.
+	full := stats.SnapshotPageWithOptions(SnapshotOptions{})
+	fullDetails := full.Snapshot.APIs["test-key"].Models["gpt-5.4"].Details
+	if len(fullDetails) != len(timestamps) {
+		t.Fatalf("full details len = %d, want %d", len(fullDetails), len(timestamps))
+	}
+	for i := 1; i < len(fullDetails); i++ {
+		if fullDetails[i].Timestamp.Before(fullDetails[i-1].Timestamp) {
+			t.Fatalf("full details not sorted ascending at index %d: %+v", i, fullDetails)
+		}
+	}
+	if full.HasMore {
+		t.Fatalf("full HasMore = true, want false")
 	}
 }
 
