@@ -6,12 +6,14 @@ package usage
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	internallogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 )
 
@@ -111,10 +113,14 @@ type modelStats struct {
 
 // RequestDetail stores the timestamp, latency, and token usage for a single request.
 type RequestDetail struct {
-	Timestamp     time.Time  `json:"timestamp"`
-	LatencyMs     int64      `json:"latency_ms"`
-	Source        string     `json:"source"`
-	AuthIndex     string     `json:"auth_index"`
+	Timestamp time.Time `json:"timestamp"`
+	LatencyMs int64     `json:"latency_ms"`
+	Source    string    `json:"source"`
+	AuthIndex string    `json:"auth_index"`
+	// RequestID is the per-request correlation id (see internal/logging.GetRequestID).
+	// It may be empty when the producing context did not carry a request id
+	// (e.g. synthetic/imported records); omitempty preserves compatibility.
+	RequestID     string     `json:"request_id,omitempty"`
 	Tokens        TokenStats `json:"tokens"`
 	Failed        bool       `json:"failed"`
 	CostUSD       float64    `json:"cost_usd,omitempty"`
@@ -184,7 +190,27 @@ type ModelSnapshot struct {
 type SnapshotOptions struct {
 	ExcludeDetails bool
 	Since          time.Time
-	DetailLimit    int
+	// DetailLimit, when > 0, caps the total number of request details
+	// returned across every api/model bucket combined (a global cap, not a
+	// per-bucket cap). See SnapshotPageWithOptions for the exact boundary
+	// semantics used when applying this cap.
+	DetailLimit int
+}
+
+// SnapshotPage wraps a StatisticsSnapshot together with pagination cursors for
+// callers windowing exports by DetailLimit/Since (e.g. incremental sync clients).
+type SnapshotPage struct {
+	Snapshot StatisticsSnapshot
+	// HasMore is true when at least one model's request-detail list was
+	// truncated by DetailLimit, meaning older windowed calls with NextSince
+	// as Since would surface additional details.
+	HasMore bool
+	// NextSince is the cursor to pass as Since on the following call to
+	// continue pulling remaining details in stable, gap-free chronological
+	// order. It is the earliest "last included" detail timestamp across all
+	// truncated model detail lists, formatted with nanosecond precision so
+	// sub-second bursts are not truncated at the boundary.
+	NextSince time.Time
 }
 
 var defaultRequestStatistics = NewRequestStatistics()
@@ -250,6 +276,7 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 		LatencyMs: normaliseLatency(record.Latency),
 		Source:    record.Source,
 		AuthIndex: record.AuthIndex,
+		RequestID: strings.TrimSpace(internallogging.GetRequestID(ctx)),
 		Tokens:    detail,
 		Failed:    failed,
 		CostUSD:   microsToUSD(pricing.CostMicros),
@@ -318,7 +345,21 @@ func (s *RequestStatistics) Snapshot() StatisticsSnapshot {
 }
 
 // SnapshotWithOptions returns a copy of aggregated metrics and can omit or
-// window per-request details for latency-sensitive management UI reads.
+// window per-request details for latency-sensitive management UI reads
+// (the live /usage endpoint).
+//
+// DetailLimit here uses *tail* semantics: within each api/model bucket's
+// Since-filtered window, the most recent DetailLimit records are kept
+// (baseline behaviour restored). This is deliberately different from the
+// export cursor path (SnapshotPageWithOptions), which keeps the *earliest*
+// DetailLimit records and returns HasMore/NextSince cursors for gap-free
+// forward pagination. The live UI wants the latest events; the export sync
+// wants a stable oldest-first cursor. Mixing the two silently dropped the
+// most recent events from /usage (see the direction-locking tests).
+//
+// Since here is *inclusive* (>= Since): the live UI passes an absolute
+// window start, not an exclusive pagination cursor, so a record exactly at
+// the boundary must not be dropped.
 func (s *RequestStatistics) SnapshotWithOptions(options SnapshotOptions) StatisticsSnapshot {
 	result := StatisticsSnapshot{}
 	if s == nil {
@@ -328,17 +369,7 @@ func (s *RequestStatistics) SnapshotWithOptions(options SnapshotOptions) Statist
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	result.TotalRequests = s.totalRequests
-	result.SuccessCount = s.successCount
-	result.FailureCount = s.failureCount
-	result.TotalTokens = s.totalTokens
-	result.TotalBillableTokens = s.totalBillableTokens
-	result.TotalCostUSD = microsToUSD(s.totalCostMicros)
-	result.UnpricedRequestCount = s.unpricedRequests
-	result.UnfinalizedRequestCount = s.unfinalizedRequests
-	result.PricingStatus = pricingStatusString(
-		pricingStateForCounts(result.TotalRequests, result.UnpricedRequestCount, result.UnfinalizedRequestCount),
-	)
+	s.fillAggregateSnapshot(&result)
 
 	result.APIs = make(map[string]APISnapshot, len(s.apis))
 	for apiName, stats := range s.apis {
@@ -353,7 +384,6 @@ func (s *RequestStatistics) SnapshotWithOptions(options SnapshotOptions) Statist
 			Models:                  make(map[string]ModelSnapshot, len(stats.Models)),
 		}
 		for modelName, modelStatsValue := range stats.Models {
-			requestDetails := snapshotRequestDetails(modelStatsValue.Details, options)
 			apiSnapshot.Models[modelName] = ModelSnapshot{
 				TotalRequests:           modelStatsValue.TotalRequests,
 				TotalTokens:             modelStatsValue.TotalTokens,
@@ -362,7 +392,7 @@ func (s *RequestStatistics) SnapshotWithOptions(options SnapshotOptions) Statist
 				PricingStatus:           pricingStatusString(modelStatsValue.PricingState),
 				UnpricedRequestCount:    modelStatsValue.UnpricedRequests,
 				UnfinalizedRequestCount: modelStatsValue.UnfinalizedRequests,
-				Details:                 requestDetails,
+				Details:                 liveRequestDetails(modelStatsValue.Details, options),
 			}
 			switch modelStatsValue.PricingState {
 			case pricingStateUnpriced:
@@ -374,6 +404,176 @@ func (s *RequestStatistics) SnapshotWithOptions(options SnapshotOptions) Statist
 		result.APIs[apiName] = apiSnapshot
 	}
 
+	s.fillTimeSeriesSnapshot(&result)
+	return result
+}
+
+// liveRequestDetails windows a single bucket's details for the live /usage
+// path: Since is inclusive (>= Since), and DetailLimit keeps the most recent
+// (tail) DetailLimit records. This restores the pre-pagination baseline
+// behaviour and is intentionally kept separate from the export cursor path,
+// which keeps the earliest records instead (see SnapshotPageWithOptions).
+func liveRequestDetails(details []RequestDetail, options SnapshotOptions) []RequestDetail {
+	if options.ExcludeDetails {
+		return []RequestDetail{}
+	}
+	// Copy before sorting: details is the live backing slice guarded by s.mu,
+	// and callers must not observe or retain a sorted mutation of it.
+	ordered := make([]RequestDetail, len(details))
+	copy(ordered, details)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		return ordered[i].Timestamp.Before(ordered[j].Timestamp)
+	})
+
+	filtered := ordered
+	if !options.Since.IsZero() {
+		filtered = make([]RequestDetail, 0, len(ordered))
+		for _, detail := range ordered {
+			// Inclusive boundary: keep records at or after Since.
+			if !detail.Timestamp.Before(options.Since) {
+				filtered = append(filtered, detail)
+			}
+		}
+	}
+	if options.DetailLimit > 0 && len(filtered) > options.DetailLimit {
+		// Tail: keep the most recent DetailLimit records.
+		filtered = filtered[len(filtered)-options.DetailLimit:]
+	}
+	requestDetails := make([]RequestDetail, len(filtered))
+	copy(requestDetails, filtered)
+	return requestDetails
+}
+
+// SnapshotPageWithOptions returns a copy of aggregated metrics along with
+// pagination cursors (HasMore/NextSince) describing whether the combined
+// request-detail list (across every api/model bucket) was truncated by
+// DetailLimit. Callers that need to pull all details across multiple
+// windowed calls (e.g. incremental sync) should keep calling this with
+// Since=previous NextSince until HasMore is false.
+//
+// DetailLimit is a *global* cap on the total number of request details
+// returned across all api/model buckets combined, not a per-bucket cap.
+// This matters because export payloads are consumed as one flat page: a
+// per-bucket limit lets each (api, model) pair independently return up to
+// DetailLimit records, so a snapshot with many buckets can return an
+// unbounded multiple of DetailLimit records in a single response (observed
+// in production: 124k+ details in a single limit=5000 export page).
+//
+// To honour the global cap, this walks every bucket's filtered/sorted
+// details twice: once to determine the single global cutoff timestamp that
+// keeps the page at (or, for a tied boundary, only slightly above) size
+// DetailLimit, and once to build the actual per-bucket, cutoff-bounded
+// result. See detailPageCutoff for the exact boundary semantics.
+func (s *RequestStatistics) SnapshotPageWithOptions(options SnapshotOptions) SnapshotPage {
+	result := StatisticsSnapshot{}
+	page := SnapshotPage{Snapshot: result}
+	if s == nil {
+		return page
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	s.fillAggregateSnapshot(&result)
+
+	// Pass 1: sort+filter (Since only, no limit) every bucket once and reuse
+	// the ordered slices in pass 2, so buckets are only sorted a single time
+	// regardless of how many passes are needed to compute the global cutoff.
+	buckets := make([]usageDetailBucket, 0, len(s.apis))
+	totalFiltered := 0
+	for apiName, stats := range s.apis {
+		for modelName, modelStatsValue := range stats.Models {
+			if options.ExcludeDetails {
+				buckets = append(buckets, usageDetailBucket{apiName: apiName, modelName: modelName})
+				continue
+			}
+			ordered := filterAndSortRequestDetails(modelStatsValue.Details, options.Since)
+			buckets = append(buckets, usageDetailBucket{apiName: apiName, modelName: modelName, ordered: ordered})
+			totalFiltered += len(ordered)
+		}
+	}
+
+	// Pass 2: compute the single global cutoff (if any) across all buckets
+	// combined, then apply it uniformly so the returned page never exceeds
+	// (or only ties-exceeds, see detailPageCutoff) DetailLimit in total.
+	hasMore, nextSince, cutoff, cutoffSet := detailPageCutoff(buckets, totalFiltered, options.DetailLimit)
+
+	result.APIs = make(map[string]APISnapshot, len(s.apis))
+	apiSnapshots := make(map[string]APISnapshot, len(s.apis))
+	for _, bucket := range buckets {
+		apiSnapshot, ok := apiSnapshots[bucket.apiName]
+		if !ok {
+			stats := s.apis[bucket.apiName]
+			apiSnapshot = APISnapshot{
+				TotalRequests:           stats.TotalRequests,
+				TotalTokens:             stats.TotalTokens,
+				TotalBillableTokens:     stats.TotalBillableTokens,
+				TotalCostUSD:            microsToUSD(stats.TotalCostMicros),
+				PricingStatus:           pricingStatusString(pricingStateForCounts(stats.TotalRequests, stats.UnpricedRequests, stats.UnfinalizedRequests)),
+				UnpricedRequestCount:    stats.UnpricedRequests,
+				UnfinalizedRequestCount: stats.UnfinalizedRequests,
+				Models:                  make(map[string]ModelSnapshot, len(stats.Models)),
+			}
+		}
+
+		modelStatsValue := s.apis[bucket.apiName].Models[bucket.modelName]
+		var requestDetails []RequestDetail
+		if options.ExcludeDetails {
+			requestDetails = []RequestDetail{}
+		} else if cutoffSet {
+			requestDetails = applyDetailPageCutoff(bucket.ordered, cutoff)
+		} else {
+			requestDetails = append([]RequestDetail(nil), bucket.ordered...)
+		}
+		apiSnapshot.Models[bucket.modelName] = ModelSnapshot{
+			TotalRequests:           modelStatsValue.TotalRequests,
+			TotalTokens:             modelStatsValue.TotalTokens,
+			TotalBillableTokens:     modelStatsValue.TotalBillableTokens,
+			TotalCostUSD:            microsToUSD(modelStatsValue.TotalCostMicros),
+			PricingStatus:           pricingStatusString(modelStatsValue.PricingState),
+			UnpricedRequestCount:    modelStatsValue.UnpricedRequests,
+			UnfinalizedRequestCount: modelStatsValue.UnfinalizedRequests,
+			Details:                 requestDetails,
+		}
+		switch modelStatsValue.PricingState {
+		case pricingStateUnpriced:
+			result.UnpricedModelCount++
+		case pricingStateUnfinalized:
+			result.UnfinalizedModelCount++
+		}
+		apiSnapshots[bucket.apiName] = apiSnapshot
+	}
+	for apiName, apiSnapshot := range apiSnapshots {
+		result.APIs[apiName] = apiSnapshot
+	}
+
+	s.fillTimeSeriesSnapshot(&result)
+
+	page.Snapshot = result
+	page.HasMore = hasMore
+	page.NextSince = nextSince
+	return page
+}
+
+// fillAggregateSnapshot copies the top-level aggregate counters into result.
+// Callers must hold s.mu (read lock is sufficient).
+func (s *RequestStatistics) fillAggregateSnapshot(result *StatisticsSnapshot) {
+	result.TotalRequests = s.totalRequests
+	result.SuccessCount = s.successCount
+	result.FailureCount = s.failureCount
+	result.TotalTokens = s.totalTokens
+	result.TotalBillableTokens = s.totalBillableTokens
+	result.TotalCostUSD = microsToUSD(s.totalCostMicros)
+	result.UnpricedRequestCount = s.unpricedRequests
+	result.UnfinalizedRequestCount = s.unfinalizedRequests
+	result.PricingStatus = pricingStatusString(
+		pricingStateForCounts(result.TotalRequests, result.UnpricedRequestCount, result.UnfinalizedRequestCount),
+	)
+}
+
+// fillTimeSeriesSnapshot copies the by-day/by-hour time series into result.
+// Callers must hold s.mu (read lock is sufficient).
+func (s *RequestStatistics) fillTimeSeriesSnapshot(result *StatisticsSnapshot) {
 	result.RequestsByDay = make(map[string]int64, len(s.requestsByDay))
 	for k, v := range s.requestsByDay {
 		result.RequestsByDay[k] = v
@@ -406,28 +606,135 @@ func (s *RequestStatistics) SnapshotWithOptions(options SnapshotOptions) Statist
 		key := formatHour(hour)
 		result.CostByHour[key] = microsToUSD(v)
 	}
-
-	return result
 }
 
-func snapshotRequestDetails(details []RequestDetail, options SnapshotOptions) []RequestDetail {
-	if options.ExcludeDetails {
-		return []RequestDetail{}
+// filterAndSortRequestDetails sorts a model's request details by Timestamp
+// ascending (stable, ties broken by original insertion order) and applies
+// the Since cutoff (strictly greater-than, so a boundary record already
+// synced by a caller is not re-included). DetailLimit is intentionally not
+// applied here: it must be applied globally, across every bucket combined,
+// by detailPageCutoff/applyDetailPageCutoff (see SnapshotPageWithOptions).
+func filterAndSortRequestDetails(details []RequestDetail, since time.Time) []RequestDetail {
+	// Copy before sorting: modelStatsValue.Details is the live backing slice
+	// guarded by s.mu, and callers must not observe or retain a sorted
+	// mutation of it.
+	ordered := make([]RequestDetail, len(details))
+	copy(ordered, details)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		return ordered[i].Timestamp.Before(ordered[j].Timestamp)
+	})
+
+	if since.IsZero() {
+		return ordered
 	}
-	filtered := details
-	if !options.Since.IsZero() {
-		filtered = make([]RequestDetail, 0, len(details))
-		for _, detail := range details {
-			if !detail.Timestamp.Before(options.Since) {
-				filtered = append(filtered, detail)
-			}
+
+	filtered := make([]RequestDetail, 0, len(ordered))
+	for _, detail := range ordered {
+		// Strictly after Since: a record exactly at the previous page's
+		// NextSince cursor was already the last item returned there, so
+		// re-including it here would duplicate it across pages.
+		if detail.Timestamp.After(since) {
+			filtered = append(filtered, detail)
 		}
 	}
-	if options.DetailLimit > 0 && len(filtered) > options.DetailLimit {
-		filtered = filtered[len(filtered)-options.DetailLimit:]
+	return filtered
+}
+
+// usageDetailBucket is a single api/model bucket's Since-filtered,
+// timestamp-sorted request details, used to compute a global DetailLimit
+// cutoff across all buckets combined (see detailPageCutoff).
+type usageDetailBucket struct {
+	apiName   string
+	modelName string
+	ordered   []RequestDetail
+}
+
+// detailPageCutoff computes the single global cutoff timestamp that bounds
+// the *combined* (across every bucket) request-detail page at DetailLimit
+// records, given totalFiltered pre-computed details across all buckets.
+//
+// Boundary semantics: same-timestamp records are never split across pages.
+// If multiple records share the exact timestamp that would fall at the
+// DetailLimit boundary, all of them are kept in this page (so the returned
+// page can be slightly larger than DetailLimit when ties occur at the
+// boundary) and NextSince is set to that shared timestamp so the next call
+// (Since is strictly-greater-than) starts after all of them. This trades a
+// small, bounded overshoot for the stronger guarantee of zero dropped and
+// zero duplicated records across pages. In practice this only matters when
+// two or more requests are recorded with identical RFC3339Nano timestamps
+// (same wall-clock nanosecond), which is rare for real traffic but not
+// impossible under high concurrency; batch-imported/merged snapshots with
+// coarser timestamp precision are more likely to collide.
+//
+// Returns hasMore, nextSince, the cutoff timestamp, and whether a cutoff
+// was applied at all (false for DetailLimit<=0 or totalFiltered<=DetailLimit,
+// meaning every filtered record across all buckets fits in this page).
+func detailPageCutoff(buckets []usageDetailBucket, totalFiltered, limit int) (hasMore bool, nextSince time.Time, cutoff time.Time, cutoffSet bool) {
+	if limit <= 0 || totalFiltered <= limit {
+		return false, time.Time{}, time.Time{}, false
 	}
-	requestDetails := make([]RequestDetail, len(filtered))
-	copy(requestDetails, filtered)
+
+	// Merge every bucket's already-sorted details into one globally ordered
+	// sequence to find the record at global rank `limit-1` (0-indexed). This
+	// is a k-way merge over pre-sorted slices, so it is linear in
+	// totalFiltered rather than requiring a full re-sort of all records.
+	indices := make([]int, len(buckets))
+	remaining := limit
+	var last RequestDetail
+	for remaining > 0 {
+		bestBucket := -1
+		for bi, bucket := range buckets {
+			if indices[bi] >= len(bucket.ordered) {
+				continue
+			}
+			if bestBucket == -1 || bucket.ordered[indices[bi]].Timestamp.Before(buckets[bestBucket].ordered[indices[bestBucket]].Timestamp) {
+				bestBucket = bi
+			}
+		}
+		if bestBucket == -1 {
+			// Should not happen given totalFiltered > limit, but guards
+			// against inconsistent bookkeeping rather than panicking.
+			break
+		}
+		last = buckets[bestBucket].ordered[indices[bestBucket]]
+		indices[bestBucket]++
+		remaining--
+	}
+
+	cutoff = last.Timestamp
+	cutoffSet = true
+
+	// Determine HasMore: true if any bucket has a record strictly after the
+	// cutoff timestamp (ties at the cutoff are included in this page, so
+	// they do not count as "more").
+	for _, bucket := range buckets {
+		ordered := bucket.ordered
+		if len(ordered) == 0 {
+			continue
+		}
+		if ordered[len(ordered)-1].Timestamp.After(cutoff) {
+			hasMore = true
+			break
+		}
+	}
+	if hasMore {
+		nextSince = cutoff
+	}
+	return hasMore, nextSince, cutoff, cutoffSet
+}
+
+// applyDetailPageCutoff returns the prefix of an already Since-filtered,
+// timestamp-sorted bucket whose Timestamp is <= cutoff. See detailPageCutoff
+// for why ties at the boundary are kept rather than split.
+func applyDetailPageCutoff(ordered []RequestDetail, cutoff time.Time) []RequestDetail {
+	if len(ordered) == 0 {
+		return []RequestDetail{}
+	}
+	end := sort.Search(len(ordered), func(i int) bool {
+		return ordered[i].Timestamp.After(cutoff)
+	})
+	requestDetails := make([]RequestDetail, end)
+	copy(requestDetails, ordered[:end])
 	return requestDetails
 }
 

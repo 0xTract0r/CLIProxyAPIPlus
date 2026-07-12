@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	internallogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 )
 
@@ -75,6 +76,72 @@ func TestRequestStatisticsSnapshotWithOptionsTrimsDetailsOnly(t *testing.T) {
 	}
 	if recentOnly.TotalRequests != 2 {
 		t.Fatalf("recent aggregate total requests = %d, want full aggregate 2", recentOnly.TotalRequests)
+	}
+}
+
+// TestSnapshotWithOptionsDetailLimitKeepsNewestTail is a direction-locking
+// regression test for the live /usage path. When DetailLimit truncates an
+// over-limit window, the live snapshot must keep the *newest* DetailLimit
+// records (tail), not the oldest. A prior refactor delegated
+// SnapshotWithOptions to the export cursor path and silently returned the
+// oldest records instead, hiding the most recent events from the UI.
+func TestSnapshotWithOptionsDetailLimitKeepsNewestTail(t *testing.T) {
+	stats := NewRequestStatistics()
+	base := time.Date(2026, 3, 20, 10, 0, 0, 0, time.UTC)
+	const total = 12
+	// Record out of chronological order to prove the live path sorts before
+	// taking the tail rather than relying on insertion order.
+	order := []int{5, 0, 11, 3, 8, 1, 10, 2, 9, 4, 7, 6}
+	for _, i := range order {
+		stats.Record(context.Background(), coreusage.Record{
+			APIKey:      "test-key",
+			Model:       "gpt-5.4",
+			RequestedAt: base.Add(time.Duration(i) * time.Minute),
+			Detail:      coreusage.Detail{InputTokens: 1, OutputTokens: 1, TotalTokens: 2},
+		})
+	}
+
+	const limit = 4
+	snap := stats.SnapshotWithOptions(SnapshotOptions{DetailLimit: limit})
+	details := snap.APIs["test-key"].Models["gpt-5.4"].Details
+	if len(details) != limit {
+		t.Fatalf("live details len = %d, want %d", len(details), limit)
+	}
+	// Tail = the newest `limit` records: minutes 8,9,10,11 in ascending order.
+	for i, detail := range details {
+		want := base.Add(time.Duration(total-limit+i) * time.Minute)
+		if !detail.Timestamp.Equal(want) {
+			t.Fatalf("live detail[%d] timestamp = %s, want %s (newest tail)", i, detail.Timestamp, want)
+		}
+	}
+	// The single newest record must be present (regression: it was dropped).
+	if last := details[len(details)-1].Timestamp; !last.Equal(base.Add(time.Duration(total-1) * time.Minute)) {
+		t.Fatalf("live newest detail = %s, want %s", last, base.Add(time.Duration(total-1)*time.Minute))
+	}
+}
+
+// TestSnapshotWithOptionsSinceIsInclusive locks the live path's Since
+// semantics to baseline: a record exactly at the Since boundary is retained
+// (>= Since), unlike the export cursor path which is strictly-after.
+func TestSnapshotWithOptionsSinceIsInclusive(t *testing.T) {
+	stats := NewRequestStatistics()
+	boundary := time.Date(2026, 3, 20, 12, 0, 0, 0, time.UTC)
+	for _, ts := range []time.Time{boundary.Add(-time.Minute), boundary, boundary.Add(time.Minute)} {
+		stats.Record(context.Background(), coreusage.Record{
+			APIKey:      "test-key",
+			Model:       "gpt-5.4",
+			RequestedAt: ts,
+			Detail:      coreusage.Detail{InputTokens: 1, OutputTokens: 1, TotalTokens: 2},
+		})
+	}
+
+	snap := stats.SnapshotWithOptions(SnapshotOptions{Since: boundary})
+	details := snap.APIs["test-key"].Models["gpt-5.4"].Details
+	if len(details) != 2 {
+		t.Fatalf("inclusive-Since details len = %d, want 2 (boundary + after)", len(details))
+	}
+	if !details[0].Timestamp.Equal(boundary) {
+		t.Fatalf("first detail = %s, want boundary %s (inclusive)", details[0].Timestamp, boundary)
 	}
 }
 
@@ -246,6 +313,362 @@ func TestRequestStatisticsPersistenceRoundTrip(t *testing.T) {
 	}
 	if details[0].LatencyMs != 750 {
 		t.Fatalf("latency_ms = %d, want 750", details[0].LatencyMs)
+	}
+}
+
+func TestRequestStatisticsRecordCapturesRequestID(t *testing.T) {
+	stats := NewRequestStatistics()
+	ctx := internallogging.WithRequestID(context.Background(), "req-abc123")
+	stats.Record(ctx, coreusage.Record{
+		APIKey: "test-key",
+		Model:  "gpt-5.4",
+		Detail: coreusage.Detail{
+			InputTokens:  10,
+			OutputTokens: 20,
+			TotalTokens:  30,
+		},
+	})
+
+	snapshot := stats.Snapshot()
+	details := snapshot.APIs["test-key"].Models["gpt-5.4"].Details
+	if len(details) != 1 {
+		t.Fatalf("details len = %d, want 1", len(details))
+	}
+	if details[0].RequestID != "req-abc123" {
+		t.Fatalf("RequestID = %q, want %q", details[0].RequestID, "req-abc123")
+	}
+}
+
+func TestRequestStatisticsRecordRequestIDEmptyWithoutContext(t *testing.T) {
+	stats := NewRequestStatistics()
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey: "test-key",
+		Model:  "gpt-5.4",
+		Detail: coreusage.Detail{
+			InputTokens:  10,
+			OutputTokens: 20,
+			TotalTokens:  30,
+		},
+	})
+
+	snapshot := stats.Snapshot()
+	details := snapshot.APIs["test-key"].Models["gpt-5.4"].Details
+	if len(details) != 1 {
+		t.Fatalf("details len = %d, want 1", len(details))
+	}
+	if details[0].RequestID != "" {
+		t.Fatalf("RequestID = %q, want empty", details[0].RequestID)
+	}
+}
+
+func TestSnapshotPageWithOptionsOrdersFiltersAndPaginatesOutOfOrderDetails(t *testing.T) {
+	stats := NewRequestStatistics()
+	base := time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC)
+	// Record out of chronological order to exercise the stable sort path.
+	timestamps := []time.Time{
+		base.Add(3 * time.Minute),
+		base.Add(1 * time.Minute),
+		base.Add(4 * time.Minute),
+		base.Add(2 * time.Minute),
+		base.Add(5 * time.Minute),
+	}
+	for _, ts := range timestamps {
+		stats.Record(context.Background(), coreusage.Record{
+			APIKey:      "test-key",
+			Model:       "gpt-5.4",
+			RequestedAt: ts,
+			Detail: coreusage.Detail{
+				InputTokens:  1,
+				OutputTokens: 1,
+				TotalTokens:  2,
+			},
+		})
+	}
+
+	// First page: since=base (exclusive), limit=2 -> earliest two after base: +1m, +2m.
+	page := stats.SnapshotPageWithOptions(SnapshotOptions{Since: base, DetailLimit: 2})
+	details := page.Snapshot.APIs["test-key"].Models["gpt-5.4"].Details
+	if len(details) != 2 {
+		t.Fatalf("page1 details len = %d, want 2", len(details))
+	}
+	if !details[0].Timestamp.Equal(base.Add(time.Minute)) || !details[1].Timestamp.Equal(base.Add(2*time.Minute)) {
+		t.Fatalf("page1 details out of order: %+v", details)
+	}
+	if !page.HasMore {
+		t.Fatalf("page1 HasMore = false, want true")
+	}
+	wantNextSince := base.Add(2 * time.Minute)
+	if !page.NextSince.Equal(wantNextSince) {
+		t.Fatalf("page1 NextSince = %s, want %s", page.NextSince, wantNextSince)
+	}
+
+	// Second page resumes from NextSince (exclusive) with the same limit.
+	page2 := stats.SnapshotPageWithOptions(SnapshotOptions{Since: page.NextSince, DetailLimit: 2})
+	details2 := page2.Snapshot.APIs["test-key"].Models["gpt-5.4"].Details
+	if len(details2) != 2 {
+		t.Fatalf("page2 details len = %d, want 2", len(details2))
+	}
+	if !details2[0].Timestamp.Equal(base.Add(3*time.Minute)) || !details2[1].Timestamp.Equal(base.Add(4*time.Minute)) {
+		t.Fatalf("page2 details out of order: %+v", details2)
+	}
+	if !page2.HasMore {
+		t.Fatalf("page2 HasMore = false, want true")
+	}
+
+	// Third page drains the remainder and reports HasMore=false.
+	page3 := stats.SnapshotPageWithOptions(SnapshotOptions{Since: page2.NextSince, DetailLimit: 2})
+	details3 := page3.Snapshot.APIs["test-key"].Models["gpt-5.4"].Details
+	if len(details3) != 1 {
+		t.Fatalf("page3 details len = %d, want 1", len(details3))
+	}
+	if !details3[0].Timestamp.Equal(base.Add(5 * time.Minute)) {
+		t.Fatalf("page3 detail timestamp = %s, want %s", details3[0].Timestamp, base.Add(5*time.Minute))
+	}
+	if page3.HasMore {
+		t.Fatalf("page3 HasMore = true, want false")
+	}
+	if !page3.NextSince.IsZero() {
+		t.Fatalf("page3 NextSince = %s, want zero", page3.NextSince)
+	}
+
+	// No params: full snapshot in ascending order, no pagination.
+	full := stats.SnapshotPageWithOptions(SnapshotOptions{})
+	fullDetails := full.Snapshot.APIs["test-key"].Models["gpt-5.4"].Details
+	if len(fullDetails) != len(timestamps) {
+		t.Fatalf("full details len = %d, want %d", len(fullDetails), len(timestamps))
+	}
+	for i := 1; i < len(fullDetails); i++ {
+		if fullDetails[i].Timestamp.Before(fullDetails[i-1].Timestamp) {
+			t.Fatalf("full details not sorted ascending at index %d: %+v", i, fullDetails)
+		}
+	}
+	if full.HasMore {
+		t.Fatalf("full HasMore = true, want false")
+	}
+}
+
+// TestSnapshotPageWithOptionsAppliesGlobalLimitAcrossBuckets is a regression
+// test for a production bug where DetailLimit was applied independently to
+// each (api, model) bucket instead of globally: /usage/export?limit=5000
+// returned 124,083 details in one page because each bucket had fewer than
+// 5000 records and was therefore never truncated. This asserts the combined
+// page across all buckets is capped at DetailLimit.
+func TestSnapshotPageWithOptionsAppliesGlobalLimitAcrossBuckets(t *testing.T) {
+	stats := NewRequestStatistics()
+	base := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+
+	// 3 api keys x 4 models = 12 buckets, 10 records each = 120 total, all
+	// with distinct nanosecond timestamps so there is no boundary tie. A
+	// naive per-bucket limit of 8 would never truncate any of these buckets
+	// (10 > 8 in every bucket, so it *would* truncate per-bucket too -
+	// instead use a limit that is well below any single bucket's count but
+	// also below the combined total, and assert the total, not per-bucket).
+	apiKeys := []string{"key-a", "key-b", "key-c"}
+	models := []string{"model-1", "model-2", "model-3", "model-4"}
+	perBucket := 10
+	total := len(apiKeys) * len(models) * perBucket
+	for bi, apiKey := range apiKeys {
+		for bj, model := range models {
+			for k := 0; k < perBucket; k++ {
+				// Globally unique offsets so every record has a distinct
+				// timestamp and global ordering is unambiguous.
+				offset := time.Duration(bi*len(models)*perBucket+bj*perBucket+k) * time.Second
+				stats.Record(context.Background(), coreusage.Record{
+					APIKey:      apiKey,
+					Model:       model,
+					RequestedAt: base.Add(offset),
+					Detail: coreusage.Detail{
+						InputTokens:  1,
+						OutputTokens: 1,
+						TotalTokens:  2,
+					},
+				})
+			}
+		}
+	}
+
+	// Use a limit bigger than any single bucket (10) but much smaller than
+	// the combined total (120), which is exactly the case the per-bucket bug
+	// missed: no individual bucket exceeds the limit, so a per-bucket
+	// implementation would never truncate and would return all 120 records.
+	const globalLimit = 25
+	page := stats.SnapshotPageWithOptions(SnapshotOptions{DetailLimit: globalLimit})
+
+	gotTotal := 0
+	for _, api := range page.Snapshot.APIs {
+		for _, model := range api.Models {
+			gotTotal += len(model.Details)
+		}
+	}
+	if gotTotal != globalLimit {
+		t.Fatalf("combined details across all buckets = %d, want exactly %d (global limit)", gotTotal, globalLimit)
+	}
+	if !page.HasMore {
+		t.Fatalf("HasMore = false, want true (only %d of %d records returned)", globalLimit, total)
+	}
+	if page.NextSince.IsZero() {
+		t.Fatalf("NextSince = zero, want a cursor for the next page")
+	}
+
+	// The global cutoff must be the timestamp of the 25th earliest record
+	// overall (0-indexed 24): base + 24s.
+	wantCutoff := base.Add(24 * time.Second)
+	if !page.NextSince.Equal(wantCutoff) {
+		t.Fatalf("NextSince = %s, want %s", page.NextSince, wantCutoff)
+	}
+}
+
+// TestSnapshotPageWithOptionsPaginatesAcrossBucketsWithoutGapsOrDuplicates
+// drives full pagination (repeated calls with Since=previous NextSince)
+// across multiple api/model buckets and asserts the union of all pages is
+// exactly the full record set with no duplicates and no gaps, i.e. the
+// global cursor is gap-free and duplicate-free even though records are
+// interleaved across buckets and inserted out of chronological order.
+func TestSnapshotPageWithOptionsPaginatesAcrossBucketsWithoutGapsOrDuplicates(t *testing.T) {
+	stats := NewRequestStatistics()
+	base := time.Date(2026, 6, 2, 0, 0, 0, 0, time.UTC)
+
+	apiKeys := []string{"key-a", "key-b", "key-c"}
+	models := []string{"model-1", "model-2"}
+	perBucket := 17 // deliberately not a multiple of the page size below
+	total := len(apiKeys) * len(models) * perBucket
+
+	// Insert in a shuffled (non-chronological) order per bucket to exercise
+	// the sort path, while keeping every timestamp globally unique.
+	type recordSpec struct {
+		apiKey string
+		model  string
+		offset time.Duration
+	}
+	var specs []recordSpec
+	seq := 0
+	for _, apiKey := range apiKeys {
+		for _, model := range models {
+			for k := 0; k < perBucket; k++ {
+				specs = append(specs, recordSpec{apiKey: apiKey, model: model, offset: time.Duration(seq) * time.Second})
+				seq++
+			}
+		}
+	}
+	// Reverse insertion order within the spec list to make writes
+	// out-of-order relative to timestamp, without changing the assigned
+	// timestamps themselves.
+	for i := len(specs) - 1; i >= 0; i-- {
+		spec := specs[i]
+		stats.Record(context.Background(), coreusage.Record{
+			APIKey:      spec.apiKey,
+			Model:       spec.model,
+			RequestedAt: base.Add(spec.offset),
+			Detail: coreusage.Detail{
+				InputTokens:  1,
+				OutputTokens: 1,
+				TotalTokens:  2,
+			},
+		})
+	}
+
+	const pageSize = 9
+	seen := make(map[string]bool, total)
+	var since time.Time
+	pages := 0
+	for {
+		pages++
+		if pages > total { // guard against an infinite loop on a bug
+			t.Fatalf("pagination did not terminate after %d pages", pages)
+		}
+		page := stats.SnapshotPageWithOptions(SnapshotOptions{Since: since, DetailLimit: pageSize})
+		pageCount := 0
+		for apiKey, api := range page.Snapshot.APIs {
+			for model, modelSnapshot := range api.Models {
+				for _, detail := range modelSnapshot.Details {
+					key := apiKey + "|" + model + "|" + detail.Timestamp.Format(time.RFC3339Nano)
+					if seen[key] {
+						t.Fatalf("duplicate record across pages: %s", key)
+					}
+					seen[key] = true
+					pageCount++
+				}
+			}
+		}
+		if !page.HasMore {
+			if pageCount == 0 && pages > 1 {
+				t.Fatalf("page %d returned 0 records with HasMore=false unexpectedly", pages)
+			}
+			break
+		}
+		if pageCount == 0 {
+			t.Fatalf("page %d returned 0 records but HasMore=true", pages)
+		}
+		since = page.NextSince
+	}
+
+	if len(seen) != total {
+		t.Fatalf("total records observed across all pages = %d, want %d (gap or drop detected)", len(seen), total)
+	}
+}
+
+// TestSnapshotPageWithOptionsKeepsTiedTimestampsInSamePage asserts the
+// documented same-timestamp boundary policy: when the DetailLimit cutoff
+// falls in the middle of a run of records sharing the exact same
+// (nanosecond-precision) timestamp, all tied records are kept in the current
+// page rather than being split across pages. This avoids ever dropping or
+// duplicating a record at the cost of the page occasionally being slightly
+// larger than DetailLimit when such a collision occurs.
+func TestSnapshotPageWithOptionsKeepsTiedTimestampsInSamePage(t *testing.T) {
+	stats := NewRequestStatistics()
+	base := time.Date(2026, 6, 3, 0, 0, 0, 0, time.UTC)
+	tied := base.Add(time.Minute) // shared boundary timestamp
+
+	// 3 records strictly before the tie, then 4 records all sharing the same
+	// timestamp, then 2 records strictly after. limit=4 lands exactly in the
+	// middle of the tied run (rank 3 of 0..8, i.e. the 4th earliest record is
+	// one of the tied ones).
+	stats.Record(context.Background(), coreusage.Record{APIKey: "k", Model: "m", RequestedAt: base, Detail: coreusage.Detail{TotalTokens: 1}})
+	stats.Record(context.Background(), coreusage.Record{APIKey: "k", Model: "m", RequestedAt: base.Add(10 * time.Second), Detail: coreusage.Detail{TotalTokens: 1}})
+	stats.Record(context.Background(), coreusage.Record{APIKey: "k", Model: "m", RequestedAt: base.Add(20 * time.Second), Detail: coreusage.Detail{TotalTokens: 1}})
+	for i := 0; i < 4; i++ {
+		stats.Record(context.Background(), coreusage.Record{APIKey: "k", Model: "m", RequestedAt: tied, Detail: coreusage.Detail{TotalTokens: 1}})
+	}
+	stats.Record(context.Background(), coreusage.Record{APIKey: "k", Model: "m", RequestedAt: base.Add(90 * time.Second), Detail: coreusage.Detail{TotalTokens: 1}})
+	stats.Record(context.Background(), coreusage.Record{APIKey: "k", Model: "m", RequestedAt: base.Add(100 * time.Second), Detail: coreusage.Detail{TotalTokens: 1}})
+
+	page := stats.SnapshotPageWithOptions(SnapshotOptions{DetailLimit: 4})
+	details := page.Snapshot.APIs["k"].Models["m"].Details
+	// 3 strictly-before records + all 4 tied records = 7, even though
+	// DetailLimit=4: the tied run is not split.
+	if len(details) != 7 {
+		t.Fatalf("details len = %d, want 7 (3 before + 4 tied, tie not split)", len(details))
+	}
+	tiedCount := 0
+	for _, d := range details {
+		if d.Timestamp.Equal(tied) {
+			tiedCount++
+		}
+	}
+	if tiedCount != 4 {
+		t.Fatalf("tied-timestamp records included = %d, want 4 (all)", tiedCount)
+	}
+	if !page.NextSince.Equal(tied) {
+		t.Fatalf("NextSince = %s, want %s (shared boundary timestamp)", page.NextSince, tied)
+	}
+	if !page.HasMore {
+		t.Fatalf("HasMore = false, want true (2 records remain after the tie)")
+	}
+
+	// Next page (Since=tied, strictly-after) must return exactly the 2
+	// remaining records with no re-inclusion of the tied run.
+	page2 := stats.SnapshotPageWithOptions(SnapshotOptions{Since: page.NextSince, DetailLimit: 4})
+	details2 := page2.Snapshot.APIs["k"].Models["m"].Details
+	if len(details2) != 2 {
+		t.Fatalf("page2 details len = %d, want 2", len(details2))
+	}
+	for _, d := range details2 {
+		if !d.Timestamp.After(tied) {
+			t.Fatalf("page2 unexpectedly re-included a record at or before the boundary: %+v", d)
+		}
+	}
+	if page2.HasMore {
+		t.Fatalf("page2 HasMore = true, want false")
 	}
 }
 
