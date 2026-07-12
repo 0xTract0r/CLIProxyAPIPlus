@@ -345,10 +345,103 @@ func (s *RequestStatistics) Snapshot() StatisticsSnapshot {
 }
 
 // SnapshotWithOptions returns a copy of aggregated metrics and can omit or
-// window per-request details for latency-sensitive management UI reads.
+// window per-request details for latency-sensitive management UI reads
+// (the live /usage endpoint).
+//
+// DetailLimit here uses *tail* semantics: within each api/model bucket's
+// Since-filtered window, the most recent DetailLimit records are kept
+// (baseline behaviour restored). This is deliberately different from the
+// export cursor path (SnapshotPageWithOptions), which keeps the *earliest*
+// DetailLimit records and returns HasMore/NextSince cursors for gap-free
+// forward pagination. The live UI wants the latest events; the export sync
+// wants a stable oldest-first cursor. Mixing the two silently dropped the
+// most recent events from /usage (see the direction-locking tests).
+//
+// Since here is *inclusive* (>= Since): the live UI passes an absolute
+// window start, not an exclusive pagination cursor, so a record exactly at
+// the boundary must not be dropped.
 func (s *RequestStatistics) SnapshotWithOptions(options SnapshotOptions) StatisticsSnapshot {
-	page := s.SnapshotPageWithOptions(options)
-	return page.Snapshot
+	result := StatisticsSnapshot{}
+	if s == nil {
+		return result
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	s.fillAggregateSnapshot(&result)
+
+	result.APIs = make(map[string]APISnapshot, len(s.apis))
+	for apiName, stats := range s.apis {
+		apiSnapshot := APISnapshot{
+			TotalRequests:           stats.TotalRequests,
+			TotalTokens:             stats.TotalTokens,
+			TotalBillableTokens:     stats.TotalBillableTokens,
+			TotalCostUSD:            microsToUSD(stats.TotalCostMicros),
+			PricingStatus:           pricingStatusString(pricingStateForCounts(stats.TotalRequests, stats.UnpricedRequests, stats.UnfinalizedRequests)),
+			UnpricedRequestCount:    stats.UnpricedRequests,
+			UnfinalizedRequestCount: stats.UnfinalizedRequests,
+			Models:                  make(map[string]ModelSnapshot, len(stats.Models)),
+		}
+		for modelName, modelStatsValue := range stats.Models {
+			apiSnapshot.Models[modelName] = ModelSnapshot{
+				TotalRequests:           modelStatsValue.TotalRequests,
+				TotalTokens:             modelStatsValue.TotalTokens,
+				TotalBillableTokens:     modelStatsValue.TotalBillableTokens,
+				TotalCostUSD:            microsToUSD(modelStatsValue.TotalCostMicros),
+				PricingStatus:           pricingStatusString(modelStatsValue.PricingState),
+				UnpricedRequestCount:    modelStatsValue.UnpricedRequests,
+				UnfinalizedRequestCount: modelStatsValue.UnfinalizedRequests,
+				Details:                 liveRequestDetails(modelStatsValue.Details, options),
+			}
+			switch modelStatsValue.PricingState {
+			case pricingStateUnpriced:
+				result.UnpricedModelCount++
+			case pricingStateUnfinalized:
+				result.UnfinalizedModelCount++
+			}
+		}
+		result.APIs[apiName] = apiSnapshot
+	}
+
+	s.fillTimeSeriesSnapshot(&result)
+	return result
+}
+
+// liveRequestDetails windows a single bucket's details for the live /usage
+// path: Since is inclusive (>= Since), and DetailLimit keeps the most recent
+// (tail) DetailLimit records. This restores the pre-pagination baseline
+// behaviour and is intentionally kept separate from the export cursor path,
+// which keeps the earliest records instead (see SnapshotPageWithOptions).
+func liveRequestDetails(details []RequestDetail, options SnapshotOptions) []RequestDetail {
+	if options.ExcludeDetails {
+		return []RequestDetail{}
+	}
+	// Copy before sorting: details is the live backing slice guarded by s.mu,
+	// and callers must not observe or retain a sorted mutation of it.
+	ordered := make([]RequestDetail, len(details))
+	copy(ordered, details)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		return ordered[i].Timestamp.Before(ordered[j].Timestamp)
+	})
+
+	filtered := ordered
+	if !options.Since.IsZero() {
+		filtered = make([]RequestDetail, 0, len(ordered))
+		for _, detail := range ordered {
+			// Inclusive boundary: keep records at or after Since.
+			if !detail.Timestamp.Before(options.Since) {
+				filtered = append(filtered, detail)
+			}
+		}
+	}
+	if options.DetailLimit > 0 && len(filtered) > options.DetailLimit {
+		// Tail: keep the most recent DetailLimit records.
+		filtered = filtered[len(filtered)-options.DetailLimit:]
+	}
+	requestDetails := make([]RequestDetail, len(filtered))
+	copy(requestDetails, filtered)
+	return requestDetails
 }
 
 // SnapshotPageWithOptions returns a copy of aggregated metrics along with
@@ -381,17 +474,7 @@ func (s *RequestStatistics) SnapshotPageWithOptions(options SnapshotOptions) Sna
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	result.TotalRequests = s.totalRequests
-	result.SuccessCount = s.successCount
-	result.FailureCount = s.failureCount
-	result.TotalTokens = s.totalTokens
-	result.TotalBillableTokens = s.totalBillableTokens
-	result.TotalCostUSD = microsToUSD(s.totalCostMicros)
-	result.UnpricedRequestCount = s.unpricedRequests
-	result.UnfinalizedRequestCount = s.unfinalizedRequests
-	result.PricingStatus = pricingStatusString(
-		pricingStateForCounts(result.TotalRequests, result.UnpricedRequestCount, result.UnfinalizedRequestCount),
-	)
+	s.fillAggregateSnapshot(&result)
 
 	// Pass 1: sort+filter (Since only, no limit) every bucket once and reuse
 	// the ordered slices in pass 2, so buckets are only sorted a single time
@@ -464,6 +547,33 @@ func (s *RequestStatistics) SnapshotPageWithOptions(options SnapshotOptions) Sna
 		result.APIs[apiName] = apiSnapshot
 	}
 
+	s.fillTimeSeriesSnapshot(&result)
+
+	page.Snapshot = result
+	page.HasMore = hasMore
+	page.NextSince = nextSince
+	return page
+}
+
+// fillAggregateSnapshot copies the top-level aggregate counters into result.
+// Callers must hold s.mu (read lock is sufficient).
+func (s *RequestStatistics) fillAggregateSnapshot(result *StatisticsSnapshot) {
+	result.TotalRequests = s.totalRequests
+	result.SuccessCount = s.successCount
+	result.FailureCount = s.failureCount
+	result.TotalTokens = s.totalTokens
+	result.TotalBillableTokens = s.totalBillableTokens
+	result.TotalCostUSD = microsToUSD(s.totalCostMicros)
+	result.UnpricedRequestCount = s.unpricedRequests
+	result.UnfinalizedRequestCount = s.unfinalizedRequests
+	result.PricingStatus = pricingStatusString(
+		pricingStateForCounts(result.TotalRequests, result.UnpricedRequestCount, result.UnfinalizedRequestCount),
+	)
+}
+
+// fillTimeSeriesSnapshot copies the by-day/by-hour time series into result.
+// Callers must hold s.mu (read lock is sufficient).
+func (s *RequestStatistics) fillTimeSeriesSnapshot(result *StatisticsSnapshot) {
 	result.RequestsByDay = make(map[string]int64, len(s.requestsByDay))
 	for k, v := range s.requestsByDay {
 		result.RequestsByDay[k] = v
@@ -496,11 +606,6 @@ func (s *RequestStatistics) SnapshotPageWithOptions(options SnapshotOptions) Sna
 		key := formatHour(hour)
 		result.CostByHour[key] = microsToUSD(v)
 	}
-
-	page.Snapshot = result
-	page.HasMore = hasMore
-	page.NextSince = nextSince
-	return page
 }
 
 // filterAndSortRequestDetails sorts a model's request details by Timestamp

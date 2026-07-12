@@ -79,6 +79,72 @@ func TestRequestStatisticsSnapshotWithOptionsTrimsDetailsOnly(t *testing.T) {
 	}
 }
 
+// TestSnapshotWithOptionsDetailLimitKeepsNewestTail is a direction-locking
+// regression test for the live /usage path. When DetailLimit truncates an
+// over-limit window, the live snapshot must keep the *newest* DetailLimit
+// records (tail), not the oldest. A prior refactor delegated
+// SnapshotWithOptions to the export cursor path and silently returned the
+// oldest records instead, hiding the most recent events from the UI.
+func TestSnapshotWithOptionsDetailLimitKeepsNewestTail(t *testing.T) {
+	stats := NewRequestStatistics()
+	base := time.Date(2026, 3, 20, 10, 0, 0, 0, time.UTC)
+	const total = 12
+	// Record out of chronological order to prove the live path sorts before
+	// taking the tail rather than relying on insertion order.
+	order := []int{5, 0, 11, 3, 8, 1, 10, 2, 9, 4, 7, 6}
+	for _, i := range order {
+		stats.Record(context.Background(), coreusage.Record{
+			APIKey:      "test-key",
+			Model:       "gpt-5.4",
+			RequestedAt: base.Add(time.Duration(i) * time.Minute),
+			Detail:      coreusage.Detail{InputTokens: 1, OutputTokens: 1, TotalTokens: 2},
+		})
+	}
+
+	const limit = 4
+	snap := stats.SnapshotWithOptions(SnapshotOptions{DetailLimit: limit})
+	details := snap.APIs["test-key"].Models["gpt-5.4"].Details
+	if len(details) != limit {
+		t.Fatalf("live details len = %d, want %d", len(details), limit)
+	}
+	// Tail = the newest `limit` records: minutes 8,9,10,11 in ascending order.
+	for i, detail := range details {
+		want := base.Add(time.Duration(total-limit+i) * time.Minute)
+		if !detail.Timestamp.Equal(want) {
+			t.Fatalf("live detail[%d] timestamp = %s, want %s (newest tail)", i, detail.Timestamp, want)
+		}
+	}
+	// The single newest record must be present (regression: it was dropped).
+	if last := details[len(details)-1].Timestamp; !last.Equal(base.Add(time.Duration(total-1) * time.Minute)) {
+		t.Fatalf("live newest detail = %s, want %s", last, base.Add(time.Duration(total-1)*time.Minute))
+	}
+}
+
+// TestSnapshotWithOptionsSinceIsInclusive locks the live path's Since
+// semantics to baseline: a record exactly at the Since boundary is retained
+// (>= Since), unlike the export cursor path which is strictly-after.
+func TestSnapshotWithOptionsSinceIsInclusive(t *testing.T) {
+	stats := NewRequestStatistics()
+	boundary := time.Date(2026, 3, 20, 12, 0, 0, 0, time.UTC)
+	for _, ts := range []time.Time{boundary.Add(-time.Minute), boundary, boundary.Add(time.Minute)} {
+		stats.Record(context.Background(), coreusage.Record{
+			APIKey:      "test-key",
+			Model:       "gpt-5.4",
+			RequestedAt: ts,
+			Detail:      coreusage.Detail{InputTokens: 1, OutputTokens: 1, TotalTokens: 2},
+		})
+	}
+
+	snap := stats.SnapshotWithOptions(SnapshotOptions{Since: boundary})
+	details := snap.APIs["test-key"].Models["gpt-5.4"].Details
+	if len(details) != 2 {
+		t.Fatalf("inclusive-Since details len = %d, want 2 (boundary + after)", len(details))
+	}
+	if !details[0].Timestamp.Equal(boundary) {
+		t.Fatalf("first detail = %s, want boundary %s (inclusive)", details[0].Timestamp, boundary)
+	}
+}
+
 func TestRequestStatisticsMergeSnapshotDedupIgnoresLatency(t *testing.T) {
 	stats := NewRequestStatistics()
 	timestamp := time.Date(2026, 3, 20, 12, 0, 0, 0, time.UTC)
