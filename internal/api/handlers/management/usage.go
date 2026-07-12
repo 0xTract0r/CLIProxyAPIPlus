@@ -29,8 +29,9 @@ type usageExportPayload struct {
 	ExportedAt time.Time                `json:"exported_at"`
 	Usage      usage.StatisticsSnapshot `json:"usage"`
 	// HasMore indicates the export was windowed (since/limit) and truncated
-	// per-model request details remain beyond NextSince. Absent/false for a
-	// full, unwindowed export (backward compatible default).
+	// request details remain beyond NextSince, across the combined page (not
+	// per-model). Absent/false for a full, unwindowed export (backward
+	// compatible default).
 	HasMore bool `json:"has_more,omitempty"`
 	// NextSince is the cursor callers should pass as `since` on the next
 	// export call to continue pulling remaining details in stable order.
@@ -140,10 +141,13 @@ func (h *Handler) ExportUsageStatistics(c *gin.Context) {
 // parseUsageExportOptions parses the `since` and `limit` query parameters for
 // /usage/export. `since` accepts RFC3339 (e.g. 2026-01-01T00:00:00Z) or a
 // Unix timestamp in milliseconds. `limit` is the maximum number of request
-// details to return per model (0 or absent means unlimited, i.e. full
-// export). Unlike parseUsageSnapshotOptions (used by the live statistics
-// endpoint), no upper bound is imposed on `limit` here: export callers
-// explicitly control batch size for their own sync cadence.
+// details to return in total across every api/model bucket combined (0 or
+// absent means unlimited, i.e. full export); it is a global cap on the
+// payload, not a per-model cap, so the response size stays bounded even when
+// a snapshot spans many api keys and models. Unlike parseUsageSnapshotOptions
+// (used by the live statistics endpoint), no upper bound is imposed on
+// `limit` here: export callers explicitly control batch size for their own
+// sync cadence.
 func parseUsageExportOptions(c *gin.Context) (usage.SnapshotOptions, error) {
 	options := usage.SnapshotOptions{}
 	if c == nil {

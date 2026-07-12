@@ -173,6 +173,66 @@ func TestExportUsageStatisticsWindowedPaginatesInOrder(t *testing.T) {
 	}
 }
 
+// TestExportUsageStatisticsAppliesGlobalLimitAcrossBuckets is an HTTP-layer
+// regression test for the production incident where /usage/export?limit=5000
+// returned 124,083 details in a single response because DetailLimit was
+// applied independently per (api, model) bucket. With multiple api keys and
+// models, each individually under the limit, the combined export payload
+// must still be capped at `limit` total details.
+func TestExportUsageStatisticsAppliesGlobalLimitAcrossBuckets(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	stats := mgmtusage.NewRequestStatistics()
+	base := time.Date(2026, 6, 4, 0, 0, 0, 0, time.UTC)
+
+	apiKeys := []string{"key-a", "key-b"}
+	models := []string{"model-1", "model-2", "model-3"}
+	perBucket := 5 // 2 keys x 3 models x 5 = 30 total, no single bucket exceeds a limit of 8
+	seq := 0
+	for _, apiKey := range apiKeys {
+		for _, model := range models {
+			for i := 0; i < perBucket; i++ {
+				stats.Record(context.Background(), coreusage.Record{
+					APIKey:      apiKey,
+					Model:       model,
+					RequestedAt: base.Add(time.Duration(seq) * time.Second),
+					Detail: coreusage.Detail{
+						InputTokens:  1,
+						OutputTokens: 1,
+						TotalTokens:  2,
+					},
+				})
+				seq++
+			}
+		}
+	}
+
+	handler := &Handler{}
+	handler.SetUsageStatistics(stats)
+
+	const limit = 8 // > any single bucket (5), well under combined total (30)
+	rec := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(rec)
+	ginCtx.Request = httptest.NewRequest(http.MethodGet, "/v0/management/usage/export?limit="+strconv.Itoa(limit), nil)
+	handler.ExportUsageStatistics(ginCtx)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	payload := decodeUsageExportPayload(t, rec)
+	if !payload.HasMore {
+		t.Fatalf("HasMore = false, want true (only %d of %d records should be returned)", limit, seq)
+	}
+	total := 0
+	for _, api := range payload.Usage.APIs {
+		for _, model := range api.Models {
+			total += len(model.Details)
+		}
+	}
+	if total != limit {
+		t.Fatalf("combined details across all buckets = %d, want exactly %d (global limit, not per-bucket)", total, limit)
+	}
+}
+
 func TestExportUsageStatisticsAcceptsUnixMillisSince(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	stats := mgmtusage.NewRequestStatistics()
