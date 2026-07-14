@@ -105,6 +105,56 @@ func TestSaveTokenRecord_PreservesUserFieldsOnReauth(t *testing.T) {
 	}
 }
 
+// TestSaveTokenRecord_PreservesClaudeDeviceIDOnReauth asserts that a bare
+// re-login (record has no claude_device_id, OAuth callback does not know
+// about it) inherits the previously persisted explicit device_id override
+// from the existing record with the same identity, via
+// mergeUserDefinedAuthMetadataInto's generic operator-metadata inheritance.
+func TestSaveTokenRecord_PreservesClaudeDeviceIDOnReauth(t *testing.T) {
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	explicit := "a1b2c3a1b2c3a1b2c3a1b2c3a1b2c3a1b2c3a1b2c3a1b2c3a1b2c3a1b2c3a1b2"
+	previous := &coreauth.Auth{
+		ID:       "claude-user@example.com.json",
+		FileName: "claude-user@example.com.json",
+		Provider: "claude",
+		Attributes: map[string]string{
+			"path":                              "/tmp/claude-user@example.com.json",
+			coreauth.ClaudeDeviceIDAttributeKey: explicit,
+		},
+		Metadata: map[string]any{
+			"type":                             "claude",
+			"email":                            "user@example.com",
+			coreauth.ClaudeDeviceIDMetadataKey: explicit,
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), previous); errRegister != nil {
+		t.Fatalf("failed to register previous auth: %v", errRegister)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+	h.tokenStore = store
+
+	record := &coreauth.Auth{
+		ID:       "claude-user@example.com.json",
+		FileName: "claude-user@example.com.json",
+		Provider: "claude",
+		Metadata: map[string]any{
+			"type":          "claude",
+			"email":         "user@example.com",
+			"access_token":  "NEW_TOKEN",
+			"refresh_token": "NEW_REFRESH",
+		},
+	}
+	if _, errSave := h.saveTokenRecord(context.Background(), record); errSave != nil {
+		t.Fatalf("saveTokenRecord returned error: %v", errSave)
+	}
+
+	if got, _ := record.Metadata[coreauth.ClaudeDeviceIDMetadataKey].(string); got != explicit {
+		t.Fatalf("metadata.claude_device_id = %q, want inherited %q", got, explicit)
+	}
+}
+
 // TestSaveTokenRecord_DoesNotLeakOldMetadataAcrossAccounts ensures that the
 // fallback lookup by email only triggers when there is an actual identity
 // match, so different operators on the same host do not accidentally inherit

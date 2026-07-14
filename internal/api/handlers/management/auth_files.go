@@ -3319,6 +3319,15 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 
 		if fieldPath == "headers" {
 			applyAuthFileHeadersPatch(targetAuth, value)
+		} else if fieldPath == "claude_device_id" {
+			if errValidate := validateAuthFileClaudeDeviceIDPatch(value); errValidate != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": errValidate.Error()})
+				return
+			}
+			if errSet := setAuthFileMetadataValue(targetAuth.Metadata, fieldPath, value); errSet != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": errSet.Error()})
+				return
+			}
 		} else if errSet := setAuthFileMetadataValue(targetAuth.Metadata, fieldPath, value); errSet != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": errSet.Error()})
 			return
@@ -3582,6 +3591,25 @@ func setAuthFileMetadataValue(metadata map[string]any, path string, value any) e
 	return nil
 }
 
+// validateAuthFileClaudeDeviceIDPatch validates a claude_device_id PATCH
+// value before it is written to Metadata. An empty string is a valid "clear
+// the override" request (the account falls back to the derived synthetic
+// device_id); any non-empty value must be a well-formed 64-char lowercase
+// hex string matching the wire shape of metadata.user_id.device_id.
+func validateAuthFileClaudeDeviceIDPatch(value any) error {
+	str, ok := value.(string)
+	if !ok {
+		return fmt.Errorf("claude_device_id must be a string")
+	}
+	if strings.TrimSpace(str) == "" {
+		return nil
+	}
+	if !coreauth.IsValidClaudeDeviceID(str) {
+		return fmt.Errorf("claude_device_id must be a 64-character lowercase hex string")
+	}
+	return nil
+}
+
 func applyAuthFileHeadersPatch(auth *coreauth.Auth, value any) {
 	if auth == nil {
 		return
@@ -3672,6 +3700,32 @@ func syncAuthFileMetadataFields(auth *coreauth.Auth, touchedRoots map[string]str
 	if _, ok := touchedRoots["disabled"]; ok {
 		syncAuthFileDisabledState(auth)
 	}
+	if _, ok := touchedRoots["claude_device_id"]; ok {
+		syncAuthFileClaudeDeviceIDAttribute(auth)
+	}
+}
+
+// syncAuthFileClaudeDeviceIDAttribute mirrors a just-patched
+// claude_device_id Metadata value into the live Attributes map (same pattern
+// as syncAuthFilePriorityAttribute / syncAuthFileNoteAttribute) so the
+// in-memory Auth object used by the current process reflects the change
+// immediately, without waiting for a full store reload. It clears the
+// mirrored attribute when the persisted value is missing, empty, or invalid
+// so the account reliably falls back to the derived synthetic device_id.
+func syncAuthFileClaudeDeviceIDAttribute(auth *coreauth.Auth) {
+	if auth == nil {
+		return
+	}
+	if auth.Attributes == nil {
+		auth.Attributes = make(map[string]string)
+	}
+	deviceID, ok := auth.Metadata[coreauth.ClaudeDeviceIDMetadataKey].(string)
+	deviceID = strings.TrimSpace(deviceID)
+	if !ok || !coreauth.IsValidClaudeDeviceID(deviceID) {
+		delete(auth.Attributes, coreauth.ClaudeDeviceIDAttributeKey)
+		return
+	}
+	auth.Attributes[coreauth.ClaudeDeviceIDAttributeKey] = deviceID
 }
 
 func syncAuthFileHeaderAttributes(auth *coreauth.Auth) {
@@ -4007,6 +4061,7 @@ var reauthUserDefinedMetadataKeys = []string{
 	"runtime_only",
 	"priority",
 	"prefix",
+	"claude_device_id",
 }
 
 // reauthTokenMetadataKeys lists metadata keys whose values are owned by the

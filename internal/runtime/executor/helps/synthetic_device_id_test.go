@@ -325,6 +325,77 @@ func TestInjectAccountDeviceID_EgressUserIDNeverObject(t *testing.T) {
 	}
 }
 
+// TestSyntheticDeviceID_ExplicitOverrideTakesPrecedence verifies that a valid
+// explicit override mirrored into Attributes (as ApplyRuntimeFieldsFromMetadata
+// does from a persisted Metadata value) is returned as-is instead of the
+// salt-derived synthetic value.
+func TestSyntheticDeviceID_ExplicitOverrideTakesPrecedence(t *testing.T) {
+	dir := newTestAuthDir(t)
+	override := "ef56ab78ef56ab78ef56ab78ef56ab78ef56ab78ef56ab78ef56ab78ef56ab78"
+	auth := &cliproxyauth.Auth{
+		ProxyURL: "direct",
+		FileName: "account-a.json",
+		Attributes: map[string]string{
+			cliproxyauth.ClaudeDeviceIDAttributeKey: override,
+		},
+	}
+
+	got := SyntheticDeviceID(dir, auth, "")
+	if got != override {
+		t.Fatalf("SyntheticDeviceID() = %q, want explicit override %q", got, override)
+	}
+}
+
+// TestSyntheticDeviceID_InvalidOverrideFallsBackToSynthetic verifies that an
+// override value that is not well-formed 64-hex is ignored, falling back to
+// the salt-derived synthetic value (defense in depth: ApplyRuntimeFieldsFromMetadata
+// should never mirror an invalid value into Attributes, but SyntheticDeviceID
+// must not trust an unexpected Attributes value either).
+func TestSyntheticDeviceID_InvalidOverrideFallsBackToSynthetic(t *testing.T) {
+	dir := newTestAuthDir(t)
+	authWithBadOverride := &cliproxyauth.Auth{
+		ProxyURL: "direct",
+		FileName: "account-a.json",
+		Attributes: map[string]string{
+			cliproxyauth.ClaudeDeviceIDAttributeKey: "not-64-hex",
+		},
+	}
+	authWithoutOverride := &cliproxyauth.Auth{ProxyURL: "direct", FileName: "account-a.json"}
+
+	got := SyntheticDeviceID(dir, authWithBadOverride, "")
+	want := SyntheticDeviceID(dir, authWithoutOverride, "")
+	if got != want {
+		t.Fatalf("SyntheticDeviceID() with invalid override = %q, want synthetic fallback %q", got, want)
+	}
+	if !hex64.MatchString(got) {
+		t.Fatalf("expected 64-hex fallback device id, got %q", got)
+	}
+}
+
+// TestInjectAccountDeviceID_UsesExplicitOverride verifies that
+// InjectAccountDeviceID (and therefore InjectAccountDeviceIDWithOptions,
+// since both derive their device_id via SyntheticDeviceID) injects the
+// explicit override rather than a freshly derived synthetic value.
+func TestInjectAccountDeviceID_UsesExplicitOverride(t *testing.T) {
+	dir := newTestAuthDir(t)
+	override := "cdef01cdef01cdef01cdef01cdef01cdef01cdef01cdef01cdef01cdef01cdef"
+	auth := &cliproxyauth.Auth{
+		ProxyURL: "direct",
+		FileName: "account-a.json",
+		Attributes: map[string]string{
+			cliproxyauth.ClaudeDeviceIDAttributeKey: override,
+		},
+	}
+	payload := []byte(`{"metadata":{"user_id":"{\"device_id\":\"realdevice\",\"account_uuid\":\"\",\"session_id\":\"s1\"}"}}`)
+
+	out := InjectAccountDeviceID(payload, dir, auth, "")
+	device := gjson.GetBytes(out, "metadata.user_id").String()
+	got := gjson.Get(device, "device_id").String()
+	if got != override {
+		t.Fatalf("injected device_id = %q, want explicit override %q", got, override)
+	}
+}
+
 func TestSyntheticDeviceID_FallsBackToProcessSaltWithoutAuthDir(t *testing.T) {
 	auth := &cliproxyauth.Auth{ProxyURL: "direct", FileName: "account-a.json"}
 

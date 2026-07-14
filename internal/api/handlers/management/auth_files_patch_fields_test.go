@@ -12,6 +12,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	runtimehelps "github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	fileauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
@@ -212,6 +213,231 @@ func TestPatchAuthFileFields_WebsocketsFalseIsUpdate(t *testing.T) {
 	}
 	if got, ok := updated.Metadata["websockets"].(bool); !ok || got {
 		t.Fatalf("metadata.websockets = %#v, want false", updated.Metadata["websockets"])
+	}
+}
+
+// TestPatchAuthFileFields_ClaudeDeviceIDExplicitValuePreferredOverSynthetic
+// asserts that setting a valid claude_device_id override via the management
+// API (a) writes it to persisted Metadata, (b) mirrors it into the live
+// Attributes map immediately, and (c) makes runtimehelps.SyntheticDeviceID
+// return the explicit value instead of the salt-derived synthetic one.
+func TestPatchAuthFileFields_ClaudeDeviceIDExplicitValuePreferredOverSynthetic(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	record := &coreauth.Auth{
+		ID:       "claude-device-id.json",
+		FileName: "claude-device-id.json",
+		Provider: "claude",
+		Attributes: map[string]string{
+			"path": "/tmp/claude-device-id.json",
+		},
+		Metadata: map[string]any{
+			"type": "claude",
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("failed to register auth record: %v", errRegister)
+	}
+
+	authDir := t.TempDir()
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+
+	explicit := "a1b2c3a1b2c3a1b2c3a1b2c3a1b2c3a1b2c3a1b2c3a1b2c3a1b2c3a1b2c3a1b2"
+	body := `{"name":"claude-device-id.json","claude_device_id":"` + explicit + `"}`
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/fields", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	ctx.Request = req
+	h.PatchAuthFileFields(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+
+	updated, ok := manager.GetByID("claude-device-id.json")
+	if !ok || updated == nil {
+		t.Fatalf("expected auth record to exist after patch")
+	}
+	if got, _ := updated.Metadata[coreauth.ClaudeDeviceIDMetadataKey].(string); got != explicit {
+		t.Fatalf("metadata.claude_device_id = %q, want %q", got, explicit)
+	}
+	if got := updated.Attributes[coreauth.ClaudeDeviceIDAttributeKey]; got != explicit {
+		t.Fatalf("attributes.claude_device_id = %q, want %q live-mirrored", got, explicit)
+	}
+	if got := runtimehelps.SyntheticDeviceID(authDir, updated, ""); got != explicit {
+		t.Fatalf("SyntheticDeviceID() = %q, want explicit override %q", got, explicit)
+	}
+}
+
+// TestPatchAuthFileFields_ClaudeDeviceIDRejectsInvalidValue asserts that a
+// non-64-hex claude_device_id PATCH is rejected with 400 and does not mutate
+// the stored record.
+func TestPatchAuthFileFields_ClaudeDeviceIDRejectsInvalidValue(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	record := &coreauth.Auth{
+		ID:       "claude-device-id-invalid.json",
+		FileName: "claude-device-id-invalid.json",
+		Provider: "claude",
+		Attributes: map[string]string{
+			"path": "/tmp/claude-device-id-invalid.json",
+		},
+		Metadata: map[string]any{
+			"type": "claude",
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("failed to register auth record: %v", errRegister)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+
+	body := `{"name":"claude-device-id-invalid.json","claude_device_id":"not-64-hex"}`
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/fields", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	ctx.Request = req
+	h.PatchAuthFileFields(ctx)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected status %d, got %d with body %s", http.StatusBadRequest, rec.Code, rec.Body.String())
+	}
+
+	updated, ok := manager.GetByID("claude-device-id-invalid.json")
+	if !ok || updated == nil {
+		t.Fatalf("expected auth record to exist")
+	}
+	if _, ok := updated.Metadata[coreauth.ClaudeDeviceIDMetadataKey]; ok {
+		t.Fatalf("expected metadata.claude_device_id to remain unset after rejected patch, got %#v", updated.Metadata[coreauth.ClaudeDeviceIDMetadataKey])
+	}
+}
+
+// TestPatchAuthFileFields_ClaudeDeviceIDEmptyStringClearsOverride asserts that
+// patching claude_device_id with an empty string clears any previously set
+// override, removing the live Attributes mirror so the account falls back to
+// the derived synthetic device_id.
+func TestPatchAuthFileFields_ClaudeDeviceIDEmptyStringClearsOverride(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	explicit := "a1b2c3a1b2c3a1b2c3a1b2c3a1b2c3a1b2c3a1b2c3a1b2c3a1b2c3a1b2c3a1b2"
+	record := &coreauth.Auth{
+		ID:       "claude-device-id-clear.json",
+		FileName: "claude-device-id-clear.json",
+		Provider: "claude",
+		Attributes: map[string]string{
+			"path":                              "/tmp/claude-device-id-clear.json",
+			coreauth.ClaudeDeviceIDAttributeKey: explicit,
+		},
+		Metadata: map[string]any{
+			"type":                             "claude",
+			coreauth.ClaudeDeviceIDMetadataKey: explicit,
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("failed to register auth record: %v", errRegister)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+
+	body := `{"name":"claude-device-id-clear.json","claude_device_id":""}`
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/fields", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	ctx.Request = req
+	h.PatchAuthFileFields(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+
+	updated, ok := manager.GetByID("claude-device-id-clear.json")
+	if !ok || updated == nil {
+		t.Fatalf("expected auth record to exist after patch")
+	}
+	if got, _ := updated.Metadata[coreauth.ClaudeDeviceIDMetadataKey].(string); got != "" {
+		t.Fatalf("metadata.claude_device_id = %q, want cleared", got)
+	}
+	if _, ok := updated.Attributes[coreauth.ClaudeDeviceIDAttributeKey]; ok {
+		t.Fatalf("expected attributes.claude_device_id cleared, got %#v", updated.Attributes[coreauth.ClaudeDeviceIDAttributeKey])
+	}
+}
+
+// TestPatchAuthFileFields_ClaudeDeviceIDSurvivesReload writes an explicit
+// override through the real FileTokenStore, then loads a *fresh* Manager
+// from the same auth directory (simulating a process restart) and confirms
+// ApplyRuntimeFieldsFromMetadata re-hydrates the live Attributes mirror from
+// the persisted Metadata so the override still takes effect.
+func TestPatchAuthFileFields_ClaudeDeviceIDSurvivesReload(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	fileName := "claude-device-id-reload.json"
+	filePath := filepath.Join(authDir, fileName)
+	store := fileauth.NewFileTokenStore()
+	store.SetBaseDir(authDir)
+	manager := coreauth.NewManager(store, nil, nil)
+	record := &coreauth.Auth{
+		ID:       fileName,
+		FileName: fileName,
+		Provider: "claude",
+		Attributes: map[string]string{
+			"path": filePath,
+		},
+		Metadata: map[string]any{
+			"type": "claude",
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("failed to register auth record: %v", errRegister)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+
+	explicit := "a1b2c3a1b2c3a1b2c3a1b2c3a1b2c3a1b2c3a1b2c3a1b2c3a1b2c3a1b2c3a1b2"
+	body := `{"name":"` + fileName + `","claude_device_id":"` + explicit + `"}`
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/fields", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	ctx.Request = req
+	h.PatchAuthFileFields(ctx)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+
+	// Simulate a restart: a brand new store + manager loading from the same
+	// on-disk auth directory.
+	reloadedStore := fileauth.NewFileTokenStore()
+	reloadedStore.SetBaseDir(authDir)
+	reloadedManager := coreauth.NewManager(reloadedStore, nil, nil)
+	if err := reloadedManager.Load(context.Background()); err != nil {
+		t.Fatalf("reloadedManager.Load: %v", err)
+	}
+	reloaded, ok := reloadedManager.GetByID(fileName)
+	if !ok || reloaded == nil {
+		t.Fatalf("expected reloaded auth record to exist after restart")
+	}
+	if got, _ := reloaded.Metadata[coreauth.ClaudeDeviceIDMetadataKey].(string); got != explicit {
+		t.Fatalf("reloaded metadata.claude_device_id = %q, want %q", got, explicit)
+	}
+	if got := reloaded.Attributes[coreauth.ClaudeDeviceIDAttributeKey]; got != explicit {
+		t.Fatalf("reloaded attributes.claude_device_id = %q, want %q (ApplyRuntimeFieldsFromMetadata must re-hydrate on load)", got, explicit)
+	}
+	if got := runtimehelps.SyntheticDeviceID(authDir, reloaded, ""); got != explicit {
+		t.Fatalf("SyntheticDeviceID() after reload = %q, want explicit override %q", got, explicit)
 	}
 }
 
