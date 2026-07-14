@@ -1,0 +1,220 @@
+name: Upstream Sync
+
+# 每周把上游 router-for-me/CLIProxyAPI 的改动"准备"成可审阅状态,不做无人值守自动合。
+#   - 每次先跑 analyze-upstream-sync.sh 生成三份清单(上游变更/冲突/无冲突语义风险)
+#   - 无冲突 → 在 bot/upstream-sync 分支完成 merge、跑 go test、开/更新 PR(打 upstream-sync label)
+#   - 有冲突 → 开/更新一个 upstream-sync Issue,交人按手工流程解冲突(不 push 半成品红 PR)
+#   - 永不 auto-merge:即使 0 冲突 + go test 绿,也停在等人工 approve
+#
+# 必须用 PAT(UPSTREAM_SYNC_TOKEN,对本仓 contents:write + pull_requests:write + issues:write),
+# 不能用默认 GITHUB_TOKEN——否则自动开的 PR 不会触发本仓 CI(GitHub 防递归限制)。
+
+on:
+  schedule:
+    # 每周一 06:17 UTC(避开整点与其它 cron;GitHub schedule 有固有延迟,属正常)
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: '只生成清单、打印摘要,不 push、不开 PR/Issue'
+        type: boolean
+        default: false
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: read          # 所有写操作走 PAT,不用默认 token
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+      SYNC_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+      SYNC_BRANCH: bot/upstream-sync
+      SYNC_LABEL: upstream-sync
+      UPSTREAM_URL: https://github.com/router-for-me/CLIProxyAPI.git
+      DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Preflight — require PAT
+        run: |
+          if [[ -z "${SYNC_TOKEN}" ]]; then
+            echo "::error::缺少 UPSTREAM_SYNC_TOKEN(需本仓 contents:write + pull_requests:write + issues:write 的 PAT)。" >&2
+            exit 1
+          fi
+
+      - name: Add upstream & fetch
+        run: |
+          git remote add upstream "${UPSTREAM_URL}" 2>/dev/null || git remote set-url upstream "${UPSTREAM_URL}"
+          git fetch upstream --tags --prune
+          git fetch origin --prune
+
+      - name: Analyze upstream sync
+        id: analyze
+        run: |
+          bash scripts/upstream-sync/analyze-upstream-sync.sh \
+            --fork-ref "origin/${DEFAULT_BRANCH}" \
+            --upstream-ref upstream/main \
+            --output "${RUNNER_TEMP}/sync-report.md"
+          # 脚本已把 has_conflict / conflict_count / upstream_ahead / ... append 到 $GITHUB_OUTPUT
+          {
+            echo "### core 上游同步分析"
+            cat "${RUNNER_TEMP}/sync-report.md"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Decide next action
+        id: decide
+        run: |
+          ahead='${{ steps.analyze.outputs.upstream_ahead }}'
+          conflict='${{ steps.analyze.outputs.has_conflict }}'
+          if [[ "${ahead}" == "0" ]]; then
+            echo "action=skip" >> "$GITHUB_OUTPUT"
+            echo "上游无新 commit,本轮跳过。"
+          elif [[ "${DRY_RUN}" == "true" ]]; then
+            echo "action=dryrun" >> "$GITHUB_OUTPUT"
+            echo "dry_run:只生成清单,不产生 PR/Issue。"
+          elif [[ "${conflict}" == "true" ]]; then
+            echo "action=issue" >> "$GITHUB_OUTPUT"
+            echo "有冲突 → 开/更新 Issue 交人工。"
+          else
+            echo "action=pr" >> "$GITHUB_OUTPUT"
+            echo "无冲突 → merge + go test + 开/更新 PR。"
+          fi
+
+      # ---------- 无冲突路径:实际 merge + go test ----------
+      - name: Merge upstream (no-conflict path)
+        id: merge
+        if: steps.decide.outputs.action == 'pr'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -B "${SYNC_BRANCH}" "origin/${DEFAULT_BRANCH}"
+          git merge --no-edit upstream/main
+          echo "merged=true" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Go
+        if: steps.merge.outputs.merged == 'true'
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: go test
+        id: gotest
+        if: steps.merge.outputs.merged == 'true'
+        continue-on-error: true
+        run: |
+          set +e
+          GOTOOLCHAIN=auto go test -timeout 600s ./... 2>&1 | tee "${RUNNER_TEMP}/gotest.log"
+          rc=${PIPESTATUS[0]}
+          echo "gotest_exit=${rc}" >> "$GITHUB_OUTPUT"
+          set -e
+
+      - name: Push sync branch
+        id: push
+        if: steps.merge.outputs.merged == 'true'
+        run: |
+          git config --local --unset-all "http.https://github.com/.extraheader" 2>/dev/null || true
+          git remote set-url origin "https://x-access-token:${SYNC_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          if git ls-remote --exit-code --heads origin "${SYNC_BRANCH}" >/dev/null 2>&1; then
+            git fetch origin "refs/heads/${SYNC_BRANCH}:refs/remotes/origin/${SYNC_BRANCH}" || true
+            git push --force-with-lease origin "${SYNC_BRANCH}"
+          else
+            git push origin "${SYNC_BRANCH}"
+          fi
+
+      - name: Create or update PR
+        if: steps.merge.outputs.merged == 'true'
+        env:
+          # 走 step env 引用,避免上游可控的 tag 名(含 shell 元字符)注入 run bash
+          UPSTREAM_TIP: ${{ steps.analyze.outputs.upstream_tip_desc }}
+          UPSTREAM_AHEAD: ${{ steps.analyze.outputs.upstream_ahead }}
+          GOTEST_EXIT: ${{ steps.gotest.outputs.gotest_exit }}
+        run: |
+          if [[ "${GOTEST_EXIT}" == "0" ]]; then
+            gotest_line="**go test: ✅ 通过**"
+          else
+            gotest_line="**go test: ❌ 失败(exit ${GOTEST_EXIT}),完整日志见本 workflow run**"
+          fi
+          title="chore(upstream-sync): 同步上游至 ${UPSTREAM_TIP} (${UPSTREAM_AHEAD} commit)"
+          {
+            echo "> 🤖 本 PR 由 upstream-sync workflow 自动生成/更新,**不会自动合并**。"
+            echo "> 0 冲突且 go test / AI 审查通过后,仍需人工在此 approve 才可合入。"
+            echo
+            echo "${gotest_line}"
+            echo
+            cat "${RUNNER_TEMP}/sync-report.md"
+          } > "${RUNNER_TEMP}/pr-body.md"
+
+          pr_number="$(gh api "repos/${GITHUB_REPOSITORY}/pulls" --method GET \
+            -f head="${GITHUB_REPOSITORY_OWNER}:${SYNC_BRANCH}" -f state=open \
+            --jq '.[0].number // empty')"
+          if [[ -n "${pr_number}" ]]; then
+            gh api "repos/${GITHUB_REPOSITORY}/pulls/${pr_number}" -X PATCH \
+              -f title="${title}" -f body="$(cat "${RUNNER_TEMP}/pr-body.md")" --jq '.html_url'
+          else
+            pr_number="$(gh api "repos/${GITHUB_REPOSITORY}/pulls" -X POST \
+              -f base="${DEFAULT_BRANCH}" -f head="${SYNC_BRANCH}" \
+              -f title="${title}" -f body="$(cat "${RUNNER_TEMP}/pr-body.md")" --jq '.number')"
+            echo "opened PR #${pr_number}"
+          fi
+          # 必须加 upstream-sync label,否则 translator-path-guard 挡住(合入 internal/translator/**)
+          gh api "repos/${GITHUB_REPOSITORY}/issues/${pr_number}/labels" -f "labels[]=${SYNC_LABEL}" >/dev/null \
+            || echo "::warning::加 ${SYNC_LABEL} label 失败;translator-path-guard 可能保持红,请手动补 label 或重跑 workflow。"
+          # 转为无冲突后,关掉遗留的 open upstream-sync Issue
+          for iss in $(gh api "repos/${GITHUB_REPOSITORY}/issues" --method GET \
+              -f state=open -f labels="${SYNC_LABEL}" \
+              --jq '.[] | select(.pull_request==null) | .number'); do
+            gh api "repos/${GITHUB_REPOSITORY}/issues/${iss}" -X PATCH -f state=closed >/dev/null \
+              && echo "closed stale issue #${iss}"
+          done
+
+      # ---------- 有冲突路径:开/更新 Issue ----------
+      - name: Create or update conflict Issue
+        if: steps.decide.outputs.action == 'issue'
+        env:
+          UPSTREAM_TIP: ${{ steps.analyze.outputs.upstream_tip_desc }}
+          UPSTREAM_AHEAD: ${{ steps.analyze.outputs.upstream_ahead }}
+          CONFLICT_COUNT: ${{ steps.analyze.outputs.conflict_count }}
+        run: |
+          title="[upstream-sync] 上游同步待处理:${CONFLICT_COUNT} 冲突 @ ${UPSTREAM_TIP}"
+          {
+            echo "> 🤖 upstream-sync workflow 检测到上游有 ${UPSTREAM_AHEAD} 个新 commit,"
+            echo "> 直接合并会产生 **${CONFLICT_COUNT} 个冲突**,需人工按流程同步。"
+            echo "> 解冲突参考:core fork 手工同步流程(加 upstream remote → worktree → merge → reconcile → 打 upstream-sync label 开 PR)。"
+            echo
+            cat "${RUNNER_TEMP}/sync-report.md"
+          } > "${RUNNER_TEMP}/issue-body.md"
+
+          issue_number="$(gh api "repos/${GITHUB_REPOSITORY}/issues" --method GET \
+            -f state=open -f labels="${SYNC_LABEL}" \
+            --jq '[.[] | select(.pull_request==null)][0].number // empty')"
+          if [[ -n "${issue_number}" ]]; then
+            gh api "repos/${GITHUB_REPOSITORY}/issues/${issue_number}" -X PATCH \
+              -f title="${title}" -f body="$(cat "${RUNNER_TEMP}/issue-body.md")" --jq '.html_url'
+          else
+            gh api "repos/${GITHUB_REPOSITORY}/issues" -X POST \
+              -f title="${title}" -f body="$(cat "${RUNNER_TEMP}/issue-body.md")" \
+              -f "labels[]=${SYNC_LABEL}" --jq '.html_url'
+          fi
+          # 若存在上一轮无冲突开的 sync PR,提示它已被新上游超越(不自动关,留人判断)
+          stale_pr="$(gh api "repos/${GITHUB_REPOSITORY}/pulls" --method GET \
+            -f head="${GITHUB_REPOSITORY_OWNER}:${SYNC_BRANCH}" -f state=open --jq '.[0].number // empty')"
+          if [[ -n "${stale_pr}" ]]; then
+            gh api "repos/${GITHUB_REPOSITORY}/issues/${stale_pr}/comments" \
+              -f body="⚠️ 上游已前进且本轮检测到冲突,此自动同步 PR 可能已过期,请优先处理最新的 upstream-sync Issue。" >/dev/null || true
+          fi
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "action=${{ steps.decide.outputs.action }} | upstream_ahead=${{ steps.analyze.outputs.upstream_ahead }} | has_conflict=${{ steps.analyze.outputs.has_conflict }} | conflict_count=${{ steps.analyze.outputs.conflict_count }}" >> "$GITHUB_STEP_SUMMARY"
