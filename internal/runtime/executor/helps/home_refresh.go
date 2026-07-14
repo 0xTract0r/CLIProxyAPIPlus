@@ -104,7 +104,36 @@ func RefreshAuthViaHome(ctx context.Context, cfg *config.Config, auth *cliproxya
 	}
 	updated.Index = authIndex
 	updated.EnsureIndex()
+	preserveClaudeDeviceIDAcrossHomeRefresh(updated, auth)
 	return updated, true, nil
+}
+
+// preserveClaudeDeviceIDAcrossHomeRefresh keeps a locally persisted explicit
+// Claude device_id override alive across a Home control-plane refresh. The
+// Home refresh path replaces the local Auth wholesale with whatever the
+// remote payload contains, so a local-only field like the device_id override
+// would otherwise be silently dropped on the very next refresh. If the
+// refreshed payload does not mention the key at all, copy the previous local
+// value forward; if Home explicitly returned the key (including an empty
+// value meaning "cleared"), respect Home's value instead. This is generic
+// across providers: the key is only ever set on Claude accounts, so it is a
+// no-op for every other provider's refresh payload.
+func preserveClaudeDeviceIDAcrossHomeRefresh(updated, original *cliproxyauth.Auth) {
+	if updated == nil || original == nil {
+		return
+	}
+	if _, present := updated.Metadata[cliproxyauth.ClaudeDeviceIDMetadataKey]; present {
+		// Home explicitly returned this key (possibly to clear it); respect it.
+		return
+	}
+	value, ok := original.Metadata[cliproxyauth.ClaudeDeviceIDMetadataKey]
+	if !ok {
+		return
+	}
+	if updated.Metadata == nil {
+		updated.Metadata = make(map[string]any)
+	}
+	updated.Metadata[cliproxyauth.ClaudeDeviceIDMetadataKey] = value
 }
 
 func parseHomeRefreshAuth(raw []byte) (*cliproxyauth.Auth, string, error) {

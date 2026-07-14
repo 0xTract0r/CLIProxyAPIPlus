@@ -118,6 +118,9 @@ func decodeSyntheticDeviceSalt(data []byte) []byte {
 //   - different between distinct upstream accounts,
 //   - opaque and free of PII, and not reversible to the real device.
 func SyntheticDeviceID(authDir string, auth *cliproxyauth.Auth, apiKey string) string {
+	if override := explicitClaudeDeviceID(auth); override != "" {
+		return override
+	}
 	salt := serverSyntheticDeviceSalt(authDir)
 	scopeKey := ClaudeAccountScopeKey(auth, apiKey)
 	h := sha256.New()
@@ -125,6 +128,27 @@ func SyntheticDeviceID(authDir string, auth *cliproxyauth.Auth, apiKey string) s
 	h.Write([]byte("\x00"))
 	h.Write([]byte(scopeKey))
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+// explicitClaudeDeviceID returns the operator-configured device_id override
+// for auth, if one is persisted and valid. It reads Auth.Attributes rather
+// than Auth.Metadata because cliproxyauth.ApplyRuntimeFieldsFromMetadata
+// mirrors auth.Metadata[cliproxyauth.ClaudeDeviceIDMetadataKey] there on
+// every store load (the same hydration mechanism used for proxy_url), and the
+// management API's in-memory patch path keeps Attributes in sync immediately
+// too. Returns "" when no valid override is set, so callers fall back to the
+// synthetic derivation. Both InjectAccountDeviceID and
+// InjectAccountDeviceIDWithOptions derive their device_id via
+// SyntheticDeviceID, so this short-circuit covers all three entry points.
+func explicitClaudeDeviceID(auth *cliproxyauth.Auth) string {
+	if auth == nil || auth.Attributes == nil {
+		return ""
+	}
+	value := strings.TrimSpace(auth.Attributes[cliproxyauth.ClaudeDeviceIDAttributeKey])
+	if !cliproxyauth.IsValidClaudeDeviceID(value) {
+		return ""
+	}
+	return value
 }
 
 // InjectAccountDeviceID rewrites only the device_id inside metadata.user_id with a

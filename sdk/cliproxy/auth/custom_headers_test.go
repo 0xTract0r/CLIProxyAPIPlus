@@ -84,6 +84,60 @@ func TestApplyRuntimeFieldsFromMetadataKeepsExplicitProxyURL(t *testing.T) {
 	}
 }
 
+func TestApplyRuntimeFieldsFromMetadataMirrorsClaudeDeviceID(t *testing.T) {
+	deviceID := "ab12cd34ab12cd34ab12cd34ab12cd34ab12cd34ab12cd34ab12cd34ab12cd34"
+	auth := &Auth{
+		Metadata: map[string]any{
+			ClaudeDeviceIDMetadataKey: deviceID,
+		},
+	}
+
+	ApplyRuntimeFieldsFromMetadata(auth)
+
+	if got := auth.Attributes[ClaudeDeviceIDAttributeKey]; got != deviceID {
+		t.Fatalf("Attributes[claude_device_id] = %q, want %q", got, deviceID)
+	}
+}
+
+func TestApplyRuntimeFieldsFromMetadataIgnoresInvalidClaudeDeviceID(t *testing.T) {
+	auth := &Auth{
+		Metadata: map[string]any{
+			ClaudeDeviceIDMetadataKey: "not-64-hex",
+		},
+	}
+
+	ApplyRuntimeFieldsFromMetadata(auth)
+
+	if _, ok := auth.Attributes[ClaudeDeviceIDAttributeKey]; ok {
+		t.Fatalf("expected claude_device_id attribute absent for invalid override, got %#v", auth.Attributes)
+	}
+}
+
+func TestApplyRuntimeFieldsFromMetadataClearsStaleClaudeDeviceIDWhenMetadataCleared(t *testing.T) {
+	// Simulates a live, already-hydrated Auth object (e.g. re-run via
+	// Manager.Update -> hydrateRuntimeFields on the same pointer) whose
+	// Metadata override was just cleared to an empty string. The previously
+	// mirrored Attributes value must be removed so the account falls back to
+	// the derived synthetic device_id rather than keeping a stale override.
+	auth := &Auth{
+		Metadata: map[string]any{
+			ClaudeDeviceIDMetadataKey: "",
+			// Metadata must stay non-empty for ApplyRuntimeFieldsFromMetadata's
+			// top-level guard to run.
+			"note": "keep-metadata-non-empty",
+		},
+		Attributes: map[string]string{
+			ClaudeDeviceIDAttributeKey: "ab12cd34ab12cd34ab12cd34ab12cd34ab12cd34ab12cd34ab12cd34ab12cd34",
+		},
+	}
+
+	ApplyRuntimeFieldsFromMetadata(auth)
+
+	if _, ok := auth.Attributes[ClaudeDeviceIDAttributeKey]; ok {
+		t.Fatalf("expected stale claude_device_id attribute cleared, got %#v", auth.Attributes)
+	}
+}
+
 type runtimeFieldCaptureExecutor struct {
 	captured *Auth
 }
