@@ -1,0 +1,54 @@
+# core fork 反关联/指纹敏感路径清单
+#
+# 用途:analyze-upstream-sync.sh 用这些 git pathspec 判定"上游改动落在 fork 命脉区"。
+#   - 命中且产生文本冲突 → 最高优先人工解冲突(既冲突又在敏感区)
+#   - 命中但未冲突        → 无冲突语义风险(能自动合但可能悄悄改行为,需 AI/人工核语义)
+#
+# 规则:每行一个 git pathspec;目录以 / 结尾表示整目录;# 开头为注释;空行忽略。
+# 宁可标宽(多几个"需人工核"不是坏事),也不要漏掉反关联核心。
+# 维护:上游若重构导致这些路径迁移,同步更新本清单(与 fork 反关联工作同源)。
+
+# === 反关联/指纹核心:执行器(claude/codex/gemini 出站与设备画像) ===
+internal/runtime/executor/
+
+# === 反关联/指纹核心:claude/codex 认证与 uTLS 传输 ===
+internal/auth/claude/
+internal/auth/codex/
+sdk/auth/codex_device.go
+
+# === 图像生成 strip 决策(fork 与上游默认相反,合并必须核对) ===
+internal/config/disable_image_generation_mode.go
+
+# === 上游大重构、且与 fork 执行器/认证强耦合的核心 SDK 与配置层 ===
+sdk/cliproxy/
+internal/config/config.go
+internal/config/parse.go
+internal/api/handlers/management/
+
+# === 第三方 provider(fork 独有能力,须随上游保留而非被覆盖) ===
+internal/auth/antigravity/
+internal/auth/copilot/
+internal/auth/gitlab/
+internal/auth/kilo/
+internal/auth/kimi/
+internal/auth/kiro/
+internal/translator/antigravity/
+internal/translator/kiro/
+sdk/auth/antigravity.go
+sdk/auth/github_copilot.go
+sdk/auth/gitlab.go
+sdk/auth/kilo.go
+sdk/auth/kimi.go
+sdk/auth/kiro.go
+
+# === translator 转 claude/codex 适配(各 provider→claude/codex 的反关联相关转换) ===
+# (antigravity/ 与 kiro/ 已由上面整目录覆盖)
+internal/translator/openai/claude/
+internal/translator/gemini/claude/
+internal/translator/gemini-cli/claude/
+internal/translator/codex/claude/
+
+# === 归因/指纹/头处理散落文件(名字即反关联核心) ===
+internal/cmd/auth_token_fingerprint.go
+internal/util/claude_attribution.go
+internal/misc/header_utils.go
