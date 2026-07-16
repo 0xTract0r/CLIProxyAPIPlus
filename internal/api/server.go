@@ -285,7 +285,18 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	if optionState.localPassword != "" {
 		s.mgmt.SetLocalPassword(optionState.localPassword)
 	}
+	// Resolve the reader-side log directory the same way the writer does
+	// (defaultRequestLoggerFactory / NewFileRequestLogger): when the resolved
+	// directory is relative, anchor it to the config file's directory rather
+	// than the process working directory. Without this, the reader falls back
+	// to <cwd>/logs while the writer writes to <configDir>/logs, so lookups
+	// such as GET /request-log-by-id/{id} always 404 when cwd != configDir.
+	// When WRITABLE_PATH is set, ResolveLogDirectory returns an absolute path
+	// and this join is skipped, preserving already-correct deployments.
 	logDir := logging.ResolveLogDirectory(cfg)
+	if !filepath.IsAbs(logDir) {
+		logDir = filepath.Join(filepath.Dir(configFilePath), logDir)
+	}
 	s.mgmt.SetLogDirectory(logDir)
 	if optionState.postAuthHook != nil {
 		s.mgmt.SetPostAuthHook(optionState.postAuthHook)
