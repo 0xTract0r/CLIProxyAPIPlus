@@ -427,6 +427,12 @@ func TestApplyClaudeHeaders_UpgradesCachedSoftwareFingerprintWhenBaselineAdvance
 // "claude --print" / SDK request (UA suffix "(external, sdk-cli)") would keep
 // emitting "sdk-cli" on every later interactive request even though that request's
 // cc_entrypoint is "cli" — a UA/entrypoint pair real claude-code never produces.
+//
+// telemetry-farm-ux-hardening T4 scope A: with the default config (cfg.Claude
+// here is the zero value, so config.NormalizeSdkCliEntrypointEnabled(cfg) ==
+// true), a "sdk-cli" inbound entrypoint is additionally folded to "cli" — see
+// the first (seed) request below, which now emits "(external, cli)" instead of
+// mirroring "(external, sdk-cli)" verbatim.
 func TestApplyClaudeHeaders_AlignsUserAgentSuffixWithInboundEntrypoint(t *testing.T) {
 	resetClaudeDeviceProfileCache()
 	stabilize := true
@@ -449,8 +455,10 @@ func TestApplyClaudeHeaders_AlignsUserAgentSuffixWithInboundEntrypoint(t *testin
 	}
 
 	// First request is a "claude --print" / SDK invocation: it seeds the per-account
-	// high-water device profile with a high version AND the sdk-cli entrypoint
-	// suffix. The outbound suffix on this request mirrors the inbound sdk-cli.
+	// high-water device profile with a high version AND (pre-T4) the sdk-cli
+	// entrypoint suffix. With the default sdk-cli normalization on, the outbound
+	// suffix on this request is folded to "(external, cli)" instead of mirroring
+	// the inbound "sdk-cli" verbatim.
 	sdkSeedReq := newClaudeHeaderTestRequest(t, http.Header{
 		"User-Agent":                  []string{"claude-cli/2.1.180 (external, sdk-cli)"},
 		"X-Stainless-Package-Version": []string{"0.90.0"},
@@ -459,9 +467,9 @@ func TestApplyClaudeHeaders_AlignsUserAgentSuffixWithInboundEntrypoint(t *testin
 		"X-Stainless-Arch":            []string{"x64"},
 	})
 	applyClaudeHeaders(sdkSeedReq, auth, "key-ua-suffix-align", false, nil, cfg)
-	// High-water version 2.1.180 adopted; OS/Arch pinned to baseline; suffix mirrors
-	// this request's sdk-cli inbound.
-	assertClaudeFingerprint(t, sdkSeedReq.Header, "claude-cli/2.1.180 (external, sdk-cli)", "0.90.0", "v24.9.0", "MacOS", "arm64")
+	// High-water version 2.1.180 adopted; OS/Arch pinned to baseline; suffix folds
+	// this request's sdk-cli inbound to cli (T4 scope A normalization).
+	assertClaudeFingerprint(t, sdkSeedReq.Header, "claude-cli/2.1.180 (external, cli)", "0.90.0", "v24.9.0", "MacOS", "arm64")
 
 	// Second request is an interactive TUI invocation at a LOWER version with the
 	// cli entrypoint. The version stays at the 2.1.180 high-water mark (only-up),
@@ -1559,6 +1567,108 @@ func TestClaudeExecutor_OutboundUserAgentSuffixMatchesCCEntrypoint(t *testing.T)
 	// High-water version is still emitted in the billing header.
 	if got := billingVersionFromBody(t, captured.body); got != "2.1.180" {
 		t.Fatalf("billing cc_version = %q, want %q", got, "2.1.180")
+	}
+}
+
+// TestClaudeExecutor_MessagesEntrypointMatchesUserAgentInAutoCloakMode is the
+// end-to-end (full Execute) regression for the T4 scope A HIGH gap that the
+// "always" cloak-mode test above masked: in the DEFAULT "auto" cloak mode a real
+// claude-cli client bypasses cloak system-block regeneration (helps.ShouldCloak
+// is false), so its inbound x-anthropic-billing-header — self-tagged
+// cc_entrypoint=sdk-cli by a `claude -p` / Agent SDK invocation — used to be
+// forwarded verbatim (signAnthropicMessagesBody only recomputes cch) while the
+// outbound UA suffix was folded to "cli". That divergence (UA=cli, body=sdk-cli)
+// is a pair real claude-code never emits. With normalizeClaudeBillingEntrypoint
+// wired into the messages path the outbound UA suffix and the body cc_entrypoint
+// must both be "cli"; disabling the switch restores the (self-consistent) pre-T4
+// verbatim behavior.
+func TestClaudeExecutor_MessagesEntrypointMatchesUserAgentInAutoCloakMode(t *testing.T) {
+	stabilize := true
+	// Inbound "claude -p" traffic: both the UA suffix and the body billing header
+	// self-report the disallowed "sdk-cli" entrypoint.
+	inboundUA := "claude-cli/2.1.180 (external, sdk-cli)"
+	payload := []byte(`{"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.63.abc; cc_entrypoint=sdk-cli; cch=12345;"},{"type":"text","text":"existing"}],"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
+
+	runOnce := func(t *testing.T, cfg *config.Config, authID string) capturedRequestForBilling {
+		t.Helper()
+		resetClaudeDeviceProfileCache()
+		var captured capturedRequestForBilling
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			body, _ := io.ReadAll(r.Body)
+			captured = capturedRequestForBilling{body: bytes.Clone(body), userAgent: r.Header.Get("User-Agent")}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","model":"claude-sonnet-4-6","role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1,"output_tokens":1}}`))
+		}))
+		defer server.Close()
+
+		executor := NewClaudeExecutor(cfg)
+		auth := &cliproxyauth.Auth{ProxyURL: "direct",
+			ID: authID,
+			Attributes: map[string]string{
+				"api_key":     "sk-ant-oat-test",
+				"base_url":    server.URL,
+				"cloak_mode":  "auto", // real claude-cli clients are intentionally NOT cloaked here
+				"tool_prefix": "disabled",
+			},
+		}
+		ctx := contextWithGinHeaders(map[string]string{
+			"User-Agent":                  inboundUA,
+			"X-Stainless-Package-Version": "0.90.0",
+			"X-Stainless-Runtime-Version": "v24.9.0",
+			"X-Stainless-Os":              "Linux",
+			"X-Stainless-Arch":            "x64",
+		})
+		if _, err := executor.Execute(ctx, auth, cliproxyexecutor.Request{
+			Model:   "claude-sonnet-4-6",
+			Payload: payload,
+		}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")}); err != nil {
+			t.Fatalf("Execute() error = %v", err)
+		}
+		return captured
+	}
+
+	baselineHeaders := config.ClaudeHeaderDefaults{
+		UserAgent:              "claude-cli/2.1.70 (external, cli)",
+		PackageVersion:         "0.80.0",
+		RuntimeVersion:         "v24.5.0",
+		OS:                     "MacOS",
+		Arch:                   "arm64",
+		StabilizeDeviceProfile: &stabilize,
+	}
+
+	// Default config (config.NormalizeSdkCliEntrypointEnabled == true): the
+	// verbatim messages path folds the inbound sdk-cli billing header to cli.
+	captured := runOnce(t, &config.Config{ClaudeHeaderDefaults: baselineHeaders}, "auth-auto-entrypoint-e2e")
+	uaEntrypoint := userAgentSuffixEntrypoint(captured.userAgent)
+	ccEntrypoint := billingEntrypointFromBody(t, captured.body)
+	if uaEntrypoint != "cli" {
+		t.Fatalf("outbound UA suffix entrypoint = %q, want cli (UA=%q)", uaEntrypoint, captured.userAgent)
+	}
+	if ccEntrypoint != "cli" {
+		t.Fatalf("billing cc_entrypoint = %q, want cli (verbatim messages path not folded)", ccEntrypoint)
+	}
+	// The core invariant: outbound UA suffix == cc_entrypoint on the auto-mode
+	// messages path (no divergence).
+	if uaEntrypoint != ccEntrypoint {
+		t.Fatalf("UA suffix entrypoint %q != cc_entrypoint %q; anti-correlation mismatch on auto-mode messages path", uaEntrypoint, ccEntrypoint)
+	}
+
+	// Rollback: with normalization disabled the messages path mirrors the inbound
+	// sdk-cli entrypoint verbatim on BOTH the UA suffix and the body, restoring the
+	// pre-T4 self-consistent behavior.
+	disabled := false
+	cfgOff := &config.Config{ClaudeHeaderDefaults: baselineHeaders, Claude: config.ClaudeConfig{NormalizeSdkCliEntrypoint: &disabled}}
+	capturedOff := runOnce(t, cfgOff, "auth-auto-entrypoint-e2e-off")
+	uaOff := userAgentSuffixEntrypoint(capturedOff.userAgent)
+	ccOff := billingEntrypointFromBody(t, capturedOff.body)
+	if ccOff != "sdk-cli" {
+		t.Fatalf("normalization disabled: billing cc_entrypoint = %q, want verbatim sdk-cli", ccOff)
+	}
+	if uaOff != "sdk-cli" {
+		t.Fatalf("normalization disabled: UA suffix entrypoint = %q, want verbatim sdk-cli", uaOff)
+	}
+	if uaOff != ccOff {
+		t.Fatalf("normalization disabled: UA suffix %q != cc_entrypoint %q", uaOff, ccOff)
 	}
 }
 

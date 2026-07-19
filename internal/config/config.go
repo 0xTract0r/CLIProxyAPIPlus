@@ -267,6 +267,25 @@ type ClaudeConfig struct {
 	// 200K window are handled. Recognized values:
 	// fail_with_hint, route_to_opus_1m, compact_required.
 	SonnetLongContextPolicy string `yaml:"sonnet_long_context_policy" json:"sonnet_long_context_policy"`
+
+	// NormalizeSdkCliEntrypoint controls whether outbound Claude requests fold an
+	// inbound "sdk-cli" cc_entrypoint into "cli" before it reaches Anthropic. Real
+	// interactive claude-cli always emits cc_entrypoint=cli; "sdk-cli" is the
+	// self-reported entrypoint tag emitted by Claude Agent SDK / `claude -p`
+	// non-interactive invocations, and Anthropic policy disallows Agent SDK usage
+	// against subscription OAuth. The fold is applied identically to the outbound
+	// User-Agent parenthetical suffix (helps.AlignClaudeDeviceProfileUserAgentSuffix)
+	// and the billing-header cc_entrypoint (parseEntrypointFromUA in
+	// claude_executor.go) so the two never diverge (a UA/entrypoint mismatch is
+	// itself a detectable signal real claude-code never produces). Only the exact
+	// "sdk-cli" token is folded; every other entrypoint (cli, vscode, ide, ...) is
+	// left untouched.
+	//
+	// Defaults to enabled (nil == true) so `claude -p` / Agent SDK traffic is
+	// normalized out of the box without requiring config changes. Set to false to
+	// restore the previous "mirror inbound entrypoint verbatim" behavior, e.g. for
+	// rollback.
+	NormalizeSdkCliEntrypoint *bool `yaml:"normalize-sdk-cli-entrypoint,omitempty" json:"normalize-sdk-cli-entrypoint,omitempty"`
 }
 
 // CodexHeaderDefaults configures fallback header values injected into Codex
@@ -1158,6 +1177,20 @@ func NormalizeAccountEnvEnabled(cfg *Config) bool {
 	return cfg != nil &&
 		cfg.NormalizeAccountEnv != nil &&
 		*cfg.NormalizeAccountEnv
+}
+
+// NormalizeSdkCliEntrypointEnabled reports whether the sdk-cli→cli
+// cc_entrypoint normalization (see ClaudeConfig.NormalizeSdkCliEntrypoint) is
+// active. Unlike NormalizeAccountEnvEnabled, this defaults to true (enabled)
+// when the pointer is unset, so a stock config normalizes Agent SDK /
+// `claude -p` traffic without an explicit opt-in. Set
+// claude.normalize-sdk-cli-entrypoint: false to opt out and restore the
+// previous "mirror inbound entrypoint verbatim" behavior.
+func NormalizeSdkCliEntrypointEnabled(cfg *Config) bool {
+	if cfg == nil || cfg.Claude.NormalizeSdkCliEntrypoint == nil {
+		return true
+	}
+	return *cfg.Claude.NormalizeSdkCliEntrypoint
 }
 
 func ManagedHeaderProfileFetchTimeout(cfg *Config) int {
