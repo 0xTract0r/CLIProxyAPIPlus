@@ -8,6 +8,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
 func writeStubAuthFile(path string) error {
@@ -405,6 +406,95 @@ func TestSaveTokenRecord_ClearsAutomaticReauthLockOnReauth(t *testing.T) {
 	}
 	if record.RefreshDisabled() {
 		t.Fatalf("RefreshDisabled() = true after reauth, want false (automatic refresh should resume)")
+	}
+}
+
+// TestSaveTokenRecord_ClearsAutoQuarantineOnReauth asserts the T3
+// (telemetry-farm-ux-hardening) recovery path: a completed reauth is the
+// designated way to break out of core's automatic terminal-auth quarantine
+// (AutoQuarantined; see markAutoQuarantine/clearAutoQuarantine in
+// sdk/cliproxy/auth/conductor.go). Once quarantined, the selector skips the
+// credential entirely, so it can never accumulate a fresh "real successful
+// request" to lift the lock on its own -- saveTokenRecord's unconditional
+// record.ClearAutoQuarantine() call is what actually breaks that deadlock.
+// This must hold even though the account is already registered with the
+// manager before saveTokenRecord runs (the record.ID/FileName match the
+// quarantined entry), so the selector can immediately pick it again.
+func TestSaveTokenRecord_ClearsAutoQuarantineOnReauth(t *testing.T) {
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	previous := &coreauth.Auth{
+		ID:            "claude-user@example.com.json",
+		FileName:      "claude-user@example.com.json",
+		Provider:      "claude",
+		ProxyURL:      "http://proxy.local:7897",
+		Status:        coreauth.StatusQuarantined,
+		StatusMessage: "auto_quarantined: repeated authentication failures, credential needs re-authentication",
+		Unavailable:   true,
+		Metadata: map[string]any{
+			"type":  "claude",
+			"email": "user@example.com",
+			"note":  "managed account",
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), previous); errRegister != nil {
+		t.Fatalf("failed to register previous auth: %v", errRegister)
+	}
+	// Simulate markAutoQuarantine having fired on the live entry (mirrors
+	// conductor_auto_quarantine_test.go's TestManagerMarkResult flow), rather
+	// than hand-setting the unexported fields directly.
+	manager.MarkResult(context.Background(), coreauth.Result{
+		AuthID: "claude-user@example.com.json", Provider: "claude", Success: false,
+		Error: &coreauth.Error{HTTPStatus: 401, Message: `{"type":"error","error":{"type":"authentication_error","message":"OAuth access token has been revoked."}}`},
+	})
+	manager.MarkResult(context.Background(), coreauth.Result{
+		AuthID: "claude-user@example.com.json", Provider: "claude", Success: false,
+		Error: &coreauth.Error{HTTPStatus: 401, Message: `{"type":"error","error":{"type":"authentication_error","message":"OAuth access token has been revoked."}}`},
+	})
+	quarantined, ok := manager.GetByID("claude-user@example.com.json")
+	if !ok || quarantined == nil || !quarantined.AutoQuarantined {
+		t.Fatalf("precondition failed: auth not quarantined before reauth, got=%+v ok=%v", quarantined, ok)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+	h.tokenStore = store
+
+	record := &coreauth.Auth{
+		ID:       "claude-user@example.com.json",
+		FileName: "claude-user@example.com.json",
+		Provider: "claude",
+		Metadata: map[string]any{
+			"type":          "claude",
+			"email":         "user@example.com",
+			"access_token":  "NEW_TOKEN",
+			"refresh_token": "NEW_REFRESH",
+		},
+	}
+	if _, errSave := h.saveTokenRecord(context.Background(), record); errSave != nil {
+		t.Fatalf("saveTokenRecord returned error: %v", errSave)
+	}
+
+	if record.AutoQuarantined {
+		t.Fatalf("record.AutoQuarantined = true after saveTokenRecord, want false")
+	}
+	if record.QuarantineReason != "" {
+		t.Fatalf("record.QuarantineReason = %q, want empty", record.QuarantineReason)
+	}
+	if !record.QuarantinedAt.IsZero() {
+		t.Fatalf("record.QuarantinedAt = %v, want zero", record.QuarantinedAt)
+	}
+
+	// The account must be immediately re-selectable: the whole point of
+	// clearing AutoQuarantined here is to break the deadlock where a
+	// quarantined credential can never accumulate a fresh successful request
+	// on its own because the selector skips it entirely.
+	selector := &coreauth.FillFirstSelector{}
+	picked, errPick := selector.Pick(context.Background(), "claude", "", cliproxyexecutor.Options{}, []*coreauth.Auth{record})
+	if errPick != nil {
+		t.Fatalf("selector.Pick returned error after reauth: %v", errPick)
+	}
+	if picked == nil || picked.ID != record.ID {
+		t.Fatalf("selector.Pick() = %+v, want the reauthed record selectable again", picked)
 	}
 }
 

@@ -97,6 +97,27 @@ type Auth struct {
 	// LastCyberPolicyAt records the timestamp of the most recent cyber_policy hit.
 	LastCyberPolicyAt time.Time `json:"last_cyber_policy_at,omitempty"`
 
+	// AutoQuarantined marks that this credential was automatically quarantined
+	// by the auth manager after repeated terminal authentication failures
+	// (e.g. a revoked OAuth token producing HTTP 401 authentication_error)
+	// within a short rolling window with zero intervening successes. It is
+	// the canonical gating flag consulted by the selector/scheduler and is
+	// intentionally distinct from the operator-controlled Disabled flag:
+	// operators must explicitly flip Disabled and core never auto-clears it,
+	// whereas AutoQuarantined is a heuristic safety net that core lifts by
+	// itself the moment this credential is re-authenticated (see
+	// saveTokenRecord in the management API) or produces a real successful
+	// request (see MarkResult). See markAutoQuarantine / clearAutoQuarantine
+	// in conductor.go.
+	AutoQuarantined bool `json:"auto_quarantined,omitempty"`
+	// QuarantineReason is a short, sanitized classification code describing
+	// why AutoQuarantined was set (e.g. "terminal_auth_failure"). It never
+	// echoes raw upstream error bodies, mirroring the sanitization used for
+	// terminal refresh failures elsewhere in this file.
+	QuarantineReason string `json:"quarantine_reason,omitempty"`
+	// QuarantinedAt records when AutoQuarantined was most recently set.
+	QuarantinedAt time.Time `json:"quarantined_at,omitempty"`
+
 	// Runtime carries non-serialisable data used during execution (in-memory only).
 	Runtime any `json:"-"`
 
@@ -105,6 +126,50 @@ type Auth struct {
 
 	recentRequests recentRequestRing `json:"-"`
 	indexAssigned  bool              `json:"-"`
+
+	// terminalAuthFailureStreak / terminalAuthFailureStreakStartAt track a
+	// rolling in-memory streak of terminal auth/permission failures (see
+	// isTerminalAuthQuarantineResultError) with zero intervening successes.
+	// They are intentionally not persisted (like Success/Failed above): a
+	// process restart simply starts the streak fresh, which is a strict
+	// safety bias (never quarantines more eagerly than a live process would).
+	// Once AutoQuarantined is set it IS persisted, so the quarantine itself
+	// survives restarts even though the streak bookkeeping does not.
+	terminalAuthFailureStreak        int       `json:"-"`
+	terminalAuthFailureStreakStartAt time.Time `json:"-"`
+
+	// quarantineStateAt is an in-memory-only (never persisted) freshness clock
+	// for the AutoQuarantined lock: markAutoQuarantine/clearAutoQuarantine
+	// always stamp it to the real wall-clock time they run at, whether or not
+	// the lock's value actually changed. Unlike QuarantinedAt (which is
+	// exported/persisted and intentionally zeroed on every clear, so it can
+	// only ever mean "currently active since"), this field only ever moves
+	// forward and survives Clone unchanged -- exactly like LastRefreshedAt
+	// does for token freshness (see tokenOwnedFreshness). Manager.Update's
+	// stale write-back guard (preserveQuarantineFieldsOnStaleWriteback in
+	// conductor.go) compares it against the live entry's own value to tell
+	// "this record's quarantine fields are at least as current as the live
+	// entry's" apart from "this is a clone that predates a concurrent
+	// mark/clear" -- both a stale unaware clone and a legitimate clear reach
+	// byte-identical zero-value AutoQuarantined/QuarantineReason/QuarantinedAt,
+	// so a real timestamp comparison is the only reliable way to tell them
+	// apart.
+	quarantineStateAt time.Time `json:"-"`
+}
+
+// ClearAutoQuarantine releases the automatic quarantine lock set by
+// markAutoQuarantine after repeated terminal authentication failures. It is
+// exported so operator-facing recovery actions outside this package (a
+// completed OAuth re-auth save, or an explicit re-enable via the management
+// API) can lift the lock the instant they represent a legitimate "give this
+// credential another chance" signal, without waiting for a live proxied
+// request to succeed through MarkResult (which would never happen on its own
+// since a quarantined credential is skipped by the selector).
+func (a *Auth) ClearAutoQuarantine() {
+	if a == nil {
+		return
+	}
+	clearAutoQuarantine(a, time.Now())
 }
 
 const (
@@ -247,6 +312,11 @@ func (a *Auth) Clone() *Auth {
 		}
 	}
 	copyAuth.Runtime = a.Runtime
+	// quarantineStateAt is a plain value copy (like LastRefreshedAt): it must
+	// survive Clone unchanged so an internal re-clone within the same request
+	// (e.g. syncAuthManagedHeaderState) does not lose the freshness signal
+	// preserveQuarantineFieldsOnStaleWriteback relies on. See its field
+	// comment above.
 	return &copyAuth
 }
 

@@ -16,4 +16,11 @@ const (
 	StatusError Status = "error"
 	// StatusDisabled marks the auth as intentionally disabled.
 	StatusDisabled Status = "disabled"
+	// StatusQuarantined marks the auth as automatically quarantined by the
+	// auth manager after repeated terminal authentication failures (e.g. a
+	// revoked OAuth token). It is distinct from StatusDisabled: the operator
+	// never chose this, and it is automatically lifted the moment the
+	// credential is re-authenticated or produces a real successful request.
+	// See Auth.AutoQuarantined.
+	StatusQuarantined Status = "quarantined"
 )
