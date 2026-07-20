@@ -970,6 +970,13 @@ func (e *ClaudeExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (
 		return auth, nil
 	}
 	svc := claudeauth.NewClaudeAuthWithProxyURL(e.cfg, auth.ProxyURL)
+	// Raise the OAuth refresh User-Agent to this account's persisted
+	// device-profile high-water mark (when present) so background token
+	// refresh matches the same claude-cli identity this account's serving
+	// requests present, instead of the generic claudeOAuthUserAgent floor.
+	if hw, ok := cliproxyauth.ClaudeDeviceHighWaterFromMetadata(auth.Metadata); ok && strings.TrimSpace(hw.UserAgent) != "" {
+		svc = svc.WithUserAgent(hw.UserAgent)
+	}
 	td, err := svc.RefreshTokensWithRetry(ctx, refreshToken, 3)
 	if err != nil {
 		return nil, err

@@ -4514,12 +4514,32 @@ func buildClaudeOAuthTokenRecord(target *coreauth.Auth, tokenStorage *claude.Cla
 	return record
 }
 
+// claudeReauthHighWaterUserAgent returns the persisted claude device-profile
+// high-water User-Agent for target, or "" when target has no usable
+// high-water metadata yet (e.g. a brand-new account with no prior serving
+// observation). Callers pass the result to ClaudeAuth.WithUserAgent, which
+// no-ops on an empty value and leaves the constructor's floor untouched.
+func claudeReauthHighWaterUserAgent(target *coreauth.Auth) string {
+	if target == nil {
+		return ""
+	}
+	hw, ok := coreauth.ClaudeDeviceHighWaterFromMetadata(target.Metadata)
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(hw.UserAgent)
+}
+
 func (h *Handler) newClaudeOAuthAuth(ctx context.Context, target *coreauth.Auth) *claude.ClaudeAuth {
 	if target == nil {
 		return claude.NewClaudeAuth(h.cfg)
 	}
 	client := h.oauthIdentityHTTPClient(ctx, "api.anthropic.com", target, anthropicOAuthExchangeTimeout)
-	return claude.NewClaudeAuthWithHTTPClient(client)
+	// Raise the reauth User-Agent to this account's persisted device-profile
+	// high-water mark (when present) so the OAuth exchange/refresh presents
+	// the same claude-cli identity this account's serving requests use,
+	// instead of falling back to the generic claudeOAuthUserAgent floor.
+	return claude.NewClaudeAuthWithHTTPClient(client).WithUserAgent(claudeReauthHighWaterUserAgent(target))
 }
 
 func (h *Handler) newClaudeOAuthAccountProxyFallbackAuth(target *coreauth.Auth) *claude.ClaudeAuth {
@@ -4530,7 +4550,7 @@ func (h *Handler) newClaudeOAuthAccountProxyFallbackAuth(target *coreauth.Auth) 
 	if proxyURL == "" {
 		return nil
 	}
-	return claude.NewClaudeAuthWithProxyURL(h.cfg, proxyURL)
+	return claude.NewClaudeAuthWithProxyURL(h.cfg, proxyURL).WithUserAgent(claudeReauthHighWaterUserAgent(target))
 }
 
 func (h *Handler) claudeOAuthTransportSummary(target *coreauth.Auth) map[string]string {
