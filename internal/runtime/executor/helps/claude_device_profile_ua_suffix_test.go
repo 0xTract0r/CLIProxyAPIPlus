@@ -4,6 +4,8 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 )
 
 // TestAlignClaudeDeviceProfileUserAgentSuffix_MirrorsInboundEntrypoint pins the
@@ -13,6 +15,13 @@ import (
 // the fix for the de-anonymizing mismatch where a frozen device profile seeded by
 // "claude --print" emits "(external, sdk-cli)" but cc_entrypoint (derived from the
 // same inbound UA) is "cli" — a pair real claude-code never produces.
+//
+// telemetry-farm-ux-hardening T4 scope A: with the default config (nil == sdk-cli
+// normalization enabled), an inbound "sdk-cli" entrypoint (Claude Agent SDK /
+// `claude -p` self-tagging, disallowed by Anthropic policy against subscription
+// OAuth) is additionally folded to "cli" here, matching the fold
+// parseEntrypointFromUA applies to cc_entrypoint, so the outbound UA suffix and
+// cc_entrypoint stay paired even for sdk-cli-tagged inbound traffic.
 func TestAlignClaudeDeviceProfileUserAgentSuffix_MirrorsInboundEntrypoint(t *testing.T) {
 	cases := []struct {
 		name        string
@@ -29,11 +38,11 @@ func TestAlignClaudeDeviceProfileUserAgentSuffix_MirrorsInboundEntrypoint(t *tes
 			wantEntrypt: "cli",
 		},
 		{
-			name:        "inbound sdk-cli yields sdk-cli outbound suffix",
+			name:        "inbound sdk-cli folded to cli outbound suffix by default normalization",
 			outboundUA:  "claude-cli/2.1.180 (external, cli)",
 			inboundUA:   "claude-cli/2.1.63 (external, sdk-cli)",
-			wantUA:      "claude-cli/2.1.180 (external, sdk-cli)",
-			wantEntrypt: "sdk-cli",
+			wantUA:      "claude-cli/2.1.180 (external, cli)",
+			wantEntrypt: "cli",
 		},
 		{
 			name:        "inbound vscode entrypoint mirrored",
@@ -62,7 +71,9 @@ func TestAlignClaudeDeviceProfileUserAgentSuffix_MirrorsInboundEntrypoint(t *tes
 		t.Run(tc.name, func(t *testing.T) {
 			r := &http.Request{Header: http.Header{}}
 			r.Header.Set("User-Agent", tc.outboundUA)
-			AlignClaudeDeviceProfileUserAgentSuffix(r, tc.inboundUA)
+			// nil cfg exercises the documented default: sdk-cli normalization
+			// enabled (config.NormalizeSdkCliEntrypointEnabled(nil) == true).
+			AlignClaudeDeviceProfileUserAgentSuffix(nil, r, tc.inboundUA)
 			got := r.Header.Get("User-Agent")
 			if got != tc.wantUA {
 				t.Fatalf("outbound User-Agent = %q, want %q", got, tc.wantUA)
@@ -77,13 +88,42 @@ func TestAlignClaudeDeviceProfileUserAgentSuffix_MirrorsInboundEntrypoint(t *tes
 	}
 }
 
+// TestAlignClaudeDeviceProfileUserAgentSuffix_SdkCliNormalizationToggle pins the
+// config.Claude.NormalizeSdkCliEntrypoint escape hatch: when explicitly disabled,
+// an inbound "sdk-cli" entrypoint is mirrored verbatim (the pre-T4 behavior)
+// instead of being folded to "cli".
+func TestAlignClaudeDeviceProfileUserAgentSuffix_SdkCliNormalizationToggle(t *testing.T) {
+	disabled := false
+	cfg := &config.Config{Claude: config.ClaudeConfig{NormalizeSdkCliEntrypoint: &disabled}}
+
+	r := &http.Request{Header: http.Header{}}
+	r.Header.Set("User-Agent", "claude-cli/2.1.180 (external, cli)")
+	AlignClaudeDeviceProfileUserAgentSuffix(cfg, r, "claude-cli/2.1.63 (external, sdk-cli)")
+
+	want := "claude-cli/2.1.180 (external, sdk-cli)"
+	if got := r.Header.Get("User-Agent"); got != want {
+		t.Fatalf("outbound User-Agent with normalization disabled = %q, want %q", got, want)
+	}
+
+	enabled := true
+	cfg = &config.Config{Claude: config.ClaudeConfig{NormalizeSdkCliEntrypoint: &enabled}}
+	r = &http.Request{Header: http.Header{}}
+	r.Header.Set("User-Agent", "claude-cli/2.1.180 (external, cli)")
+	AlignClaudeDeviceProfileUserAgentSuffix(cfg, r, "claude-cli/2.1.63 (external, sdk-cli)")
+
+	want = "claude-cli/2.1.180 (external, cli)"
+	if got := r.Header.Get("User-Agent"); got != want {
+		t.Fatalf("outbound User-Agent with normalization explicitly enabled = %q, want %q", got, want)
+	}
+}
+
 // TestAlignClaudeDeviceProfileUserAgentSuffix_NonClaudeOutboundUntouched ensures a
 // non-claude outbound UA (e.g. an operator/api-key path that did not emit a
 // claude-cli UA) is left as-is so the alignment never fabricates a claude suffix.
 func TestAlignClaudeDeviceProfileUserAgentSuffix_NonClaudeOutboundUntouched(t *testing.T) {
 	r := &http.Request{Header: http.Header{}}
 	r.Header.Set("User-Agent", "my-gateway/1.0")
-	AlignClaudeDeviceProfileUserAgentSuffix(r, "claude-cli/2.1.63 (external, cli)")
+	AlignClaudeDeviceProfileUserAgentSuffix(nil, r, "claude-cli/2.1.63 (external, cli)")
 	if got := r.Header.Get("User-Agent"); got != "my-gateway/1.0" {
 		t.Fatalf("non-claude outbound User-Agent = %q, want unchanged", got)
 	}

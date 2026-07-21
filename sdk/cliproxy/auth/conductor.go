@@ -91,6 +91,25 @@ const (
 	// 429 responses (e.g. model capacity, TPM bursts) so other auths can be tried
 	// while this one recovers within a short window.
 	transientRateLimitCooldown = time.Minute
+	// authAutoQuarantineWindow is the rolling window used to detect a terminal
+	// auth/permission failure streak with zero successes in between (see
+	// evaluateAutoQuarantineLocked). It sits in the middle of the reviewed
+	// 30-60 minute range: long enough to tolerate a couple of low-frequency
+	// probe cycles (e.g. a telemetry-farm keepalive firing every ~30-90min)
+	// without over-reacting to a single flaky 401, short enough that a truly
+	// revoked-token account is quarantined well before it accumulates a large
+	// amount of wasted 30-minute cooldown/retry cycles.
+	authAutoQuarantineWindow = 45 * time.Minute
+	// authAutoQuarantineFailureThreshold is the minimum number of terminal
+	// auth failures (with zero successes in between) inside
+	// authAutoQuarantineWindow before the credential is automatically
+	// quarantined.
+	authAutoQuarantineFailureThreshold = 2
+	// quarantineReasonTerminalAuthFailure is the sanitized classification code
+	// persisted as Auth.QuarantineReason. It never echoes the raw upstream
+	// error body (which is not guaranteed to be free of sensitive content),
+	// mirroring the sanitization already used for terminal refresh failures.
+	quarantineReasonTerminalAuthFailure = "terminal_auth_failure"
 )
 
 var quotaCooldownDisabled atomic.Bool
@@ -1268,6 +1287,15 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	// non-token metadata changes.
 	if preserveNewerTokenOwnedFields(auth, existing) {
 		logEntryWithRequestID(ctx).WithField("auth_id", auth.ID).Warn("auth update carried stale token-owned fields; preserved newer stored token state")
+	}
+	// Guard against a stale write-back silently rolling back the automatic
+	// terminal-auth quarantine lock (T3, see markAutoQuarantine /
+	// clearAutoQuarantine / preserveQuarantineFieldsOnStaleWriteback above): a
+	// caller that cloned this auth before a concurrent MarkResult quarantined
+	// it would otherwise wholesale-overwrite the live entry with its unaware
+	// zero-value quarantine fields.
+	if preserveQuarantineFieldsOnStaleWriteback(auth, existing) {
+		logEntryWithRequestID(ctx).WithField("auth_id", auth.ID).Warn("auth update carried stale auto-quarantine fields; preserved live quarantine state")
 	}
 	auth.EnsureIndex()
 	authClone := auth.Clone()
@@ -2885,6 +2913,15 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			}
 		}
 
+		// Evaluate the terminal-auth-failure quarantine window last, after all
+		// the status/state mutations above (both the per-model and the
+		// auth-level branches), so it is always the final word for this call
+		// and can never be silently overwritten by the generic
+		// "auth.Status = StatusError" writes those branches perform for every
+		// kind of failure. See evaluateAutoQuarantineLocked for the recovery
+		// guarantee (a real success always lifts an existing quarantine).
+		m.evaluateAutoQuarantineLocked(auth, result.Success, result.Error, now)
+
 		_ = m.persist(ctx, auth)
 		authSnapshot = auth.Clone()
 	}
@@ -3476,6 +3513,207 @@ func nextQuotaCooldown(prevLevel int, disableCooling bool) (time.Duration, int) 
 		return quotaBackoffMax, prevLevel
 	}
 	return cooldown, prevLevel + 1
+}
+
+// isTerminalAuthQuarantineResultError reports whether a failure result
+// represents a terminal authentication/permission failure (e.g. a revoked
+// OAuth token or invalid credentials returning HTTP 401 authentication_error)
+// as opposed to a transient error that can recover on its own: rate limiting
+// (429), overload/gateway errors (408/5xx), quota exhaustion, a model-support
+// gap, or the other already-specialized failure classes handled earlier in
+// MarkResult. Only terminal auth failures count toward the automatic
+// quarantine rolling window (see evaluateAutoQuarantineLocked); everything
+// else must keep following the existing per-status-code cooldown/retry path
+// unchanged.
+//
+// This intentionally classifies by HTTP status (401) rather than by matching
+// substrings like "revoked" in the raw error body: the existing MarkResult
+// switch already isolates 401 into its own "unauthorized" cooldown case,
+// distinct from 402/403 (payment_required), 404, 429 (quota), and
+// 408/500/502/503/504 (transient upstream). Reusing that same boundary keeps
+// this classifier robust across providers whose exact wording for a revoked
+// credential varies, instead of depending on a fragile message-content match.
+func isTerminalAuthQuarantineResultError(err *Error) bool {
+	if err == nil {
+		return false
+	}
+	// These failure classes already have their own dedicated recovery paths
+	// and must never be double-counted as a permission revocation, even
+	// though some of them can (rarely) surface alongside a 401-shaped error.
+	if isCloudflareChallengeResultError(err) ||
+		isModelSupportResultError(err) ||
+		isRequestScopedNotFoundResultError(err) ||
+		isLongContextExtraUsageRequiredResultError(err) {
+		return false
+	}
+	return statusCodeFromResult(err) == http.StatusUnauthorized
+}
+
+// evaluateAutoQuarantineLocked maintains the rolling terminal-auth-failure
+// streak for auth and flips Auth.AutoQuarantined once the streak reaches
+// authAutoQuarantineFailureThreshold within authAutoQuarantineWindow with
+// zero intervening successes. It must be called once per MarkResult
+// invocation, after any other status/state mutation for this result, so it
+// is always the final word on AutoQuarantined/Status for this call and can
+// never be silently clobbered by the generic "auth.Status = StatusError"
+// writes that the existing per-status-code branches perform for every kind
+// of failure (429/5xx included). Callers must hold m.mu.
+//
+// A real success (success=true) — including a per-model success that merely
+// tripped a quota limit — always resets the streak and lifts any existing
+// quarantine: it proves the credential itself is valid, which is the exact
+// "reauth 后一次真实成功请求即可解除隔离" recovery signal this feature must
+// preserve (an account can legitimately cycle through revoke->reauth several
+// times and must never be permanently blacklisted by this heuristic alone).
+func (m *Manager) evaluateAutoQuarantineLocked(auth *Auth, success bool, resultErr *Error, now time.Time) {
+	if auth == nil {
+		return
+	}
+	if success {
+		auth.terminalAuthFailureStreak = 0
+		auth.terminalAuthFailureStreakStartAt = time.Time{}
+		if auth.AutoQuarantined {
+			clearAutoQuarantine(auth, now)
+		}
+		return
+	}
+	if !isTerminalAuthQuarantineResultError(resultErr) {
+		// Transient/other failures (429, 5xx, timeouts, quota, model support,
+		// ...) neither advance nor reset the terminal-auth streak: they are
+		// not a success, so an in-progress streak must survive them, but they
+		// also are not themselves evidence of a revoked credential.
+		return
+	}
+	if auth.terminalAuthFailureStreak <= 0 || now.Sub(auth.terminalAuthFailureStreakStartAt) > authAutoQuarantineWindow {
+		auth.terminalAuthFailureStreak = 1
+		auth.terminalAuthFailureStreakStartAt = now
+		return
+	}
+	auth.terminalAuthFailureStreak++
+	if auth.terminalAuthFailureStreak >= authAutoQuarantineFailureThreshold && !auth.AutoQuarantined {
+		markAutoQuarantine(auth, now)
+	}
+}
+
+// markAutoQuarantine sets the persisted AutoQuarantined lock. Callers must
+// hold m.mu (or otherwise own exclusive access to auth).
+func markAutoQuarantine(auth *Auth, now time.Time) {
+	if auth == nil {
+		return
+	}
+	auth.AutoQuarantined = true
+	auth.QuarantineReason = quarantineReasonTerminalAuthFailure
+	auth.QuarantinedAt = now
+	auth.Status = StatusQuarantined
+	auth.StatusMessage = "auto_quarantined: repeated authentication failures, credential needs re-authentication"
+	auth.Unavailable = true
+	// The credential is skipped entirely by isAuthBlockedForModel while
+	// quarantined (like StatusDisabled), so a NextRetryAfter-driven cooldown
+	// retry would never fire anyway; clearing it just keeps the persisted
+	// state from implying a retry is still scheduled.
+	auth.NextRetryAfter = time.Time{}
+	auth.UpdatedAt = now
+	// See preserveQuarantineFieldsOnStaleWriteback: stamp the quarantine
+	// freshness clock so a stale write-back can be detected and rejected.
+	auth.quarantineStateAt = now
+}
+
+// clearAutoQuarantine releases the AutoQuarantined lock and resets the streak
+// bookkeeping. Callers must hold m.mu (or otherwise own exclusive access to
+// auth), except when invoked via the exported Auth.ClearAutoQuarantine
+// wrapper used by callers outside this package that already own the record
+// exclusively (e.g. a freshly built re-auth record not yet shared with the
+// manager).
+func clearAutoQuarantine(auth *Auth, now time.Time) {
+	if auth == nil {
+		return
+	}
+	wasQuarantined := auth.AutoQuarantined
+	auth.AutoQuarantined = false
+	auth.QuarantineReason = ""
+	auth.QuarantinedAt = time.Time{}
+	auth.terminalAuthFailureStreak = 0
+	auth.terminalAuthFailureStreakStartAt = time.Time{}
+	// See preserveQuarantineFieldsOnStaleWriteback: stamp the quarantine
+	// freshness clock unconditionally, even when this call is idempotent
+	// (already unquarantined) -- callers like saveTokenRecord call this on
+	// every reauth regardless of prior state, and the clear is still the
+	// caller's authoritative, current intent for this field.
+	auth.quarantineStateAt = now
+	if auth.Status == StatusQuarantined {
+		auth.Status = StatusActive
+		auth.StatusMessage = ""
+		auth.Unavailable = false
+	}
+	if wasQuarantined {
+		auth.UpdatedAt = now
+	}
+}
+
+// preserveQuarantineFieldsOnStaleWriteback guards the automatic terminal-auth
+// quarantine lock (AutoQuarantined / QuarantineReason / QuarantinedAt, plus
+// the in-memory streak bookkeeping) against being silently rolled back by a
+// stale in-flight clone, the same way preserveNewerTokenOwnedFields guards
+// token material. It cannot use a plain "existing is quarantined => force
+// copy" rule like Manager.Update already applies to Success/Failed/
+// recentRequests, because the two sanctioned recovery paths -- a completed
+// reauth (saveTokenRecord -> Auth.ClearAutoQuarantine) and an explicit
+// operator re-enable (PatchAuthFileStatus / PatchAuthFileAccountSettings ->
+// Auth.ClearAutoQuarantine) -- legitimately need to CLEAR the lock, and their
+// cleared end state (AutoQuarantined=false, QuarantineReason="",
+// QuarantinedAt=zero) is byte-for-byte identical to a stale clone that was
+// taken before the quarantine was ever set on the live entry.
+//
+// The two cases are told apart by Auth.quarantineStateAt, an in-memory-only
+// freshness clock that markAutoQuarantine/clearAutoQuarantine stamp to the
+// real wall-clock time on every call (mark or clear) and that Auth.Clone
+// preserves unchanged (like LastRefreshedAt for tokens) -- so it correctly
+// survives an internal re-clone within the same request (e.g.
+// syncAuthManagedHeaderState building a fresh Auth to attach new metadata to)
+// without losing the caller's already-current quarantine intent, while still
+// detecting a clone that was taken strictly before the live entry's most
+// recent mark/clear. A same-or-newer incoming quarantineStateAt is trusted
+// as-is (whatever it says: quarantined or explicitly cleared); a strictly
+// older one means the incoming record predates the live entry's last
+// quarantine decision and must not be allowed to roll it back.
+//
+// Returns whether the incoming record's quarantine fields were overwritten.
+// Callers must hold m.mu (called only from Manager.Update).
+func preserveQuarantineFieldsOnStaleWriteback(incoming, existing *Auth) bool {
+	if incoming == nil || existing == nil {
+		return false
+	}
+	if !existing.quarantineStateAt.After(incoming.quarantineStateAt) {
+		return false
+	}
+	changed := incoming.AutoQuarantined != existing.AutoQuarantined ||
+		incoming.QuarantineReason != existing.QuarantineReason ||
+		!incoming.QuarantinedAt.Equal(existing.QuarantinedAt)
+	if !changed {
+		return false
+	}
+	incoming.AutoQuarantined = existing.AutoQuarantined
+	incoming.QuarantineReason = existing.QuarantineReason
+	incoming.QuarantinedAt = existing.QuarantinedAt
+	incoming.terminalAuthFailureStreak = existing.terminalAuthFailureStreak
+	incoming.terminalAuthFailureStreakStartAt = existing.terminalAuthFailureStreakStartAt
+	incoming.quarantineStateAt = existing.quarantineStateAt
+	if existing.AutoQuarantined {
+		// Keep the restored record internally consistent with the exact
+		// "quarantined" view markAutoQuarantine produces, instead of only
+		// restoring the AutoQuarantined bool while leaving
+		// Status/Unavailable/NextRetryAfter at whatever the stale clone
+		// happened to carry. Without this, a stale write-back could still
+		// produce the same class of self-contradictory persisted state
+		// (AutoQuarantined=true but Status/Unavailable disagreeing) that the
+		// refreshAuthStatus success-path fix addresses for the other
+		// direction (see management.refreshAuthStatus).
+		incoming.Status = existing.Status
+		incoming.StatusMessage = existing.StatusMessage
+		incoming.Unavailable = existing.Unavailable
+		incoming.NextRetryAfter = existing.NextRetryAfter
+	}
+	return true
 }
 
 // List returns all auth entries currently known by the manager.

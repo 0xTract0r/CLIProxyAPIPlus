@@ -372,7 +372,16 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 	if auth == nil {
 		return true, blockReasonOther, time.Time{}
 	}
-	if auth.Disabled || auth.Status == StatusDisabled {
+	// AutoQuarantined is checked alongside the operator-controlled Disabled
+	// flag (not folded into it) so the two recovery paths stay distinct: an
+	// operator must explicitly flip Disabled and core never auto-clears it,
+	// while AutoQuarantined is the auth manager's own heuristic lock that it
+	// lifts by itself on re-auth or a real successful request (see
+	// markAutoQuarantine / clearAutoQuarantine in conductor.go). Both share
+	// blockReasonDisabled so a quarantined credential is skipped entirely
+	// (like Disabled) rather than treated as a cooldown that quietly expires
+	// and gets retried every ~30 minutes.
+	if auth.Disabled || auth.Status == StatusDisabled || auth.AutoQuarantined {
 		return true, blockReasonDisabled, time.Time{}
 	}
 	if model != "" {
