@@ -323,9 +323,19 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		bodyForUpstream, oauthToolNamesReverseMap = prepareClaudeOAuthToolNamesForUpstream(bodyForUpstream, claudeToolPrefix, auth.ToolPrefixDisabled())
 	}
 	bodyForUpstream = sanitizeClaudeMessagesForClaudeUpstreamWithDebug(ctx, bodyForUpstream, baseModel)
+	// Fold a self-tagged "sdk-cli" cc_entrypoint in the body billing header into
+	// "cli" on the /v1/messages path, mirroring the outbound UA suffix fold. Real
+	// claude-cli clients skip cloak system-block regeneration (ShouldCloak=false
+	// in the default auto mode), so their inbound billing header would otherwise
+	// reach Anthropic verbatim, leaving the outbound UA suffix (cli) and the body
+	// cc_entrypoint (sdk-cli) divergent. Runs before signing so the recomputed cch
+	// covers the folded body; gated by the same switch (default on).
+	bodyForUpstream, entrypointFolded := normalizeClaudeBillingEntrypoint(e.cfg, bodyForUpstream)
 	// Enable cch signing by default for OAuth tokens (not just experimental flag).
-	// Claude Code always computes cch; missing or invalid cch is a detectable fingerprint.
-	if oauthToken || experimentalCCHSigningEnabled(e.cfg, auth) {
+	// Claude Code always computes cch; missing or invalid cch is a detectable
+	// fingerprint. Also re-sign when the entrypoint was folded so the cch stays
+	// consistent with the rewritten body even on non-OAuth paths.
+	if oauthToken || experimentalCCHSigningEnabled(e.cfg, auth) || entrypointFolded {
 		bodyForUpstream = signAnthropicMessagesBody(bodyForUpstream)
 	}
 	reporter.SetTranslatedReasoningEffort(bodyForUpstream, to.String())
@@ -529,8 +539,19 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		bodyForUpstream, oauthToolNamesReverseMap = prepareClaudeOAuthToolNamesForUpstream(bodyForUpstream, claudeToolPrefix, auth.ToolPrefixDisabled())
 	}
 	bodyForUpstream = sanitizeClaudeMessagesForClaudeUpstreamWithDebug(ctx, bodyForUpstream, baseModel)
+	// Fold a self-tagged "sdk-cli" cc_entrypoint in the body billing header into
+	// "cli" on the streaming /v1/messages path, mirroring the outbound UA suffix
+	// fold. Real claude-cli clients skip cloak system-block regeneration
+	// (ShouldCloak=false in the default auto mode), so their inbound billing
+	// header would otherwise reach Anthropic verbatim, leaving the outbound UA
+	// suffix (cli) and the body cc_entrypoint (sdk-cli) divergent. Runs before
+	// signing so the recomputed cch covers the folded body; gated by the same
+	// switch (default on).
+	bodyForUpstream, entrypointFolded := normalizeClaudeBillingEntrypoint(e.cfg, bodyForUpstream)
 	// Enable cch signing by default for OAuth tokens (not just experimental flag).
-	if oauthToken || experimentalCCHSigningEnabled(e.cfg, auth) {
+	// Also re-sign when the entrypoint was folded so the cch stays consistent with
+	// the rewritten body even on non-OAuth paths.
+	if oauthToken || experimentalCCHSigningEnabled(e.cfg, auth) || entrypointFolded {
 		bodyForUpstream = signAnthropicMessagesBody(bodyForUpstream)
 	}
 	reporter.SetTranslatedReasoningEffort(bodyForUpstream, to.String())
@@ -826,7 +847,7 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 		billingVersion := resolveClaudeBillingVersion(ctx, e.cfg, auth, apiKey)
 		if useCCHSigning {
 			clientUserAgent := getClientUserAgent(ctx)
-			entrypoint := parseEntrypointFromUA(clientUserAgent)
+			entrypoint := parseEntrypointFromUA(e.cfg, clientUserAgent)
 			workload := getWorkloadFromContext(ctx)
 			body = checkSystemInstructionsWithSigningMode(body, false, useCCHSigning, oauthToken, billingVersion, entrypoint, workload)
 		} else {
@@ -1603,7 +1624,7 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 		// seed to "sdk-cli") can diverge from cc_entrypoint and produce a
 		// UA/entrypoint pair real claude-code never emits. ginHeaders.Get reads the
 		// same inbound request header source as getClientUserAgent.
-		helps.AlignClaudeDeviceProfileUserAgentSuffix(r, ginHeaders.Get("User-Agent"))
+		helps.AlignClaudeDeviceProfileUserAgentSuffix(cfg, r, ginHeaders.Get("User-Agent"))
 	} else {
 		helps.ApplyClaudeLegacyDeviceHeaders(r, ginHeaders, cfg)
 	}
@@ -2078,28 +2099,40 @@ func getClientUserAgent(ctx context.Context) string {
 	return ""
 }
 
-// parseEntrypointFromUA extracts the entrypoint from a Claude Code User-Agent.
+// parseEntrypointFromUA extracts the billing cc_entrypoint from a Claude Code
+// User-Agent.
 // Format: "claude-cli/x.y.z (external, cli)" → "cli"
 // Format: "claude-cli/x.y.z (external, vscode)" → "vscode"
 // Returns "cli" if parsing fails or UA is not Claude Code.
-func parseEntrypointFromUA(userAgent string) string {
+//
+// When config.NormalizeSdkCliEntrypointEnabled(cfg) is true (the default), a
+// parsed "sdk-cli" entrypoint (Claude Agent SDK / `claude -p` non-interactive
+// self-tagging, disallowed by Anthropic policy against subscription OAuth) is
+// folded to "cli" — the same fold normalizeClaudeUserAgentSuffixEntrypoint
+// applies to the outbound UA parenthetical suffix, so the emitted
+// cc_entrypoint and UA suffix never diverge. Every other entrypoint value is
+// returned unchanged.
+func parseEntrypointFromUA(cfg *config.Config, userAgent string) string {
 	// Find content inside parentheses
 	start := strings.Index(userAgent, "(")
 	end := strings.LastIndex(userAgent, ")")
 	if start < 0 || end <= start {
-		return "cli"
+		return claudeNormalizedCliEntrypoint
 	}
 	inner := userAgent[start+1 : end]
 	// Split by comma, take the second part (entrypoint is at index 1, after USER_TYPE)
 	// Format: "(USER_TYPE, ENTRYPOINT[, extra...])"
 	parts := strings.Split(inner, ",")
+	entrypoint := claudeNormalizedCliEntrypoint
 	if len(parts) >= 2 {
-		ep := strings.TrimSpace(parts[1])
-		if ep != "" {
-			return ep
+		if ep := strings.TrimSpace(parts[1]); ep != "" {
+			entrypoint = ep
 		}
 	}
-	return "cli"
+	if entrypoint == claudeSdkCliEntrypoint && config.NormalizeSdkCliEntrypointEnabled(cfg) {
+		return claudeNormalizedCliEntrypoint
+	}
+	return entrypoint
 }
 
 // getWorkloadFromContext extracts workload identifier from the gin request headers.
@@ -2460,7 +2493,7 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 
 	// Skip system instructions for claude-3-5-haiku models
 	if !strings.HasPrefix(model, "claude-3-5-haiku") {
-		entrypoint := parseEntrypointFromUA(clientUserAgent)
+		entrypoint := parseEntrypointFromUA(cfg, clientUserAgent)
 		workload := getWorkloadFromContext(ctx)
 		payload = checkSystemInstructionsWithSigningMode(payload, strictMode, useCCHSigning, oauthToken, billingVersion, entrypoint, workload)
 	}

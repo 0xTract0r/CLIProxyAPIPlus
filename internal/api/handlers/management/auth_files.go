@@ -565,6 +565,22 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 		"source":         "memory",
 		"size":           int64(0),
 	}
+	// T3 (telemetry-farm-ux-hardening): surface the automatic terminal-auth
+	// quarantine lock separately from "status"/"disabled" so callers (the
+	// farm-orchestrator passthrough, the management UI) can distinguish it
+	// from an operator's explicit Disabled=true without depending on the
+	// exact "status" string. auth.Status is already "quarantined"
+	// (coreauth.StatusQuarantined) while this is set; auto_quarantined is the
+	// authoritative boolean gate.
+	entry["auto_quarantined"] = auth.AutoQuarantined
+	if auth.AutoQuarantined {
+		if reason := strings.TrimSpace(auth.QuarantineReason); reason != "" {
+			entry["quarantine_reason"] = reason
+		}
+		if !auth.QuarantinedAt.IsZero() {
+			entry["quarantined_at"] = auth.QuarantinedAt.UTC().Format(time.RFC3339)
+		}
+	}
 	entry["success"] = auth.Success
 	entry["failed"] = auth.Failed
 	entry["recent_requests"] = auth.RecentRequestsSnapshot(time.Now())
@@ -668,7 +684,11 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 	// (GET /v0/management/anthropic-auth-url?auth_name=), so the field is
 	// only populated for that provider; this reuses the exact same relative
 	// path builder as the conductor.go alert log so the two stay consistent.
-	if strings.EqualFold(providerKey(auth), "claude") && coreauth.IsReauthRequiredMetadata(auth.Metadata) {
+	// T3: also surface it for the automatic terminal-auth quarantine lock
+	// (AutoQuarantined) -- re-auth is that lock's recovery path too, and
+	// without this the farm/management UI would have no actionable link for
+	// a quarantined account short of the operator manually re-enabling it.
+	if strings.EqualFold(providerKey(auth), "claude") && (coreauth.IsReauthRequiredMetadata(auth.Metadata) || auth.AutoQuarantined) {
 		if reauthURL := coreauth.ReauthAlertURL(auth.ID); reauthURL != "" {
 			entry["reauth_url"] = reauthURL
 		}
@@ -3054,6 +3074,17 @@ func (h *Handler) refreshAuthStatus(ctx context.Context, current *coreauth.Auth)
 	updated.NextRefreshAfter = time.Time{}
 	updated.LastRefreshedAt = now
 	updated.UpdatedAt = now
+	// T3 (telemetry-farm-ux-hardening): a manually triggered status refresh
+	// that actually succeeds is just as much a "real, current" recovery
+	// signal as a live proxied request succeeding (see MarkResult's
+	// evaluateAutoQuarantineLocked) -- it proves the credential itself is
+	// valid again. Without this, a successful refresh above would still set
+	// Status=StatusActive while leaving AutoQuarantined=true, which is a
+	// self-contradictory persisted state (status says healthy, but the
+	// selector -- isAuthBlockedForModel -- still skips the credential
+	// forever) and gives the operator no way to tell the two apart short of
+	// reading the raw JSON.
+	updated.ClearAutoQuarantine()
 
 	return h.authManager.Update(ctx, updated)
 }
@@ -3236,6 +3267,12 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 				ms.Status = coreauth.StatusActive
 			}
 		}
+		// An explicit operator re-enable is also a valid recovery signal for
+		// core's automatic terminal-auth quarantine (T3, see
+		// markAutoQuarantine/clearAutoQuarantine): the operator is choosing to
+		// give the credential another chance, so lift the lock now instead of
+		// leaving it permanently unselectable.
+		targetAuth.ClearAutoQuarantine()
 	}
 	targetAuth.UpdatedAt = time.Now()
 
@@ -3467,9 +3504,15 @@ func (h *Handler) PatchAuthFileAccountSettings(c *gin.Context) {
 	if *req.Disabled {
 		targetAuth.Status = coreauth.StatusDisabled
 		targetAuth.StatusMessage = "disabled via management API"
-	} else if targetAuth.Status == coreauth.StatusDisabled {
-		targetAuth.Status = coreauth.StatusActive
-		targetAuth.StatusMessage = ""
+	} else {
+		if targetAuth.Status == coreauth.StatusDisabled {
+			targetAuth.Status = coreauth.StatusActive
+			targetAuth.StatusMessage = ""
+		}
+		// See PatchAuthFileStatus above: an explicit operator "not disabled"
+		// intent is also a valid recovery signal for core's automatic
+		// terminal-auth quarantine (T3).
+		targetAuth.ClearAutoQuarantine()
 	}
 
 	targetAuth.ProxyURL = proxyURL
@@ -3927,6 +3970,19 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 	// UI). See clearStaleReauthLockOnSave for why the lock survives the merge
 	// above without this.
 	clearStaleReauthLockOnSave(record)
+
+	// T3 (telemetry-farm-ux-hardening): a completed re-auth / OAuth callback
+	// is the account's designated recovery path out of core's automatic
+	// terminal-auth quarantine (AutoQuarantined; see markAutoQuarantine /
+	// clearAutoQuarantine in sdk/cliproxy/auth/conductor.go). Once
+	// quarantined, the selector skips the credential entirely, so it can
+	// never accumulate a fresh "real successful request" to lift the lock on
+	// its own -- this call is what actually breaks that deadlock. Some
+	// provider-specific record builders (e.g. buildClaudeOAuthTokenRecord)
+	// deliberately copy the previous Status/StatusMessage forward for other
+	// reasons, so clear unconditionally here rather than relying on every
+	// builder to omit AutoQuarantined.
+	record.ClearAutoQuarantine()
 
 	if h.postAuthHook != nil {
 		if err := h.postAuthHook(ctx, record); err != nil {

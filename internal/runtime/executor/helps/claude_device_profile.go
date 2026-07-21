@@ -949,10 +949,48 @@ func ApplyClaudeDeviceProfileHeaders(r *http.Request, profile ClaudeDeviceProfil
 // inbound-derived entrypoint, so this default is shared by both.
 const defaultClaudeFingerprintUserAgentSuffix = "(external, cli)"
 
+// claudeSdkCliEntrypointToken / claudeNormalizedCliEntrypointToken are the
+// self-reported "ENTRYPOINT" field values folded by
+// config.NormalizeSdkCliEntrypointEnabled: "sdk-cli" (Claude Agent SDK /
+// `claude -p` non-interactive invocations, disallowed by Anthropic policy
+// against subscription OAuth) is folded to "cli" (the entrypoint real
+// interactive claude-cli always emits).
+const (
+	claudeSdkCliEntrypointToken        = "sdk-cli"
+	claudeNormalizedCliEntrypointToken = "cli"
+)
+
 // claudeUserAgentSuffixPattern captures the first parenthetical block of a
 // claude-cli User-Agent, e.g. the "(external, cli)" in
 // "claude-cli/2.1.63 (external, cli)".
 var claudeUserAgentSuffixPattern = regexp.MustCompile(`\([^)]*\)`)
+
+// normalizeClaudeUserAgentSuffixEntrypoint folds a "sdk-cli" ENTRYPOINT field
+// inside a "(USER_TYPE, ENTRYPOINT[, extra...])" suffix into "cli", when
+// config.NormalizeSdkCliEntrypointEnabled(cfg) is true. Every other suffix
+// (including non-sdk-cli entrypoints, or a suffix with no parenthetical
+// structure) is returned unchanged. This is the outbound-UA half of the
+// sdk-cli→cli normalization. The cc_entrypoint half lives in the executor:
+// parseEntrypointFromUA folds the cloak / count_tokens paths (which regenerate
+// the billing header from the inbound UA), and normalizeClaudeBillingEntrypoint
+// folds the verbatim /v1/messages path (real claude-cli clients whose inbound
+// billing header is forwarded without cloak regeneration). All three share this
+// same enable switch so the UA suffix and cc_entrypoint stay paired.
+func normalizeClaudeUserAgentSuffixEntrypoint(cfg *config.Config, suffix string) string {
+	if !config.NormalizeSdkCliEntrypointEnabled(cfg) {
+		return suffix
+	}
+	if !strings.HasPrefix(suffix, "(") || !strings.HasSuffix(suffix, ")") {
+		return suffix
+	}
+	inner := suffix[1 : len(suffix)-1]
+	parts := strings.Split(inner, ",")
+	if len(parts) < 2 || strings.TrimSpace(parts[1]) != claudeSdkCliEntrypointToken {
+		return suffix
+	}
+	parts[1] = " " + claudeNormalizedCliEntrypointToken
+	return "(" + strings.Join(parts, ",") + ")"
+}
 
 // claudeClientUserAgentSuffix returns the parenthetical "(USER_TYPE, ENTRYPOINT)"
 // block of an inbound claude-code client User-Agent. When the inbound client is
@@ -976,18 +1014,29 @@ func claudeClientUserAgentSuffix(clientUA string) string {
 // "(USER_TYPE, ENTRYPOINT)" block, while preserving the high-water
 // "claude-cli/<version>" prefix and all other stabilized fingerprint fields.
 //
-// Anti-correlation invariant: the outbound UA suffix and the billing
-// cc_entrypoint are both derived from the same inbound client User-Agent
-// (parseEntrypointFromUA in the executor reads the same source). Without this
-// alignment the outbound UA suffix comes from a frozen high-water device profile
-// (which a single "claude --print" can seed to "sdk-cli") while cc_entrypoint is
-// derived per request, producing a UA/entrypoint pair (e.g. "(external, sdk-cli)"
-// + cc_entrypoint=cli) that real claude-code never emits and that Anthropic can
-// detect. After this call the suffix and cc_entrypoint can no longer diverge.
+// Anti-correlation invariant: the outbound UA suffix must reference the same
+// inbound entrypoint as the billing cc_entrypoint. Without this alignment the
+// outbound UA suffix comes from a frozen high-water device profile (which a
+// single "claude --print" can seed to "sdk-cli") while cc_entrypoint is derived
+// per request, producing a UA/entrypoint pair (e.g. "(external, sdk-cli)" +
+// cc_entrypoint=cli) that real claude-code never emits and that Anthropic can
+// detect. After this call the outbound UA suffix reflects the inbound entrypoint
+// (folded per config); the billing cc_entrypoint is folded to match by
+// parseEntrypointFromUA (cloak / count_tokens paths) and by
+// normalizeClaudeBillingEntrypoint (the verbatim /v1/messages path), so the pair
+// stays aligned across every serving path.
 //
 // Only the parenthetical suffix is rewritten; the version, package version,
 // runtime version, OS and arch fields stay at their stabilized high-water values.
-func AlignClaudeDeviceProfileUserAgentSuffix(r *http.Request, clientUA string) {
+//
+// The mirrored suffix is then passed through
+// normalizeClaudeUserAgentSuffixEntrypoint, which folds a "sdk-cli" entrypoint
+// into "cli" when config.NormalizeSdkCliEntrypointEnabled(cfg) is true (the
+// default). This keeps the outbound UA suffix paired with the cc_entrypoint
+// normalization applied in the executor by parseEntrypointFromUA (cloak /
+// count_tokens paths) and normalizeClaudeBillingEntrypoint (verbatim
+// /v1/messages path).
+func AlignClaudeDeviceProfileUserAgentSuffix(cfg *config.Config, r *http.Request, clientUA string) {
 	if r == nil {
 		return
 	}
@@ -995,7 +1044,7 @@ func AlignClaudeDeviceProfileUserAgentSuffix(r *http.Request, clientUA string) {
 	if outboundUA == "" || !isClaudeCodeClient(outboundUA) {
 		return
 	}
-	desiredSuffix := claudeClientUserAgentSuffix(clientUA)
+	desiredSuffix := normalizeClaudeUserAgentSuffixEntrypoint(cfg, claudeClientUserAgentSuffix(clientUA))
 	if claudeUserAgentSuffixPattern.MatchString(outboundUA) {
 		aligned := claudeUserAgentSuffixPattern.ReplaceAllString(outboundUA, desiredSuffix)
 		r.Header.Set("User-Agent", aligned)

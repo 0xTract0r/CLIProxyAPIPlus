@@ -200,6 +200,63 @@ func TestPatchAuthFileAccountSettings_RewritesRuntimeSnapshotAndStoredSchema(t *
 	}
 }
 
+// TestPatchAuthFileAccountSettings_ReEnableClearsAutoQuarantine mirrors
+// TestPatchAuthFileStatus_ReEnableClearsAutoQuarantine for the
+// account-settings entry point: an explicit operator "not disabled" via
+// PatchAuthFileAccountSettings must also lift the automatic terminal-auth
+// quarantine lock (AutoQuarantined), per the "See PatchAuthFileStatus above"
+// comment in the handler.
+func TestPatchAuthFileAccountSettings_ReEnableClearsAutoQuarantine(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	record := &coreauth.Auth{
+		ID:       "quarantined-settings.json",
+		FileName: "quarantined-settings.json",
+		Provider: "claude",
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("failed to register auth record: %v", errRegister)
+	}
+	terminalAuthErr := &coreauth.Error{HTTPStatus: http.StatusUnauthorized, Message: `{"type":"error","error":{"type":"authentication_error","message":"OAuth access token has been revoked."}}`}
+	manager.MarkResult(context.Background(), coreauth.Result{AuthID: "quarantined-settings.json", Provider: "claude", Success: false, Error: terminalAuthErr})
+	manager.MarkResult(context.Background(), coreauth.Result{AuthID: "quarantined-settings.json", Provider: "claude", Success: false, Error: terminalAuthErr})
+	quarantined, ok := manager.GetByID("quarantined-settings.json")
+	if !ok || quarantined == nil || !quarantined.AutoQuarantined {
+		t.Fatalf("precondition failed: auth not quarantined, got=%+v ok=%v", quarantined, ok)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+
+	body := `{"name":"quarantined-settings.json","proxy_url":"http://proxy.remote:8080","disabled":false}`
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/account-settings", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	ctx.Request = req
+	h.PatchAuthFileAccountSettings(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+
+	updated, ok := manager.GetByID("quarantined-settings.json")
+	if !ok || updated == nil {
+		t.Fatalf("expected auth record to exist after patch")
+	}
+	if updated.AutoQuarantined {
+		t.Fatalf("AutoQuarantined = true after explicit re-enable via account-settings, want false")
+	}
+	if updated.QuarantineReason != "" {
+		t.Fatalf("QuarantineReason = %q, want empty", updated.QuarantineReason)
+	}
+	if !updated.QuarantinedAt.IsZero() {
+		t.Fatalf("QuarantinedAt = %v, want zero", updated.QuarantinedAt)
+	}
+}
+
 func TestPatchAuthFileAccountSettings_RejectsEmptyProxyURLForEnabledAccount(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
 	gin.SetMode(gin.TestMode)

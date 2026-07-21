@@ -133,6 +133,94 @@ func TestRefreshAuthFileStatusClearsStaleWarningOnSuccess(t *testing.T) {
 	}
 }
 
+// TestRefreshAuthFileStatusClearsAutoQuarantineOnSuccess covers T3
+// (telemetry-farm-ux-hardening) finding #1: a manually triggered status
+// refresh that actually succeeds must clear the automatic terminal-auth
+// quarantine lock (AutoQuarantined), not just flip Status back to active.
+// Before this fix, a successful refresh on a quarantined account produced
+// the self-contradictory persisted state "status=active but
+// auto_quarantined=true", and the selector (which gates on AutoQuarantined
+// directly) would still skip the account forever.
+func TestRefreshAuthFileStatusClearsAutoQuarantineOnSuccess(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	manager.RegisterExecutor(&refreshStatusExecutor{
+		provider: "claude",
+		refresh: func(ctx context.Context, auth *coreauth.Auth) (*coreauth.Auth, error) {
+			if auth.Metadata == nil {
+				auth.Metadata = make(map[string]any)
+			}
+			auth.Metadata["last_refresh"] = time.Now().Format(time.RFC3339)
+			auth.Metadata["access_token"] = "new-token"
+			return auth, nil
+		},
+	})
+
+	record := &coreauth.Auth{ProxyURL: "http://test-proxy:8080",
+		ID:       "claude-quarantined.json",
+		FileName: "claude-quarantined.json",
+		Provider: "claude",
+		Metadata: map[string]any{
+			"type":          "claude",
+			"email":         "quarantined@example.com",
+			"refresh_token": "rt-123",
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("register auth record: %v", errRegister)
+	}
+	terminalAuthErr := &coreauth.Error{HTTPStatus: http.StatusUnauthorized, Message: `{"type":"error","error":{"type":"authentication_error","message":"OAuth access token has been revoked."}}`}
+	manager.MarkResult(context.Background(), coreauth.Result{AuthID: "claude-quarantined.json", Provider: "claude", Success: false, Error: terminalAuthErr})
+	manager.MarkResult(context.Background(), coreauth.Result{AuthID: "claude-quarantined.json", Provider: "claude", Success: false, Error: terminalAuthErr})
+	quarantined, ok := manager.GetByID("claude-quarantined.json")
+	if !ok || quarantined == nil || !quarantined.AutoQuarantined {
+		t.Fatalf("precondition failed: auth not quarantined, got=%+v ok=%v", quarantined, ok)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPost, "/v0/management/auth-files/refresh-status", strings.NewReader(`{"name":"claude-quarantined.json"}`))
+	req.Header.Set("Content-Type", "application/json")
+	ctx.Request = req
+	h.RefreshAuthFileStatus(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+
+	updated, ok := manager.GetByID("claude-quarantined.json")
+	if !ok || updated == nil {
+		t.Fatalf("expected refreshed auth record")
+	}
+	if updated.Status != coreauth.StatusActive {
+		t.Fatalf("status = %q, want %q", updated.Status, coreauth.StatusActive)
+	}
+	if updated.AutoQuarantined {
+		t.Fatalf("AutoQuarantined = true after successful refresh, want false (status=active but auto_quarantined=true would be self-contradictory)")
+	}
+	if updated.QuarantineReason != "" {
+		t.Fatalf("QuarantineReason = %q, want empty", updated.QuarantineReason)
+	}
+	if !updated.QuarantinedAt.IsZero() {
+		t.Fatalf("QuarantinedAt = %v, want zero", updated.QuarantinedAt)
+	}
+
+	// The account must be immediately re-selectable again.
+	selector := &coreauth.FillFirstSelector{}
+	picked, errPick := selector.Pick(context.Background(), "claude", "", cliproxyexecutor.Options{}, []*coreauth.Auth{updated})
+	if errPick != nil {
+		t.Fatalf("selector.Pick returned error after successful refresh: %v", errPick)
+	}
+	if picked == nil || picked.ID != updated.ID {
+		t.Fatalf("selector.Pick() = %+v, want the refreshed record selectable again", picked)
+	}
+}
+
 func TestRefreshAuthFileStatusPersistsCurrentFailure(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
 	gin.SetMode(gin.TestMode)
