@@ -160,6 +160,27 @@ func (e *ClaudeExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Au
 	deviceProfile := helps.ResolveClaudeDeviceProfile(auth, apiKey, req.Header, e.cfg)
 	if helps.ClaudeDeviceProfileStabilizationEnabled(e.cfg) {
 		helps.ApplyClaudeDeviceProfileHeaders(req, deviceProfile)
+		// Fold the applied device-profile high-water User-Agent suffix entrypoint
+		// (sdk-cli -> cli, gated by config.NormalizeSdkCliEntrypointEnabled) so this
+		// background quota/oauth token-endpoint egress — the GET /api/oauth/profile
+		// and /api/oauth/usage snapshot lookups reaching here via
+		// quota_snapshots.go fetchQuotaJSON -> exec.HttpRequest — presents the same
+		// "(external, cli)" suffix as the serving path
+		// (helps.AlignClaudeDeviceProfileUserAgentSuffix) and the refresh/reauth
+		// token-endpoint paths (helps.NormalizeClaudeUserAgentEntrypoint). Unlike
+		// serving there is no inbound client UA to mirror here (this is a sessionless
+		// background call; ginHeaders is nil below), so the frozen high-water suffix
+		// — which a single `claude --print` can seed to "sdk-cli" — is folded in
+		// place, exactly as the refresh/reauth high-water is folded before injection.
+		// Only the parenthetical entrypoint field is rewritten; the high-water
+		// "claude-cli/<version>" prefix is preserved. The fold is a no-op when the
+		// gate is disabled, the suffix entrypoint is not sdk-cli, or the applied UA
+		// has no parenthetical block.
+		if ua := req.Header.Get("User-Agent"); ua != "" {
+			if folded := helps.NormalizeClaudeUserAgentEntrypoint(e.cfg, ua); folded != ua {
+				req.Header.Set("User-Agent", folded)
+			}
+		}
 	}
 	// claude 版本高水位持久化：ResolveClaudeDeviceProfile 已把本次合法候选记入内存观测
 	// （伪造超高版本在 sanity-ceiling gate 已被丢弃，不会进入观测）。这里把当前账号的
@@ -1015,8 +1036,12 @@ func (e *ClaudeExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (
 	// device-profile high-water mark (when present) so background token
 	// refresh matches the same claude-cli identity this account's serving
 	// requests present, instead of the generic claudeOAuthUserAgent floor.
-	if hw, ok := cliproxyauth.ClaudeDeviceHighWaterFromMetadata(auth.Metadata); ok && strings.TrimSpace(hw.UserAgent) != "" {
-		svc = svc.WithUserAgent(hw.UserAgent)
+	// The high-water suffix entrypoint is folded (sdk-cli -> cli, gated by
+	// config.NormalizeSdkCliEntrypointEnabled) so the token-endpoint UA suffix
+	// matches the serving outbound UA suffix aligned by
+	// helps.AlignClaudeDeviceProfileUserAgentSuffix.
+	if refreshUA := claudeRefreshHighWaterUserAgent(e.cfg, auth); refreshUA != "" {
+		svc = svc.WithUserAgent(refreshUA)
 	}
 	td, err := svc.RefreshTokensWithRetry(ctx, refreshToken, 3)
 	if err != nil {
@@ -1035,6 +1060,23 @@ func (e *ClaudeExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (
 	now := time.Now().Format(time.RFC3339)
 	auth.Metadata["last_refresh"] = now
 	return auth, nil
+}
+
+// claudeRefreshHighWaterUserAgent returns the OAuth-refresh User-Agent for auth:
+// the account's persisted device-profile high-water User-Agent with its suffix
+// entrypoint folded (sdk-cli -> cli, gated by config.NormalizeSdkCliEntrypointEnabled)
+// so the token-endpoint refresh identity matches the serving outbound UA suffix.
+// It returns "" when auth has no usable high-water User-Agent, in which case the
+// caller leaves the constructor's claudeOAuthUserAgent floor untouched.
+func claudeRefreshHighWaterUserAgent(cfg *config.Config, auth *cliproxyauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	hw, ok := cliproxyauth.ClaudeDeviceHighWaterFromMetadata(auth.Metadata)
+	if !ok || strings.TrimSpace(hw.UserAgent) == "" {
+		return ""
+	}
+	return helps.NormalizeClaudeUserAgentEntrypoint(cfg, hw.UserAgent)
 }
 
 // extractAndRemoveBetas extracts the "betas" array from the body and removes it.

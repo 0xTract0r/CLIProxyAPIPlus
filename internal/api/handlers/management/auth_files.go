@@ -4571,11 +4571,14 @@ func buildClaudeOAuthTokenRecord(target *coreauth.Auth, tokenStorage *claude.Cla
 }
 
 // claudeReauthHighWaterUserAgent returns the persisted claude device-profile
-// high-water User-Agent for target, or "" when target has no usable
-// high-water metadata yet (e.g. a brand-new account with no prior serving
-// observation). Callers pass the result to ClaudeAuth.WithUserAgent, which
-// no-ops on an empty value and leaves the constructor's floor untouched.
-func claudeReauthHighWaterUserAgent(target *coreauth.Auth) string {
+// high-water User-Agent for target with its suffix entrypoint folded
+// (sdk-cli -> cli, gated by config.NormalizeSdkCliEntrypointEnabled) so the
+// reauth token-endpoint identity matches the serving outbound UA suffix aligned
+// by helps.AlignClaudeDeviceProfileUserAgentSuffix. It returns "" when target
+// has no usable high-water metadata yet (e.g. a brand-new account with no prior
+// serving observation). Callers pass the result to ClaudeAuth.WithUserAgent,
+// which no-ops on an empty value and leaves the constructor's floor untouched.
+func claudeReauthHighWaterUserAgent(cfg *config.Config, target *coreauth.Auth) string {
 	if target == nil {
 		return ""
 	}
@@ -4583,7 +4586,11 @@ func claudeReauthHighWaterUserAgent(target *coreauth.Auth) string {
 	if !ok {
 		return ""
 	}
-	return strings.TrimSpace(hw.UserAgent)
+	ua := strings.TrimSpace(hw.UserAgent)
+	if ua == "" {
+		return ""
+	}
+	return runtimehelps.NormalizeClaudeUserAgentEntrypoint(cfg, ua)
 }
 
 func (h *Handler) newClaudeOAuthAuth(ctx context.Context, target *coreauth.Auth) *claude.ClaudeAuth {
@@ -4595,7 +4602,7 @@ func (h *Handler) newClaudeOAuthAuth(ctx context.Context, target *coreauth.Auth)
 	// high-water mark (when present) so the OAuth exchange/refresh presents
 	// the same claude-cli identity this account's serving requests use,
 	// instead of falling back to the generic claudeOAuthUserAgent floor.
-	return claude.NewClaudeAuthWithHTTPClient(client).WithUserAgent(claudeReauthHighWaterUserAgent(target))
+	return claude.NewClaudeAuthWithHTTPClient(client).WithUserAgent(claudeReauthHighWaterUserAgent(h.cfg, target))
 }
 
 func (h *Handler) newClaudeOAuthAccountProxyFallbackAuth(target *coreauth.Auth) *claude.ClaudeAuth {
@@ -4606,7 +4613,7 @@ func (h *Handler) newClaudeOAuthAccountProxyFallbackAuth(target *coreauth.Auth) 
 	if proxyURL == "" {
 		return nil
 	}
-	return claude.NewClaudeAuthWithProxyURL(h.cfg, proxyURL).WithUserAgent(claudeReauthHighWaterUserAgent(target))
+	return claude.NewClaudeAuthWithProxyURL(h.cfg, proxyURL).WithUserAgent(claudeReauthHighWaterUserAgent(h.cfg, target))
 }
 
 func (h *Handler) claudeOAuthTransportSummary(target *coreauth.Auth) map[string]string {
