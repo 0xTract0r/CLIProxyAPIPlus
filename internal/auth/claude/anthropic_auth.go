@@ -153,11 +153,11 @@ type tokenResponse struct {
 // and refreshing expired tokens using PKCE for enhanced security.
 type ClaudeAuth struct {
 	httpClient *http.Client
-	// userAgent, when non-empty, is set on OAuth token exchange/refresh requests.
-	// Only the bare-client constructors (NewClaudeAuthWithProxyURL) populate it so
-	// background token refresh presents the serving identity; the management-bound
-	// client (NewClaudeAuthWithHTTPClient) leaves it empty and relies on its own
-	// managed-header transport.
+	// userAgent is set on OAuth token exchange/refresh requests. All
+	// constructors default it to claudeOAuthUserAgent so egress never falls
+	// back to the Go net/http default ("Go-http-client/1.1"); callers that
+	// know a per-account device-profile high-water User-Agent should raise it
+	// via WithUserAgent so refresh matches that account's serving identity.
 	userAgent string
 }
 
@@ -212,7 +212,22 @@ func NewClaudeAuthWithHTTPClient(client *http.Client) *ClaudeAuth {
 	if client == nil {
 		client = NewAnthropicHttpClient(nil)
 	}
-	return &ClaudeAuth{httpClient: client}
+	return &ClaudeAuth{httpClient: client, userAgent: claudeOAuthUserAgent}
+}
+
+// WithUserAgent overrides the User-Agent sent on OAuth token exchange/refresh
+// requests. Callers pass the account's persisted device-profile high-water
+// User-Agent (see sdk/cliproxy/auth.ClaudeDeviceHighWaterFromMetadata) so a
+// per-account refresh matches that account's serving identity instead of the
+// generic baseline. An empty/whitespace-only userAgent leaves the existing
+// value (the claudeOAuthUserAgent floor) untouched, so callers can call this
+// unconditionally without risking a downgrade to an empty User-Agent.
+func (o *ClaudeAuth) WithUserAgent(userAgent string) *ClaudeAuth {
+	if strings.TrimSpace(userAgent) == "" {
+		return o
+	}
+	o.userAgent = userAgent
+	return o
 }
 
 // GenerateAuthURL creates the OAuth authorization URL with PKCE.

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"github.com/klauspost/compress/zstd"
 	xxHash64 "github.com/pierrec/xxHash/xxHash64"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
@@ -1746,6 +1747,163 @@ func TestClaudeExecutorPrepareRequest_RecordsDirectClientVersionObservation(t *t
 	}
 	if got := observations[0].Version; got != "2.1.142" {
 		t.Fatalf("observation version = %q, want 2.1.142", got)
+	}
+}
+
+// TestClaudeExecutorPrepareRequest_AppliesFullManagedAnthropicHeaderSet covers
+// the quota/oauth snapshot egress path (quota_snapshots.go fetchQuotaJSON ->
+// exec.HttpRequest -> ClaudeExecutor.PrepareRequest, used for GET
+// /api/oauth/profile and /api/oauth/usage). Before the fix, PrepareRequest only
+// applied 5 device-profile headers (UA/package-version/runtime-version/os/arch),
+// leaving quota egress with a half-managed subset of real claude-cli's header
+// set. This asserts PrepareRequest now fills in the rest of the managed
+// Anthropic/stainless protocol headers to match real serving, while preserving
+// the caller-set Accept and quota-specific anthropic-beta, and never attaching a
+// client session id (quota is a sessionless background lookup).
+func TestClaudeExecutorPrepareRequest_AppliesFullManagedAnthropicHeaderSet(t *testing.T) {
+	resetClaudeDeviceProfileCache()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		ProxyURL: "direct",
+		Provider: "claude",
+		Attributes: map[string]string{
+			"api_key": "sk-ant-oat-test",
+		},
+	}
+
+	// Mirrors quota_snapshots.go fetchQuotaJSON: Accept and the quota-specific
+	// oauth beta are set by the caller before the request reaches PrepareRequest.
+	req, err := http.NewRequest(http.MethodGet, "https://api.anthropic.com/api/oauth/profile", nil)
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("anthropic-beta", "oauth-2025-04-20")
+
+	if err := executor.PrepareRequest(req, auth); err != nil {
+		t.Fatalf("PrepareRequest() error = %v", err)
+	}
+
+	wantSet := map[string]string{
+		"Anthropic-Version":       "2023-06-01",
+		"X-App":                   "cli",
+		"X-Stainless-Lang":        "js",
+		"X-Stainless-Runtime":     "node",
+		"X-Stainless-Retry-Count": "0",
+		"X-Stainless-Timeout":     "600",
+		"Connection":              "keep-alive",
+	}
+	for name, want := range wantSet {
+		if got := req.Header.Get(name); got != want {
+			t.Fatalf("%s = %q, want %q", name, got, want)
+		}
+	}
+
+	if got := req.Header.Get("x-client-request-id"); got == "" {
+		t.Fatalf("x-client-request-id must be set for first-party api.anthropic.com requests")
+	} else if _, errParse := uuid.Parse(got); errParse != nil {
+		t.Fatalf("x-client-request-id = %q, want a uuid: %v", got, errParse)
+	}
+
+	// The quota-specific beta set by the caller must survive untouched;
+	// PrepareRequest must never replace it with serving's own beta set.
+	if got := req.Header.Get("anthropic-beta"); got != "oauth-2025-04-20" {
+		t.Fatalf("anthropic-beta = %q, want %q (must be preserved)", got, "oauth-2025-04-20")
+	}
+	if got := req.Header.Get("Accept"); got != "application/json" {
+		t.Fatalf("Accept = %q, want %q (must be preserved)", got, "application/json")
+	}
+
+	// Quota is a sessionless background call: a client session id must never be
+	// attached, unlike real serving which always attaches one.
+	if got := req.Header.Get("X-Claude-Code-Session-Id"); got != "" {
+		t.Fatalf("X-Claude-Code-Session-Id = %q, want empty (quota must not gain a session correlation anchor)", got)
+	}
+}
+
+// TestClaudeExecutorPrepareRequest_FreshClientRequestIDPerCall asserts
+// x-client-request-id is a new UUID on every call, matching real claude-cli's
+// per-request id semantics (not a stable/cached value).
+func TestClaudeExecutorPrepareRequest_FreshClientRequestIDPerCall(t *testing.T) {
+	resetClaudeDeviceProfileCache()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		ProxyURL: "direct",
+		Provider: "claude",
+		Attributes: map[string]string{
+			"api_key": "sk-ant-oat-test",
+		},
+	}
+
+	newReq := func() *http.Request {
+		req, err := http.NewRequest(http.MethodGet, "https://api.anthropic.com/api/oauth/usage", nil)
+		if err != nil {
+			t.Fatalf("NewRequest() error = %v", err)
+		}
+		return req
+	}
+
+	first := newReq()
+	if err := executor.PrepareRequest(first, auth); err != nil {
+		t.Fatalf("PrepareRequest() error = %v", err)
+	}
+	second := newReq()
+	if err := executor.PrepareRequest(second, auth); err != nil {
+		t.Fatalf("PrepareRequest() error = %v", err)
+	}
+
+	firstID := first.Header.Get("x-client-request-id")
+	secondID := second.Header.Get("x-client-request-id")
+	if firstID == "" || secondID == "" {
+		t.Fatalf("x-client-request-id must be set on both requests: first=%q second=%q", firstID, secondID)
+	}
+	if firstID == secondID {
+		t.Fatalf("x-client-request-id must be fresh per request, got same value %q on both calls", firstID)
+	}
+}
+
+// TestClaudeExecutorPrepareRequest_SkipsManagedProtocolHeadersForNonAnthropicHost
+// guards the host gate. PrepareRequest also implements the generic
+// RequestPreparer hook reachable via Manager.InjectCredentials/
+// PrepareHttpRequest for arbitrary requests an SDK embedder may build (not just
+// quota's fixed api.anthropic.com targets). It must not inject
+// Anthropic-specific managed protocol headers onto a request targeting a
+// non-Anthropic base_url/proxy host.
+func TestClaudeExecutorPrepareRequest_SkipsManagedProtocolHeadersForNonAnthropicHost(t *testing.T) {
+	resetClaudeDeviceProfileCache()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		ProxyURL: "direct",
+		Provider: "claude",
+		Attributes: map[string]string{
+			"api_key":  "sk-ant-oat-test",
+			"base_url": "https://compat.example.com",
+		},
+	}
+
+	req, err := http.NewRequest(http.MethodGet, "https://compat.example.com/api/oauth/profile", nil)
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+
+	if err := executor.PrepareRequest(req, auth); err != nil {
+		t.Fatalf("PrepareRequest() error = %v", err)
+	}
+
+	for _, name := range []string{
+		"Anthropic-Version",
+		"X-Stainless-Lang",
+		"X-Stainless-Runtime",
+		"X-Stainless-Retry-Count",
+		"X-Stainless-Timeout",
+		"x-client-request-id",
+	} {
+		if got := req.Header.Get(name); got != "" {
+			t.Fatalf("%s = %q, want empty for non-anthropic host", name, got)
+		}
 	}
 }
 

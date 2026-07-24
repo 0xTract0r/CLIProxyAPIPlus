@@ -160,6 +160,27 @@ func (e *ClaudeExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Au
 	deviceProfile := helps.ResolveClaudeDeviceProfile(auth, apiKey, req.Header, e.cfg)
 	if helps.ClaudeDeviceProfileStabilizationEnabled(e.cfg) {
 		helps.ApplyClaudeDeviceProfileHeaders(req, deviceProfile)
+		// Fold the applied device-profile high-water User-Agent suffix entrypoint
+		// (sdk-cli -> cli, gated by config.NormalizeSdkCliEntrypointEnabled) so this
+		// background quota/oauth token-endpoint egress — the GET /api/oauth/profile
+		// and /api/oauth/usage snapshot lookups reaching here via
+		// quota_snapshots.go fetchQuotaJSON -> exec.HttpRequest — presents the same
+		// "(external, cli)" suffix as the serving path
+		// (helps.AlignClaudeDeviceProfileUserAgentSuffix) and the refresh/reauth
+		// token-endpoint paths (helps.NormalizeClaudeUserAgentEntrypoint). Unlike
+		// serving there is no inbound client UA to mirror here (this is a sessionless
+		// background call; ginHeaders is nil below), so the frozen high-water suffix
+		// — which a single `claude --print` can seed to "sdk-cli" — is folded in
+		// place, exactly as the refresh/reauth high-water is folded before injection.
+		// Only the parenthetical entrypoint field is rewritten; the high-water
+		// "claude-cli/<version>" prefix is preserved. The fold is a no-op when the
+		// gate is disabled, the suffix entrypoint is not sdk-cli, or the applied UA
+		// has no parenthetical block.
+		if ua := req.Header.Get("User-Agent"); ua != "" {
+			if folded := helps.NormalizeClaudeUserAgentEntrypoint(e.cfg, ua); folded != ua {
+				req.Header.Set("User-Agent", folded)
+			}
+		}
 	}
 	// claude 版本高水位持久化：ResolveClaudeDeviceProfile 已把本次合法候选记入内存观测
 	// （伪造超高版本在 sanity-ceiling gate 已被丢弃，不会进入观测）。这里把当前账号的
@@ -174,6 +195,26 @@ func (e *ClaudeExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Au
 	} else {
 		req.Header.Del("x-api-key")
 		req.Header.Set("Authorization", "Bearer "+apiKey)
+	}
+	// Fill in the rest of the managed Anthropic/stainless protocol header set that
+	// real serving (applyClaudeHeaders) always sends, so this adapter's callers —
+	// currently only the background quota/oauth snapshot lookups in
+	// quota_snapshots.go (GET /api/oauth/profile, /api/oauth/usage via
+	// exec.HttpRequest) — stop egressing a half-managed subset (previously just
+	// the 5 device-profile headers above) that stands out as a distinguishable
+	// fingerprint gap versus real claude-cli. Gate on isAnthropicBase: this method
+	// also implements the generic RequestPreparer hook reachable via
+	// Manager.InjectCredentials/PrepareHttpRequest for arbitrary requests an SDK
+	// embedder may build, so only inject Anthropic-specific protocol headers when
+	// the request actually targets api.anthropic.com, never a non-Anthropic
+	// base_url/proxy target. ginHeaders is intentionally nil here (unlike real
+	// serving, which sources overrides from the inbound client request): this is
+	// a sessionless background call with no legitimate inbound client headers to
+	// inherit from. includeSessionID=false for the same reason — quota/oauth is a
+	// backend lookup with no client session context, and attaching a session id
+	// would itself become a new cross-account correlation anchor.
+	if isAnthropicBase {
+		applyClaudeManagedProtocolHeaders(req, nil, e.cfg, apiKey, isAnthropicBase, false)
 	}
 	managedHeaderSnapshot := captureManagedHeaderSnapshot(req.Header, claudeManagedHeaderNames)
 	util.ApplyCustomHeadersFromAttrs(req, authAttrs(auth))
@@ -991,6 +1032,17 @@ func (e *ClaudeExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (
 		return auth, nil
 	}
 	svc := claudeauth.NewClaudeAuthWithProxyURL(e.cfg, auth.ProxyURL)
+	// Raise the OAuth refresh User-Agent to this account's persisted
+	// device-profile high-water mark (when present) so background token
+	// refresh matches the same claude-cli identity this account's serving
+	// requests present, instead of the generic claudeOAuthUserAgent floor.
+	// The high-water suffix entrypoint is folded (sdk-cli -> cli, gated by
+	// config.NormalizeSdkCliEntrypointEnabled) so the token-endpoint UA suffix
+	// matches the serving outbound UA suffix aligned by
+	// helps.AlignClaudeDeviceProfileUserAgentSuffix.
+	if refreshUA := claudeRefreshHighWaterUserAgent(e.cfg, auth); refreshUA != "" {
+		svc = svc.WithUserAgent(refreshUA)
+	}
 	td, err := svc.RefreshTokensWithRetry(ctx, refreshToken, 3)
 	if err != nil {
 		return nil, err
@@ -1008,6 +1060,23 @@ func (e *ClaudeExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (
 	now := time.Now().Format(time.RFC3339)
 	auth.Metadata["last_refresh"] = now
 	return auth, nil
+}
+
+// claudeRefreshHighWaterUserAgent returns the OAuth-refresh User-Agent for auth:
+// the account's persisted device-profile high-water User-Agent with its suffix
+// entrypoint folded (sdk-cli -> cli, gated by config.NormalizeSdkCliEntrypointEnabled)
+// so the token-endpoint refresh identity matches the serving outbound UA suffix.
+// It returns "" when auth has no usable high-water User-Agent, in which case the
+// caller leaves the constructor's claudeOAuthUserAgent floor untouched.
+func claudeRefreshHighWaterUserAgent(cfg *config.Config, auth *cliproxyauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	hw, ok := cliproxyauth.ClaudeDeviceHighWaterFromMetadata(auth.Metadata)
+	if !ok || strings.TrimSpace(hw.UserAgent) == "" {
+		return ""
+	}
+	return helps.NormalizeClaudeUserAgentEntrypoint(cfg, hw.UserAgent)
 }
 
 // extractAndRemoveBetas extracts the "betas" array from the body and removes it.
@@ -1434,19 +1503,68 @@ func resolveClaudeBillingVersion(ctx context.Context, cfg *config.Config, auth *
 	return helps.DefaultClaudeVersion(cfg)
 }
 
-func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string, stream bool, extraBetas []string, cfg *config.Config) {
+// applyClaudeManagedProtocolHeaders sets the managed Anthropic/stainless-SDK
+// protocol headers real claude-cli always sends: Anthropic-Version, X-App, the
+// stainless client fingerprint (lang/runtime/retry-count/timeout), a fresh
+// per-request client id (first-party api.anthropic.com only), and
+// Connection: keep-alive. It is shared by two callers:
+//
+//   - applyClaudeHeaders, used by the real /v1/messages serving path
+//     (Execute/ExecuteStream/CountTokens).
+//   - ClaudeExecutor.PrepareRequest, used by the background quota/oauth
+//     snapshot lookups (GET /api/oauth/profile, /api/oauth/usage via
+//     exec.HttpRequest in quota_snapshots.go). Before this extraction,
+//     PrepareRequest only applied the 5 device-profile headers
+//     (UA/package-version/runtime-version/os/arch) via
+//     ApplyClaudeDeviceProfileHeaders, so quota egress carried a
+//     distinguishable "half-managed" header set compared to real serving.
+//
+// includeSessionID controls whether X-Claude-Code-Session-Id is attached. Real
+// serving always passes true (a client session exists). The quota/oauth path
+// is a sessionless background lookup with no client session context and must
+// pass false: attaching a session id there would itself become a new
+// cross-account correlation anchor, not a fingerprint fix.
+//
+// isAnthropicBase gates x-client-request-id (first-party API only, matching
+// real claude-cli) and must be computed by the caller from the actual request
+// host — PrepareRequest is a generic RequestPreparer hook that can in principle
+// be reached for non-Anthropic base_url/proxy targets, so this function must
+// never assume every caller targets api.anthropic.com.
+//
+// X-App is a low-entropy A-class identity field: real claude-cli always sends
+// "cli". It is forced (Set, not EnsureHeader) so a client-supplied or
+// operator-configured X-App override (e.g. "browser") can never leak through
+// and de-anonymize the account; both callers snapshot/reapply managed headers
+// afterward (applyClaudeManagedHeaders) and re-pin it the same way.
+func applyClaudeManagedProtocolHeaders(r *http.Request, ginHeaders http.Header, cfg *config.Config, apiKey string, isAnthropicBase bool, includeSessionID bool) {
 	hdrDefault := func(cfgVal, fallback string) string {
 		if cfgVal != "" {
 			return cfgVal
 		}
 		return fallback
 	}
-
 	var hd config.ClaudeHeaderDefaults
 	if cfg != nil {
 		hd = cfg.ClaudeHeaderDefaults
 	}
+	misc.EnsureHeader(r.Header, ginHeaders, "Anthropic-Version", "2023-06-01")
+	r.Header.Set("X-App", "cli")
+	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Retry-Count", "0")
+	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Runtime", "node")
+	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Lang", "js")
+	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Timeout", hdrDefault(hd.Timeout, "600"))
+	if includeSessionID {
+		// Session ID: stable per auth/apiKey, matches Claude Code's X-Claude-Code-Session-Id header.
+		misc.EnsureHeader(r.Header, ginHeaders, "X-Claude-Code-Session-Id", helps.CachedSessionID(apiKey))
+	}
+	// Per-request UUID, matches Claude Code's x-client-request-id for first-party API.
+	if isAnthropicBase {
+		misc.EnsureHeader(r.Header, ginHeaders, "x-client-request-id", uuid.New().String())
+	}
+	r.Header.Set("Connection", "keep-alive")
+}
 
+func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string, stream bool, extraBetas []string, cfg *config.Config) {
 	useAPIKey := auth != nil && auth.Attributes != nil && strings.TrimSpace(auth.Attributes["api_key"]) != ""
 	isAnthropicBase := r.URL != nil && strings.EqualFold(r.URL.Scheme, "https") && strings.EqualFold(r.URL.Host, "api.anthropic.com")
 	if isAnthropicBase && useAPIKey {
@@ -1523,30 +1641,11 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 	}
 	r.Header.Set("Anthropic-Beta", baseBetas)
 
-	misc.EnsureHeader(r.Header, ginHeaders, "Anthropic-Version", "2023-06-01")
 	// Only set browser access header for API key mode; real Claude Code CLI does not send it.
 	if useAPIKey {
 		misc.EnsureHeader(r.Header, ginHeaders, "Anthropic-Dangerous-Direct-Browser-Access", "true")
 	}
-	// x-app is a low-entropy A-class identity field: real claude-cli always
-	// sends "cli". Force it instead of using EnsureHeader so a client-supplied
-	// X-App (e.g. "browser") can never leak through and de-anonymize the
-	// account. X-App stays pinned to "cli" through the managed-header phase too:
-	// the structured path snapshots it after this Set, and the non-structured
-	// path skips X-App, so even a per-account header:X-App override cannot
-	// restore a non-cli value.
-	r.Header.Set("X-App", "cli")
-	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Retry-Count", "0")
-	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Runtime", "node")
-	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Lang", "js")
-	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Timeout", hdrDefault(hd.Timeout, "600"))
-	// Session ID: stable per auth/apiKey, matches Claude Code's X-Claude-Code-Session-Id header.
-	misc.EnsureHeader(r.Header, ginHeaders, "X-Claude-Code-Session-Id", helps.CachedSessionID(apiKey))
-	// Per-request UUID, matches Claude Code's x-client-request-id for first-party API.
-	if isAnthropicBase {
-		misc.EnsureHeader(r.Header, ginHeaders, "x-client-request-id", uuid.New().String())
-	}
-	r.Header.Set("Connection", "keep-alive")
+	applyClaudeManagedProtocolHeaders(r, ginHeaders, cfg, apiKey, isAnthropicBase, true)
 	if stream {
 		r.Header.Set("Accept", "text/event-stream")
 		r.Header.Set("Accept-Encoding", "identity")

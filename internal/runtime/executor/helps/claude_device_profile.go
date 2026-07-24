@@ -1056,6 +1056,35 @@ func AlignClaudeDeviceProfileUserAgentSuffix(cfg *config.Config, r *http.Request
 	r.Header.Set("User-Agent", outboundUA+" "+desiredSuffix)
 }
 
+// NormalizeClaudeUserAgentEntrypoint folds the "sdk-cli" ENTRYPOINT field inside
+// the parenthetical suffix of a full claude-cli User-Agent string (e.g.
+// "claude-cli/2.1.215 (external, sdk-cli)" -> "claude-cli/2.1.215 (external, cli)")
+// when config.NormalizeSdkCliEntrypointEnabled(cfg) is true (the default). The
+// "claude-cli/<version>" prefix (an account's device-profile high-water version)
+// and every other field are preserved; only the first parenthetical block's
+// entrypoint is rewritten.
+//
+// This is the token-endpoint (OAuth refresh / reauth) counterpart of the serving
+// alignment done by AlignClaudeDeviceProfileUserAgentSuffix. Both reuse the exact
+// same fold routine (normalizeClaudeUserAgentSuffixEntrypoint) gated by the same
+// config.NormalizeSdkCliEntrypointEnabled switch, so the high-water User-Agent a
+// background token refresh/reauth injects presents the same "(external, cli)"
+// suffix that this account's serving requests present, instead of the frozen
+// high-water "(external, sdk-cli)" suffix a single `claude --print` can seed. When
+// the gate is disabled, the UA has no parenthetical block, or the entrypoint is
+// not "sdk-cli", the UA is returned unchanged.
+func NormalizeClaudeUserAgentEntrypoint(cfg *config.Config, ua string) string {
+	match := claudeUserAgentSuffixPattern.FindString(ua)
+	if match == "" {
+		return ua
+	}
+	normalized := normalizeClaudeUserAgentSuffixEntrypoint(cfg, match)
+	if normalized == match {
+		return ua
+	}
+	return strings.Replace(ua, match, normalized, 1)
+}
+
 // DefaultClaudeVersion returns the version string (e.g. "2.1.63") from the
 // current baseline device profile. It extracts the version from the User-Agent.
 func DefaultClaudeVersion(cfg *config.Config) string {

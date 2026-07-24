@@ -4570,12 +4570,39 @@ func buildClaudeOAuthTokenRecord(target *coreauth.Auth, tokenStorage *claude.Cla
 	return record
 }
 
+// claudeReauthHighWaterUserAgent returns the persisted claude device-profile
+// high-water User-Agent for target with its suffix entrypoint folded
+// (sdk-cli -> cli, gated by config.NormalizeSdkCliEntrypointEnabled) so the
+// reauth token-endpoint identity matches the serving outbound UA suffix aligned
+// by helps.AlignClaudeDeviceProfileUserAgentSuffix. It returns "" when target
+// has no usable high-water metadata yet (e.g. a brand-new account with no prior
+// serving observation). Callers pass the result to ClaudeAuth.WithUserAgent,
+// which no-ops on an empty value and leaves the constructor's floor untouched.
+func claudeReauthHighWaterUserAgent(cfg *config.Config, target *coreauth.Auth) string {
+	if target == nil {
+		return ""
+	}
+	hw, ok := coreauth.ClaudeDeviceHighWaterFromMetadata(target.Metadata)
+	if !ok {
+		return ""
+	}
+	ua := strings.TrimSpace(hw.UserAgent)
+	if ua == "" {
+		return ""
+	}
+	return runtimehelps.NormalizeClaudeUserAgentEntrypoint(cfg, ua)
+}
+
 func (h *Handler) newClaudeOAuthAuth(ctx context.Context, target *coreauth.Auth) *claude.ClaudeAuth {
 	if target == nil {
 		return claude.NewClaudeAuth(h.cfg)
 	}
 	client := h.oauthIdentityHTTPClient(ctx, "api.anthropic.com", target, anthropicOAuthExchangeTimeout)
-	return claude.NewClaudeAuthWithHTTPClient(client)
+	// Raise the reauth User-Agent to this account's persisted device-profile
+	// high-water mark (when present) so the OAuth exchange/refresh presents
+	// the same claude-cli identity this account's serving requests use,
+	// instead of falling back to the generic claudeOAuthUserAgent floor.
+	return claude.NewClaudeAuthWithHTTPClient(client).WithUserAgent(claudeReauthHighWaterUserAgent(h.cfg, target))
 }
 
 func (h *Handler) newClaudeOAuthAccountProxyFallbackAuth(target *coreauth.Auth) *claude.ClaudeAuth {
@@ -4586,7 +4613,7 @@ func (h *Handler) newClaudeOAuthAccountProxyFallbackAuth(target *coreauth.Auth) 
 	if proxyURL == "" {
 		return nil
 	}
-	return claude.NewClaudeAuthWithProxyURL(h.cfg, proxyURL)
+	return claude.NewClaudeAuthWithProxyURL(h.cfg, proxyURL).WithUserAgent(claudeReauthHighWaterUserAgent(h.cfg, target))
 }
 
 func (h *Handler) claudeOAuthTransportSummary(target *coreauth.Auth) map[string]string {
