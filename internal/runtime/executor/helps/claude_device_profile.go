@@ -136,6 +136,18 @@ func ClaudeDeviceProfileStabilizationEnabled(cfg *config.Config) bool {
 	return *cfg.ClaudeHeaderDefaults.StabilizeDeviceProfile
 }
 
+// ClaudeWireHeaderOrderReplayEnabled reports whether the claude serving/quota
+// outbound transport should replay the real claude-cli HTTP/1.1 request-header
+// wire order + original casing (route A, JA4H "_hd" fix). Defaults to false
+// (nil == false): opt-in, and gate-off preserves the exact current Go net/http
+// header ordering/casing behavior.
+func ClaudeWireHeaderOrderReplayEnabled(cfg *config.Config) bool {
+	if cfg == nil || cfg.ClaudeHeaderDefaults.ReplayWireHeaderOrder == nil {
+		return false
+	}
+	return *cfg.ClaudeHeaderDefaults.ReplayWireHeaderOrder
+}
+
 // ClaudeDeviceProfileStaleGuardActive reports whether the runtime is in the
 // only remaining stale-prone state under the high-water model (requirement ⑥,
 // plan A): stabilize is enabled, no operator baseline User-Agent is configured,

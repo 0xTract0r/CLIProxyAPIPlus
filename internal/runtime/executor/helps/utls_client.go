@@ -138,6 +138,13 @@ type utlsRoundTripper struct {
 	// (claude outbound, the TLS evidence probe and capture paths). Only the
 	// codex outbound path sets it to codexRustlsClientHelloProfileID.
 	customSpecID string
+	// replayClaudeHeaderOrder, when true, wraps each successfully dialed uTLS
+	// conn so outgoing HTTP/1.1 request headers are re-emitted in the real
+	// claude-cli (undici/Stainless) wire order + original casing (route A, JA4H
+	// "_hd" fix). It is set ONLY for the claude serving/quota transport when the
+	// config flag is on; codex never sets it. Default false preserves the exact
+	// current Go net/http header ordering/casing.
+	replayClaudeHeaderOrder bool
 }
 
 func newUtlsRoundTripper(proxyURL string, clientHello tls.ClientHelloID) *utlsRoundTripper {
@@ -223,7 +230,7 @@ func (t *utlsRoundTripper) dialTLSContext(ctx context.Context, network, addr str
 	if err == nil {
 		// A configured-ClientHello attempt succeeded (possibly after retries).
 		t.lastHandshakeHello.Store(t.clientHello.Str())
-		return conn, nil
+		return t.maybeWrapClaudeHeaderOrder(conn), nil
 	}
 
 	fallbackHello := tls.HelloChrome_133
@@ -249,8 +256,21 @@ func (t *utlsRoundTripper) dialTLSContext(ctx context.Context, network, addr str
 	conn, err = t.handshake(ctx, host, addr, fallbackHello)
 	if err == nil {
 		t.lastHandshakeHello.Store(fallbackHello.Str())
+		return t.maybeWrapClaudeHeaderOrder(conn), nil
 	}
 	return conn, err
+}
+
+// maybeWrapClaudeHeaderOrder wraps a freshly dialed uTLS conn so outgoing
+// HTTP/1.1 request headers are re-emitted in the real claude-cli wire order +
+// original casing, but only when replayClaudeHeaderOrder is set (claude
+// serving/quota with the flag on). Otherwise it returns the conn untouched, so
+// gate-off is a strict no-op with zero behavior change. Reads are never wrapped.
+func (t *utlsRoundTripper) maybeWrapClaudeHeaderOrder(conn net.Conn) net.Conn {
+	if conn == nil || !t.replayClaudeHeaderOrder {
+		return conn
+	}
+	return newClaudeHeaderOrderConn(conn)
 }
 
 // handshakeWithRetry attempts the configured ClientHello handshake up to
@@ -651,6 +671,16 @@ func NewUtlsHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyau
 }
 
 func NewUtlsRoundTripperForProfile(proxyURL string, profileID string) http.RoundTripper {
+	return NewUtlsRoundTripperForProfileWithHeaderOrder(proxyURL, profileID, false)
+}
+
+// NewUtlsRoundTripperForProfileWithHeaderOrder is NewUtlsRoundTripperForProfile
+// plus an opt-in to replay the real claude-cli HTTP/1.1 request-header wire order
+// + original casing (route A). replayClaudeHeaderOrder only takes effect for the
+// claude strong-fingerprint HelloCustom profile (claude_cli_clienthello_v1 and
+// aliases); it is ignored for every other profile so codex/Chrome-preset callers
+// can never accidentally re-case codex headers to the claude-cli order.
+func NewUtlsRoundTripperForProfileWithHeaderOrder(proxyURL string, profileID string, replayClaudeHeaderOrder bool) http.RoundTripper {
 	clientHello, ok := resolveClaudeClientHelloID(profileID)
 	if !ok {
 		profileID = claudeCLIClientHelloProfileID
@@ -671,6 +701,9 @@ func NewUtlsRoundTripperForProfile(proxyURL string, profileID string) http.Round
 		utlsRT = newUtlsRoundTripper(proxyURL, clientHello)
 	}
 	utlsRT.customSpecID = codexCustomSpecID(profileID)
+	// Header-order replay is claude-only: restrict to the claude strong
+	// HelloCustom profile so a codex/Chrome caller can never re-case its headers.
+	utlsRT.replayClaudeHeaderOrder = replayClaudeHeaderOrder && isClaudeStrictHelloCustomProfile(profileID)
 	return &fallbackRoundTripper{
 		utls:     utlsRT,
 		fallback: standardTransportForProxy(proxyURL),

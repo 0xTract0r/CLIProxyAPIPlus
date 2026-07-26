@@ -259,6 +259,17 @@ type ClaudeHeaderDefaults struct {
 	Arch                   string `yaml:"arch" json:"arch"`
 	Timeout                string `yaml:"timeout" json:"timeout"`
 	StabilizeDeviceProfile *bool  `yaml:"stabilize-device-profile,omitempty" json:"stabilize-device-profile,omitempty"`
+
+	// ReplayWireHeaderOrder, when true, makes the claude serving/quota outbound
+	// transport replay the real claude-cli (undici/Stainless) HTTP/1.1 request
+	// header wire order AND original header-name casing, instead of Go net/http's
+	// canonical Title-Case + alphabetical order. This closes the JA4H "_hd"
+	// (header-order) fingerprint gap on claude egress. It only affects the
+	// claude_cli_clienthello_v1 uTLS path; codex/gemini and the OAuth
+	// token-refresh path are unaffected. Defaults to disabled (nil == false):
+	// opt-in until validated against a real upstream, and gate-off preserves the
+	// exact current Go header behavior.
+	ReplayWireHeaderOrder *bool `yaml:"replay-wire-header-order,omitempty" json:"replay-wire-header-order,omitempty"`
 }
 
 // ClaudeConfig contains Claude-specific runtime policy.
