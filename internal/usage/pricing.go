@@ -981,34 +981,33 @@ func normalizeCanonicalModelID(model string) string {
 		return "gpt-5.2"
 	}
 
-	if strings.HasPrefix(normalized, "gpt-5-5") {
+	// Fold only fully normalized base forms onto their canonical id. Date and
+	// snapshot suffixes were already stripped above, so any remaining trailing
+	// token identifies a distinct variant model (e.g. "gpt-5-5-cyber") that
+	// carries its own pricing tier. Such variants must keep their own id so a
+	// variant row can never collapse onto—and overwrite—the canonical tier
+	// when scraping upstream pricing pages. Longer canonical ids (codex, spark)
+	// are matched exactly, so ordering no longer matters.
+	switch normalized {
+	case "gpt-5-5":
 		return "gpt-5.5"
-	}
-	if strings.HasPrefix(normalized, "gpt-5-4") {
+	case "gpt-5-4":
 		return "gpt-5.4"
-	}
-	if strings.HasPrefix(normalized, "gpt-5-2-codex") {
-		return "gpt-5.2-codex"
-	}
-	if strings.HasPrefix(normalized, "gpt-5-3-codex-spark") {
-		return "gpt-5.3-codex-spark"
-	}
-	if strings.HasPrefix(normalized, "gpt-5-3-codex") {
-		return "gpt-5.3-codex"
-	}
-	if strings.HasPrefix(normalized, "gpt-5-2") {
+	case "gpt-5-2":
 		return "gpt-5.2"
-	}
-	if strings.HasPrefix(normalized, "claude-opus-4-7") {
+	case "gpt-5-2-codex":
+		return "gpt-5.2-codex"
+	case "gpt-5-3-codex":
+		return "gpt-5.3-codex"
+	case "gpt-5-3-codex-spark":
+		return "gpt-5.3-codex-spark"
+	case "claude-opus-4-7":
 		return "claude-opus-4-7"
-	}
-	if strings.HasPrefix(normalized, "claude-opus-4-6") {
+	case "claude-opus-4-6":
 		return "claude-opus-4-6"
-	}
-	if strings.HasPrefix(normalized, "claude-sonnet-4-6") {
+	case "claude-sonnet-4-6":
 		return "claude-sonnet-4-6"
-	}
-	if strings.HasPrefix(normalized, "claude-haiku-4-5") {
+	case "claude-haiku-4-5":
 		return "claude-haiku-4-5"
 	}
 	return normalized
