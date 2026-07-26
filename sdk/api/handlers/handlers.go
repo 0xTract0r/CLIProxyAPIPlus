@@ -603,10 +603,12 @@ func (h *BaseAPIHandler) executeWithAuthManager(ctx context.Context, handlerType
 		SourceFormat:    sdktranslator.FromString(handlerType),
 		Headers:         headersFromContext(ctx),
 	}
+	h.applyFarmAccountPin(ctx, reqMeta)
 	opts.Metadata = reqMeta
 	resp, err := h.AuthManager.Execute(ctx, providers, req, opts)
 	if err != nil {
 		err = enrichAuthSelectionError(err, providers, normalizedModel)
+		err = annotateFarmPinError(err, reqMeta)
 		status := http.StatusInternalServerError
 		if se, ok := err.(interface{ StatusCode() int }); ok && se != nil {
 			if code := se.StatusCode(); code > 0 {
@@ -653,10 +655,12 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 		SourceFormat:    sdktranslator.FromString(handlerType),
 		Headers:         headersFromContext(ctx),
 	}
+	h.applyFarmAccountPin(ctx, reqMeta)
 	opts.Metadata = reqMeta
 	resp, err := h.AuthManager.ExecuteCount(ctx, providers, req, opts)
 	if err != nil {
 		err = enrichAuthSelectionError(err, providers, normalizedModel)
+		err = annotateFarmPinError(err, reqMeta)
 		status := http.StatusInternalServerError
 		if se, ok := err.(interface{ StatusCode() int }); ok && se != nil {
 			if code := se.StatusCode(); code > 0 {
@@ -716,10 +720,12 @@ func (h *BaseAPIHandler) executeStreamWithAuthManager(ctx context.Context, handl
 		SourceFormat:    sdktranslator.FromString(handlerType),
 		Headers:         headersFromContext(ctx),
 	}
+	h.applyFarmAccountPin(ctx, reqMeta)
 	opts.Metadata = reqMeta
 	streamResult, err := h.AuthManager.ExecuteStream(ctx, providers, req, opts)
 	if err != nil {
 		err = enrichAuthSelectionError(err, providers, normalizedModel)
+		err = annotateFarmPinError(err, reqMeta)
 		errChan := make(chan *interfaces.ErrorMessage, 1)
 		status := http.StatusInternalServerError
 		if se, ok := err.(interface{ StatusCode() int }); ok && se != nil {
@@ -830,6 +836,7 @@ func (h *BaseAPIHandler) executeStreamWithAuthManager(ctx context.Context, handl
 								continue outer
 							}
 							streamErr = enrichAuthSelectionError(retryErr, providers, normalizedModel)
+							streamErr = annotateFarmPinError(streamErr, reqMeta)
 						}
 					}
 
