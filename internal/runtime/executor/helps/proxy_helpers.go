@@ -105,7 +105,23 @@ func newProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 	if baseURLHost == "" {
 		baseURLHost = runtimeTransportBaseURLHost(auth)
 	}
+	// Route A (JA4H "_hd"): replay real claude-cli request-header wire order +
+	// casing on the claude serving/quota transport when the config flag is on.
+	// The flag is folded into the cache key (claude auths only) so a hot config
+	// toggle yields a distinct cached transport instead of reusing a stale one.
+	replayClaudeHeaderOrder := ClaudeWireHeaderOrderReplayEnabled(cfg)
 	if transportKey := RuntimeTransportProfileCacheKeyForHost(proxyURL, baseURLHost, auth); transportKey != "" {
+		// Fold the header-order flag into the cache key using the SAME provider
+		// resolution as the wrapping gate (BuildRuntimeTransportRoundTripperWithOptions
+		// switches on ResolveRuntimeTransportProfile(auth).Provider). Keying off the
+		// raw auth.Provider instead would miss the edge where auth.Provider is empty
+		// but account_settings transport_profile.provider == "claude", letting a hot
+		// flag toggle reuse a stale cached transport.
+		if replayClaudeHeaderOrder {
+			if profile := ResolveRuntimeTransportProfile(auth); profile != nil && profile.Provider == "claude" {
+				transportKey += "|claude_hdr_order=v1"
+			}
+		}
 		httpClientCacheMutex.RLock()
 		if cachedClient, ok := httpClientCache[transportKey]; ok {
 			httpClientCacheMutex.RUnlock()
@@ -116,7 +132,7 @@ func newProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 		}
 		httpClientCacheMutex.RUnlock()
 
-		if transport, ok := BuildRuntimeTransportRoundTripper(proxyURL, auth); ok && transport != nil {
+		if transport, ok := BuildRuntimeTransportRoundTripperWithOptions(proxyURL, auth, RuntimeTransportRoundTripperOptions{ReplayClaudeHeaderOrder: replayClaudeHeaderOrder}); ok && transport != nil {
 			httpClient := &http.Client{Transport: transport}
 			if timeout > 0 {
 				httpClient.Timeout = timeout

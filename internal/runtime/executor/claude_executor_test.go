@@ -843,6 +843,21 @@ func TestClaudeDeviceProfileStabilizationEnabled_DefaultFalse(t *testing.T) {
 	}
 }
 
+func TestClaudeWireHeaderOrderReplayEnabled_DefaultFalse(t *testing.T) {
+	if helps.ClaudeWireHeaderOrderReplayEnabled(nil) {
+		t.Fatal("expected nil config to default to disabled header-order replay")
+	}
+	if helps.ClaudeWireHeaderOrderReplayEnabled(&config.Config{}) {
+		t.Fatal("expected unset replay-wire-header-order to default to disabled header-order replay")
+	}
+	enabled := true
+	cfg := &config.Config{}
+	cfg.ClaudeHeaderDefaults.ReplayWireHeaderOrder = &enabled
+	if !helps.ClaudeWireHeaderOrderReplayEnabled(cfg) {
+		t.Fatal("expected explicit replay-wire-header-order=true to enable header-order replay")
+	}
+}
+
 func TestApplyClaudeToolPrefix(t *testing.T) {
 	input := []byte(`{"tools":[{"name":"alpha"},{"name":"proxy_bravo"}],"tool_choice":{"type":"tool","name":"charlie"},"messages":[{"role":"assistant","content":[{"type":"tool_use","name":"delta","id":"t1","input":{}}]}]}`)
 	out := applyClaudeToolPrefix(input, "proxy_")

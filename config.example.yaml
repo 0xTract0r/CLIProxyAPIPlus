@@ -269,6 +269,12 @@ nonstream-keepalive-interval: 0
 #   arch: "arm64"
 #   timeout: "600"
 #   stabilize-device-profile: false  # optional, default false; set true to enable per-auth/API-key fingerprint pinning
+#   replay-wire-header-order: false  # optional, default false. When true, claude serving/quota egress
+#                                    # replays the real claude-cli (undici/Stainless) HTTP/1.1 request
+#                                    # header wire ORDER + original casing (JA4H "_hd" fix). Only affects
+#                                    # the claude uTLS path; codex/gemini and OAuth token refresh are
+#                                    # unaffected. Keep disabled until you have verified the resulting
+#                                    # JA4H "_hd" and upstream reachability against the real api.anthropic.com.
 
 # Claude request policy. Default keeps explicit Sonnet model choices unchanged
 # and returns a hint instead of silently routing long Sonnet context to Opus.

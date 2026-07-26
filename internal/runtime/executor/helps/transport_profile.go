@@ -335,7 +335,25 @@ func RuntimeTransportProfileToken(auth *cliproxyauth.Auth) string {
 	return profile.cacheToken()
 }
 
+// RuntimeTransportRoundTripperOptions carries opt-in tweaks for building an
+// account runtime transport round tripper. Zero value preserves the historical
+// behavior of BuildRuntimeTransportRoundTripper.
+type RuntimeTransportRoundTripperOptions struct {
+	// ReplayClaudeHeaderOrder, when true, makes the claude uTLS serving/quota
+	// transport replay the real claude-cli HTTP/1.1 request-header wire order +
+	// original casing (route A, JA4H "_hd" fix). It only affects the claude
+	// HelloCustom path; codex/gemini branches ignore it.
+	ReplayClaudeHeaderOrder bool
+}
+
 func BuildRuntimeTransportRoundTripper(proxyURL string, auth *cliproxyauth.Auth) (http.RoundTripper, bool) {
+	return BuildRuntimeTransportRoundTripperWithOptions(proxyURL, auth, RuntimeTransportRoundTripperOptions{})
+}
+
+// BuildRuntimeTransportRoundTripperWithOptions is BuildRuntimeTransportRoundTripper
+// with opt-in behavior. The default-options wrapper above keeps existing callers
+// (e.g. the TLS probe) on the exact historical behavior.
+func BuildRuntimeTransportRoundTripperWithOptions(proxyURL string, auth *cliproxyauth.Auth, opts RuntimeTransportRoundTripperOptions) (http.RoundTripper, bool) {
 	profile := ResolveRuntimeTransportProfile(auth)
 	if profile == nil || !profile.SupportsRuntime() {
 		return nil, false
@@ -353,7 +371,7 @@ func BuildRuntimeTransportRoundTripper(proxyURL string, auth *cliproxyauth.Auth)
 		if clientHelloProfile == "" {
 			clientHelloProfile = profile.ProfileID
 		}
-		return NewUtlsRoundTripperForProfile(proxyURL, clientHelloProfile), true
+		return NewUtlsRoundTripperForProfileWithHeaderOrder(proxyURL, clientHelloProfile, opts.ReplayClaudeHeaderOrder), true
 	case "codex":
 		if profile.isCLINativeProfile() {
 			return standardTransportForProxy(proxyURL), true
