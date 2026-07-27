@@ -405,61 +405,6 @@ func TestRoundRobinSelectorPick_CursorKeyCap(t *testing.T) {
 	}
 }
 
-func TestRoundRobinSelectorPick_GeminiCLICredentialGrouping(t *testing.T) {
-	t.Parallel()
-
-	selector := &RoundRobinSelector{}
-
-	// Simulate two gemini-cli credentials, each with multiple projects:
-	// Credential A (parent = "cred-a.json") has 3 projects
-	// Credential B (parent = "cred-b.json") has 2 projects
-	auths := []*Auth{
-		{ID: "cred-a.json::proj-a1", Attributes: map[string]string{"gemini_virtual_parent": "cred-a.json"}},
-		{ID: "cred-a.json::proj-a2", Attributes: map[string]string{"gemini_virtual_parent": "cred-a.json"}},
-		{ID: "cred-a.json::proj-a3", Attributes: map[string]string{"gemini_virtual_parent": "cred-a.json"}},
-		{ID: "cred-b.json::proj-b1", Attributes: map[string]string{"gemini_virtual_parent": "cred-b.json"}},
-		{ID: "cred-b.json::proj-b2", Attributes: map[string]string{"gemini_virtual_parent": "cred-b.json"}},
-	}
-
-	// Two-level round-robin: consecutive picks must alternate between credentials.
-	// Credential group order is randomized, but within each call the group cursor
-	// advances by 1, so consecutive picks should cycle through different parents.
-	picks := make([]string, 6)
-	parents := make([]string, 6)
-	for i := 0; i < 6; i++ {
-		got, err := selector.Pick(context.Background(), "gemini-cli", "gemini-2.5-pro", cliproxyexecutor.Options{}, auths)
-		if err != nil {
-			t.Fatalf("Pick() #%d error = %v", i, err)
-		}
-		if got == nil {
-			t.Fatalf("Pick() #%d auth = nil", i)
-		}
-		picks[i] = got.ID
-		parents[i] = got.Attributes["gemini_virtual_parent"]
-	}
-
-	// Verify property: consecutive picks must alternate between credential groups.
-	for i := 1; i < len(parents); i++ {
-		if parents[i] == parents[i-1] {
-			t.Fatalf("Pick() #%d and #%d both from same parent %q (IDs: %q, %q); expected alternating credentials",
-				i-1, i, parents[i], picks[i-1], picks[i])
-		}
-	}
-
-	// Verify property: each credential's projects are picked in sequence (round-robin within group).
-	credPicks := map[string][]string{}
-	for i, id := range picks {
-		credPicks[parents[i]] = append(credPicks[parents[i]], id)
-	}
-	for parent, ids := range credPicks {
-		for i := 1; i < len(ids); i++ {
-			if ids[i] == ids[i-1] {
-				t.Fatalf("Credential %q picked same project %q twice in a row", parent, ids[i])
-			}
-		}
-	}
-}
-
 func TestExtractSessionID(t *testing.T) {
 	t.Parallel()
 
@@ -613,42 +558,6 @@ func TestSessionAffinitySelector_DifferentSessionsDifferentAuths(t *testing.T) {
 	}
 }
 
-func TestRoundRobinSelectorPick_SingleParentFallsBackToFlat(t *testing.T) {
-	t.Parallel()
-
-	selector := &RoundRobinSelector{}
-
-	// All auths from the same parent - should fall back to flat round-robin
-	// because there's only one credential group (no benefit from two-level).
-	auths := []*Auth{
-		{ID: "cred-a.json::proj-a1", Attributes: map[string]string{"gemini_virtual_parent": "cred-a.json"}},
-		{ID: "cred-a.json::proj-a2", Attributes: map[string]string{"gemini_virtual_parent": "cred-a.json"}},
-		{ID: "cred-a.json::proj-a3", Attributes: map[string]string{"gemini_virtual_parent": "cred-a.json"}},
-	}
-
-	// With single parent group, parentOrder has length 1, so it uses flat round-robin.
-	// Sorted by ID: proj-a1, proj-a2, proj-a3
-	want := []string{
-		"cred-a.json::proj-a1",
-		"cred-a.json::proj-a2",
-		"cred-a.json::proj-a3",
-		"cred-a.json::proj-a1",
-	}
-
-	for i, expectedID := range want {
-		got, err := selector.Pick(context.Background(), "gemini-cli", "gemini-2.5-pro", cliproxyexecutor.Options{}, auths)
-		if err != nil {
-			t.Fatalf("Pick() #%d error = %v", i, err)
-		}
-		if got == nil {
-			t.Fatalf("Pick() #%d auth = nil", i)
-		}
-		if got.ID != expectedID {
-			t.Fatalf("Pick() #%d auth.ID = %q, want %q", i, got.ID, expectedID)
-		}
-	}
-}
-
 func TestSessionAffinitySelector_FailoverWhenAuthUnavailable(t *testing.T) {
 	t.Parallel()
 
@@ -700,39 +609,6 @@ func TestSessionAffinitySelector_FailoverWhenAuthUnavailable(t *testing.T) {
 	}
 }
 
-func TestRoundRobinSelectorPick_MixedVirtualAndNonVirtualFallsBackToFlat(t *testing.T) {
-	t.Parallel()
-
-	selector := &RoundRobinSelector{}
-
-	// Mix of virtual and non-virtual auths (e.g., a regular gemini-cli auth without projects
-	// alongside virtual ones). Should fall back to flat round-robin.
-	auths := []*Auth{
-		{ID: "cred-a.json::proj-a1", Attributes: map[string]string{"gemini_virtual_parent": "cred-a.json"}},
-		{ID: "cred-regular.json"}, // no gemini_virtual_parent
-	}
-
-	// groupByVirtualParent returns nil when any auth lacks the attribute,
-	// so flat round-robin is used. Sorted by ID: cred-a.json::proj-a1, cred-regular.json
-	want := []string{
-		"cred-a.json::proj-a1",
-		"cred-regular.json",
-		"cred-a.json::proj-a1",
-	}
-
-	for i, expectedID := range want {
-		got, err := selector.Pick(context.Background(), "gemini-cli", "", cliproxyexecutor.Options{}, auths)
-		if err != nil {
-			t.Fatalf("Pick() #%d error = %v", i, err)
-		}
-		if got == nil {
-			t.Fatalf("Pick() #%d auth = nil", i)
-		}
-		if got.ID != expectedID {
-			t.Fatalf("Pick() #%d auth.ID = %q, want %q", i, got.ID, expectedID)
-		}
-	}
-}
 func TestExtractSessionID_ClaudeCodePriorityOverHeader(t *testing.T) {
 	t.Parallel()
 
@@ -816,60 +692,6 @@ func TestExtractSessionID_CodexSessionIDPriorityOverClientRequestID(t *testing.T
 	}
 }
 
-func TestExtractSessionID_AmpThreadId(t *testing.T) {
-	t.Parallel()
-
-	headers := make(http.Header)
-	headers.Set("X-Amp-Thread-Id", "T-7873e6bd-6354-4a9a-be2c-c7702c6e1b64")
-
-	got := ExtractSessionID(headers, nil, nil)
-	want := "amp:T-7873e6bd-6354-4a9a-be2c-c7702c6e1b64"
-	if got != want {
-		t.Errorf("ExtractSessionID() with X-Amp-Thread-Id = %q, want %q", got, want)
-	}
-}
-
-func TestExtractSessionID_AmpThreadIdPriorityOverClientRequestID(t *testing.T) {
-	t.Parallel()
-
-	headers := make(http.Header)
-	headers.Set("X-Amp-Thread-Id", "T-priority-test")
-	headers.Set("X-Client-Request-Id", "pi-session-123")
-
-	got := ExtractSessionID(headers, nil, nil)
-	want := "amp:T-priority-test"
-	if got != want {
-		t.Errorf("ExtractSessionID() = %q, want %q (X-Amp-Thread-Id should take priority over X-Client-Request-Id)", got, want)
-	}
-}
-
-// TestExtractSessionID_AmpThreadIdLowerPriority verifies X-Amp-Thread-Id is lower
-// priority than Claude Code metadata.user_id but higher than conversation_id.
-func TestExtractSessionID_AmpThreadIdPriority(t *testing.T) {
-	t.Parallel()
-
-	// X-Amp-Thread-Id should be used when no Claude Code user_id is present
-	headers := make(http.Header)
-	headers.Set("X-Amp-Thread-Id", "T-priority-test")
-
-	payload := []byte(`{"conversation_id":"conv-12345"}`)
-	got := ExtractSessionID(headers, payload, nil)
-	want := "amp:T-priority-test"
-	if got != want {
-		t.Errorf("ExtractSessionID() = %q, want %q (Amp thread ID should take priority over conversation_id)", got, want)
-	}
-
-	// Claude Code user_id should take priority over X-Amp-Thread-Id
-	headers2 := make(http.Header)
-	headers2.Set("X-Amp-Thread-Id", "T-priority-test")
-	payload2 := []byte(`{"metadata":{"user_id":"user_xxx_account__session_ac980658-63bd-4fb3-97ba-8da64cb1e344"}}`)
-	got2 := ExtractSessionID(headers2, payload2, nil)
-	want2 := "claude:ac980658-63bd-4fb3-97ba-8da64cb1e344"
-	if got2 != want2 {
-		t.Errorf("ExtractSessionID() = %q, want %q (Claude Code should take priority over Amp thread ID)", got2, want2)
-	}
-}
-
 // TestExtractSessionID_IdempotencyKey verifies that idempotency_key is intentionally
 // ignored for session affinity (it's auto-generated per-request, causing cache misses).
 func TestExtractSessionID_IdempotencyKey(t *testing.T) {
@@ -881,6 +703,45 @@ func TestExtractSessionID_IdempotencyKey(t *testing.T) {
 	// idempotency_key is disabled - should return empty (no payload to hash)
 	if got != "" {
 		t.Errorf("ExtractSessionID() with idempotency_key = %q, want empty (idempotency_key is disabled)", got)
+	}
+}
+
+func TestExtractSessionID_DerivedSessionAndExplicitPriority(t *testing.T) {
+	t.Parallel()
+
+	metadata := map[string]any{cliproxyexecutor.DerivedSessionIDMetadataKey: "ctx:v1:derived-root"}
+	payload := []byte(`{"messages":[{"role":"user","content":"hello"}]}`)
+	if got := ExtractSessionID(nil, payload, metadata); got != "derived:ctx:v1:derived-root" {
+		t.Fatalf("ExtractSessionID() = %q, want derived identity", got)
+	}
+
+	executionMetadata := map[string]any{
+		cliproxyexecutor.ExecutionSessionMetadataKey: "execution-session",
+		cliproxyexecutor.DerivedSessionIDMetadataKey: "ctx:v1:derived-root",
+	}
+	if got := ExtractSessionID(nil, payload, executionMetadata); got != "execution:execution-session" {
+		t.Fatalf("ExtractSessionID() = %q, want explicit execution session", got)
+	}
+
+	explicitPayload := []byte(`{"session_id":"explicit-session","prompt_cache_key":"explicit-cache","messages":[{"role":"user","content":"hello"}]}`)
+	if got := ExtractSessionID(nil, explicitPayload, metadata); got != "session:explicit-session" {
+		t.Fatalf("ExtractSessionID() = %q, want explicit body session", got)
+	}
+
+	userPayload := []byte(`{"metadata":{"user_id":"explicit-user"},"conversation_id":"explicit-conversation","messages":[{"role":"user","content":"hello"}]}`)
+	if got := ExtractSessionID(nil, userPayload, metadata); got != "user:explicit-user" {
+		t.Fatalf("ExtractSessionID() = %q, want explicit metadata.user_id", got)
+	}
+
+	lowercaseHeaders := http.Header{"x-session-id": []string{" lowercase-session "}}
+	if got := ExtractSessionID(lowercaseHeaders, payload, metadata); got != "header:lowercase-session" {
+		t.Fatalf("ExtractSessionID() = %q, want case-insensitive trimmed header session", got)
+	}
+
+	headers := make(http.Header)
+	headers.Set("X-Session-ID", "header-session")
+	if got := ExtractSessionID(headers, explicitPayload, metadata); got != "header:header-session" {
+		t.Fatalf("ExtractSessionID() = %q, want explicit header session", got)
 	}
 }
 

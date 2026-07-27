@@ -122,3 +122,354 @@ func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_DefersMessageUntil
 		t.Fatalf("messages.3.content = %q, want %q", got, "next")
 	}
 }
+
+func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_AttachesReasoningToAssistantMessage(t *testing.T) {
+	raw := []byte(`{
+		"input": [
+			{
+				"type": "reasoning",
+				"id": "rs_1",
+				"summary": [
+					{"type": "summary_text", "text": "first line\n"},
+					{"type": "summary_text", "text": "second line"}
+				]
+			},
+			{
+				"type": "message",
+				"role": "assistant",
+				"content": [{"type": "output_text", "text": "answer"}]
+			},
+			{"type": "message", "role": "user", "content": "next"}
+		]
+	}`)
+	t.Logf("input json:\n%s", prettyJSONForTest(raw))
+
+	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("deepseek-v4-flash", raw, false)
+	t.Logf("output json:\n%s", prettyJSONForTest(out))
+
+	if got := gjson.GetBytes(out, "messages.#").Int(); got != 2 {
+		t.Fatalf("messages count = %d, want 2; output=%s", got, out)
+	}
+	if got := gjson.GetBytes(out, "messages.0.role").String(); got != "assistant" {
+		t.Fatalf("messages.0.role = %q, want assistant; output=%s", got, out)
+	}
+	if got := gjson.GetBytes(out, "messages.0.reasoning_content").String(); got != "first line\nsecond line" {
+		t.Fatalf("messages.0.reasoning_content = %q, want %q; output=%s", got, "first line\nsecond line", out)
+	}
+	if got := gjson.GetBytes(out, "messages.0.content.0.text").String(); got != "answer" {
+		t.Fatalf("messages.0.content.0.text = %q, want answer; output=%s", got, out)
+	}
+	if got := gjson.GetBytes(out, "messages.1.role").String(); got != "user" {
+		t.Fatalf("messages.1.role = %q, want user; output=%s", got, out)
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_AttachesReasoningToToolCallMessage(t *testing.T) {
+	raw := []byte(`{
+		"input": [
+			{
+				"type": "reasoning",
+				"id": "rs_tool",
+				"summary": [{"type": "summary_text", "text": "tool reasoning"}]
+			},
+			{"type":"function_call","call_id":"call_1","name":"exec_command","arguments":"{\"cmd\":\"pwd\"}"},
+			{"type":"function_call_output","call_id":"call_1","output":"ok"}
+		]
+	}`)
+	t.Logf("input json:\n%s", prettyJSONForTest(raw))
+
+	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("deepseek-v4-flash", raw, true)
+	t.Logf("output json:\n%s", prettyJSONForTest(out))
+
+	if got := gjson.GetBytes(out, "messages.#").Int(); got != 2 {
+		t.Fatalf("messages count = %d, want 2; output=%s", got, out)
+	}
+	if got := gjson.GetBytes(out, "messages.0.role").String(); got != "assistant" {
+		t.Fatalf("messages.0.role = %q, want assistant; output=%s", got, out)
+	}
+	if got := gjson.GetBytes(out, "messages.0.reasoning_content").String(); got != "tool reasoning" {
+		t.Fatalf("messages.0.reasoning_content = %q, want tool reasoning; output=%s", got, out)
+	}
+	if got := gjson.GetBytes(out, "messages.0.tool_calls.0.id").String(); got != "call_1" {
+		t.Fatalf("messages.0.tool_calls.0.id = %q, want call_1; output=%s", got, out)
+	}
+	if got := gjson.GetBytes(out, "messages.1.role").String(); got != "tool" {
+		t.Fatalf("messages.1.role = %q, want tool; output=%s", got, out)
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_KeepsReasoningBeforeUserMessage(t *testing.T) {
+	raw := []byte(`{
+		"input": [
+			{"type": "reasoning", "id": "rs_empty", "summary": []},
+			{"type": "message", "role": "user", "content": "continue"}
+		]
+	}`)
+	t.Logf("input json:\n%s", prettyJSONForTest(raw))
+
+	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("deepseek-v4-flash", raw, false)
+	t.Logf("output json:\n%s", prettyJSONForTest(out))
+
+	if got := gjson.GetBytes(out, "messages.#").Int(); got != 2 {
+		t.Fatalf("messages count = %d, want 2; output=%s", got, out)
+	}
+	if got := gjson.GetBytes(out, "messages.0.role").String(); got != "assistant" {
+		t.Fatalf("messages.0.role = %q, want assistant; output=%s", got, out)
+	}
+	if got := gjson.GetBytes(out, "messages.0.reasoning_content").String(); got != "[reasoning unavailable]" {
+		t.Fatalf("messages.0.reasoning_content = %q, want placeholder; output=%s", got, out)
+	}
+	if got := gjson.GetBytes(out, "messages.1.role").String(); got != "user" {
+		t.Fatalf("messages.1.role = %q, want user; output=%s", got, out)
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_FlattensNamespaceTools(t *testing.T) {
+	raw := []byte(`{
+		"input": [
+			{"role":"user","content":"Use add_numbers."}
+		],
+		"tools": [
+			{
+				"type": "namespace",
+				"name": "mcp__test_mcp__",
+				"description": "Tools in the mcp__test_mcp__ namespace.",
+				"tools": [
+					{
+						"type": "function",
+						"name": "add_numbers",
+						"description": "Add two numbers",
+						"parameters": {
+							"type": "object",
+							"properties": {
+								"a": { "type": "number" },
+								"b": { "type": "number" }
+							},
+							"required": ["a", "b"]
+						}
+					}
+				]
+			}
+		],
+		"tool_choice": "auto"
+	}`)
+	t.Logf("input json:\n%s", prettyJSONForTest(raw))
+
+	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("deepseek-v4-flash", raw, false)
+	t.Logf("output json:\n%s", prettyJSONForTest(out))
+
+	if got := gjson.GetBytes(out, "tools.#").Int(); got != 1 {
+		t.Fatalf("tools count = %d, want 1; output=%s", got, out)
+	}
+	if got := gjson.GetBytes(out, "tools.0.type").String(); got != "function" {
+		t.Fatalf("tools.0.type = %q, want function; output=%s", got, out)
+	}
+	if got := gjson.GetBytes(out, "tools.0.function.name").String(); got != "mcp__test_mcp__add_numbers" {
+		t.Fatalf("tools.0.function.name = %q, want mcp__test_mcp__add_numbers; output=%s", got, out)
+	}
+	if got := gjson.GetBytes(out, "tools.0.function.description").String(); got != "Add two numbers" {
+		t.Fatalf("tools.0.function.description = %q, want Add two numbers; output=%s", got, out)
+	}
+	if got := gjson.GetBytes(out, "tools.0.function.parameters.required.0").String(); got != "a" {
+		t.Fatalf("tools.0.function.parameters.required.0 = %q, want a; output=%s", got, out)
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_QualifiesNamespaceFunctionCallHistory(t *testing.T) {
+	raw := []byte(`{
+		"input": [
+			{"type":"function_call","call_id":"call_get_me","name":"get_me","namespace":"mcp__github","arguments":"{}"},
+			{"type":"function_call_output","call_id":"call_get_me","output":"ok"}
+		],
+		"tools": [
+			{
+				"type":"namespace",
+				"name":"mcp__github",
+				"tools":[{"type":"function","name":"get_me","parameters":{"type":"object"}}]
+			}
+		]
+	}`)
+
+	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("deepseek-v4-flash", raw, false)
+
+	gotHistoryName := gjson.GetBytes(out, "messages.0.tool_calls.0.function.name").String()
+	gotDeclaredName := gjson.GetBytes(out, "tools.0.function.name").String()
+	if gotHistoryName != "mcp__github__get_me" {
+		t.Fatalf("history function name = %q, want mcp__github__get_me; output=%s", gotHistoryName, out)
+	}
+	if gotHistoryName != gotDeclaredName {
+		t.Fatalf("history function name = %q, declared function name = %q; output=%s", gotHistoryName, gotDeclaredName, out)
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_FlattensNamespaceCustomTools(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  []byte
+	}{
+		{
+			name: "top-level tools",
+			raw: []byte(`{
+				"tools":[{
+					"type":"namespace",
+					"name":"terminal",
+					"tools":[{"type":"custom","name":"exec","description":"Run a command"}]
+				}]
+			}`),
+		},
+		{
+			name: "additional tools",
+			raw: []byte(`{
+				"input":[{
+					"type":"additional_tools",
+					"tools":[{
+						"type":"namespace",
+						"name":"terminal",
+						"tools":[{"type":"custom","name":"exec","description":"Run a command"}]
+					}]
+				}]
+			}`),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("gpt-5.4", tt.raw, false)
+
+			if got := gjson.GetBytes(out, "tools.#").Int(); got != 1 {
+				t.Fatalf("tools count = %d, want 1; output=%s", got, out)
+			}
+			if got := gjson.GetBytes(out, "tools.0.function.name").String(); got != "terminal__exec" {
+				t.Fatalf("tool name = %q, want terminal__exec; output=%s", got, out)
+			}
+			if got := gjson.GetBytes(out, "tools.0.function.description").String(); got != "Run a command" {
+				t.Fatalf("tool description = %q, want Run a command; output=%s", got, out)
+			}
+			if got := gjson.GetBytes(out, "tools.0.function.parameters.type").String(); got != "object" {
+				t.Fatalf("parameters type = %q, want object; output=%s", got, out)
+			}
+			if got := gjson.GetBytes(out, "tools.0.function.parameters.properties.input.type").String(); got != "string" {
+				t.Fatalf("input type = %q, want string; output=%s", got, out)
+			}
+			if got := gjson.GetBytes(out, "tools.0.function.parameters.required.0").String(); got != "input" {
+				t.Fatalf("required parameter = %q, want input; output=%s", got, out)
+			}
+		})
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_PreservesStructuredToolChoice(t *testing.T) {
+	raw := []byte(`{
+		"input": [
+			{"role":"user","content":"Run command."}
+		],
+		"tools": [
+			{
+				"type": "function",
+				"name": "run_command",
+				"parameters": {"type": "object"}
+			}
+		],
+		"tool_choice": {
+			"type": "function",
+			"function": {
+				"name": "run_command"
+			}
+		}
+	}`)
+	t.Logf("input json:\n%s", prettyJSONForTest(raw))
+
+	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("gpt-5.4", raw, false)
+	t.Logf("output json:\n%s", prettyJSONForTest(out))
+
+	if got := gjson.GetBytes(out, "tool_choice.type").String(); got != "function" {
+		t.Fatalf("tool_choice.type = %q, want function; output=%s", got, out)
+	}
+	if got := gjson.GetBytes(out, "tool_choice.function.name").String(); got != "run_command" {
+		t.Fatalf("tool_choice.function.name = %q, want run_command; output=%s", got, out)
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_OmitsToolSettingsWithoutTools(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  []byte
+	}{
+		{
+			name: "empty tools",
+			raw: []byte(`{
+				"input": [{"role":"user","content":"say ok"}],
+				"tools": [],
+				"tool_choice": "auto",
+				"parallel_tool_calls": false
+			}`),
+		},
+		{
+			name: "unconvertible tools",
+			raw: []byte(`{
+				"tools": [{"type":"unsupported"}],
+				"tool_choice": "auto",
+				"parallel_tool_calls": false
+			}`),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("grok-4.5", tt.raw, false)
+
+			for _, field := range []string{"tools", "tool_choice", "parallel_tool_calls"} {
+				if got := gjson.GetBytes(out, field); got.Exists() {
+					t.Fatalf("%s should be omitted without tools; output=%s", field, out)
+				}
+			}
+		})
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_PreservesParallelToolCallsWithTools(t *testing.T) {
+	raw := []byte(`{
+		"tools": [
+			{
+				"type": "function",
+				"name": "run_command",
+				"parameters": {"type": "object"}
+			}
+		],
+		"parallel_tool_calls": false
+	}`)
+
+	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("grok-4.5", raw, false)
+
+	if got := gjson.GetBytes(out, "parallel_tool_calls"); !got.Exists() || got.Bool() {
+		t.Fatalf("parallel_tool_calls = %v, want false; output=%s", got.Value(), out)
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_PreservesInputImageDetail(t *testing.T) {
+	raw := []byte(`{
+		"input": [
+			{
+				"role": "user",
+				"content": [
+					{
+						"type": "input_image",
+						"image_url": "https://example.com/image.png",
+						"detail": "high"
+					}
+				]
+			}
+		]
+	}`)
+	t.Logf("input json:\n%s", prettyJSONForTest(raw))
+
+	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("gpt-5.4", raw, false)
+	t.Logf("output json:\n%s", prettyJSONForTest(out))
+
+	if got := gjson.GetBytes(out, "messages.0.content.0.image_url.url").String(); got != "https://example.com/image.png" {
+		t.Fatalf("messages.0.content.0.image_url.url = %q, want https://example.com/image.png; output=%s", got, out)
+	}
+	if got := gjson.GetBytes(out, "messages.0.content.0.image_url.detail").String(); got != "high" {
+		t.Fatalf("messages.0.content.0.image_url.detail = %q, want high; output=%s", got, out)
+	}
+}

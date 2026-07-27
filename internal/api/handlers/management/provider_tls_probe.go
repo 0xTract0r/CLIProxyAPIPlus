@@ -70,11 +70,6 @@ func (h *Handler) RunProviderTLSProbe(c *gin.Context) {
 	c.JSON(http.StatusOK, result)
 }
 
-func firstNonEmpty(values ...string) string {
-	for _, value := range values {
-		if trimmed := strings.TrimSpace(value); trimmed != "" {
-			return trimmed
-		}
-	}
-	return ""
-}
+// firstNonEmpty is defined in oauth_callback.go (upstream v7.2.101 split); the fork
+// copy that used to live here was removed during the upstream sync to avoid a
+// redeclaration. Both had identical behavior.

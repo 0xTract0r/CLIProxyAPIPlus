@@ -99,6 +99,7 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	}
 
 	from := opts.SourceFormat
+	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
 	to := sdktranslator.FromString("openai")
 	endpoint := "/chat/completions"
 	if opts.Alt == "responses/compact" {
@@ -110,8 +111,8 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 		originalPayloadSource = opts.OriginalRequest
 	}
 	originalPayload := originalPayloadSource
-	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, opts.Stream)
-	translated := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, opts.Stream)
+	originalTranslated := helps.TranslateRequestWithCodexMultiAgentV2(ctx, opts.Headers, e.cfg, from, to, baseModel, originalPayload, opts.Stream)
+	translated := helps.TranslateRequestWithCodexMultiAgentV2(ctx, opts.Headers, e.cfg, from, to, baseModel, req.Payload, opts.Stream)
 
 	translated, err = thinking.ApplyThinking(translated, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
@@ -193,7 +194,7 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	reporter.EnsurePublished(ctx)
 	// Translate response back to source format when needed
 	var param any
-	out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, opts.OriginalRequest, translated, body, &param)
+	out := sdktranslator.TranslateNonStream(ctx, to, responseFormat, req.Model, opts.OriginalRequest, translated, body, &param)
 	resp = cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}
 	return resp, nil
 }
@@ -304,14 +305,15 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	}
 
 	from := opts.SourceFormat
+	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
 	to := sdktranslator.FromString("openai")
 	originalPayloadSource := req.Payload
 	if len(opts.OriginalRequest) > 0 {
 		originalPayloadSource = opts.OriginalRequest
 	}
 	originalPayload := originalPayloadSource
-	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, true)
-	translated := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, true)
+	originalTranslated := helps.TranslateRequestWithCodexMultiAgentV2(ctx, opts.Headers, e.cfg, from, to, baseModel, originalPayload, true)
+	translated := helps.TranslateRequestWithCodexMultiAgentV2(ctx, opts.Headers, e.cfg, from, to, baseModel, req.Payload, true)
 
 	translated, err = thinking.ApplyThinking(translated, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
@@ -324,7 +326,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 
 	// Request usage data in the final streaming chunk so that token statistics
 	// are captured even when the upstream is an OpenAI-compatible provider.
-	translated, _ = sjson.SetBytes(translated, "stream_options.include_usage", true)
+	translated = helps.SetBoolIfDifferent(translated, "stream_options.include_usage", true)
 	reporter.SetTranslatedReasoningEffort(translated, to.String())
 
 	url := strings.TrimSuffix(baseURL, "/") + "/chat/completions"
@@ -390,13 +392,14 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		}()
 		scanner := bufio.NewScanner(httpResp.Body)
 		scanner.Buffer(nil, 52_428_800) // 50MB
+		claudeInputTokens := helps.NewClaudeInputTokenState(from, to, responseFormat, originalPayload)
 		var param any
+		var streamUsage helps.StreamUsageBuffer
+		defer streamUsage.Publish(ctx, reporter)
 		for scanner.Scan() {
 			line := scanner.Bytes()
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
-			if detail, ok := helps.ParseOpenAIStreamUsage(line); ok {
-				reporter.Publish(ctx, detail)
-			}
+			streamUsage.ObserveOpenAIStream(line)
 			trimmedLine := bytes.TrimSpace(line)
 			if len(trimmedLine) == 0 {
 				continue
@@ -421,7 +424,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 			}
 
 			// OpenAI-compatible streams must use SSE data lines.
-			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, opts.OriginalRequest, translated, bytes.Clone(trimmedLine), &param)
+			chunks := helps.TranslateStreamWithClaudeInputTokens(ctx, to, responseFormat, req.Model, opts.OriginalRequest, translated, bytes.Clone(trimmedLine), &param, claudeInputTokens)
 			for i := range chunks {
 				select {
 				case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
@@ -441,7 +444,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 			// In case the upstream close the stream without a terminal [DONE] marker.
 			// Feed a synthetic done marker through the translator so pending
 			// response.completed events are still emitted exactly once.
-			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, opts.OriginalRequest, translated, []byte("data: [DONE]"), &param)
+			chunks := helps.TranslateStreamWithClaudeInputTokens(ctx, to, responseFormat, req.Model, opts.OriginalRequest, translated, []byte("data: [DONE]"), &param, claudeInputTokens)
 			for i := range chunks {
 				select {
 				case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
@@ -450,7 +453,8 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 				}
 			}
 		}
-		// Ensure we record the request if no usage chunk was ever seen
+		// Ensure we record the request if no usage chunk was ever seen.
+		streamUsage.Publish(ctx, reporter)
 		reporter.EnsurePublished(ctx)
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
@@ -577,8 +581,9 @@ func (e *OpenAICompatExecutor) CountTokens(ctx context.Context, auth *cliproxyau
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
 	from := opts.SourceFormat
+	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
 	to := sdktranslator.FromString("openai")
-	translated := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, false)
+	translated := helps.TranslateRequestWithCodexMultiAgentV2(ctx, opts.Headers, e.cfg, from, to, baseModel, req.Payload, false)
 
 	modelForCounting := baseModel
 
@@ -598,7 +603,7 @@ func (e *OpenAICompatExecutor) CountTokens(ctx context.Context, auth *cliproxyau
 	}
 
 	usageJSON := helps.BuildOpenAIUsageJSON(count)
-	translatedUsage := sdktranslator.TranslateTokenCount(ctx, to, from, count, usageJSON)
+	translatedUsage := sdktranslator.TranslateTokenCount(ctx, to, responseFormat, count, usageJSON)
 	return cliproxyexecutor.Response{Payload: translatedUsage}, nil
 }
 
@@ -630,10 +635,10 @@ func prepareOpenAICompatImagesPayload(payload []byte, model string, contentType 
 	contentType = strings.TrimSpace(contentType)
 	if json.Valid(payload) {
 		if model != "" {
-			payload, _ = sjson.SetBytes(payload, "model", model)
+			payload = helps.SetStringIfDifferent(payload, "model", model)
 		}
 		if stream {
-			payload, _ = sjson.SetBytes(payload, "stream", true)
+			payload = helps.SetBoolIfDifferent(payload, "stream", true)
 		} else {
 			payload, _ = sjson.DeleteBytes(payload, "stream")
 		}
@@ -774,8 +779,7 @@ func (e *OpenAICompatExecutor) overrideModel(payload []byte, model string) []byt
 	if len(payload) == 0 || model == "" {
 		return payload
 	}
-	payload, _ = sjson.SetBytes(payload, "model", model)
-	return payload
+	return helps.SetStringIfDifferent(payload, "model", model)
 }
 
 type statusErr struct {

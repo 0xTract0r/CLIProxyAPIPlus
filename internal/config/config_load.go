@@ -1,0 +1,226 @@
+package config
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"os"
+	"strings"
+	"syscall"
+
+	log "github.com/sirupsen/logrus"
+	"gopkg.in/yaml.v3"
+)
+
+// LoadConfig reads a YAML configuration file from the given path,
+// unmarshals it into a Config struct, applies environment variable overrides,
+// and returns it.
+//
+// Parameters:
+//   - configFile: The path to the YAML configuration file
+//
+// Returns:
+//   - *Config: The loaded configuration
+//   - error: An error if the configuration could not be loaded
+func LoadConfig(configFile string) (*Config, error) {
+	return LoadConfigOptional(configFile, false)
+}
+
+// LoadConfigOptional reads YAML from configFile.
+// If optional is true and the file is missing, it returns an empty Config.
+// If optional is true and the file is empty or invalid, it returns an empty Config.
+func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
+	// Read the entire configuration file into memory.
+	data, err := os.ReadFile(configFile)
+	if err != nil {
+		if optional {
+			if os.IsNotExist(err) || errors.Is(err, syscall.EISDIR) {
+				// Missing and optional: return empty config (cloud deploy standby).
+				cfg := &Config{CredentialInFlight: DefaultCredentialInFlightConfig()}
+				cfg.NormalizePluginsConfig()
+				return cfg, nil
+			}
+		}
+		return nil, fmt.Errorf("failed to read config file: %w", err)
+	}
+
+	// In cloud deploy mode (optional=true), if file is empty or contains only whitespace, return empty config.
+	if optional && len(bytes.TrimSpace(data)) == 0 {
+		cfg := &Config{CredentialInFlight: DefaultCredentialInFlightConfig()}
+		cfg.NormalizePluginsConfig()
+		return cfg, nil
+	}
+
+	// Unmarshal the YAML data into the Config struct.
+	var cfg Config
+	// Set defaults before unmarshal so that absent keys keep defaults.
+	cfg.Host = "" // Default empty: binds to all interfaces (IPv4 + IPv6)
+	cfg.LoggingToFile = false
+	cfg.LogsMaxTotalSizeMB = 0
+	// fork(anticorr): restore the log-retention defaults that the upstream
+	// defaults-block rewrite dropped during the merge. Absent keys must keep the
+	// fork defaults (compress after 7 days, delete after 30) instead of Go's zero
+	// value, otherwise log rotation silently stops compressing/pruning.
+	cfg.LogsCompressAfterDays = DefaultLogsCompressAfterDays
+	cfg.LogsDeleteAfterDays = DefaultLogsDeleteAfterDays
+	cfg.LoggingDisplayTimezoneOffsetHours = DefaultLoggingDisplayTimezoneOffsetHours
+	cfg.ErrorLogsMaxFiles = 10
+	cfg.UsageStatisticsEnabled = false
+	cfg.RedisUsageQueueRetentionSeconds = 60
+	cfg.DisableCooling = false
+	cfg.SaveCooldownStatus = false
+	cfg.TransientErrorCooldownSeconds = 0
+	cfg.DisableImageGeneration = DisableImageGenerationOff
+	cfg.WebsocketAuth = true
+	cfg.Pprof.Enable = false
+	cfg.Pprof.Addr = DefaultPprofAddr
+	// fork(anticorr): restore the AmpCode localhost-restriction default that upstream's
+	// defaults-block rewrite silently dropped during the merge. Default false: API key
+	// auth is sufficient, so the Amp management surface is not locked to localhost.
+	cfg.AmpCode.RestrictManagementToLocalhost = false
+	cfg.RemoteManagement.PanelGitHubRepository = DefaultPanelGitHubRepository
+	cfg.CredentialInFlight = DefaultCredentialInFlightConfig()
+	if err = yaml.Unmarshal(data, &cfg); err != nil {
+		if optional {
+			// In cloud deploy mode, if YAML parsing fails, return empty config instead of error.
+			cfgOptional := &Config{CredentialInFlight: DefaultCredentialInFlightConfig()}
+			cfgOptional.NormalizePluginsConfig()
+			return cfgOptional, nil
+		}
+		return nil, fmt.Errorf("failed to parse config file: %w", err)
+	}
+
+	// fork(anticorr): DORMANT — neutralize the account env/cwd normalization switch
+	// (requirement ⑦) right after unmarshal so a config.yaml `normalize-account-env: true`
+	// cannot re-enable the retired cwd-normalization chain. Whatever the file says, the
+	// effective runtime value is nil (off); NormalizeAccountEnvEnabled therefore always
+	// returns false. The gate function is left honest so unit tests can still set the
+	// pointer and exercise the dormant normalize implementations directly.
+	cfg.NormalizeAccountEnv = nil
+
+	cfg.CredentialConcurrency = cfg.CredentialConcurrency.WithDefaults()
+	if errValidate := cfg.CredentialInFlight.Validate(); errValidate != nil {
+		return nil, errValidate
+	}
+	if errValidate := cfg.Codex.LiveMediaRelay.Validate(); errValidate != nil {
+		return nil, errValidate
+	}
+
+	// Hash remote management key if plaintext is detected (nested)
+	// We consider a value to be already hashed if it looks like a bcrypt hash ($2a$, $2b$, or $2y$ prefix).
+	if cfg.RemoteManagement.SecretKey != "" && !looksLikeBcrypt(cfg.RemoteManagement.SecretKey) {
+		hashed, errHash := hashSecret(cfg.RemoteManagement.SecretKey)
+		if errHash != nil {
+			return nil, fmt.Errorf("failed to hash remote management key: %w", errHash)
+		}
+		cfg.RemoteManagement.SecretKey = hashed
+
+		// Persist the hashed value back to the config file to avoid re-hashing on next startup.
+		// Preserve YAML comments and ordering; update only the nested key.
+		_ = SaveConfigPreserveCommentsUpdateNestedScalar(configFile, []string{"remote-management", "secret-key"}, hashed)
+	}
+
+	cfg.RemoteManagement.PanelGitHubRepository = strings.TrimSpace(cfg.RemoteManagement.PanelGitHubRepository)
+	if cfg.RemoteManagement.PanelGitHubRepository == "" {
+		cfg.RemoteManagement.PanelGitHubRepository = DefaultPanelGitHubRepository
+	}
+
+	cfg.Pprof.Addr = strings.TrimSpace(cfg.Pprof.Addr)
+	if cfg.Pprof.Addr == "" {
+		cfg.Pprof.Addr = DefaultPprofAddr
+	}
+
+	if cfg.LogsMaxTotalSizeMB < 0 {
+		cfg.LogsMaxTotalSizeMB = 0
+	}
+
+	// fork(anticorr): negative log-retention values are invalid; fall back to the
+	// fork defaults instead of leaving a negative window that disables rotation.
+	if cfg.LogsCompressAfterDays < 0 {
+		cfg.LogsCompressAfterDays = DefaultLogsCompressAfterDays
+	}
+
+	if cfg.LogsDeleteAfterDays < 0 {
+		cfg.LogsDeleteAfterDays = DefaultLogsDeleteAfterDays
+	}
+
+	if cfg.ErrorLogsMaxFiles < 0 {
+		cfg.ErrorLogsMaxFiles = 10
+	}
+
+	// fork(anticorr): trim the Feishu error-log alert webhook so a value pasted
+	// with surrounding whitespace still resolves to a valid URL.
+	cfg.ErrorLogAlert.FeishuWebhookURL = strings.TrimSpace(cfg.ErrorLogAlert.FeishuWebhookURL)
+
+	// 显示时区偏移仅用于日志显示/解析；超出 [-12, 14] 钳回默认 UTC+8。
+	if cfg.LoggingDisplayTimezoneOffsetHours < -12 || cfg.LoggingDisplayTimezoneOffsetHours > 14 {
+		cfg.LoggingDisplayTimezoneOffsetHours = DefaultLoggingDisplayTimezoneOffsetHours
+	}
+
+	if cfg.RedisUsageQueueRetentionSeconds <= 0 {
+		cfg.RedisUsageQueueRetentionSeconds = 60
+	} else if cfg.RedisUsageQueueRetentionSeconds > 3600 {
+		log.WithField("value", cfg.RedisUsageQueueRetentionSeconds).Warn("redis-usage-queue-retention-seconds too large; clamping to 3600")
+		cfg.RedisUsageQueueRetentionSeconds = 3600
+	}
+
+	if cfg.MaxRetryCredentials < 0 {
+		cfg.MaxRetryCredentials = 0
+	}
+
+	cfg.NormalizePluginsConfig()
+	if errResolvePluginsDir := cfg.ResolvePluginsDir(); errResolvePluginsDir != nil && cfg.Plugins.Enabled {
+		return nil, errResolvePluginsDir
+	}
+
+	// Sanitize Gemini API key configuration and migrate legacy entries.
+	cfg.SanitizeGeminiKeys()
+
+	// Sanitize native Interactions API key configuration.
+	cfg.SanitizeInteractionsKeys()
+
+	// Sanitize Vertex-compatible API keys.
+	cfg.SanitizeVertexCompatKeys()
+
+	// Sanitize Codex keys: drop entries without base-url
+	cfg.SanitizeCodexKeys()
+
+	// Sanitize xAI keys: drop entries without base-url
+	cfg.SanitizeXAIKeys()
+
+	// Sanitize Codex header defaults.
+	cfg.SanitizeCodexHeaderDefaults()
+
+	// Sanitize Claude header defaults.
+	cfg.SanitizeClaudeHeaderDefaults()
+
+	// Sanitize Claude-specific runtime policy (fork anti-corr).
+	cfg.SanitizeClaudeConfig()
+
+	// Sanitize managed header profile online update settings (fork anti-corr).
+	cfg.SanitizeManagedHeaderProfile()
+
+	// Sanitize quota snapshot refresh policy (fork anti-corr).
+	cfg.SanitizeQuotaSnapshotRefresh()
+
+	// Sanitize Claude key headers
+	cfg.SanitizeClaudeKeys()
+
+	// Sanitize Kiro keys: trim whitespace from credential fields (fork anti-corr).
+	cfg.SanitizeKiroKeys()
+
+	// Sanitize OpenAI compatibility providers: drop entries without base-url
+	cfg.SanitizeOpenAICompatibility()
+
+	// Normalize OAuth provider model exclusion map.
+	cfg.OAuthExcludedModels = NormalizeOAuthExcludedModels(cfg.OAuthExcludedModels)
+
+	// Normalize global OAuth model name aliases.
+	cfg.SanitizeOAuthModelAlias()
+
+	// Validate raw payload rules and drop invalid entries.
+	cfg.SanitizePayloadRules()
+
+	// Return the populated configuration struct.
+	return &cfg, nil
+}

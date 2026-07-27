@@ -37,7 +37,7 @@ func TestRegisterModelsForAuth_CodexPlanFiltersSpark(t *testing.T) {
 			reg.UnregisterClient(auth.ID)
 			t.Cleanup(func() { reg.UnregisterClient(auth.ID) })
 
-			service.registerModelsForAuth(auth)
+			service.registerModelsForAuth(context.Background(), auth)
 			gotSpark := modelListContains(reg.GetModelsForClient(auth.ID), "gpt-5.3-codex-spark")
 			if gotSpark != tt.wantSpark {
 				t.Fatalf("Spark registered = %v, want %v", gotSpark, tt.wantSpark)
@@ -73,7 +73,7 @@ func TestRegisterModelsForAuth_CodexConfigModelsAdvertiseFastMetadata(t *testing
 	reg.UnregisterClient(auth.ID)
 	t.Cleanup(func() { reg.UnregisterClient(auth.ID) })
 
-	service.registerModelsForAuth(auth)
+	service.registerModelsForAuth(context.Background(), auth)
 	models := reg.GetAvailableModels("openai")
 	model := openAIModelByID(models, "codex-fast-alias")
 	if model == nil {
@@ -294,7 +294,7 @@ func TestRegisterModelsForAuth_ClaudePlanFiltersOpusByHighTier(t *testing.T) {
 			reg.UnregisterClient(tt.auth.ID)
 			t.Cleanup(func() { reg.UnregisterClient(tt.auth.ID) })
 
-			service.registerModelsForAuth(tt.auth)
+			service.registerModelsForAuth(context.Background(), tt.auth)
 			models := reg.GetModelsForClient(tt.auth.ID)
 			gotBaseOpus := modelListContains(models, "claude-opus-4-7")
 			if gotBaseOpus != tt.wantBaseOpus {

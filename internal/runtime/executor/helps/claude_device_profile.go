@@ -1,6 +1,7 @@
 package helps
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"net/http"
@@ -932,6 +933,25 @@ func ResolveClaudeDeviceProfile(auth *cliproxyauth.Auth, apiKey string, headers 
 	}
 
 	return baseline
+}
+
+// ResolveClaudeDeviceProfileRequired is the context/error-returning entrypoint that
+// the (upstream-restructured) claude executor request path calls. This fork keeps the
+// full anti-correlation resolve — the sanity-ceiling gate, the per-account/global
+// observed high-water triple, UA-suffix/entrypoint alignment inputs, and platform
+// pinning — inside ResolveClaudeDeviceProfile and runs it entirely in local mode, so
+// this call always succeeds and never returns an error. The error return exists only
+// to satisfy the upstream call signature so the ported executor compiles unchanged.
+//
+// The upstream home-KV device-profile backend (homekv-backed KVGet/KVSet/KVSetNX
+// locking) is intentionally NOT adopted here: in its upstream form it persists only a
+// bare UA/pkg/runtime/os/arch tuple and would bypass this fork's sanity-ceiling gate
+// and observation-based high-water, weakening anti-correlation. Restart persistence is
+// instead handled fidelity-preservingly via the auth.Metadata high-water triple
+// (claudePersistedHighWaterProfile / SeedClaudeObservedHighWaterFromAuth).
+func ResolveClaudeDeviceProfileRequired(ctx context.Context, auth *cliproxyauth.Auth, apiKey string, headers http.Header, cfg *config.Config) (ClaudeDeviceProfile, error) {
+	_ = ctx
+	return ResolveClaudeDeviceProfile(auth, apiKey, headers, cfg), nil
 }
 
 func ApplyClaudeDeviceProfileHeaders(r *http.Request, profile ClaudeDeviceProfile) {

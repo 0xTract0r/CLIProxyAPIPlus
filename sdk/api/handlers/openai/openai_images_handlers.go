@@ -26,6 +26,7 @@ import (
 
 const (
 	defaultImagesMainModel      = "gpt-5.4-mini"
+	gptImage15Model             = "gpt-image-1.5"
 	defaultImagesToolModel      = "gpt-image-2"
 	defaultXAIImagesModel       = "grok-imagine-image"
 	xaiImagesQualityModel       = "grok-imagine-image-quality"
@@ -215,15 +216,15 @@ func isXAIImagesModel(model string) bool {
 }
 
 func isSupportedImagesModel(model string) bool {
-	baseModel := imagesModelBase(model)
-	if baseModel == defaultImagesToolModel {
+	if isCodexImagesToolModel(model) {
 		return true
 	}
 	return isXAIImagesModel(model) || isOpenAICompatImagesModel(model)
 }
 
-func isDefaultImagesToolModel(model string) bool {
-	return imagesModelBase(model) == defaultImagesToolModel
+func isCodexImagesToolModel(model string) bool {
+	baseModel := imagesModelBase(model)
+	return baseModel == gptImage15Model || baseModel == defaultImagesToolModel
 }
 
 func isOpenAICompatImagesModel(model string) bool {
@@ -242,7 +243,7 @@ func rejectUnsupportedImagesModel(c *gin.Context, model string) bool {
 
 	c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
 		Error: handlers.ErrorDetail{
-			Message: fmt.Sprintf("Model %s is not supported on %s or %s. Use %s, %s, %s, or a configured openai-compatibility image model.", model, imagesGenerationsPath, imagesEditsPath, defaultImagesToolModel, defaultXAIImagesModel, xaiImagesQualityModel),
+			Message: fmt.Sprintf("Model %s is not supported on %s or %s. Use %s, %s, %s, %s, or a configured openai-compatibility image model.", model, imagesGenerationsPath, imagesEditsPath, gptImage15Model, defaultImagesToolModel, defaultXAIImagesModel, xaiImagesQualityModel),
 			Type:    "invalid_request_error",
 		},
 	})
@@ -627,7 +628,7 @@ func (h *OpenAIAPIHandler) ImagesGenerations(c *gin.Context) {
 	}
 	stream := gjson.GetBytes(rawJSON, "stream").Bool()
 
-	if isDefaultImagesToolModel(imageModel) {
+	if isCodexImagesToolModel(imageModel) {
 		imageReq := buildOpenAICompatImagesJSONRequest(rawJSON, imageModel, stream)
 		h.handleRoutedImages(c, imageReq, imageModel, stream)
 		return
@@ -772,7 +773,7 @@ func (h *OpenAIAPIHandler) imagesEditsFromMultipart(c *gin.Context) {
 	}
 	stream := parseBoolField(c.PostForm("stream"), false)
 
-	if isDefaultImagesToolModel(imageModel) {
+	if isCodexImagesToolModel(imageModel) {
 		imageReq, contentType, errBuild := buildOpenAICompatImagesMultipartRequest(form, imageModel, stream)
 		if errBuild != nil {
 			c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
@@ -914,7 +915,7 @@ func (h *OpenAIAPIHandler) imagesEditsFromJSON(c *gin.Context) {
 	}
 	stream := gjson.GetBytes(rawJSON, "stream").Bool()
 
-	if isDefaultImagesToolModel(imageModel) {
+	if isCodexImagesToolModel(imageModel) {
 		imageReq := buildOpenAICompatImagesJSONRequest(rawJSON, imageModel, stream)
 		h.handleRoutedImages(c, imageReq, imageModel, stream)
 		return
@@ -1312,7 +1313,7 @@ func (h *OpenAIAPIHandler) streamOpenAICompatImages(c *gin.Context, compatReq []
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
 	model := strings.TrimSpace(imageModel)
 	execution, streamStarted, canceled := h.waitImagesStreamExecution(c, flusher, func() imagesStreamExecutionResult {
-		dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, xaiImagesHandlerType, model, compatReq, "")
+		dataChan, upstreamHeaders, errChan := h.ExecuteImageStreamWithAuthManager(cliCtx, xaiImagesHandlerType, model, compatReq, "")
 		return imagesStreamExecutionResult{Data: dataChan, UpstreamHeaders: upstreamHeaders, Errs: errChan}
 	})
 	if canceled {
@@ -1400,7 +1401,7 @@ func (h *OpenAIAPIHandler) collectImagesWithModel(c *gin.Context, imageReq []byt
 	stopKeepAlive := h.StartNonStreamingKeepAlive(c, cliCtx)
 
 	model = strings.TrimSpace(model)
-	resp, upstreamHeaders, errMsg := h.ExecuteWithAuthManager(cliCtx, xaiImagesHandlerType, model, imageReq, "")
+	resp, upstreamHeaders, errMsg := h.ExecuteImageWithAuthManager(cliCtx, xaiImagesHandlerType, model, imageReq, "")
 	stopKeepAlive()
 	if errMsg != nil {
 		h.WriteErrorResponse(c, errMsg)
@@ -1451,7 +1452,7 @@ func (h *OpenAIAPIHandler) streamImagesWithModel(c *gin.Context, imageReq []byte
 	}
 	resultChan := make(chan imageStreamResult, 1)
 	go func() {
-		resp, upstreamHeaders, errMsg := h.ExecuteWithAuthManager(cliCtx, xaiImagesHandlerType, model, imageReq, "")
+		resp, upstreamHeaders, errMsg := h.ExecuteImageWithAuthManager(cliCtx, xaiImagesHandlerType, model, imageReq, "")
 		resultChan <- imageStreamResult{resp: resp, upstreamHeaders: upstreamHeaders, errMsg: errMsg}
 	}()
 

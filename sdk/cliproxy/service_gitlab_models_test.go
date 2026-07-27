@@ -1,6 +1,7 @@
 package cliproxy
 
 import (
+	"context"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
@@ -26,7 +27,7 @@ func TestRegisterModelsForAuth_GitLabUsesDiscoveredModels(t *testing.T) {
 	reg.UnregisterClient(auth.ID)
 	t.Cleanup(func() { reg.UnregisterClient(auth.ID) })
 
-	service.registerModelsForAuth(auth)
+	service.registerModelsForAuth(context.Background(), auth)
 	models := reg.GetModelsForClient(auth.ID)
 	if len(models) < 2 {
 		t.Fatalf("expected stable alias and discovered model, got %d entries", len(models))
