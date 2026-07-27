@@ -1641,8 +1641,17 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 	}
 	r.Header.Set("Anthropic-Beta", baseBetas)
 
-	// Only set browser access header for API key mode; real Claude Code CLI does not send it.
-	if useAPIKey {
+	// Real claude-cli 2.1.220 sends Anthropic-Dangerous-Direct-Browser-Access on
+	// /v1/messages in BOTH x-api-key and OAuth/Bearer mode. First-party ground
+	// truth (5/5 captures to the real api.anthropic.com endpoint send it):
+	// docs/fingerprint/cpa-reqs/phase3-evidence/header-order-probe/COMPARISON-firstparty.md.
+	// The earlier "OAuth doesn't send it" belief came from a custom-base_url
+	// capture and is contradicted at the first-party endpoint. In OAuth mode it is
+	// gated behind the wire-replication flag so gate-off preserves the exact
+	// historical header set; enabling replay-wire-header-order yields the full
+	// real-cli header profile (order + casing + this set member) together, making
+	// the egress JA4H_b match a genuine claude-cli value.
+	if useAPIKey || helps.ClaudeWireHeaderOrderReplayEnabled(cfg) {
 		misc.EnsureHeader(r.Header, ginHeaders, "Anthropic-Dangerous-Direct-Browser-Access", "true")
 	}
 	applyClaudeManagedProtocolHeaders(r, ginHeaders, cfg, apiKey, isAnthropicBase, true)
