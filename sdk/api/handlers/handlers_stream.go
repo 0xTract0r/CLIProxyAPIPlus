@@ -220,11 +220,13 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 		Query:                       modelExecutionQuery(ctx, execOptions.Query),
 		RequestAfterAuthInterceptor: h.requestAfterAuthInterceptor(afterAuthCapture, execOptions.SkipInterceptorPluginID),
 	}
+	h.applyFarmAccountPin(ctx, reqMeta)
 	opts.Metadata = reqMeta
 	req, opts = h.applyRequestInterceptorsBeforeAuth(ctx, entryProtocol, originalRequestedModel, req, opts, execOptions.SkipInterceptorPluginID)
 	streamResult, err := h.AuthManager.ExecuteStream(ctx, providers, req, opts)
 	if err != nil {
 		err = enrichAuthSelectionError(err, providers, normalizedModel)
+		err = annotateFarmPinError(err, reqMeta)
 		errChan := make(chan *interfaces.ErrorMessage, 1)
 		status := http.StatusInternalServerError
 		if se, ok := err.(interface{ StatusCode() int }); ok && se != nil {
@@ -403,7 +405,7 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 		bootstrapRetries++
 		retryResult, retryErr := h.AuthManager.ExecuteStream(ctx, providers, req, opts)
 		if retryErr != nil {
-			bootstrapErr = executionErrorMessage(enrichAuthSelectionError(retryErr, providers, normalizedModel))
+			bootstrapErr = executionErrorMessage(annotateFarmPinError(enrichAuthSelectionError(retryErr, providers, normalizedModel), reqMeta))
 			break
 		}
 		if retryResult == nil {
