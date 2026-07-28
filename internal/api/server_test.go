@@ -1110,6 +1110,68 @@ func TestOAuthCallbackRouteSkipsManagementKeyMiddleware(t *testing.T) {
 	}
 }
 
+// TestOAuthLandingCallbackRoutesWritePendingSessionFiles guards against the
+// regression where the google/gitlab/kiro OAuth landing routes were dropped when
+// upstream split the route registrations out of server.go into server_routes.go.
+// The WebUI add-account flows for these providers redirect to /google/callback,
+// /gitlab/callback and /kiro/callback (management auth_files_anticorr.go), so a
+// missing route 302s into a 404 and the account can never be added. Each route
+// must persist the short-lived code/state for the pending session; the google
+// landing route maps to the internal "gemini" provider.
+func TestOAuthLandingCallbackRoutesWritePendingSessionFiles(t *testing.T) {
+	cases := []struct {
+		name string
+		// routePath is the landing route the WebUI redirects to.
+		routePath string
+		// sessionProvider is the canonical provider the pending session is registered
+		// under and the provider segment of the written .oauth-<provider>-<state> file.
+		sessionProvider string
+	}{
+		{name: "google maps to gemini", routePath: "/google/callback", sessionProvider: "gemini"},
+		{name: "gitlab", routePath: "/gitlab/callback", sessionProvider: "gitlab"},
+		{name: "kiro", routePath: "/kiro/callback", sessionProvider: "kiro"},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			server := newTestServer(t)
+			state := "regress-" + tc.sessionProvider + "-callback-state"
+			managementHandlers.RegisterOAuthSession(state, tc.sessionProvider)
+			defer managementHandlers.CompleteOAuthSession(state)
+
+			req := httptest.NewRequest(http.MethodGet, tc.routePath+"?state="+state+"&code=test-code", nil)
+			rr := httptest.NewRecorder()
+			server.engine.ServeHTTP(rr, req)
+
+			if rr.Code != http.StatusOK {
+				t.Fatalf("%s status = %d, want %d; body=%s", tc.routePath, rr.Code, http.StatusOK, rr.Body.String())
+			}
+			if !strings.Contains(rr.Body.String(), "Authentication successful") {
+				t.Fatalf("%s body = %q, want success landing page", tc.routePath, rr.Body.String())
+			}
+
+			callbackPath := filepath.Join(server.cfg.AuthDir, ".oauth-"+tc.sessionProvider+"-"+state+".oauth")
+			data, errRead := os.ReadFile(callbackPath)
+			if errRead != nil {
+				t.Fatalf("%s expected callback file %s to be written: %v", tc.routePath, callbackPath, errRead)
+			}
+
+			var payload struct {
+				Code  string `json:"code"`
+				State string `json:"state"`
+				Error string `json:"error"`
+			}
+			if errUnmarshal := json.Unmarshal(data, &payload); errUnmarshal != nil {
+				t.Fatalf("%s decode callback payload: %v; data=%s", tc.routePath, errUnmarshal, data)
+			}
+			if payload.Code != "test-code" || payload.State != state || payload.Error != "" {
+				t.Fatalf("%s callback payload = %+v, want code=test-code state=%s error empty", tc.routePath, payload, state)
+			}
+		})
+	}
+}
+
 func TestNewServerWithPluginHostInjectsHandlerInterceptors(t *testing.T) {
 	host := pluginhost.New()
 	server := newTestServerWithOptions(t, WithPluginHost(host))
