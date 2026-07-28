@@ -107,7 +107,7 @@ func TestSchedulerFarmPin_FailsClosedWhenPinnedUnavailable(t *testing.T) {
 	t.Parallel()
 
 	provider, model := "claude", "claude-farm-pin-failclosed"
-	pinnedID, otherID := "farm-pinned-dead", "farm-other-live"
+	pinnedID, otherID := "farm-pinned-dead", "farm-other-live-failclosed"
 	registerSchedulerModels(t, provider, model, pinnedID, otherID)
 	scheduler := newSchedulerForTest(&RoundRobinSelector{},
 		&Auth{ID: pinnedID, Provider: provider, AutoQuarantined: true, Status: StatusQuarantined},

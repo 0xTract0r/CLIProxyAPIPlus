@@ -10,6 +10,10 @@ import (
 	"strings"
 )
 
+// Fork-only Gemini CLI User-Agent helpers. Upstream v7.2.101 deleted these when it
+// dropped native Gemini CLI support, but the fork retains gemini-cli (see the restored
+// internal/auth/gemini package and internal/runtime/executor/gemini_cli_executor.go),
+// so this outbound-fingerprint helper must survive the upstream sync.
 const (
 	// GeminiCLIVersion is the version string reported in the User-Agent for upstream requests.
 	GeminiCLIVersion = "0.34.0"

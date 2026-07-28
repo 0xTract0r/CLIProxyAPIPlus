@@ -6,7 +6,7 @@ This is the Plus version of [CLIProxyAPI](https://github.com/router-for-me/CLIPr
 
 All third-party provider support is maintained by community contributors; CLIProxyAPI does not provide technical support. Please contact the corresponding community maintainer if you need assistance.
 
-The Plus release stays in lockstep with the mainline features.
+The Plus release stays in lockstep with the mainline features. See the [mainline README](https://github.com/router-for-me/CLIProxyAPI) for the full provider list, sponsors, overview, and SDK docs (including the new plugin host support).
 
 ## Contributing
 
