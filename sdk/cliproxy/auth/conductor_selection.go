@@ -168,10 +168,34 @@ func (m *Manager) ReconcileRegistryModelStates(ctx context.Context, authID strin
 		}
 		if changed {
 			updateAggregatedAvailability(auth, now)
-			if !hasModelError(auth, now) {
-				auth.LastError = nil
-				auth.StatusMessage = ""
-				auth.Status = StatusActive
+			switch {
+			case auth.AutoQuarantined:
+				// This pass only prunes/normalizes per-model state; it must never
+				// clobber the auth-level "quarantined" view that markAutoQuarantine
+				// owns. preserveQuarantineFieldsOnStaleWriteback already restores
+				// this exact Status/StatusMessage/Unavailable/NextRetryAfter trio
+				// for a stale Manager.Update write-back, but this reconciliation
+				// path writes directly via m.persist/scheduler.upsertAuth below and
+				// bypasses that guard entirely. Without this case, a routine
+				// registry reconciliation silently flips a quarantined,
+				// unavailable auth back to Status=active/Unavailable=false while
+				// leaving AutoQuarantined/QuarantineReason/QuarantinedAt set,
+				// producing a self-contradictory persisted state that every status
+				// reader (logs, other APIs, both management frontends) misreads as
+				// a false "healthy" signal.
+				auth.Unavailable = true
+				auth.NextRetryAfter = time.Time{}
+			case auth.Disabled || auth.Status == StatusDisabled:
+				// Same class of drift for an operator-disabled auth: Status must
+				// stay StatusDisabled until the operator explicitly re-enables it,
+				// not get silently promoted back to active by a routine model-state
+				// reconciliation pass.
+			default:
+				if !hasModelError(auth, now) {
+					auth.LastError = nil
+					auth.StatusMessage = ""
+					auth.Status = StatusActive
+				}
 			}
 			auth.UpdatedAt = now
 			if errPersist := m.persist(ctx, auth); errPersist != nil {
