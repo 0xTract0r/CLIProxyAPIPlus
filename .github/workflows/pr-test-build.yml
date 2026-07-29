@@ -17,9 +17,13 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - name: Test
+        run: GOTOOLCHAIN=auto go test -timeout 600s ./...
       - name: Refresh models catalog
         run: bash .github/scripts/refresh-model-catalogs.sh
       - name: Build
         run: |
           go build -o test-output ./cmd/server
           rm -f test-output
+      - name: fork feature survival audit
+        run: bash scripts/upstream-sync/check-fork-features-alive.sh

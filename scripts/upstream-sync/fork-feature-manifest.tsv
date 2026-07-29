@@ -1,0 +1,106 @@
+# core fork 特性存活审计清单(fork-feature-manifest.tsv)
+#
+# 用途:check-fork-features-alive.sh 逐行读取本清单,断言 fork 反关联/自定义能力的
+#   符号/路由/文件在当前 core 代码里仍然存在。任一条目"消失"即视为该 fork 特性在
+#   一次上游同步/重构中被误删或被回退,脚本非零退出、可接 CI 拦截。
+#
+# 定位:只做"存在性"审计,不逐字比对函数完整签名——上游同步允许内部实现变化,
+#   但导出/关键符号名、fork 自定义路由路径、fork 专属文件不应该消失。这是
+#   "go test 覆盖不到的整条接线被删"的兜底,不替代 go test。
+#
+# 格式:TAB 分隔,5 列,# 开头为注释,空行忽略:
+#   1 类别                    人读分组标签
+#   2 标识                    人读条目名(通常=符号名/路由路径/文件名)
+#   3 断言方式                symbol | pattern | pattern_absent | route | file
+#   4 grep_pattern_或_路径    symbol/pattern/pattern_absent/route 用 grep -E 扩展正则;
+#                             file 方式不使用,固定填 -
+#   5 所在文件相对core路径     symbol/pattern/pattern_absent/route:在这个文件内 grep;
+#                             file:就是要断言存在的文件或目录路径本身
+#
+# 断言方式语义:
+#   symbol          该文件必须命中此 grep pattern(fork 关键符号定义仍在)
+#   pattern         该文件必须命中此 grep pattern(fork 专属调用点/接线仍在)
+#   pattern_absent  该文件【必须不】命中此 grep pattern——命中说明 fork 保护被
+#                   回退掉了(例如 G1 反关联 uTLS 客户端被换回裸 HTTP client)
+#   route           该文件必须命中此路由字符串(fork 自定义路由仍注册)
+#   file            第 5 列路径(文件或目录)必须存在
+#
+# 维护:新增一条 fork 反关联/自定义能力的关键接线时,补一行本清单;
+#   上游重构导致路径迁移时同步更新路径,而不是删掉这条守护。
+
+# === 反关联/指纹核心符号(20) ===
+反关联-uTLS客户端	NewUtlsHTTPClient	symbol	^func NewUtlsHTTPClient\(	internal/runtime/executor/helps/utls_client.go
+反关联-uTLS客户端	NewUtlsHTTPClientForProfile	symbol	^func NewUtlsHTTPClientForProfile\(	internal/runtime/executor/helps/utls_client.go
+反关联-uTLS客户端	utlsProtectedHosts	symbol	^var utlsProtectedHosts 	internal/runtime/executor/helps/utls_client.go
+反关联-Codex指纹	CodexRustlsClientHelloProfileID	symbol	^const CodexRustlsClientHelloProfileID 	internal/runtime/executor/helps/utls_client.go
+反关联-设备指纹注入	InjectAccountDeviceID	symbol	^func InjectAccountDeviceID\(	internal/runtime/executor/helps/synthetic_device_id.go
+反关联-Claude设备画像	resolveClaudeDeviceProfileForRequest	symbol	^func resolveClaudeDeviceProfileForRequest\(	internal/runtime/executor/claude_executor_request.go
+反关联-Claude设备画像	applyClaudeManagedHeaders	symbol	^func applyClaudeManagedHeaders\(	internal/runtime/executor/claude_executor_request.go
+反关联-代理留白拦截	blockingRoundTripper	symbol	^type blockingRoundTripper struct	internal/runtime/executor/helps/proxy_helpers.go
+反关联-OAuth刷新传输	NewOAuthRefreshUtlsHTTPClient	symbol	^func NewOAuthRefreshUtlsHTTPClient\(	internal/runtime/executor/helps/utls_client.go
+反关联-管理API出站	apiCallUtlsRoundTripper	symbol	^func \(h \*Handler\) apiCallUtlsRoundTripper\(	internal/api/handlers/management/api_tools.go
+反关联-账号环境归一化	NormalizeAccountEnv	symbol	^func NormalizeAccountEnv\(	internal/runtime/executor/helps/normalize_account_env.go
+反关联-TLS探针	RunProviderTLSProbe	symbol	^func RunProviderTLSProbe\(	internal/runtime/executor/helps/provider_tls_probe.go
+反关联-TLS探针	CaptureSyntheticProviderSNIEvidence	symbol	^func CaptureSyntheticProviderSNIEvidence\(	internal/runtime/executor/helps/tls_evidence_capture.go
+反关联-Codex客户端画像	ResolveCodexClientProfile	symbol	^func ResolveCodexClientProfile\(	internal/runtime/executor/helps/codex_client_profile.go
+反关联-设备高水位	ClaudeDeviceHighWater	symbol	^type ClaudeDeviceHighWater struct	sdk/cliproxy/auth/claude_device_high_water.go
+反关联-设备高水位	CodexDeviceHighWater	symbol	^type CodexDeviceHighWater struct	sdk/cliproxy/auth/codex_device_high_water.go
+反关联-自动隔离	evaluateAutoQuarantineLocked	symbol	^func \(m \*Manager\) evaluateAutoQuarantineLocked\(	sdk/cliproxy/auth/conductor_auto_quarantine.go
+反关联-farm账号钉定	applyFarmAccountPin	symbol	^func \(h \*BaseAPIHandler\) applyFarmAccountPin\(	sdk/api/handlers/farm_pin.go
+反关联-Codex路径归一化	normalizeCodexPaths	symbol	^func normalizeCodexPaths\(	internal/runtime/executor/helps/normalize_codex_env.go
+反关联-Codex路径归一化	persistCodexDeviceHighWater	symbol	^func \(e \*CodexExecutor\) persistCodexDeviceHighWater\(	internal/runtime/executor/codex_executor.go
+
+# === G1 关键回退守护(2 条必须成对读:一条必须命中,一条必须不命中) ===
+G1-反关联回退守护	codex_openai_images使用uTLS客户端	pattern	helps\.NewUtlsHTTPClient	internal/runtime/executor/codex_openai_images.go
+G1-反关联回退守护	codex_openai_images禁止裸ProxyAware回退	pattern_absent	helps\.NewProxyAwareHTTPClient	internal/runtime/executor/codex_openai_images.go
+
+# === fork 自定义 OAuth 回调路由(3) ===
+fork路由-OAuth回调	/google/callback	route	"/google/callback"	internal/api/server_routes.go
+fork路由-OAuth回调	/gitlab/callback	route	"/gitlab/callback"	internal/api/server_routes.go
+fork路由-OAuth回调	/kiro/callback	route	"/kiro/callback"	internal/api/server_routes.go
+
+# === fork 自定义管理端点(4) ===
+fork路由-管理端点	provider-tls-probe	route	/diagnostics/provider-tls-probe	internal/api/server_management.go
+fork路由-管理端点	usage/pricing	route	"/usage/pricing"	internal/api/server_management.go
+fork路由-管理端点	quota/snapshots	route	/quota/snapshots	internal/api/server_management.go
+fork路由-管理端点	logs-compress-after-days	route	/logs-compress-after-days	internal/api/server_management.go
+
+# === fork 自定义模块/反关联支撑文件存在性(19) ===
+fork文件-amp模块	internal/api/modules/amp/	file	-	internal/api/modules/amp
+fork文件-反关联支撑	provider_tls_probe.go(helps)	file	-	internal/runtime/executor/helps/provider_tls_probe.go
+fork文件-反关联支撑	tls_evidence_capture.go	file	-	internal/runtime/executor/helps/tls_evidence_capture.go
+fork文件-反关联支撑	normalize_account_env.go	file	-	internal/runtime/executor/helps/normalize_account_env.go
+fork文件-反关联支撑	codex_client_profile.go	file	-	internal/runtime/executor/helps/codex_client_profile.go
+fork文件-反关联支撑	synthetic_device_id.go	file	-	internal/runtime/executor/helps/synthetic_device_id.go
+fork文件-反关联支撑	claude_device_profile.go	file	-	internal/runtime/executor/helps/claude_device_profile.go
+fork文件-反关联支撑	utls_client.go	file	-	internal/runtime/executor/helps/utls_client.go
+fork文件-反关联支撑	transport_profile.go	file	-	internal/runtime/executor/helps/transport_profile.go
+fork文件-反关联支撑	normalize_codex_env.go	file	-	internal/runtime/executor/helps/normalize_codex_env.go
+fork文件-反关联支撑	proxy_helpers.go	file	-	internal/runtime/executor/helps/proxy_helpers.go
+fork文件-反关联支撑	auth_files_anticorr.go	file	-	internal/api/handlers/management/auth_files_anticorr.go
+fork文件-反关联支撑	provider_tls_probe.go(management)	file	-	internal/api/handlers/management/provider_tls_probe.go
+fork文件-反关联支撑	claude_device_high_water.go	file	-	sdk/cliproxy/auth/claude_device_high_water.go
+fork文件-反关联支撑	codex_device_high_water.go	file	-	sdk/cliproxy/auth/codex_device_high_water.go
+fork文件-反关联支撑	conductor_auto_quarantine.go	file	-	sdk/cliproxy/auth/conductor_auto_quarantine.go
+fork文件-反关联支撑	farm_pin.go	file	-	sdk/api/handlers/farm_pin.go
+fork文件-反关联支撑	tls_transport_probe/main.go	file	-	cmd/tls_transport_probe/main.go
+fork文件-反关联支撑	disable_image_generation_mode.go	file	-	internal/config/disable_image_generation_mode.go
+
+# === WS 出站接线【调用点】守护(4) ===
+# 补硬:上游若只删调用点、保留 normalizeCodexPaths / persistCodexDeviceHighWater 符号定义,
+#   仅断言符号定义的条目仍会 PASS。这里额外断言这两个反关联函数在 Codex WS 出站路径
+#   (execute + stream)被真正调用,整条接线被拆时报红。
+反关联-Codex路径归一化调用点	normalizeCodexPaths@ws_execute	pattern	e\.normalizeCodexPaths\(	internal/runtime/executor/codex_websockets_execute.go
+反关联-Codex路径归一化调用点	normalizeCodexPaths@ws_stream	pattern	e\.normalizeCodexPaths\(	internal/runtime/executor/codex_websockets_stream.go
+反关联-Codex高水位持久化调用点	persistCodexDeviceHighWater@ws_execute	pattern	e\.persistCodexDeviceHighWater\(	internal/runtime/executor/codex_websockets_execute.go
+反关联-Codex高水位持久化调用点	persistCodexDeviceHighWater@ws_stream	pattern	e\.persistCodexDeviceHighWater\(	internal/runtime/executor/codex_websockets_stream.go
+
+# === fork 自定义 Amp(ampcode)管理路由(5) ===
+# 补硬:fork-only 的 /v0/management/ampcode 管理端点整段(server_management.go 内 Amp CLI
+#   integration 路由块)被上游同步删掉时,仅靠 amp 模块目录存在性条目无法发现。这里挑 5 条
+#   代表性 ampcode fork 路由/handler 标识 anchored 到 server_management.go,整段被删即报红。
+fork路由-Amp管理	ampcode(base)	route	mgmt\.GET\("/ampcode", s\.mgmt\.GetAmpCode\)	internal/api/server_management.go
+fork路由-Amp管理	ampcode/upstream-url	route	s\.mgmt\.PutAmpUpstreamURL	internal/api/server_management.go
+fork路由-Amp管理	ampcode/restrict-management-to-localhost	route	s\.mgmt\.GetAmpRestrictManagementToLocalhost	internal/api/server_management.go
+fork路由-Amp管理	ampcode/model-mappings	route	s\.mgmt\.GetAmpModelMappings	internal/api/server_management.go
+fork路由-Amp管理	ampcode/force-model-mappings	route	s\.mgmt\.GetAmpForceModelMappings	internal/api/server_management.go
