@@ -119,6 +119,17 @@ jobs:
           echo "gotest_exit=${rc}" >> "$GITHUB_OUTPUT"
           set -e
 
+      - name: fork feature survival audit
+        id: forkaudit
+        if: steps.merge.outputs.merged == 'true'
+        continue-on-error: true
+        run: |
+          set +e
+          bash scripts/upstream-sync/check-fork-features-alive.sh 2>&1 | tee "${RUNNER_TEMP}/fork-audit.log"
+          rc=${PIPESTATUS[0]}
+          echo "audit_exit=${rc}" >> "$GITHUB_OUTPUT"
+          set -e
+
       - name: Push sync branch
         id: push
         if: steps.merge.outputs.merged == 'true'
@@ -139,11 +150,17 @@ jobs:
           UPSTREAM_TIP: ${{ steps.analyze.outputs.upstream_tip_desc }}
           UPSTREAM_AHEAD: ${{ steps.analyze.outputs.upstream_ahead }}
           GOTEST_EXIT: ${{ steps.gotest.outputs.gotest_exit }}
+          AUDIT_EXIT: ${{ steps.forkaudit.outputs.audit_exit }}
         run: |
           if [[ "${GOTEST_EXIT}" == "0" ]]; then
             gotest_line="**go test: ✅ 通过**"
           else
             gotest_line="**go test: ❌ 失败(exit ${GOTEST_EXIT}),完整日志见本 workflow run**"
+          fi
+          if [[ "${AUDIT_EXIT}" == "0" ]]; then
+            audit_line="**fork 特性存活审计: ✅ 通过(未丢失 fork 自定义 API/反关联)**"
+          else
+            audit_line="**fork 特性存活审计: ❌ 失败(exit ${AUDIT_EXIT}),疑似丢失 fork 特性,须人工核对 manifest 与日志**"
           fi
           title="chore(upstream-sync): 同步上游至 ${UPSTREAM_TIP} (${UPSTREAM_AHEAD} commit)"
           {
@@ -151,6 +168,8 @@ jobs:
             echo "> 0 冲突且 go test / AI 审查通过后,仍需人工在此 approve 才可合入。"
             echo
             echo "${gotest_line}"
+            echo
+            echo "${audit_line}"
             echo
             cat "${RUNNER_TEMP}/sync-report.md"
           } > "${RUNNER_TEMP}/pr-body.md"

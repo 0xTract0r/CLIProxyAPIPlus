@@ -23,3 +23,5 @@ jobs:
         run: |
           go build -o test-output ./cmd/server
           rm -f test-output
+      - name: fork feature survival audit
+        run: bash scripts/upstream-sync/check-fork-features-alive.sh
