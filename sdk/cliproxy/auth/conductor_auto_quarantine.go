@@ -35,7 +35,56 @@ const (
 	// error body (which is not guaranteed to be free of sensitive content),
 	// mirroring the sanitization already used for terminal refresh failures.
 	quarantineReasonTerminalAuthFailure = "terminal_auth_failure"
+
+	// The following three keys mirror the AutoQuarantined/QuarantineReason/
+	// QuarantinedAt struct fields (see Auth in types.go, whose json tags use
+	// the identical names) into the persisted auth.Metadata map. This is the
+	// only representation that actually survives a process restart: auth
+	// JSON files and Postgres auth_store rows both only ever serialize
+	// auth.Metadata (see sdk/auth/filestore.go Save / internal/store/
+	// postgresstore.go Save), never the top-level Auth struct itself. Without
+	// this mirror, markAutoQuarantine's struct-field write is purely
+	// in-memory and a terminal quarantine silently evaporates on the next
+	// restart (readAuthFiles / postgresstore.List would see a plain,
+	// unquarantined record) -- the exact gap this const block,
+	// setAutoQuarantineMetadata and clearAutoQuarantineMetadata close. See
+	// readAuthFiles (sdk/auth/filestore.go) and
+	// applyQuarantineStateFromMetadata (internal/store/postgresstore.go) for
+	// the corresponding restore-on-load side.
+	metadataKeyAutoQuarantined  = "auto_quarantined"
+	metadataKeyQuarantineReason = "quarantine_reason"
+	metadataKeyQuarantinedAt    = "quarantined_at"
 )
+
+// setAutoQuarantineMetadata writes the persisted terminal-auth quarantine
+// lock into auth.Metadata (creating the map if necessary) so it survives a
+// process restart, mirroring markAutoQuarantine's struct-field write. Callers
+// must hold m.mu (or otherwise own exclusive access to auth), same as every
+// other mutator of auth.Metadata in this package.
+func setAutoQuarantineMetadata(auth *Auth, reason string, at time.Time) {
+	if auth == nil {
+		return
+	}
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	auth.Metadata[metadataKeyAutoQuarantined] = true
+	auth.Metadata[metadataKeyQuarantineReason] = reason
+	auth.Metadata[metadataKeyQuarantinedAt] = at.UTC().Format(time.RFC3339)
+}
+
+// clearAutoQuarantineMetadata removes the persisted quarantine lock keys from
+// auth.Metadata, mirroring clearAutoQuarantine's struct-field reset. It is a
+// no-op when auth.Metadata is nil or the keys are already absent, matching
+// clearAutoQuarantine's own idempotent behavior.
+func clearAutoQuarantineMetadata(auth *Auth) {
+	if auth == nil || auth.Metadata == nil {
+		return
+	}
+	delete(auth.Metadata, metadataKeyAutoQuarantined)
+	delete(auth.Metadata, metadataKeyQuarantineReason)
+	delete(auth.Metadata, metadataKeyQuarantinedAt)
+}
 
 // isLongContextExtraUsageRequiredMessage reports whether an error message is the
 // Claude "extra usage is required for long context requests" signal.
@@ -159,6 +208,9 @@ func markAutoQuarantine(auth *Auth, now time.Time) {
 	// See preserveQuarantineFieldsOnStaleWriteback: stamp the quarantine
 	// freshness clock so a stale write-back can be detected and rejected.
 	auth.quarantineStateAt = now
+	// Persist the lock into Metadata so it survives a restart (see
+	// setAutoQuarantineMetadata doc comment for why this is required).
+	setAutoQuarantineMetadata(auth, quarantineReasonTerminalAuthFailure, now)
 }
 
 // clearAutoQuarantine releases the AutoQuarantined lock and resets the streak
@@ -183,6 +235,11 @@ func clearAutoQuarantine(auth *Auth, now time.Time) {
 	// every reauth regardless of prior state, and the clear is still the
 	// caller's authoritative, current intent for this field.
 	auth.quarantineStateAt = now
+	// Mirror the release into Metadata too (see clearAutoQuarantineMetadata):
+	// unconditional and idempotent for the same reason as the struct-field
+	// reset above, so a restart never resurrects a lock that was already
+	// lifted (a completed reauth, or an operator re-enable).
+	clearAutoQuarantineMetadata(auth)
 	if auth.Status == StatusQuarantined {
 		auth.Status = StatusActive
 		auth.StatusMessage = ""
@@ -255,6 +312,21 @@ func preserveQuarantineFieldsOnStaleWriteback(incoming, existing *Auth) bool {
 		incoming.StatusMessage = existing.StatusMessage
 		incoming.Unavailable = existing.Unavailable
 		incoming.NextRetryAfter = existing.NextRetryAfter
+		// Manager.Update persists `incoming` right after this guard runs (see
+		// conductor_lifecycle.go), and only incoming.Metadata is ever
+		// serialized to disk/Postgres -- restoring the struct fields above
+		// without also restoring the mirrored Metadata keys would let a
+		// stale write-back's unaware Metadata (missing the lock) reach disk
+		// even though the in-memory struct fields now correctly say
+		// quarantined, silently losing the lock again on the very next
+		// restart.
+		setAutoQuarantineMetadata(incoming, existing.QuarantineReason, existing.QuarantinedAt)
+	} else {
+		// existing was explicitly cleared (a completed reauth or operator
+		// re-enable): mirror that into incoming.Metadata too, so a stale
+		// write-back landing right after a legitimate clear does not
+		// resurrect stale quarantine Metadata keys on the next persist/List.
+		clearAutoQuarantineMetadata(incoming)
 	}
 	return true
 }

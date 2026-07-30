@@ -412,9 +412,26 @@ func (s *FileTokenStore) readAuthFiles(path, baseDir string) ([]*cliproxyauth.Au
 	}
 	id := s.idFor(path, baseDir)
 	disabled, _ := metadata["disabled"].(bool)
+	// autoQuarantined restores the fork's terminal-auth-failure quarantine
+	// lock (see markAutoQuarantine/clearAutoQuarantine in
+	// sdk/cliproxy/auth/conductor_auto_quarantine.go) from the persisted
+	// Metadata key so it survives a process restart. Without this, the lock
+	// only ever lived on the in-memory Auth struct and a restart silently
+	// re-exposed a terminally revoked credential as a fresh, active one.
+	autoQuarantined, _ := metadata["auto_quarantined"].(bool)
 	status := cliproxyauth.StatusActive
-	if disabled {
+	switch {
+	case disabled:
+		// An operator-disabled account keeps StatusDisabled for display even
+		// if it was also auto-quarantined before being disabled (operators
+		// can disable an already-quarantined credential; see
+		// applyAuthDisabledState, which does not clear an existing
+		// quarantine on disable). AutoQuarantined is still set below
+		// regardless, so the selector's isAuthBlockedForModel OR-check
+		// blocks on either reason independently.
 		status = cliproxyauth.StatusDisabled
+	case autoQuarantined:
+		status = cliproxyauth.StatusQuarantined
 	}
 
 	// Calculate NextRefreshAfter from expires_at (20 minutes before expiry)
@@ -426,12 +443,18 @@ func (s *FileTokenStore) readAuthFiles(path, baseDir string) ([]*cliproxyauth.Au
 	}
 
 	auth := &cliproxyauth.Auth{
-		ID:       id,
-		Provider: provider,
-		FileName: id,
-		Label:    s.labelFor(metadata),
-		Status:   status,
-		Disabled: disabled,
+		ID:              id,
+		Provider:        provider,
+		FileName:        id,
+		Label:           s.labelFor(metadata),
+		Status:          status,
+		Disabled:        disabled,
+		AutoQuarantined: autoQuarantined,
+		// Unavailable mirrors markAutoQuarantine's own in-memory state so a
+		// restored record is byte-for-byte consistent with a live-quarantined
+		// one, the same invariant preserveQuarantineFieldsOnStaleWriteback
+		// already protects against a stale write-back rolling back.
+		Unavailable: autoQuarantined,
 		Attributes: map[string]string{
 			cliproxyauth.AttributePath:          path,
 			cliproxyauth.AttributeSource:        path,
@@ -445,6 +468,16 @@ func (s *FileTokenStore) readAuthFiles(path, baseDir string) ([]*cliproxyauth.Au
 	}
 	if email, ok := metadata["email"].(string); ok && email != "" {
 		auth.Attributes["email"] = email
+	}
+	if autoQuarantined {
+		if reason, ok := metadata["quarantine_reason"].(string); ok {
+			auth.QuarantineReason = reason
+		}
+		if quarantinedAtStr, ok := metadata["quarantined_at"].(string); ok && quarantinedAtStr != "" {
+			if quarantinedAt, err := time.Parse(time.RFC3339, quarantinedAtStr); err == nil {
+				auth.QuarantinedAt = quarantinedAt
+			}
+		}
 	}
 	cliproxyauth.ApplyRuntimeFieldsFromMetadata(auth)
 	cliproxyauth.ApplyCustomHeadersFromMetadata(auth)
