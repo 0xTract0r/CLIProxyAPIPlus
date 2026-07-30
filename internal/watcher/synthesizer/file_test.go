@@ -620,6 +620,106 @@ func TestFileSynthesizer_Synthesize_IgnoresGeminiOAuthFile(t *testing.T) {
 	}
 }
 
+// TestSynthesizeFileAuths_RestoresQuarantineStateOnColdLoad covers the live
+// file-watcher synthesizer path (synthesizeFileAuths / SynthesizeAuthFile),
+// which is a *second* loader independent from sdk/auth/filestore.go's
+// readAuthFiles. Both loaders read the same on-disk auth JSON, so both must
+// restore the persisted auto-quarantine lock (auto_quarantined /
+// quarantine_reason / quarantined_at) identically -- otherwise a cold store
+// load correctly restores StatusQuarantined, only for the live watcher's
+// synthesizer to immediately overwrite it back to StatusActive.
+func TestSynthesizeFileAuths_RestoresQuarantineStateOnColdLoad(t *testing.T) {
+	tempDir := t.TempDir()
+	fullPath := filepath.Join(tempDir, "claude-auth.json")
+	authData := map[string]any{
+		"type":              "claude",
+		"email":             "quarantined@example.com",
+		"access_token":      "token-value",
+		"auto_quarantined":  true,
+		"quarantine_reason": "terminal_auth_failure",
+		"quarantined_at":    "2026-01-01T00:00:00Z",
+	}
+	data, errMarshal := json.Marshal(authData)
+	if errMarshal != nil {
+		t.Fatalf("marshal auth data: %v", errMarshal)
+	}
+	if errWrite := os.WriteFile(fullPath, data, 0644); errWrite != nil {
+		t.Fatalf("write auth file: %v", errWrite)
+	}
+
+	ctx := &SynthesisContext{
+		Config:      &config.Config{},
+		AuthDir:     tempDir,
+		Now:         time.Now(),
+		IDGenerator: NewStableIDGenerator(),
+	}
+
+	auths := SynthesizeAuthFile(ctx, fullPath, data)
+	if len(auths) != 1 {
+		t.Fatalf("SynthesizeAuthFile() len = %d, want 1", len(auths))
+	}
+	got := auths[0]
+	if !got.AutoQuarantined {
+		t.Fatalf("AutoQuarantined = false, want true (disk auto_quarantined:true must survive live synthesis)")
+	}
+	if got.Status != coreauth.StatusQuarantined {
+		t.Fatalf("Status = %q, want %q", got.Status, coreauth.StatusQuarantined)
+	}
+	if !got.Unavailable {
+		t.Fatalf("Unavailable = false, want true (mirrors AutoQuarantined like the cold-load path)")
+	}
+	if got.QuarantineReason != "terminal_auth_failure" {
+		t.Fatalf("QuarantineReason = %q, want %q", got.QuarantineReason, "terminal_auth_failure")
+	}
+	if got.QuarantinedAt.IsZero() {
+		t.Fatalf("QuarantinedAt is zero, want set from disk quarantined_at")
+	}
+}
+
+// TestSynthesizeFileAuths_DisabledTakesPriorityOverQuarantinedStatus mirrors
+// the disabled>quarantined status precedence in sdk/auth/filestore.go's
+// readAuthFiles: an operator-disabled credential displays StatusDisabled even
+// if it was also auto-quarantined, but AutoQuarantined must remain true so the
+// selector still blocks on it independently of Disabled.
+func TestSynthesizeFileAuths_DisabledTakesPriorityOverQuarantinedStatus(t *testing.T) {
+	tempDir := t.TempDir()
+	fullPath := filepath.Join(tempDir, "claude-auth.json")
+	authData := map[string]any{
+		"type":              "claude",
+		"email":             "disabled-and-quarantined@example.com",
+		"disabled":          true,
+		"auto_quarantined":  true,
+		"quarantine_reason": "terminal_auth_failure",
+		"quarantined_at":    "2026-01-01T00:00:00Z",
+	}
+	data, errMarshal := json.Marshal(authData)
+	if errMarshal != nil {
+		t.Fatalf("marshal auth data: %v", errMarshal)
+	}
+
+	ctx := &SynthesisContext{
+		Config:      &config.Config{},
+		AuthDir:     tempDir,
+		Now:         time.Now(),
+		IDGenerator: NewStableIDGenerator(),
+	}
+
+	auths := SynthesizeAuthFile(ctx, fullPath, data)
+	if len(auths) != 1 {
+		t.Fatalf("SynthesizeAuthFile() len = %d, want 1", len(auths))
+	}
+	got := auths[0]
+	if got.Status != coreauth.StatusDisabled {
+		t.Fatalf("Status = %q, want %q (disabled takes priority over quarantined)", got.Status, coreauth.StatusDisabled)
+	}
+	if !got.Disabled {
+		t.Fatalf("Disabled = false, want true")
+	}
+	if !got.AutoQuarantined {
+		t.Fatalf("AutoQuarantined = false, want true (quarantine lock must still be tracked even while disabled)")
+	}
+}
+
 func TestFileSynthesizer_Synthesize_NoteParsing(t *testing.T) {
 	tests := []struct {
 		name     string
