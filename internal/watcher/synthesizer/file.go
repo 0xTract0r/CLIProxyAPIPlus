@@ -8,6 +8,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
@@ -95,6 +96,19 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 			perAccountExcluded := extractExcludedModelsFromMetadata(metadata)
 			perAccountModelAliases := extractOAuthModelAliasesFromMetadata(metadata)
 			disabled, _ := metadata["disabled"].(bool)
+			// autoQuarantined restores the fork's terminal-auth-failure
+			// quarantine lock from the persisted Metadata key so a plugin-owned
+			// auth file also survives a live file-watcher resynthesis. This
+			// mirrors the same restoration in the built-in branch below and in
+			// sdk/auth/filestore.go's readAuthFiles cold-load path; without it,
+			// a quarantined plugin auth would be silently reset to active every
+			// time the file watcher resynthesizes.
+			autoQuarantined, _ := metadata["auto_quarantined"].(bool)
+			quarantineReason, _ := metadata["quarantine_reason"].(string)
+			var quarantinedAt time.Time
+			if quarantinedAtStr, ok := metadata["quarantined_at"].(string); ok && quarantinedAtStr != "" {
+				quarantinedAt, _ = time.Parse(time.RFC3339, quarantinedAtStr)
+			}
 			for index, auth := range auths {
 				if auth == nil {
 					continue
@@ -110,6 +124,12 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 				auth.Attributes[coreauth.AttributePath] = fullPath
 				auth.Attributes[coreauth.AttributeSource] = fullPath
 				auth.Attributes[coreauth.AttributeSourceBackend] = coreauth.AuthSourceFile
+				// disabled > quarantined: an operator-disabled credential keeps
+				// StatusDisabled for display even if it was also
+				// auto-quarantined, matching sdk/auth/filestore.go's
+				// readAuthFiles switch. AutoQuarantined/Unavailable are still
+				// restored regardless so the selector's OR-check keeps
+				// blocking on either reason independently.
 				if disabled {
 					auth.Disabled = true
 					auth.Status = coreauth.StatusDisabled
@@ -117,6 +137,25 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 						auth.Metadata = make(map[string]any)
 					}
 					auth.Metadata["disabled"] = true
+				}
+				if autoQuarantined {
+					auth.AutoQuarantined = true
+					auth.Unavailable = true
+					auth.QuarantineReason = quarantineReason
+					auth.QuarantinedAt = quarantinedAt
+					if !disabled {
+						auth.Status = coreauth.StatusQuarantined
+					}
+					if auth.Metadata == nil {
+						auth.Metadata = make(map[string]any)
+					}
+					auth.Metadata["auto_quarantined"] = true
+					if quarantineReason != "" {
+						auth.Metadata["quarantine_reason"] = quarantineReason
+					}
+					if !quarantinedAt.IsZero() {
+						auth.Metadata["quarantined_at"] = quarantinedAt.Format(time.RFC3339)
+					}
 				}
 				coreauth.SetOAuthModelAliasesAttribute(auth, perAccountModelAliases)
 				ApplyAuthExcludedModelsMeta(auth, cfg, perAccountExcluded, "oauth")
@@ -158,9 +197,26 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 	}
 
 	disabled, _ := metadata["disabled"].(bool)
+	// autoQuarantined restores the fork's terminal-auth-failure quarantine
+	// lock (see markAutoQuarantine/clearAutoQuarantine in
+	// sdk/cliproxy/auth/conductor_auto_quarantine.go) from the persisted
+	// Metadata key so it survives a live file-watcher resynthesis, not just a
+	// cold store load. sdk/auth/filestore.go's readAuthFiles already restores
+	// this on cold load, but this synthesizer runs on every subsequent file
+	// watcher event and previously always reset Status back to
+	// StatusActive/StatusDisabled here, silently clearing the quarantine the
+	// moment the watcher next fired after a cold load.
+	autoQuarantined, _ := metadata["auto_quarantined"].(bool)
 	status := coreauth.StatusActive
-	if disabled {
+	switch {
+	case disabled:
+		// An operator-disabled account keeps StatusDisabled for display even
+		// if it was also auto-quarantined before being disabled; AutoQuarantined
+		// is still restored below regardless, so the selector's
+		// isAuthBlockedForModel OR-check blocks on either reason independently.
 		status = coreauth.StatusDisabled
+	case autoQuarantined:
+		status = coreauth.StatusQuarantined
 	}
 
 	// Read per-account excluded models from the OAuth JSON file.
@@ -168,13 +224,19 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 	perAccountModelAliases := extractOAuthModelAliasesFromMetadata(metadata)
 
 	a := &coreauth.Auth{
-		ID:       id,
-		FileName: filepath.Base(fullPath),
-		Provider: provider,
-		Label:    label,
-		Prefix:   prefix,
-		Status:   status,
-		Disabled: disabled,
+		ID:              id,
+		FileName:        filepath.Base(fullPath),
+		Provider:        provider,
+		Label:           label,
+		Prefix:          prefix,
+		Status:          status,
+		Disabled:        disabled,
+		AutoQuarantined: autoQuarantined,
+		// Unavailable mirrors markAutoQuarantine's own in-memory state so a
+		// restored record is byte-for-byte consistent with a live-quarantined
+		// one, the same invariant preserveQuarantineFieldsOnStaleWriteback
+		// already protects against a stale write-back rolling back.
+		Unavailable: autoQuarantined,
 		Attributes: map[string]string{
 			coreauth.AttributeSource:        fullPath,
 			coreauth.AttributePath:          fullPath,
@@ -184,6 +246,16 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 		Metadata:  metadata,
 		CreatedAt: now,
 		UpdatedAt: now,
+	}
+	if autoQuarantined {
+		if reason, ok := metadata["quarantine_reason"].(string); ok {
+			a.QuarantineReason = reason
+		}
+		if quarantinedAtStr, ok := metadata["quarantined_at"].(string); ok && quarantinedAtStr != "" {
+			if quarantinedAt, errParse := time.Parse(time.RFC3339, quarantinedAtStr); errParse == nil {
+				a.QuarantinedAt = quarantinedAt
+			}
+		}
 	}
 	// Read priority from auth file.
 	if rawPriority, ok := metadata["priority"]; ok {
