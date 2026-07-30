@@ -396,6 +396,110 @@ func TestManagerUpdate_ExplicitClearAutoQuarantineStillClears(t *testing.T) {
 	}
 }
 
+// TestManagerMarkResult_QuarantineMirroredIntoMetadataForRestartPersistence
+// covers the actual restart-persistence gap this feature closes: markAutoQuarantine
+// must mirror the lock into auth.Metadata (not just the top-level Auth struct
+// fields), since only auth.Metadata is ever serialized to an auth JSON file or
+// a Postgres auth_store row (see sdk/auth/filestore.go Save /
+// internal/store/postgresstore.go Save) -- without this mirror the quarantine
+// is purely in-memory and silently evaporates on the next CPA restart. A real
+// success must then remove the mirrored keys again, not just flip them back
+// to a zero/false value, so a restart cannot misread a stale leftover key.
+func TestManagerMarkResult_QuarantineMirroredIntoMetadataForRestartPersistence(t *testing.T) {
+	mgr := NewManager(nil, nil, nil)
+	ctx := WithSkipPersist(context.Background())
+	auth := &Auth{ID: "metadata-mirror", Provider: "claude", Metadata: map[string]any{"type": "claude"}}
+	if _, err := mgr.Register(ctx, auth); err != nil {
+		t.Fatalf("Register returned error: %v", err)
+	}
+
+	mgr.MarkResult(ctx, Result{AuthID: "metadata-mirror", Provider: "claude", Success: false, Error: revokedOAuthTokenError()})
+	mgr.MarkResult(ctx, Result{AuthID: "metadata-mirror", Provider: "claude", Success: false, Error: revokedOAuthTokenError()})
+
+	got, ok := mgr.GetByID("metadata-mirror")
+	if !ok || got == nil || !got.AutoQuarantined {
+		t.Fatalf("precondition failed: auth not quarantined, got=%+v ok=%v", got, ok)
+	}
+	if autoQuarantined, _ := got.Metadata["auto_quarantined"].(bool); !autoQuarantined {
+		t.Fatalf("Metadata[auto_quarantined] = %#v, want true", got.Metadata["auto_quarantined"])
+	}
+	if reason, _ := got.Metadata["quarantine_reason"].(string); reason != quarantineReasonTerminalAuthFailure {
+		t.Fatalf("Metadata[quarantine_reason] = %#v, want %q", got.Metadata["quarantine_reason"], quarantineReasonTerminalAuthFailure)
+	}
+	if at, _ := got.Metadata["quarantined_at"].(string); at == "" {
+		t.Fatalf("Metadata[quarantined_at] = %#v, want a non-empty RFC3339 timestamp", got.Metadata["quarantined_at"])
+	}
+
+	mgr.MarkResult(ctx, Result{AuthID: "metadata-mirror", Provider: "claude", Success: true})
+
+	got, ok = mgr.GetByID("metadata-mirror")
+	if !ok || got == nil || got.AutoQuarantined {
+		t.Fatalf("auth still quarantined after a real success, got=%+v ok=%v", got, ok)
+	}
+	if _, present := got.Metadata["auto_quarantined"]; present {
+		t.Fatalf("Metadata[auto_quarantined] = %#v after recovery, want key removed", got.Metadata["auto_quarantined"])
+	}
+	if _, present := got.Metadata["quarantine_reason"]; present {
+		t.Fatalf("Metadata[quarantine_reason] = %#v after recovery, want key removed", got.Metadata["quarantine_reason"])
+	}
+	if _, present := got.Metadata["quarantined_at"]; present {
+		t.Fatalf("Metadata[quarantined_at] = %#v after recovery, want key removed", got.Metadata["quarantined_at"])
+	}
+}
+
+// TestManagerUpdate_StaleWritebackAlsoRestoresQuarantineMetadataForPersist
+// extends the low#2 stale-write-back guard (see
+// TestManagerUpdate_DoesNotRollBackAutoQuarantineFromStaleWriteback) to the
+// mirrored Metadata keys: Manager.Update persists `incoming` right after
+// preserveQuarantineFieldsOnStaleWriteback runs, and only incoming.Metadata is
+// ever serialized to disk/Postgres. If the guard restored only the top-level
+// struct fields and left incoming.Metadata at whatever the stale clone
+// happened to carry (missing the lock, since the clone predates the
+// quarantine), the very next restart would silently lose the quarantine again
+// -- reproducing the bug this whole feature fixes through a different door.
+func TestManagerUpdate_StaleWritebackAlsoRestoresQuarantineMetadataForPersist(t *testing.T) {
+	mgr := NewManager(nil, nil, nil)
+	ctx := WithSkipPersist(context.Background())
+	auth := &Auth{ID: "race-quarantine-metadata", Provider: "claude", Label: "original", ProxyURL: "http://test-proxy:8080"}
+	if _, err := mgr.Register(ctx, auth); err != nil {
+		t.Fatalf("Register returned error: %v", err)
+	}
+
+	staleClone, ok := mgr.GetByID("race-quarantine-metadata")
+	if !ok || staleClone == nil {
+		t.Fatalf("GetByID returned ok=%v auth=%v", ok, staleClone)
+	}
+
+	mgr.MarkResult(ctx, Result{AuthID: "race-quarantine-metadata", Provider: "claude", Success: false, Error: revokedOAuthTokenError()})
+	mgr.MarkResult(ctx, Result{AuthID: "race-quarantine-metadata", Provider: "claude", Success: false, Error: revokedOAuthTokenError()})
+	got, ok := mgr.GetByID("race-quarantine-metadata")
+	if !ok || got == nil || !got.AutoQuarantined {
+		t.Fatalf("precondition failed: live entry not quarantined before stale Update, got=%+v ok=%v", got, ok)
+	}
+
+	// staleClone was taken before the quarantine and carries no auto_quarantined
+	// Metadata key at all; writing it back with an unrelated field change must
+	// not let that stale (missing-lock) Metadata reach the live entry.
+	staleClone.Label = "updated-by-stale-caller"
+	if _, err := mgr.Update(ctx, staleClone); err != nil {
+		t.Fatalf("Update returned error: %v", err)
+	}
+
+	got, ok = mgr.GetByID("race-quarantine-metadata")
+	if !ok || got == nil || !got.AutoQuarantined {
+		t.Fatalf("AutoQuarantined = false after a stale write-back, want true (struct-field guard regressed)")
+	}
+	if autoQuarantined, _ := got.Metadata["auto_quarantined"].(bool); !autoQuarantined {
+		t.Fatalf("Metadata[auto_quarantined] = %#v after stale write-back, want true (a restart right now would lose the lock)", got.Metadata["auto_quarantined"])
+	}
+	if reason, _ := got.Metadata["quarantine_reason"].(string); reason != quarantineReasonTerminalAuthFailure {
+		t.Fatalf("Metadata[quarantine_reason] = %#v after stale write-back, want %q", got.Metadata["quarantine_reason"], quarantineReasonTerminalAuthFailure)
+	}
+	if at, _ := got.Metadata["quarantined_at"].(string); at == "" {
+		t.Fatalf("Metadata[quarantined_at] = %#v after stale write-back, want a non-empty RFC3339 timestamp", got.Metadata["quarantined_at"])
+	}
+}
+
 // TestIsTerminalAuthQuarantineResultError_Classification pins the boundary
 // between terminal auth/permission failures and every transient/other class
 // this feature must never touch.

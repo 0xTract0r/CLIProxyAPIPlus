@@ -328,6 +328,7 @@ func (s *PostgresStore) List(ctx context.Context) ([]*cliproxyauth.Auth, error) 
 			auth.Disabled = true
 			auth.Status = cliproxyauth.StatusDisabled
 		}
+		applyQuarantineStateFromMetadata(auth, metadata)
 		auths = append(auths, auth)
 	}
 	if err = rows.Err(); err != nil {
@@ -650,6 +651,52 @@ func valueAsString(v any) string {
 		return t.String()
 	default:
 		return ""
+	}
+}
+
+// applyQuarantineStateFromMetadata restores the fork's terminal-auth-failure
+// quarantine lock (see markAutoQuarantine/clearAutoQuarantine in
+// sdk/cliproxy/auth/conductor_auto_quarantine.go) from the persisted
+// auth_store row metadata into the runtime Auth struct fields the
+// scheduler/selector actually gate on (AutoQuarantined/Status/Unavailable),
+// mirroring the same restore already performed for "disabled" just above
+// this call site (and for the file-backed store in
+// sdk/auth/filestore.go:readAuthFiles). Without this, a terminal quarantine
+// only ever lived on the in-memory Auth struct and silently evaporated on
+// the next process restart. It is a no-op when the persisted
+// "auto_quarantined" key is absent or false, so ordinary (non-quarantined)
+// and transient-cooldown-only records are left untouched -- the
+// terminal-vs-transient streak bookkeeping itself is intentionally never
+// persisted (see Auth.terminalAuthFailureStreak doc comment).
+func applyQuarantineStateFromMetadata(auth *cliproxyauth.Auth, metadata map[string]any) {
+	if auth == nil {
+		return
+	}
+	autoQuarantined, _ := metadata["auto_quarantined"].(bool)
+	if !autoQuarantined {
+		return
+	}
+	auth.AutoQuarantined = true
+	// Unavailable mirrors markAutoQuarantine's own in-memory state so a
+	// restored record is byte-for-byte consistent with a live-quarantined
+	// one (see the identical rationale in filestore.go:readAuthFiles).
+	auth.Unavailable = true
+	if !auth.Disabled {
+		// An operator-disabled account keeps StatusDisabled for display even
+		// if it was also auto-quarantined before being disabled (see
+		// applyAuthDisabledState, which does not clear an existing
+		// quarantine on disable). AutoQuarantined is still set above
+		// regardless, so the selector's isAuthBlockedForModel OR-check
+		// blocks on either reason independently.
+		auth.Status = cliproxyauth.StatusQuarantined
+	}
+	if reason, ok := metadata["quarantine_reason"].(string); ok {
+		auth.QuarantineReason = reason
+	}
+	if quarantinedAtStr, ok := metadata["quarantined_at"].(string); ok && quarantinedAtStr != "" {
+		if quarantinedAt, err := time.Parse(time.RFC3339, quarantinedAtStr); err == nil {
+			auth.QuarantinedAt = quarantinedAt
+		}
 	}
 }
 
