@@ -438,6 +438,145 @@ func TestPatchAuthFileFields_ClaudeDeviceIDSurvivesReload(t *testing.T) {
 	}
 }
 
+// TestPatchAuthFileFields_DisabledFalseNoopResendKeepsQuarantineStatus is the
+// syncAuthFileDisabledState sibling of
+// TestPatchAuthFileStatus_ReEnableWithoutDisabledTransitionKeepsAutoQuarantine
+// (auth_files_status_test.go), covering the same class of status-drift bug
+// through the PatchAuthFileFields "fields" endpoint instead of the "status"
+// endpoint.
+//
+// Auto-quarantine never sets Disabled=true, so an already-enabled,
+// auto-quarantined account has Disabled=false both before and after any
+// disabled=false save. Patching an unrelated field (here: note) through this
+// endpoint while the client also resends disabled=false must be a no-op for
+// Status/StatusMessage/Unavailable/AutoQuarantine -- it must not
+// unconditionally stomp Status back to StatusActive while leaving
+// AutoQuarantined=true, which would produce the self-contradictory persisted
+// state auto_quarantined=true + status=active + unavailable=false.
+//
+// Registers through the real persistence path (no WithSkipPersist) so it also
+// exercises whatever the manager writes back to the store.
+func TestPatchAuthFileFields_DisabledFalseNoopResendKeepsQuarantineStatus(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	record := &coreauth.Auth{
+		ProxyURL: "http://test-proxy:8080",
+		ID:       "quarantined-fields.json",
+		FileName: "quarantined-fields.json",
+		Provider: "claude",
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("failed to register auth record: %v", errRegister)
+	}
+	terminalAuthErr := &coreauth.Error{HTTPStatus: http.StatusUnauthorized, Message: `{"type":"error","error":{"type":"authentication_error","message":"OAuth access token has been revoked."}}`}
+	manager.MarkResult(context.Background(), coreauth.Result{AuthID: "quarantined-fields.json", Provider: "claude", Success: false, Error: terminalAuthErr})
+	manager.MarkResult(context.Background(), coreauth.Result{AuthID: "quarantined-fields.json", Provider: "claude", Success: false, Error: terminalAuthErr})
+	quarantined, ok := manager.GetByID("quarantined-fields.json")
+	if !ok || quarantined == nil || !quarantined.AutoQuarantined || quarantined.Disabled {
+		t.Fatalf("precondition failed: want auto-quarantined and not disabled, got=%+v ok=%v", quarantined, ok)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+
+	// disabled=false here is a no-op resend (the account was never
+	// Disabled=true) piggybacked on an unrelated "note" field edit -- not an
+	// operator "re-enable" action.
+	body := `{"name":"quarantined-fields.json","note":"unrelated edit","disabled":false}`
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/fields", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	ctx.Request = req
+	h.PatchAuthFileFields(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+
+	updated, ok := manager.GetByID("quarantined-fields.json")
+	if !ok || updated == nil {
+		t.Fatalf("expected auth record to exist after patch")
+	}
+	if updated.Disabled {
+		t.Fatalf("Disabled = true after disabled=false resend, want false")
+	}
+	if !updated.AutoQuarantined {
+		t.Fatalf("AutoQuarantined = false after a disabled=false resend with no prior disabled=true, want true (quarantine must survive)")
+	}
+	if updated.QuarantineReason == "" {
+		t.Fatalf("QuarantineReason = empty, want non-empty (quarantine must survive)")
+	}
+	if updated.QuarantinedAt.IsZero() {
+		t.Fatalf("QuarantinedAt = zero, want non-zero (quarantine must survive)")
+	}
+	if updated.Status != coreauth.StatusQuarantined {
+		t.Fatalf("Status = %q, want %q (quarantined state must survive a no-op disabled=false resend)", updated.Status, coreauth.StatusQuarantined)
+	}
+	if !updated.Unavailable {
+		t.Fatalf("Unavailable = false, want true (quarantined credential must stay marked unavailable)")
+	}
+	// The unrelated field edit must still have applied.
+	if got, _ := updated.Attributes["note"]; got != "unrelated edit" {
+		t.Fatalf("attrs note = %q, want %q", got, "unrelated edit")
+	}
+}
+
+// TestPatchAuthFileFields_DisabledTrueToFalseGenuineTransitionResetsStatus
+// verifies the sibling genuine-transition path stays intact after gating the
+// syncAuthFileDisabledState reset on wasDisabled: an account that really was
+// Disabled=true/StatusDisabled must still recover to StatusActive with a
+// cleared StatusMessage when the client patches disabled=false.
+func TestPatchAuthFileFields_DisabledTrueToFalseGenuineTransitionResetsStatus(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	record := &coreauth.Auth{
+		ProxyURL:      "http://test-proxy:8080",
+		ID:            "disabled-fields.json",
+		FileName:      "disabled-fields.json",
+		Provider:      "claude",
+		Disabled:      true,
+		Status:        coreauth.StatusDisabled,
+		StatusMessage: "disabled via management API",
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("failed to register auth record: %v", errRegister)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+
+	body := `{"name":"disabled-fields.json","disabled":false}`
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/fields", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	ctx.Request = req
+	h.PatchAuthFileFields(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+
+	updated, ok := manager.GetByID("disabled-fields.json")
+	if !ok || updated == nil {
+		t.Fatalf("expected auth record to exist after patch")
+	}
+	if updated.Disabled {
+		t.Fatalf("Disabled = true, want false")
+	}
+	if updated.Status != coreauth.StatusActive {
+		t.Fatalf("Status = %q, want %q", updated.Status, coreauth.StatusActive)
+	}
+	if updated.StatusMessage != "" {
+		t.Fatalf("StatusMessage = %q, want empty", updated.StatusMessage)
+	}
+}
+
 func TestPatchAuthFileFields_ArbitraryFieldsPersistToFile(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
 

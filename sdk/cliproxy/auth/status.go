@@ -24,3 +24,14 @@ const (
 	// See Auth.AutoQuarantined.
 	StatusQuarantined Status = "quarantined"
 )
+
+// AutoQuarantineStatusMessage is the StatusMessage every code path must set
+// whenever it puts (or keeps) an Auth in the StatusQuarantined state for the
+// automatic terminal-auth quarantine lock (AutoQuarantined). It is exported
+// as a single shared const -- rather than duplicated as separate string
+// literals in markAutoQuarantine (this package) and
+// management.refreshAuthStatus's AutoQuarantined-sync-back branch
+// (internal/api/handlers/management/auth_files_anticorr.go) -- so the two
+// call sites can never silently drift apart and report inconsistent wording
+// for the same underlying lock.
+const AutoQuarantineStatusMessage = "auto_quarantined: repeated authentication failures, credential needs re-authentication"

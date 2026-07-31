@@ -197,7 +197,7 @@ func markAutoQuarantine(auth *Auth, now time.Time) {
 	auth.QuarantineReason = quarantineReasonTerminalAuthFailure
 	auth.QuarantinedAt = now
 	auth.Status = StatusQuarantined
-	auth.StatusMessage = "auto_quarantined: repeated authentication failures, credential needs re-authentication"
+	auth.StatusMessage = AutoQuarantineStatusMessage
 	auth.Unavailable = true
 	// The credential is skipped entirely by isAuthBlockedForModel while
 	// quarantined (like StatusDisabled), so a NextRetryAfter-driven cooldown
@@ -305,9 +305,12 @@ func preserveQuarantineFieldsOnStaleWriteback(incoming, existing *Auth) bool {
 		// Status/Unavailable/NextRetryAfter at whatever the stale clone
 		// happened to carry. Without this, a stale write-back could still
 		// produce the same class of self-contradictory persisted state
-		// (AutoQuarantined=true but Status/Unavailable disagreeing) that the
-		// refreshAuthStatus success-path fix addresses for the other
-		// direction (see management.refreshAuthStatus).
+		// (AutoQuarantined=true but Status/Unavailable disagreeing) that
+		// management.refreshAuthStatus's own success path also guards
+		// against directly: it keeps Status/Unavailable in sync with
+		// AutoQuarantined instead of clearing the lock on token-refresh
+		// success alone (see that function's doc comment for why a
+		// successful token refresh must not, by itself, lift the lock).
 		incoming.Status = existing.Status
 		incoming.StatusMessage = existing.StatusMessage
 		incoming.Unavailable = existing.Unavailable
