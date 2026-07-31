@@ -122,6 +122,14 @@ func TestPatchAuthFileStatus_ReEnableClearsModelStatesCooldown(t *testing.T) {
 // PatchAuthFileStatus must lift the automatic terminal-auth quarantine lock
 // (AutoQuarantined) exactly like a completed reauth does, and the account
 // must become immediately selectable again.
+//
+// This is a genuine disabled=true -> disabled=false transition (the record
+// starts Disabled=true), which is the only case the "not disabled" recovery
+// signal is sanctioned for. See
+// TestPatchAuthFileStatus_ReEnableWithoutDisabledTransitionKeepsAutoQuarantine
+// for the sibling case that must NOT clear the lock: an already-enabled,
+// auto-quarantined account (auto-quarantine never sets Disabled=true) that
+// merely resends disabled=false.
 func TestPatchAuthFileStatus_ReEnableClearsAutoQuarantine(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
 	gin.SetMode(gin.TestMode)
@@ -129,9 +137,12 @@ func TestPatchAuthFileStatus_ReEnableClearsAutoQuarantine(t *testing.T) {
 	store := &memoryAuthStore{}
 	manager := coreauth.NewManager(store, nil, nil)
 	record := &coreauth.Auth{ProxyURL: "http://test-proxy:8080",
-		ID:       "quarantined.json",
-		FileName: "quarantined.json",
-		Provider: "claude",
+		ID:            "quarantined.json",
+		FileName:      "quarantined.json",
+		Provider:      "claude",
+		Disabled:      true,
+		Status:        coreauth.StatusDisabled,
+		StatusMessage: "disabled via management API",
 	}
 	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
 		t.Fatalf("failed to register auth record: %v", errRegister)
@@ -162,6 +173,9 @@ func TestPatchAuthFileStatus_ReEnableClearsAutoQuarantine(t *testing.T) {
 	if !ok || updated == nil {
 		t.Fatalf("expected auth record to exist after patch")
 	}
+	if updated.Disabled {
+		t.Fatalf("Disabled = true after explicit re-enable, want false")
+	}
 	if updated.AutoQuarantined {
 		t.Fatalf("AutoQuarantined = true after explicit re-enable, want false")
 	}
@@ -173,5 +187,86 @@ func TestPatchAuthFileStatus_ReEnableClearsAutoQuarantine(t *testing.T) {
 	}
 	if updated.Status != coreauth.StatusActive {
 		t.Fatalf("Status = %q, want %q", updated.Status, coreauth.StatusActive)
+	}
+}
+
+// TestPatchAuthFileStatus_ReEnableWithoutDisabledTransitionKeepsAutoQuarantine
+// is the bug repro/regression for applyAuthDisabledState: auto-quarantine
+// never sets Disabled=true (it is tracked independently via
+// AutoQuarantined/Status), so an already-enabled account that becomes
+// auto-quarantined has Disabled=false both before and after any
+// disabled=false save. Without gating the *entire* "not disabled" reset
+// block (Status/StatusMessage/Unavailable plus ClearAutoQuarantine) on a
+// genuine disabled=true -> disabled=false transition, resending the
+// unchanged disabled=false here would either silently and incorrectly lift
+// a real quarantine lock with zero recovery evidence, or -- the narrower
+// regression this test guards against -- leave AutoQuarantined=true intact
+// while still stomping Status back to StatusActive and Unavailable back to
+// false, producing a self-contradictory persisted state that readers
+// relying on Status/Unavailable (instead of AutoQuarantined) would
+// misreport as healthy. This test deliberately registers through the real
+// persistence path (no WithSkipPersist) so it also exercises whatever the
+// manager writes back to the store, not just an in-memory shortcut.
+func TestPatchAuthFileStatus_ReEnableWithoutDisabledTransitionKeepsAutoQuarantine(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	record := &coreauth.Auth{ProxyURL: "http://test-proxy:8080",
+		ID:       "quarantined-enabled.json",
+		FileName: "quarantined-enabled.json",
+		Provider: "claude",
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("failed to register auth record: %v", errRegister)
+	}
+	terminalAuthErr := &coreauth.Error{HTTPStatus: http.StatusUnauthorized, Message: `{"type":"error","error":{"type":"authentication_error","message":"OAuth access token has been revoked."}}`}
+	manager.MarkResult(context.Background(), coreauth.Result{AuthID: "quarantined-enabled.json", Provider: "claude", Success: false, Error: terminalAuthErr})
+	manager.MarkResult(context.Background(), coreauth.Result{AuthID: "quarantined-enabled.json", Provider: "claude", Success: false, Error: terminalAuthErr})
+	quarantined, ok := manager.GetByID("quarantined-enabled.json")
+	if !ok || quarantined == nil || !quarantined.AutoQuarantined || quarantined.Disabled {
+		t.Fatalf("precondition failed: want auto-quarantined and not disabled, got=%+v ok=%v", quarantined, ok)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+
+	// disabled=false here is a no-op resend (the account was never
+	// Disabled=true), not an operator "re-enable" action.
+	body := `{"name":"quarantined-enabled.json","disabled":false}`
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/status", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	ctx.Request = req
+	h.PatchAuthFileStatus(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+
+	updated, ok := manager.GetByID("quarantined-enabled.json")
+	if !ok || updated == nil {
+		t.Fatalf("expected auth record to exist after patch")
+	}
+	if !updated.AutoQuarantined {
+		t.Fatalf("AutoQuarantined = false after a disabled=false resend with no prior disabled=true, want true (quarantine must survive)")
+	}
+	if updated.QuarantineReason == "" {
+		t.Fatalf("QuarantineReason = empty, want non-empty (quarantine must survive)")
+	}
+	if updated.QuarantinedAt.IsZero() {
+		t.Fatalf("QuarantinedAt = zero, want non-zero (quarantine must survive)")
+	}
+	// Regression: Status/Unavailable must stay in sync with the surviving
+	// AutoQuarantined lock. A prior version of applyAuthDisabledState gated
+	// only ClearAutoQuarantine() on wasDisabled but still unconditionally
+	// reset Status/Unavailable, producing the self-contradictory persisted
+	// state auto_quarantined=true + status=active + unavailable=false.
+	if updated.Status != coreauth.StatusQuarantined {
+		t.Fatalf("Status = %q, want %q (quarantined state must survive a no-op disabled=false resend)", updated.Status, coreauth.StatusQuarantined)
+	}
+	if !updated.Unavailable {
+		t.Fatalf("Unavailable = false, want true (quarantined credential must stay marked unavailable)")
 	}
 }

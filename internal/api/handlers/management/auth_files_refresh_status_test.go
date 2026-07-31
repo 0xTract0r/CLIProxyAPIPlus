@@ -133,15 +133,26 @@ func TestRefreshAuthFileStatusClearsStaleWarningOnSuccess(t *testing.T) {
 	}
 }
 
-// TestRefreshAuthFileStatusClearsAutoQuarantineOnSuccess covers T3
-// (telemetry-farm-ux-hardening) finding #1: a manually triggered status
-// refresh that actually succeeds must clear the automatic terminal-auth
-// quarantine lock (AutoQuarantined), not just flip Status back to active.
-// Before this fix, a successful refresh on a quarantined account produced
-// the self-contradictory persisted state "status=active but
-// auto_quarantined=true", and the selector (which gates on AutoQuarantined
-// directly) would still skip the account forever.
-func TestRefreshAuthFileStatusClearsAutoQuarantineOnSuccess(t *testing.T) {
+// TestRefreshAuthFileStatusDoesNotClearAutoQuarantineOnSuccess is the bug
+// repro/regression for refreshAuthStatus's previous unconditional
+// Auth.ClearAutoQuarantine() on refresh success (added by the original T3
+// (telemetry-farm-ux-hardening) change). A successful OAuth token refresh
+// only proves the refresh_token itself is still valid; it does NOT prove the
+// account can serve real model requests, which is the actual signal the
+// automatic terminal-auth quarantine gate (AutoQuarantined) guards against.
+// A revoked/banned account can keep refreshing its access token
+// successfully indefinitely while every real model request still returns a
+// terminal 401 -- so a routine/periodic refresh must not, by itself, lift a
+// genuine quarantine lock. This must hold for both the manual "recheck
+// status" trigger exercised here and the periodic auto-refresh trigger,
+// since both share the same refreshAuthStatus code path.
+//
+// The two sanctioned recovery signals remain unchanged: a real model request
+// succeeding (Manager.MarkResult, see
+// TestManagerMarkResult_RealSuccessClearsAutoQuarantine) and a completed
+// re-authentication (saveTokenRecord, see
+// TestSaveTokenRecord_ClearsAutoQuarantineOnReauth).
+func TestRefreshAuthFileStatusDoesNotClearAutoQuarantineOnSuccess(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
 	gin.SetMode(gin.TestMode)
 
@@ -197,27 +208,32 @@ func TestRefreshAuthFileStatusClearsAutoQuarantineOnSuccess(t *testing.T) {
 	if !ok || updated == nil {
 		t.Fatalf("expected refreshed auth record")
 	}
-	if updated.Status != coreauth.StatusActive {
-		t.Fatalf("status = %q, want %q", updated.Status, coreauth.StatusActive)
+	if !updated.AutoQuarantined {
+		t.Fatalf("AutoQuarantined = false after a successful token refresh, want true (token refresh success must not lift the quarantine lock)")
 	}
-	if updated.AutoQuarantined {
-		t.Fatalf("AutoQuarantined = true after successful refresh, want false (status=active but auto_quarantined=true would be self-contradictory)")
+	if updated.QuarantineReason == "" {
+		t.Fatalf("QuarantineReason = empty, want non-empty (quarantine must survive)")
 	}
-	if updated.QuarantineReason != "" {
-		t.Fatalf("QuarantineReason = %q, want empty", updated.QuarantineReason)
+	if updated.QuarantinedAt.IsZero() {
+		t.Fatalf("QuarantinedAt = zero, want non-zero (quarantine must survive)")
 	}
-	if !updated.QuarantinedAt.IsZero() {
-		t.Fatalf("QuarantinedAt = %v, want zero", updated.QuarantinedAt)
+	// Status/Unavailable must stay in sync with the still-active quarantine
+	// lock instead of reporting the self-contradictory "status=active" a
+	// naive success-path reset would otherwise produce.
+	if updated.Status != coreauth.StatusQuarantined {
+		t.Fatalf("status = %q, want %q (must stay in sync with AutoQuarantined=true)", updated.Status, coreauth.StatusQuarantined)
+	}
+	if !updated.Unavailable {
+		t.Fatalf("Unavailable = false, want true while still quarantined")
 	}
 
-	// The account must be immediately re-selectable again.
+	// The account must remain blocked from selection: the underlying
+	// refresh_token being renewable again is not evidence the account can
+	// serve real model requests.
 	selector := &coreauth.FillFirstSelector{}
 	picked, errPick := selector.Pick(context.Background(), "claude", "", cliproxyexecutor.Options{}, []*coreauth.Auth{updated})
-	if errPick != nil {
-		t.Fatalf("selector.Pick returned error after successful refresh: %v", errPick)
-	}
-	if picked == nil || picked.ID != updated.ID {
-		t.Fatalf("selector.Pick() = %+v, want the refreshed record selectable again", picked)
+	if errPick == nil && picked != nil {
+		t.Fatalf("selector.Pick() = %+v, want no selectable auth while still quarantined", picked)
 	}
 }
 

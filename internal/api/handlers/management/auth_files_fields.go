@@ -184,11 +184,40 @@ func applyAuthDisabledState(auth *coreauth.Auth, disabled bool) {
 	if auth == nil {
 		return
 	}
+	// Bug fix: capture the pre-mutation Disabled value so the entire "not
+	// disabled" recovery reset below -- Status/StatusMessage/Unavailable,
+	// in-memory cooldown/quota/ModelStates, and the auto-quarantine clear
+	// (see the "T3" comment further down) -- is gated as one unit on a
+	// genuine disabled=true -> disabled=false transition, instead of firing
+	// on every call that merely resends disabled=false.
+	//
+	// Bug fix (regression): a prior version of this function only gated
+	// ClearAutoQuarantine() on wasDisabled but still reset
+	// Status/StatusMessage/Unavailable/cooldown/quota/ModelStates
+	// unconditionally. Auto-quarantine never sets Disabled=true (it is
+	// tracked independently via AutoQuarantined/Status), so an
+	// already-enabled, auto-quarantined account has wasDisabled=false both
+	// before and after any disabled=false save -- e.g. while the operator is
+	// only editing an unrelated field via a different endpoint that also
+	// happens to resend disabled=false. That no-op resend used to still
+	// unconditionally stomp Status back to StatusActive and Unavailable back
+	// to false while leaving AutoQuarantined/QuarantineReason/QuarantinedAt
+	// untouched (ClearAutoQuarantine itself was correctly skipped) -- a
+	// self-contradictory persisted state (auto_quarantined=true but
+	// status=active, unavailable=false) that every reader relying on
+	// Status/Unavailable instead of AutoQuarantined (e.g. dashboards, health
+	// checks, other management endpoints) would misreport as healthy, even
+	// though the selector (isAuthBlockedForModel) still correctly blocks the
+	// credential on AutoQuarantined alone. Gating the whole reset block on
+	// wasDisabled keeps the persisted state internally consistent: a no-op
+	// resend now leaves everything untouched, exactly like ClearAutoQuarantine
+	// already did.
+	wasDisabled := auth.Disabled
 	auth.Disabled = disabled
 	if disabled {
 		auth.Status = coreauth.StatusDisabled
 		auth.StatusMessage = "disabled via management API"
-	} else {
+	} else if wasDisabled {
 		auth.Status = coreauth.StatusActive
 		auth.StatusMessage = ""
 		// Fork recovery: re-enabling via management API must clear in-memory
@@ -217,6 +246,11 @@ func applyAuthDisabledState(auth *coreauth.Auth, disabled bool) {
 		// another chance, so lift the lock now instead of leaving it unselectable.
 		auth.ClearAutoQuarantine()
 	}
+	// else (disabled == false && !wasDisabled): a no-op resend of the
+	// already-"not disabled" state -- there is no genuine transition here, so
+	// there is no recovery evidence to act on. Leave Status/StatusMessage/
+	// Unavailable/cooldown/quota/ModelStates/AutoQuarantine exactly as they
+	// were (see the bug-fix comment above).
 	auth.UpdatedAt = time.Now()
 	if auth.Metadata == nil {
 		auth.Metadata = make(map[string]any)
@@ -595,12 +629,33 @@ func syncAuthFileDisabledState(auth *coreauth.Auth) {
 	if !ok {
 		return
 	}
+	// Bug fix: same class of status-drift as applyAuthDisabledState. Capture
+	// the pre-mutation Disabled value so the "not disabled" Status/
+	// StatusMessage reset below only fires on a genuine disabled=true ->
+	// disabled=false transition, not on every PatchAuthFileFields call that
+	// merely resends disabled=false (e.g. while editing an unrelated field).
+	//
+	// Auto-quarantine (see conductor_auto_quarantine.go) never sets
+	// Disabled=true -- it is tracked independently via AutoQuarantined/
+	// Status=StatusQuarantined -- so an already-enabled, auto-quarantined
+	// account has wasDisabled=false both before and after any disabled=false
+	// save here. Without this gate, that no-op resend would unconditionally
+	// stomp Status back to StatusActive (while AutoQuarantined stays true),
+	// producing the same self-contradictory persisted state
+	// (auto_quarantined=true but status=active) that applyAuthDisabledState
+	// was fixed to avoid.
+	wasDisabled := auth.Disabled
 	auth.Disabled = disabled
 	if disabled {
 		auth.Status = coreauth.StatusDisabled
 		if strings.TrimSpace(auth.StatusMessage) == "" {
 			auth.StatusMessage = "disabled via management API"
 		}
+		return
+	}
+	if !wasDisabled {
+		// No-op resend of the already-"not disabled" state: no genuine
+		// transition, so leave Status/StatusMessage untouched.
 		return
 	}
 	auth.Status = coreauth.StatusActive

@@ -1945,9 +1945,6 @@ func (h *Handler) refreshAuthStatus(ctx context.Context, current *coreauth.Auth)
 	}
 
 	updated.LastError = nil
-	updated.Status = coreauth.StatusActive
-	updated.StatusMessage = ""
-	updated.Unavailable = false
 	updated.Quota.Exceeded = false
 	updated.Quota.Reason = ""
 	updated.Quota.NextRecoverAt = time.Time{}
@@ -1955,17 +1952,36 @@ func (h *Handler) refreshAuthStatus(ctx context.Context, current *coreauth.Auth)
 	updated.NextRefreshAfter = time.Time{}
 	updated.LastRefreshedAt = now
 	updated.UpdatedAt = now
-	// T3 (telemetry-farm-ux-hardening): a manually triggered status refresh
-	// that actually succeeds is just as much a "real, current" recovery
-	// signal as a live proxied request succeeding (see MarkResult's
-	// evaluateAutoQuarantineLocked) -- it proves the credential itself is
-	// valid again. Without this, a successful refresh above would still set
-	// Status=StatusActive while leaving AutoQuarantined=true, which is a
-	// self-contradictory persisted state (status says healthy, but the
-	// selector -- isAuthBlockedForModel -- still skips the credential
-	// forever) and gives the operator no way to tell the two apart short of
-	// reading the raw JSON.
-	updated.ClearAutoQuarantine()
+	// Bug fix: a successful OAuth token refresh only proves the
+	// refresh_token itself is still valid; it does NOT prove the account can
+	// serve real model requests, which is the actual signal the automatic
+	// terminal-auth quarantine gate (AutoQuarantined; see
+	// evaluateAutoQuarantineLocked / markAutoQuarantine) guards against. A
+	// revoked/banned account can keep refreshing its access token
+	// successfully indefinitely while every real model request still
+	// returns a terminal 401. The previous "T3 (telemetry-farm-ux-hardening)"
+	// behavior here called Auth.ClearAutoQuarantine() unconditionally on
+	// refresh success (both the manual "recheck status" action and the
+	// periodic auto-refresh trigger share this same code path), which let a
+	// routine token refresh silently lift a genuine quarantine lock with no
+	// evidence the account actually recovered. The two sanctioned recovery
+	// signals are unchanged: a real model request succeeding
+	// (Manager.MarkResult -> evaluateAutoQuarantineLocked) and a completed
+	// re-authentication (saveTokenRecord -> Auth.ClearAutoQuarantine).
+	if updated.AutoQuarantined {
+		// Keep the persisted Status/StatusMessage/Unavailable in sync with
+		// the still-active quarantine lock instead of reporting the
+		// self-contradictory "status=active" that an unconditional reset
+		// here would otherwise produce for a credential the selector
+		// (isAuthBlockedForModel) still blocks on AutoQuarantined alone.
+		updated.Status = coreauth.StatusQuarantined
+		updated.StatusMessage = coreauth.AutoQuarantineStatusMessage
+		updated.Unavailable = true
+	} else {
+		updated.Status = coreauth.StatusActive
+		updated.StatusMessage = ""
+		updated.Unavailable = false
+	}
 
 	return h.authManager.Update(ctx, updated)
 }
@@ -2181,6 +2197,11 @@ func (h *Handler) PatchAuthFileAccountSettings(c *gin.Context) {
 		refreshEnabled = *req.RefreshEnabled
 	}
 
+	// Bug fix: capture the pre-mutation Disabled value so the auto-quarantine
+	// clear below can be gated on a genuine disabled=true -> disabled=false
+	// transition instead of firing on every save that merely resends
+	// disabled=false (see the wasDisabled comment further down).
+	wasDisabled := targetAuth.Disabled
 	targetAuth.Disabled = *req.Disabled
 	if *req.Disabled {
 		targetAuth.Status = coreauth.StatusDisabled
@@ -2193,7 +2214,19 @@ func (h *Handler) PatchAuthFileAccountSettings(c *gin.Context) {
 		// See PatchAuthFileStatus above: an explicit operator "not disabled"
 		// intent is also a valid recovery signal for core's automatic
 		// terminal-auth quarantine (T3).
-		targetAuth.ClearAutoQuarantine()
+		//
+		// Bug fix: only do this on a genuine disabled=true -> disabled=false
+		// transition (wasDisabled). Auto-quarantine never sets Disabled=true
+		// (it is tracked independently via AutoQuarantined/Status), so an
+		// already-enabled, auto-quarantined account has Disabled=false both
+		// before and after this call. Without the wasDisabled guard, an
+		// operator merely editing an unrelated field (proxy_url/note/
+		// extra_headers) on such an account and saving -- which resends the
+		// unchanged disabled=false -- would silently and incorrectly lift a
+		// real quarantine lock as a side effect.
+		if wasDisabled {
+			targetAuth.ClearAutoQuarantine()
+		}
 	}
 
 	targetAuth.ProxyURL = proxyURL

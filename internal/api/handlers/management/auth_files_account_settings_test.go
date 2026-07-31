@@ -206,6 +206,12 @@ func TestPatchAuthFileAccountSettings_RewritesRuntimeSnapshotAndStoredSchema(t *
 // PatchAuthFileAccountSettings must also lift the automatic terminal-auth
 // quarantine lock (AutoQuarantined), per the "See PatchAuthFileStatus above"
 // comment in the handler.
+//
+// This is a genuine disabled=true -> disabled=false transition (the record
+// starts Disabled=true), which is the only case the "not disabled" recovery
+// signal is sanctioned for. See
+// TestPatchAuthFileAccountSettings_UnrelatedFieldSaveKeepsAutoQuarantine for
+// the sibling bug-repro case that must NOT clear the lock.
 func TestPatchAuthFileAccountSettings_ReEnableClearsAutoQuarantine(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
 	gin.SetMode(gin.TestMode)
@@ -213,9 +219,12 @@ func TestPatchAuthFileAccountSettings_ReEnableClearsAutoQuarantine(t *testing.T)
 	store := &memoryAuthStore{}
 	manager := coreauth.NewManager(store, nil, nil)
 	record := &coreauth.Auth{
-		ID:       "quarantined-settings.json",
-		FileName: "quarantined-settings.json",
-		Provider: "claude",
+		ID:            "quarantined-settings.json",
+		FileName:      "quarantined-settings.json",
+		Provider:      "claude",
+		Disabled:      true,
+		Status:        coreauth.StatusDisabled,
+		StatusMessage: "disabled via management API",
 	}
 	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
 		t.Fatalf("failed to register auth record: %v", errRegister)
@@ -246,6 +255,9 @@ func TestPatchAuthFileAccountSettings_ReEnableClearsAutoQuarantine(t *testing.T)
 	if !ok || updated == nil {
 		t.Fatalf("expected auth record to exist after patch")
 	}
+	if updated.Disabled {
+		t.Fatalf("Disabled = true after explicit re-enable via account-settings, want false")
+	}
 	if updated.AutoQuarantined {
 		t.Fatalf("AutoQuarantined = true after explicit re-enable via account-settings, want false")
 	}
@@ -254,6 +266,72 @@ func TestPatchAuthFileAccountSettings_ReEnableClearsAutoQuarantine(t *testing.T)
 	}
 	if !updated.QuarantinedAt.IsZero() {
 		t.Fatalf("QuarantinedAt = %v, want zero", updated.QuarantinedAt)
+	}
+}
+
+// TestPatchAuthFileAccountSettings_UnrelatedFieldSaveKeepsAutoQuarantine is
+// the bug repro/regression for PatchAuthFileAccountSettings's previously
+// unconditional ClearAutoQuarantine on disabled=false: an operator saving an
+// already-enabled, auto-quarantined account to change an unrelated field
+// (proxy_url here) must not silently clear the quarantine lock as a side
+// effect. Auto-quarantine never sets Disabled=true, so this account has
+// Disabled=false both before and after the save; only a genuine
+// disabled=true -> disabled=false transition may clear the lock (see
+// TestPatchAuthFileAccountSettings_ReEnableClearsAutoQuarantine).
+func TestPatchAuthFileAccountSettings_UnrelatedFieldSaveKeepsAutoQuarantine(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	record := &coreauth.Auth{
+		ID:       "quarantined-settings-enabled.json",
+		FileName: "quarantined-settings-enabled.json",
+		Provider: "claude",
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("failed to register auth record: %v", errRegister)
+	}
+	terminalAuthErr := &coreauth.Error{HTTPStatus: http.StatusUnauthorized, Message: `{"type":"error","error":{"type":"authentication_error","message":"OAuth access token has been revoked."}}`}
+	manager.MarkResult(context.Background(), coreauth.Result{AuthID: "quarantined-settings-enabled.json", Provider: "claude", Success: false, Error: terminalAuthErr})
+	manager.MarkResult(context.Background(), coreauth.Result{AuthID: "quarantined-settings-enabled.json", Provider: "claude", Success: false, Error: terminalAuthErr})
+	quarantined, ok := manager.GetByID("quarantined-settings-enabled.json")
+	if !ok || quarantined == nil || !quarantined.AutoQuarantined || quarantined.Disabled {
+		t.Fatalf("precondition failed: want auto-quarantined and not disabled, got=%+v ok=%v", quarantined, ok)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+
+	// Operator only wants to change proxy_url/note; disabled=false is resent
+	// unchanged (the account was never Disabled=true), not a re-enable
+	// action.
+	body := `{"name":"quarantined-settings-enabled.json","proxy_url":"http://proxy.remote:8080","note":"rotated proxy","disabled":false}`
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/account-settings", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	ctx.Request = req
+	h.PatchAuthFileAccountSettings(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+
+	updated, ok := manager.GetByID("quarantined-settings-enabled.json")
+	if !ok || updated == nil {
+		t.Fatalf("expected auth record to exist after patch")
+	}
+	if updated.ProxyURL != "http://proxy.remote:8080" {
+		t.Fatalf("proxy_url = %q, want the newly saved value (unrelated field must still save)", updated.ProxyURL)
+	}
+	if !updated.AutoQuarantined {
+		t.Fatalf("AutoQuarantined = false after an unrelated-field save with no disabled transition, want true (quarantine must survive)")
+	}
+	if updated.QuarantineReason == "" {
+		t.Fatalf("QuarantineReason = empty, want non-empty (quarantine must survive)")
+	}
+	if updated.QuarantinedAt.IsZero() {
+		t.Fatalf("QuarantinedAt = zero, want non-zero (quarantine must survive)")
 	}
 }
 
