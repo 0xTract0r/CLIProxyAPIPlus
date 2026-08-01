@@ -80,7 +80,7 @@ func newServingHighWaterFixture(t *testing.T, serverURL string) (*ClaudeExecutor
 }
 
 // versionedInboundHeaders carries a real, version-bearing claude-cli User-Agent
-// (above the frozen floor 2.1.63, below the sanity ceiling 4.0.0) so the device
+// (above the frozen floor 2.1.211, below the sanity ceiling 4.0.0) so the device
 // profile resolution records it as a first-party observation.
 func versionedInboundHeaders(version string) http.Header {
 	h := http.Header{}

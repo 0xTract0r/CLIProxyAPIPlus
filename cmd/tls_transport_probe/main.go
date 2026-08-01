@@ -196,9 +196,9 @@ func syntheticClaudeAuth() *cliproxyauth.Auth {
 		Label:    "synthetic claude uTLS probe",
 		Metadata: map[string]any{
 			"headers": map[string]any{
-				"User-Agent":                  "claude-cli/2.1.63 (external, cli)",
-				"X-Stainless-Package-Version": "0.74.0",
-				"X-Stainless-Runtime-Version": "v24.3.0",
+				"User-Agent":                  "claude-cli/2.1.211 (external, cli)",
+				"X-Stainless-Package-Version": "0.94.0",
+				"X-Stainless-Runtime-Version": "v26.3.0",
 				"X-Stainless-Os":              "MacOS",
 				"X-Stainless-Arch":            "arm64",
 			},

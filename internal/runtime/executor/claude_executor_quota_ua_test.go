@@ -12,7 +12,7 @@ import (
 // claude_device_high_water triple carries the given outbound User-Agent, so
 // claudeFallbackBaseline surfaces it as the resolved device-profile UA that
 // PrepareRequest applies to the outgoing quota/oauth request. The version encoded
-// in the UA (2.1.215) is above the frozen floor (2.1.63), so it is picked as the
+// in the UA (2.1.315) is above the frozen floor (2.1.211), so it is picked as the
 // ceiling; the executor is built without an auth manager so PrepareRequest's
 // persistClaudeDeviceHighWater is a no-op and the seeded high-water is stable.
 func quotaAuthWithClaudeHighWaterUA(ua string) *cliproxyauth.Auth {
@@ -26,7 +26,7 @@ func quotaAuthWithClaudeHighWaterUA(ua string) *cliproxyauth.Auth {
 			"type": "claude",
 			cliproxyauth.ClaudeDeviceHighWaterMetadataKey: map[string]any{
 				"user_agent":      ua,
-				"version":         "2.1.215",
+				"version":         "2.1.315",
 				"package_version": "0.1.0",
 				"runtime_version": "v22.0.0",
 			},
@@ -50,7 +50,7 @@ func quotaAuthWithClaudeHighWaterUA(ua string) *cliproxyauth.Auth {
 // This drives the real PrepareRequest path on-wire (stabilize on, sdk-cli
 // high-water seeded into auth.Metadata) and asserts the resolved outbound
 // User-Agent header suffix is folded to "(external, cli)" under the default and
-// explicitly-enabled gate while the high-water version (2.1.215) is preserved, and
+// explicitly-enabled gate while the high-water version (2.1.315) is preserved, and
 // is left "(external, sdk-cli)" verbatim when the normalize gate is disabled. The
 // fold reuses helps.NormalizeClaudeUserAgentEntrypoint — the same in-place fold the
 // refresh/reauth token-endpoint paths use — gated by the same
@@ -68,17 +68,17 @@ func TestClaudeExecutorPrepareRequest_FoldsQuotaHighWaterUserAgentSuffix(t *test
 		{
 			name:          "default gate folds sdk-cli high-water to cli",
 			normalizeGate: nil,
-			wantUA:        "claude-cli/2.1.215 (external, cli)",
+			wantUA:        "claude-cli/2.1.315 (external, cli)",
 		},
 		{
 			name:          "explicitly enabled gate folds sdk-cli high-water to cli",
 			normalizeGate: &enabled,
-			wantUA:        "claude-cli/2.1.215 (external, cli)",
+			wantUA:        "claude-cli/2.1.315 (external, cli)",
 		},
 		{
 			name:          "disabled gate keeps sdk-cli high-water verbatim",
 			normalizeGate: &disabled,
-			wantUA:        "claude-cli/2.1.215 (external, sdk-cli)",
+			wantUA:        "claude-cli/2.1.315 (external, sdk-cli)",
 		},
 	}
 
@@ -97,7 +97,7 @@ func TestClaudeExecutorPrepareRequest_FoldsQuotaHighWaterUserAgentSuffix(t *test
 				},
 			}
 			executor := NewClaudeExecutor(cfg)
-			auth := quotaAuthWithClaudeHighWaterUA("claude-cli/2.1.215 (external, sdk-cli)")
+			auth := quotaAuthWithClaudeHighWaterUA("claude-cli/2.1.315 (external, sdk-cli)")
 
 			// Mirrors quota_snapshots.go fetchQuotaJSON: a bare GET to the
 			// first-party oauth profile endpoint with no inbound client UA.
@@ -114,5 +114,56 @@ func TestClaudeExecutorPrepareRequest_FoldsQuotaHighWaterUserAgentSuffix(t *test
 				t.Fatalf("quota-path outbound User-Agent = %q, want %q", got, tc.wantUA)
 			}
 		})
+	}
+}
+
+// TestClaudeExecutorPrepareRequest_QuotaPathEmitsCorrectedFloorHighWater pins the
+// background quota/oauth token-endpoint egress path (a bare GET with no inbound
+// client UA) to the corrected real fleet high-water. An account whose persisted
+// device high-water is exactly claude-cli/2.1.211 — the double-sourced real fleet
+// version this fix restores over the fabricated 2.1.216 — must egress 2.1.211 on
+// the quota probe, never a version no real client here ever presented.
+func TestClaudeExecutorPrepareRequest_QuotaPathEmitsCorrectedFloorHighWater(t *testing.T) {
+	// Clear the shared observation/high-water cache so a prior test's global
+	// observation cannot outrank the seeded persisted high-water.
+	resetClaudeDeviceProfileCache()
+
+	stabilize := true
+	cfg := &config.Config{
+		ClaudeHeaderDefaults: config.ClaudeHeaderDefaults{
+			StabilizeDeviceProfile: &stabilize,
+		},
+	}
+	executor := NewClaudeExecutor(cfg)
+	auth := &cliproxyauth.Auth{
+		ProxyURL: "direct",
+		Provider: "claude",
+		Attributes: map[string]string{
+			"api_key": "sk-ant-oat-quota-floor-test",
+		},
+		Metadata: map[string]any{
+			"type": "claude",
+			cliproxyauth.ClaudeDeviceHighWaterMetadataKey: map[string]any{
+				"user_agent":      "claude-cli/2.1.211 (external, cli)",
+				"version":         "2.1.211",
+				"package_version": "0.94.0",
+				"runtime_version": "v26.3.0",
+				"os":              "MacOS",
+				"arch":            "arm64",
+			},
+		},
+	}
+
+	// Mirrors quota_snapshots.go fetchQuotaJSON: a bare GET to the first-party oauth
+	// profile endpoint with no inbound client UA.
+	req, err := http.NewRequest(http.MethodGet, "https://api.anthropic.com/api/oauth/profile", nil)
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	if err := executor.PrepareRequest(req, auth); err != nil {
+		t.Fatalf("PrepareRequest() error = %v", err)
+	}
+	if got := req.Header.Get("User-Agent"); got != "claude-cli/2.1.211 (external, cli)" {
+		t.Fatalf("quota-path outbound User-Agent = %q, want corrected floor high-water claude-cli/2.1.211 (external, cli)", got)
 	}
 }

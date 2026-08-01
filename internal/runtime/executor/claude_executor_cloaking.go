@@ -168,7 +168,10 @@ func replaceBillingHeaderVersion(billingHeader string, version string) (string, 
 }
 
 func checkSystemInstructionsWithMode(payload []byte, strictMode bool) []byte {
-	return checkSystemInstructionsWithVersion(payload, strictMode, "2.1.63")
+	// Fallback billing cc_version floor; mirrors the device-profile UA floor
+	// (defaultClaudeFingerprintUserAgent) so an unresolved version never emits a
+	// cc_version that disagrees with the outbound User-Agent.
+	return checkSystemInstructionsWithVersion(payload, strictMode, "2.1.211")
 }
 
 func checkSystemInstructionsWithVersion(payload []byte, strictMode bool, version string) []byte {
@@ -185,7 +188,9 @@ func checkSystemInstructionsWithVersion(payload []byte, strictMode bool, version
 //	system[5]: user system messages moved to first user message
 func checkSystemInstructionsWithSigningMode(payload []byte, strictMode bool, experimentalCCHSigning bool, oauthMode bool, version, entrypoint, workload string) []byte {
 	if strings.TrimSpace(version) == "" {
-		version = "2.1.63"
+		// Mirror the device-profile UA floor so cc_version never disagrees with the
+		// outbound User-Agent when the caller passes no resolved version.
+		version = "2.1.211"
 	}
 	system := gjson.GetBytes(payload, "system")
 

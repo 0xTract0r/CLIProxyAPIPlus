@@ -93,6 +93,10 @@ func (s *Service) Run(ctx context.Context) error {
 				log.Warnf("failed to restore cooldown state: %v", errRestoreCooldown)
 			}
 		}
+		// fork(anticorr): aggregate persisted claude device high-water from all
+		// loaded accounts so the global observed fallback ceiling is warm from the
+		// first request after a restart (see seedClaudeObservedHighWaterFromLoadedAuths).
+		s.seedClaudeObservedHighWaterFromLoadedAuths()
 	}
 
 	if !homeEnabled {

@@ -37,7 +37,7 @@ func authWithPersistedHighWater(id, version string) *cliproxyauth.Auth {
 // baseline UA, the stale-guard predicate fires even though the auth carries a real
 // persisted high-water that the outbound floor path already uses. Re-seeding the
 // persisted triple into the in-memory observation map must align the predicate's
-// view with disk so the misleading "falls back to frozen floor 2.1.63" warning no
+// view with disk so the misleading "falls back to frozen floor 2.1.211" warning no
 // longer fires, while keeping only-up semantics.
 func TestSeedClaudeObservedHighWaterFromAuth_DisarmsStaleGuardAfterRestart(t *testing.T) {
 	ResetClaudeDeviceProfileCache()
@@ -88,16 +88,17 @@ func TestSeedClaudeObservedHighWaterFromAuth_OnlyUp(t *testing.T) {
 	ResetClaudeDeviceProfileCache()
 	t.Cleanup(ResetClaudeDeviceProfileCache)
 
-	// A live first-party observation lands at 2.1.200 on some account.
+	// A live first-party observation lands at 2.1.320 (above the floor) on some
+	// account.
 	_ = ResolveClaudeDeviceProfile(
 		&cliproxyauth.Auth{ProxyURL: "direct", ID: "acct-live", Provider: "claude"},
 		"",
-		map[string][]string{"User-Agent": {"claude-cli/2.1.200 (external, cli)"}},
+		map[string][]string{"User-Agent": {"claude-cli/2.1.320 (external, cli)"}},
 		&config.Config{},
 	)
 	live, has := globalClaudeObservedHighWaterVersion()
-	if !has || formatClaudeCLIVersion(live) != "2.1.200" {
-		t.Fatalf("precondition: live observation must seed global high-water to 2.1.200, got has=%v ver=%q", has, formatClaudeCLIVersion(live))
+	if !has || formatClaudeCLIVersion(live) != "2.1.320" {
+		t.Fatalf("precondition: live observation must seed global high-water to 2.1.320, got has=%v ver=%q", has, formatClaudeCLIVersion(live))
 	}
 
 	// Re-seeding a lower persisted triple (2.1.185) must not lower the high-water.
@@ -108,8 +109,8 @@ func TestSeedClaudeObservedHighWaterFromAuth_OnlyUp(t *testing.T) {
 	if !has {
 		t.Fatalf("global observed high-water missing after re-seed")
 	}
-	if got := formatClaudeCLIVersion(after); got != "2.1.200" {
-		t.Fatalf("re-seed must be only-up: global high-water = %q, want %q (lower persisted value must not lower it)", got, "2.1.200")
+	if got := formatClaudeCLIVersion(after); got != "2.1.320" {
+		t.Fatalf("re-seed must be only-up: global high-water = %q, want %q (lower persisted value must not lower it)", got, "2.1.320")
 	}
 }
 
