@@ -329,6 +329,12 @@ func (s *PostgresStore) List(ctx context.Context) ([]*cliproxyauth.Auth, error) 
 			auth.Status = cliproxyauth.StatusDisabled
 		}
 		applyQuarantineStateFromMetadata(auth, metadata)
+		// Restore the terminal reauth-required lock from persisted row metadata,
+		// mirroring applyQuarantineStateFromMetadata just above. Without it a
+		// Postgres-backed dead-refresh-token credential reloads as StatusActive
+		// and gets routed again (false green). It is a no-op when disabled or
+		// auto-quarantined already own a stronger terminal Status.
+		cliproxyauth.ApplyReauthRequiredStateFromMetadata(auth)
 		auths = append(auths, auth)
 	}
 	if err = rows.Err(); err != nil {

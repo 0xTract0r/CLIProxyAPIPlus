@@ -481,6 +481,13 @@ func (s *FileTokenStore) readAuthFiles(path, baseDir string) ([]*cliproxyauth.Au
 	}
 	cliproxyauth.ApplyRuntimeFieldsFromMetadata(auth)
 	cliproxyauth.ApplyCustomHeadersFromMetadata(auth)
+	// Restore the terminal reauth-required lock (persisted by
+	// markRefreshReauthRequiredWithReason) the same way autoQuarantined is
+	// restored just above, so a dead refresh token survives a process restart
+	// as an abnormal, unroutable record instead of a fresh StatusActive one.
+	// It is a no-op when disabled/auto-quarantined already own a stronger
+	// terminal Status (see ApplyReauthRequiredStateFromMetadata).
+	cliproxyauth.ApplyReauthRequiredStateFromMetadata(auth)
 	return []*cliproxyauth.Auth{auth}, nil
 }
 

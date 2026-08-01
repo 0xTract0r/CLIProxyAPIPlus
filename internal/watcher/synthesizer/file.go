@@ -109,6 +109,12 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 			if quarantinedAtStr, ok := metadata["quarantined_at"].(string); ok && quarantinedAtStr != "" {
 				quarantinedAt, _ = time.Parse(time.RFC3339, quarantinedAtStr)
 			}
+			// reauthRequired restores the terminal reauth-required lock (dead
+			// refresh token; see markRefreshReauthRequiredWithReason) from the
+			// file-level metadata, mirroring autoQuarantined above. Read from the
+			// file metadata (not each plugin auth's own map) in case the plugin
+			// parser rebuilt a fresh Metadata that dropped the lock keys.
+			reauthRequired := coreauth.IsReauthRequiredMetadata(metadata)
 			for index, auth := range auths {
 				if auth == nil {
 					continue
@@ -157,9 +163,29 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 						auth.Metadata["quarantined_at"] = quarantinedAt.Format(time.RFC3339)
 					}
 				}
+				if reauthRequired {
+					// Mirror the file-level lock keys onto the plugin auth's own
+					// Metadata (like auto_quarantined above) so both
+					// ApplyReauthRequiredStateFromMetadata here and the live
+					// selector's isReauthRequiredMetadata check see the lock even
+					// if the plugin parser dropped the keys.
+					if auth.Metadata == nil {
+						auth.Metadata = make(map[string]any)
+					}
+					for _, key := range []string{"reauth_required", "refresh_status", "refresh_error_code", "refresh_disabled_reason"} {
+						if value, ok := metadata[key]; ok {
+							auth.Metadata[key] = value
+						}
+					}
+				}
 				coreauth.SetOAuthModelAliasesAttribute(auth, perAccountModelAliases)
 				ApplyAuthExcludedModelsMeta(auth, cfg, perAccountExcluded, "oauth")
 				coreauth.ApplyCustomHeadersFromMetadata(auth)
+				// Restore the terminal reauth-required lock on every live watcher
+				// resynthesis, mirroring the autoQuarantined restoration above so a
+				// dead refresh token is not silently reset to StatusActive. No-op
+				// when disabled/auto-quarantined already own a stronger Status.
+				coreauth.ApplyReauthRequiredStateFromMetadata(auth)
 			}
 			return auths
 		}
@@ -290,6 +316,14 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 			}
 		}
 	}
+	// Restore the terminal reauth-required lock (persisted by
+	// markRefreshReauthRequiredWithReason) on every live watcher resynthesis,
+	// mirroring the autoQuarantined restoration in the Status switch above. The
+	// synthesizer runs on each file-watcher event; without this a dead refresh
+	// token would be rebuilt as StatusActive/Unavailable=false every ~5 minutes,
+	// re-exposing a false-green account. No-op when disabled/auto-quarantined
+	// already own a stronger terminal Status.
+	coreauth.ApplyReauthRequiredStateFromMetadata(a)
 	return []*coreauth.Auth{a}
 }
 

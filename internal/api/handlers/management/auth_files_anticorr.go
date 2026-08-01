@@ -708,6 +708,13 @@ func clearAuthReauthRequiredLock(auth *coreauth.Auth) {
 		if auth.Status == coreauth.StatusError {
 			auth.Status = coreauth.StatusActive
 		}
+		// ApplyReauthRequiredStateFromMetadata (sdk/cliproxy/auth/types.go) sets
+		// Unavailable=true when it restores this lock on load, so releasing the
+		// lock must clear it back on the live record too. A subsequent reload
+		// already recomputes Unavailable from the (now-cleared) metadata, but
+		// this keeps the in-memory record from lingering as "unavailable" while
+		// its Status reads active between the re-auth and the next reload.
+		auth.Unavailable = false
 		if auth.LastError != nil && auth.LastError.Code == "reauth_required" {
 			auth.LastError = nil
 		}
