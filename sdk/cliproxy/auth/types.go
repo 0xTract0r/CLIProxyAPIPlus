@@ -1000,6 +1000,60 @@ func (a *Auth) MarkRefreshReauthRequired(now time.Time) {
 	a.markRefreshReauthRequired(now)
 }
 
+// ApplyReauthRequiredStateFromMetadata restores the terminal reauth-required
+// lock written by markRefreshReauthRequiredWithReason from persisted metadata
+// into the runtime Status/StatusMessage/Unavailable/LastError fields the
+// selector and the management UI actually gate on. It is the read-back analogue
+// of applyQuarantineStateFromMetadata (the auto-quarantine restore in
+// internal/store/postgresstore.go and sdk/auth/filestore.go): without it a dead
+// refresh token (reauth_required) is silently rebuilt as a fresh StatusActive
+// credential every time the file watcher resynthesizes or the process restarts,
+// producing a false-green account that keeps getting routed and 401-ing.
+//
+// Priority ordering (disabled > auto_quarantined > reauth_required > active):
+// an operator Disabled flag and the automatic AutoQuarantined lock each own a
+// stronger terminal Status and already force the record unavailable, so this is
+// a deliberate no-op when either is set. It only ever promotes an otherwise
+// active record to the error/unavailable state, so the three terminal locks
+// never clobber one another's display Status.
+//
+// It is self-clearing by construction: it keys off the current metadata, so the
+// instant a completed re-auth / successful refresh removes the lock keys (see
+// clearAuthReauthRequiredLock in the management API), isReauthRequiredMetadata
+// returns false, the guard returns, and the record loads back as active. There
+// is no reverse dead-lock.
+func ApplyReauthRequiredStateFromMetadata(auth *Auth) {
+	if auth == nil {
+		return
+	}
+	if auth.Disabled || auth.Status == StatusDisabled || auth.AutoQuarantined {
+		return
+	}
+	if !isReauthRequiredMetadata(auth.Metadata) {
+		return
+	}
+	auth.Status = StatusError
+	auth.StatusMessage = "reauth_required"
+	// Unavailable mirrors the persisted terminal state so a restored record is
+	// consistent with an abnormal (non-green) credential in the management UI.
+	// The selector does not rely on this flag for reauth (a zero NextRetryAfter
+	// would otherwise leave Unavailable un-gated); the selector blocks reauth
+	// records directly on the metadata lock instead. See isAuthBlockedForModel.
+	auth.Unavailable = true
+	if auth.LastError == nil {
+		code := ""
+		if raw, ok := auth.Metadata["refresh_error_code"].(string); ok {
+			code = strings.TrimSpace(raw)
+		}
+		auth.LastError = &Error{
+			Code:       "reauth_required",
+			Message:    reauthMessageForCode(code),
+			Retryable:  false,
+			HTTPStatus: http.StatusUnauthorized,
+		}
+	}
+}
+
 // tokenOwnedMetadataKeys are metadata fields owned by the OAuth/token lifecycle.
 // They must only move forward (a successful refresh or re-auth), never be rolled
 // back by a stale clone that carried older token state while writing unrelated

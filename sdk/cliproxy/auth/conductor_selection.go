@@ -190,6 +190,21 @@ func (m *Manager) ReconcileRegistryModelStates(ctx context.Context, authID strin
 				// stay StatusDisabled until the operator explicitly re-enables it,
 				// not get silently promoted back to active by a routine model-state
 				// reconciliation pass.
+			case isReauthRequiredMetadata(auth.Metadata):
+				// Same class of drift for a terminal reauth-required auth (dead
+				// refresh token; see markRefreshReauthRequiredWithReason). This
+				// pass writes directly via m.persist below and bypasses
+				// preserveQuarantineFieldsOnStaleWriteback, so without this case a
+				// routine registry reconciliation would silently flip a dead-token
+				// auth back to Status=active/StatusMessage=""/LastError=nil while
+				// its reauth_required metadata lock is still set, reintroducing the
+				// exact false-green status this fix closes. The lock is self-
+				// clearing: once a completed re-auth removes the metadata keys this
+				// case no longer matches and the default active-reset applies.
+				auth.Status = StatusError
+				auth.StatusMessage = "reauth_required"
+				auth.Unavailable = true
+				auth.NextRetryAfter = time.Time{}
 			default:
 				if !hasModelError(auth, now) {
 					auth.LastError = nil

@@ -316,7 +316,19 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 	// blockReasonDisabled so a quarantined credential is skipped entirely
 	// (like Disabled) rather than treated as a cooldown that quietly expires
 	// and gets retried every ~30 minutes.
-	if auth.Disabled || auth.Status == StatusDisabled || auth.AutoQuarantined {
+	//
+	// isReauthRequiredMetadata is the third terminal lock: a credential whose
+	// refresh token was rejected as terminally invalid (invalid_grant / reuse)
+	// carries the persisted reauth_required metadata written by
+	// markRefreshReauthRequiredWithReason. It must be skipped entirely too --
+	// keying off the metadata (rather than Unavailable/NextRetryAfter) means it
+	// blocks on BOTH the live in-memory record and a watcher-resynthesized /
+	// restart-restored one, and it self-clears the moment a completed re-auth
+	// removes the lock keys. Note a bare Unavailable=true with a zero
+	// NextRetryAfter would NOT be blocked by the transient-cooldown check below,
+	// so the metadata lock here is what actually keeps a dead-token account off
+	// the rotation.
+	if auth.Disabled || auth.Status == StatusDisabled || auth.AutoQuarantined || isReauthRequiredMetadata(auth.Metadata) {
 		return true, blockReasonDisabled, time.Time{}
 	}
 	if model != "" {
