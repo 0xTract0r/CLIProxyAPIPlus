@@ -103,6 +103,66 @@ func normalizeClaudeBillingEntrypoint(cfg *config.Config, body []byte) ([]byte, 
 	return updated, true
 }
 
+// alignRealPathBillingVersion rewrites ONLY the <version> segment of the body's
+// x-anthropic-billing-header (system[0].text) cc_version=<version>.<build> token
+// to billingVersion (the account high-water version V), preserving the <build>
+// fingerprint and every other billing field byte-for-byte, and returns the
+// (possibly rewritten) body plus whether a rewrite occurred.
+//
+// This is the REAL serving path (helps.ShouldCloak == false, genuine
+// interactive claude-cli) counterpart of the cc_version floor the cloaked path
+// already applies inside checkSystemInstructionsWithSigningMode. On the real
+// path applyCloaking early-returns before that floor, so a below-high-water
+// client would send an outbound User-Agent floored up to V (the header side,
+// done in the device-profile floor) while its body cc_version stays at the
+// lower client version — a "one account, two versions" mismatch. Aligning the
+// body version to the same V the UA uses closes that gap. It is the /v1/messages
+// (+ streaming) sibling of normalizeClaudeBillingEntrypoint (which folds
+// cc_entrypoint); both rewrite the verbatim inbound billing header and require
+// the caller to re-sign afterward.
+//
+// Only the <version> segment changes; <build> is passed through verbatim via
+// replaceBillingHeaderVersion (which splits cc_version on "." into exactly four
+// parts and re-emits "cc_version=<V>.<parts[3]>", so the build fingerprint is
+// never recomputed — the build algorithm is not yet real-machine validated and
+// forging a build no real client emits would itself be a detection signal).
+//
+// Callers must re-sign (signAnthropicMessagesBody) after a reported rewrite so
+// the recomputed cch covers the rewritten body. When the switch is off (default),
+// when billingVersion is empty, when system[0].text is not a billing header,
+// when it carries no cc_version token, or when the version is already V, the body
+// is returned unchanged with changed=false — the real path then stays
+// byte-identical to today (default-safe / idempotent), and no forced re-sign is
+// triggered on its behalf. Malformed / non-JSON bodies are a safe no-op
+// pass-through (never a panic, never a corrupted body).
+func alignRealPathBillingVersion(cfg *config.Config, body []byte, billingVersion string) ([]byte, bool) {
+	if !config.AlignRealPathBillingVersionEnabled(cfg) {
+		return body, false
+	}
+	billingVersion = strings.TrimSpace(billingVersion)
+	if billingVersion == "" {
+		return body, false
+	}
+	firstText := gjson.GetBytes(body, "system.0.text").String()
+	if !strings.HasPrefix(firstText, "x-anthropic-billing-header:") {
+		return body, false
+	}
+	updatedText, ok := replaceBillingHeaderVersion(firstText, billingVersion)
+	// replaceBillingHeaderVersion's bool reports "applicable" (billing header +
+	// non-empty version), not "changed": it re-emits an identical string when the
+	// version is already V or when there is no cc_version token to match. Compare
+	// the strings so a no-op (already-at-V / missing cc_version) returns
+	// changed=false and never forces a redundant re-sign.
+	if !ok || updatedText == firstText {
+		return body, false
+	}
+	updated, err := sjson.SetBytes(body, "system.0.text", updatedText)
+	if err != nil {
+		return body, false
+	}
+	return updated, true
+}
+
 func resolveClaudeKeyConfig(cfg *config.Config, auth *cliproxyauth.Auth) *config.ClaudeKey {
 	if cfg == nil || auth == nil {
 		return nil

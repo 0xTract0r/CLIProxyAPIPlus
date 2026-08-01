@@ -643,6 +643,29 @@ type ClaudeConfig struct {
 	// restore the previous "mirror inbound entrypoint verbatim" behavior, e.g. for
 	// rollback.
 	NormalizeSdkCliEntrypoint *bool `yaml:"normalize-sdk-cli-entrypoint,omitempty" json:"normalize-sdk-cli-entrypoint,omitempty"`
+
+	// AlignRealPathBillingVersion controls whether the REAL serving path (genuine
+	// claude-cli traffic, helps.ShouldCloak == false) rewrites the body
+	// x-anthropic-billing-header cc_version=<version>.<build> token's <version>
+	// segment to the account high-water billing version V — the same V the outbound
+	// User-Agent is floored up to (resolveClaudeBillingVersion). On the real path
+	// applyCloaking early-returns before the cloaked-path cc_version floor
+	// (checkSystemInstructionsWithSigningMode), so a below-high-water client would
+	// otherwise emit an outbound UA floored to V while its body cc_version stays at
+	// the lower client version — a "one account, two versions" mismatch real
+	// claude-code never produces. Aligning the body version closes that gap; the
+	// billing-header cch is re-signed so it still covers the rewritten body.
+	//
+	// Only the <version> segment is rewritten; the <build> fingerprint segment is
+	// always passed through byte-for-byte (never recomputed — the build fingerprint
+	// algorithm is not yet real-machine validated, so forging a build no real
+	// client emits would itself be a detection signal).
+	//
+	// Defaults to DISABLED (nil == false). This real-path body mutation stays INERT
+	// until an operator explicitly opts in after real-machine (`claude -p` MITM)
+	// validation, so a stock config leaves the real serving path byte-for-byte
+	// unchanged.
+	AlignRealPathBillingVersion *bool `yaml:"align-real-path-billing-version,omitempty" json:"align-real-path-billing-version,omitempty"`
 }
 
 // ManagedHeaderProfileConfig controls whether core can consult public online

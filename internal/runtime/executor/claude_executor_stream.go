@@ -62,8 +62,12 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	}
 
 	// Apply cloaking (system prompt injection, fake user ID, sensitive word obfuscation)
-	// based on client type and configuration.
-	body = applyCloaking(ctx, e.cfg, auth, body, baseModel, apiKey, resolveClaudeBillingVersion(ctx, e.cfg, auth, apiKey))
+	// based on client type and configuration. billingVersion (the account
+	// high-water version V, floored up in the device profile) is resolved once and
+	// reused below for the real-path body cc_version alignment so both the outbound
+	// UA and the body draw the same V (no re-resolve).
+	billingVersion := resolveClaudeBillingVersion(ctx, e.cfg, auth, apiKey)
+	body = applyCloaking(ctx, e.cfg, auth, body, baseModel, apiKey, billingVersion)
 	body = ensureModelMaxTokens(body, baseModel)
 
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
@@ -109,10 +113,22 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	// signing so the recomputed cch covers the folded body; gated by the same
 	// switch (default on).
 	bodyForUpstream, entrypointFolded := normalizeClaudeBillingEntrypoint(e.cfg, bodyForUpstream)
+	// REAL serving path (ShouldCloak=false, genuine claude-cli) body cc_version
+	// floor: align the body billing-header cc_version <version> segment to the same
+	// account high-water V the outbound User-Agent is floored to, so a below-
+	// high-water client cannot emit UA=V + body cc_version=<lower> (a
+	// one-account-two-versions tell). The <build> segment is passed through
+	// verbatim. Runs on the final upstream body (after sanitize / entrypoint fold),
+	// mirroring normalizeClaudeBillingEntrypoint, so the single re-sign below covers
+	// the rewritten body exactly once. No-op on the cloaked path (cc_version is
+	// already V there) and when the switch is off (default) — real path then stays
+	// byte-identical to today.
+	bodyForUpstream, billingVersionAligned := alignRealPathBillingVersion(e.cfg, bodyForUpstream, billingVersion)
 	// Enable cch signing by default for OAuth tokens (not just experimental flag).
-	// Also re-sign when the entrypoint was folded so the cch stays consistent with
-	// the rewritten body even on non-OAuth paths.
-	if oauthToken || experimentalCCHSigningEnabled(e.cfg, auth) || entrypointFolded {
+	// Also re-sign when the entrypoint was folded or the real-path billing version
+	// was aligned so the cch stays consistent with the rewritten body even on
+	// non-OAuth paths. Exactly one re-sign covers all body mutations.
+	if oauthToken || experimentalCCHSigningEnabled(e.cfg, auth) || entrypointFolded || billingVersionAligned {
 		bodyForUpstream = signAnthropicMessagesBody(bodyForUpstream)
 	}
 	reporter.SetTranslatedReasoningEffort(bodyForUpstream, to.String())
