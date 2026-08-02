@@ -117,8 +117,9 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	// floor: align the body billing-header cc_version <version> segment to the same
 	// account high-water V the outbound User-Agent is floored to, so a below-
 	// high-water client cannot emit UA=V + body cc_version=<lower> (a
-	// one-account-two-versions tell). The <build> segment is passed through
-	// verbatim. Runs on the final upstream body (after sanitize / entrypoint fold),
+	// one-account-two-versions tell). The <build> segment is RECOMPUTED for V via
+	// the genuine claude-cli build-hash (first user message + V, real-machine
+	// validated). Runs on the final upstream body (after sanitize / entrypoint fold),
 	// mirroring normalizeClaudeBillingEntrypoint, so the single re-sign below covers
 	// the rewritten body exactly once. No-op on the cloaked path (cc_version is
 	// already V there) and when the switch is off (default) — real path then stays

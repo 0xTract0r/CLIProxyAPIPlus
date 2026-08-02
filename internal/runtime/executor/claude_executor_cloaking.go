@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"unicode/utf16"
+	"unicode/utf8"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
@@ -110,22 +112,90 @@ const fingerprintSalt = "59cf53e54c78"
 // fork can rewrite the version segment when a stabilized device profile changes it.
 var claudeBillingHeaderVersionPattern = regexp.MustCompile(`\bcc_version=([0-9]+\.[0-9]+\.[0-9]+)\.[^;]*`)
 
-// computeFingerprint computes the 3-char build fingerprint that Claude Code embeds in cc_version.
-// Algorithm: SHA256(salt + messageText[4] + messageText[7] + messageText[20] + version)[:3]
+// jsUTF16CodeUnitAt returns the i-th UTF-16 code unit of a string encoded the
+// exact way JavaScript's String.prototype[i] followed by hashing feeds it to a
+// hash. Genuine Claude Code computes the build fingerprint in JS, where str[i]
+// indexes UTF-16 code units (not Unicode code points / Go []rune) and each
+// selected unit is UTF-8 encoded when hashed:
+//
+//   - A BMP code unit encodes to its normal UTF-8 bytes. A non-BMP character is
+//     stored as a surrogate PAIR, so indexing one half yields a lone surrogate,
+//     which is not a valid Unicode scalar: Node's crypto (Buffer utf8 encoder)
+//     substitutes U+FFFD before hashing, matching JS str[i] semantics here.
+//   - An out-of-range index substitutes the literal '0' (empirically confirmed
+//     against genuine 2.1.220 captures), so this returns "0".
+func jsUTF16CodeUnitAt(units []uint16, i int) string {
+	if i < 0 || i >= len(units) {
+		return "0"
+	}
+	u := units[i]
+	if u >= 0xD800 && u <= 0xDFFF {
+		// Lone surrogate: Node hashes the UTF-8 bytes of U+FFFD (0xEF 0xBF 0xBD).
+		return string(utf8.RuneError)
+	}
+	return string(rune(u))
+}
+
+// computeFingerprint computes the 3-char build fingerprint Claude Code embeds in
+// cc_version: SHA256(salt + msg[4] + msg[7] + msg[20] + version)[:3], where msg
+// is indexed by UTF-16 code units (JS str[i]) and an out-of-range index is the
+// literal '0'. The caller supplies msg as the first non-meta user message text
+// (see firstNonMetaUserMessageText) — the field real Claude Code hashes, NOT any
+// system[] text block. Reproduces genuine claude-cli 2.1.220 builds byte-for-byte
+// (see the golden-vector tests).
 func computeFingerprint(messageText, version string) string {
-	indices := [3]int{4, 7, 20}
-	runes := []rune(messageText)
+	units := utf16.Encode([]rune(messageText))
 	var sb strings.Builder
-	for _, idx := range indices {
-		if idx < len(runes) {
-			sb.WriteRune(runes[idx])
-		} else {
-			sb.WriteRune('0')
-		}
+	for _, idx := range [3]int{4, 7, 20} {
+		sb.WriteString(jsUTF16CodeUnitAt(units, idx))
 	}
 	input := fingerprintSalt + sb.String() + version
 	h := sha256.Sum256([]byte(input))
 	return hex.EncodeToString(h[:])[:3]
+}
+
+// firstNonMetaUserMessageText returns the text of the first non-meta user
+// message in messages[] and whether such a message exists. This is the field
+// genuine Claude Code hashes for the build fingerprint:
+// messages.find(m => m.role === 'user' && !m.isMeta), reading its string content
+// or, for block content, the first text block's text.
+//
+// The outbound Anthropic /v1/messages body has no isMeta field — it is a
+// claude-cli-internal flag filtered out before serialization — so there is no
+// exact analog here; we therefore use the first role=="user" message. The
+// genuine title-generation captures carry exactly one clean user message, so
+// this reproduces the real build byte-for-byte (see the golden-vector tests). On
+// the main conversation path claude-cli folds its meta reminders into the first
+// real user message's content rather than emitting separate leading user
+// messages, so the first user message is expected to be the non-meta one; this
+// assumption is validated on real traffic before the recompute flag is enabled.
+func firstNonMetaUserMessageText(payload []byte) (string, bool) {
+	messages := gjson.GetBytes(payload, "messages")
+	if !messages.IsArray() {
+		return "", false
+	}
+	text := ""
+	found := false
+	messages.ForEach(func(_, msg gjson.Result) bool {
+		if msg.Get("role").String() != "user" {
+			return true
+		}
+		found = true
+		content := msg.Get("content")
+		if content.Type == gjson.String {
+			text = content.String()
+		} else if content.IsArray() {
+			content.ForEach(func(_, block gjson.Result) bool {
+				if block.Get("type").String() == "text" {
+					text = block.Get("text").String()
+					return false
+				}
+				return true
+			})
+		}
+		return false // stop at the first user message
+	})
+	return text, found
 }
 
 // generateBillingHeader creates the x-anthropic-billing-header text block that
@@ -167,6 +237,31 @@ func replaceBillingHeaderVersion(billingHeader string, version string) (string, 
 	}), true
 }
 
+// replaceBillingHeaderVersionAndBuild rewrites BOTH the version and build
+// segments of an already-injected billing header's cc_version=<version>.<build>
+// token to the supplied version and build, preserving every other field. Unlike
+// replaceBillingHeaderVersion (which passes the build through), this is used by
+// the real-path align to set a build RECOMPUTED for the floored version. The
+// bool reports whether an applicable cc_version token was found and rewritten (it
+// re-emits an identical string when version+build already match, so callers must
+// compare strings to detect a real change).
+func replaceBillingHeaderVersionAndBuild(billingHeader, version, build string) (string, bool) {
+	version = strings.TrimSpace(version)
+	if version == "" || build == "" || !strings.HasPrefix(billingHeader, "x-anthropic-billing-header:") {
+		return billingHeader, false
+	}
+	rewritten := false
+	out := claudeBillingHeaderVersionPattern.ReplaceAllStringFunc(billingHeader, func(match string) string {
+		parts := strings.SplitN(strings.TrimPrefix(match, "cc_version="), ".", 4)
+		if len(parts) != 4 {
+			return match
+		}
+		rewritten = true
+		return "cc_version=" + version + "." + build
+	})
+	return out, rewritten
+}
+
 func checkSystemInstructionsWithMode(payload []byte, strictMode bool) []byte {
 	// Fallback billing cc_version floor; mirrors the device-profile UA floor
 	// (defaultClaudeFingerprintUserAgent) so an unresolved version never emits a
@@ -194,21 +289,6 @@ func checkSystemInstructionsWithSigningMode(payload []byte, strictMode bool, exp
 	}
 	system := gjson.GetBytes(payload, "system")
 
-	// Extract original message text for fingerprint computation (before billing injection).
-	// Use the first system text block's content as the fingerprint source.
-	messageText := ""
-	if system.IsArray() {
-		system.ForEach(func(_, part gjson.Result) bool {
-			if part.Get("type").String() == "text" {
-				messageText = part.Get("text").String()
-				return false
-			}
-			return true
-		})
-	} else if system.Type == gjson.String {
-		messageText = system.String()
-	}
-
 	// If already injected, only rewrite the cc_version segment to keep it aligned
 	// with the resolved (possibly stabilized) device-profile version.
 	firstText := gjson.GetBytes(payload, "system.0.text").String()
@@ -221,27 +301,16 @@ func checkSystemInstructionsWithSigningMode(payload []byte, strictMode bool, exp
 		return payload
 	}
 
-	billingText := generateBillingHeader(payload, experimentalCCHSigning, version, messageText, entrypoint, workload)
-	billingBlock := buildTextBlock(billingText, nil)
-
-	// Build system blocks matching real Claude Code structure.
-	// Important: Claude Code's internal cacheScope='org' does NOT serialize to
-	// scope='org' in the API request. Only scope='global' is sent explicitly.
-	// The system prompt prefix block is sent without cache_control.
-	agentBlock := buildTextBlock("You are Claude Code, Anthropic's official CLI for Claude.", nil)
-	staticPrompt := strings.Join([]string{
-		helps.ClaudeCodeIntro,
-		helps.ClaudeCodeSystem,
-		helps.ClaudeCodeDoingTasks,
-		helps.ClaudeCodeToneAndStyle,
-		helps.ClaudeCodeOutputEfficiency,
-	}, "\n\n")
-	staticBlock := buildTextBlock(staticPrompt, nil)
-
-	systemResult := "[" + billingBlock + "," + agentBlock + "," + staticBlock + "]"
-	payload, _ = sjson.SetRawBytes(payload, "system", []byte(systemResult))
-
-	// Collect user system instructions and prepend to first user message
+	// Prepend the caller's system instructions to the first user message BEFORE
+	// computing the billing fingerprint below. Genuine Claude Code hashes its own
+	// FINAL outgoing first user message; on this cloaked path that final state is
+	// the post-prepend message (prependToFirstUserMessage wraps the forwarded
+	// system text into a <system-reminder> block at the head of the first user
+	// message), so the fingerprint must be computed after this mutation to match
+	// genuine semantics. prependToFirstUserMessage only reads/writes messages[],
+	// never system[], so doing it before the system-array rebuild below leaves the
+	// final system[] and messages[] bytes identical to the previous ordering —
+	// only the fingerprint source changes.
 	if !strictMode {
 		var userSystemParts []string
 		if system.IsArray() {
@@ -268,6 +337,33 @@ func checkSystemInstructionsWithSigningMode(payload []byte, strictMode bool, exp
 			}
 		}
 	}
+
+	// Compute the billing fingerprint over the first non-meta user message text as
+	// it now appears in the final outgoing body (post-prepend). This is the field
+	// real Claude Code hashes — NOT any system[] text block (the previous, buggy
+	// source, which for a real claude-cli client would even be the client's own
+	// injected billing header).
+	messageText, _ := firstNonMetaUserMessageText(payload)
+
+	billingText := generateBillingHeader(payload, experimentalCCHSigning, version, messageText, entrypoint, workload)
+	billingBlock := buildTextBlock(billingText, nil)
+
+	// Build system blocks matching real Claude Code structure.
+	// Important: Claude Code's internal cacheScope='org' does NOT serialize to
+	// scope='org' in the API request. Only scope='global' is sent explicitly.
+	// The system prompt prefix block is sent without cache_control.
+	agentBlock := buildTextBlock("You are Claude Code, Anthropic's official CLI for Claude.", nil)
+	staticPrompt := strings.Join([]string{
+		helps.ClaudeCodeIntro,
+		helps.ClaudeCodeSystem,
+		helps.ClaudeCodeDoingTasks,
+		helps.ClaudeCodeToneAndStyle,
+		helps.ClaudeCodeOutputEfficiency,
+	}, "\n\n")
+	staticBlock := buildTextBlock(staticPrompt, nil)
+
+	systemResult := "[" + billingBlock + "," + agentBlock + "," + staticBlock + "]"
+	payload, _ = sjson.SetRawBytes(payload, "system", []byte(systemResult))
 
 	return payload
 }

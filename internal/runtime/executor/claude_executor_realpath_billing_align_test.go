@@ -19,14 +19,20 @@ import (
 	"github.com/tidwall/sjson"
 )
 
-// This file pins Stage B / Phase C.B1+B4: on the REAL serving path (genuine
-// interactive claude-cli, helps.ShouldCloak == false) the outbound body's
-// x-anthropic-billing-header cc_version <version> segment is floored up to the
-// same account high-water version V the outbound User-Agent already uses, so a
-// below-high-water client cannot emit UA=V + body cc_version=<lower> (a
-// one-account-two-versions tell). The <build> fingerprint segment is passed
-// through byte-for-byte, the billing-header cch is re-signed exactly once so it
-// still covers the rewritten body, and the whole rewrite stays INERT by default
+// This file pins Stage B / Phase C.B1+B4 as REVISED by Stage C real-machine
+// validation: on the REAL serving path (genuine interactive claude-cli,
+// helps.ShouldCloak == false) the outbound body's x-anthropic-billing-header
+// cc_version <version> segment is floored up to the same account high-water
+// version V the outbound User-Agent already uses, so a below-high-water client
+// cannot emit UA=V + body cc_version=<lower> (a one-account-two-versions tell).
+//
+// The <build> fingerprint segment is now RECOMPUTED for V (was: passed through
+// byte-for-byte). Stage C account-free capture of genuine claude-cli 2.1.220
+// proved the build is a deterministic function of (first non-meta user message,
+// version) — computeFingerprint — so a client floored from v to V must emit the
+// build V produces over the same first user message, not the build it computed
+// for v. The billing-header cch is re-signed exactly once so it still covers the
+// rewritten body, and the whole rewrite stays INERT by default
 // (config.AlignRealPathBillingVersion nil/false) so the real path is
 // byte-for-byte unchanged until an operator opts in after real-machine
 // validation.
@@ -34,7 +40,7 @@ import (
 const (
 	realPathClientVersion = "2.1.158" // below the frozen floor 2.1.211
 	realPathHighWater     = "2.1.211" // defaultClaudeFingerprintUserAgent floor / V
-	realPathBuildSeg      = "a1b"     // arbitrary 3-char build; must be preserved verbatim
+	realPathBuildSeg      = "a1b"     // arbitrary 3-char INPUT build; now recomputed for V, not preserved
 )
 
 // ccVersionBuildPattern captures the <build> segment of cc_version=<v>.<build>;.
@@ -126,15 +132,22 @@ func ccBuildSegment(t *testing.T, body []byte) string {
 	return m[1]
 }
 
-// (a) + build passthrough + untouched fields: flag ON, a below-high-water body
-// cc_version 2.1.158.<build> becomes 2.1.211.<build> — only the <version>
-// segment changes; <build>, cc_entrypoint, cch, system[1], messages and tools
-// are byte-identical.
-func TestAlignRealPathBillingVersion_FloorsVersionKeepsBuildAndOtherFields(t *testing.T) {
+// (a) build RECOMPUTE + untouched fields: flag ON, a below-high-water body
+// cc_version 2.1.158.<oldBuild> becomes 2.1.211.<recomputedBuild>. BOTH the
+// <version> and <build> segments change: the build is recomputed for V over the
+// first user message (computeFingerprint), NOT passed through. cc_entrypoint,
+// cch, system[1], messages and tools stay byte-identical.
+//
+// WHY this replaces the old build-passthrough expectation: Stage C account-free
+// capture of genuine claude-cli 2.1.220 proved the build is
+// computeFingerprint(firstUserMsg, version). A client floored from v→V must emit
+// the build V produces over the same first user message; passing through the old
+// v-build would leave a v-build under a V-version, itself a mismatch. This is an
+// intentional behavior change, not test-weakening.
+func TestAlignRealPathBillingVersion_FloorsVersionRecomputesBuildKeepsOtherFields(t *testing.T) {
 	enabled := true
 	cfg := &config.Config{Claude: config.ClaudeConfig{AlignRealPathBillingVersion: &enabled}}
 	in := billingBodyWithVersion(t, realPathClientVersion, realPathBuildSeg, "11111")
-	inHeader := gjson.GetBytes(in, "system.0.text").String()
 
 	out, changed := alignRealPathBillingVersion(cfg, bytes.Clone(in), realPathHighWater)
 	if !changed {
@@ -144,16 +157,27 @@ func TestAlignRealPathBillingVersion_FloorsVersionKeepsBuildAndOtherFields(t *te
 	if got := ccVersionSegment(t, out); got != realPathHighWater {
 		t.Fatalf("cc_version version segment = %q, want %q", got, realPathHighWater)
 	}
-	if got := ccBuildSegment(t, out); got != realPathBuildSeg {
-		t.Fatalf("cc_version build segment = %q, want %q (build must be passed through verbatim)", got, realPathBuildSeg)
+	// The first user message billingBodyWithVersion writes is "please read the
+	// file"; the build must be recomputed for V over it (not the input "a1b").
+	firstUserMsg, ok := firstNonMetaUserMessageText(out)
+	if !ok {
+		t.Fatal("captured body has no first user message")
+	}
+	wantBuild := computeFingerprint(firstUserMsg, realPathHighWater)
+	if wantBuild == realPathBuildSeg {
+		t.Fatalf("test setup: recomputed build %q coincidentally equals the input build; pick a different fixture", wantBuild)
+	}
+	if got := ccBuildSegment(t, out); got != wantBuild {
+		t.Fatalf("cc_version build segment = %q, want recomputed %q (build must be RECOMPUTED for V, not passed through)", got, wantBuild)
 	}
 
-	// Only the version segment changed: rewriting V back to the client version
-	// must reproduce the original header byte-for-byte (build, cc_entrypoint and
-	// cch all preserved).
+	// Only the cc_version token changed; every other billing field is preserved.
 	outHeader := gjson.GetBytes(out, "system.0.text").String()
-	if restored := strings.Replace(outHeader, realPathHighWater, realPathClientVersion, 1); restored != inHeader {
-		t.Fatalf("only the version segment may change.\n got: %q\nwant restore to: %q", outHeader, inHeader)
+	if !strings.Contains(outHeader, "cc_entrypoint=cli;") {
+		t.Fatalf("cc_entrypoint not preserved: %q", outHeader)
+	}
+	if !strings.Contains(outHeader, "cch=11111;") {
+		t.Fatalf("cch must be preserved by align (re-sign is a separate step): %q", outHeader)
 	}
 
 	// Everything outside system[0] is untouched.
@@ -224,19 +248,30 @@ func TestAlignRealPathBillingVersion_DisabledIsByteIdentical(t *testing.T) {
 	}
 }
 
-// (d) idempotent at the high-water: a client already at V yields changed=false
-// and a byte-identical body (no redundant re-sign is forced on its behalf).
-func TestAlignRealPathBillingVersion_IdempotentAtHighWater(t *testing.T) {
+// (d) idempotent for a genuine client already at V: when the body is already at
+// V AND its build already equals the recompute over the first user message (i.e.
+// a genuine client that computed the build the same way), align yields
+// changed=false and a byte-identical body (no redundant re-sign is forced).
+//
+// WHY the fixture build changed from an arbitrary "a1b" to the recomputed value:
+// with build RECOMPUTE, "already at V" alone is no longer a no-op — a client
+// claiming V with a non-genuine build gets its build corrected. True idempotency
+// now requires the build to already match computeFingerprint(firstUserMsg, V),
+// which is exactly what a genuine client at V emits.
+func TestAlignRealPathBillingVersion_IdempotentAtHighWaterForGenuineBuild(t *testing.T) {
 	enabled := true
 	cfg := &config.Config{Claude: config.ClaudeConfig{AlignRealPathBillingVersion: &enabled}}
-	in := billingBodyWithVersion(t, realPathHighWater, realPathBuildSeg, "abcde")
+	// billingBodyWithVersion writes first user message "please read the file"; use
+	// the build a genuine client at V would compute over it.
+	genuineBuild := computeFingerprint("please read the file", realPathHighWater)
+	in := billingBodyWithVersion(t, realPathHighWater, genuineBuild, "abcde")
 
 	out, changed := alignRealPathBillingVersion(cfg, bytes.Clone(in), realPathHighWater)
 	if changed {
-		t.Fatal("expected changed=false when already at the high-water version")
+		t.Fatal("expected changed=false when already at V with a build that reproduces")
 	}
 	if !bytes.Equal(out, in) {
-		t.Fatalf("already-at-V body must be byte-identical.\n got: %s\nwant: %s", out, in)
+		t.Fatalf("already-at-V genuine body must be byte-identical.\n got: %s\nwant: %s", out, in)
 	}
 }
 
@@ -329,8 +364,14 @@ func TestClaudeExecutorExecute_RealPathFloorsBodyBillingVersionWhenEnabled(t *te
 	if got := ccVersionSegment(t, seen); got != realPathHighWater {
 		t.Fatalf("upstream cc_version = %q, want floored %q", got, realPathHighWater)
 	}
-	if got := ccBuildSegment(t, seen); got != realPathBuildSeg {
-		t.Fatalf("upstream cc_version build = %q, want preserved %q", got, realPathBuildSeg)
+	// Build is RECOMPUTED for V over the first user message as it appears in the
+	// final captured body (robust to any message transformation on the path).
+	firstUserMsg, ok := firstNonMetaUserMessageText(seen)
+	if !ok {
+		t.Fatal("captured upstream body has no first user message")
+	}
+	if got, want := ccBuildSegment(t, seen), computeFingerprint(firstUserMsg, realPathHighWater); got != want {
+		t.Fatalf("upstream cc_version build = %q, want recomputed %q", got, want)
 	}
 	// cch covers the rewritten upstream body under the real xxHash64 algorithm.
 	if emitted, want := cchFromBody(t, seen), recomputeExpectedCCH(t, seen); emitted != want {
@@ -406,8 +447,13 @@ func TestClaudeExecutorExecuteStream_RealPathFloorsBodyBillingVersionWhenEnabled
 	if got := ccVersionSegment(t, seen); got != realPathHighWater {
 		t.Fatalf("stream upstream cc_version = %q, want floored %q", got, realPathHighWater)
 	}
-	if got := ccBuildSegment(t, seen); got != realPathBuildSeg {
-		t.Fatalf("stream upstream build = %q, want preserved %q", got, realPathBuildSeg)
+	// Build is RECOMPUTED for V over the first user message in the final body.
+	firstUserMsg, ok := firstNonMetaUserMessageText(seen)
+	if !ok {
+		t.Fatal("captured stream upstream body has no first user message")
+	}
+	if got, want := ccBuildSegment(t, seen), computeFingerprint(firstUserMsg, realPathHighWater); got != want {
+		t.Fatalf("stream upstream build = %q, want recomputed %q", got, want)
 	}
 	if emitted, want := cchFromBody(t, seen), recomputeExpectedCCH(t, seen); emitted != want {
 		t.Fatalf("stream upstream cch %q != recompute over rewritten body %q", emitted, want)
