@@ -154,21 +154,39 @@ func computeFingerprint(messageText, version string) string {
 	return hex.EncodeToString(h[:])[:3]
 }
 
-// firstNonMetaUserMessageText returns the text of the first non-meta user
-// message in messages[] and whether such a message exists. This is the field
-// genuine Claude Code hashes for the build fingerprint:
+// isSystemReminderText reports whether a wire text block is a claude-cli
+// <system-reminder> meta block. These originate from the client's internal
+// isMeta messages: the cli's role-grouper MERGES a leading isMeta user message
+// into the following genuine user message's content as a PREPENDED text block
+// (block[0]) and strips the isMeta flag on the wire. There is therefore no
+// isMeta field to read here — the tag prefix is the only wire signal — so the
+// build-fingerprint source must skip any leading <system-reminder> block(s) to
+// reach the genuine user text the cli actually hashes. Leading whitespace is
+// trimmed before the prefix check; the closing ">" is intentionally omitted so
+// tag variants (attributes) still match.
+func isSystemReminderText(text string) bool {
+	return strings.HasPrefix(strings.TrimLeft(text, " \t\r\n"), "<system-reminder")
+}
+
+// firstNonMetaUserMessageText returns the text genuine Claude Code hashes for the
+// build fingerprint, and whether any user message exists. Genuine semantics:
 // messages.find(m => m.role === 'user' && !m.isMeta), reading its string content
-// or, for block content, the first text block's text.
+// or, for block content, its first text block's text.
 //
-// The outbound Anthropic /v1/messages body has no isMeta field — it is a
-// claude-cli-internal flag filtered out before serialization — so there is no
-// exact analog here; we therefore use the first role=="user" message. The
-// genuine title-generation captures carry exactly one clean user message, so
-// this reproduces the real build byte-for-byte (see the golden-vector tests). On
-// the main conversation path claude-cli folds its meta reminders into the first
-// real user message's content rather than emitting separate leading user
-// messages, so the first user message is expected to be the non-meta one; this
-// assumption is validated on real traffic before the recompute flag is enabled.
+// The outbound Anthropic /v1/messages body carries no isMeta field — the cli
+// strips it after folding each leading isMeta user message into the next genuine
+// user message's content as a prepended <system-reminder> block[0] (see
+// isSystemReminderText). So on the wire the genuine hashed text is the first user
+// text that is NOT a <system-reminder>: within a message we take the first
+// non-reminder text (string content, or the first non-reminder text block of an
+// array); if a user message yields only reminder text (or no text), we keep
+// scanning subsequent user messages. found reflects whether any role=="user"
+// message existed at all, independent of whether non-reminder text was found, so
+// the empty / no-cc_version edge behavior is preserved. Verified byte-for-byte
+// against genuine 2.1.220 captures: a real multi-turn body whose messages[0] is
+// [<system-reminder> block0, genuine block1] reproduces the captured build over
+// block1, and single-clean-message title-generation captures are unchanged (see
+// the golden-vector tests).
 func firstNonMetaUserMessageText(payload []byte) (string, bool) {
 	messages := gjson.GetBytes(payload, "messages")
 	if !messages.IsArray() {
@@ -178,22 +196,36 @@ func firstNonMetaUserMessageText(payload []byte) (string, bool) {
 	found := false
 	messages.ForEach(func(_, msg gjson.Result) bool {
 		if msg.Get("role").String() != "user" {
-			return true
+			return true // skip non-user messages
 		}
 		found = true
 		content := msg.Get("content")
-		if content.Type == gjson.String {
-			text = content.String()
-		} else if content.IsArray() {
+		switch {
+		case content.Type == gjson.String:
+			if s := content.String(); !isSystemReminderText(s) {
+				text = s
+				return false // genuine string content of this user message
+			}
+			// A <system-reminder>-only string is a folded meta block: keep scanning.
+		case content.IsArray():
+			picked := false
 			content.ForEach(func(_, block gjson.Result) bool {
-				if block.Get("type").String() == "text" {
-					text = block.Get("text").String()
-					return false
+				if block.Get("type").String() != "text" {
+					return true // only text blocks carry the hashed field
 				}
-				return true
+				if bt := block.Get("text").String(); !isSystemReminderText(bt) {
+					text = bt
+					picked = true
+					return false // first non-reminder text block wins
+				}
+				return true // skip a prepended <system-reminder> block, try the next
 			})
+			if picked {
+				return false // found genuine text in this user message
+			}
+			// All text blocks were reminders (or none): keep scanning.
 		}
-		return false // stop at the first user message
+		return true // keep scanning subsequent user messages
 	})
 	return text, found
 }
