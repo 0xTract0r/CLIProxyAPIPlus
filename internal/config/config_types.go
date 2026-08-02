@@ -656,10 +656,14 @@ type ClaudeConfig struct {
 	// claude-code never produces. Aligning the body version closes that gap; the
 	// billing-header cch is re-signed so it still covers the rewritten body.
 	//
-	// Only the <version> segment is rewritten; the <build> fingerprint segment is
-	// always passed through byte-for-byte (never recomputed — the build fingerprint
-	// algorithm is not yet real-machine validated, so forging a build no real
-	// client emits would itself be a detection signal).
+	// Both the <version> and <build> segments are rewritten: the <build> is
+	// recomputed for V by the real-machine-validated fingerprint algorithm (salt +
+	// first non-<system-reminder> user text block indexed by UTF-16 code units,
+	// sha256[:3]; golden vectors 204/784/842/d49 reproduce genuine 2.1.220 captures
+	// byte-for-byte). Recomputing keeps <version> and <build> mutually consistent —
+	// passing the old build through while bumping the version would itself be an
+	// internal-inconsistency tell — and the algorithm matches genuine claude-cli, so
+	// it forges no build a real client would not emit.
 	//
 	// Defaults to DISABLED (nil == false). This real-path body mutation stays INERT
 	// until an operator explicitly opts in after real-machine (`claude -p` MITM)

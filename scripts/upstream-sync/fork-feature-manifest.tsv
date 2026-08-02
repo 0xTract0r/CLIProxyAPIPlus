@@ -36,6 +36,10 @@
 反关联-设备指纹注入	InjectAccountDeviceID	symbol	^func InjectAccountDeviceID\(	internal/runtime/executor/helps/synthetic_device_id.go
 反关联-Claude设备画像	resolveClaudeDeviceProfileForRequest	symbol	^func resolveClaudeDeviceProfileForRequest\(	internal/runtime/executor/claude_executor_request.go
 反关联-Claude设备画像	applyClaudeManagedHeaders	symbol	^func applyClaudeManagedHeaders\(	internal/runtime/executor/claude_executor_request.go
+反关联-真实路径计费对齐	alignRealPathBillingVersion	symbol	^func alignRealPathBillingVersion\(	internal/runtime/executor/claude_signing.go
+反关联-真实路径计费对齐	computeFingerprint	symbol	^func computeFingerprint\(	internal/runtime/executor/claude_executor_cloaking.go
+反关联-真实路径计费对齐	firstNonMetaUserMessageText	symbol	^func firstNonMetaUserMessageText\(	internal/runtime/executor/claude_executor_cloaking.go
+反关联-真实路径计费对齐	fingerprintSalt	pattern	^const fingerprintSalt = "59cf53e54c78"	internal/runtime/executor/claude_executor_cloaking.go
 反关联-代理留白拦截	blockingRoundTripper	symbol	^type blockingRoundTripper struct	internal/runtime/executor/helps/proxy_helpers.go
 反关联-OAuth刷新传输	NewOAuthRefreshUtlsHTTPClient	symbol	^func NewOAuthRefreshUtlsHTTPClient\(	internal/runtime/executor/helps/utls_client.go
 反关联-管理API出站	apiCallUtlsRoundTripper	symbol	^func \(h \*Handler\) apiCallUtlsRoundTripper\(	internal/api/handlers/management/api_tools.go
