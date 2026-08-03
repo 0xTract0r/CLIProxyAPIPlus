@@ -103,6 +103,84 @@ func normalizeClaudeBillingEntrypoint(cfg *config.Config, body []byte) ([]byte, 
 	return updated, true
 }
 
+// alignRealPathBillingVersion rewrites the body's x-anthropic-billing-header
+// (system[0].text) cc_version=<version>.<build> token so BOTH segments match the
+// account high-water version V: the <version> segment is set to billingVersion
+// (V) and the <build> segment is RECOMPUTED as computeFingerprint(firstUserMsg,
+// V) over the first non-meta user message in the final outgoing body. Every other
+// billing field is preserved byte-for-byte. It returns the (possibly rewritten)
+// body plus whether a rewrite occurred.
+//
+// This is the REAL serving path (helps.ShouldCloak == false, genuine
+// interactive claude-cli) counterpart of the cc_version floor the cloaked path
+// already applies inside checkSystemInstructionsWithSigningMode. On the real
+// path applyCloaking early-returns before that floor, so a below-high-water
+// client would send an outbound User-Agent floored up to V (the header side,
+// done in the device-profile floor) while its body cc_version stays at the
+// lower client version — a "one account, two versions" mismatch. Aligning the
+// body version to the same V the UA uses closes that gap. It is the /v1/messages
+// (+ streaming) sibling of normalizeClaudeBillingEntrypoint (which folds
+// cc_entrypoint); both rewrite the verbatim inbound billing header and require
+// the caller to re-sign afterward.
+//
+// The <build> is RECOMPUTED (not passed through) because Claude Code's build is a
+// deterministic function of (first user message, version): a client floored from
+// v to V must emit the build V would produce over the same first user message,
+// not the build it computed for v. Validated against genuine claude-cli 2.1.220
+// captures (Stage C account-free capture) — the build is sha256(salt + msg[4] +
+// msg[7] + msg[20] + version)[:3] over the first non-meta user message, indexed
+// by UTF-16 code units (see computeFingerprint). Because alignRealPathBillingVersion
+// runs at the final re-sign point (after sanitize / oauth tool rename / entrypoint
+// fold), the body it hashes is the final outgoing state — the same bytes genuine
+// Claude Code hashes. For a genuine client already at V the recompute reproduces
+// its own build, so the rewrite is an idempotent no-op.
+//
+// Callers must re-sign (signAnthropicMessagesBody) after a reported rewrite so
+// the recomputed cch covers the rewritten body. When the switch is off (default),
+// when billingVersion is empty, when system[0].text is not a billing header, when
+// there is no first user message text to hash, when it carries no cc_version
+// token, or when the recomputed cc_version already equals the current header, the
+// body is returned unchanged with changed=false — the real path then stays
+// byte-identical to today (default-safe / idempotent), and no forced re-sign is
+// triggered on its behalf. Malformed / non-JSON bodies are a safe no-op
+// pass-through (never a panic, never a corrupted build).
+func alignRealPathBillingVersion(cfg *config.Config, body []byte, billingVersion string) ([]byte, bool) {
+	if !config.AlignRealPathBillingVersionEnabled(cfg) {
+		return body, false
+	}
+	billingVersion = strings.TrimSpace(billingVersion)
+	if billingVersion == "" {
+		return body, false
+	}
+	firstText := gjson.GetBytes(body, "system.0.text").String()
+	if !strings.HasPrefix(firstText, "x-anthropic-billing-header:") {
+		return body, false
+	}
+	// Recompute the build for V over the first non-meta user message as it appears
+	// in the final outgoing body. If there is no first user message text, fall back
+	// to a no-op rather than emit a build over nothing (never a corrupt build).
+	firstUserMsg, ok := firstNonMetaUserMessageText(body)
+	if !ok || firstUserMsg == "" {
+		return body, false
+	}
+	newBuild := computeFingerprint(firstUserMsg, billingVersion)
+	updatedText, rewritten := replaceBillingHeaderVersionAndBuild(firstText, billingVersion, newBuild)
+	// replaceBillingHeaderVersionAndBuild's bool reports "applicable" (billing
+	// header + non-empty version/build + a cc_version token), not "changed": it
+	// re-emits an identical string for a genuine client already at V whose build
+	// reproduces, or when there is no cc_version token to match. Compare the
+	// strings so an already-correct header (idempotent) or a missing cc_version
+	// returns changed=false and never forces a redundant re-sign.
+	if !rewritten || updatedText == firstText {
+		return body, false
+	}
+	updated, err := sjson.SetBytes(body, "system.0.text", updatedText)
+	if err != nil {
+		return body, false
+	}
+	return updated, true
+}
+
 func resolveClaudeKeyConfig(cfg *config.Config, auth *cliproxyauth.Auth) *config.ClaudeKey {
 	if cfg == nil || auth == nil {
 		return nil

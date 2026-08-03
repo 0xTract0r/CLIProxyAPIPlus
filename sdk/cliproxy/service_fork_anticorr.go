@@ -20,9 +20,47 @@ import (
 
 	kiroauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/kiro"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
 )
+
+// seedClaudeObservedHighWaterFromLoadedAuths aggregates every loaded account's
+// persisted claude_device_high_water triple into the in-memory global observed
+// high-water map at startup, so the claude zero-observation fallback ceiling is
+// warm from the very first request after a (re)start instead of collapsing to the
+// hardcoded floor until a live client happens to be seen.
+//
+// Background: the per-account high-water triple is persisted in each auth's
+// Metadata and survives restarts, but the in-memory observation map that backs the
+// global zero-observation fallback (and the operator stale-guard warning predicate)
+// is empty on a fresh process. Previously it was only re-seeded lazily, per account,
+// on that account's own first request (resolveClaudeDeviceProfileForRequest). Until
+// a given account was hit, a brand-new/quota-polling account resolving in that
+// window inherited only the static hardcoded floor. This startup pass makes the
+// global observed high-water hot immediately after the auth store loads, across
+// restarts, from data already persisted per account.
+//
+// It reuses helps.SeedClaudeObservedHighWaterFromAuth verbatim, so all existing
+// guarantees are preserved unchanged: monotonic (the global high-water always takes
+// the max, so re-seeding never lowers it), sanity-ceiling (the persisted triple was
+// gated before it was ever written) and atomic-triple (UA/version + package +
+// runtime are recorded together from a single real observation). Seeding is only-up
+// and idempotent; non-claude auths and auths without a persisted triple are no-ops.
+func (s *Service) seedClaudeObservedHighWaterFromLoadedAuths() {
+	if s == nil || s.coreManager == nil {
+		return
+	}
+	seeded := 0
+	for _, auth := range s.coreManager.List() {
+		if helps.SeedClaudeObservedHighWaterFromAuth(auth) {
+			seeded++
+		}
+	}
+	if seeded > 0 {
+		log.Infof("claude device profile: seeded global observed high-water from %d persisted account(s) at startup", seeded)
+	}
+}
 
 // authRegistryHook keeps the global model registry and scheduler in sync with
 // core-manager auth lifecycle events. On every add/update it re-runs the

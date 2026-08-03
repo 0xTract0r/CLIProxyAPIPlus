@@ -42,8 +42,10 @@ const (
 	// token exchange/refresh has no inbound client context, so it uses this baseline
 	// default to stay consistent with the serving identity. Kept as a local copy
 	// because that constant is unexported and importing the executor package here
-	// would create an import cycle.
-	claudeOAuthUserAgent = "claude-cli/2.1.63 (external, cli)"
+	// would create an import cycle. This value MUST stay in lockstep with the
+	// device-profile floor; TestClaudeOAuthUserAgentMatchesDeviceProfileFloor guards
+	// the two against drift.
+	claudeOAuthUserAgent = "claude-cli/2.1.211 (external, cli)"
 )
 
 const maxOAuthErrorBodyBytes = 512

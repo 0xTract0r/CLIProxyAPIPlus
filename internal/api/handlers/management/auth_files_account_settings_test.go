@@ -1337,12 +1337,12 @@ func TestGetAuthFileAccountSettings_ReturnsClaudeClientVersionObservations(t *te
 
 	cfg := &config.Config{AuthDir: t.TempDir()}
 	_ = runtimehelps.ResolveClaudeDeviceProfile(record, "", http.Header{
-		"User-Agent":                  []string{"claude-cli/2.1.140 (external, cli)"},
+		"User-Agent":                  []string{"claude-cli/2.1.260 (external, cli)"},
 		"X-Stainless-Package-Version": []string{"0.80.0"},
 		"X-Stainless-Runtime-Version": []string{"v24.5.0"},
 	}, cfg)
 	_ = runtimehelps.ResolveClaudeDeviceProfile(record, "", http.Header{
-		"User-Agent":                  []string{"claude-cli/2.1.142 (external, cli)"},
+		"User-Agent":                  []string{"claude-cli/2.1.262 (external, cli)"},
 		"X-Stainless-Package-Version": []string{"0.81.0"},
 		"X-Stainless-Runtime-Version": []string{"v24.6.0"},
 	}, cfg)
@@ -1370,8 +1370,8 @@ func TestGetAuthFileAccountSettings_ReturnsClaudeClientVersionObservations(t *te
 	for _, observation := range observations {
 		versions[observation.Version] = true
 	}
-	if !versions["2.1.140"] || !versions["2.1.142"] {
-		t.Fatalf("expected observed versions 2.1.140 and 2.1.142, got %#v", observations)
+	if !versions["2.1.260"] || !versions["2.1.262"] {
+		t.Fatalf("expected observed versions 2.1.260 and 2.1.262, got %#v", observations)
 	}
 }
 

@@ -18,9 +18,28 @@ import (
 )
 
 const (
-	defaultClaudeFingerprintUserAgent      = "claude-cli/2.1.63 (external, cli)"
-	defaultClaudeFingerprintPackageVersion = "0.74.0"
-	defaultClaudeFingerprintRuntimeVersion = "v24.3.0"
+	// defaultClaudeFingerprint* is the hardcoded floor (device high-water lower
+	// bound) applied to a zero-observation account when neither an operator baseline
+	// nor any real first-party observation exists. It MUST stay a single internally
+	// consistent, currently-shipping claude-cli release triple (UA version + package
+	// version + runtime version) so a zero-observation account never emits a
+	// fingerprint no real client ever presented. The UA version is the highest
+	// internally-consistent version this deployment's real fleet is DOUBLE-SOURCED to
+	// have actually shipped: production egress logs AND the first-party persistent
+	// device high-water (claude_device_high_water) on two live accounts both land on
+	// claude-cli 2.1.211 / @anthropic-ai/claude-code 0.94.0 / Node v26.3.0 on
+	// MacOS/arm64. A previous change floored this to 2.1.216, but no real account
+	// here ever presented 2.1.216 (every 2.1.212+/999.0.0 seen in logs was a
+	// forged/test-injected UA with no genuine backing); a fabricated floor forces
+	// real 2.1.211/2.1.197 clients up to a version they never sent, so it is reverted
+	// to the double-sourced real 2.1.211. When bumping, only bump to a version this
+	// fleet is actually observed to ship, bump all three together, and keep
+	// internal/auth/claude.claudeOAuthUserAgent in lockstep (guarded by
+	// TestClaudeOAuthUserAgentMatchesDeviceProfileFloor); it duplicates this UA to
+	// avoid an import cycle.
+	defaultClaudeFingerprintUserAgent      = "claude-cli/2.1.211 (external, cli)"
+	defaultClaudeFingerprintPackageVersion = "0.94.0"
+	defaultClaudeFingerprintRuntimeVersion = "v26.3.0"
 	defaultClaudeFingerprintOS             = "MacOS"
 	defaultClaudeFingerprintArch           = "arm64"
 	claudeDeviceProfileTTL                 = 7 * 24 * time.Hour
@@ -358,7 +377,7 @@ func claudePersistedHighWaterProfile(auth *cliproxyauth.Auth) (ClaudeDeviceProfi
 // warning predicate (ClaudeDeviceProfileStaleGuardActive ->
 // globalClaudeObservedHighWaterVersion) instead consults ONLY the in-memory
 // observation map, which is empty right after a restart. That mismatch makes the
-// guard emit a "no real claude-cli observed, falling back to frozen floor 2.1.63"
+// guard emit a "no real claude-cli observed, falling back to frozen floor 2.1.211"
 // warning on the first request even though the real outbound UA is the (correct)
 // persisted version — a misleading false positive that self-heals only after the
 // first live observation lands.
@@ -811,7 +830,7 @@ func claudeFallbackBaseline(auth *cliproxyauth.Auth, apiKey string, cfg *config.
 		ceilingProfile, hasCeiling = globalClaudeObservedHighWaterProfile()
 	}
 
-	// claude 版本高水位持久化：重启/部署后内存观测被清空，会回落到 floor 2.1.63。
+	// claude 版本高水位持久化：重启/部署后内存观测被清空，会回落到 floor 2.1.211。
 	// 这里把上一次 persist 进 auth.Metadata 的高水位三元组作为额外的 ceiling 候选，
 	// 与内存观测取 max。persisted 三元组本身来自上一进程里已过 sanity-ceiling gate 的
 	// 真实观测（写回点在 RaiseClaudeDeviceHighWater 之前已做 sanity 校验），因此不会
@@ -825,7 +844,7 @@ func claudeFallbackBaseline(auth *cliproxyauth.Auth, apiKey string, cfg *config.
 
 	// 只有当存在同一次真实观测的完整三元组、且其版本高于 baseline 时才整体抬升；
 	// 否则三元组整体停在 baseline（baseline 自身是内部自洽的真实发布三元组：
-	// 2.1.63 / 0.74.0 / v24.3.0）。
+	// 2.1.211 / 0.94.0 / v26.3.0）。
 	if hasCeiling && (!baseline.hasVersion || ceilingProfile.version.Compare(baseline.version) > 0) {
 		baseline = withClaudeFloorProfile(baseline, ceilingProfile, observedManagedHeaderProfileSource())
 	}
@@ -878,13 +897,35 @@ func ResolveClaudeDeviceProfile(auth *cliproxyauth.Auth, apiKey string, headers 
 	if hasCandidate && !claudeObservationWithinSanityCeiling(candidate, cfg) {
 		hasCandidate = false
 	}
+	// Diagnostics/high-water recording is DECOUPLED from emission: record every
+	// candidate that cleared the sanity-ceiling gate above, BEFORE the floor-up gate
+	// below can discard it. A real client running below the account high-water is
+	// still a genuine observation worth logging into the per-account diagnostic
+	// history (ClaudeDeviceProfileObservations) and worth feeding the only-up observed
+	// high-water; gating recording on the floor-up decision silently drops those
+	// below-high-water real versions (the diagnostic regression this reverses).
+	// Emission stays floored UP via the gate below, so recording never lowers the
+	// emitted/cached profile. Recording carries NO lower bound beyond the sanity
+	// ceiling, and this is the only record site per resolve (the request path
+	// memoizes one resolve per request), so each request adds exactly one observation.
+	if hasCandidate {
+		claudeDeviceProfileCacheMu.Lock()
+		recordClaudeDeviceProfileObservation(cacheKey, candidate, now)
+		claudeDeviceProfileCacheMu.Unlock()
+	}
+	// High-water floor-up gate: a shared upstream account must egress as ONE machine
+	// at ONE unified version — the account's high-water (baseline = max(hardcoded
+	// floor, real observed/persisted high-water)). A candidate is kept ONLY when it
+	// is a STRICT upgrade over the baseline, which ratchets the high-water up
+	// (only-up). Any candidate that is not a strict upgrade — including a genuine
+	// real client running BELOW the account high-water — is discarded here, so the
+	// function falls back to the baseline and the outbound identity is floored UP to
+	// the high-water. Egressing a below-high-water client at its own lower version
+	// would make one shared account look like "one person, many machine versions" —
+	// the exact anti-correlation tell this unify-to-high-water design prevents, so a
+	// lower version is never passed through.
 	if hasCandidate && !shouldUpgradeClaudeDeviceProfile(candidate, baseline) {
-		staticBaselineVersion, _ := parseClaudeCLIVersion(defaultClaudeFingerprintUserAgent)
-		allowObservedFirstParty := candidate.hasVersion &&
-			candidate.version.Compare(staticBaselineVersion) >= 0
-		if !allowObservedFirstParty {
-			hasCandidate = false
-		}
+		hasCandidate = false
 	}
 
 	claudeDeviceProfileCacheMu.RLock()
@@ -898,7 +939,6 @@ func ResolveClaudeDeviceProfile(auth *cliproxyauth.Auth, apiKey string, headers 
 		}
 
 		claudeDeviceProfileCacheMu.Lock()
-		recordClaudeDeviceProfileObservation(cacheKey, candidate, now)
 		entry, hasCached = claudeDeviceProfileCache[cacheKey]
 		cachedValid = hasCached && entry.expire.After(now) && entry.profile.UserAgent != ""
 		if cachedValid {
@@ -994,7 +1034,7 @@ const (
 
 // claudeUserAgentSuffixPattern captures the first parenthetical block of a
 // claude-cli User-Agent, e.g. the "(external, cli)" in
-// "claude-cli/2.1.63 (external, cli)".
+// "claude-cli/2.1.211 (external, cli)".
 var claudeUserAgentSuffixPattern = regexp.MustCompile(`\([^)]*\)`)
 
 // normalizeClaudeUserAgentSuffixEntrypoint folds a "sdk-cli" ENTRYPOINT field
@@ -1117,14 +1157,16 @@ func NormalizeClaudeUserAgentEntrypoint(cfg *config.Config, ua string) string {
 	return strings.Replace(ua, match, normalized, 1)
 }
 
-// DefaultClaudeVersion returns the version string (e.g. "2.1.63") from the
+// DefaultClaudeVersion returns the version string (e.g. "2.1.211") from the
 // current baseline device profile. It extracts the version from the User-Agent.
 func DefaultClaudeVersion(cfg *config.Config) string {
 	profile := defaultClaudeDeviceProfile(cfg)
 	if version := profile.VersionString(); version != "" {
 		return version
 	}
-	return "2.1.63"
+	// Last-resort literal must mirror the defaultClaudeFingerprintUserAgent floor
+	// version so a parse failure never re-introduces a stale version.
+	return "2.1.211"
 }
 
 func ApplyClaudeLegacyDeviceHeaders(r *http.Request, ginHeaders http.Header, cfg *config.Config) {

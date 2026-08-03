@@ -206,8 +206,8 @@ func extensionPresent(t *testing.T, hs []byte, want int) bool {
 		t.Fatalf("not a client_hello handshake message")
 	}
 	p := 4
-	p += 2      // version
-	p += 32     // random
+	p += 2              // version
+	p += 32             // random
 	p += int(hs[p]) + 1 // session id (len byte + body)
 	csLen := int(uint16(hs[p])<<8 | uint16(hs[p+1]))
 	p += 2 + csLen

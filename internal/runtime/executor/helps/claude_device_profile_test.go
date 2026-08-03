@@ -52,29 +52,29 @@ func TestResolveClaudeDeviceProfile_OnlineRegistryNeverExceedsRealObservation(t 
 		ID:       "claude-zero-observation-auth",
 		Provider: "claude",
 	}, "", nil, cfg)
-	if got := zeroObs.VersionString(); got != "2.1.63" {
-		t.Fatalf("zero-observation version = %q, want static floor 2.1.63 (npm must not be a ceiling)", got)
+	if got := zeroObs.VersionString(); got != "2.1.211" {
+		t.Fatalf("zero-observation version = %q, want static floor 2.1.211 (npm must not be a ceiling)", got)
 	}
-	if got := zeroObs.UserAgent; !strings.Contains(got, "claude-cli/2.1.63") {
+	if got := zeroObs.UserAgent; !strings.Contains(got, "claude-cli/2.1.211") {
 		t.Fatalf("zero-observation UserAgent = %q, want static floor, not npm latest", got)
 	}
 
-	// Now observe a real first-party client below npm latest on a different
-	// account; npm must be capped to that real observed high-water (2.1.100),
-	// never lifted to npm latest 2.9.9.
+	// Now observe a real first-party client above the floor but below npm latest on
+	// a different account; npm must be capped to that real observed high-water
+	// (2.1.220), never lifted to npm latest 2.9.9.
 	_ = ResolveClaudeDeviceProfile(&cliproxyauth.Auth{ProxyURL: "direct",
 		ID:       "claude-real-client-auth",
 		Provider: "claude",
 	}, "", map[string][]string{
-		"User-Agent": {"claude-cli/2.1.100 (external, cli)"},
+		"User-Agent": {"claude-cli/2.1.220 (external, cli)"},
 	}, cfg)
 
 	cappedFallback := ResolveClaudeDeviceProfile(&cliproxyauth.Auth{ProxyURL: "direct",
 		ID:       "claude-zero-observation-auth",
 		Provider: "claude",
 	}, "", nil, cfg)
-	if got := cappedFallback.VersionString(); got != "2.1.100" {
-		t.Fatalf("fallback version = %q, want global observed high-water 2.1.100 (npm capped to real)", got)
+	if got := cappedFallback.VersionString(); got != "2.1.220" {
+		t.Fatalf("fallback version = %q, want global observed high-water 2.1.220 (npm capped to real)", got)
 	}
 	// Platform/software fingerprint stays pinned to the static baseline.
 	if got := cappedFallback.OS; got != defaultClaudeFingerprintOS {
@@ -95,7 +95,7 @@ func TestResolveClaudeDeviceProfile_PrefersObservedClaudeCLIOverNewerOnlineFallb
 			return managedHeaderOnlineVersion{}, false
 		}
 		return managedHeaderOnlineVersion{
-			Version: "2.1.144",
+			Version: "2.1.264",
 			ManagedHeaderProfileSource: ManagedHeaderProfileSource{
 				Source:       managedHeaderProfileSourceNPM,
 				SourceURL:    claudeCodeNPMURL,
@@ -110,11 +110,13 @@ func TestResolveClaudeDeviceProfile_PrefersObservedClaudeCLIOverNewerOnlineFallb
 		resetManagedHeaderOnlineProfileCacheForTests()
 	})
 
+	// Observed real client (2.1.262) is above the floor but below npm latest
+	// (2.1.264); the observed version must be preferred over the newer online value.
 	profile := ResolveClaudeDeviceProfile(&cliproxyauth.Auth{ProxyURL: "direct",
 		ID:       "claude-observed-auth",
 		Provider: "claude",
 	}, "", map[string][]string{
-		"User-Agent":                  {"claude-cli/2.1.142 (external, cli)"},
+		"User-Agent":                  {"claude-cli/2.1.262 (external, cli)"},
 		"X-Stainless-Package-Version": {"0.80.0"},
 		"X-Stainless-Runtime-Version": {"v24.5.0"},
 		"X-Stainless-Os":              {"Linux"},
@@ -125,7 +127,7 @@ func TestResolveClaudeDeviceProfile_PrefersObservedClaudeCLIOverNewerOnlineFallb
 		},
 	})
 
-	if got := profile.UserAgent; got != "claude-cli/2.1.142 (external, cli)" {
+	if got := profile.UserAgent; got != "claude-cli/2.1.262 (external, cli)" {
 		t.Fatalf("UserAgent = %q, want observed local Claude CLI version", got)
 	}
 	if got := profile.PackageVersion; got != "0.80.0" {
@@ -142,7 +144,7 @@ func TestResolveClaudeDeviceProfile_PrefersObservedClaudeCLIOverNewerOnlineFallb
 	}
 }
 
-func TestResolveClaudeDeviceProfile_AllowsObservedCLIWhenConfiguredFallbackIsNewer(t *testing.T) {
+func TestResolveClaudeDeviceProfile_FloorsUpObservedCLIBelowConfiguredFallback(t *testing.T) {
 	ResetClaudeDeviceProfileCache()
 	t.Cleanup(ResetClaudeDeviceProfileCache)
 
@@ -150,32 +152,59 @@ func TestResolveClaudeDeviceProfile_AllowsObservedCLIWhenConfiguredFallbackIsNew
 		FileName: "claude-configured-fallback.json",
 		Provider: "claude",
 	}
+	// The configured fallback baseline (2.1.264) is NEWER than the inbound real
+	// client (2.1.260). Unify-to-high-water requires the request to floor UP to the
+	// baseline triple and egress at the baseline version — never at the client's own
+	// lower version, which would expose one shared account as "one person, many
+	// machine versions".
 	cfg := &config.Config{
 		ClaudeHeaderDefaults: config.ClaudeHeaderDefaults{
-			UserAgent:      "claude-cli/2.1.144 (external, cli)",
+			UserAgent:      "claude-cli/2.1.264 (external, cli)",
 			PackageVersion: "0.96.0",
 			RuntimeVersion: "v24.5.0",
 		},
 	}
 
 	profile := ResolveClaudeDeviceProfile(auth, "runtime-api-key", map[string][]string{
-		"User-Agent":                  {"claude-cli/2.1.140 (external, cli)"},
+		"User-Agent":                  {"claude-cli/2.1.260 (external, cli)"},
 		"X-Stainless-Package-Version": {"0.92.0"},
 		"X-Stainless-Runtime-Version": {"v24.3.0"},
 	}, cfg)
 
-	if got := profile.UserAgent; got != "claude-cli/2.1.140 (external, cli)" {
-		t.Fatalf("UserAgent = %q, want observed local Claude CLI version", got)
+	if got := profile.UserAgent; got != "claude-cli/2.1.264 (external, cli)" {
+		t.Fatalf("UserAgent = %q, want floor-up to configured baseline claude-cli/2.1.264 (external, cli)", got)
 	}
+	if got := profile.VersionString(); got != "2.1.264" {
+		t.Fatalf("version = %q, want floor-up baseline 2.1.264 (not lower observed 2.1.260)", got)
+	}
+	// The whole software triple floors up atomically to the configured baseline.
+	if got := profile.PackageVersion; got != "0.96.0" {
+		t.Fatalf("package version = %q, want configured baseline 0.96.0", got)
+	}
+	if got := profile.RuntimeVersion; got != "v24.5.0" {
+		t.Fatalf("runtime version = %q, want configured baseline v24.5.0", got)
+	}
+	// Emission floors UP to the configured baseline, but recording is decoupled from
+	// the floor-up gate: the real below-baseline client (2.1.260) is still recorded
+	// into the per-account diagnostic history — it just never becomes the emitted or
+	// cached profile. The prior coupled gate dropped this observation; decoupling
+	// restores it.
 	observations := ClaudeDeviceProfileObservations(auth, "")
 	if len(observations) != 1 {
-		t.Fatalf("observations length = %d, want 1: %#v", len(observations), observations)
+		t.Fatalf("observations length = %d, want 1 (below-baseline client still recorded for diagnostics): %#v", len(observations), observations)
 	}
-	if got := observations[0].Version; got != "2.1.140" {
-		t.Fatalf("observation version = %q, want 2.1.140", got)
+	if got := observations[0].Version; got != "2.1.260" {
+		t.Fatalf("observation version = %q, want 2.1.260 (real inbound client recorded)", got)
 	}
 }
 
+// TestClaudeDeviceProfileObservations_TracksRecentClientVersionsPerAuth verifies the
+// per-account observation set records each distinct real client version with
+// first/last-seen timestamps and per-version request counts. Recording is decoupled
+// from the floor-up emission gate: every sanity-passing real client is recorded, so a
+// repeat of a below-high-water version (the third request below) IS re-counted — its
+// request_count reaches 2 even though that version is never emitted (emission stays
+// floored up to the high-water).
 func TestClaudeDeviceProfileObservations_TracksRecentClientVersionsPerAuth(t *testing.T) {
 	ResetClaudeDeviceProfileCache()
 	t.Cleanup(ResetClaudeDeviceProfileCache)
@@ -184,17 +213,17 @@ func TestClaudeDeviceProfileObservations_TracksRecentClientVersionsPerAuth(t *te
 	auth := &cliproxyauth.Auth{ProxyURL: "direct", ID: "claude-observation-auth", Provider: "claude"}
 
 	_ = ResolveClaudeDeviceProfile(auth, "", map[string][]string{
-		"User-Agent":                  {"claude-cli/2.1.140 (external, cli)"},
+		"User-Agent":                  {"claude-cli/2.1.260 (external, cli)"},
 		"X-Stainless-Package-Version": {"0.80.0"},
 		"X-Stainless-Runtime-Version": {"v24.5.0"},
 	}, cfg)
 	_ = ResolveClaudeDeviceProfile(auth, "", map[string][]string{
-		"User-Agent":                  {"claude-cli/2.1.142 (external, cli)"},
+		"User-Agent":                  {"claude-cli/2.1.262 (external, cli)"},
 		"X-Stainless-Package-Version": {"0.81.0"},
 		"X-Stainless-Runtime-Version": {"v24.6.0"},
 	}, cfg)
 	_ = ResolveClaudeDeviceProfile(auth, "", map[string][]string{
-		"User-Agent":                  {"claude-cli/2.1.140 (external, cli)"},
+		"User-Agent":                  {"claude-cli/2.1.260 (external, cli)"},
 		"X-Stainless-Package-Version": {"0.80.0"},
 		"X-Stainless-Runtime-Version": {"v24.5.0"},
 	}, cfg)
@@ -207,14 +236,17 @@ func TestClaudeDeviceProfileObservations_TracksRecentClientVersionsPerAuth(t *te
 	for _, observation := range observations {
 		byVersion[observation.Version] = observation
 	}
-	if got := byVersion["2.1.140"].RequestCount; got != 2 {
-		t.Fatalf("2.1.140 request_count = %d, want 2: %#v", got, byVersion["2.1.140"])
+	// The third request repeats 2.1.260, below the 2.1.262 high-water. It is never
+	// emitted (emission floors up), but recording is decoupled from the floor-up gate,
+	// so the repeat is still counted: request_count reaches 2.
+	if got := byVersion["2.1.260"].RequestCount; got != 2 {
+		t.Fatalf("2.1.260 request_count = %d, want 2 (below-high-water repeat still recorded under decoupled diagnostics): %#v", got, byVersion["2.1.260"])
 	}
-	if got := byVersion["2.1.142"].RequestCount; got != 1 {
-		t.Fatalf("2.1.142 request_count = %d, want 1: %#v", got, byVersion["2.1.142"])
+	if got := byVersion["2.1.262"].RequestCount; got != 1 {
+		t.Fatalf("2.1.262 request_count = %d, want 1: %#v", got, byVersion["2.1.262"])
 	}
-	if byVersion["2.1.140"].LastSeenAt == "" || byVersion["2.1.140"].FirstSeenAt == "" {
-		t.Fatalf("expected first/last seen timestamps: %#v", byVersion["2.1.140"])
+	if byVersion["2.1.260"].LastSeenAt == "" || byVersion["2.1.260"].FirstSeenAt == "" {
+		t.Fatalf("expected first/last seen timestamps: %#v", byVersion["2.1.260"])
 	}
 }
 
@@ -226,7 +258,7 @@ func TestClaudeDeviceProfileObservations_FileBackedAuthVisibleWithoutAPIKey(t *t
 	auth := &cliproxyauth.Auth{ProxyURL: "direct", ID: "runtime-id-from-loader", FileName: "claude-file-auth.json", Provider: "claude"}
 
 	_ = ResolveClaudeDeviceProfile(auth, "runtime-api-key", map[string][]string{
-		"User-Agent":                  {"claude-cli/2.1.142 (external, cli)"},
+		"User-Agent":                  {"claude-cli/2.1.262 (external, cli)"},
 		"X-Stainless-Package-Version": {"0.94.0"},
 		"X-Stainless-Runtime-Version": {"v24.3.0"},
 	}, cfg)
@@ -235,8 +267,8 @@ func TestClaudeDeviceProfileObservations_FileBackedAuthVisibleWithoutAPIKey(t *t
 	if len(observations) != 1 {
 		t.Fatalf("observations length = %d, want 1: %#v", len(observations), observations)
 	}
-	if got := observations[0].Version; got != "2.1.142" {
-		t.Fatalf("version = %q, want 2.1.142", got)
+	if got := observations[0].Version; got != "2.1.262" {
+		t.Fatalf("version = %q, want 2.1.262", got)
 	}
 	if got := observations[0].RequestCount; got != 1 {
 		t.Fatalf("request_count = %d, want 1", got)
@@ -257,7 +289,7 @@ func TestClaudeDeviceProfileObservations_FileNameAuthIDAliases(t *testing.T) {
 	requestAuth := &cliproxyauth.Auth{ProxyURL: "direct", ID: "claude-file-auth.json", Provider: "claude"}
 
 	_ = ResolveClaudeDeviceProfile(requestAuth, "runtime-api-key", map[string][]string{
-		"User-Agent":                  {"claude-cli/2.1.144 (external, cli)"},
+		"User-Agent":                  {"claude-cli/2.1.264 (external, cli)"},
 		"X-Stainless-Package-Version": {"0.96.0"},
 		"X-Stainless-Runtime-Version": {"v24.5.0"},
 	}, cfg)
@@ -267,8 +299,8 @@ func TestClaudeDeviceProfileObservations_FileNameAuthIDAliases(t *testing.T) {
 	if len(observations) != 1 {
 		t.Fatalf("observations length = %d, want 1: %#v", len(observations), observations)
 	}
-	if got := observations[0].Version; got != "2.1.144" {
-		t.Fatalf("version = %q, want 2.1.144", got)
+	if got := observations[0].Version; got != "2.1.264" {
+		t.Fatalf("version = %q, want 2.1.264", got)
 	}
 }
 
@@ -280,7 +312,7 @@ func TestClaudeDeviceProfileObservations_LabelAlias(t *testing.T) {
 	requestAuth := &cliproxyauth.Auth{ProxyURL: "direct", Label: "bcd898@example.com", Provider: "claude"}
 
 	_ = ResolveClaudeDeviceProfile(requestAuth, "runtime-api-key", map[string][]string{
-		"User-Agent":                  {"claude-cli/2.1.142 (external, cli)"},
+		"User-Agent":                  {"claude-cli/2.1.262 (external, cli)"},
 		"X-Stainless-Package-Version": {"0.94.0"},
 		"X-Stainless-Runtime-Version": {"v24.3.0"},
 	}, cfg)
@@ -290,8 +322,8 @@ func TestClaudeDeviceProfileObservations_LabelAlias(t *testing.T) {
 	if len(observations) != 1 {
 		t.Fatalf("observations length = %d, want 1: %#v", len(observations), observations)
 	}
-	if got := observations[0].Version; got != "2.1.142" {
-		t.Fatalf("version = %q, want 2.1.142", got)
+	if got := observations[0].Version; got != "2.1.262" {
+		t.Fatalf("version = %q, want 2.1.262", got)
 	}
 }
 
@@ -303,7 +335,7 @@ func TestClaudeDeviceProfileObservations_GlobalFallbackForUnidentifiedAuth(t *te
 	requestAuth := &cliproxyauth.Auth{ProxyURL: "direct", Provider: "claude"}
 
 	_ = ResolveClaudeDeviceProfile(requestAuth, "provider-token", map[string][]string{
-		"User-Agent":                  {"claude-cli/2.1.141 (external, cli)"},
+		"User-Agent":                  {"claude-cli/2.1.261 (external, cli)"},
 		"X-Stainless-Package-Version": {"0.93.0"},
 		"X-Stainless-Runtime-Version": {"v24.3.0"},
 	}, cfg)
@@ -313,14 +345,14 @@ func TestClaudeDeviceProfileObservations_GlobalFallbackForUnidentifiedAuth(t *te
 	if len(observations) != 1 {
 		t.Fatalf("observations length = %d, want 1: %#v", len(observations), observations)
 	}
-	if got := observations[0].Version; got != "2.1.141" {
-		t.Fatalf("version = %q, want 2.1.141", got)
+	if got := observations[0].Version; got != "2.1.261" {
+		t.Fatalf("version = %q, want 2.1.261", got)
 	}
 }
 
 // TestResolveClaudeDeviceProfile_HighWaterCapsToObservedNotNpm covers requirement
-// ⑥ plan A case (a): an account whose only real observation is claude-cli/2.1.173
-// has a high-water of exactly 2.1.173. Even with online-update enabled and npm
+// ⑥ plan A case (a): an account whose only real observation is claude-cli/2.1.293
+// has a high-water of exactly 2.1.293. Even with online-update enabled and npm
 // latest ahead (2.5.0), the cached high-water must NOT be inflated past the real
 // observed value on subsequent requests.
 func TestResolveClaudeDeviceProfile_HighWaterCapsToObservedNotNpm(t *testing.T) {
@@ -349,29 +381,30 @@ func TestResolveClaudeDeviceProfile_HighWaterCapsToObservedNotNpm(t *testing.T) 
 	cfg := &config.Config{
 		ManagedHeaderProfile: config.ManagedHeaderProfileConfig{OnlineUpdate: &online},
 	}
-	auth := &cliproxyauth.Auth{ProxyURL: "direct", ID: "claude-173-auth", Provider: "claude"}
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", ID: "claude-293-auth", Provider: "claude"}
 
-	// First request: real client 2.1.173 is observed and becomes the high-water.
+	// First request: real client 2.1.293 is observed and becomes the high-water.
 	first := ResolveClaudeDeviceProfile(auth, "", map[string][]string{
-		"User-Agent": {"claude-cli/2.1.173 (external, cli)"},
+		"User-Agent": {"claude-cli/2.1.293 (external, cli)"},
 	}, cfg)
-	if got := first.VersionString(); got != "2.1.173" {
-		t.Fatalf("first request version = %q, want observed 2.1.173", got)
+	if got := first.VersionString(); got != "2.1.293" {
+		t.Fatalf("first request version = %q, want observed 2.1.293", got)
 	}
 
-	// Subsequent request without a client UA: must reuse the cached 2.1.173
+	// Subsequent request without a client UA: must reuse the cached 2.1.293
 	// high-water, never the newer npm latest 2.5.0.
 	cached := ResolveClaudeDeviceProfile(auth, "", nil, cfg)
-	if got := cached.VersionString(); got != "2.1.173" {
-		t.Fatalf("cached version = %q, want observed high-water 2.1.173 (npm must not inflate)", got)
+	if got := cached.VersionString(); got != "2.1.293" {
+		t.Fatalf("cached version = %q, want observed high-water 2.1.293 (npm must not inflate)", got)
 	}
 
-	// A second real client at 2.1.170 (older) must not lower the high-water.
+	// A second real client at 2.1.290 (older, still above floor) must not lower the
+	// high-water.
 	lower := ResolveClaudeDeviceProfile(auth, "", map[string][]string{
-		"User-Agent": {"claude-cli/2.1.170 (external, cli)"},
+		"User-Agent": {"claude-cli/2.1.290 (external, cli)"},
 	}, cfg)
-	if got := lower.VersionString(); got != "2.1.173" {
-		t.Fatalf("after older client, version = %q, want high-water 2.1.173 (only-up)", got)
+	if got := lower.VersionString(); got != "2.1.293" {
+		t.Fatalf("after older client, version = %q, want high-water 2.1.293 (only-up)", got)
 	}
 }
 
@@ -400,8 +433,8 @@ func TestResolveClaudeDeviceProfile_ZeroObservationDoesNotReportNpmLatest(t *tes
 	}
 
 	profile := ResolveClaudeDeviceProfile(&cliproxyauth.Auth{ProxyURL: "direct", ID: "claude-empty-auth", Provider: "claude"}, "", nil, cfg)
-	if got := profile.VersionString(); got != "2.1.63" {
-		t.Fatalf("zero-observation version = %q, want static floor 2.1.63, never npm latest", got)
+	if got := profile.VersionString(); got != "2.1.211" {
+		t.Fatalf("zero-observation version = %q, want static floor 2.1.211, never npm latest", got)
 	}
 }
 
@@ -431,8 +464,8 @@ func TestResolveClaudeDeviceProfile_OnlineUpdateDisabledByDefaultBehavior(t *tes
 	if consulted {
 		t.Fatalf("online registry must not be consulted when online-update is disabled")
 	}
-	if got := profile.VersionString(); got != "2.1.63" {
-		t.Fatalf("version = %q, want static floor 2.1.63 with online-update off", got)
+	if got := profile.VersionString(); got != "2.1.211" {
+		t.Fatalf("version = %q, want static floor 2.1.211 with online-update off", got)
 	}
 }
 
@@ -447,28 +480,28 @@ func TestResolveClaudeDeviceProfile_OnlyUpStillHoldsForNewerRealClient(t *testin
 	auth := &cliproxyauth.Auth{ProxyURL: "direct", ID: "claude-onlyup-auth", Provider: "claude"}
 
 	if got := ResolveClaudeDeviceProfile(auth, "", map[string][]string{
-		"User-Agent": {"claude-cli/2.1.100 (external, cli)"},
-	}, cfg).VersionString(); got != "2.1.100" {
-		t.Fatalf("version = %q, want 2.1.100", got)
+		"User-Agent": {"claude-cli/2.1.220 (external, cli)"},
+	}, cfg).VersionString(); got != "2.1.220" {
+		t.Fatalf("version = %q, want 2.1.220", got)
 	}
 
 	// Newer real client raises the high-water.
 	if got := ResolveClaudeDeviceProfile(auth, "", map[string][]string{
-		"User-Agent": {"claude-cli/2.1.180 (external, cli)"},
-	}, cfg).VersionString(); got != "2.1.180" {
-		t.Fatalf("version = %q, want raised high-water 2.1.180", got)
+		"User-Agent": {"claude-cli/2.1.300 (external, cli)"},
+	}, cfg).VersionString(); got != "2.1.300" {
+		t.Fatalf("version = %q, want raised high-water 2.1.300", got)
 	}
 
 	// Older real client must not lower it.
 	if got := ResolveClaudeDeviceProfile(auth, "", map[string][]string{
-		"User-Agent": {"claude-cli/2.1.150 (external, cli)"},
-	}, cfg).VersionString(); got != "2.1.180" {
-		t.Fatalf("version = %q, want retained high-water 2.1.180", got)
+		"User-Agent": {"claude-cli/2.1.270 (external, cli)"},
+	}, cfg).VersionString(); got != "2.1.300" {
+		t.Fatalf("version = %q, want retained high-water 2.1.300", got)
 	}
 
 	// No-client fallback keeps the high-water.
-	if got := ResolveClaudeDeviceProfile(auth, "", nil, cfg).VersionString(); got != "2.1.180" {
-		t.Fatalf("fallback version = %q, want retained high-water 2.1.180", got)
+	if got := ResolveClaudeDeviceProfile(auth, "", nil, cfg).VersionString(); got != "2.1.300" {
+		t.Fatalf("fallback version = %q, want retained high-water 2.1.300", got)
 	}
 }
 
@@ -485,23 +518,23 @@ func TestResolveClaudeDeviceProfile_PerAccountHighWaterNotLiftedByGlobal(t *test
 	authB := &cliproxyauth.Auth{ProxyURL: "direct", ID: "acct-b", Provider: "claude"}
 
 	_ = ResolveClaudeDeviceProfile(authA, "", map[string][]string{
-		"User-Agent": {"claude-cli/2.1.100 (external, cli)"},
+		"User-Agent": {"claude-cli/2.1.220 (external, cli)"},
 	}, cfg)
 	_ = ResolveClaudeDeviceProfile(authB, "", map[string][]string{
-		"User-Agent": {"claude-cli/2.1.180 (external, cli)"},
+		"User-Agent": {"claude-cli/2.1.300 (external, cli)"},
 	}, cfg)
 
-	// Account A's fallback must stay at its own high-water 2.1.100, never the
-	// higher 2.1.180 observed on account B.
-	if got := ResolveClaudeDeviceProfile(authA, "", nil, cfg).VersionString(); got != "2.1.100" {
-		t.Fatalf("acct-a fallback = %q, want own high-water 2.1.100 (not global 2.1.180)", got)
+	// Account A's fallback must stay at its own high-water 2.1.220, never the
+	// higher 2.1.300 observed on account B.
+	if got := ResolveClaudeDeviceProfile(authA, "", nil, cfg).VersionString(); got != "2.1.220" {
+		t.Fatalf("acct-a fallback = %q, want own high-water 2.1.220 (not global 2.1.300)", got)
 	}
 
 	// A brand-new account with no observation of its own DOES use the global
-	// observed high-water (2.1.180) as a safe fallback ceiling.
+	// observed high-water (2.1.300) as a safe fallback ceiling.
 	authNew := &cliproxyauth.Auth{ProxyURL: "direct", ID: "acct-new", Provider: "claude"}
-	if got := ResolveClaudeDeviceProfile(authNew, "", nil, cfg).VersionString(); got != "2.1.180" {
-		t.Fatalf("acct-new fallback = %q, want global observed high-water 2.1.180", got)
+	if got := ResolveClaudeDeviceProfile(authNew, "", nil, cfg).VersionString(); got != "2.1.300" {
+		t.Fatalf("acct-new fallback = %q, want global observed high-water 2.1.300", got)
 	}
 }
 
@@ -522,8 +555,8 @@ func TestResolveClaudeDeviceProfile_SanityCeilingRejectsFabricatedHighUA(t *test
 	forged := ResolveClaudeDeviceProfile(attacker, "", map[string][]string{
 		"User-Agent": {"claude-cli/999.0.0 (external, cli)"},
 	}, cfg)
-	if got := forged.VersionString(); got != "2.1.63" {
-		t.Fatalf("forged 999.0.0 outbound version = %q, want static floor 2.1.63 (must be rejected)", got)
+	if got := forged.VersionString(); got != "2.1.211" {
+		t.Fatalf("forged 999.0.0 outbound version = %q, want static floor 2.1.211 (must be rejected)", got)
 	}
 
 	// Forged version must not be recorded into this account's observations.
@@ -534,13 +567,13 @@ func TestResolveClaudeDeviceProfile_SanityCeilingRejectsFabricatedHighUA(t *test
 	// Forged version must not pollute the global observed high-water: a fresh
 	// account with no observation of its own must NOT inherit 999.x.
 	fresh := &cliproxyauth.Auth{ProxyURL: "direct", ID: "claude-fresh-after-forgery-auth", Provider: "claude"}
-	if got := ResolveClaudeDeviceProfile(fresh, "", nil, cfg).VersionString(); got != "2.1.63" {
-		t.Fatalf("fresh account fallback = %q, want static floor 2.1.63 (forged global high-water must not leak)", got)
+	if got := ResolveClaudeDeviceProfile(fresh, "", nil, cfg).VersionString(); got != "2.1.211" {
+		t.Fatalf("fresh account fallback = %q, want static floor 2.1.211 (forged global high-water must not leak)", got)
 	}
 }
 
 // TestResolveClaudeDeviceProfile_SanityCeilingAcceptsRealRecentVersion covers
-// sanity-ceiling case (b): a genuine recent version (2.1.180), comfortably below
+// sanity-ceiling case (b): a genuine recent version (2.1.300), comfortably below
 // the static sanity ceiling, is accepted normally — the ceiling must not
 // false-reject real clients.
 func TestResolveClaudeDeviceProfile_SanityCeilingAcceptsRealRecentVersion(t *testing.T) {
@@ -551,21 +584,21 @@ func TestResolveClaudeDeviceProfile_SanityCeilingAcceptsRealRecentVersion(t *tes
 	auth := &cliproxyauth.Auth{ProxyURL: "direct", ID: "claude-real-recent-auth", Provider: "claude"}
 
 	real := ResolveClaudeDeviceProfile(auth, "", map[string][]string{
-		"User-Agent": {"claude-cli/2.1.180 (external, cli)"},
+		"User-Agent": {"claude-cli/2.1.300 (external, cli)"},
 	}, cfg)
-	if got := real.VersionString(); got != "2.1.180" {
-		t.Fatalf("real recent 2.1.180 version = %q, want accepted 2.1.180 (no false reject)", got)
+	if got := real.VersionString(); got != "2.1.300" {
+		t.Fatalf("real recent 2.1.300 version = %q, want accepted 2.1.300 (no false reject)", got)
 	}
 
 	// It must be recorded as the account's observed high-water.
 	obs := ClaudeDeviceProfileObservations(auth, "")
-	if len(obs) != 1 || obs[0].Version != "2.1.180" {
-		t.Fatalf("observations = %#v, want exactly [2.1.180] recorded", obs)
+	if len(obs) != 1 || obs[0].Version != "2.1.300" {
+		t.Fatalf("observations = %#v, want exactly [2.1.300] recorded", obs)
 	}
 
 	// And it must survive as the cached high-water on a no-client request.
-	if got := ResolveClaudeDeviceProfile(auth, "", nil, cfg).VersionString(); got != "2.1.180" {
-		t.Fatalf("cached fallback = %q, want retained high-water 2.1.180", got)
+	if got := ResolveClaudeDeviceProfile(auth, "", nil, cfg).VersionString(); got != "2.1.300" {
+		t.Fatalf("cached fallback = %q, want retained high-water 2.1.300", got)
 	}
 }
 
@@ -573,7 +606,7 @@ func TestResolveClaudeDeviceProfile_SanityCeilingAcceptsRealRecentVersion(t *tes
 // sanity-ceiling case (c): when npm latest is available it raises the validation
 // ceiling (here npm latest 4.1.0, above the hardcoded static 4.0.0), but npm is
 // used ONLY as an upper bound — it never pushes the outbound version up. With a
-// real observation of 2.1.173 the outbound version stays 2.1.173, not npm latest.
+// real observation of 2.1.293 the outbound version stays 2.1.293, not npm latest.
 // A client at the npm-raised ceiling (4.1.0, above the static 4.0.0 bound) is then
 // accepted, proving npm widened acceptance without inflating the floor.
 func TestResolveClaudeDeviceProfile_SanityCeilingLiftedByNpmStillNotPushed(t *testing.T) {
@@ -604,17 +637,17 @@ func TestResolveClaudeDeviceProfile_SanityCeilingLiftedByNpmStillNotPushed(t *te
 	}
 	auth := &cliproxyauth.Auth{ProxyURL: "direct", ID: "claude-npm-ceiling-auth", Provider: "claude"}
 
-	// Real observation 2.1.173 with npm latest 4.1.0 available: npm is a ceiling
-	// reference only, so the outbound version stays at the real observed 2.1.173
+	// Real observation 2.1.293 with npm latest 4.1.0 available: npm is a ceiling
+	// reference only, so the outbound version stays at the real observed 2.1.293
 	// (npm must not push the floor up to 4.1.0).
 	first := ResolveClaudeDeviceProfile(auth, "", map[string][]string{
-		"User-Agent": {"claude-cli/2.1.173 (external, cli)"},
+		"User-Agent": {"claude-cli/2.1.293 (external, cli)"},
 	}, cfg)
-	if got := first.VersionString(); got != "2.1.173" {
-		t.Fatalf("first version = %q, want observed 2.1.173 (npm must not push up)", got)
+	if got := first.VersionString(); got != "2.1.293" {
+		t.Fatalf("first version = %q, want observed 2.1.293 (npm must not push up)", got)
 	}
-	if got := ResolveClaudeDeviceProfile(auth, "", nil, cfg).VersionString(); got != "2.1.173" {
-		t.Fatalf("cached version = %q, want 2.1.173 (npm 4.1.0 must not inflate outbound)", got)
+	if got := ResolveClaudeDeviceProfile(auth, "", nil, cfg).VersionString(); got != "2.1.293" {
+		t.Fatalf("cached version = %q, want 2.1.293 (npm 4.1.0 must not inflate outbound)", got)
 	}
 
 	// The npm-raised sanity ceiling the helper computes must be npm latest 4.1.0,
@@ -675,8 +708,8 @@ func TestResolveClaudeDeviceProfile_SanityCeilingOfflineConstantApplies(t *testi
 	auth := &cliproxyauth.Auth{ProxyURL: "direct", ID: "claude-offline-ceiling-auth", Provider: "claude"}
 	if got := ResolveClaudeDeviceProfile(auth, "", map[string][]string{
 		"User-Agent": {"claude-cli/999.0.0 (external, cli)"},
-	}, cfg).VersionString(); got != "2.1.63" {
-		t.Fatalf("offline forged 999.0.0 = %q, want static floor 2.1.63 (rejected by offline ceiling)", got)
+	}, cfg).VersionString(); got != "2.1.211" {
+		t.Fatalf("offline forged 999.0.0 = %q, want static floor 2.1.211 (rejected by offline ceiling)", got)
 	}
 	if obs := ClaudeDeviceProfileObservations(auth, ""); len(obs) != 0 {
 		t.Fatalf("offline forged 999.0.0 recorded %#v, want none", obs)
@@ -688,5 +721,37 @@ func TestResolveClaudeDeviceProfile_SanityCeilingOfflineConstantApplies(t *testi
 		"User-Agent": {"claude-cli/4.0.0 (external, cli)"},
 	}, cfg).VersionString(); got != "4.0.0" {
 		t.Fatalf("boundary 4.0.0 = %q, want accepted at static ceiling", got)
+	}
+}
+
+// TestResolveClaudeDeviceProfile_SubTwoZeroFabricatedVersionFlooredToBaseline
+// confirms the floor-up EMIT gate covers nonsensical sub-2.0 versions (0.x/1.x),
+// which no genuine native-generation claude-cli emits: 1.5.0 is far below the
+// baseline high-water, so it is a non-upgrade — floored to the static baseline
+// (2.1.211) on egress rather than emitted verbatim. Recording is decoupled from
+// emission and carries no lower bound (only the sanity ceiling), so the raw 1.5.0
+// observation is still logged into the diagnostic history even though it is never
+// emitted.
+func TestResolveClaudeDeviceProfile_SubTwoZeroFabricatedVersionFlooredToBaseline(t *testing.T) {
+	ResetClaudeDeviceProfileCache()
+	t.Cleanup(ResetClaudeDeviceProfileCache)
+
+	cfg := &config.Config{}
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", ID: "claude-sub2-auth", Provider: "claude"}
+
+	profile := ResolveClaudeDeviceProfile(auth, "", map[string][]string{
+		"User-Agent": {"claude-cli/1.5.0 (external, cli)"},
+	}, cfg)
+	if got := profile.VersionString(); got != "2.1.211" {
+		t.Fatalf("sub-2.0 forged 1.5.0 version = %q, want floored to baseline 2.1.211 (garbage low version floored up, never emitted)", got)
+	}
+	// Emission floors up, but the raw observation is still recorded for diagnostics
+	// (recording is gated only by the sanity ceiling, with no lower bound).
+	obs := ClaudeDeviceProfileObservations(auth, "")
+	if len(obs) != 1 {
+		t.Fatalf("sub-2.0 forged 1.5.0 observations = %#v, want 1 (recorded for diagnostics, decoupled from emission)", obs)
+	}
+	if got := obs[0].Version; got != "1.5.0" {
+		t.Fatalf("observation version = %q, want 1.5.0 (raw inbound recorded even though floored on egress)", got)
 	}
 }

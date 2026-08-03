@@ -28,7 +28,7 @@
 # 维护:新增一条 fork 反关联/自定义能力的关键接线时,补一行本清单;
 #   上游重构导致路径迁移时同步更新路径,而不是删掉这条守护。
 
-# === 反关联/指纹核心符号(20) ===
+# === 反关联/指纹核心符号(21) ===
 反关联-uTLS客户端	NewUtlsHTTPClient	symbol	^func NewUtlsHTTPClient\(	internal/runtime/executor/helps/utls_client.go
 反关联-uTLS客户端	NewUtlsHTTPClientForProfile	symbol	^func NewUtlsHTTPClientForProfile\(	internal/runtime/executor/helps/utls_client.go
 反关联-uTLS客户端	utlsProtectedHosts	symbol	^var utlsProtectedHosts 	internal/runtime/executor/helps/utls_client.go
@@ -36,6 +36,10 @@
 反关联-设备指纹注入	InjectAccountDeviceID	symbol	^func InjectAccountDeviceID\(	internal/runtime/executor/helps/synthetic_device_id.go
 反关联-Claude设备画像	resolveClaudeDeviceProfileForRequest	symbol	^func resolveClaudeDeviceProfileForRequest\(	internal/runtime/executor/claude_executor_request.go
 反关联-Claude设备画像	applyClaudeManagedHeaders	symbol	^func applyClaudeManagedHeaders\(	internal/runtime/executor/claude_executor_request.go
+反关联-真实路径计费对齐	alignRealPathBillingVersion	symbol	^func alignRealPathBillingVersion\(	internal/runtime/executor/claude_signing.go
+反关联-真实路径计费对齐	computeFingerprint	symbol	^func computeFingerprint\(	internal/runtime/executor/claude_executor_cloaking.go
+反关联-真实路径计费对齐	firstNonMetaUserMessageText	symbol	^func firstNonMetaUserMessageText\(	internal/runtime/executor/claude_executor_cloaking.go
+反关联-真实路径计费对齐	fingerprintSalt	pattern	^const fingerprintSalt = "59cf53e54c78"	internal/runtime/executor/claude_executor_cloaking.go
 反关联-代理留白拦截	blockingRoundTripper	symbol	^type blockingRoundTripper struct	internal/runtime/executor/helps/proxy_helpers.go
 反关联-OAuth刷新传输	NewOAuthRefreshUtlsHTTPClient	symbol	^func NewOAuthRefreshUtlsHTTPClient\(	internal/runtime/executor/helps/utls_client.go
 反关联-管理API出站	apiCallUtlsRoundTripper	symbol	^func \(h \*Handler\) apiCallUtlsRoundTripper\(	internal/api/handlers/management/api_tools.go
@@ -45,6 +49,7 @@
 反关联-Codex客户端画像	ResolveCodexClientProfile	symbol	^func ResolveCodexClientProfile\(	internal/runtime/executor/helps/codex_client_profile.go
 反关联-设备高水位	ClaudeDeviceHighWater	symbol	^type ClaudeDeviceHighWater struct	sdk/cliproxy/auth/claude_device_high_water.go
 反关联-设备高水位	CodexDeviceHighWater	symbol	^type CodexDeviceHighWater struct	sdk/cliproxy/auth/codex_device_high_water.go
+反关联-设备高水位	seedClaudeObservedHighWaterFromLoadedAuths	symbol	^func \(s \*Service\) seedClaudeObservedHighWaterFromLoadedAuths\(	sdk/cliproxy/service_fork_anticorr.go
 反关联-自动隔离	evaluateAutoQuarantineLocked	symbol	^func \(m \*Manager\) evaluateAutoQuarantineLocked\(	sdk/cliproxy/auth/conductor_auto_quarantine.go
 反关联-farm账号钉定	applyFarmAccountPin	symbol	^func \(h \*BaseAPIHandler\) applyFarmAccountPin\(	sdk/api/handlers/farm_pin.go
 反关联-Codex路径归一化	normalizeCodexPaths	symbol	^func normalizeCodexPaths\(	internal/runtime/executor/helps/normalize_codex_env.go

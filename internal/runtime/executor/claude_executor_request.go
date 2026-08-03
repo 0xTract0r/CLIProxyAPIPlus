@@ -647,7 +647,10 @@ func claudeCreds(a *cliproxyauth.Auth) (apiKey, baseURL string) {
 }
 
 func checkSystemInstructions(payload []byte) []byte {
-	return checkSystemInstructionsWithSigningMode(payload, false, false, false, "2.1.63", "", "")
+	// Fallback billing cc_version floor; mirrors the device-profile UA floor
+	// (defaultClaudeFingerprintUserAgent) so an unresolved version never emits a
+	// cc_version that disagrees with the outbound User-Agent.
+	return checkSystemInstructionsWithSigningMode(payload, false, false, false, "2.1.211", "", "")
 }
 
 func rebuildMidSystemMessagesToTopLevel(payload []byte) []byte {

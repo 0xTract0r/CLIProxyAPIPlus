@@ -380,6 +380,20 @@ func NormalizeSdkCliEntrypointEnabled(cfg *Config) bool {
 	return *cfg.Claude.NormalizeSdkCliEntrypoint
 }
 
+// AlignRealPathBillingVersionEnabled reports whether the REAL serving path
+// (genuine claude-cli, helps.ShouldCloak == false) rewrites the body billing
+// header cc_version <version> segment to the account high-water version V (see
+// ClaudeConfig.AlignRealPathBillingVersion). Unlike NormalizeSdkCliEntrypoint,
+// this defaults to false (disabled) when the pointer is unset, so the real
+// serving path stays byte-for-byte unchanged until an operator explicitly opts
+// in after real-machine validation. Set claude.align-real-path-billing-version:
+// true to enable.
+func AlignRealPathBillingVersionEnabled(cfg *Config) bool {
+	return cfg != nil &&
+		cfg.Claude.AlignRealPathBillingVersion != nil &&
+		*cfg.Claude.AlignRealPathBillingVersion
+}
+
 // ManagedHeaderOnlineUpdateEnabled reports whether core may consult public
 // online registries to refresh provider-managed version markers.
 func ManagedHeaderOnlineUpdateEnabled(cfg *Config) bool {

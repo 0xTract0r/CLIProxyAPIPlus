@@ -162,7 +162,7 @@ func TestApplyClaudeHeaders_RecordsClientObservationWhenStabilizationDisabled(t 
 		},
 	}
 	incoming := http.Header{
-		"User-Agent":                  []string{"claude-cli/2.1.140 (external, cli)"},
+		"User-Agent":                  []string{"claude-cli/2.1.260 (external, cli)"},
 		"X-Stainless-Package-Version": []string{"0.80.0"},
 		"X-Stainless-Runtime-Version": []string{"v24.5.0"},
 		"X-Stainless-Os":              []string{"darwin"},
@@ -176,8 +176,8 @@ func TestApplyClaudeHeaders_RecordsClientObservationWhenStabilizationDisabled(t 
 	if len(observations) != 1 {
 		t.Fatalf("observations length = %d, want 1: %#v", len(observations), observations)
 	}
-	if got := observations[0].Version; got != "2.1.140" {
-		t.Fatalf("observed version = %q, want 2.1.140: %#v", got, observations[0])
+	if got := observations[0].Version; got != "2.1.260" {
+		t.Fatalf("observed version = %q, want 2.1.260: %#v", got, observations[0])
 	}
 }
 
@@ -197,7 +197,7 @@ func TestResolveClaudeBillingVersionAndApplyHeaders_RecordSingleClientObservatio
 		},
 	}
 	incoming := http.Header{
-		"User-Agent":                  []string{"claude-cli/2.1.141 (external, cli)"},
+		"User-Agent":                  []string{"claude-cli/2.1.261 (external, cli)"},
 		"X-Stainless-Package-Version": []string{"0.80.1"},
 		"X-Stainless-Runtime-Version": []string{"v24.5.1"},
 		"X-Stainless-Os":              []string{"darwin"},
@@ -205,8 +205,8 @@ func TestResolveClaudeBillingVersionAndApplyHeaders_RecordSingleClientObservatio
 	}
 
 	req := newClaudeHeaderTestRequest(t, incoming)
-	if got := resolveClaudeBillingVersion(req.Context(), cfg, auth, "key-observation-request-cache"); got != "2.1.141" {
-		t.Fatalf("billing version = %q, want 2.1.141", got)
+	if got := resolveClaudeBillingVersion(req.Context(), cfg, auth, "key-observation-request-cache"); got != "2.1.261" {
+		t.Fatalf("billing version = %q, want 2.1.261", got)
 	}
 	applyClaudeHeaders(req, auth, "key-observation-request-cache", false, nil, cfg)
 
@@ -352,6 +352,9 @@ func TestApplyClaudeHeaders_DoesNotDowngradeConfiguredBaselineOnFirstClaudeClien
 		},
 	}
 
+	// A genuine older client (2.1.62) below the configured baseline is floored UP to
+	// the configured baseline triple; only-up never egresses the client's own lower
+	// version.
 	olderClaudeReq := newClaudeHeaderTestRequest(t, http.Header{
 		"User-Agent":                  []string{"claude-cli/2.1.62 (external, cli)"},
 		"X-Stainless-Package-Version": []string{"0.74.0"},
@@ -362,6 +365,8 @@ func TestApplyClaudeHeaders_DoesNotDowngradeConfiguredBaselineOnFirstClaudeClien
 	applyClaudeHeaders(olderClaudeReq, auth, "key-baseline-floor", false, nil, cfg)
 	assertClaudeFingerprint(t, olderClaudeReq.Header, "claude-cli/2.1.70 (external, cli)", "0.80.0", "v24.5.0", "MacOS", "arm64")
 
+	// A newer client (2.1.71, above the configured baseline) ratchets the high-water
+	// up and egresses at its own version — the only-up path.
 	newerClaudeReq := newClaudeHeaderTestRequest(t, http.Header{
 		"User-Agent":                  []string{"claude-cli/2.1.71 (external, cli)"},
 		"X-Stainless-Package-Version": []string{"0.81.0"},
@@ -2265,7 +2270,7 @@ func TestClaudeExecutorPrepareRequest_RecordsDirectClientVersionObservation(t *t
 		},
 	}
 	req := httptest.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages?beta=true", nil)
-	req.Header.Set("User-Agent", "claude-cli/2.1.142 (external, sdk-cli)")
+	req.Header.Set("User-Agent", "claude-cli/2.1.262 (external, sdk-cli)")
 	req.Header.Set("X-Stainless-Package-Version", "0.94.0")
 	req.Header.Set("X-Stainless-Runtime-Version", "v24.3.0")
 
@@ -2276,8 +2281,8 @@ func TestClaudeExecutorPrepareRequest_RecordsDirectClientVersionObservation(t *t
 	if len(observations) != 1 {
 		t.Fatalf("observations length = %d, want 1: %#v", len(observations), observations)
 	}
-	if got := observations[0].Version; got != "2.1.142" {
-		t.Fatalf("observation version = %q, want 2.1.142", got)
+	if got := observations[0].Version; got != "2.1.262" {
+		t.Fatalf("observation version = %q, want 2.1.262", got)
 	}
 }
 
@@ -2470,7 +2475,7 @@ func TestClaudeExecutor_UsesOptionsHeadersForClientVersionObservation(t *testing
 	}
 	payload := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
 	headers := http.Header{
-		"User-Agent":                  []string{"claude-cli/2.1.142 (external, cli)"},
+		"User-Agent":                  []string{"claude-cli/2.1.262 (external, cli)"},
 		"X-Stainless-Package-Version": []string{"0.94.0"},
 		"X-Stainless-Runtime-Version": []string{"v24.3.0"},
 	}
@@ -2482,18 +2487,18 @@ func TestClaudeExecutor_UsesOptionsHeadersForClientVersionObservation(t *testing
 	if err != nil {
 		t.Fatalf("Execute() error = %v", err)
 	}
-	if captured.userAgent != "claude-cli/2.1.142 (external, cli)" {
+	if captured.userAgent != "claude-cli/2.1.262 (external, cli)" {
 		t.Fatalf("User-Agent = %q, want options header version", captured.userAgent)
 	}
-	if got := billingVersionFromBody(t, captured.body); got != "2.1.142" {
-		t.Fatalf("billing cc_version = %q, want %q", got, "2.1.142")
+	if got := billingVersionFromBody(t, captured.body); got != "2.1.262" {
+		t.Fatalf("billing cc_version = %q, want %q", got, "2.1.262")
 	}
 	observations := helps.ClaudeDeviceProfileObservations(auth, "")
 	if len(observations) != 1 {
 		t.Fatalf("observations length = %d, want 1: %#v", len(observations), observations)
 	}
-	if got := observations[0].Version; got != "2.1.142" {
-		t.Fatalf("observation version = %q, want 2.1.142", got)
+	if got := observations[0].Version; got != "2.1.262" {
+		t.Fatalf("observation version = %q, want 2.1.262", got)
 	}
 }
 
@@ -2842,14 +2847,14 @@ func TestApplyClaudeHeaders_PreservesClaudeCloakingDefaultsWithoutSavedHeaders(t
 
 	applyClaudeHeaders(req, auth, "sk-ant-oat-test", true, nil, nil)
 
-	if got := req.Header.Get("User-Agent"); got != "claude-cli/2.1.63 (external, cli)" {
-		t.Fatalf("User-Agent = %q, want %q", got, "claude-cli/2.1.63 (external, cli)")
+	if got := req.Header.Get("User-Agent"); got != "claude-cli/2.1.211 (external, cli)" {
+		t.Fatalf("User-Agent = %q, want %q", got, "claude-cli/2.1.211 (external, cli)")
 	}
 	if got := req.Header.Get("X-App"); got != "cli" {
 		t.Fatalf("X-App = %q, want %q", got, "cli")
 	}
-	if got := req.Header.Get("X-Stainless-Runtime-Version"); got != "v24.3.0" {
-		t.Fatalf("X-Stainless-Runtime-Version = %q, want %q", got, "v24.3.0")
+	if got := req.Header.Get("X-Stainless-Runtime-Version"); got != "v26.3.0" {
+		t.Fatalf("X-Stainless-Runtime-Version = %q, want %q", got, "v26.3.0")
 	}
 	if got := req.Header.Get("Accept-Encoding"); got != "identity" {
 		t.Fatalf("Accept-Encoding = %q, want %q", got, "identity")
@@ -4773,7 +4778,7 @@ func TestClaudeDeviceProfileStaleGuardActive_DetectsStaleProneConfig(t *testing.
 	// A real first-party observation anywhere provides a non-stale fallback
 	// ceiling and disarms the guard.
 	_ = helps.ResolveClaudeDeviceProfile(&cliproxyauth.Auth{ProxyURL: "direct", ID: "stale-guard-seed", Provider: "claude"}, "", map[string][]string{
-		"User-Agent": {"claude-cli/2.1.158 (external, cli)"},
+		"User-Agent": {"claude-cli/2.1.278 (external, cli)"},
 	}, &config.Config{})
 	if helps.ClaudeDeviceProfileStaleGuardActive(staleCfg) {
 		t.Fatalf("guard must be off once a real first-party client has been observed")
@@ -4802,16 +4807,16 @@ func TestApplyClaudeHeaders_StaleGuardOffPreservesObservedNewerClient(t *testing
 		Attributes: map[string]string{"api_key": "key-stale-guard"},
 	}
 
-	// Real client far newer than the frozen built-in baseline (2.1.63).
+	// Real client far newer than the frozen built-in baseline (2.1.211).
 	req := newClaudeHeaderTestRequest(t, http.Header{
-		"User-Agent":                  []string{"claude-cli/2.1.158 (external, cli)"},
+		"User-Agent":                  []string{"claude-cli/2.1.278 (external, cli)"},
 		"X-Stainless-Package-Version": []string{"0.94.0"},
 		"X-Stainless-Runtime-Version": []string{"v24.3.0"},
 		"X-Stainless-Os":              []string{"MacOS"},
 		"X-Stainless-Arch":            []string{"arm64"},
 	})
 	applyClaudeHeaders(req, auth, "key-stale-guard", false, nil, cfg)
-	assertClaudeFingerprint(t, req.Header, "claude-cli/2.1.158 (external, cli)", "0.94.0", "v24.3.0", "MacOS", "arm64")
+	assertClaudeFingerprint(t, req.Header, "claude-cli/2.1.278 (external, cli)", "0.94.0", "v24.3.0", "MacOS", "arm64")
 }
 
 func TestEnsureClaudeThinkingDisplay_SetsSummarizedWhenMissing(t *testing.T) {

@@ -11,10 +11,10 @@ import (
 // 三元组（UA/version、X-Stainless-Package-Version、X-Stainless-Runtime-Version）
 // 必须整体取自同一次真实观测，绝不出现"新 UA + 旧常量 pkg/runtime"。
 //
-// 场景：账号 A 观测到一份完整真实三元组（UA=2.1.100 + pkg=0.95.0 + runtime=v25.0.0，
-// 三者都不同于 baseline 默认常量 0.74.0 / v24.3.0）；零观测的账号 B 走 fallback floor
-// 被抬升到该全局高水位。修复前 B 会得到 UA=2.1.100 但 pkg/runtime 仍是旧常量；
-// 修复后 B 必须整组拿到 0.95.0 / v25.0.0。
+// 场景：账号 A 观测到一份完整真实三元组（UA=2.1.220 + pkg=0.95.0 + runtime=v25.0.0，
+// 三者都不同于 baseline 默认常量 0.94.0 / v26.3.0）；零观测的账号 B 走 fallback floor
+// 被抬升到该全局高水位。修复前 B 会得到 UA=2.1.220 但 pkg/runtime 仍是旧常量；
+// 修复后 B 必须整组拿到 0.95.0 / v25.0.0。观测版本须高于 floor（2.1.211）才会被采纳为高水位。
 func TestResolveClaudeDeviceProfile_FloorLiftsVersionTripleAtomically(t *testing.T) {
 	ResetClaudeDeviceProfileCache()
 	t.Cleanup(ResetClaudeDeviceProfileCache)
@@ -22,7 +22,7 @@ func TestResolveClaudeDeviceProfile_FloorLiftsVersionTripleAtomically(t *testing
 	cfg := &config.Config{}
 
 	const (
-		highUA      = "claude-cli/2.1.100 (external, cli)"
+		highUA      = "claude-cli/2.1.220 (external, cli)"
 		highPkg     = "0.95.0"
 		highRuntime = "v25.0.0"
 	)
@@ -53,8 +53,8 @@ func TestResolveClaudeDeviceProfile_FloorLiftsVersionTripleAtomically(t *testing
 	if got := fallback.UserAgent; got != highUA {
 		t.Fatalf("fallback UserAgent = %q, want lifted high-water %q", got, highUA)
 	}
-	if got := fallback.VersionString(); got != "2.1.100" {
-		t.Fatalf("fallback version = %q, want 2.1.100", got)
+	if got := fallback.VersionString(); got != "2.1.220" {
+		t.Fatalf("fallback version = %q, want 2.1.220", got)
 	}
 
 	// 关键不变式：pkg/runtime 必须与抬高的 UA 来自同一次真实观测，
@@ -82,7 +82,7 @@ func TestResolveClaudeDeviceProfile_FloorLiftsVersionTripleAtomically(t *testing
 }
 
 // 反关联修复 B（R5）边界：没有任何真实观测时，三元组整体停在内部自洽的 baseline
-// （2.1.63 / 0.74.0 / v24.3.0），不得被任何来源拆成不一致组合。
+// （2.1.211 / 0.94.0 / v26.3.0），不得被任何来源拆成不一致组合。
 func TestResolveClaudeDeviceProfile_ZeroObservationKeepsConsistentBaselineTriple(t *testing.T) {
 	ResetClaudeDeviceProfileCache()
 	t.Cleanup(ResetClaudeDeviceProfileCache)
@@ -92,8 +92,8 @@ func TestResolveClaudeDeviceProfile_ZeroObservationKeepsConsistentBaselineTriple
 		Provider: "claude",
 	}, "", nil, &config.Config{})
 
-	if got := profile.VersionString(); got != "2.1.63" {
-		t.Fatalf("zero-observation version = %q, want baseline 2.1.63", got)
+	if got := profile.VersionString(); got != "2.1.211" {
+		t.Fatalf("zero-observation version = %q, want baseline 2.1.211", got)
 	}
 	if got := profile.PackageVersion; got != defaultClaudeFingerprintPackageVersion {
 		t.Fatalf("zero-observation PackageVersion = %q, want baseline %q", got, defaultClaudeFingerprintPackageVersion)
@@ -114,7 +114,7 @@ func TestResolveClaudeDeviceProfile_SameAccountKeepsObservedTripleConsistent(t *
 	auth := &cliproxyauth.Auth{ProxyURL: "direct", ID: "claude-account-consistent", Provider: "claude"}
 
 	headers := map[string][]string{
-		"User-Agent":                  {"claude-cli/2.1.120 (external, cli)"},
+		"User-Agent":                  {"claude-cli/2.1.240 (external, cli)"},
 		"X-Stainless-Package-Version": {"0.92.0"},
 		"X-Stainless-Runtime-Version": {"v24.9.0"},
 		"X-Stainless-Os":              {"MacOS"},
@@ -125,7 +125,7 @@ func TestResolveClaudeDeviceProfile_SameAccountKeepsObservedTripleConsistent(t *
 	second := ResolveClaudeDeviceProfile(auth, "", headers, cfg)
 
 	for name, p := range map[string]ClaudeDeviceProfile{"first": first, "second": second} {
-		if p.UserAgent != "claude-cli/2.1.120 (external, cli)" {
+		if p.UserAgent != "claude-cli/2.1.240 (external, cli)" {
 			t.Fatalf("%s UA = %q, want observed", name, p.UserAgent)
 		}
 		if p.PackageVersion != "0.92.0" {

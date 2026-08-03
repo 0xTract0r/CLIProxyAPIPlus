@@ -91,7 +91,7 @@ func TestClaudeMessagesRecordsIncomingClientObservation(t *testing.T) {
 	}`))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Anthropic-Version", "2023-06-01")
-	req.Header.Set("User-Agent", "claude-cli/2.1.142 (external, sdk-cli)")
+	req.Header.Set("User-Agent", "claude-cli/2.1.262 (external, sdk-cli)")
 	req.Header.Set("X-Stainless-Package-Version", "0.94.0")
 	req.Header.Set("X-Stainless-Runtime-Version", "v24.3.0")
 	resp := httptest.NewRecorder()
@@ -104,8 +104,8 @@ func TestClaudeMessagesRecordsIncomingClientObservation(t *testing.T) {
 	if len(observations) != 1 {
 		t.Fatalf("observations length = %d, want 1: %#v", len(observations), observations)
 	}
-	if got := observations[0].Version; got != "2.1.142" {
-		t.Fatalf("version = %q, want 2.1.142", got)
+	if got := observations[0].Version; got != "2.1.262" {
+		t.Fatalf("version = %q, want 2.1.262", got)
 	}
 }
 
