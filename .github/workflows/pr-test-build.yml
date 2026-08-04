@@ -19,6 +19,10 @@ jobs:
           cache: true
       - name: Test
         run: GOTOOLCHAIN=auto go test -timeout 600s ./...
+      # IMPORTANT: keep "Refresh models catalog" AFTER "Test". This step rewrites the
+      # committed model catalog on disk; registry tests assert the committed catalog
+      # state, so running it before "Test" mutates the catalog and turns those
+      # assertions into false failures. Do not reorder these two steps.
       - name: Refresh models catalog
         run: bash .github/scripts/refresh-model-catalogs.sh
       - name: Build
