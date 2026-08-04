@@ -90,14 +90,6 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 		return nil, fmt.Errorf("failed to parse config file: %w", err)
 	}
 
-	// fork(anticorr): DORMANT — neutralize the account env/cwd normalization switch
-	// (requirement ⑦) right after unmarshal so a config.yaml `normalize-account-env: true`
-	// cannot re-enable the retired cwd-normalization chain. Whatever the file says, the
-	// effective runtime value is nil (off); NormalizeAccountEnvEnabled therefore always
-	// returns false. The gate function is left honest so unit tests can still set the
-	// pointer and exercise the dormant normalize implementations directly.
-	cfg.NormalizeAccountEnv = nil
-
 	cfg.CredentialConcurrency = cfg.CredentialConcurrency.WithDefaults()
 	if errValidate := cfg.CredentialInFlight.Validate(); errValidate != nil {
 		return nil, errValidate

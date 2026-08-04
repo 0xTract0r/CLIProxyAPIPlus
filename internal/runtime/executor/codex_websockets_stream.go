@@ -56,10 +56,6 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
 	body = helps.SetStringIfDifferent(body, "model", baseModel)
 	body = normalizeCodexInstructions(body)
-	// fork(anticorr ⑦-codex): normalize the real cwd/git/CODEX_HOME paths in the
-	// outbound body, gated by the shared normalize-account-env switch (capturing
-	// the fake→real mapping for response-side restoration).
-	body = e.normalizeCodexPaths(ctx, body, auth, apiKey)
 	if e.cfg == nil || e.cfg.DisableImageGeneration == config.DisableImageGenerationOff {
 		body = ensureImageGenerationTool(body, baseModel, auth, opts.Headers)
 	}
@@ -398,11 +394,6 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			}
 
 			clientPayload := applyCodexIdentityExposeResponsePayload(payload, identityState)
-			// fork(anticorr ⑦-codex): restore real cwd/git paths before relaying the
-			// frame to a downstream websocket client (reverses normalizeCodexPaths).
-			// The DownstreamWebsocket relay path bypasses SSE translation, so the
-			// restore must happen here too or the client sees the account-neutral fakes.
-			clientPayload = restoreCodexResponseCwd(ctx, clientPayload)
 			if cliproxyexecutor.DownstreamWebsocket(ctx) {
 				if !send(cliproxyexecutor.StreamChunk{Payload: clientPayload}) {
 					terminateReason = "context_done"
@@ -421,9 +412,6 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			}
 			eventType = gjson.GetBytes(payload, "type").String()
 			clientPayload = applyCodexIdentityExposeResponsePayload(payload, identityState)
-			// fork(anticorr ⑦-codex): restore real cwd/git paths in the SSE-translated
-			// response (reverses normalizeCodexPaths) before encoding for the client.
-			clientPayload = restoreCodexResponseCwd(ctx, clientPayload)
 			line := encodeCodexWebsocketAsSSE(clientPayload)
 			chunks := helps.TranslateStreamWithClaudeInputTokens(ctx, to, responseFormat, req.Model, originalPayload, clientBody, line, &param, claudeInputTokens)
 			for i := range chunks {

@@ -53,48 +53,6 @@ type CodexExecutor struct {
 
 func NewCodexExecutor(cfg *config.Config) *CodexExecutor { return &CodexExecutor{cfg: cfg} }
 
-// normalizeCodexPaths gates the outbound codex cwd / CODEX_HOME normalization
-// (requirement ⑦-codex) behind the SAME global switch that controls claude's
-// NormalizeAccountEnv, and captures the fake→real mapping for response-side
-// restoration. Previously codex normalization was unconditional (always-on),
-// which broke local agents that received fake-rooted tool-call paths with no way
-// to restore them. Both halves now share one switch: when off, the outbound body
-// is left untouched and the response is unchanged; when on, paths are normalized
-// outbound and restored inbound.
-func (e *CodexExecutor) normalizeCodexPaths(ctx context.Context, body []byte, auth *cliproxyauth.Auth, apiKey string) []byte {
-	if !config.NormalizeAccountEnvEnabled(e.cfg) {
-		return body
-	}
-	return helps.NormalizeCodexPathsWithRestore(ctx, body, auth, apiKey)
-}
-
-// restoreCodexResponseCwd restores fake→real cwd / CODEX_HOME inside the tool-call
-// (function_call / custom_tool_call) "arguments" of a codex response payload
-// (OpenAI-responses JSON or one streamed SSE line). The complete arguments are
-// carried by response.output_item.done / response.completed events, so the fixed
-// literal is whole there; incremental function_call_arguments.delta fragments are
-// display-only and the authoritative .done event is restored.
-//
-// Restoration is STRUCTURAL and JSON-safe: the arguments string is parsed and only
-// its decoded string values are rewritten, then re-escaped on write-back, so a real
-// cwd containing backslashes/quotes/control chars cannot corrupt the JSON. It is
-// also scope-disciplined like the claude tool_use restore: ONLY tool-call arguments
-// are restored, never conversational text / reasoning / tool outputs. (This is safe
-// against second-turn leakage because the reasoning-replay cache is populated from
-// the pre-restore upstream payload, so the cache only ever holds fake roots; see
-// the call sites around cacheCodexReasoningReplayFromCompleted.)
-//
-// Returns payload unchanged when nothing was captured or no tool-call argument
-// carries a fake root.
-func restoreCodexResponseCwd(ctx context.Context, payload []byte) []byte {
-	collector := helps.CwdRestoreCollectorFromContext(ctx)
-	if collector == nil {
-		return payload
-	}
-	restored, _ := helps.RestoreCodexFunctionCallCwdInResponse(collector.Pairs(), payload)
-	return restored
-}
-
 // NewCodexExecutorWithManager wires the auth manager so cyber_policy hits are
 // persisted into the auth record (CyberPolicyFlagCount / LastCyberPolicyAt).
 func NewCodexExecutorWithManager(cfg *config.Config, manager *cliproxyauth.Manager) *CodexExecutor {

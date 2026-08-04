@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -24,11 +23,6 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	}
 	if isCodexOpenAIImageRequest(opts) {
 		return e.executeOpenAIImage(ctx, auth, req, opts)
-	}
-	// fork(anticorr ⑦-codex): attach a cwd-restore collector when normalization is on
-	// so the response can restore fake→real tool-call paths (restore half).
-	if config.NormalizeAccountEnvEnabled(e.cfg) {
-		ctx, _ = helps.ContextWithCwdRestoreCollector(ctx)
 	}
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
@@ -66,10 +60,6 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	body, _ = sjson.DeleteBytes(body, "safety_identifier")
 	body, _ = sjson.DeleteBytes(body, "stream_options")
 	body = normalizeCodexInstructions(body)
-	// fork(anticorr ⑦-codex): normalize the real cwd/git/CODEX_HOME paths in the
-	// outbound body, gated by the shared normalize-account-env switch (capturing the
-	// fake→real mapping for response-side restoration).
-	body = e.normalizeCodexPaths(ctx, body, auth, apiKey)
 	// fork: 图像策略统一走 applyImageGenerationPolicy —— DisableImageGenerationOff 时注入
 	// （仍跳过 free/spark/responses-lite），其余档位（含 nil cfg）剥离 image_generation。
 	// opts.Headers 必须透传，responses-lite 通过请求头 X-OpenAI-Internal-Codex-Responses-Lite
@@ -191,9 +181,6 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 
 		var param any
 		clientCompletedData := applyCodexIdentityExposeResponsePayload(completedData, identityState)
-		// fork(anticorr ⑦-codex): restore fake→real cwd in tool-call arguments before
-		// returning to the client (see codex_executor.go restoreCodexResponseCwd).
-		clientCompletedData = restoreCodexResponseCwd(ctx, clientCompletedData)
 		out := sdktranslator.TranslateNonStream(ctx, to, responseFormat, req.Model, originalPayload, body, clientCompletedData, &param)
 		resp = cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}
 		return resp, nil
@@ -211,11 +198,6 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 }
 
 func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
-	// fork(anticorr ⑦-codex): attach a cwd-restore collector when normalization is on
-	// so the compact response can restore fake→real tool-call paths.
-	if config.NormalizeAccountEnvEnabled(e.cfg) {
-		ctx, _ = helps.ContextWithCwdRestoreCollector(ctx)
-	}
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
 	apiKey, baseURL := codexCreds(auth)
@@ -247,10 +229,8 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	body = helps.SetStringIfDifferent(body, "model", baseModel)
 	body, _ = sjson.DeleteBytes(body, "stream")
 	body = normalizeCodexInstructions(body)
-	// fork(anticorr ⑦-codex): normalize outbound cwd/git/CODEX_HOME on the compact path.
 	// (No image-generation policy here: compact/summarization must not carry a tools
 	// array — see TestCodexExecutorCompactAddsDefaultInstructionsWithoutInjectingImageTool.)
-	body = e.normalizeCodexPaths(ctx, body, auth, apiKey)
 	body = sanitizeOpenAIResponsesReasoningEncryptedContent(ctx, "codex executor", body)
 	body = normalizeCodexParallelToolCalls(body, opts.Headers)
 	body, optimizeMultiAgentV2 := helps.OptimizeCodexMultiAgentV2Request(ctx, opts.Headers, body, e.cfg)
@@ -317,8 +297,6 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	reporter.EnsurePublished(ctx)
 	var param any
 	clientData := applyCodexIdentityExposeResponsePayload(upstreamData, identityState)
-	// fork(anticorr ⑦-codex): restore fake→real cwd in compact tool-call arguments.
-	clientData = restoreCodexResponseCwd(ctx, clientData)
 	out := sdktranslator.TranslateNonStream(ctx, to, responseFormat, req.Model, originalPayload, body, clientData, &param)
 	resp = cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}
 	return resp, nil

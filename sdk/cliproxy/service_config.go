@@ -286,10 +286,4 @@ func forceHomeRuntimeConfig(cfg *config.Config) {
 	cfg.RemoteManagement.AllowRemote = false
 	cfg.RemoteManagement.DisableControlPanel = true
 	cfg.Plugins.StoreAuth = nil
-	// fork(anticorr ⑦): DORMANT double-safeguard — account env/cwd normalization
-	// must never re-enable via the home remote-config overlay path. The primary
-	// neutralization happens in config load/parse; re-assert nil here (the home
-	// runtime-field cleaner) so any future home overlay reintroducing the pointer
-	// stays off.
-	cfg.NormalizeAccountEnv = nil
 }

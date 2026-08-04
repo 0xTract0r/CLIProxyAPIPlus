@@ -9,7 +9,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -90,17 +89,6 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 		countTokensAuthDir = e.cfg.AuthDir
 	}
 	body = helps.InjectAccountDeviceIDWithOptions(body, countTokensAuthDir, auth, apiKey, false)
-
-	// Account env/cwd normalization (requirement ⑦). Mirror the main messages
-	// path (applyCloaking): gated by the same independent global switch (default
-	// off, nil-cfg safe). When on, the real cwd / home paths inside <env> /
-	// <system-reminder> blocks are rewritten to a per-account canonical path so
-	// the count_tokens fingerprint matches the Execute path. When off the body is
-	// left untouched (zero behavior change); NormalizeAccountEnv is a safe
-	// pass-through on unparsable bodies and a no-op when no env block is present.
-	if config.NormalizeAccountEnvEnabled(e.cfg) {
-		body = helps.NormalizeAccountEnv(body, auth, apiKey, e.cfg)
-	}
 
 	// 反关联修复 A（C1）续：在 body 完成全部规范化（sanitize / device_id ⑦ / env）之后，
 	// 与 messages 路径（Execute / ExecuteStream）完全相同地回填 cch。
