@@ -59,10 +59,6 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	body, _ = sjson.DeleteBytes(body, "prompt_cache_retention")
 	body, _ = sjson.DeleteBytes(body, "safety_identifier")
 	body = normalizeCodexInstructions(body)
-	// fork(anticorr ⑦-codex): normalize the real cwd/git/CODEX_HOME paths in the
-	// outbound body, gated by the shared normalize-account-env switch (capturing
-	// the fake→real mapping for response-side restoration).
-	body = e.normalizeCodexPaths(ctx, body, auth, apiKey)
 	if e.cfg == nil || e.cfg.DisableImageGeneration == config.DisableImageGenerationOff {
 		body = ensureImageGenerationTool(body, baseModel, auth, opts.Headers)
 	}
@@ -323,10 +319,6 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 			}
 			var param any
 			clientPayload := applyCodexIdentityExposeResponsePayload(payload, identityState)
-			// fork(anticorr ⑦-codex): restore the client's real cwd/git paths in the
-			// outbound response (reverses normalizeCodexPaths) so the downstream client
-			// sees its own paths, not the account-neutral fakes we sent upstream.
-			clientPayload = restoreCodexResponseCwd(ctx, clientPayload)
 			out := sdktranslator.TranslateNonStream(ctx, to, responseFormat, req.Model, originalPayload, clientBody, clientPayload, &param)
 			resp = cliproxyexecutor.Response{Payload: out}
 			return resp, nil

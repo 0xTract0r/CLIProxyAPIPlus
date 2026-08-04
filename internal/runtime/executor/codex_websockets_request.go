@@ -87,19 +87,6 @@ func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *
 	ensureHeaderWithPriority(headers, ginHeaders, "x-codex-beta-features", cfgBetaFeatures, "")
 	misc.EnsureHeader(headers, ginHeaders, "x-codex-turn-state", "")
 	misc.EnsureHeader(headers, ginHeaders, "x-codex-turn-metadata", "")
-	// fork(anticorr ⑦-codex): turn-metadata header cwd/git normalization is now
-	// DORMANT and gated by the same account-env switch as the body path (mirrors
-	// applyCodexHeaders). Previously unconditional; with body-side cwd
-	// normalization off the header must pass the real cwd/git through unchanged
-	// (透传) to avoid a fake-header / real-body contradiction. The switch is forced
-	// off in LoadConfig, so this branch never runs in production. Identity fields
-	// remain handled by applyCodexTurnMetadataIdentityConfuse.
-	if config.NormalizeAccountEnvEnabled(cfg) {
-		// ws header keys are lower-case; the helper is case-insensitive. WithRestore
-		// captures the header's real cwd into the response-restore collector when one
-		// is attached to ctx.
-		helps.NormalizeCodexTurnMetadataHeaderWithRestore(ctx, headers, "x-codex-turn-metadata", auth, token)
-	}
 	misc.EnsureHeader(headers, ginHeaders, "x-client-request-id", "")
 	misc.EnsureHeader(headers, ginHeaders, "x-responsesapi-include-timing-metrics", "")
 	// fork(anticorr): 真实 codex 出站没有独立 Version 头，版本只体现在 UA。删除任何

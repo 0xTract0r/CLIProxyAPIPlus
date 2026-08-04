@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -25,11 +24,6 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	}
 	if isCodexOpenAIImageRequest(opts) {
 		return e.executeOpenAIImageStream(ctx, auth, req, opts)
-	}
-	// fork(anticorr ⑦-codex): attach a cwd-restore collector when normalization is on
-	// so the streamed response can restore fake→real tool-call paths.
-	if config.NormalizeAccountEnvEnabled(e.cfg) {
-		ctx, _ = helps.ContextWithCwdRestoreCollector(ctx)
 	}
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
@@ -66,9 +60,6 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	body, _ = sjson.DeleteBytes(body, "stream_options")
 	body = helps.SetStringIfDifferent(body, "model", baseModel)
 	body = normalizeCodexInstructions(body)
-	// fork(anticorr ⑦-codex): normalize the real cwd/git/CODEX_HOME paths in the
-	// outbound streamed body (capturing the fake→real mapping for response-side restore).
-	body = e.normalizeCodexPaths(ctx, body, auth, apiKey)
 	// fork: 图像策略统一走 applyImageGenerationPolicy（DisableImageGenerationOff 注入、
 	// 其余档位含 nil cfg 剥离 image_generation）。opts.Headers 透传用于 responses-lite 判定。
 	body = applyImageGenerationPolicy(e.cfg, body, baseModel, auth, opts.Headers)
@@ -208,10 +199,6 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			}
 
 			translatedLine = applyCodexIdentityExposeResponsePayload(translatedLine, identityState)
-			// fork(anticorr ⑦-codex): restore fake→real cwd in tool-call arguments per line.
-			// The .done/.completed events carry the complete arguments, so the fixed-literal
-			// fake root is whole there; per-line restoration applies.
-			translatedLine = restoreCodexResponseCwd(ctx, translatedLine)
 			chunks := helps.TranslateStreamWithClaudeInputTokens(ctx, to, responseFormat, req.Model, originalPayload, body, translatedLine, &param, claudeInputTokens)
 			for i := range chunks {
 				select {

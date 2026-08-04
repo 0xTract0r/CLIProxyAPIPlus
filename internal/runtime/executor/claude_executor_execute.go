@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -20,14 +19,6 @@ import (
 
 func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
 	ctx = contextWithClaudeInboundHeaders(ctx, opts.Headers)
-	// Account cwd normalization (requirement ⑦) is response-restorable: attach a
-	// collector so applyCloaking's NormalizeAccountEnvWithRestore can record the
-	// fake→real cwd mapping this request applies, and restore it in tool_use path
-	// arguments on the response. Only attached when the switch is on.
-	var cwdRestore *helps.CwdRestoreCollector
-	if config.NormalizeAccountEnvEnabled(e.cfg) {
-		ctx, cwdRestore = helps.ContextWithCwdRestoreCollector(ctx)
-	}
 	if opts.Alt == "responses/compact" {
 		return resp, statusErr{code: http.StatusNotImplemented, msg: "/responses/compact not supported"}
 	}
@@ -239,18 +230,6 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	}
 	data = restoreClaudeOAuthToolNamesFromResponse(data, claudeToolPrefix, auth.ToolPrefixDisabled(), oauthToolNamesReverseMap)
 	data = e.restoreResponseModel(data, req.Model)
-	// Restore the fake→real cwd inside tool_use path arguments before translation,
-	// the response-side half of account cwd normalization (requirement ⑦). The
-	// non-stream JSON form uses the tool_use input walker; a buffered upstream
-	// stream blob (from != to) is restored line-by-line. Conversational text is
-	// never touched.
-	if pairs := cwdRestore.Pairs(); len(pairs) > 0 {
-		if stream {
-			data = restoreClaudeStreamCwdBlob(pairs, data)
-		} else {
-			data = helps.RestoreClaudeToolUseCwdInResponse(pairs, data)
-		}
-	}
 	var param any
 	out := sdktranslator.TranslateNonStream(
 		ctx,

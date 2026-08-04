@@ -348,31 +348,12 @@ func NormalizeClaudeSonnetLongContextPolicy(policy string) string {
 	}
 }
 
-// NormalizeAccountEnvEnabled reports whether the global account env/cwd
-// normalization switch (requirement ⑦) is on. It defaults to false when the
-// pointer is unset.
-//
-// fork(anticorr): DORMANT. LoadConfig neutralizes NormalizeAccountEnv to nil
-// right after unmarshal (see LoadConfigOptional / ParseConfigBytes), so in
-// production this always returns false regardless of what config.yaml says —
-// cwd normalization is turned off and real cwd/home paths are passed through
-// unchanged. The pointer is still honored here on purpose so function-level unit
-// tests can construct a Config with the switch on and exercise the dormant
-// normalize implementations directly. Do not add extra suppression here; the
-// single reversible off-switch lives in the config load path.
-func NormalizeAccountEnvEnabled(cfg *Config) bool {
-	return cfg != nil &&
-		cfg.NormalizeAccountEnv != nil &&
-		*cfg.NormalizeAccountEnv
-}
-
 // NormalizeSdkCliEntrypointEnabled reports whether the sdk-cli→cli
 // cc_entrypoint normalization (see ClaudeConfig.NormalizeSdkCliEntrypoint) is
-// active. Unlike NormalizeAccountEnvEnabled, this defaults to true (enabled)
-// when the pointer is unset, so a stock config normalizes Agent SDK /
-// `claude -p` traffic without an explicit opt-in. Set
-// claude.normalize-sdk-cli-entrypoint: false to opt out and restore the
-// previous "mirror inbound entrypoint verbatim" behavior.
+// active. It defaults to true (enabled) when the pointer is unset, so a stock
+// config normalizes Agent SDK / `claude -p` traffic without an explicit
+// opt-in. Set claude.normalize-sdk-cli-entrypoint: false to opt out and
+// restore the previous "mirror inbound entrypoint verbatim" behavior.
 func NormalizeSdkCliEntrypointEnabled(cfg *Config) bool {
 	if cfg == nil || cfg.Claude.NormalizeSdkCliEntrypoint == nil {
 		return true

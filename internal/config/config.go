@@ -164,14 +164,6 @@ type Config struct {
 	// ManagedHeaderProfile controls online refresh of version-sensitive managed header profiles.
 	ManagedHeaderProfile ManagedHeaderProfileConfig `yaml:"managed-header-profile" json:"managed-header-profile"`
 
-	// NormalizeAccountEnv is a global switch (requirement ⑦) that rewrites the real
-	// cwd / home paths inside <env> and <system-reminder> blocks of the request body
-	// to a per-account canonical path. It is independent of cloak / device-profile
-	// stabilization and defaults to disabled (nil/false): when off the body is left
-	// untouched, so enabling it is a safe, zero-migration gray rollout that can be
-	// rolled back by turning the switch off again.
-	NormalizeAccountEnv *bool `yaml:"normalize-account-env,omitempty" json:"normalize-account-env,omitempty"`
-
 	// DisableClaudeCloakMode globally disables Claude request cloaking when true.
 	// Cloaking disguises requests as the official Claude Code CLI and replaces the
 	// system prompt. When true, every Claude credential defaults to no cloaking

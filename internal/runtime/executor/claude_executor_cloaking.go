@@ -546,22 +546,6 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 	}
 	payload = helps.InjectAccountDeviceID(payload, authDir, auth, apiKey)
 
-	// Account env/cwd normalization (requirement ⑦). Like the device_id rewrite
-	// above, this runs before the ShouldCloak gate so it also applies to real
-	// claude-cli clients, and before checkSystemInstructionsWithSigningMode below
-	// so the cch billing fingerprint is computed over the normalized body. It is
-	// gated by an independent global switch (default off): when off the body is
-	// left untouched (zero behavior change), when on the real cwd / home paths
-	// inside <env> / <system-reminder> blocks are rewritten to a per-account
-	// canonical path.
-	if config.NormalizeAccountEnvEnabled(cfg) {
-		// WithRestore captures the fake→real cwd mapping into the collector attached
-		// to ctx (when present) so the response side can restore tool_use path
-		// arguments. When no collector is attached this is identical to the plain
-		// NormalizeAccountEnv (zero behavior change).
-		payload = helps.NormalizeAccountEnvWithRestore(ctx, payload, auth, apiKey, cfg)
-	}
-
 	// Determine if the remaining (broader) cloak transformations should be applied.
 	// claude-cli clients are intentionally excluded here; only the device_id
 	// rewrite above applies to them.
