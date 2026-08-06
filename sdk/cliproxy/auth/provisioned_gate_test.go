@@ -155,3 +155,103 @@ func TestFarmRequireProvisionedEnabled_Parsing(t *testing.T) {
 		})
 	}
 }
+
+// claudeAuthWithMetadataOverride builds a Claude auth whose PERSISTED metadata
+// carries a claude_device_id value, then hydrates the attribute mirror exactly
+// like the live pipeline (ApplyRuntimeFieldsFromMetadata) so classification sees
+// the same state the gate does.
+func claudeAuthWithMetadataOverride(deviceID string) *Auth {
+	auth := &Auth{ID: "claude-acct", Provider: "claude", Status: StatusActive}
+	auth.Metadata = map[string]any{ClaudeDeviceIDMetadataKey: deviceID}
+	ApplyRuntimeFieldsFromMetadata(auth)
+	return auth
+}
+
+// TestClaudeDeviceIDSource_ContainerSynced: a valid persisted override marks a
+// real container binding -> container_synced + farm_bound true.
+func TestClaudeDeviceIDSource_ContainerSynced(t *testing.T) {
+	auth := claudeAuthWithMetadataOverride(validProvisionedDeviceID)
+	source, bound := ClaudeDeviceIDSource(auth)
+	if source != DeviceIDSourceContainerSynced {
+		t.Fatalf("source = %q, want %q", source, DeviceIDSourceContainerSynced)
+	}
+	if !bound {
+		t.Fatalf("farmBound = false, want true for a container-synced account")
+	}
+}
+
+// TestClaudeDeviceIDSource_SyntheticNoOverride: no override at all -> synthetic,
+// not farm-bound.
+func TestClaudeDeviceIDSource_SyntheticNoOverride(t *testing.T) {
+	auth := &Auth{ID: "claude-acct", Provider: "claude", Status: StatusActive}
+	source, bound := ClaudeDeviceIDSource(auth)
+	if source != DeviceIDSourceSynthetic {
+		t.Fatalf("source = %q, want %q", source, DeviceIDSourceSynthetic)
+	}
+	if bound {
+		t.Fatalf("farmBound = true, want false for an unbound synthetic account")
+	}
+}
+
+// TestClaudeDeviceIDSource_SyntheticClearedOverride: an explicitly emptied
+// override is an intentional synthetic fallback, NOT drift.
+func TestClaudeDeviceIDSource_SyntheticClearedOverride(t *testing.T) {
+	auth := claudeAuthWithMetadataOverride("")
+	source, bound := ClaudeDeviceIDSource(auth)
+	if source != DeviceIDSourceSynthetic {
+		t.Fatalf("source = %q, want %q (empty override is intentional synthetic, not drift)", source, DeviceIDSourceSynthetic)
+	}
+	if bound {
+		t.Fatalf("farmBound = true, want false")
+	}
+}
+
+// TestClaudeDeviceIDSource_Drift: a residual, non-empty-but-invalid persisted
+// override marks historical drift -> drift, not farm-bound.
+func TestClaudeDeviceIDSource_Drift(t *testing.T) {
+	auth := claudeAuthWithMetadataOverride("not-a-valid-64-hex-device-id")
+	// Sanity: hydration must have refused to mirror the invalid value.
+	if _, ok := auth.Attributes[ClaudeDeviceIDAttributeKey]; ok {
+		t.Fatalf("invalid override was mirrored into attributes; drift precondition broken")
+	}
+	source, bound := ClaudeDeviceIDSource(auth)
+	if source != DeviceIDSourceDrift {
+		t.Fatalf("source = %q, want %q", source, DeviceIDSourceDrift)
+	}
+	if bound {
+		t.Fatalf("farmBound = true, want false for a drifted account")
+	}
+}
+
+// TestClaudeDeviceIDSource_UnknownNonClaudeAndNil: the classifier is Claude-only.
+func TestClaudeDeviceIDSource_UnknownNonClaudeAndNil(t *testing.T) {
+	codex := claudeAuthWithMetadataOverride(validProvisionedDeviceID)
+	codex.Provider = "codex"
+	if source, bound := ClaudeDeviceIDSource(codex); source != DeviceIDSourceUnknown || bound {
+		t.Fatalf("non-Claude: got (%q, %v), want (%q, false)", source, bound, DeviceIDSourceUnknown)
+	}
+	if source, bound := ClaudeDeviceIDSource(nil); source != DeviceIDSourceUnknown || bound {
+		t.Fatalf("nil: got (%q, %v), want (%q, false)", source, bound, DeviceIDSourceUnknown)
+	}
+}
+
+// TestClaudeDeviceIDSource_FarmBoundMatchesGate is the cross-consistency guard:
+// farm_bound==true must be exactly the set of Claude accounts the armed gate
+// would allow (i.e. NOT blocked). This is the property the three-end contract
+// relies on and the reason the classifier reuses authHasProvisionedDeviceBinding.
+func TestClaudeDeviceIDSource_FarmBoundMatchesGate(t *testing.T) {
+	t.Setenv(FarmRequireProvisionedEnvVar, "1")
+	cases := []*Auth{
+		claudeAuthWithMetadataOverride(validProvisionedDeviceID), // bound
+		&Auth{ID: "a", Provider: "claude", Status: StatusActive}, // synthetic
+		claudeAuthWithMetadataOverride(""),                       // cleared -> synthetic
+		claudeAuthWithMetadataOverride("not-valid"),              // drift
+	}
+	for i, auth := range cases {
+		_, bound := ClaudeDeviceIDSource(auth)
+		blocked := forkRequireProvisionedBlocked(auth)
+		if bound == blocked {
+			t.Fatalf("case %d: farmBound=%v but gateBlocked=%v; farm_bound must equal NOT-blocked", i, bound, blocked)
+		}
+	}
+}

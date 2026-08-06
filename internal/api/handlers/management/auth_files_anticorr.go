@@ -194,9 +194,18 @@ type authFileAccountSettingsView struct {
 	// hex characters are exposed, followed by an ellipsis, so that callers can
 	// compare stability across requests without recovering the full derived value.
 	// It is never persisted and PATCH requests must not include this field.
-	SyntheticDeviceID string                            `json:"synthetic_device_id,omitempty"`
-	Activation        authFileAccountSettingsActivation `json:"activation"`
-	Warnings          []string                          `json:"warnings"`
+	SyntheticDeviceID string `json:"synthetic_device_id,omitempty"`
+	// DeviceIDSource and FarmBound project the farm telemetry contract
+	// (P2 "咬合"): DeviceIDSource is one of container_synced / synthetic / drift /
+	// unknown, and FarmBound reports whether the account is bound to a real
+	// container device_id. Both are derived from coreauth.ClaudeDeviceIDSource,
+	// which reuses the exact supply-atomicity gate predicate so FarmBound==true is
+	// precisely the set the gate would allow. Additive, read-only fields; PATCH
+	// must not include them. Non-Claude accounts report unknown / false.
+	DeviceIDSource string                            `json:"device_id_source"`
+	FarmBound      bool                              `json:"farm_bound"`
+	Activation     authFileAccountSettingsActivation `json:"activation"`
+	Warnings       []string                          `json:"warnings"`
 }
 
 type authFileAccountSettingsActivation struct {
@@ -823,6 +832,12 @@ func buildAuthFileAccountSettingsView(auth *coreauth.Auth, cfg *config.Config) a
 		}
 	}
 
+	// Farm telemetry contract (P2): classify the account's device_id provenance
+	// and farm-bound state. Derivation is centralized in coreauth.ClaudeDeviceIDSource
+	// (single source of truth, reuses the supply-atomicity gate predicate) rather
+	// than recomputed here. Non-Claude accounts return unknown / false.
+	deviceIDSource, farmBound := coreauth.ClaudeDeviceIDSource(auth)
+
 	return authFileAccountSettingsView{
 		ProxyURL:           authProxyURL(auth),
 		Note:               authNote(auth),
@@ -837,6 +852,8 @@ func buildAuthFileAccountSettingsView(auth *coreauth.Auth, cfg *config.Config) a
 		ManagedHeaderState: managedHeaderState,
 		ClientObservations: clientObservations,
 		SyntheticDeviceID:  syntheticDeviceIDMasked,
+		DeviceIDSource:     deviceIDSource,
+		FarmBound:          farmBound,
 		Activation: authFileAccountSettingsActivation{
 			Summary:   accountSettingsActivationSummary(auth, managedHeaders, extraHeaders, refreshEnabled, transportRuntimeEnforced, tlsRuntimeEnforced),
 			State:     accountSettingsActivationState(auth, stored.TransportProfile, stored.TLSProfile, refreshEnabled, transportRuntimeEnforced, tlsRuntimeEnforced),

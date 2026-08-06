@@ -2320,3 +2320,115 @@ func containsString(values []string, want string) bool {
 	}
 	return false
 }
+
+// getAccountSettingsRaw registers auth, calls the GET handler, and returns the
+// decoded typed response plus the raw account_settings JSON object so tests can
+// assert the exact contract field names (device_id_source / farm_bound).
+func getAccountSettingsRaw(t *testing.T, record *coreauth.Auth) (authFileAccountSettingsResponse, map[string]json.RawMessage) {
+	t.Helper()
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	if _, err := manager.Register(context.Background(), record); err != nil {
+		t.Fatalf("failed to register auth record: %v", err)
+	}
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v0/management/auth-files/account-settings?name="+record.ID, nil)
+	h.GetAuthFileAccountSettings(ctx)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+
+	var typed authFileAccountSettingsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &typed); err != nil {
+		t.Fatalf("decode typed: %v", err)
+	}
+	var envelope struct {
+		AccountSettings map[string]json.RawMessage `json:"account_settings"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("decode raw: %v", err)
+	}
+	return typed, envelope.AccountSettings
+}
+
+// TestGetAuthFileAccountSettings_FarmContractContainerSynced verifies a Claude
+// account with a valid claude_device_id override projects
+// device_id_source=container_synced + farm_bound=true, with EXACT contract field
+// names present in the JSON (frontend AG2 depends on these).
+func TestGetAuthFileAccountSettings_FarmContractContainerSynced(t *testing.T) {
+	deviceID := strings.Repeat("a", 64)
+	record := &coreauth.Auth{
+		ID:       "claude-bound.json",
+		FileName: "claude-bound.json",
+		Provider: "claude",
+		Metadata: map[string]any{"type": "claude", coreauth.ClaudeDeviceIDMetadataKey: deviceID},
+	}
+	typed, raw := getAccountSettingsRaw(t, record)
+
+	if _, ok := raw["device_id_source"]; !ok {
+		t.Fatalf("response missing exact contract field device_id_source; keys=%v", rawKeys(raw))
+	}
+	if _, ok := raw["farm_bound"]; !ok {
+		t.Fatalf("response missing exact contract field farm_bound; keys=%v", rawKeys(raw))
+	}
+	if typed.AccountSettings.DeviceIDSource != coreauth.DeviceIDSourceContainerSynced {
+		t.Fatalf("device_id_source = %q, want %q", typed.AccountSettings.DeviceIDSource, coreauth.DeviceIDSourceContainerSynced)
+	}
+	if !typed.AccountSettings.FarmBound {
+		t.Fatalf("farm_bound = false, want true for a container-synced account")
+	}
+}
+
+// TestGetAuthFileAccountSettings_FarmContractSynthetic verifies an unbound Claude
+// account projects device_id_source=synthetic + farm_bound=false.
+func TestGetAuthFileAccountSettings_FarmContractSynthetic(t *testing.T) {
+	record := &coreauth.Auth{
+		ID:       "claude-unbound.json",
+		FileName: "claude-unbound.json",
+		Provider: "claude",
+		Metadata: map[string]any{"type": "claude"},
+	}
+	typed, _ := getAccountSettingsRaw(t, record)
+	if typed.AccountSettings.DeviceIDSource != coreauth.DeviceIDSourceSynthetic {
+		t.Fatalf("device_id_source = %q, want %q", typed.AccountSettings.DeviceIDSource, coreauth.DeviceIDSourceSynthetic)
+	}
+	if typed.AccountSettings.FarmBound {
+		t.Fatalf("farm_bound = true, want false for an unbound account")
+	}
+}
+
+// TestGetAuthFileAccountSettings_FarmContractNonClaudeUnknown verifies a
+// non-Claude account is unknown / not farm-bound (只管 Claude).
+func TestGetAuthFileAccountSettings_FarmContractNonClaudeUnknown(t *testing.T) {
+	record := &coreauth.Auth{
+		ID:         "codex.json",
+		FileName:   "codex.json",
+		Provider:   "codex",
+		Attributes: map[string]string{"path": "/tmp/codex.json"},
+		Metadata:   map[string]any{"type": "codex", "proxy_url": "http://p"},
+	}
+	typed, raw := getAccountSettingsRaw(t, record)
+	if _, ok := raw["device_id_source"]; !ok {
+		t.Fatalf("non-Claude response still must carry device_id_source (additive field)")
+	}
+	if typed.AccountSettings.DeviceIDSource != coreauth.DeviceIDSourceUnknown {
+		t.Fatalf("device_id_source = %q, want %q", typed.AccountSettings.DeviceIDSource, coreauth.DeviceIDSourceUnknown)
+	}
+	if typed.AccountSettings.FarmBound {
+		t.Fatalf("farm_bound = true, want false for a non-Claude account")
+	}
+}
+
+func rawKeys(m map[string]json.RawMessage) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
+}

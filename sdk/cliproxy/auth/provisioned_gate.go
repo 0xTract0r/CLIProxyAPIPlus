@@ -96,3 +96,77 @@ func forkRequireProvisionedBlocked(auth *Auth) bool {
 	}
 	return !authHasProvisionedDeviceBinding(auth)
 }
+
+// device_id_source enum values for the farm telemetry contract. These string
+// constants are the single source of truth shared with the management
+// projection (GET /auth-files/account-settings) and, downstream, the frontend
+// (field name device_id_source). Do not rename without updating the three-end
+// contract.
+const (
+	// DeviceIDSourceContainerSynced marks a Claude account bound to a real
+	// container that persisted a valid claude_device_id override. This is the
+	// only "normal"/servable state under the supply-atomicity gate.
+	DeviceIDSourceContainerSynced = "container_synced"
+	// DeviceIDSourceSynthetic marks a Claude account with no container binding:
+	// it runs on the per-account synthetic derived device_id (never provisioned,
+	// or the override was explicitly cleared).
+	DeviceIDSourceSynthetic = "synthetic"
+	// DeviceIDSourceDrift marks a Claude account whose persisted claude_device_id
+	// metadata carries a non-empty value that no longer validates as a real
+	// device_id (historical binding that drifted/corrupted). The runtime mirror
+	// is cleared so serving falls back to the synthetic value, but the residual
+	// metadata distinguishes it from a clean never-bound account.
+	DeviceIDSourceDrift = "drift"
+	// DeviceIDSourceUnknown marks accounts the farm binding concept does not
+	// apply to (nil auth or a non-Claude provider). farm_bound is always false
+	// here; other providers are never fail-closed by the gate.
+	DeviceIDSourceUnknown = "unknown"
+)
+
+// claudeDeviceIDMetadataValue reports whether a persisted claude_device_id
+// metadata entry exists and returns its trimmed string value. It reads the
+// persisted Metadata (not the hydrated Attributes mirror) so it can observe a
+// residual value even after applyClaudeDeviceIDFromMetadata clears the invalid
+// attribute mirror.
+func claudeDeviceIDMetadataValue(auth *Auth) (present bool, value string) {
+	if auth == nil || auth.Metadata == nil {
+		return false, ""
+	}
+	raw, ok := auth.Metadata[ClaudeDeviceIDMetadataKey]
+	if !ok {
+		return false, ""
+	}
+	str, _ := raw.(string)
+	return true, strings.TrimSpace(str)
+}
+
+// ClaudeDeviceIDSource classifies a Claude account's device_id provenance for
+// the farm telemetry contract and reports whether it is farm-bound. It is the
+// canonical derivation reused by the management projection so the two ends never
+// diverge, and — crucially — its container_synced/farm_bound decision reuses the
+// exact same predicate (authHasProvisionedDeviceBinding) the supply-atomicity
+// fail-closed gate uses, so farm_bound == true is precisely the set of accounts
+// the gate would allow to serve.
+//
+// It is scoped to Claude only ("只管 Claude"): a nil auth or any non-Claude
+// provider is reported as unknown / not farm-bound, never blocked and never
+// mislabeled. The classification never mutates auth.
+func ClaudeDeviceIDSource(auth *Auth) (source string, farmBound bool) {
+	if auth == nil || strings.ToLower(strings.TrimSpace(auth.Provider)) != "claude" {
+		return DeviceIDSourceUnknown, false
+	}
+	// container_synced is decided by the exact gate predicate (attribute mirror),
+	// guaranteeing farm_bound and the gate can never disagree.
+	if authHasProvisionedDeviceBinding(auth) {
+		return DeviceIDSourceContainerSynced, true
+	}
+	// A residual, non-empty-but-invalid persisted override marks historical
+	// drift: a device_id was recorded once but no longer validates. An explicitly
+	// empty value (operator cleared the override) is an intentional synthetic
+	// fallback, not drift.
+	if present, value := claudeDeviceIDMetadataValue(auth); present && value != "" && !IsValidClaudeDeviceID(value) {
+		return DeviceIDSourceDrift, false
+	}
+	// No binding and no residual override: pure per-account synthetic device_id.
+	return DeviceIDSourceSynthetic, false
+}
