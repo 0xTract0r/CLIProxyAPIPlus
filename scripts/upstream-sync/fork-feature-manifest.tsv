@@ -94,6 +94,15 @@ fork文件-反关联支撑	disable_image_generation_mode.go	file	-	internal/conf
 反关联-Codex高水位持久化调用点	persistCodexDeviceHighWater@ws_execute	pattern	e\.persistCodexDeviceHighWater\(	internal/runtime/executor/codex_websockets_execute.go
 反关联-Codex高水位持久化调用点	persistCodexDeviceHighWater@ws_stream	pattern	e\.persistCodexDeviceHighWater\(	internal/runtime/executor/codex_websockets_stream.go
 
+# === Codex WS uTLS 出站接线守护(2) ===
+# 补硬:本 wave 给 Codex 响应 WebSocket 的 wss 出站握手挂 codex-rs(rustls) uTLS
+#   ClientHello(JA3 e4d448cd...),替换裸 gorilla/websocket 的裸 Go TLS 握手
+#   (JA3 03117a8e...)。上游同步若删掉工厂或接线,出站会回退裸 Go TLS 指纹泄漏——仅靠
+#   符号存在性发现不了整条接线被拆,这里额外断言工厂符号与调用点仍在。调用点用
+#   "(dialer," 精确匹配【调用】而非函数定义("(dialer *websocket.Dialer")。
+反关联-Codex WS uTLS工厂	NewCodexRustlsTLSDialer	symbol	^func NewCodexRustlsTLSDialer\(	internal/runtime/executor/helps/utls_client.go
+反关联-Codex WS uTLS接线	applyCodexRustlsWebsocketTLS@ws_connection	pattern	applyCodexRustlsWebsocketTLS\(dialer,	internal/runtime/executor/codex_websockets_connection.go
+
 # === fork 自定义 Amp(ampcode)管理路由(5) ===
 # 补硬:fork-only 的 /v0/management/ampcode 管理端点整段(server_management.go 内 Amp CLI
 #   integration 路由块)被上游同步删掉时,仅靠 amp 模块目录存在性条目无法发现。这里挑 5 条

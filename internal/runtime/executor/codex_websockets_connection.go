@@ -32,6 +32,12 @@ func (e *CodexWebsocketsExecutor) dialCodexWebsocket(ctx context.Context, auth *
 	dialer := newProxyAwareWebsocketDialer(e.cfg, auth)
 	dialer.HandshakeTimeout = codexResponsesWebsocketHandshakeTO
 	dialer.EnableCompression = true
+	// Present the real codex-rs (rustls) uTLS ClientHello on the wss handshake
+	// instead of a bare Go TLS ClientHello. This is codex-only: the shared
+	// newProxyAwareWebsocketDialer is also used by the xAI executor, which must
+	// keep its own TLS stack, so the codex-rs fingerprint is applied here rather
+	// than inside the shared dialer.
+	applyCodexRustlsWebsocketTLS(dialer, codexWebsocketEffectiveProxyURL(e.cfg, auth))
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -218,6 +224,38 @@ func newProxyAwareWebsocketDialer(cfg *config.Config, auth *cliproxyauth.Auth) *
 	}
 
 	return dialer
+}
+
+// applyCodexRustlsWebsocketTLS routes the codex responses WebSocket wss handshake
+// through the strict codex-rs (rustls) uTLS dialer so the outbound ClientHello is
+// the real codex-rs fingerprint (JA3 e4d448cd...) rather than a bare Go TLS
+// ClientHello (JA3 03117a8e...). It is codex-only and must not be applied to the
+// xAI executor, which shares newProxyAwareWebsocketDialer but keeps its own TLS.
+//
+// dialer.Proxy is forced to nil: gorilla/websocket still consults Dialer.Proxy
+// even when NetDialTLSContext is set and would otherwise wrap the uTLS dialer as
+// the base dialer used to REACH a proxy (double-proxy). With Proxy nil the uTLS
+// closure is the sole owner of the proxy tunnel (which it already performs via
+// proxyutil.BuildDialer for the same proxyURL). NetDialContext, set by
+// newProxyAwareWebsocketDialer for the plaintext ws:// path, is left intact; codex
+// is always wss so it is not exercised in production.
+//
+// Fail-closed: if the codex-rs uTLS dialer cannot be constructed, every dial fails
+// with the construction error instead of downgrading to bare Go TLS or plaintext.
+func applyCodexRustlsWebsocketTLS(dialer *websocket.Dialer, proxyURL string) {
+	if dialer == nil {
+		return
+	}
+	dialer.Proxy = nil
+	tlsDial, errTLS := helps.NewCodexRustlsTLSDialer(strings.TrimSpace(proxyURL))
+	if errTLS != nil {
+		log.Errorf("codex websockets executor: build codex-rs uTLS dialer failed: %v", errTLS)
+		dialer.NetDialTLSContext = func(context.Context, string, string) (net.Conn, error) {
+			return nil, fmt.Errorf("codex websockets executor: codex-rs uTLS dialer unavailable: %w", errTLS)
+		}
+		return
+	}
+	dialer.NetDialTLSContext = tlsDial
 }
 
 func buildCodexResponsesWebsocketURL(httpURL string) (string, error) {

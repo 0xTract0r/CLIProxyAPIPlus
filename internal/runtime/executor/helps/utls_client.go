@@ -2,6 +2,7 @@ package helps
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"net/http"
 	"strings"
@@ -192,6 +193,56 @@ func newStrictUtlsRoundTripper(proxyURL string, clientHello tls.ClientHelloID) *
 	rt := newUtlsRoundTripper(proxyURL, clientHello)
 	rt.disableFallback = true
 	return rt
+}
+
+// newCodexRustlsStrictRoundTripper builds the strict (no-downgrade) codex-rs
+// (rustls) uTLS round tripper: HelloCustom resolved from the codex-rs profile,
+// customSpecID set so dialTLSContext materializes the codex-rs ClientHelloSpec
+// (JA3 e4d448cd...), and disableFallback=true so a failed handshake returns an
+// error rather than downgrading to a Chrome ClientHello. It is the shared
+// construction behind both the codex HTTP client path (via
+// profileRequiresNoDowngrade) and NewCodexRustlsTLSDialer, so the WebSocket TLS
+// dialer presents exactly the same codex-rs fingerprint as codex HTTP serving.
+// proxyURL is the per-account outbound proxy (empty for direct); the round
+// tripper's dialer tunnels through it (socks5h remote DNS or http/https CONNECT)
+// via proxyutil.BuildDialer.
+func newCodexRustlsStrictRoundTripper(proxyURL string) (*utlsRoundTripper, error) {
+	clientHello, ok := resolveClaudeClientHelloID(codexRustlsClientHelloProfileID)
+	if !ok {
+		return nil, fmt.Errorf("utls: cannot resolve codex-rs ClientHello profile %q", codexRustlsClientHelloProfileID)
+	}
+	rt := newStrictUtlsRoundTripper(proxyURL, clientHello)
+	rt.customSpecID = codexRustlsClientHelloProfileID
+	return rt, nil
+}
+
+// NewCodexRustlsTLSDialer returns a TLS dialing function for the codex WebSocket
+// (gorilla/websocket) outbound path so wss upstreams are dialed with the real
+// codex-rs (rustls) uTLS ClientHello (JA3 e4d448cd...) instead of a bare Go TLS
+// ClientHello (JA3 03117a8e...), which would leak that this is not the real codex
+// client.
+//
+// The returned closure has the exact signature gorilla's Dialer.NetDialTLSContext
+// expects (func(ctx, network, addr) (net.Conn, error)) and reuses the SAME strict
+// codex round tripper as the codex HTTP client:
+//   - proxyURL is tunneled inside the closure (socks5h remote DNS or http/https
+//     CONNECT via proxyutil.BuildDialer). The caller MUST therefore set the gorilla
+//     Dialer.Proxy to nil: gorilla still consults Dialer.Proxy even when
+//     NetDialTLSContext is set and would otherwise wrap this TLS dialer as the base
+//     dialer used to REACH a proxy (double-proxy).
+//   - codex strict / no-downgrade: a failed codex-rs handshake returns an error; it
+//     NEVER downgrades to a Chrome ClientHello (which would change the JA3 and
+//     re-introduce the UA/TLS mismatch) and NEVER falls back to plaintext.
+//
+// Construction is fail-closed: if the round tripper cannot be built it returns an
+// error (never a nil dialer), so the caller fails the dial rather than silently
+// dialing with bare Go TLS.
+func NewCodexRustlsTLSDialer(proxyURL string) (func(ctx context.Context, network, addr string) (net.Conn, error), error) {
+	rt, err := newCodexRustlsStrictRoundTripper(proxyURL)
+	if err != nil {
+		return nil, err
+	}
+	return rt.dialTLSContext, nil
 }
 
 // newHTTP11Transport builds an HTTP/1.1-only transport that performs the uTLS
