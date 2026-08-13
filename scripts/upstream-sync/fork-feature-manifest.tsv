@@ -55,6 +55,8 @@
 反关联-farm供给门	forkRequireProvisionedBlocked	symbol	^func forkRequireProvisionedBlocked\(	sdk/cliproxy/auth/provisioned_gate.go
 反关联-farm供给门	blockReasonUnprovisioned	symbol	^const blockReasonUnprovisioned 	sdk/cliproxy/auth/provisioned_gate.go
 反关联-farm供给门	供给门接线到选号阻断	pattern	forkRequireProvisionedBlocked\(auth\)	sdk/cliproxy/auth/selector.go
+反关联-farm按账号纳管	AuthFarmEnrolled	symbol	^func AuthFarmEnrolled\(	sdk/cliproxy/auth/farm_enrolled.go
+反关联-farm按账号纳管	供给门只拦已纳管账号	pattern	!AuthFarmEnrolled\(auth\)	sdk/cliproxy/auth/provisioned_gate.go
 反关联-Codex路径归一化	normalizeCodexPaths	symbol	^func normalizeCodexPaths\(	internal/runtime/executor/helps/normalize_codex_env.go
 反关联-Codex路径归一化	persistCodexDeviceHighWater	symbol	^func \(e \*CodexExecutor\) persistCodexDeviceHighWater\(	internal/runtime/executor/codex_executor.go
 
@@ -92,6 +94,7 @@ fork文件-反关联支撑	codex_device_high_water.go	file	-	sdk/cliproxy/auth/c
 fork文件-反关联支撑	conductor_auto_quarantine.go	file	-	sdk/cliproxy/auth/conductor_auto_quarantine.go
 fork文件-反关联支撑	farm_pin.go	file	-	sdk/api/handlers/farm_pin.go
 fork文件-反关联支撑	provisioned_gate.go	file	-	sdk/cliproxy/auth/provisioned_gate.go
+fork文件-反关联支撑	farm_enrolled.go	file	-	sdk/cliproxy/auth/farm_enrolled.go
 fork文件-反关联支撑	tls_transport_probe/main.go	file	-	cmd/tls_transport_probe/main.go
 fork文件-反关联支撑	disable_image_generation_mode.go	file	-	internal/config/disable_image_generation_mode.go
 

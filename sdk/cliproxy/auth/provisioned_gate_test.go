@@ -18,6 +18,17 @@ func claudeAuthWithOverride(deviceID string) *Auth {
 	return auth
 }
 
+// claudeAuthEnrolledWithOverride behaves like claudeAuthWithOverride but
+// additionally marks the account farm-enrolled (AuthFarmEnrolled,
+// farm_enrolled.go). Enrollment is the account-level precondition the gate
+// now requires in addition to the binding check: an account must be BOTH
+// enrolled AND unbound to be fail-closed.
+func claudeAuthEnrolledWithOverride(deviceID string) *Auth {
+	auth := claudeAuthWithOverride(deviceID)
+	auth.Metadata = map[string]any{FarmEnrolledMetadataKey: true}
+	return auth
+}
+
 // TestForkRequireProvisioned_FlagOffIsNoop is the critical no-op guard: with
 // FARM_REQUIRE_PROVISIONED unset, an unprovisioned Claude account (no real
 // device_id override, only the synthetic fallback) must NOT be blocked, so
@@ -44,23 +55,24 @@ func TestForkRequireProvisioned_FlagOffIsNoop(t *testing.T) {
 	}
 }
 
-// TestForkRequireProvisioned_FlagOnBlocksUnprovisionedClaude confirms the
-// fail-closed behaviour: with the flag armed, a Claude account that carries only
-// a synthetic device_id (no valid override binding) is skipped entirely with the
-// distinct blockReasonUnprovisioned and no retry time.
-func TestForkRequireProvisioned_FlagOnBlocksUnprovisionedClaude(t *testing.T) {
+// TestForkRequireProvisioned_FlagOnBlocksUnprovisionedEnrolledClaude confirms
+// the fail-closed behaviour: with the flag armed AND the account explicitly
+// farm-enrolled, a Claude account that carries only a synthetic device_id (no
+// valid override binding) is skipped entirely with the distinct
+// blockReasonUnprovisioned and no retry time.
+func TestForkRequireProvisioned_FlagOnBlocksUnprovisionedEnrolledClaude(t *testing.T) {
 	t.Setenv(FarmRequireProvisionedEnvVar, "1")
 
-	auth := claudeAuthWithOverride("")
+	auth := claudeAuthEnrolledWithOverride("")
 	now := time.Now()
 
 	if !forkRequireProvisionedBlocked(auth) {
-		t.Fatalf("forkRequireProvisionedBlocked = false, want true (unprovisioned account must fail closed)")
+		t.Fatalf("forkRequireProvisionedBlocked = false, want true (enrolled+unprovisioned account must fail closed)")
 	}
 	for _, model := range []string{"", "claude-sonnet-4-5"} {
 		blocked, reason, next := isAuthBlockedForModel(auth, model, now)
 		if !blocked {
-			t.Fatalf("model=%q: blocked = false, want true (unprovisioned must be skipped)", model)
+			t.Fatalf("model=%q: blocked = false, want true (enrolled+unprovisioned must be skipped)", model)
 		}
 		if reason != blockReasonUnprovisioned {
 			t.Fatalf("model=%q: reason = %v, want %v (distinct from disabled/cooldown)", model, reason, blockReasonUnprovisioned)
@@ -71,21 +83,68 @@ func TestForkRequireProvisioned_FlagOnBlocksUnprovisionedClaude(t *testing.T) {
 	}
 }
 
-// TestForkRequireProvisioned_FlagOnAllowsProvisionedClaude confirms the recovery
-// side: a Claude account WITH a valid claude_device_id override binding passes
-// the gate and is servable even when the flag is armed.
-func TestForkRequireProvisioned_FlagOnAllowsProvisionedClaude(t *testing.T) {
+// TestForkRequireProvisioned_FlagOnAllowsUnenrolledUnprovisionedClaude is the
+// single most important regression guard for the account-scoped gate: with
+// the global flag armed, a Claude account that was NEVER farm-enrolled — which
+// today means every pre-existing account, including every production-stable
+// account — must be passed through unconditionally even though it also
+// carries no real device_id override. Arming the global flag must be a
+// complete no-op for the entire non-enrolled account population.
+func TestForkRequireProvisioned_FlagOnAllowsUnenrolledUnprovisionedClaude(t *testing.T) {
 	t.Setenv(FarmRequireProvisionedEnvVar, "1")
 
-	auth := claudeAuthWithOverride(validProvisionedDeviceID)
+	auth := claudeAuthWithOverride("") // unenrolled: no Metadata[farm_enrolled] at all
 	now := time.Now()
 
 	if forkRequireProvisionedBlocked(auth) {
-		t.Fatalf("forkRequireProvisionedBlocked = true for a provisioned account, want false")
+		t.Fatalf("forkRequireProvisionedBlocked = true for an unenrolled account, want false (gate must be a no-op for non-enrolled accounts)")
+	}
+	blocked, reason, next := isAuthBlockedForModel(auth, "", now)
+	if blocked {
+		t.Fatalf("blocked = true for an unenrolled account, want false (old/production-stable accounts must stay immune)")
+	}
+	if reason != blockReasonNone {
+		t.Fatalf("reason = %v, want %v", reason, blockReasonNone)
+	}
+	if !next.IsZero() {
+		t.Fatalf("next = %v, want zero", next)
+	}
+}
+
+// TestForkRequireProvisioned_FlagOnAllowsExplicitlyUnenrolledClaude covers the
+// explicit-false variant of unenrolled (Metadata present but farm_enrolled ==
+// false), which must behave identically to the metadata-absent case above.
+func TestForkRequireProvisioned_FlagOnAllowsExplicitlyUnenrolledClaude(t *testing.T) {
+	t.Setenv(FarmRequireProvisionedEnvVar, "1")
+
+	auth := claudeAuthWithOverride("")
+	auth.Metadata = map[string]any{FarmEnrolledMetadataKey: false}
+	now := time.Now()
+
+	if forkRequireProvisionedBlocked(auth) {
+		t.Fatalf("forkRequireProvisionedBlocked = true for an explicitly-unenrolled account, want false")
+	}
+	blocked, _, _ := isAuthBlockedForModel(auth, "", now)
+	if blocked {
+		t.Fatalf("blocked = true for an explicitly-unenrolled account, want false")
+	}
+}
+
+// TestForkRequireProvisioned_FlagOnAllowsProvisionedClaude confirms the recovery
+// side: an enrolled Claude account WITH a valid claude_device_id override
+// binding passes the gate and is servable even when the flag is armed.
+func TestForkRequireProvisioned_FlagOnAllowsProvisionedClaude(t *testing.T) {
+	t.Setenv(FarmRequireProvisionedEnvVar, "1")
+
+	auth := claudeAuthEnrolledWithOverride(validProvisionedDeviceID)
+	now := time.Now()
+
+	if forkRequireProvisionedBlocked(auth) {
+		t.Fatalf("forkRequireProvisionedBlocked = true for an enrolled+provisioned account, want false")
 	}
 	blocked, reason, _ := isAuthBlockedForModel(auth, "", now)
 	if blocked {
-		t.Fatalf("blocked = true for a provisioned account, want false")
+		t.Fatalf("blocked = true for an enrolled+provisioned account, want false")
 	}
 	if reason != blockReasonNone {
 		t.Fatalf("reason = %v, want %v", reason, blockReasonNone)
@@ -113,13 +172,14 @@ func TestForkRequireProvisioned_FlagOnIgnoresNonClaude(t *testing.T) {
 
 // TestForkRequireProvisioned_DisabledTakesPrecedence confirms the gate is
 // isomorphic to and ordered after the disabled/quarantine/reauth locks: an
-// operator-disabled account that also happens to be unprovisioned still reports
-// its terminal blockReasonDisabled, so the new reason never clobbers the
-// existing terminal locks (unprovisioned != dead).
+// operator-disabled account that also happens to be enrolled+unprovisioned
+// (i.e. the gate WOULD otherwise block it) still reports its terminal
+// blockReasonDisabled, so the new reason never clobbers the existing terminal
+// locks (unprovisioned != dead).
 func TestForkRequireProvisioned_DisabledTakesPrecedence(t *testing.T) {
 	t.Setenv(FarmRequireProvisionedEnvVar, "1")
 
-	auth := claudeAuthWithOverride("")
+	auth := claudeAuthEnrolledWithOverride("")
 	auth.Disabled = true
 	now := time.Now()
 
@@ -164,6 +224,15 @@ func claudeAuthWithMetadataOverride(deviceID string) *Auth {
 	auth := &Auth{ID: "claude-acct", Provider: "claude", Status: StatusActive}
 	auth.Metadata = map[string]any{ClaudeDeviceIDMetadataKey: deviceID}
 	ApplyRuntimeFieldsFromMetadata(auth)
+	return auth
+}
+
+// claudeAuthWithMetadataOverrideEnrolled behaves like
+// claudeAuthWithMetadataOverride but additionally marks the account
+// farm-enrolled, matching AuthFarmEnrolled's persisted-metadata contract.
+func claudeAuthWithMetadataOverrideEnrolled(deviceID string) *Auth {
+	auth := claudeAuthWithMetadataOverride(deviceID)
+	auth.Metadata[FarmEnrolledMetadataKey] = true
 	return auth
 }
 
@@ -235,23 +304,47 @@ func TestClaudeDeviceIDSource_UnknownNonClaudeAndNil(t *testing.T) {
 	}
 }
 
-// TestClaudeDeviceIDSource_FarmBoundMatchesGate is the cross-consistency guard:
-// farm_bound==true must be exactly the set of Claude accounts the armed gate
-// would allow (i.e. NOT blocked). This is the property the three-end contract
-// relies on and the reason the classifier reuses authHasProvisionedDeviceBinding.
+// TestClaudeDeviceIDSource_FarmBoundMatchesGate is the cross-consistency guard
+// between the (enrollment-independent) farm_bound classification and the
+// (now account-scoped) gate:
+//
+//  1. Universal, regardless of enrollment: the gate must never fail-close an
+//     account that farm_bound reports as bound — a container-synced account
+//     is always servable.
+//  2. For ENROLLED accounts specifically, the invariant is exact: farm_bound
+//     == true must be precisely the set the armed gate allows (NOT blocked).
+//     This is the property the three-end management contract relies on for
+//     opted-in accounts, and the reason the classifier reuses
+//     authHasProvisionedDeviceBinding.
+//  3. For UNENROLLED accounts, the gate is always a no-op (never blocks)
+//     regardless of what farm_bound reports — this is the account-scoping
+//     guarantee this gate was changed to provide.
 func TestClaudeDeviceIDSource_FarmBoundMatchesGate(t *testing.T) {
 	t.Setenv(FarmRequireProvisionedEnvVar, "1")
-	cases := []*Auth{
-		claudeAuthWithMetadataOverride(validProvisionedDeviceID), // bound
-		&Auth{ID: "a", Provider: "claude", Status: StatusActive}, // synthetic
-		claudeAuthWithMetadataOverride(""),                       // cleared -> synthetic
-		claudeAuthWithMetadataOverride("not-valid"),              // drift
+	cases := []struct {
+		enrolled bool
+		auth     *Auth
+	}{
+		{enrolled: true, auth: claudeAuthWithMetadataOverrideEnrolled(validProvisionedDeviceID)},                                                  // bound
+		{enrolled: true, auth: &Auth{ID: "a", Provider: "claude", Status: StatusActive, Metadata: map[string]any{FarmEnrolledMetadataKey: true}}}, // synthetic
+		{enrolled: true, auth: claudeAuthWithMetadataOverrideEnrolled("")},                                                                        // cleared -> synthetic
+		{enrolled: true, auth: claudeAuthWithMetadataOverrideEnrolled("not-valid")},                                                               // drift
+		{enrolled: false, auth: claudeAuthWithMetadataOverride(validProvisionedDeviceID)},                                                         // bound, but never enrolled
+		{enrolled: false, auth: &Auth{ID: "b", Provider: "claude", Status: StatusActive}},                                                         // synthetic, never enrolled (the old-account case)
+		{enrolled: false, auth: claudeAuthWithMetadataOverride("")},                                                                               // cleared -> synthetic, never enrolled
+		{enrolled: false, auth: claudeAuthWithMetadataOverride("not-valid")},                                                                      // drift, never enrolled
 	}
-	for i, auth := range cases {
-		_, bound := ClaudeDeviceIDSource(auth)
-		blocked := forkRequireProvisionedBlocked(auth)
-		if bound == blocked {
-			t.Fatalf("case %d: farmBound=%v but gateBlocked=%v; farm_bound must equal NOT-blocked", i, bound, blocked)
+	for i, tc := range cases {
+		_, bound := ClaudeDeviceIDSource(tc.auth)
+		blocked := forkRequireProvisionedBlocked(tc.auth)
+		if bound && blocked {
+			t.Fatalf("case %d: farm_bound account was blocked by the gate; a bound account must never be fail-closed", i)
+		}
+		if !tc.enrolled && blocked {
+			t.Fatalf("case %d: unenrolled account was blocked by the gate; the gate must be a no-op for non-enrolled accounts", i)
+		}
+		if tc.enrolled && bound == blocked {
+			t.Fatalf("case %d (enrolled): farmBound=%v but gateBlocked=%v; for enrolled accounts farm_bound must equal NOT-blocked", i, bound, blocked)
 		}
 	}
 }

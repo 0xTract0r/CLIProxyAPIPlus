@@ -424,6 +424,16 @@ nonstream-keepalive-interval: 0
 #   arch: "arm64"
 #   timeout: "600"
 #   stabilize-device-profile: false  # optional, default false; set true to enable per-auth/API-key fingerprint pinning
+#   farm-os: "Linux"   # optional, default "Linux". Outbound X-Stainless-Os for FARM-BOUND claude accounts
+#                      # (accounts bound to a real container device_id). A farm container's claude-cli
+#                      # telemetry egresses direct to Anthropic under the same device_id reporting the
+#                      # container's real Linux; serving those accounts as MacOS would contradict it.
+#                      # Non-farm accounts keep the os/arch baseline above. Only applies when
+#                      # stabilize-device-profile is enabled.
+#   farm-arch: "x64"   # optional, default "x64". Outbound X-Stainless-Arch for farm-bound accounts.
+#                      # MUST match the container's real architecture; x64 is a provisional default
+#                      # pending on-wire confirmation of the production container arch (TR6). Set
+#                      # explicitly once confirmed.
 #   replay-wire-header-order: false  # optional, default false. When true, claude serving/quota egress
 #                                    # replays the real claude-cli (undici/Stainless) HTTP/1.1 request
 #                                    # header wire ORDER + original casing (JA4H "_hd" fix). Only affects

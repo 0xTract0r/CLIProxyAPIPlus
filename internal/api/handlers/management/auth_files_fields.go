@@ -776,6 +776,22 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 	if previous != nil {
 		mergeUserDefinedAuthMetadataInto(record, previous)
 		inheritUserDefinedAuthAttributesInto(record, previous)
+	} else {
+		// TR4 (telemetry-farm-ux-hardening): previous == nil means
+		// lookupExistingAuthForReauth found no prior record for this account
+		// (neither by ID nor by provider+email/account_id), i.e. this save is
+		// the account's first completed authentication. Auto-enroll it into
+		// the device farm at creation time so operators do not have to
+		// remember to flip the enrollment toggle by hand for every new
+		// account. Deliberately keyed off previous == nil rather than
+		// record.CreatedAt / Auth file mtime, since those get rewritten by
+		// later reauth and would misclassify an existing account as "new".
+		// Existing accounts going through reauth take the previous != nil
+		// branch above instead, and their current farm_enrolled value is
+		// already carried forward untouched by mergeUserDefinedAuthMetadataInto
+		// (the key is not in reauthTokenMetadataKeys/reauthRuntimeMetadataKeys),
+		// so this branch never re-enrolls or un-enrolls them.
+		applyAuthFarmEnrolledMetadata(record, true)
 	}
 
 	// Bug fix: a successful reauth / OAuth callback must clear any automatic

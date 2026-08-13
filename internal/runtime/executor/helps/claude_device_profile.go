@@ -42,8 +42,36 @@ const (
 	defaultClaudeFingerprintRuntimeVersion = "v26.3.0"
 	defaultClaudeFingerprintOS             = "MacOS"
 	defaultClaudeFingerprintArch           = "arm64"
-	claudeDeviceProfileTTL                 = 7 * 24 * time.Hour
-	claudeDeviceProfileCleanupPeriod       = time.Hour
+
+	// defaultClaudeFarmFingerprintOS / defaultClaudeFarmFingerprintArch are the
+	// platform (X-Stainless-Os / X-Stainless-Arch) applied to a FARM-BOUND Claude
+	// account (one bound to a real container device_id) when the operator has not
+	// overridden claude-header-defaults.farm-os / farm-arch. See TR3: a farm
+	// container runs claude-cli whose hardcoded telemetry egresses direct to
+	// Anthropic under the SAME device_id this proxy serves, reporting the
+	// container's real Linux platform. Serving that account with a MacOS header
+	// would make the two channels disagree on OS under one device_id — a proxy
+	// tell. Aligning the farm-bound serving header to the container's Linux removes
+	// that contradiction; non-farm accounts have no such side-channel and stay on
+	// the MacOS/arm64 baseline (hiding Linux is still a net win there).
+	//
+	// Arch is INTENTIONALLY not hardcoded past this default: the farm arch must
+	// match the container's REAL architecture, which is not yet on-wire confirmed
+	// (TR6). x64 is the conservative default because the production 201 host looks
+	// x86_64; a stray arm64 capture is suspected to be a Mac Docker Desktop
+	// collection artifact, not the real container. Operators MUST set
+	// claude-header-defaults.farm-arch once TR6 confirms the real container arch.
+	//
+	// Honest boundary: there is no public evidence that Anthropic actively
+	// cross-checks the serving-header OS against the direct-telemetry OS per
+	// device_id. This alignment is applied under risk-minimization (remove a
+	// self-consistent-looking contradiction we can observe ourselves), not a
+	// confirmed detection vector.
+	defaultClaudeFarmFingerprintOS   = "Linux"
+	defaultClaudeFarmFingerprintArch = "x64"
+
+	claudeDeviceProfileTTL           = 7 * 24 * time.Hour
+	claudeDeviceProfileCleanupPeriod = time.Hour
 
 	// claudeSanityCeilingMajor / Minor / Patch is the hardcoded, offline,
 	// deterministic upper bound on any claude-cli version we are willing to treat
@@ -817,8 +845,69 @@ func ClaudeDeviceProfileObservations(auth *cliproxyauth.Auth, apiKey string) []C
 // The result is monotonic-up only: the returned version is the maximum of the
 // static floor and any real-observed ceiling, and the emitted triple is always
 // internally consistent (all three fields from the same real source).
+// farmClaudeDevicePlatform returns the outbound X-Stainless-Os / X-Stainless-Arch
+// a farm-bound Claude account egresses. It is the operator-configurable
+// claude-header-defaults.farm-os / farm-arch, defaulting to
+// defaultClaudeFarmFingerprintOS / defaultClaudeFarmFingerprintArch (Linux / x64)
+// when unset. Arch is deliberately config-driven, never hardcoded, because the
+// real farm-container arch is still pending TR6 on-wire confirmation.
+func farmClaudeDevicePlatform(cfg *config.Config) (os, arch string) {
+	os = defaultClaudeFarmFingerprintOS
+	arch = defaultClaudeFarmFingerprintArch
+	if cfg == nil {
+		return os, arch
+	}
+	if v := strings.TrimSpace(cfg.ClaudeHeaderDefaults.FarmOS); v != "" {
+		os = v
+	}
+	if v := strings.TrimSpace(cfg.ClaudeHeaderDefaults.FarmArch); v != "" {
+		arch = v
+	}
+	return os, arch
+}
+
+// applyFarmDevicePlatformBaseline pins the baseline platform (OS/Arch) to the
+// farm-container platform for farm-bound Claude accounts, leaving the software
+// fingerprint (UA/version + pkg + runtime) untouched. It is the TR3 per-account
+// platform split: only accounts the farm supply-atomicity gate treats as bound to
+// a real container (auth.ClaudeDeviceIDSource -> farmBound, the exact predicate the
+// gate uses) egress the container's real Linux; every other account (non-farm
+// Claude, and any non-Claude provider — farmBound is false there) keeps the MacOS
+// baseline.
+//
+// It mutates only the platform fields, so it must run BEFORE the version high-water
+// raise (withClaudeFloorProfile), which replaces UA/pkg/runtime but preserves
+// OS/Arch — keeping the farm platform stable regardless of version raising. This
+// override reaches the wire only through ApplyClaudeDeviceProfileHeaders, which the
+// executor calls solely when stabilize-device-profile is enabled; with stabilize
+// off the legacy emitter (ApplyClaudeLegacyDeviceHeaders, which has no auth and is
+// farm-agnostic) is used instead, so stabilize-off behavior is unchanged.
+//
+// Latent coupling (out of TR3 scope, body plane): the body-plane env-block OS
+// rewrite in normalize_account_env.go derives its Platform / OS Version from the
+// GLOBAL defaultClaudeDeviceProfile(cfg).OS (MacOS), not this per-account farm OS.
+// That path is DORMANT in production (NormalizeAccountEnv is neutralized to nil at
+// config load), so today the inbound body (real Linux from the farm container)
+// passes through and agrees with this Linux header. If that path is ever un-
+// dormanted while stabilize is on, the body would report MacOS against this Linux
+// header — a follow-up must make the body OS farm-aware (including the Mac-style
+// canonicalHomeRoot) before enabling it for farm accounts.
+func applyFarmDevicePlatformBaseline(auth *cliproxyauth.Auth, baseline ClaudeDeviceProfile, cfg *config.Config) ClaudeDeviceProfile {
+	if _, farmBound := cliproxyauth.ClaudeDeviceIDSource(auth); !farmBound {
+		return baseline
+	}
+	baseline.OS, baseline.Arch = farmClaudeDevicePlatform(cfg)
+	return baseline
+}
+
 func claudeFallbackBaseline(auth *cliproxyauth.Auth, apiKey string, cfg *config.Config) ClaudeDeviceProfile {
 	baseline := defaultClaudeDeviceProfile(cfg)
+
+	// TR3 每账号出站平台分流：农场号（绑定真实容器 device_id）出站平台钉到容器真实
+	// Linux，与其旁路遥测通道在同一 device_id 下的 OS 保持一致；普通号无此侧信道，保持
+	// MacOS/arm64 baseline。放在版本高水位抬升之前，因为 withClaudeFloorProfile 只换
+	// UA/pkg/runtime、保留 OS/Arch，此处钉住的平台位不会被后续版本抬升覆盖。
+	baseline = applyFarmDevicePlatformBaseline(auth, baseline, cfg)
 
 	// 反关联修复 B（R5）：抬高 floor 时把版本三元组当原子单元处理。
 	// 优先取本账号观测到的最高版本**完整三元组**；本账号零观测时回退全局最高版本

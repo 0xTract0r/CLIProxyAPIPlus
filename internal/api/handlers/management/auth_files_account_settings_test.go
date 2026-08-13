@@ -452,6 +452,113 @@ func TestPatchAuthFileAccountSettings_AllowsValidProxyURLForEnabledAccount(t *te
 	}
 }
 
+// TestPatchAuthFileAccountSettings_FarmEnrolledRoundTrip covers TR1
+// (telemetry-device-farm): account_settings.farm_enrolled must persist to
+// Metadata[coreauth.FarmEnrolledMetadataKey] (the single source of truth read
+// by coreauth.AuthFarmEnrolled) and round-trip through GET, mirroring the
+// existing refresh_enabled coverage above.
+func TestPatchAuthFileAccountSettings_FarmEnrolledRoundTrip(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	record := &coreauth.Auth{
+		ID:       "farm-enrolled.json",
+		FileName: "farm-enrolled.json",
+		Provider: "claude",
+		Attributes: map[string]string{
+			"path": "/tmp/farm-enrolled.json",
+		},
+		Metadata: map[string]any{"type": "claude"},
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("failed to register auth record: %v", errRegister)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+
+	patch := func(body string) authFileAccountSettingsResponse {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(rec)
+		req := httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/account-settings", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		ctx.Request = req
+		h.PatchAuthFileAccountSettings(ctx)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+		}
+		var resp authFileAccountSettingsResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("failed to decode patch response: %v", err)
+		}
+		return resp
+	}
+
+	// Default (never patched) is not-enrolled.
+	getResp := func() authFileAccountSettingsResponse {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(rec)
+		req := httptest.NewRequest(http.MethodGet, "/v0/management/auth-files/account-settings?name=farm-enrolled.json", nil)
+		ctx.Request = req
+		h.GetAuthFileAccountSettings(ctx)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+		}
+		var resp authFileAccountSettingsResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("failed to decode get response: %v", err)
+		}
+		return resp
+	}
+	if getResp().AccountSettings.FarmEnrolled {
+		t.Fatalf("farm_enrolled default = true, want false for a never-patched account")
+	}
+
+	// PATCH farm_enrolled=true persists Metadata[farm_enrolled] and echoes true.
+	setResp := patch(`{"name":"farm-enrolled.json","proxy_url":"http://proxy.remote","disabled":false,"farm_enrolled":true}`)
+	if !setResp.AccountSettings.FarmEnrolled {
+		t.Fatalf("response farm_enrolled = false after enrolling, want true")
+	}
+	enrolled, ok := manager.GetByID("farm-enrolled.json")
+	if !ok || enrolled == nil {
+		t.Fatalf("expected updated auth record")
+	}
+	if got, gotOK := enrolled.Metadata[coreauth.FarmEnrolledMetadataKey]; !gotOK || got != true {
+		t.Fatalf("Metadata[farm_enrolled] = %#v (ok=%v), want true", got, gotOK)
+	}
+	if !coreauth.AuthFarmEnrolled(enrolled) {
+		t.Fatalf("coreauth.AuthFarmEnrolled() = false after enrolling, want true")
+	}
+
+	// A PATCH that omits farm_enrolled must preserve the previously-set intent
+	// (accountSettingsFarmEnrolled falls back to the stored account_settings
+	// pointer before re-deriving from Metadata).
+	unrelatedResp := patch(`{"name":"farm-enrolled.json","proxy_url":"http://proxy.remote","note":"rotated","disabled":false}`)
+	if !unrelatedResp.AccountSettings.FarmEnrolled {
+		t.Fatalf("farm_enrolled = false after unrelated-field save, want true (must survive)")
+	}
+
+	// PATCH farm_enrolled=false clears the metadata key rather than persisting
+	// an explicit-false marker.
+	clearedResp := patch(`{"name":"farm-enrolled.json","proxy_url":"http://proxy.remote","disabled":false,"farm_enrolled":false}`)
+	if clearedResp.AccountSettings.FarmEnrolled {
+		t.Fatalf("response farm_enrolled = true after un-enrolling, want false")
+	}
+	cleared, ok := manager.GetByID("farm-enrolled.json")
+	if !ok || cleared == nil {
+		t.Fatalf("expected updated auth record")
+	}
+	if _, gotOK := cleared.Metadata[coreauth.FarmEnrolledMetadataKey]; gotOK {
+		t.Fatalf("Metadata[farm_enrolled] still present after un-enrolling, want deleted")
+	}
+	if coreauth.AuthFarmEnrolled(cleared) {
+		t.Fatalf("coreauth.AuthFarmEnrolled() = true after un-enrolling, want false")
+	}
+}
+
 func TestPatchAuthFileAccountSettings_DisablesRefreshForAccessTokenOnlyRecords(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
 	gin.SetMode(gin.TestMode)

@@ -27,6 +27,13 @@
 // existing serving byte identical to today's selection behaviour when the flag
 // is off, and it never touches non-Claude providers (which have no
 // claude_device_id concept).
+//
+// Even when armed, the gate only applies per-account: only accounts explicitly
+// marked farm-enrolled (AuthFarmEnrolled, see farm_enrolled.go) can ever be
+// blocked by it. Every account that has never been enrolled into the farm —
+// which today means every pre-existing account, including production-stable
+// ones — is passed through unconditionally, so arming the global flag can
+// never fail-close an account the operator did not opt into the farm.
 package auth
 
 import (
@@ -82,8 +89,12 @@ func authHasProvisionedDeviceBinding(auth *Auth) bool {
 // unless FARM_REQUIRE_PROVISIONED is armed, so non-farm deployments keep
 // byte-identical selection behaviour. The gate is scoped to Claude accounts only
 // (other providers have no claude_device_id container binding and must not be
-// fail-closed by it). A Claude account is blocked only when it lacks a real
-// device_id provisioning binding.
+// fail-closed by it). Beyond that, the gate is scoped to explicitly
+// farm-enrolled accounts only (AuthFarmEnrolled, farm_enrolled.go /
+// telemetry-device-farm TR1): every pre-existing Claude account — including
+// every production-stable account — was never marked farm_enrolled and stays
+// immune to this gate even while it is armed. A Claude account is blocked only
+// when it is farm-enrolled AND lacks a real device_id provisioning binding.
 func forkRequireProvisionedBlocked(auth *Auth) bool {
 	if auth == nil {
 		return false
@@ -92,6 +103,9 @@ func forkRequireProvisionedBlocked(auth *Auth) bool {
 		return false
 	}
 	if strings.ToLower(strings.TrimSpace(auth.Provider)) != "claude" {
+		return false
+	}
+	if !AuthFarmEnrolled(auth) {
 		return false
 	}
 	return !authHasProvisionedDeviceBinding(auth)

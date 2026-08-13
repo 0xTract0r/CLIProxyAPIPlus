@@ -552,3 +552,188 @@ func TestSaveTokenRecord_KeepsOperatorDisableAcrossReauth(t *testing.T) {
 		t.Fatalf("RefreshDisabled() = false after reauth, want true (operator explicitly disabled refresh)")
 	}
 }
+
+// TestSaveTokenRecord_AutoEnrollsFarmOnFirstAuth asserts the TR4
+// (telemetry-farm-ux-hardening) auto-enrollment path: when
+// lookupExistingAuthForReauth finds no prior record for this account (neither
+// by ID nor by provider+email/account_id), saveTokenRecord is completing that
+// account's first authentication and must mark it
+// Metadata[coreauth.FarmEnrolledMetadataKey] = true, mirroring the manual
+// applyAuthFarmEnrolledMetadata(true) toggle so a brand-new account is
+// enrolled into the device farm without requiring an operator to flip it by
+// hand afterwards.
+func TestSaveTokenRecord_AutoEnrollsFarmOnFirstAuth(t *testing.T) {
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+	h.tokenStore = store
+
+	record := &coreauth.Auth{
+		ID:       "claude-brand-new@example.com.json",
+		FileName: "claude-brand-new@example.com.json",
+		Provider: "claude",
+		Metadata: map[string]any{
+			"type":          "claude",
+			"email":         "brand-new@example.com",
+			"access_token":  "NEW_TOKEN",
+			"refresh_token": "NEW_REFRESH",
+		},
+	}
+	if _, errSave := h.saveTokenRecord(context.Background(), record); errSave != nil {
+		t.Fatalf("saveTokenRecord returned error: %v", errSave)
+	}
+
+	if got, _ := record.Metadata[coreauth.FarmEnrolledMetadataKey].(bool); !got {
+		t.Fatalf("metadata[farm_enrolled] = %v, want true for a brand-new account's first auth", record.Metadata[coreauth.FarmEnrolledMetadataKey])
+	}
+	if !coreauth.AuthFarmEnrolled(record) {
+		t.Fatalf("AuthFarmEnrolled(record) = false, want true for a brand-new account's first auth")
+	}
+}
+
+// TestSaveTokenRecord_DoesNotAutoEnrollLegacyAccountOnReauth asserts that a
+// reauth for an account that already existed before TR4 (its previous record
+// predates the farm_enrolled field and therefore has no value for it) is left
+// unenrolled. Auto-enrollment must only fire on genuinely first-time
+// authentication (previous == nil), never retroactively via reauth for an old
+// account, since reauth is a routine refresh flow an operator may run at any
+// time and must not silently opt a pre-existing account into the farm.
+func TestSaveTokenRecord_DoesNotAutoEnrollLegacyAccountOnReauth(t *testing.T) {
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	previous := &coreauth.Auth{
+		ID:       "claude-legacy@example.com.json",
+		FileName: "claude-legacy@example.com.json",
+		Provider: "claude",
+		Metadata: map[string]any{
+			"type":  "claude",
+			"email": "legacy@example.com",
+			"note":  "managed account",
+			// No farm_enrolled key: this record predates TR1/TR4.
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), previous); errRegister != nil {
+		t.Fatalf("failed to register previous auth: %v", errRegister)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+	h.tokenStore = store
+
+	record := &coreauth.Auth{
+		ID:       "claude-legacy@example.com.json",
+		FileName: "claude-legacy@example.com.json",
+		Provider: "claude",
+		Metadata: map[string]any{
+			"type":          "claude",
+			"email":         "legacy@example.com",
+			"access_token":  "NEW_TOKEN",
+			"refresh_token": "NEW_REFRESH",
+		},
+	}
+	if _, errSave := h.saveTokenRecord(context.Background(), record); errSave != nil {
+		t.Fatalf("saveTokenRecord returned error: %v", errSave)
+	}
+
+	if _, ok := record.Metadata[coreauth.FarmEnrolledMetadataKey]; ok {
+		t.Fatalf("metadata[farm_enrolled] = %#v after reauth of a pre-TR4 account, want key absent", record.Metadata[coreauth.FarmEnrolledMetadataKey])
+	}
+	if coreauth.AuthFarmEnrolled(record) {
+		t.Fatalf("AuthFarmEnrolled(record) = true after reauth of a pre-TR4 account, want false")
+	}
+}
+
+// TestSaveTokenRecord_PreservesEnrolledFarmFlagAcrossReauth asserts that an
+// already-enrolled account keeps farm_enrolled = true across a normal reauth
+// (previous != nil): reauth must never touch or flip an existing enrollment
+// decision, only mergeUserDefinedAuthMetadataInto's generic operator-metadata
+// carry-forward applies here since the key is absent from
+// reauthTokenMetadataKeys/reauthRuntimeMetadataKeys.
+func TestSaveTokenRecord_PreservesEnrolledFarmFlagAcrossReauth(t *testing.T) {
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	previous := &coreauth.Auth{
+		ID:       "claude-enrolled@example.com.json",
+		FileName: "claude-enrolled@example.com.json",
+		Provider: "claude",
+		Metadata: map[string]any{
+			"type":                           "claude",
+			"email":                          "enrolled@example.com",
+			coreauth.FarmEnrolledMetadataKey: true,
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), previous); errRegister != nil {
+		t.Fatalf("failed to register previous auth: %v", errRegister)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+	h.tokenStore = store
+
+	record := &coreauth.Auth{
+		ID:       "claude-enrolled@example.com.json",
+		FileName: "claude-enrolled@example.com.json",
+		Provider: "claude",
+		Metadata: map[string]any{
+			"type":          "claude",
+			"email":         "enrolled@example.com",
+			"access_token":  "NEW_TOKEN",
+			"refresh_token": "NEW_REFRESH",
+		},
+	}
+	if _, errSave := h.saveTokenRecord(context.Background(), record); errSave != nil {
+		t.Fatalf("saveTokenRecord returned error: %v", errSave)
+	}
+
+	if !coreauth.AuthFarmEnrolled(record) {
+		t.Fatalf("AuthFarmEnrolled(record) = false after reauth of an already-enrolled account, want true (must not be flipped)")
+	}
+}
+
+// TestSaveTokenRecord_FarmEnrollmentIdempotentAcrossRepeatedFirstAuthSaves
+// asserts the auto-enrollment write itself is idempotent: running the
+// previous == nil (first-auth) branch more than once for the same record --
+// e.g. the OAuth callback retries, or the identity lookup keeps missing a
+// match -- must keep farm_enrolled at true rather than ever toggling it back
+// off. applyAuthFarmEnrolledMetadata(record, true) only ever writes true in
+// this branch, so this is a regression guard against a future refactor
+// accidentally making it conditional/toggling.
+func TestSaveTokenRecord_FarmEnrollmentIdempotentAcrossRepeatedFirstAuthSaves(t *testing.T) {
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+	h.tokenStore = store
+
+	newRecord := func() *coreauth.Auth {
+		return &coreauth.Auth{
+			ID:       "claude-repeat@example.com.json",
+			FileName: "claude-repeat@example.com.json",
+			Provider: "claude",
+			Metadata: map[string]any{
+				"type":          "claude",
+				"email":         "repeat@example.com",
+				"access_token":  "NEW_TOKEN",
+				"refresh_token": "NEW_REFRESH",
+			},
+		}
+	}
+
+	first := newRecord()
+	if _, errSave := h.saveTokenRecord(context.Background(), first); errSave != nil {
+		t.Fatalf("first saveTokenRecord returned error: %v", errSave)
+	}
+	if !coreauth.AuthFarmEnrolled(first) {
+		t.Fatalf("AuthFarmEnrolled(first) = false, want true after first save")
+	}
+
+	// Simulate a rebuild that, for whatever reason, still resolves previous ==
+	// nil (e.g. the registered entry above was later removed out-of-band).
+	// The rebuilt record already carries farm_enrolled = true forward; the
+	// second save must not flip it.
+	second := newRecord()
+	second.Metadata[coreauth.FarmEnrolledMetadataKey] = true
+	if _, errSave := h.saveTokenRecord(context.Background(), second); errSave != nil {
+		t.Fatalf("second saveTokenRecord returned error: %v", errSave)
+	}
+	if !coreauth.AuthFarmEnrolled(second) {
+		t.Fatalf("AuthFarmEnrolled(second) = false, want true to remain unchanged across a repeated first-auth save")
+	}
+}

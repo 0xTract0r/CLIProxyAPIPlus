@@ -449,6 +449,15 @@ func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth) gin.H {
 	if !auth.LastCyberPolicyAt.IsZero() {
 		entry["last_cyber_policy_at"] = auth.LastCyberPolicyAt.UTC().Format(time.RFC3339)
 	}
+	// TR1 (telemetry-device-farm): project the account-level farm enrollment
+	// flag as a top-level, unconditionally-written boolean -- same pattern as
+	// auto_quarantined above -- so the farm-orchestrator's candidate filter and
+	// the management UI can read it without depending on the nested
+	// account_settings sub-object. coreauth.AuthFarmEnrolled(auth) is the
+	// single source of truth (reads Metadata[coreauth.FarmEnrolledMetadataKey]
+	// directly); the nested account_settings.farm_enrolled below is the same
+	// value, projected for the account-settings editing surface.
+	entry["farm_enrolled"] = coreauth.AuthFarmEnrolled(auth)
 	entry["account_settings"] = buildAuthFileAccountSettingsView(auth, h.cfg)
 	if websockets, ok := authWebsocketsValue(auth); ok {
 		entry["websockets"] = websockets
