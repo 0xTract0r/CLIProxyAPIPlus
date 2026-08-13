@@ -3,6 +3,7 @@ package live
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -617,7 +618,42 @@ func isNormalWebsocketClose(err error) bool {
 }
 
 func newProxyAwareSidebandDialer(cfg *config.Config, selected *auth.Auth) *websocket.Dialer {
-	return newSidebandDialer(proxyURLForAuth(cfg, selected))
+	proxyURL := proxyURLForAuth(cfg, selected)
+	dialer := newSidebandDialer(proxyURL)
+	applyCodexRustlsSidebandTLS(dialer, proxyURL)
+	return dialer
+}
+
+// applyCodexRustlsSidebandTLS routes the sideband relay's wss handshake (to
+// api.openai.com, the codex identity) through the strict codex-rs (rustls) uTLS
+// dialer so the outbound ClientHello is the real codex-rs fingerprint
+// (JA3 e4d448cd...) rather than a bare Go TLS ClientHello (JA3 03117a8e...), which
+// would leak that this is not the real codex client.
+//
+// dialer.Proxy is forced to nil: gorilla/websocket still consults Dialer.Proxy
+// even when NetDialTLSContext is set and would otherwise wrap the uTLS dialer as
+// the base dialer used to REACH a proxy (double-proxy). With Proxy nil the uTLS
+// closure is the sole owner of the proxy tunnel (which it performs via
+// proxyutil.BuildDialer for the same proxyURL). NetDialContext, set by
+// newSidebandDialer for the plaintext ws:// path, is left intact; sideband is
+// always wss so it is not exercised in production.
+//
+// Fail-closed: if the codex-rs uTLS dialer cannot be constructed, every dial fails
+// with the construction error instead of downgrading to bare Go TLS or plaintext.
+func applyCodexRustlsSidebandTLS(dialer *websocket.Dialer, proxyURL string) {
+	if dialer == nil {
+		return
+	}
+	dialer.Proxy = nil
+	tlsDial, errTLS := helps.NewCodexRustlsTLSDialer(strings.TrimSpace(proxyURL))
+	if errTLS != nil {
+		log.Errorf("codex live sideband: build codex-rs uTLS dialer failed: %v", errTLS)
+		dialer.NetDialTLSContext = func(context.Context, string, string) (net.Conn, error) {
+			return nil, fmt.Errorf("codex live sideband: codex-rs uTLS dialer unavailable: %w", errTLS)
+		}
+		return
+	}
+	dialer.NetDialTLSContext = tlsDial
 }
 
 func proxyURLForAuth(cfg *config.Config, selected *auth.Auth) string {
