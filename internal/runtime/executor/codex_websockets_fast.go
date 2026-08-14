@@ -1,8 +1,12 @@
 package executor
 
 import (
+	"bytes"
+	"context"
+	"fmt"
 	"strings"
 
+	"github.com/gorilla/websocket"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -10,6 +14,13 @@ import (
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
+
+// codexFastPrewarmWarmupText is the neutral warmup message used by the generate:false
+// prewarm frame. It keeps the frame valid and cheap even if the upstream ignores
+// generate:false (it would then run on this neutral message, not double-run the real
+// prompt). This mirrors the real-machine probe flow that reproduced the 1.55x priority
+// speedup.
+const codexFastPrewarmWarmupText = "<session warmup>"
 
 // codexFastEnabled reports whether the Codex priority/fast Responses websocket flow
 // is enabled for this credential AND this specific model. It is the per-account &
@@ -100,4 +111,127 @@ func applyCodexServiceTierPriority(body []byte) []byte {
 		return body
 	}
 	return updated
+}
+
+// buildCodexWebsocketPrewarmBody builds the generate:false prewarm frame from the
+// already-normalized upstream body. It reuses every identity-normalized field (model,
+// instructions, client_metadata, prompt_cache_key, service_tier, reasoning, ...) so the
+// prewarm inherits the SAME anti-correlation normalization as the main turn and never
+// opens a second un-normalized outbound. Only the input is swapped for a minimal neutral
+// warmup message, generate is forced false, and any inherited previous_response_id is
+// dropped because the prewarm STARTS the turn chain.
+func buildCodexWebsocketPrewarmBody(upstreamBody []byte) []byte {
+	if len(upstreamBody) == 0 {
+		return nil
+	}
+	body := bytes.Clone(upstreamBody)
+	if updated, err := sjson.DeleteBytes(body, "previous_response_id"); err == nil {
+		body = updated
+	}
+	warmupInput := []byte(`[{"type":"message","role":"user","content":[{"type":"input_text","text":"` + codexFastPrewarmWarmupText + `"}]}]`)
+	if updated, err := sjson.SetRawBytes(body, "input", warmupInput); err == nil && len(updated) > 0 {
+		body = updated
+	}
+	if updated, err := sjson.SetBytes(body, "generate", false); err == nil && len(updated) > 0 {
+		body = updated
+	}
+	// buildCodexWebsocketRequestBody sets type=response.create and sanitizes input ids
+	// (the warmup input has none, so sanitize is a no-op) and preserves generate:false.
+	return buildCodexWebsocketRequestBody(body)
+}
+
+// buildCodexWebsocketFastMainBody builds the main turn frame linked to the prewarm
+// response via previous_response_id (generate defaults true). It keeps the REAL user
+// input from the upstream body and, when a prewarm id is present, overwrites any
+// client-supplied previous_response_id with it — codex fast requires the main turn to
+// link to the prewarm on the same connection.
+//
+// Note: codex-cli uses store:false and resends the full transcript each turn, so
+// overwriting previous_response_id does not drop conversation context. Clients that
+// rely on server-stored previous_response_id are out of scope for fast (Phase 5).
+func buildCodexWebsocketFastMainBody(upstreamBody []byte, previousResponseID string) []byte {
+	if len(upstreamBody) == 0 {
+		return buildCodexWebsocketRequestBody(upstreamBody)
+	}
+	body := bytes.Clone(upstreamBody)
+	// The main turn must generate; strip any stray generate flag inherited from the body.
+	if updated, err := sjson.DeleteBytes(body, "generate"); err == nil {
+		body = updated
+	}
+	if id := strings.TrimSpace(previousResponseID); id != "" {
+		if updated, err := sjson.SetBytes(body, "previous_response_id", id); err == nil && len(updated) > 0 {
+			body = updated
+		}
+	}
+	return buildCodexWebsocketRequestBody(body)
+}
+
+// runCodexFastPrewarm sends the generate:false prewarm frame on the established upstream
+// connection and reads until the upstream returns a terminal response, returning the
+// real upstream response id used to link the main turn via previous_response_id
+// (codex-rs responses websocket v2 turn semantics). Prewarm and main run on the SAME
+// connection sequentially; only after the prewarm terminal is read does the caller send
+// the main frame, so their frames never interleave.
+//
+// Fail-closed: any write/read/upstream error, or a terminal completion without a
+// response id, aborts the fast turn with an error rather than silently downgrading to a
+// path that would leak identity or mischarge.
+func (e *CodexWebsocketsExecutor) runCodexFastPrewarm(
+	ctx context.Context,
+	sess *codexWebsocketSession,
+	conn *websocket.Conn,
+	readCh chan codexWebsocketRead,
+	upstreamBody []byte,
+	identityState codexIdentityConfuseState,
+) (string, error) {
+	prewarmBody := buildCodexWebsocketPrewarmBody(upstreamBody)
+	if len(prewarmBody) == 0 {
+		return "", fmt.Errorf("codex websockets executor: fast prewarm body is empty")
+	}
+	if errSend := writeCodexWebsocketMessage(sess, conn, prewarmBody); errSend != nil {
+		return "", mapCodexWebsocketWriteError(sess, conn, errSend)
+	}
+
+	var prewarmID string
+	for {
+		if ctx != nil && ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+		msgType, payload, errRead := readCodexWebsocketMessage(ctx, sess, conn, readCh)
+		if errRead != nil {
+			return "", mapCodexWebsocketReadError(errRead)
+		}
+		if msgType != websocket.TextMessage {
+			if msgType == websocket.BinaryMessage {
+				return "", fmt.Errorf("codex websockets executor: unexpected binary message during fast prewarm")
+			}
+			continue
+		}
+		payload = bytes.TrimSpace(payload)
+		if len(payload) == 0 {
+			continue
+		}
+		// Extract the raw upstream response id BEFORE any identity transform: the
+		// previous_response_id echoed upstream must be the exact id the server issued.
+		if id := strings.TrimSpace(gjson.GetBytes(payload, "response.id").String()); id != "" {
+			prewarmID = id
+		}
+		if wsErr, ok := parseCodexWebsocketError(payload); ok {
+			return "", wsErr
+		}
+		if streamErr, _, ok := codexTerminalFailureErr(payload); ok {
+			return "", streamErr
+		}
+		eventType := gjson.GetBytes(payload, "type").String()
+		// Mirror the main loop's logging discipline (log the confused view, never the
+		// real identity fields).
+		helps.AppendAPIWebsocketResponse(ctx, e.cfg, applyCodexIdentityConfuseResponsePayload(payload, identityState))
+		switch eventType {
+		case "response.completed", "response.done":
+			if prewarmID == "" {
+				return "", fmt.Errorf("codex websockets executor: fast prewarm completed without a response id")
+			}
+			return prewarmID, nil
+		}
+	}
 }

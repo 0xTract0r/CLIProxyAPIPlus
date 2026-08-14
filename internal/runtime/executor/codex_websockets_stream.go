@@ -197,6 +197,39 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		readCh = sess.activate(conn)
 	}
 
+	// Codex fast: run the generate:false prewarm -> main turn link on this same
+	// connection before the main send (necessary condition for upstream priority).
+	// Fail-closed: a prewarm error tears down the connection and aborts the turn.
+	if fastEnabled {
+		prewarmID, errPrewarm := e.runCodexFastPrewarm(ctx, sess, conn, readCh, upstreamBody, identityState)
+		if errPrewarm != nil {
+			helps.RecordAPIWebsocketError(ctx, e.cfg, "fast_prewarm", errPrewarm)
+			if sess != nil {
+				e.invalidateUpstreamConn(sess, conn, "fast_prewarm_error", errPrewarm)
+				sess.clearActive(conn, readCh)
+				unlockStreamSession()
+			} else {
+				logCodexWebsocketDisconnected(executionSessionID, authID, wsURL, "fast_prewarm_error", errPrewarm)
+				if errClose := closer.Close(); errClose != nil {
+					log.Errorf("codex websockets executor: close websocket error: %v", errClose)
+				}
+			}
+			return nil, errPrewarm
+		}
+		wsReqBody = buildCodexWebsocketFastMainBody(upstreamBody, prewarmID)
+		helps.RecordAPIWebsocketRequest(ctx, e.cfg, helps.UpstreamRequestLog{
+			URL:       wsURL,
+			Method:    "WEBSOCKET",
+			Headers:   wsHeaders.Clone(),
+			Body:      wsReqBody,
+			Provider:  e.Identifier(),
+			AuthID:    authID,
+			AuthLabel: authLabel,
+			AuthType:  authType,
+			AuthValue: authValue,
+		})
+	}
+
 	if errSend := writeCodexWebsocketMessage(sess, conn, wsReqBody); errSend != nil {
 		errSend = mapCodexWebsocketWriteError(sess, conn, errSend)
 		helps.RecordAPIWebsocketError(ctx, e.cfg, "send", errSend)

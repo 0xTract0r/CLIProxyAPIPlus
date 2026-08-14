@@ -200,6 +200,33 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		}()
 	}
 
+	// Codex fast: run the generate:false prewarm -> main turn link on this same
+	// connection (the necessary condition for upstream priority). Fail-closed: a
+	// prewarm error aborts the turn (the deferred close/unlock/clearActive above and
+	// the sess==nil close defer handle teardown).
+	if fastEnabled {
+		prewarmID, errPrewarm := e.runCodexFastPrewarm(ctx, sess, conn, readCh, upstreamBody, identityState)
+		if errPrewarm != nil {
+			if sess != nil {
+				e.invalidateUpstreamConn(sess, conn, "fast_prewarm_error", errPrewarm)
+			}
+			helps.RecordAPIWebsocketError(ctx, e.cfg, "fast_prewarm", errPrewarm)
+			return resp, errPrewarm
+		}
+		wsReqBody = buildCodexWebsocketFastMainBody(upstreamBody, prewarmID)
+		helps.RecordAPIWebsocketRequest(ctx, e.cfg, helps.UpstreamRequestLog{
+			URL:       wsURL,
+			Method:    "WEBSOCKET",
+			Headers:   wsHeaders.Clone(),
+			Body:      wsReqBody,
+			Provider:  e.Identifier(),
+			AuthID:    authID,
+			AuthLabel: authLabel,
+			AuthType:  authType,
+			AuthValue: authValue,
+		})
+	}
+
 	if errSend := writeCodexWebsocketMessage(sess, conn, wsReqBody); errSend != nil {
 		errSend = mapCodexWebsocketWriteError(sess, conn, errSend)
 		if sess != nil {
