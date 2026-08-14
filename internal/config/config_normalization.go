@@ -310,6 +310,15 @@ func NormalizeExcludedModels(models []string) []string {
 	return out
 }
 
+// NormalizeCodexFastModels trims, lowercases, and deduplicates the Codex fast/priority
+// model allowlist. It preserves the order of first occurrences and drops empty entries.
+// Reused by both the auth synthesizer (to write the fast_models attribute) and the
+// runtime gate (to compare a request's model against the allowlist) so both sides agree
+// on normalization.
+func NormalizeCodexFastModels(models []string) []string {
+	return NormalizeExcludedModels(models)
+}
+
 // NormalizeOAuthExcludedModels cleans provider -> excluded models mappings by normalizing provider keys
 // and applying model exclusion normalization to each entry.
 func NormalizeOAuthExcludedModels(entries map[string][]string) map[string][]string {

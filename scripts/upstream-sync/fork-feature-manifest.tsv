@@ -94,6 +94,35 @@ fork文件-反关联支撑	disable_image_generation_mode.go	file	-	internal/conf
 反关联-Codex高水位持久化调用点	persistCodexDeviceHighWater@ws_execute	pattern	e\.persistCodexDeviceHighWater\(	internal/runtime/executor/codex_websockets_execute.go
 反关联-Codex高水位持久化调用点	persistCodexDeviceHighWater@ws_stream	pattern	e\.persistCodexDeviceHighWater\(	internal/runtime/executor/codex_websockets_stream.go
 
+# === Codex WS / sideband uTLS 出站接线守护(3) ===
+# 补硬:本 wave 给 Codex 响应 WebSocket 与 live sideband 的 wss 出站握手挂 codex-rs
+#   (rustls) uTLS ClientHello(JA3 e4d448cd...),替换裸 gorilla/websocket 的裸 Go TLS
+#   握手(JA3 03117a8e...)。上游同步若删掉工厂或任一处接线,出站会回退裸 Go TLS 指纹
+#   泄漏——仅靠符号存在性发现不了整条接线被拆,这里额外断言工厂符号与两处调用点仍在。
+#   两处调用点用 "(dialer," 精确匹配【调用】而非函数定义("(dialer *websocket.Dialer")。
+反关联-Codex WS uTLS工厂	NewCodexRustlsTLSDialer	symbol	^func NewCodexRustlsTLSDialer\(	internal/runtime/executor/helps/utls_client.go
+反关联-Codex WS uTLS接线	applyCodexRustlsWebsocketTLS@ws_connection	pattern	applyCodexRustlsWebsocketTLS\(dialer,	internal/runtime/executor/codex_websockets_connection.go
+反关联-Codex sideband uTLS接线	applyCodexRustlsSidebandTLS@sideband	pattern	applyCodexRustlsSidebandTLS\(dialer,	internal/client/codex/live/sideband.go
+
+# === Codex fast/priority WS 传输门控 + service_tier 注入守护(3) ===
+# 补硬:fork-only 的 codex fast/priority 传输能力。fast 蕴含 ws:fast 开时把 HTTP/SSE
+#   下游路由到 ws 上游(codexAutoRouteToWebsocket),对上游 body 注入 service_tier=priority
+#   (applyCodexServiceTierPriority)。上游同步若删掉门控或路由接线,fast 请求会静默回退
+#   HTTP POST(priority 被上游降级)、且不再注入 service_tier——仅靠符号存在性发现不了整条
+#   路由被拆,这里断言门控/路由符号与 service_tier 注入仍在。
+反关联-Codex fast门控	codexFastEnabled	symbol	^func codexFastEnabled\(	internal/runtime/executor/codex_websockets_fast.go
+反关联-Codex fast路由接线	codexAutoRouteToWebsocket@auto_executor	pattern	codexAutoRouteToWebsocket\(ctx, auth, req\.Model\)	internal/runtime/executor/codex_websockets_executor.go
+反关联-Codex fast service_tier注入	applyCodexServiceTierPriority	symbol	^func applyCodexServiceTierPriority\(	internal/runtime/executor/codex_websockets_fast.go
+
+# === Codex fast 完整流程(prewarm -> main turn 链接)守护(3) ===
+# 补硬:完整流程是拿 priority 的必要条件(孤立 response.create 拿不到)。prewarm
+#   (generate:false)建连拿真 response_id -> 主请求 previous_response_id 同连接 turn 链接。
+#   上游同步若删掉 prewarm 或两处调用点,fast 退回孤立请求、priority 失效——断言 prewarm
+#   runner/main-body 构造与 execute+stream 两处接线仍在。
+反关联-Codex fast prewarm runner	runCodexFastPrewarm	symbol	func \(e \*CodexWebsocketsExecutor\) runCodexFastPrewarm\(	internal/runtime/executor/codex_websockets_fast.go
+反关联-Codex fast prewarm接线@ws_execute	e.runCodexFastPrewarm@execute	pattern	e\.runCodexFastPrewarm\(	internal/runtime/executor/codex_websockets_execute.go
+反关联-Codex fast prewarm接线@ws_stream	e.runCodexFastPrewarm@stream	pattern	e\.runCodexFastPrewarm\(	internal/runtime/executor/codex_websockets_stream.go
+
 # === fork 自定义 Amp(ampcode)管理路由(5) ===
 # 补硬:fork-only 的 /v0/management/ampcode 管理端点整段(server_management.go 内 Amp CLI
 #   integration 路由块)被上游同步删掉时,仅靠 amp 模块目录存在性条目无法发现。这里挑 5 条

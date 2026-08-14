@@ -79,7 +79,7 @@ func (e *CodexAutoExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth
 	if e == nil || e.httpExec == nil || e.wsExec == nil {
 		return cliproxyexecutor.Response{}, fmt.Errorf("codex auto executor: executor is nil")
 	}
-	if cliproxyexecutor.DownstreamWebsocket(ctx) && codexWebsocketsEnabled(auth) {
+	if codexAutoRouteToWebsocket(ctx, auth, req.Model) {
 		return e.wsExec.Execute(ctx, auth, req, opts)
 	}
 	if cliproxyexecutor.RequiredUpstreamWebsocket(ctx) {
@@ -92,7 +92,7 @@ func (e *CodexAutoExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 	if e == nil || e.httpExec == nil || e.wsExec == nil {
 		return nil, fmt.Errorf("codex auto executor: executor is nil")
 	}
-	if cliproxyexecutor.DownstreamWebsocket(ctx) && codexWebsocketsEnabled(auth) {
+	if codexAutoRouteToWebsocket(ctx, auth, req.Model) {
 		return e.wsExec.ExecuteStream(ctx, auth, req, opts)
 	}
 	if cliproxyexecutor.RequiredUpstreamWebsocket(ctx) {
@@ -127,6 +127,22 @@ func (e *CodexAutoExecutor) UpstreamDisconnectChan(sessionID string) <-chan erro
 		return nil
 	}
 	return e.wsExec.UpstreamDisconnectChan(sessionID)
+}
+
+// codexAutoRouteToWebsocket decides whether a Codex request is served over the
+// responses websocket upstream. Two independent conditions route to ws:
+//  1. The existing rule: the downstream transport is websocket AND the credential
+//     enables websockets.
+//  2. Fast implies ws: the credential enables fast for this model. Codex priority
+//     only applies over the responses websocket transport, so a fast-enabled request
+//     is routed to the ws upstream even when the downstream is plain HTTP/SSE. The ws
+//     executor already translates the ws event stream back to SSE / non-stream for a
+//     non-websocket downstream.
+func codexAutoRouteToWebsocket(ctx context.Context, auth *cliproxyauth.Auth, model string) bool {
+	if cliproxyexecutor.DownstreamWebsocket(ctx) && codexWebsocketsEnabled(auth) {
+		return true
+	}
+	return codexFastEnabled(auth, codexBaseModelName(model))
 }
 
 func codexWebsocketsEnabled(auth *cliproxyauth.Auth) bool {
