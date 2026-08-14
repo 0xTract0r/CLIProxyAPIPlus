@@ -104,6 +104,16 @@ fork文件-反关联支撑	disable_image_generation_mode.go	file	-	internal/conf
 反关联-Codex WS uTLS接线	applyCodexRustlsWebsocketTLS@ws_connection	pattern	applyCodexRustlsWebsocketTLS\(dialer,	internal/runtime/executor/codex_websockets_connection.go
 反关联-Codex sideband uTLS接线	applyCodexRustlsSidebandTLS@sideband	pattern	applyCodexRustlsSidebandTLS\(dialer,	internal/client/codex/live/sideband.go
 
+# === Codex fast/priority WS 传输门控 + service_tier 注入守护(3) ===
+# 补硬:fork-only 的 codex fast/priority 传输能力。fast 蕴含 ws:fast 开时把 HTTP/SSE
+#   下游路由到 ws 上游(codexAutoRouteToWebsocket),对上游 body 注入 service_tier=priority
+#   (applyCodexServiceTierPriority)。上游同步若删掉门控或路由接线,fast 请求会静默回退
+#   HTTP POST(priority 被上游降级)、且不再注入 service_tier——仅靠符号存在性发现不了整条
+#   路由被拆,这里断言门控/路由符号与 service_tier 注入仍在。
+反关联-Codex fast门控	codexFastEnabled	symbol	^func codexFastEnabled\(	internal/runtime/executor/codex_websockets_fast.go
+反关联-Codex fast路由接线	codexAutoRouteToWebsocket@auto_executor	pattern	codexAutoRouteToWebsocket\(ctx, auth, req\.Model\)	internal/runtime/executor/codex_websockets_executor.go
+反关联-Codex fast service_tier注入	applyCodexServiceTierPriority	symbol	^func applyCodexServiceTierPriority\(	internal/runtime/executor/codex_websockets_fast.go
+
 # === fork 自定义 Amp(ampcode)管理路由(5) ===
 # 补硬:fork-only 的 /v0/management/ampcode 管理端点整段(server_management.go 内 Amp CLI
 #   integration 路由块)被上游同步删掉时,仅靠 amp 模块目录存在性条目无法发现。这里挑 5 条

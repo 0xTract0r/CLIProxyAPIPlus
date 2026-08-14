@@ -416,6 +416,15 @@ type CodexKey struct {
 	// Websockets enables the Responses API websocket transport for this credential.
 	Websockets bool `yaml:"websockets,omitempty" json:"websockets,omitempty"`
 
+	// FastModels enables the Codex priority/fast Responses websocket flow for the
+	// listed models on this credential (Codex only; ignored for xAI). Each entry is
+	// a model name/alias, or "*" to enable every model. Empty disables fast entirely
+	// (the default: fast is never on by default). Enabling fast implies the websocket
+	// transport (fast requires it) and consumes the account's included quota at the
+	// provider's per-model multiplier (e.g. 2.5x for GPT-5.6/5.5, 2x for GPT-5.4), so
+	// it must be opted in per account and per model to avoid silently burning quota.
+	FastModels []string `yaml:"fast-models,omitempty" json:"fast-models,omitempty"`
+
 	// ProxyURL overrides the global proxy setting for this API key if provided.
 	ProxyURL string `yaml:"proxy-url" json:"proxy-url"`
 

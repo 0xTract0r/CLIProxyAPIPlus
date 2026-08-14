@@ -28,6 +28,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	}
 
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
+	fastEnabled := codexFastEnabled(auth, baseModel)
 	apiKey, baseURL := codexCreds(auth)
 	if baseURL == "" {
 		baseURL = "https://chatgpt.com/backend-api/codex"
@@ -80,6 +81,11 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	clientBody := body
 	var identityState codexIdentityConfuseState
 	upstreamBody, identityState := applyCodexIdentityConfuseBody(e.cfg, auth, originalPayloadSource, body)
+	if fastEnabled {
+		// Inject service_tier=priority into the upstream body only. Both the prewarm
+		// frame and the main turn derive from upstreamBody, so both carry it.
+		upstreamBody = applyCodexServiceTierPriority(upstreamBody)
+	}
 	reporter.SetTranslatedReasoningEffort(clientBody, to.String())
 	wsHeaders = applyCodexWebsocketHeaders(ctx, wsHeaders, auth, apiKey, e.cfg)
 	// codex 版本高水位持久化（真实 serving 路径：WS ExecuteStream 出站）。见 WS Execute 注释。
@@ -93,6 +99,11 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	authType, authValue = auth.AccountInfo()
 
 	executionSessionID := executionSessionIDFromOptions(opts)
+	if executionSessionID == "" && fastEnabled {
+		// See codex_websockets_execute.go: fast HTTP downstream needs a stable session
+		// id to reuse the warm connection and run prewarm -> main. Fast path only.
+		executionSessionID = codexFastSessionFallbackID(opts, req)
+	}
 	var sess *codexWebsocketSession
 	if executionSessionID != "" {
 		sess = e.getOrCreateSession(executionSessionID, auth, wsURL)

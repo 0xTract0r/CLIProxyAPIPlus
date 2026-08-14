@@ -198,6 +198,14 @@ func (s *ConfigSynthesizer) synthesizeCodexStyleKeys(ctx *SynthesisContext, entr
 		if entry.Websockets {
 			attrs["websockets"] = "true"
 		}
+		// fast/priority opt-in is Codex-only (the xAI executor has its own transport
+		// controls). Writing the codex-specific attribute onto xAI auths would be dead
+		// metadata, so gate it on provider. Default: absent => fast disabled.
+		if provider == "codex" {
+			if fastModels := config.NormalizeCodexFastModels(entry.FastModels); len(fastModels) > 0 {
+				attrs["fast_models"] = strings.Join(fastModels, ",")
+			}
+		}
 		if hash := diff.ComputeCodexModelsHash(entry.Models); hash != "" {
 			attrs["models_hash"] = hash
 		}

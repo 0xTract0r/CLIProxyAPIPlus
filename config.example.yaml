@@ -335,6 +335,9 @@ nonstream-keepalive-interval: 0
 #     prefix: "test" # optional: require calls like "test/gpt-5-codex" to target this credential
 #     disable-cooling: false # optional: per-auth override for auth/model cooldown scheduling
 #     base-url: "https://www.example.com" # use the custom codex API endpoint
+#     fast-models: ["gpt-5.6"] # optional: enable the priority/fast responses-websocket flow ONLY for these models
+#       # ("*" enables all). Off by default. Fast implies the websocket transport and consumes the account's
+#       # included quota at the provider's per-model multiplier (e.g. 2.5x for GPT-5.6/5.5), so opt in per model.
 #     headers:
 #       X-Custom-Header: "custom-value"
 #     proxy-url: "socks5://proxy.example.com:1080" # optional: per-key proxy override
