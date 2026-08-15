@@ -68,6 +68,20 @@ fork路由-管理端点	usage/pricing	route	"/usage/pricing"	internal/api/server
 fork路由-管理端点	quota/snapshots	route	/quota/snapshots	internal/api/server_management.go
 fork路由-管理端点	logs-compress-after-days	route	/logs-compress-after-days	internal/api/server_management.go
 
+# === 内建 provider OAuth 加号「账号代理绑进 token 交换 + proxy 落库」接线(8) ===
+# 回归背景:上游同步 c8132e1d 用上游版覆盖 auth_files_provider_oauth.go,丢了这 5 个内建
+#   provider 加号 handler 的账号代理接线,导致新账号 proxy_url 为空、token 交换回退核心全局代理。
+#   这里断言【调用点】而非符号定义——回归正是"helper 符号还在但 handler 不再调用它",
+#   逐 handler 钉住各自独有的 setup 消费调用点,任一被上游覆盖丢失即变红。
+反关联-内建OAuth代理接线	5个handler读setup	pattern	parseOAuthAccountSetupFromRequest\(c\)	internal/api/handlers/management/auth_files_provider_oauth.go
+反关联-内建OAuth代理接线	claude绑账号代理	pattern	prepareOAuthSetupRuntimeAuth\("claude"	internal/api/handlers/management/auth_files_provider_oauth.go
+反关联-内建OAuth代理接线	codex合成账号身份	pattern	prepareOAuthSetupRuntimeAuth\("codex"	internal/api/handlers/management/auth_files_provider_oauth.go
+反关联-内建OAuth代理接线	codex交换走账号代理	pattern	oauthIdentityHTTPClient\(ctx, "auth\.openai\.com"	internal/api/handlers/management/auth_files_provider_oauth.go
+反关联-内建OAuth代理接线	antigravity绑账号代理	pattern	NewAntigravityAuth\(h\.configForOAuthSetup\(setup\)	internal/api/handlers/management/auth_files_provider_oauth.go
+反关联-内建OAuth代理接线	xai绑账号代理	pattern	NewXAIAuth\(h\.configForOAuthSetup\(setup\)	internal/api/handlers/management/auth_files_provider_oauth.go
+反关联-内建OAuth代理接线	kimi绑账号代理	pattern	NewKimiAuth\(h\.configForOAuthSetup\(setup\)	internal/api/handlers/management/auth_files_provider_oauth.go
+反关联-内建OAuth代理接线	proxy写落库record	pattern	applyOAuthAccountSetupToRecord\(record, setup\)	internal/api/handlers/management/auth_files_provider_oauth.go
+
 # === fork 自定义模块/反关联支撑文件存在性(19) ===
 fork文件-amp模块	internal/api/modules/amp/	file	-	internal/api/modules/amp
 fork文件-反关联支撑	provider_tls_probe.go(helps)	file	-	internal/runtime/executor/helps/provider_tls_probe.go

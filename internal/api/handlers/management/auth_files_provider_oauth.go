@@ -39,6 +39,13 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 
 	fmt.Println("Initializing Claude authentication...")
 
+	// 解析可选的账号级 setup（note / proxy_url）；proxy_url 非法直接 400。
+	setup, errSetup := parseOAuthAccountSetupFromRequest(c)
+	if errSetup != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errSetup.Error()})
+		return
+	}
+
 	// Generate PKCE codes
 	pkceCodes, err := claude.GeneratePKCECodes()
 	if err != nil {
@@ -55,8 +62,11 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 		return
 	}
 
-	// Initialize Claude auth service
-	anthropicAuth := claude.NewClaudeAuth(h.cfg)
+	// Initialize Claude auth service. 新账号 setup 先合成一份临时账号身份，OAuth token
+	// 交换就绑定这台账号自己的代理/运行时画像，不会静默回退到核心全局代理；setup 为空时
+	// exchangeAuth 为 nil，newClaudeOAuthAuth 退回 claude.NewClaudeAuth(h.cfg)，行为不变。
+	exchangeAuth := h.prepareOAuthSetupRuntimeAuth("claude", setup)
+	anthropicAuth := h.newClaudeOAuthAuth(ctx, exchangeAuth)
 
 	// Generate authorization URL (then override redirect_uri to reuse server port)
 	authURL, state, err := anthropicAuth.GenerateAuthURL(state, pkceCodes)
@@ -159,6 +169,9 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 			Storage:  tokenStorage,
 			Metadata: map[string]any{"email": tokenStorage.Email},
 		}
+		// 把 setup 的托管头种子和 proxy_url 等字段写进落库 record，保证新账号 proxy_url 不为空。
+		copyOAuthSetupSeed(record, exchangeAuth)
+		h.applyOAuthAccountSetupToRecord(record, setup)
 		if errGuard := guardOAuthSessionPendingForSave(state, "anthropic"); errGuard != nil {
 			return
 		}
@@ -174,7 +187,7 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 			fmt.Println("API key obtained and saved")
 		}
 		fmt.Println("You can now use Claude services through this CLI")
-		CompleteOAuthSession(state)
+		CompleteOAuthSessionWithRecord(state, savedPath, record)
 	}()
 
 	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
@@ -185,6 +198,13 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 	ctx = PopulateAuthContext(ctx, c)
 
 	fmt.Println("Initializing Codex authentication...")
+
+	// 解析可选的账号级 setup（note / proxy_url）；proxy_url 非法直接 400。
+	setup, errSetup := parseOAuthAccountSetupFromRequest(c)
+	if errSetup != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errSetup.Error()})
+		return
+	}
 
 	// Generate PKCE codes
 	pkceCodes, err := codex.GeneratePKCECodes()
@@ -202,8 +222,13 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 		return
 	}
 
-	// Initialize Codex auth service
+	// Initialize Codex auth service. 新账号 setup 先合成一份临时账号身份，token 交换就走
+	// 账号自己的代理 + 托管头 + 运行时画像；setup 为空时退回核心全局 codex 服务，行为不变。
+	setupAuth := h.prepareOAuthSetupRuntimeAuth("codex", setup)
 	openaiAuth := newCodexOAuthService(h.cfg)
+	if setupAuth != nil {
+		openaiAuth = codex.NewCodexAuthWithHTTPClient(h.oauthIdentityHTTPClient(ctx, "auth.openai.com", setupAuth, anthropicOAuthExchangeTimeout))
+	}
 
 	// Generate authorization URL
 	authURL, err := openaiAuth.GenerateAuthURL(state, pkceCodes)
@@ -308,6 +333,9 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 				"account_id": tokenStorage.AccountID,
 			},
 		}
+		// 把 setup 的托管头种子和 proxy_url 等字段写进落库 record，保证新账号 proxy_url 不为空。
+		copyOAuthSetupSeed(record, setupAuth)
+		h.applyOAuthAccountSetupToRecord(record, setup)
 		if errGuard := guardOAuthSessionPendingForSave(state, "codex"); errGuard != nil {
 			return
 		}
@@ -322,7 +350,7 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 			fmt.Println("API key obtained and saved")
 		}
 		fmt.Println("You can now use Codex services through this CLI")
-		CompleteOAuthSession(state)
+		CompleteOAuthSessionWithRecord(state, savedPath, record)
 	}()
 
 	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
@@ -334,7 +362,16 @@ func (h *Handler) RequestAntigravityToken(c *gin.Context) {
 
 	fmt.Println("Initializing Antigravity authentication...")
 
-	authSvc := antigravity.NewAntigravityAuth(h.cfg, nil)
+	// 解析可选的账号级 setup（note / proxy_url）；proxy_url 非法直接 400。
+	setup, errSetup := parseOAuthAccountSetupFromRequest(c)
+	if errSetup != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errSetup.Error()})
+		return
+	}
+
+	// token 交换 / 用户信息拉取的出站 HTTP 走账号自己的代理（configForOAuthSetup 用账号
+	// proxy 覆盖全局代理），不回退核心全局代理；setup 无 proxy 时等价于 h.cfg，行为不变。
+	authSvc := antigravity.NewAntigravityAuth(h.configForOAuthSetup(setup), nil)
 
 	state, errState := misc.GenerateRandomState()
 	if errState != nil {
@@ -474,6 +511,8 @@ func (h *Handler) RequestAntigravityToken(c *gin.Context) {
 			Label:    label,
 			Metadata: metadata,
 		}
+		// 把 setup 的 proxy_url 等字段写进落库 record，保证新账号 proxy_url 不为空。
+		h.applyOAuthAccountSetupToRecord(record, setup)
 		if errGuard := guardOAuthSessionPendingForSave(state, "antigravity"); errGuard != nil {
 			return
 		}
@@ -484,7 +523,7 @@ func (h *Handler) RequestAntigravityToken(c *gin.Context) {
 			return
 		}
 
-		CompleteOAuthSession(state)
+		CompleteOAuthSessionWithRecord(state, savedPath, record)
 		fmt.Printf("Authentication successful! Token saved to %s\n", savedPath)
 		if projectID != "" {
 			fmt.Printf("Using GCP project: %s\n", util.HideAPIKey(projectID))
@@ -501,8 +540,17 @@ func (h *Handler) RequestXAIToken(c *gin.Context) {
 
 	fmt.Println("Initializing xAI authentication...")
 
+	// 解析可选的账号级 setup（note / proxy_url）；proxy_url 非法直接 400。
+	setup, errSetup := parseOAuthAccountSetupFromRequest(c)
+	if errSetup != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errSetup.Error()})
+		return
+	}
+
 	state := fmt.Sprintf("xai-%d", time.Now().UnixNano())
-	authSvc := xaiauth.NewXAIAuth(h.cfg)
+	// device flow 的 token 交换出站 HTTP 走账号自己的代理（configForOAuthSetup 用账号
+	// proxy 覆盖全局代理），不回退核心全局代理；setup 无 proxy 时等价于 h.cfg，行为不变。
+	authSvc := xaiauth.NewXAIAuth(h.configForOAuthSetup(setup))
 
 	deviceFlow, errStartDeviceFlow := authSvc.StartDeviceFlow(ctx)
 	if errStartDeviceFlow != nil {
@@ -581,6 +629,8 @@ func (h *Handler) RequestXAIToken(c *gin.Context) {
 				"base_url":  tokenStorage.BaseURL,
 			},
 		}
+		// 把 setup 的 proxy_url 等字段写进落库 record，保证新账号 proxy_url 不为空。
+		h.applyOAuthAccountSetupToRecord(record, setup)
 		if errGuard := guardOAuthSessionPendingForSave(state, "xai"); errGuard != nil {
 			return
 		}
@@ -591,7 +641,7 @@ func (h *Handler) RequestXAIToken(c *gin.Context) {
 			return
 		}
 
-		CompleteOAuthSession(state)
+		CompleteOAuthSessionWithRecord(state, savedPath, record)
 		fmt.Printf("Authentication successful! Token saved to %s\n", savedPath)
 		fmt.Println("You can now use xAI services through this CLI")
 	}()
@@ -614,9 +664,18 @@ func (h *Handler) RequestKimiToken(c *gin.Context) {
 
 	fmt.Println("Initializing Kimi authentication...")
 
+	// 解析可选的账号级 setup（note / proxy_url）；proxy_url 非法直接 400。
+	setup, errSetup := parseOAuthAccountSetupFromRequest(c)
+	if errSetup != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errSetup.Error()})
+		return
+	}
+
 	state := fmt.Sprintf("kmi-%d", time.Now().UnixNano())
-	// Initialize Kimi auth service
-	kimiAuth := kimi.NewKimiAuth(h.cfg)
+	// Initialize Kimi auth service. device flow 的 token 交换出站 HTTP 走账号自己的代理
+	// （configForOAuthSetup 用账号 proxy 覆盖全局代理），不回退核心全局代理；setup 无 proxy
+	// 时等价于 h.cfg，行为不变。
+	kimiAuth := kimi.NewKimiAuth(h.configForOAuthSetup(setup))
 
 	// Generate authorization URL
 	deviceFlow, errStartDeviceFlow := kimiAuth.StartDeviceFlow(ctx)
@@ -679,6 +738,8 @@ func (h *Handler) RequestKimiToken(c *gin.Context) {
 			Storage:  tokenStorage,
 			Metadata: metadata,
 		}
+		// 把 setup 的 proxy_url 等字段写进落库 record，保证新账号 proxy_url 不为空。
+		h.applyOAuthAccountSetupToRecord(record, setup)
 		if errGuard := guardOAuthSessionPendingForSave(state, "kimi"); errGuard != nil {
 			return
 		}
@@ -691,7 +752,7 @@ func (h *Handler) RequestKimiToken(c *gin.Context) {
 
 		fmt.Printf("Authentication successful! Token saved to %s\n", savedPath)
 		fmt.Println("You can now use Kimi services through this CLI")
-		CompleteOAuthSession(state)
+		CompleteOAuthSessionWithRecord(state, savedPath, record)
 	}()
 
 	response := gin.H{"status": "ok", "url": authURL, "state": state, "flow": "device"}
