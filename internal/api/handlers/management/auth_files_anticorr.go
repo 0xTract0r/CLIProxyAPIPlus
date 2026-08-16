@@ -177,12 +177,19 @@ type authFileAccountSettingsStored struct {
 }
 
 type authFileAccountSettingsView struct {
-	ProxyURL           string                                        `json:"proxy_url"`
-	Note               string                                        `json:"note"`
-	Disabled           bool                                          `json:"disabled"`
-	ManagedHeaders     map[string]string                             `json:"managed_headers"`
-	ExtraHeaders       map[string]string                             `json:"extra_headers"`
-	RefreshEnabled     bool                                          `json:"refresh_enabled"`
+	ProxyURL       string            `json:"proxy_url"`
+	Note           string            `json:"note"`
+	Disabled       bool              `json:"disabled"`
+	ManagedHeaders map[string]string `json:"managed_headers"`
+	ExtraHeaders   map[string]string `json:"extra_headers"`
+	RefreshEnabled bool              `json:"refresh_enabled"`
+	// Fast reports whether the Codex priority/fast Responses websocket flow is
+	// currently enabled for this account (a non-empty fast_models allowlist,
+	// including "*"). It is only meaningful for codex accounts; non-codex
+	// accounts always report false. Mirrors executor.codexFastEnabled's
+	// "is fast configured at all" determination so the management card badge
+	// matches the runtime gate.
+	Fast               bool                                          `json:"fast"`
 	TransportProfile   any                                           `json:"transport_profile"`
 	TLSProfile         any                                           `json:"tls_profile"`
 	RuntimeProfile     *runtimehelps.RuntimeTransportProfile         `json:"runtime_profile,omitempty"`
@@ -620,6 +627,71 @@ func legacyExtraHeaders(auth *coreauth.Auth) map[string]string {
 	return normalizeHeaderMap(extraHeaders)
 }
 
+// accountSettingsFastEnabled reports whether Codex fast (priority Responses
+// websocket transport) is currently enabled for this account. It is a read-only
+// view derived from the same sources executor.codexFastEnabled consumes: the
+// synthesizer-written Attributes["fast_models"] (config API-key codex auths) and
+// the OAuth token-json top-level fast_models flattened into
+// Metadata["fast_models"] by the file store loader. A non-empty allowlist
+// (including "*") means fast is enabled. Fast is codex-only; every other provider
+// reports false so the management card badge never claims fast for accounts where
+// the runtime gate can never fire.
+func accountSettingsFastEnabled(auth *coreauth.Auth) bool {
+	if auth == nil || providerKey(auth) != "codex" {
+		return false
+	}
+	if len(auth.Attributes) > 0 && strings.TrimSpace(auth.Attributes["fast_models"]) != "" {
+		return true
+	}
+	if len(auth.Metadata) == 0 {
+		return false
+	}
+	// Mirror codexFastEnabled's accepted metadata shapes. We only ever write the
+	// string scalar form ("*"/""), but tolerate the legacy []string/[]interface{}
+	// shapes defensively so a hand-authored account still reads correctly.
+	switch typed := auth.Metadata["fast_models"].(type) {
+	case string:
+		return strings.TrimSpace(typed) != ""
+	case []string:
+		for _, entry := range typed {
+			if strings.TrimSpace(entry) != "" {
+				return true
+			}
+		}
+	case []any:
+		for _, entry := range typed {
+			if str, ok := entry.(string); ok && strings.TrimSpace(str) != "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// applyAuthFastModelsMetadata writes the codex fast toggle to the account's
+// top-level fast_models metadata key (round-tripped to the account JSON top level
+// by FileTokenStore.Save, the exact location executor.codexFastEnabled and the
+// config synthesizer read). Enabling writes the string scalar "*" (all models);
+// disabling writes the empty string "" rather than deleting the key, matching the
+// "disabled" convention already used elsewhere.
+//
+// Critical: the value MUST be a JSON string scalar. codexFastEnabled's type switch
+// only recognizes string / []string; a JSON array would decode to []interface{}
+// and be silently treated as fast=false, so callers must never write an array here.
+func applyAuthFastModelsMetadata(auth *coreauth.Auth, enabled bool) {
+	if auth == nil {
+		return
+	}
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	if enabled {
+		auth.Metadata["fast_models"] = "*"
+		return
+	}
+	auth.Metadata["fast_models"] = ""
+}
+
 func accountSettingsRefreshEnabled(auth *coreauth.Auth, stored authFileAccountSettingsStored) bool {
 	if stored.RefreshEnabled != nil {
 		return *stored.RefreshEnabled
@@ -830,6 +902,7 @@ func buildAuthFileAccountSettingsView(auth *coreauth.Auth, cfg *config.Config) a
 		ManagedHeaders:     managedHeaders,
 		ExtraHeaders:       extraHeaders,
 		RefreshEnabled:     refreshEnabled,
+		Fast:               accountSettingsFastEnabled(auth),
 		TransportProfile:   stored.TransportProfile,
 		TLSProfile:         stored.TLSProfile,
 		RuntimeProfile:     runtimeProfile,
@@ -2135,6 +2208,7 @@ func (h *Handler) PatchAuthFileAccountSettings(c *gin.Context) {
 		Disabled         *bool             `json:"disabled"`
 		ExtraHeaders     map[string]string `json:"extra_headers"`
 		RefreshEnabled   *bool             `json:"refresh_enabled"`
+		Fast             *bool             `json:"fast"`
 		TransportProfile any               `json:"transport_profile"`
 		TLSProfile       any               `json:"tls_profile"`
 	}
@@ -2262,6 +2336,19 @@ func (h *Handler) PatchAuthFileAccountSettings(c *gin.Context) {
 		RuntimeIdentityState:  existingStored.RuntimeIdentityState,
 	}
 	applyAuthRefreshEnabledMetadata(targetAuth, refreshEnabled)
+
+	// Codex fast is a first-class, codex-only account setting. Only mutate
+	// fast_models when the field is present in the request AND this is a codex
+	// account; a non-codex account's fast toggle is a no-op (the runtime gate can
+	// never fire there) so we never write dead fast_models metadata onto it. The
+	// value is a top-level metadata key (not part of account_settings), so the
+	// account_settings assignment above does not clobber it, and it is written
+	// after that assignment for clarity. syncAuthManagedHeaderState clones the auth
+	// and preserves arbitrary top-level metadata keys, so fast_models survives the
+	// sync and reaches the store the same way refresh_disabled/refresh_enabled do.
+	if req.Fast != nil && strings.EqualFold(providerKey(targetAuth), "codex") {
+		applyAuthFastModelsMetadata(targetAuth, *req.Fast)
+	}
 
 	targetAuth = h.syncAuthManagedHeaderState(c.Request.Context(), targetAuth)
 	managedHeaders := managedHeadersForAuth(targetAuth, h.cfg)

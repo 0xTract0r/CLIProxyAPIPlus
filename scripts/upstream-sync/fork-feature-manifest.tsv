@@ -127,6 +127,8 @@ fork文件-反关联支撑	disable_image_generation_mode.go	file	-	internal/conf
 反关联-Codex fast门控	codexFastEnabled	symbol	^func codexFastEnabled\(	internal/runtime/executor/codex_websockets_fast.go
 反关联-Codex fast路由接线	codexAutoRouteToWebsocket@auto_executor	pattern	codexAutoRouteToWebsocket\(ctx, auth, req\.Model\)	internal/runtime/executor/codex_websockets_executor.go
 反关联-Codex fast service_tier注入	applyCodexServiceTierPriority	symbol	^func applyCodexServiceTierPriority\(	internal/runtime/executor/codex_websockets_fast.go
+反关联-Codex fast管理面视图	accountSettingsFastEnabled	symbol	^func accountSettingsFastEnabled\(	internal/api/handlers/management/auth_files_anticorr.go
+反关联-Codex fast管理面写入	applyAuthFastModelsMetadata	symbol	^func applyAuthFastModelsMetadata\(	internal/api/handlers/management/auth_files_anticorr.go
 
 # === Codex fast 完整流程(prewarm -> main turn 链接)守护(3) ===
 # 补硬:完整流程是拿 priority 的必要条件(孤立 response.create 拿不到)。prewarm
