@@ -452,6 +452,113 @@ func TestPatchAuthFileAccountSettings_AllowsValidProxyURLForEnabledAccount(t *te
 	}
 }
 
+// TestPatchAuthFileAccountSettings_FarmEnrolledRoundTrip covers TR1
+// (telemetry-device-farm): account_settings.farm_enrolled must persist to
+// Metadata[coreauth.FarmEnrolledMetadataKey] (the single source of truth read
+// by coreauth.AuthFarmEnrolled) and round-trip through GET, mirroring the
+// existing refresh_enabled coverage above.
+func TestPatchAuthFileAccountSettings_FarmEnrolledRoundTrip(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	record := &coreauth.Auth{
+		ID:       "farm-enrolled.json",
+		FileName: "farm-enrolled.json",
+		Provider: "claude",
+		Attributes: map[string]string{
+			"path": "/tmp/farm-enrolled.json",
+		},
+		Metadata: map[string]any{"type": "claude"},
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("failed to register auth record: %v", errRegister)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+
+	patch := func(body string) authFileAccountSettingsResponse {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(rec)
+		req := httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/account-settings", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		ctx.Request = req
+		h.PatchAuthFileAccountSettings(ctx)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+		}
+		var resp authFileAccountSettingsResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("failed to decode patch response: %v", err)
+		}
+		return resp
+	}
+
+	// Default (never patched) is not-enrolled.
+	getResp := func() authFileAccountSettingsResponse {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(rec)
+		req := httptest.NewRequest(http.MethodGet, "/v0/management/auth-files/account-settings?name=farm-enrolled.json", nil)
+		ctx.Request = req
+		h.GetAuthFileAccountSettings(ctx)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+		}
+		var resp authFileAccountSettingsResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("failed to decode get response: %v", err)
+		}
+		return resp
+	}
+	if getResp().AccountSettings.FarmEnrolled {
+		t.Fatalf("farm_enrolled default = true, want false for a never-patched account")
+	}
+
+	// PATCH farm_enrolled=true persists Metadata[farm_enrolled] and echoes true.
+	setResp := patch(`{"name":"farm-enrolled.json","proxy_url":"http://proxy.remote","disabled":false,"farm_enrolled":true}`)
+	if !setResp.AccountSettings.FarmEnrolled {
+		t.Fatalf("response farm_enrolled = false after enrolling, want true")
+	}
+	enrolled, ok := manager.GetByID("farm-enrolled.json")
+	if !ok || enrolled == nil {
+		t.Fatalf("expected updated auth record")
+	}
+	if got, gotOK := enrolled.Metadata[coreauth.FarmEnrolledMetadataKey]; !gotOK || got != true {
+		t.Fatalf("Metadata[farm_enrolled] = %#v (ok=%v), want true", got, gotOK)
+	}
+	if !coreauth.AuthFarmEnrolled(enrolled) {
+		t.Fatalf("coreauth.AuthFarmEnrolled() = false after enrolling, want true")
+	}
+
+	// A PATCH that omits farm_enrolled must preserve the previously-set intent
+	// (accountSettingsFarmEnrolled falls back to the stored account_settings
+	// pointer before re-deriving from Metadata).
+	unrelatedResp := patch(`{"name":"farm-enrolled.json","proxy_url":"http://proxy.remote","note":"rotated","disabled":false}`)
+	if !unrelatedResp.AccountSettings.FarmEnrolled {
+		t.Fatalf("farm_enrolled = false after unrelated-field save, want true (must survive)")
+	}
+
+	// PATCH farm_enrolled=false clears the metadata key rather than persisting
+	// an explicit-false marker.
+	clearedResp := patch(`{"name":"farm-enrolled.json","proxy_url":"http://proxy.remote","disabled":false,"farm_enrolled":false}`)
+	if clearedResp.AccountSettings.FarmEnrolled {
+		t.Fatalf("response farm_enrolled = true after un-enrolling, want false")
+	}
+	cleared, ok := manager.GetByID("farm-enrolled.json")
+	if !ok || cleared == nil {
+		t.Fatalf("expected updated auth record")
+	}
+	if _, gotOK := cleared.Metadata[coreauth.FarmEnrolledMetadataKey]; gotOK {
+		t.Fatalf("Metadata[farm_enrolled] still present after un-enrolling, want deleted")
+	}
+	if coreauth.AuthFarmEnrolled(cleared) {
+		t.Fatalf("coreauth.AuthFarmEnrolled() = true after un-enrolling, want false")
+	}
+}
+
 func TestPatchAuthFileAccountSettings_DisablesRefreshForAccessTokenOnlyRecords(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
 	gin.SetMode(gin.TestMode)
@@ -2564,4 +2671,116 @@ func containsString(values []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// getAccountSettingsRaw registers auth, calls the GET handler, and returns the
+// decoded typed response plus the raw account_settings JSON object so tests can
+// assert the exact contract field names (device_id_source / farm_bound).
+func getAccountSettingsRaw(t *testing.T, record *coreauth.Auth) (authFileAccountSettingsResponse, map[string]json.RawMessage) {
+	t.Helper()
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	if _, err := manager.Register(context.Background(), record); err != nil {
+		t.Fatalf("failed to register auth record: %v", err)
+	}
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v0/management/auth-files/account-settings?name="+record.ID, nil)
+	h.GetAuthFileAccountSettings(ctx)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+
+	var typed authFileAccountSettingsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &typed); err != nil {
+		t.Fatalf("decode typed: %v", err)
+	}
+	var envelope struct {
+		AccountSettings map[string]json.RawMessage `json:"account_settings"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("decode raw: %v", err)
+	}
+	return typed, envelope.AccountSettings
+}
+
+// TestGetAuthFileAccountSettings_FarmContractContainerSynced verifies a Claude
+// account with a valid claude_device_id override projects
+// device_id_source=container_synced + farm_bound=true, with EXACT contract field
+// names present in the JSON (frontend AG2 depends on these).
+func TestGetAuthFileAccountSettings_FarmContractContainerSynced(t *testing.T) {
+	deviceID := strings.Repeat("a", 64)
+	record := &coreauth.Auth{
+		ID:       "claude-bound.json",
+		FileName: "claude-bound.json",
+		Provider: "claude",
+		Metadata: map[string]any{"type": "claude", coreauth.ClaudeDeviceIDMetadataKey: deviceID},
+	}
+	typed, raw := getAccountSettingsRaw(t, record)
+
+	if _, ok := raw["device_id_source"]; !ok {
+		t.Fatalf("response missing exact contract field device_id_source; keys=%v", rawKeys(raw))
+	}
+	if _, ok := raw["farm_bound"]; !ok {
+		t.Fatalf("response missing exact contract field farm_bound; keys=%v", rawKeys(raw))
+	}
+	if typed.AccountSettings.DeviceIDSource != coreauth.DeviceIDSourceContainerSynced {
+		t.Fatalf("device_id_source = %q, want %q", typed.AccountSettings.DeviceIDSource, coreauth.DeviceIDSourceContainerSynced)
+	}
+	if !typed.AccountSettings.FarmBound {
+		t.Fatalf("farm_bound = false, want true for a container-synced account")
+	}
+}
+
+// TestGetAuthFileAccountSettings_FarmContractSynthetic verifies an unbound Claude
+// account projects device_id_source=synthetic + farm_bound=false.
+func TestGetAuthFileAccountSettings_FarmContractSynthetic(t *testing.T) {
+	record := &coreauth.Auth{
+		ID:       "claude-unbound.json",
+		FileName: "claude-unbound.json",
+		Provider: "claude",
+		Metadata: map[string]any{"type": "claude"},
+	}
+	typed, _ := getAccountSettingsRaw(t, record)
+	if typed.AccountSettings.DeviceIDSource != coreauth.DeviceIDSourceSynthetic {
+		t.Fatalf("device_id_source = %q, want %q", typed.AccountSettings.DeviceIDSource, coreauth.DeviceIDSourceSynthetic)
+	}
+	if typed.AccountSettings.FarmBound {
+		t.Fatalf("farm_bound = true, want false for an unbound account")
+	}
+}
+
+// TestGetAuthFileAccountSettings_FarmContractNonClaudeUnknown verifies a
+// non-Claude account is unknown / not farm-bound (只管 Claude).
+func TestGetAuthFileAccountSettings_FarmContractNonClaudeUnknown(t *testing.T) {
+	record := &coreauth.Auth{
+		ID:         "codex.json",
+		FileName:   "codex.json",
+		Provider:   "codex",
+		Attributes: map[string]string{"path": "/tmp/codex.json"},
+		Metadata:   map[string]any{"type": "codex", "proxy_url": "http://p"},
+	}
+	typed, raw := getAccountSettingsRaw(t, record)
+	if _, ok := raw["device_id_source"]; !ok {
+		t.Fatalf("non-Claude response still must carry device_id_source (additive field)")
+	}
+	if typed.AccountSettings.DeviceIDSource != coreauth.DeviceIDSourceUnknown {
+		t.Fatalf("device_id_source = %q, want %q", typed.AccountSettings.DeviceIDSource, coreauth.DeviceIDSourceUnknown)
+	}
+	if typed.AccountSettings.FarmBound {
+		t.Fatalf("farm_bound = true, want false for a non-Claude account")
+	}
+}
+
+func rawKeys(m map[string]json.RawMessage) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
 }

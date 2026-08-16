@@ -119,6 +119,26 @@ type ClaudeHeaderDefaults struct {
 	// opt-in until validated against a real upstream, and gate-off preserves the
 	// exact current Go header behavior.
 	ReplayWireHeaderOrder *bool `yaml:"replay-wire-header-order,omitempty" json:"replay-wire-header-order,omitempty"`
+
+	// FarmOS / FarmArch override the stabilized outbound X-Stainless-Os /
+	// X-Stainless-Arch platform applied ONLY to farm-bound Claude accounts —
+	// accounts bound to a real container device_id (auth.ClaudeDeviceIDSource ->
+	// farmBound). A farm container runs claude-cli whose hardcoded telemetry goes
+	// direct to Anthropic under the SAME device_id this proxy serves, reporting the
+	// container's real Linux platform; if this proxy's serving header reported
+	// MacOS the two channels would disagree on OS under one device_id, which is a
+	// proxy tell. Aligning farm-bound serving to the container's Linux closes that
+	// gap. Non-farm accounts have no such side-channel container and keep the
+	// MacOS/arm64 baseline (hiding Linux is still a net win for them).
+	//
+	// Empty falls back to Linux / x64. Note: the farm arch MUST match the
+	// container's REAL architecture; x64 is the default pending TR6 on-wire
+	// confirmation of the production container arch (early samples are inconclusive:
+	// the 201 host looks x86_64 but an arm64 capture may be a Mac Docker Desktop
+	// collection artifact). Set farm-arch explicitly once the real container arch is
+	// confirmed. Only takes effect when stabilize-device-profile is enabled.
+	FarmOS   string `yaml:"farm-os,omitempty" json:"farm-os,omitempty"`
+	FarmArch string `yaml:"farm-arch,omitempty" json:"farm-arch,omitempty"`
 }
 
 // CodexHeaderDefaults configures fallback header values injected into Codex

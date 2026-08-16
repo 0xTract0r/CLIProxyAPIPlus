@@ -166,14 +166,21 @@ type authFileRuntimeIdentityState struct {
 }
 
 type authFileAccountSettingsStored struct {
-	SchemaVersion         int                           `json:"schema_version"`
-	ManagedHeaderSeedHash string                        `json:"managed_header_seed_hash,omitempty"`
-	ExtraHeaders          map[string]string             `json:"extra_headers,omitempty"`
-	RefreshEnabled        *bool                         `json:"refresh_enabled,omitempty"`
-	TransportProfile      any                           `json:"transport_profile,omitempty"`
-	TLSProfile            any                           `json:"tls_profile,omitempty"`
-	ManagedHeaderState    *authFileManagedHeaderState   `json:"managed_header_state,omitempty"`
-	RuntimeIdentityState  *authFileRuntimeIdentityState `json:"runtime_identity_state,omitempty"`
+	SchemaVersion         int               `json:"schema_version"`
+	ManagedHeaderSeedHash string            `json:"managed_header_seed_hash,omitempty"`
+	ExtraHeaders          map[string]string `json:"extra_headers,omitempty"`
+	RefreshEnabled        *bool             `json:"refresh_enabled,omitempty"`
+	// FarmEnrolled mirrors the account-level device-farm enrollment flag
+	// (telemetry-device-farm TR1). coreauth.AuthFarmEnrolled(auth), which
+	// reads Metadata[coreauth.FarmEnrolledMetadataKey] directly, remains the
+	// single source of truth; this pointer only lets accountSettingsFarmEnrolled
+	// echo an explicit PATCH intent (see farmEnrolledStorageValue) the same
+	// way RefreshEnabled does for refresh_enabled.
+	FarmEnrolled         *bool                         `json:"farm_enrolled,omitempty"`
+	TransportProfile     any                           `json:"transport_profile,omitempty"`
+	TLSProfile           any                           `json:"tls_profile,omitempty"`
+	ManagedHeaderState   *authFileManagedHeaderState   `json:"managed_header_state,omitempty"`
+	RuntimeIdentityState *authFileRuntimeIdentityState `json:"runtime_identity_state,omitempty"`
 }
 
 type authFileAccountSettingsView struct {
@@ -201,9 +208,24 @@ type authFileAccountSettingsView struct {
 	// hex characters are exposed, followed by an ellipsis, so that callers can
 	// compare stability across requests without recovering the full derived value.
 	// It is never persisted and PATCH requests must not include this field.
-	SyntheticDeviceID string                            `json:"synthetic_device_id,omitempty"`
-	Activation        authFileAccountSettingsActivation `json:"activation"`
-	Warnings          []string                          `json:"warnings"`
+	SyntheticDeviceID string `json:"synthetic_device_id,omitempty"`
+	// DeviceIDSource and FarmBound project the farm telemetry contract
+	// (P2 "咬合"): DeviceIDSource is one of container_synced / synthetic / drift /
+	// unknown, and FarmBound reports whether the account is bound to a real
+	// container device_id. Both are derived from coreauth.ClaudeDeviceIDSource,
+	// which reuses the exact supply-atomicity gate predicate so FarmBound==true is
+	// precisely the set the gate would allow. Additive, read-only fields; PATCH
+	// must not include them. Non-Claude accounts report unknown / false.
+	DeviceIDSource string `json:"device_id_source"`
+	FarmBound      bool   `json:"farm_bound"`
+	// FarmEnrolled is the writable device-farm enrollment intent
+	// (telemetry-device-farm TR1, coreauth.AuthFarmEnrolled), distinct from
+	// the read-only FarmBound above: an account can be enrolled but not yet
+	// bound to a container (pending provisioning), or bound while enrollment
+	// metadata is absent on a legacy record. PATCH may set this field.
+	FarmEnrolled bool                              `json:"farm_enrolled"`
+	Activation   authFileAccountSettingsActivation `json:"activation"`
+	Warnings     []string                          `json:"warnings"`
 }
 
 type authFileAccountSettingsActivation struct {
@@ -702,6 +724,20 @@ func accountSettingsRefreshEnabled(auth *coreauth.Auth, stored authFileAccountSe
 	return true
 }
 
+// accountSettingsFarmEnrolled echoes the persisted account_settings.farm_enrolled
+// intent (telemetry-device-farm TR1). The account_settings blob only stores an
+// explicit prior PATCH value (see farmEnrolledStorageValue); when it has never
+// been set through this endpoint, fall back to the actual single source of
+// truth, coreauth.AuthFarmEnrolled(auth), which reads
+// Metadata[coreauth.FarmEnrolledMetadataKey] directly. This mirrors
+// accountSettingsRefreshEnabled falling back to auth.RefreshDisabled().
+func accountSettingsFarmEnrolled(auth *coreauth.Auth, stored authFileAccountSettingsStored) bool {
+	if stored.FarmEnrolled != nil {
+		return *stored.FarmEnrolled
+	}
+	return coreauth.AuthFarmEnrolled(auth)
+}
+
 // refreshEnabledStorageValue always returns a non-nil pointer so the stored
 // account_settings.refresh_enabled faithfully echoes the user's explicit intent.
 //
@@ -714,6 +750,17 @@ func accountSettingsRefreshEnabled(auth *coreauth.Auth, stored authFileAccountSe
 // in refreshDisabledFromMetadata, so it does not itself trigger RefreshDisabled.
 func refreshEnabledStorageValue(enabled bool) *bool {
 	value := enabled
+	return &value
+}
+
+// farmEnrolledStorageValue always returns a non-nil pointer, for the same
+// round-trip-fidelity reason as refreshEnabledStorageValue: persisting the
+// explicit intent (rather than nil-for-the-default-false, which omitempty
+// would drop) means accountSettingsFarmEnrolled echoes exactly what the
+// operator last set on GET/view, instead of re-deriving it from
+// coreauth.AuthFarmEnrolled every time.
+func farmEnrolledStorageValue(enrolled bool) *bool {
+	value := enrolled
 	return &value
 }
 
@@ -741,6 +788,27 @@ func applyAuthRefreshEnabledMetadata(auth *coreauth.Auth, enabled bool) {
 	auth.Metadata["refresh_disabled"] = true
 	auth.Metadata["refresh_enabled"] = false
 	auth.NextRefreshAfter = time.Time{}
+}
+
+// applyAuthFarmEnrolledMetadata writes/clears the single-source-of-truth
+// account-level farm enrollment flag on Metadata[coreauth.FarmEnrolledMetadataKey]
+// (telemetry-device-farm TR1, coreauth.AuthFarmEnrolled). Unlike
+// applyAuthRefreshEnabledMetadata there is no independent lock to release
+// here: enrolled writes the key true, and not-enrolled deletes it so
+// coreauth.AuthFarmEnrolled falls back to its documented false default
+// instead of persisting a redundant explicit-false marker.
+func applyAuthFarmEnrolledMetadata(auth *coreauth.Auth, enrolled bool) {
+	if auth == nil {
+		return
+	}
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	if !enrolled {
+		delete(auth.Metadata, coreauth.FarmEnrolledMetadataKey)
+		return
+	}
+	auth.Metadata[coreauth.FarmEnrolledMetadataKey] = true
 }
 
 // clearAuthReauthRequiredLock releases the terminal reauth-required state that
@@ -895,6 +963,13 @@ func buildAuthFileAccountSettingsView(auth *coreauth.Auth, cfg *config.Config) a
 		}
 	}
 
+	// Farm telemetry contract (P2): classify the account's device_id provenance
+	// and farm-bound state. Derivation is centralized in coreauth.ClaudeDeviceIDSource
+	// (single source of truth, reuses the supply-atomicity gate predicate) rather
+	// than recomputed here. Non-Claude accounts return unknown / false.
+	deviceIDSource, farmBound := coreauth.ClaudeDeviceIDSource(auth)
+	farmEnrolled := accountSettingsFarmEnrolled(auth, stored)
+
 	return authFileAccountSettingsView{
 		ProxyURL:           authProxyURL(auth),
 		Note:               authNote(auth),
@@ -910,6 +985,9 @@ func buildAuthFileAccountSettingsView(auth *coreauth.Auth, cfg *config.Config) a
 		ManagedHeaderState: managedHeaderState,
 		ClientObservations: clientObservations,
 		SyntheticDeviceID:  syntheticDeviceIDMasked,
+		DeviceIDSource:     deviceIDSource,
+		FarmBound:          farmBound,
+		FarmEnrolled:       farmEnrolled,
 		Activation: authFileAccountSettingsActivation{
 			Summary:   accountSettingsActivationSummary(auth, managedHeaders, extraHeaders, refreshEnabled, transportRuntimeEnforced, tlsRuntimeEnforced),
 			State:     accountSettingsActivationState(auth, stored.TransportProfile, stored.TLSProfile, refreshEnabled, transportRuntimeEnforced, tlsRuntimeEnforced),
@@ -2209,6 +2287,7 @@ func (h *Handler) PatchAuthFileAccountSettings(c *gin.Context) {
 		ExtraHeaders     map[string]string `json:"extra_headers"`
 		RefreshEnabled   *bool             `json:"refresh_enabled"`
 		Fast             *bool             `json:"fast"`
+		FarmEnrolled     *bool             `json:"farm_enrolled"`
 		TransportProfile any               `json:"transport_profile"`
 		TLSProfile       any               `json:"tls_profile"`
 	}
@@ -2277,6 +2356,10 @@ func (h *Handler) PatchAuthFileAccountSettings(c *gin.Context) {
 	if req.RefreshEnabled != nil {
 		refreshEnabled = *req.RefreshEnabled
 	}
+	farmEnrolled := accountSettingsFarmEnrolled(targetAuth, existingStored)
+	if req.FarmEnrolled != nil {
+		farmEnrolled = *req.FarmEnrolled
+	}
 
 	// Bug fix: capture the pre-mutation Disabled value so the auto-quarantine
 	// clear below can be gated on a genuine disabled=true -> disabled=false
@@ -2330,12 +2413,14 @@ func (h *Handler) PatchAuthFileAccountSettings(c *gin.Context) {
 		ManagedHeaderSeedHash: accountManagedHeaderSeedHash(targetAuth),
 		ExtraHeaders:          extraHeaders,
 		RefreshEnabled:        refreshEnabledStorageValue(refreshEnabled),
+		FarmEnrolled:          farmEnrolledStorageValue(farmEnrolled),
 		TransportProfile:      transportProfile,
 		TLSProfile:            tlsProfile,
 		ManagedHeaderState:    existingStored.ManagedHeaderState,
 		RuntimeIdentityState:  existingStored.RuntimeIdentityState,
 	}
 	applyAuthRefreshEnabledMetadata(targetAuth, refreshEnabled)
+	applyAuthFarmEnrolledMetadata(targetAuth, farmEnrolled)
 
 	// Codex fast is a first-class, codex-only account setting. Only mutate
 	// fast_models when the field is present in the request AND this is a codex
