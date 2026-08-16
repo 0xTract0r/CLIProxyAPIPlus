@@ -331,6 +331,18 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 	if auth.Disabled || auth.Status == StatusDisabled || auth.AutoQuarantined || isReauthRequiredMetadata(auth.Metadata) {
 		return true, blockReasonDisabled, time.Time{}
 	}
+	// Fork supply-atomicity fail-closed gate (P2-A1): checked here, isomorphic to
+	// the disabled/quarantine/reauth locks above and after them, so an
+	// operator-disabled or quarantined account still reports its own terminal
+	// reason. When FARM_REQUIRE_PROVISIONED is armed, a Claude account without a
+	// real container device_id binding (only a synthetic derived value) is skipped
+	// entirely with a distinct blockReasonUnprovisioned so it can never serve
+	// traffic under a fabricated device_id. Unprovisioned is not "dead": the gate
+	// self-clears the moment a valid claude_device_id override is persisted. This
+	// is a strict no-op when the flag is unset (see forkRequireProvisionedBlocked).
+	if forkRequireProvisionedBlocked(auth) {
+		return true, blockReasonUnprovisioned, time.Time{}
+	}
 	if model != "" {
 		if len(auth.ModelStates) > 0 {
 			state, ok := auth.ModelStates[model]

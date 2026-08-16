@@ -252,6 +252,49 @@ func TestAuthFileLookupAndEntryBuildConcurrentEnsureIndex(t *testing.T) {
 	wg.Wait()
 }
 
+// TestBuildAuthFileEntryProjectsFarmEnrolled covers TR1
+// (telemetry-device-farm): buildAuthFileEntry must unconditionally project
+// the account-level farm_enrolled flag as a top-level entry field (same
+// pattern as auto_quarantined) so the farm-orchestrator candidate filter and
+// the management UI can read it without unpacking account_settings.
+func TestBuildAuthFileEntryProjectsFarmEnrolled(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, nil)
+
+	notEnrolled := &coreauth.Auth{
+		ID:         "auth-not-enrolled",
+		FileName:   "not-enrolled.json",
+		Provider:   "claude",
+		Status:     coreauth.StatusActive,
+		Attributes: map[string]string{"path": filepath.Join(t.TempDir(), "not-enrolled.json")},
+		Metadata:   map[string]any{"type": "claude"},
+	}
+	entry := h.buildAuthFileEntry(notEnrolled)
+	if entry == nil {
+		t.Fatalf("expected entry, got nil")
+	}
+	if got, ok := entry["farm_enrolled"]; !ok || got != false {
+		t.Fatalf("farm_enrolled = %#v (present=%v), want false (present)", got, ok)
+	}
+
+	enrolled := &coreauth.Auth{
+		ID:         "auth-enrolled",
+		FileName:   "enrolled.json",
+		Provider:   "claude",
+		Status:     coreauth.StatusActive,
+		Attributes: map[string]string{"path": filepath.Join(t.TempDir(), "enrolled.json")},
+		Metadata:   map[string]any{"type": "claude", coreauth.FarmEnrolledMetadataKey: true},
+	}
+	entry = h.buildAuthFileEntry(enrolled)
+	if entry == nil {
+		t.Fatalf("expected entry, got nil")
+	}
+	if got, ok := entry["farm_enrolled"]; !ok || got != true {
+		t.Fatalf("farm_enrolled = %#v (present=%v), want true (present)", got, ok)
+	}
+}
+
 func registerAuthForLookupTest(t *testing.T, manager *coreauth.Manager, auth *coreauth.Auth) {
 	t.Helper()
 	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
