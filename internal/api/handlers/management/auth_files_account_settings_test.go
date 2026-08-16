@@ -2312,6 +2312,251 @@ func TestPatchAuthFileAccountSettings_ReauthRequiredReenableRoundTrips(t *testin
 	}
 }
 
+// TestGetAuthFileAccountSettings_FastReflectsCodexFastModels asserts the GET view
+// exposes fast=true exactly when the codex account carries a non-empty fast_models
+// allowlist (including "*") and fast=false when it is empty.
+func TestGetAuthFileAccountSettings_FastReflectsCodexFastModels(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	cases := []struct {
+		name       string
+		fastModels any
+		wantFast   bool
+	}{
+		{name: "star_enables", fastModels: "*", wantFast: true},
+		{name: "empty_disables", fastModels: "", wantFast: false},
+		{name: "explicit_model_enables", fastModels: "gpt-5.6", wantFast: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &memoryAuthStore{}
+			manager := coreauth.NewManager(store, nil, nil)
+			record := &coreauth.Auth{
+				ID:         "codex-fast-get.json",
+				FileName:   "codex-fast-get.json",
+				Provider:   "codex",
+				Attributes: map[string]string{"path": "/tmp/codex-fast-get.json"},
+				Metadata: map[string]any{
+					"type":         "codex",
+					"access_token": "access-token",
+					"fast_models":  tc.fastModels,
+				},
+			}
+			if _, err := manager.Register(context.Background(), record); err != nil {
+				t.Fatalf("failed to register auth record: %v", err)
+			}
+			h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+
+			rec := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(rec)
+			ctx.Request = httptest.NewRequest(http.MethodGet, "/v0/management/auth-files/account-settings?name=codex-fast-get.json", nil)
+			h.GetAuthFileAccountSettings(ctx)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("GET status = %d, body %s", rec.Code, rec.Body.String())
+			}
+			var resp authFileAccountSettingsResponse
+			if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+				t.Fatalf("failed to decode response: %v", err)
+			}
+			if resp.AccountSettings.Fast != tc.wantFast {
+				t.Fatalf("fast = %v, want %v (fast_models=%#v)", resp.AccountSettings.Fast, tc.wantFast, tc.fastModels)
+			}
+		})
+	}
+}
+
+// TestGetAuthFileAccountSettings_FastFalseForNonCodex verifies fast is reported as
+// false for a non-codex account even if a stray fast_models value is present, since
+// the runtime fast gate can never fire for such an account.
+func TestGetAuthFileAccountSettings_FastFalseForNonCodex(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	record := &coreauth.Auth{
+		ID:         "claude-fast-get.json",
+		FileName:   "claude-fast-get.json",
+		Provider:   "claude",
+		Attributes: map[string]string{"path": "/tmp/claude-fast-get.json"},
+		Metadata: map[string]any{
+			"type":         "claude",
+			"access_token": "access-token",
+			"fast_models":  "*",
+		},
+	}
+	if _, err := manager.Register(context.Background(), record); err != nil {
+		t.Fatalf("failed to register auth record: %v", err)
+	}
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v0/management/auth-files/account-settings?name=claude-fast-get.json", nil)
+	h.GetAuthFileAccountSettings(ctx)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET status = %d, body %s", rec.Code, rec.Body.String())
+	}
+	var resp authFileAccountSettingsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if resp.AccountSettings.Fast {
+		t.Fatalf("non-codex account fast = true, want false")
+	}
+}
+
+// TestPatchAuthFileAccountSettings_FastTogglesCodexFastModelsAsStringScalar is the
+// core write contract: PATCH fast=true writes fast_models="*" as a JSON STRING scalar
+// (never an array, which codexFastEnabled would silently treat as false) at the
+// account metadata top level; PATCH fast=false writes the empty string "" (present,
+// not deleted). The GET/response view reflects the toggle both times.
+func TestPatchAuthFileAccountSettings_FastTogglesCodexFastModelsAsStringScalar(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	record := &coreauth.Auth{
+		ID:         "codex-fast-patch.json",
+		FileName:   "codex-fast-patch.json",
+		Provider:   "codex",
+		Attributes: map[string]string{"path": "/tmp/codex-fast-patch.json"},
+		Metadata: map[string]any{
+			"type":         "codex",
+			"access_token": "access-token",
+		},
+	}
+	if _, err := manager.Register(context.Background(), record); err != nil {
+		t.Fatalf("failed to register auth record: %v", err)
+	}
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+
+	patch := func(fast bool) authFileAccountSettingsResponse {
+		t.Helper()
+		body := `{"name":"codex-fast-patch.json","proxy_url":"http://test-proxy:8080","disabled":false,"fast":` + map[bool]string{true: "true", false: "false"}[fast] + `}`
+		rec := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(rec)
+		req := httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/account-settings", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		ctx.Request = req
+		h.PatchAuthFileAccountSettings(ctx)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("PATCH fast=%v status = %d, body %s", fast, rec.Code, rec.Body.String())
+		}
+		var resp authFileAccountSettingsResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("failed to decode patch response: %v", err)
+		}
+		return resp
+	}
+
+	// fast=true -> string scalar "*"
+	respOn := patch(true)
+	if !respOn.AccountSettings.Fast {
+		t.Fatalf("PATCH fast=true response fast = false, want true")
+	}
+	updated, ok := manager.GetByID("codex-fast-patch.json")
+	if !ok || updated == nil {
+		t.Fatalf("expected updated auth record")
+	}
+	rawOn, okType := updated.Metadata["fast_models"].(string)
+	if !okType {
+		t.Fatalf("fast_models is %T, want string scalar", updated.Metadata["fast_models"])
+	}
+	if rawOn != "*" {
+		t.Fatalf("fast_models = %q, want %q", rawOn, "*")
+	}
+	// Prove the persisted JSON shape is a string scalar, not an array (the critical
+	// codexFastEnabled compatibility contract).
+	marshaledOn, err := json.Marshal(updated.Metadata)
+	if err != nil {
+		t.Fatalf("failed to marshal metadata: %v", err)
+	}
+	if !strings.Contains(string(marshaledOn), `"fast_models":"*"`) {
+		t.Fatalf("marshaled metadata missing string-scalar fast_models: %s", marshaledOn)
+	}
+
+	// fast=false -> empty string "" (present, not deleted)
+	respOff := patch(false)
+	if respOff.AccountSettings.Fast {
+		t.Fatalf("PATCH fast=false response fast = true, want false")
+	}
+	updatedOff, ok := manager.GetByID("codex-fast-patch.json")
+	if !ok || updatedOff == nil {
+		t.Fatalf("expected updated auth record after disable")
+	}
+	rawOff, present := updatedOff.Metadata["fast_models"]
+	if !present {
+		t.Fatalf("fast_models key should remain present (empty string), got deleted")
+	}
+	strOff, okType := rawOff.(string)
+	if !okType {
+		t.Fatalf("fast_models is %T, want string scalar", rawOff)
+	}
+	if strOff != "" {
+		t.Fatalf("fast_models = %q, want empty string", strOff)
+	}
+	marshaledOff, err := json.Marshal(updatedOff.Metadata)
+	if err != nil {
+		t.Fatalf("failed to marshal metadata: %v", err)
+	}
+	if !strings.Contains(string(marshaledOff), `"fast_models":""`) {
+		t.Fatalf("marshaled metadata missing empty string fast_models: %s", marshaledOff)
+	}
+}
+
+// TestPatchAuthFileAccountSettings_FastIgnoredForNonCodex verifies a fast toggle on a
+// non-codex account is a no-op: fast_models is never written and the view stays false.
+func TestPatchAuthFileAccountSettings_FastIgnoredForNonCodex(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	record := &coreauth.Auth{
+		ID:         "claude-fast-patch.json",
+		FileName:   "claude-fast-patch.json",
+		Provider:   "claude",
+		Attributes: map[string]string{"path": "/tmp/claude-fast-patch.json"},
+		Metadata: map[string]any{
+			"type":         "claude",
+			"access_token": "access-token",
+		},
+	}
+	if _, err := manager.Register(context.Background(), record); err != nil {
+		t.Fatalf("failed to register auth record: %v", err)
+	}
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+
+	body := `{"name":"claude-fast-patch.json","proxy_url":"http://test-proxy:8080","disabled":false,"fast":true}`
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/account-settings", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	ctx.Request = req
+	h.PatchAuthFileAccountSettings(ctx)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PATCH status = %d, body %s", rec.Code, rec.Body.String())
+	}
+
+	updated, ok := manager.GetByID("claude-fast-patch.json")
+	if !ok || updated == nil {
+		t.Fatalf("expected updated auth record")
+	}
+	if v, present := updated.Metadata["fast_models"]; present {
+		t.Fatalf("non-codex account must not get fast_models, got %#v", v)
+	}
+	var resp authFileAccountSettingsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to decode patch response: %v", err)
+	}
+	if resp.AccountSettings.Fast {
+		t.Fatalf("non-codex account fast = true, want false")
+	}
+}
+
 func containsString(values []string, want string) bool {
 	for _, value := range values {
 		if value == want {
