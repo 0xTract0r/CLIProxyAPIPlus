@@ -111,6 +111,18 @@ func forkRequireProvisionedBlocked(auth *Auth) bool {
 	return !authHasProvisionedDeviceBinding(auth)
 }
 
+// RequireProvisionedBlocked is the exported wrapper around
+// forkRequireProvisionedBlocked so callers outside this package — the management
+// quota poller (quota_snapshots.go), the api-call precheck (api_tools.go) and the
+// Claude refresh executor (claude_executor_auth.go) — can reuse the EXACT same
+// supply-atomicity fail-closed predicate instead of re-deriving a looser one. It
+// inherits every gating property verbatim: strict no-op unless
+// FARM_REQUIRE_PROVISIONED is armed, Claude-only, and scoped to explicitly
+// farm-enrolled accounts (pre-existing/production accounts stay immune).
+func RequireProvisionedBlocked(auth *Auth) bool {
+	return forkRequireProvisionedBlocked(auth)
+}
+
 // device_id_source enum values for the farm telemetry contract. These string
 // constants are the single source of truth shared with the management
 // projection (GET /auth-files/account-settings) and, downstream, the frontend

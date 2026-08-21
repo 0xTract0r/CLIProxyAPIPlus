@@ -348,6 +348,19 @@ func nextRefreshCheckAt(now time.Time, auth *Auth, interval time.Duration) (time
 	if auth.RefreshDisabled() {
 		return time.Time{}, false
 	}
+	// Farm supply-atomicity fail-closed gate (R5-3e): an enrolled-but-unprovisioned
+	// Claude account must never be picked up by the auto-refresh scheduler. A
+	// background OAuth token refresh would otherwise reach api.anthropic.com under
+	// only the per-account synthetic device_id (and, when the account carries no
+	// proxy, over the real server IP) — exactly the correlation leak this gate
+	// exists to prevent. It reuses the same predicate as selection, so it is a
+	// strict no-op when FARM_REQUIRE_PROVISIONED is off and for every non-enrolled
+	// account (leaving today's refresh schedule byte-identical); the account
+	// self-clears and re-schedules the moment a real claude_device_id binding is
+	// persisted (a subsequent auth Update re-runs this evaluation).
+	if forkRequireProvisionedBlocked(auth) {
+		return time.Time{}, false
+	}
 	if hasUnauthorizedAuthFailure(auth) {
 		return time.Time{}, false
 	}
