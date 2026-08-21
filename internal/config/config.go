@@ -121,6 +121,18 @@ type Config struct {
 
 	AntigravitySignatureBypassStrict *bool `yaml:"antigravity-signature-bypass-strict,omitempty" json:"antigravity-signature-bypass-strict,omitempty"`
 
+	// FarmAutoEnroll is the global switch for auto-enrolling a brand-new account
+	// into the device telemetry farm on its first completed authentication (the
+	// management saveTokenRecord previous == nil branch). It is a *bool so the Go
+	// zero value cannot silently force it off: unset (nil) means enabled, which
+	// preserves the pre-toggle behavior where every newly authenticated account
+	// was auto-enrolled. Read it via config.FarmAutoEnrollEnabled (nil => true).
+	// Set farm-auto-enroll: false to make farm enrollment strictly manual
+	// opt-in through the account-level farm_enrolled toggle; existing accounts'
+	// enrollment is never changed by this switch (only first-auth enrollment is
+	// gated), and reauth of an existing account is unaffected either way.
+	FarmAutoEnroll *bool `yaml:"farm-auto-enroll,omitempty" json:"farm-auto-enroll,omitempty"`
+
 	// GeminiKey defines Gemini API key configurations with optional routing overrides.
 	GeminiKey []GeminiKey `yaml:"gemini-api-key" json:"gemini-api-key"`
 
