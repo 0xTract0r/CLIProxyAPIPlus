@@ -319,6 +319,23 @@ func (h *Handler) PutForceModelPrefix(c *gin.Context) {
 	h.updateBoolField(c, func(v bool) { h.cfg.ForceModelPrefix = v })
 }
 
+// FarmAutoEnroll is the global switch that decides whether a brand-new account's
+// first completed authentication is auto-enrolled into the device telemetry farm
+// (see saveTokenRecord's previous == nil branch and config.FarmAutoEnrollEnabled).
+// The JSON contract is the positive {"value": bool} sense — value=true means
+// auto-enroll is on — matching the management UI toggle. The config stores it as
+// a *bool where unset defaults to true, so GET normalizes nil to true and PUT
+// always writes an explicit pointer.
+func (h *Handler) GetFarmAutoEnroll(c *gin.Context) {
+	c.JSON(200, gin.H{"value": config.FarmAutoEnrollEnabled(h.cfg)})
+}
+func (h *Handler) PutFarmAutoEnroll(c *gin.Context) {
+	h.updateBoolField(c, func(v bool) {
+		enabled := v
+		h.cfg.FarmAutoEnroll = &enabled
+	})
+}
+
 func normalizeRoutingStrategy(strategy string) (string, bool) {
 	normalized := strings.ToLower(strings.TrimSpace(strategy))
 	switch normalized {

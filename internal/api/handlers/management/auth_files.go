@@ -358,6 +358,28 @@ func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth) gin.H {
 			entry["quarantined_at"] = auth.QuarantinedAt.UTC().Format(time.RFC3339)
 		}
 	}
+	// R5-1a (telemetry-farm): surface the automatic reauth/ban timestamp
+	// (Metadata["refresh_disabled_at"], written as an RFC3339 string by
+	// markRefreshReauthRequiredWithReason when a credential is auto-disabled and
+	// needs re-authentication) so the farm-orchestrator passthrough and the
+	// management UI can show *when* the account was banned instead of a
+	// hardcoded "—". Independent of AutoQuarantined: the reauth lock and the
+	// quarantine lock are separate automatic locks. Mirrors the quarantined_at
+	// gate above -- only emit when the key exists and the string is non-empty,
+	// never a Go zero time ("0001-01-01...") or an empty/dirty value.
+	if refreshDisabledAt, ok := auth.Metadata["refresh_disabled_at"].(string); ok {
+		if trimmed := strings.TrimSpace(refreshDisabledAt); trimmed != "" {
+			// Mirror the quarantined_at IsZero() gate above: a Go zero time
+			// serialized as an RFC3339 string ("0001-01-01T00:00:00Z") is
+			// non-empty but carries no real ban timestamp, so drop it. A
+			// non-empty string that does not parse as RFC3339 is passed
+			// through unchanged (best effort; markRefreshReauthRequiredWithReason
+			// always writes RFC3339 via time.RFC3339).
+			if parsed, err := time.Parse(time.RFC3339, trimmed); err != nil || !parsed.IsZero() {
+				entry["refresh_disabled_at"] = trimmed
+			}
+		}
+	}
 	entry["success"] = auth.Success
 	entry["failed"] = auth.Failed
 	entry["recent_requests"] = auth.RecentRequestsSnapshot(time.Now())

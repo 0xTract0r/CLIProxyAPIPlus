@@ -326,6 +326,12 @@ func isKnownDefaultValue(path []string, node *yaml.Node) bool {
 		switch fullPath {
 		case "quota-snapshot-refresh.enabled", "quota-snapshot-refresh.startup-catch-up":
 			return node.Value == "true"
+		case "farm-auto-enroll":
+			// farm-auto-enroll defaults to true (config.FarmAutoEnrollEnabled), so
+			// an explicit `false` must survive the generic zero-value pruning below
+			// (regression guarded by TestSaveConfigPreserveCommentsKeepsFarmAutoEnrollFalse).
+			// Only the redundant `true` is a prunable known default here.
+			return node.Value == "true"
 		}
 	}
 	if node.Kind == yaml.MappingNode && fullPath == "quota-snapshot-refresh" {

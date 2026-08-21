@@ -155,3 +155,28 @@ fork路由-Amp管理	ampcode/upstream-url	route	s\.mgmt\.PutAmpUpstreamURL	inter
 fork路由-Amp管理	ampcode/restrict-management-to-localhost	route	s\.mgmt\.GetAmpRestrictManagementToLocalhost	internal/api/server_management.go
 fork路由-Amp管理	ampcode/model-mappings	route	s\.mgmt\.GetAmpModelMappings	internal/api/server_management.go
 fork路由-Amp管理	ampcode/force-model-mappings	route	s\.mgmt\.GetAmpForceModelMappings	internal/api/server_management.go
+
+# === R5-1a: 账号封禁时间(refresh_disabled_at)暴露到管理 API 守护(1) ===
+# 补硬:markRefreshReauthRequiredWithReason 把账号自动禁用/需重认证时间写进
+#   Metadata["refresh_disabled_at"],buildAuthFileEntryLocked 把它透传进 auth-files
+#   管理 API 响应,供 farm 页/管理 UI 展示封禁时间。上游同步若覆盖 auth_files.go 丢掉
+#   这条透传赋值,前端封禁时间格会回退硬编码"—"——仅靠符号存在性发现不了,这里断言
+#   该透传赋值点仍在。
+反关联-账号封禁时间暴露	refresh_disabled_at@buildAuthFileEntry	pattern	entry\["refresh_disabled_at"\]	internal/api/handlers/management/auth_files.go
+
+# === H4: 全局自动纳管开关(farm-auto-enroll)端点 + config gate 守护(6) ===
+# 补硬:fork-only 的全局自动纳管总开关。GET/PUT/PATCH /v0/management/farm-auto-enroll 读写
+#   config.FarmAutoEnroll;saveTokenRecord 的"全新账号(previous == nil)首次成功认证"纳管接线
+#   applyAuthFarmEnrolledMetadata(record, true) 被 config.FarmAutoEnrollEnabled(h.cfg) gate 包住——
+#   operator 关掉开关后全新账号不再自动纳管,改为严格手动 opt-in。上游同步若覆盖
+#   server_management.go / config_basic.go / config_normalization.go / auth_files_fields.go,会静默
+#   丢掉端点注册、handler、gate 符号或 gate 接线:端点消失、开关失效(自动纳管回退为无条件纳管)——
+#   仅靠符号存在性发现不了整条接线被拆,这里断言两条路由 + 两个 handler + gate 符号 + gate 接线仍在。
+#   route/symbol/pattern 均 anchor 到生产文件(第 5 列),不误命中 *_test.go——测试文件用
+#   h.GetFarmAutoEnroll(ctx) 调用点,不含 mgmt.GET 注册串 / ^func 定义 / auth_files_fields.go 内接线。
+H4-farm自动纳管开关	farm-auto-enroll路由GET	route	mgmt\.GET\("/farm-auto-enroll", s\.mgmt\.GetFarmAutoEnroll\)	internal/api/server_management.go
+H4-farm自动纳管开关	farm-auto-enroll路由PUT	route	mgmt\.PUT\("/farm-auto-enroll", s\.mgmt\.PutFarmAutoEnroll\)	internal/api/server_management.go
+H4-farm自动纳管开关	GetFarmAutoEnroll handler	symbol	^func \(h \*Handler\) GetFarmAutoEnroll\(	internal/api/handlers/management/config_basic.go
+H4-farm自动纳管开关	PutFarmAutoEnroll handler	symbol	^func \(h \*Handler\) PutFarmAutoEnroll\(	internal/api/handlers/management/config_basic.go
+H4-farm自动纳管开关	FarmAutoEnrollEnabled gate符号	symbol	^func FarmAutoEnrollEnabled\(	internal/config/config_normalization.go
+H4-farm自动纳管开关	gate包住applyAuthFarmEnrolledMetadata	pattern	config\.FarmAutoEnrollEnabled\(h\.cfg\)	internal/api/handlers/management/auth_files_fields.go

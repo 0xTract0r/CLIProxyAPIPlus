@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
@@ -791,7 +792,18 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 		// already carried forward untouched by mergeUserDefinedAuthMetadataInto
 		// (the key is not in reauthTokenMetadataKeys/reauthRuntimeMetadataKeys),
 		// so this branch never re-enrolls or un-enrolls them.
-		applyAuthFarmEnrolledMetadata(record, true)
+		//
+		// H4 (telemetry-farm): auto-enrollment is now gated behind the global
+		// farm-auto-enroll switch (config.FarmAutoEnrollEnabled, default true).
+		// When an operator flips it off, first-auth accounts are left unenrolled
+		// (farm_enrolled key absent => coreauth.AuthFarmEnrolled false default)
+		// so enrollment becomes strictly manual opt-in via the account-level
+		// toggle. h.cfg is the live in-memory config the management handler
+		// mutates on PUT and that hot-reload swaps via SetConfig, so this read
+		// always observes the current switch value.
+		if config.FarmAutoEnrollEnabled(h.cfg) {
+			applyAuthFarmEnrolledMetadata(record, true)
+		}
 	}
 
 	// Bug fix: a successful reauth / OAuth callback must clear any automatic

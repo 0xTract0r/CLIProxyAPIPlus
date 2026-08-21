@@ -386,6 +386,20 @@ func AlignRealPathBillingVersionEnabled(cfg *Config) bool {
 		*cfg.Claude.AlignRealPathBillingVersion
 }
 
+// FarmAutoEnrollEnabled reports whether a brand-new account's first completed
+// authentication is auto-enrolled into the device telemetry farm (management
+// saveTokenRecord's previous == nil branch; see Config.FarmAutoEnroll). It
+// defaults to true (enabled) when the pointer is unset, preserving the
+// pre-toggle behavior where every newly authenticated account was auto-enrolled
+// and avoiding the Go bool zero-value trap that would otherwise make a stock
+// config silently stop enrolling. Set farm-auto-enroll: false to make farm
+// enrollment strictly manual opt-in via the account-level farm_enrolled toggle.
+func FarmAutoEnrollEnabled(cfg *Config) bool {
+	return cfg == nil ||
+		cfg.FarmAutoEnroll == nil ||
+		*cfg.FarmAutoEnroll
+}
+
 // ManagedHeaderOnlineUpdateEnabled reports whether core may consult public
 // online registries to refresh provider-managed version markers.
 func ManagedHeaderOnlineUpdateEnabled(cfg *Config) bool {
