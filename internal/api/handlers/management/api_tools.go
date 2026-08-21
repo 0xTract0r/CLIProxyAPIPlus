@@ -181,6 +181,19 @@ func (h *Handler) APICall(c *gin.Context) {
 	authIndex := firstNonEmptyString(body.AuthIndexSnake, body.AuthIndexCamel, body.AuthIndexPascal)
 	auth := h.authByIndex(authIndex)
 
+	// Farm supply-atomicity fail-closed gate (R5-3b): reject an api-call targeting
+	// an enrolled-but-unprovisioned Claude account before any outbound request is
+	// built or token resolved. The management api-call path issues arbitrary
+	// authenticated requests (e.g. api.anthropic.com probes) carrying this
+	// account's token; running one before the account is bound to a container
+	// leaks the synthetic device_id identity. The predicate is nil-safe (auth may
+	// be nil when no index matched) and a strict no-op when FARM_REQUIRE_PROVISIONED
+	// is off / for non-enrolled accounts, matching the :201-207 token-missing 400s.
+	if coreauth.RequireProvisionedBlocked(auth) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "farm account not provisioned: container fail-closed, refusing api-call before device binding"})
+		return
+	}
+
 	reqHeaders := body.Header
 	if reqHeaders == nil {
 		reqHeaders = map[string]string{}

@@ -219,6 +219,16 @@ func (h *Handler) refreshDueQuotaSnapshots(ctx context.Context, policy QuotaSnap
 		if auth == nil || auth.Disabled || !quotaSnapshotProviderSupported(auth.Provider) {
 			continue
 		}
+		// Farm supply-atomicity fail-closed gate (R5-3e): skip background quota
+		// polling for enrolled-but-unprovisioned Claude accounts. The claude quota
+		// probe (fetchProviderQuotaSnapshot) issues real GET /api/oauth/profile and
+		// /api/oauth/usage requests to api.anthropic.com carrying this account's
+		// token; probing one before it is bound to a container leaks the synthetic
+		// device_id identity. Strict no-op when FARM_REQUIRE_PROVISIONED is off /
+		// for non-enrolled accounts, so existing polling is unchanged.
+		if coreauth.RequireProvisionedBlocked(auth) {
+			continue
+		}
 		// Recovered (StatusActive) accounts may still carry a stale
 		// quota_refresh_status=reauth_required written by an earlier transient
 		// 401/403. Mirror the explicit-refresh path (quotaRefreshTargets) so the
@@ -426,11 +436,41 @@ func quotaSnapshotEntryFromAuth(auth *coreauth.Auth) quotaSnapshotEntry {
 	return entry
 }
 
+// errQuotaRefreshProvisionedBlocked is returned by refreshQuotaSnapshot when the
+// farm supply-atomicity fail-closed gate matches an account. It signals the quota
+// probe was intentionally skipped (no api.anthropic.com egress) — distinct from a
+// provider/network error — so refreshQuotaSnapshotResult renders a clean blocked
+// result instead of a scary provider error, and callers can errors.Is it.
+var errQuotaRefreshProvisionedBlocked = errors.New("farm account not provisioned: refusing anthropic quota probe (fail-closed)")
+
 func (h *Handler) refreshQuotaSnapshot(ctx context.Context, auth *coreauth.Auth, policy QuotaSnapshotRefreshPolicy) (*coreauth.Auth, error) {
 	policy = policy.normalized()
 	manager := h.currentAuthManager()
 	if manager == nil || auth == nil {
 		return auth, fmt.Errorf("auth manager unavailable")
+	}
+	// Farm supply-atomicity fail-closed gate (R5-3e, explicit-refresh chokepoint):
+	// refreshQuotaSnapshot is the SINGLE function through which BOTH the background
+	// poller (refreshDueQuotaSnapshots) AND the explicit operator/frontend-triggered
+	// endpoint (POST /quota/refresh -> RefreshQuotaSnapshots -> quotaRefreshTargets
+	// -> refreshQuotaSnapshotResult) reach fetchProviderQuotaSnapshot, whose Claude
+	// branch issues real GET /api/oauth/profile + /api/oauth/usage requests to
+	// api.anthropic.com carrying this account's token AND its frozen managed device
+	// profile — UA / stainless / protocol headers / x-client-request-id, i.e. the
+	// per-account synthetic device identity (ClaudeExecutor.PrepareRequest applies
+	// the full managed device profile on isAnthropicBase). The GET probe has no body,
+	// so the leak is these request headers, not a body device_id. Probing an enrolled-but-unprovisioned Claude account before
+	// it is bound to a container leaks the synthetic device_id <-> account
+	// correlation over the account proxy. The poller already skips these accounts at
+	// its scheduling loop (see the :229 gate); wiring the same predicate here closes
+	// the previously-ungated explicit endpoint for EVERY trigger mode (by-id /
+	// by-name / provider-wide / global) plus any future direct caller, with one
+	// chokepoint. It reuses the exact same predicate as selection/refresh, so it is a
+	// strict no-op when FARM_REQUIRE_PROVISIONED is off / for non-enrolled /
+	// provisioned / non-Claude accounts, keeping default behaviour and every existing
+	// quota test byte-identical.
+	if coreauth.RequireProvisionedBlocked(auth) {
+		return auth, errQuotaRefreshProvisionedBlocked
 	}
 	exec, ok := manager.Executor(auth.Provider)
 	if !ok || exec == nil {
@@ -480,6 +520,17 @@ func (h *Handler) refreshQuotaSnapshotResult(ctx context.Context, auth *coreauth
 	}
 	if result.Status == "" {
 		result.Status = quotaRefreshStatusStale
+	}
+	// Farm supply-atomicity fail-closed gate (R5-3e): the probe was intentionally
+	// skipped (no anthropic egress). Report it as a deliberate skip rather than a
+	// provider/network error — refreshed=false with a dedicated error_class and no
+	// scary error string — and do not warn-log it (mirrors the poller's silent :229
+	// skip). Return early so it never falls through to the provider-error path.
+	if errors.Is(err, errQuotaRefreshProvisionedBlocked) {
+		result.Refreshed = false
+		result.ErrorClass = "provisioning_blocked"
+		result.Error = ""
+		return result
 	}
 	if err != nil {
 		result.Refreshed = false

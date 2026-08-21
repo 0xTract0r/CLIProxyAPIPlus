@@ -56,6 +56,12 @@
 反关联-farm供给门	供给门接线到选号阻断	pattern	forkRequireProvisionedBlocked\(auth\)	sdk/cliproxy/auth/selector.go
 反关联-farm按账号纳管	AuthFarmEnrolled	symbol	^func AuthFarmEnrolled\(	sdk/cliproxy/auth/farm_enrolled.go
 反关联-farm按账号纳管	供给门只拦已纳管账号	pattern	!AuthFarmEnrolled\(auth\)	sdk/cliproxy/auth/provisioned_gate.go
+反关联-farm供给门	RequireProvisionedBlocked导出包装	symbol	^func RequireProvisionedBlocked\(	sdk/cliproxy/auth/provisioned_gate.go
+反关联-farm供给门	R5-3e供给门接线到刷新调度	pattern	forkRequireProvisionedBlocked\(auth\)	sdk/cliproxy/auth/auto_refresh_loop.go
+反关联-farm供给门	R5-3e供给门接线到配额轮询	pattern	RequireProvisionedBlocked\(auth\)	internal/api/handlers/management/quota_snapshots.go
+反关联-farm供给门	R5-3e供给门接线到配额刷新chokepoint	pattern	return auth, errQuotaRefreshProvisionedBlocked	internal/api/handlers/management/quota_snapshots.go
+反关联-farm供给门	R5-3d供给门接线到claude刷新执行器	pattern	RequireProvisionedBlocked\(auth\)	internal/runtime/executor/claude_executor_auth.go
+反关联-farm供给门	R5-3b供给门接线到api-call预检	pattern	RequireProvisionedBlocked\(auth\)	internal/api/handlers/management/api_tools.go
 反关联-Codex路径归一化	persistCodexDeviceHighWater	symbol	^func \(e \*CodexExecutor\) persistCodexDeviceHighWater\(	internal/runtime/executor/codex_executor.go
 
 # === G1 关键回退守护(2 条必须成对读:一条必须命中,一条必须不命中) ===

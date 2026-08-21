@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -12,6 +13,18 @@ import (
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
 )
+
+// errFarmUnprovisionedRefreshProxyMissing is returned by ClaudeExecutor.Refresh
+// when the farm supply-atomicity fail-closed gate matches an account
+// (FARM_REQUIRE_PROVISIONED armed + farm-enrolled + unprovisioned Claude) that
+// resolves to no proxy at all. Falling through to NewClaudeAuthWithProxyURL with
+// an empty proxy builds a direct OAuth transport (NewAnthropicHttpClient ->
+// proxyutil.NewDirectTransport) that would expose the real server IP to
+// api.anthropic.com under only the synthetic device_id. This sentinel is a new
+// executor-local error (not the helps package's egress guard) so the fail-closed
+// reason is specific to the farm supply-atomicity policy rather than the generic
+// serving egress guard, and callers can errors.Is it distinctly.
+var errFarmUnprovisionedRefreshProxyMissing = errors.New("farm account not provisioned and no proxy configured: refusing direct OAuth refresh to prevent IP exposure")
 
 func (e *ClaudeExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {
 	log.Debugf("claude executor: refresh called")
@@ -36,6 +49,27 @@ func (e *ClaudeExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (
 	}
 	if refreshToken == "" {
 		return auth, nil
+	}
+	// Farm supply-atomicity fail-closed gate (R5-3d): when the gate matches this
+	// account AND neither the account nor the global config carries a proxy, refuse
+	// to refresh instead of falling through to NewClaudeAuthWithProxyURL, whose
+	// empty-proxy path builds a direct transport that would expose the real server
+	// IP to the token endpoint. The auto-refresh scheduler (R5-3e) already unschedules
+	// these accounts; this is the defense-in-depth executor-layer guard for any
+	// other refresh caller. Strict no-op when FARM_REQUIRE_PROVISIONED is off / for
+	// non-enrolled or provisioned accounts (predicate returns false), so refresh
+	// behaviour stays byte-identical today. An account WITH a resolved proxy still
+	// refreshes normally (egress is not direct), so this never fail-closes a
+	// properly-proxied enrolled account.
+	if cliproxyauth.RequireProvisionedBlocked(auth) {
+		cfgProxyURL := ""
+		if e.cfg != nil {
+			cfgProxyURL = strings.TrimSpace(e.cfg.ProxyURL)
+		}
+		if strings.TrimSpace(auth.ProxyURL) == "" && cfgProxyURL == "" {
+			log.Warnf("claude executor: refusing OAuth refresh for farm-unprovisioned auth %q with no proxy (fail-closed)", auth.ID)
+			return nil, errFarmUnprovisionedRefreshProxyMissing
+		}
 	}
 	svc := claudeauth.NewClaudeAuthWithProxyURL(e.cfg, auth.ProxyURL)
 	// Raise the OAuth refresh User-Agent to this account's persisted
