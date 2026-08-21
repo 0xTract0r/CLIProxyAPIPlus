@@ -3,6 +3,7 @@ package management
 import (
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
@@ -20,6 +21,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	log "github.com/sirupsen/logrus"
 )
 
 const (
@@ -298,7 +300,9 @@ func (h *Handler) GetRequestLogByID(c *gin.Context) {
 	}
 
 	suffix := "-" + requestID + ".log"
+	suffixGz := "-" + requestID + ".log.gz"
 	var matchedFile string
+	var matchedGz string
 	for _, entry := range entries {
 		if entry.IsDir() {
 			continue
@@ -308,9 +312,21 @@ func (h *Handler) GetRequestLogByID(c *gin.Context) {
 			matchedFile = name
 			break
 		}
+		if matchedGz == "" && strings.HasSuffix(name, suffixGz) {
+			matchedGz = name
+		}
 	}
 
-	if matchedFile == "" {
+	// Retention may compress older request logs into "-{id}.log.gz". Prefer an
+	// uncompressed hit; only fall back to the gzip archive when no plain file exists.
+	isGzip := false
+	matchedName := matchedFile
+	if matchedName == "" && matchedGz != "" {
+		matchedName = matchedGz
+		isGzip = true
+	}
+
+	if matchedName == "" {
 		c.JSON(http.StatusNotFound, gin.H{"error": "log file not found for the given request ID"})
 		return
 	}
@@ -320,7 +336,7 @@ func (h *Handler) GetRequestLogByID(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to resolve log directory: %v", errAbs)})
 		return
 	}
-	fullPath := filepath.Clean(filepath.Join(dirAbs, matchedFile))
+	fullPath := filepath.Clean(filepath.Join(dirAbs, matchedName))
 	prefix := dirAbs + string(os.PathSeparator)
 	if !strings.HasPrefix(fullPath, prefix) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid log file path"})
@@ -341,7 +357,48 @@ func (h *Handler) GetRequestLogByID(c *gin.Context) {
 		return
 	}
 
-	c.FileAttachment(fullPath, matchedFile)
+	if !isGzip {
+		c.FileAttachment(fullPath, matchedName)
+		return
+	}
+
+	h.serveGzipRequestLog(c, fullPath, matchedName)
+}
+
+// serveGzipRequestLog decompresses a retention-compressed request log ("-{id}.log.gz")
+// and streams the plain-text content back to the client. It never buffers the full
+// file in memory since historical logs can reach several hundred KB.
+func (h *Handler) serveGzipRequestLog(c *gin.Context, fullPath, gzName string) {
+	file, errOpen := os.Open(fullPath)
+	if errOpen != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to open log file: %v", errOpen)})
+		return
+	}
+	defer func() {
+		if errClose := file.Close(); errClose != nil {
+			log.Errorf("failed to close request log file %s: %v", fullPath, errClose)
+		}
+	}()
+
+	gzReader, errGz := gzip.NewReader(file)
+	if errGz != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to decompress log file: %v", errGz)})
+		return
+	}
+	defer func() {
+		if errClose := gzReader.Close(); errClose != nil {
+			log.Errorf("failed to close gzip reader for %s: %v", fullPath, errClose)
+		}
+	}()
+
+	plainName := strings.TrimSuffix(gzName, ".gz")
+	c.Header("Content-Type", "text/plain; charset=utf-8")
+	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=%q", plainName))
+	c.Status(http.StatusOK)
+	if _, errCopy := io.Copy(c.Writer, gzReader); errCopy != nil {
+		// Response headers/status are already flushed; only log the failure.
+		log.Errorf("failed to stream decompressed request log %s: %v", fullPath, errCopy)
+	}
 }
 
 // DownloadRequestErrorLog downloads a specific error request log file by name.
