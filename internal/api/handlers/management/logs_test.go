@@ -1,6 +1,7 @@
 package management
 
 import (
+	"compress/gzip"
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
@@ -726,6 +727,100 @@ func writeMainLog(t *testing.T, dir, content string) {
 	if err := os.WriteFile(filepath.Join(dir, defaultLogFileName), []byte(content), 0o644); err != nil {
 		t.Fatalf("write main log: %v", err)
 	}
+}
+
+func TestGetRequestLogByIDServesGzipCompressedLog(t *testing.T) {
+	dir := t.TempDir()
+	requestID := "req-gzip-1"
+	plainContent := "[2026-06-15 10:00:00] gzip request log body\nline two\n"
+	writeGzipRequestLog(t, dir, requestID, plainContent)
+
+	rec := performGetRequestLogByID(t, newLogsTestHandler(dir, true), requestID)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if rec.Body.String() != plainContent {
+		t.Fatalf("body = %q, want decompressed content %q", rec.Body.String(), plainContent)
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/plain") {
+		t.Fatalf("Content-Type = %q, want text/plain prefix", ct)
+	}
+	wantDisposition := `attachment; filename="app-` + requestID + `.log"`
+	if cd := rec.Header().Get("Content-Disposition"); cd != wantDisposition {
+		t.Fatalf("Content-Disposition = %q, want %q", cd, wantDisposition)
+	}
+}
+
+func TestGetRequestLogByIDPrefersPlainOverGzip(t *testing.T) {
+	dir := t.TempDir()
+	requestID := "req-both-1"
+	plainContent := "[2026-06-15 10:00:00] plain request log body\n"
+	if err := os.WriteFile(filepath.Join(dir, "app-"+requestID+".log"), []byte(plainContent), 0o644); err != nil {
+		t.Fatalf("write plain log: %v", err)
+	}
+	writeGzipRequestLog(t, dir, requestID, "[2026-06-15 09:00:00] stale gzip body\n")
+
+	rec := performGetRequestLogByID(t, newLogsTestHandler(dir, true), requestID)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if rec.Body.String() != plainContent {
+		t.Fatalf("body = %q, want plain content %q", rec.Body.String(), plainContent)
+	}
+}
+
+func TestGetRequestLogByIDMissingReturnsNotFound(t *testing.T) {
+	dir := t.TempDir()
+	rec := performGetRequestLogByID(t, newLogsTestHandler(dir, true), "req-missing-1")
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, body = %s, want 404", rec.Code, rec.Body.String())
+	}
+}
+
+func TestGetRequestLogByIDCorruptGzipReturnsServerError(t *testing.T) {
+	dir := t.TempDir()
+	requestID := "req-corrupt-1"
+	if err := os.WriteFile(filepath.Join(dir, "app-"+requestID+".log.gz"), []byte("not a real gzip stream"), 0o644); err != nil {
+		t.Fatalf("write corrupt gzip log: %v", err)
+	}
+
+	rec := performGetRequestLogByID(t, newLogsTestHandler(dir, true), requestID)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, body = %s, want 500", rec.Code, rec.Body.String())
+	}
+	if strings.TrimSpace(rec.Body.String()) == "not a real gzip stream" {
+		t.Fatal("handler leaked raw corrupt bytes back to the client instead of erroring")
+	}
+}
+
+func writeGzipRequestLog(t *testing.T, dir, requestID, plainContent string) string {
+	t.Helper()
+	path := filepath.Join(dir, "app-"+requestID+".log.gz")
+	f, errCreate := os.Create(path)
+	if errCreate != nil {
+		t.Fatalf("create gzip log: %v", errCreate)
+	}
+	gw := gzip.NewWriter(f)
+	if _, errWrite := gw.Write([]byte(plainContent)); errWrite != nil {
+		t.Fatalf("write gzip content: %v", errWrite)
+	}
+	if errClose := gw.Close(); errClose != nil {
+		t.Fatalf("close gzip writer: %v", errClose)
+	}
+	if errClose := f.Close(); errClose != nil {
+		t.Fatalf("close gzip file: %v", errClose)
+	}
+	return path
+}
+
+func performGetRequestLogByID(t *testing.T, h *Handler, requestID string) *httptest.ResponseRecorder {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodGet, "/v0/management/request-log-by-id/"+requestID, nil)
+	c.Params = gin.Params{{Key: "id", Value: requestID}}
+	h.GetRequestLogByID(c)
+	return rec
 }
 
 func appendMainLog(t *testing.T, dir, content string) {
