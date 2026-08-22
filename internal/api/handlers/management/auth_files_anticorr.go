@@ -2523,6 +2523,52 @@ func syncAuthFileClaudeDeviceIDAttribute(auth *coreauth.Auth) {
 	auth.Attributes[coreauth.ClaudeDeviceIDAttributeKey] = deviceID
 }
 
+// validateFarmAliveAtPatch validates a farm_container_alive_at PATCH value
+// before it is written to Metadata (write-side guard mirroring
+// validateAuthFileClaudeDeviceIDPatch). An empty string is a valid "clear the
+// heartbeat" request (the account is then treated as not-alive by the
+// container-liveness gate); any non-empty value MUST parse as an RFC3339
+// timestamp so a malformed heartbeat can never be persisted and later mis-read
+// as fresh by the gate predicate.
+func validateFarmAliveAtPatch(value any) error {
+	str, ok := value.(string)
+	if !ok {
+		return fmt.Errorf("farm_container_alive_at must be a string")
+	}
+	trimmed := strings.TrimSpace(str)
+	if trimmed == "" {
+		return nil
+	}
+	if _, err := time.Parse(time.RFC3339, trimmed); err != nil {
+		return fmt.Errorf("farm_container_alive_at must be an RFC3339 timestamp")
+	}
+	return nil
+}
+
+// syncAuthFileContainerAliveAtAttribute mirrors a just-patched
+// farm_container_alive_at Metadata value into the live Attributes map (same
+// immediate-visibility pattern as syncAuthFileClaudeDeviceIDAttribute) so the
+// container-liveness gate (coreauth.authContainerRecentlyAlive, which reads
+// Attributes) observes the new heartbeat in-process without waiting for a full
+// store reload. It clears the mirrored attribute when the persisted value is
+// missing, empty (an explicit "clear"), or not a string, so a cleared heartbeat
+// reliably falls back to not-alive.
+func syncAuthFileContainerAliveAtAttribute(auth *coreauth.Auth) {
+	if auth == nil {
+		return
+	}
+	if auth.Attributes == nil {
+		auth.Attributes = make(map[string]string)
+	}
+	aliveAt, ok := auth.Metadata[coreauth.FarmContainerAliveAtMetadataKey].(string)
+	aliveAt = strings.TrimSpace(aliveAt)
+	if !ok || aliveAt == "" {
+		delete(auth.Attributes, coreauth.FarmContainerAliveAtAttributeKey)
+		return
+	}
+	auth.Attributes[coreauth.FarmContainerAliveAtAttributeKey] = aliveAt
+}
+
 // lookupExistingAuthForReauth attempts to find a prior auth record that maps to
 // the same account as the supplied re-auth record. The returned previous record
 // is used to merge user-defined metadata; orphanPath is non-empty when the

@@ -68,7 +68,9 @@ func TestRefreshDueQuotaSnapshots_ProvisionedGate(t *testing.T) {
 	})
 
 	t.Run("flag off: both probed (byte-identical no-op)", func(t *testing.T) {
-		t.Setenv(coreauth.FarmRequireProvisionedEnvVar, "")
+		// PG-1: FARM_REQUIRE_PROVISIONED now defaults to ARMED, so "" no longer
+		// means off — force it off explicitly with a recognized falsey token.
+		t.Setenv(coreauth.FarmRequireProvisionedEnvVar, "0")
 		h, exec := build(t)
 		h.refreshDueQuotaSnapshots(context.Background(), defaultQuotaSnapshotTestPolicy(), false)
 		if got := exec.CallsForAuth("claude-enrolled-unprov"); got == 0 {
@@ -233,7 +235,9 @@ func TestRefreshQuotaSnapshots_ProvisionedGate(t *testing.T) {
 	})
 
 	t.Run("flag off: enrolled+unprovisioned is probed (byte-identical no-op)", func(t *testing.T) {
-		t.Setenv(coreauth.FarmRequireProvisionedEnvVar, "")
+		// PG-1: FARM_REQUIRE_PROVISIONED now defaults to ARMED, so "" no longer
+		// means off — force it off explicitly with a recognized falsey token.
+		t.Setenv(coreauth.FarmRequireProvisionedEnvVar, "0")
 		manager, exec := newManager(t, "claude")
 		register(t, manager, enrolledUnprovisionedClaudeAuth("claude-enrolled-unprov"))
 
@@ -293,7 +297,9 @@ func TestAPICall_ProvisionedGate(t *testing.T) {
 	})
 
 	t.Run("flag off: enrolled+unprovisioned Claude not fail-closed (no-op)", func(t *testing.T) {
-		t.Setenv(coreauth.FarmRequireProvisionedEnvVar, "")
+		// PG-1: FARM_REQUIRE_PROVISIONED now defaults to ARMED, so "" no longer
+		// means off — force it off explicitly with a recognized falsey token.
+		t.Setenv(coreauth.FarmRequireProvisionedEnvVar, "0")
 		rec := doAPICall(t, enrolledUnprovisionedClaudeAuth("claude-enrolled-unprov"))
 		if isFailClosed(rec) {
 			t.Fatalf("flag off must be a no-op; got fail-closed 400 body=%s", rec.Body.String())

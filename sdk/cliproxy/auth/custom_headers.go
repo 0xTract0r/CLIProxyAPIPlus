@@ -20,6 +20,22 @@ const ClaudeDeviceIDMetadataKey = "claude_device_id"
 // other hydrated runtime fields.
 const ClaudeDeviceIDAttributeKey = "claude_device_id"
 
+// FarmContainerAliveAtMetadataKey is the persisted auth.Metadata key for the
+// farm container-liveness heartbeat: an RFC3339 UTC timestamp the farm
+// orchestrator refreshes (via PATCH /v0/management/auth-files/fields) while the
+// account's bound container is alive. An empty string clears it (the account is
+// then treated as not-alive by the container-liveness sub-gate). This is a
+// cross-slice contract field name shared with the orchestrator; do not rename.
+const FarmContainerAliveAtMetadataKey = "farm_container_alive_at"
+
+// FarmContainerAliveAtAttributeKey is the live runtime mirror of
+// FarmContainerAliveAtMetadataKey, hydrated into Auth.Attributes by
+// ApplyRuntimeFieldsFromMetadata (same mechanism as claude_device_id). The
+// container-liveness sub-gate (authContainerRecentlyAlive) reads the heartbeat
+// from Auth.Attributes rather than Auth.Metadata so it stays consistent with the
+// other hydrated runtime fields the selector relies on.
+const FarmContainerAliveAtAttributeKey = "farm_container_alive_at"
+
 // claudeDeviceIDPattern validates a device_id override as a 64-char lowercase
 // hex string, matching the shape of metadata.user_id.device_id on the wire.
 var claudeDeviceIDPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
@@ -107,6 +123,7 @@ func ApplyRuntimeFieldsFromMetadata(auth *Auth) {
 		}
 	}
 	applyClaudeDeviceIDFromMetadata(auth)
+	applyFarmAliveAtFromMetadata(auth)
 }
 
 // applyClaudeDeviceIDFromMetadata mirrors a valid ClaudeDeviceIDMetadataKey
@@ -138,6 +155,42 @@ func applyClaudeDeviceIDFromMetadata(auth *Auth) {
 		auth.Attributes = make(map[string]string)
 	}
 	auth.Attributes[ClaudeDeviceIDAttributeKey] = trimmed
+}
+
+// applyFarmAliveAtFromMetadata mirrors the persisted farm container-liveness
+// heartbeat (FarmContainerAliveAtMetadataKey) into Attributes so the
+// container-liveness sub-gate (authContainerRecentlyAlive) can read it at
+// selection time without touching Metadata directly, exactly like
+// applyClaudeDeviceIDFromMetadata does for the device_id override. It mirrors a
+// non-empty string value verbatim, and clears any stale mirrored value when the
+// persisted heartbeat is missing, empty (an explicit "clear"), or not a string,
+// so a cleared heartbeat reliably falls back to not-alive on a live,
+// already-hydrated Auth object (e.g. a management PATCH followed by
+// Manager.Update, which re-runs this hydration on the same pointer rather than a
+// freshly loaded one). RFC3339 shape is NOT validated here — write-side
+// validation lives in the management PATCH guard (validateFarmAliveAtPatch) and
+// freshness/parse validation lives in the gate predicate; hydration only mirrors
+// bytes so the two mirrors (device_id and alive-at) stay symmetric.
+func applyFarmAliveAtFromMetadata(auth *Auth) {
+	raw, ok := auth.Metadata[FarmContainerAliveAtMetadataKey]
+	if !ok {
+		if auth.Attributes != nil {
+			delete(auth.Attributes, FarmContainerAliveAtAttributeKey)
+		}
+		return
+	}
+	str, isString := raw.(string)
+	trimmed := strings.TrimSpace(str)
+	if !isString || trimmed == "" {
+		if auth.Attributes != nil {
+			delete(auth.Attributes, FarmContainerAliveAtAttributeKey)
+		}
+		return
+	}
+	if auth.Attributes == nil {
+		auth.Attributes = make(map[string]string)
+	}
+	auth.Attributes[FarmContainerAliveAtAttributeKey] = trimmed
 }
 
 func HasStructuredAccountSettingsMetadata(auth *Auth) bool {

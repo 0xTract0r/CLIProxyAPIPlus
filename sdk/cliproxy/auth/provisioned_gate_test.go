@@ -30,12 +30,14 @@ func claudeAuthEnrolledWithOverride(deviceID string) *Auth {
 }
 
 // TestForkRequireProvisioned_FlagOffIsNoop is the critical no-op guard: with
-// FARM_REQUIRE_PROVISIONED unset, an unprovisioned Claude account (no real
-// device_id override, only the synthetic fallback) must NOT be blocked, so
-// existing serving is byte-identical to today's behaviour.
+// FARM_REQUIRE_PROVISIONED explicitly disarmed, an unprovisioned Claude account
+// (no real device_id override, only the synthetic fallback) must NOT be
+// blocked, so existing serving is byte-identical to today's behaviour.
 func TestForkRequireProvisioned_FlagOffIsNoop(t *testing.T) {
-	// Force the flag off explicitly so a polluted process env cannot mask this.
-	t.Setenv(FarmRequireProvisionedEnvVar, "")
+	// PG-1: FARM_REQUIRE_PROVISIONED now defaults to ARMED, so an empty value no
+	// longer means off (os.Getenv cannot distinguish unset from empty). Use an
+	// explicit, recognized falsey token to force the flag off.
+	t.Setenv(FarmRequireProvisionedEnvVar, "0")
 
 	auth := claudeAuthWithOverride("")
 	now := time.Now()
@@ -52,6 +54,41 @@ func TestForkRequireProvisioned_FlagOffIsNoop(t *testing.T) {
 	}
 	if !next.IsZero() {
 		t.Fatalf("next = %v, want zero", next)
+	}
+}
+
+// TestForkRequireProvisioned_FlagUnsetDefaultsArmed is the PG-1 fail-safe
+// default guard: with FARM_REQUIRE_PROVISIONED forced to "" (== unset, since
+// os.Getenv cannot tell the two apart) rather than an explicit falsey token, a
+// deployment that forgot to set the env var must still fail closed — an
+// enrolled-but-unprovisioned Claude account is blocked. Immune populations
+// (unenrolled, non-Claude) still pass through unconditionally even under this
+// default-armed state, proving the fail-safe flip did not widen the gate's
+// account-level scoping.
+func TestForkRequireProvisioned_FlagUnsetDefaultsArmed(t *testing.T) {
+	t.Setenv(FarmRequireProvisionedEnvVar, "") // simulate "deploy forgot to set it"
+
+	if !farmRequireProvisionedEnabled() {
+		t.Fatalf("farmRequireProvisionedEnabled = false with env unset, want true (PG-1 fail-safe default)")
+	}
+
+	enrolledUnprovisioned := claudeAuthEnrolledWithOverride("")
+	if !forkRequireProvisionedBlocked(enrolledUnprovisioned) {
+		t.Fatalf("forkRequireProvisionedBlocked = false for enrolled+unprovisioned with env unset, want true (fail-safe default must block)")
+	}
+	blocked, reason, next := isAuthBlockedForModel(enrolledUnprovisioned, "", time.Now())
+	if !blocked || reason != blockReasonUnprovisioned || !next.IsZero() {
+		t.Fatalf("isAuthBlockedForModel = (%v,%v,%v) with env unset, want (true,%v,zero)", blocked, reason, next, blockReasonUnprovisioned)
+	}
+
+	unenrolled := claudeAuthWithOverride("")
+	if forkRequireProvisionedBlocked(unenrolled) {
+		t.Fatalf("forkRequireProvisionedBlocked = true for an unenrolled account with env unset, want false (immune even under fail-safe default)")
+	}
+
+	nonClaude := &Auth{ID: "codex-acct", Provider: "codex", Status: StatusActive, Metadata: map[string]any{FarmEnrolledMetadataKey: true}}
+	if forkRequireProvisionedBlocked(nonClaude) {
+		t.Fatalf("forkRequireProvisionedBlocked = true for a non-Claude account with env unset, want false (Claude-scoped even under fail-safe default)")
 	}
 }
 
@@ -192,22 +229,25 @@ func TestForkRequireProvisioned_DisabledTakesPrecedence(t *testing.T) {
 	}
 }
 
-// TestFarmRequireProvisionedEnabled_Parsing confirms the env truthy parsing
-// matches the sibling FARM_PIN_ENABLED toggle so the two farm switches behave
-// identically.
+// TestFarmRequireProvisionedEnabled_Parsing confirms the PG-1 fail-safe
+// denylist parsing: everything stays armed EXCEPT a recognized falsey token
+// (case-insensitive, whitespace-trimmed). This is the mirror image of the
+// sibling FARM_PIN_ENABLED / FARM_REQUIRE_CONTAINER_ALIVE allowlist toggles —
+// unset/empty and any unrecognized value must stay armed here, never fall
+// through to disarmed the way they would under an allowlist.
 func TestFarmRequireProvisionedEnabled_Parsing(t *testing.T) {
-	truthy := []string{"1", "true", "TRUE", "Yes", "on", " on "}
-	for _, v := range truthy {
-		t.Run("on/"+v, func(t *testing.T) {
+	armed := []string{"", "1", "true", "TRUE", "Yes", "on", " on ", "garbage"}
+	for _, v := range armed {
+		t.Run("armed/"+v, func(t *testing.T) {
 			t.Setenv(FarmRequireProvisionedEnvVar, v)
 			if !farmRequireProvisionedEnabled() {
-				t.Fatalf("farmRequireProvisionedEnabled = false for %q, want true", v)
+				t.Fatalf("farmRequireProvisionedEnabled = false for %q, want true (fail-safe default)", v)
 			}
 		})
 	}
-	falsy := []string{"", "0", "false", "off", "no", "garbage"}
-	for _, v := range falsy {
-		t.Run("off/"+v, func(t *testing.T) {
+	disarmed := []string{"0", "false", "FALSE", "off", "OFF", "no", "No", " off "}
+	for _, v := range disarmed {
+		t.Run("disarmed/"+v, func(t *testing.T) {
 			t.Setenv(FarmRequireProvisionedEnvVar, v)
 			if farmRequireProvisionedEnabled() {
 				t.Fatalf("farmRequireProvisionedEnabled = true for %q, want false", v)

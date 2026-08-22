@@ -347,6 +347,19 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 				c.JSON(http.StatusBadRequest, gin.H{"error": errSet.Error()})
 				return
 			}
+		} else if fieldPath == "farm_container_alive_at" {
+			// Fork farm container-liveness gate: the heartbeat written by the
+			// orchestrator must be a well-formed RFC3339 timestamp (or an empty
+			// string to clear it) so a malformed value can never be persisted and
+			// later mis-read as a fresh heartbeat by the gate.
+			if errValidate := validateFarmAliveAtPatch(value); errValidate != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": errValidate.Error()})
+				return
+			}
+			if errSet := setAuthFileMetadataValue(targetAuth.Metadata, fieldPath, value); errSet != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": errSet.Error()})
+				return
+			}
 		} else if errSet := setAuthFileMetadataValue(targetAuth.Metadata, fieldPath, value); errSet != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": errSet.Error()})
 			return
@@ -515,6 +528,15 @@ func syncAuthFileMetadataFields(auth *coreauth.Auth, touchedRoots map[string]str
 		// Fork anti-corr: mirror the edited synthetic Claude device_id into the
 		// auth attribute so downstream cloaking reads the operator override.
 		syncAuthFileClaudeDeviceIDAttribute(auth)
+	}
+	if _, ok := touchedRoots["farm_container_alive_at"]; ok {
+		// Fork farm container-liveness gate: mirror the just-patched heartbeat
+		// timestamp into the live Attributes map immediately so the gate
+		// (coreauth.authContainerRecentlyAlive, which reads Attributes) observes
+		// it in-process without waiting for a full store reload. Without this the
+		// PATCHed value would live only in Metadata and the gate would never see
+		// it.
+		syncAuthFileContainerAliveAtAttribute(auth)
 	}
 }
 
