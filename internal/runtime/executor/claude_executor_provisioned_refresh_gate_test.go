@@ -85,7 +85,9 @@ func TestClaudeExecutor_Refresh_FarmUnprovisionedWithProxy_StillRefreshes(t *tes
 // refresh path (which here fails with the pre-cancelled context, deterministically
 // and without any real network I/O), never the fail-closed sentinel.
 func TestClaudeExecutor_Refresh_FlagOff_NoProxy_NotFailClosed(t *testing.T) {
-	t.Setenv(cliproxyauth.FarmRequireProvisionedEnvVar, "") // gate off
+	// PG-1: FARM_REQUIRE_PROVISIONED now defaults to ARMED, so "" no longer
+	// means off — force it off explicitly with a recognized falsey token.
+	t.Setenv(cliproxyauth.FarmRequireProvisionedEnvVar, "0") // gate off
 
 	exec := NewClaudeExecutor(&config.Config{})
 	auth := enrolledUnprovisionedClaudeRefreshAuth("")

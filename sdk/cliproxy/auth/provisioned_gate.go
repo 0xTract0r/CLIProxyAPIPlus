@@ -23,10 +23,13 @@
 // claude_device_id override is persisted (an auth Update re-runs the scheduler
 // upsert / a fresh candidate scan re-evaluates the gate).
 //
-// It is a strict no-op unless FARM_REQUIRE_PROVISIONED is set, which keeps every
-// existing serving byte identical to today's selection behaviour when the flag
-// is off, and it never touches non-Claude providers (which have no
-// claude_device_id concept).
+// FARM_REQUIRE_PROVISIONED defaults to ARMED (fail-safe, PG-1): an unset or
+// empty value arms the gate exactly like an explicit truthy value, so a
+// deployment that forgot to set the env var still fails closed instead of
+// silently running unprotected. An explicit falsey value (0/false/no/off,
+// case-insensitive) opts back out to the historical no-op behaviour. Either
+// way it never touches non-Claude providers (which have no claude_device_id
+// concept).
 //
 // Even when armed, the gate only applies per-account: only accounts explicitly
 // marked farm-enrolled (AuthFarmEnrolled, see farm_enrolled.go) can ever be
@@ -46,7 +49,9 @@ import (
 // supply-atomicity fail-closed gate. It is intentionally env-driven (like
 // FARM_PIN_ENABLED and the management/GITLAB toggles) so enabling the primitive
 // requires no config-schema change and stays fully decoupled from non-farm
-// request handling.
+// request handling. Unlike those toggles, it now defaults to ARMED when unset
+// (see farmRequireProvisionedEnabled) — set it to an explicit falsey value
+// (0/false/no/off) to opt back out.
 const FarmRequireProvisionedEnvVar = "FARM_REQUIRE_PROVISIONED"
 
 // FarmRequireContainerAliveEnvVar arms the container-liveness sub-gate: a
@@ -57,7 +62,12 @@ const FarmRequireProvisionedEnvVar = "FARM_REQUIRE_PROVISIONED"
 // It is env-driven and truthy-parsed exactly like FarmRequireProvisionedEnvVar
 // so the two farm sub-gates arm the same way, require no config-schema change,
 // and stay decoupled from non-farm request handling. Default off => strict
-// no-op (see forkRequireProvisionedBlocked's byte-identical early return).
+// no-op for THIS sub-gate (see forkRequireProvisionedBlocked's byte-identical
+// early return, which now only fires when the sibling FARM_REQUIRE_PROVISIONED
+// is also explicitly disarmed — see FarmRequireProvisionedEnvVar's PG-1
+// fail-safe default). Unlike that sibling, this sub-gate deliberately stays
+// default-off during its staged rollout; do not mirror the fail-safe default
+// onto it.
 const FarmRequireContainerAliveEnvVar = "FARM_REQUIRE_CONTAINER_ALIVE"
 
 // FarmContainerAliveStaleThreshold is the freshness window for a container
@@ -100,20 +110,32 @@ const blockReasonContainerNotAlive blockReason = 1 << 17
 var provisionedGateNow = time.Now
 
 // farmRequireProvisionedEnabled reports whether the supply-atomicity fail-closed
-// gate is armed. Mirrors farmPinEnvEnabled's truthy parsing so the two farm
-// toggles behave identically.
+// gate is armed. PG-1 fail-safe default: an unset/empty FARM_REQUIRE_PROVISIONED
+// is treated as ARMED (default-on), so a deployment that forgot to set the env
+// var still fails closed rather than silently running unprotected. Only an
+// explicit, recognized falsey token (0/false/no/off, case-insensitive) disarms
+// it; every other value — including an explicit truthy token, and any
+// unrecognized/garbage value — stays armed, so a typo can never silently
+// disarm the gate. This is a deliberate denylist (opt out of armed), the
+// mirror image of farmRequireContainerAliveEnabled's allowlist (opt into
+// armed) below: that sibling sub-gate must stay default-off during its staged
+// rollout, so do NOT copy this denylist shape onto it.
 func farmRequireProvisionedEnabled() bool {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv(FarmRequireProvisionedEnvVar))) {
-	case "1", "true", "yes", "on":
-		return true
-	default:
+	case "0", "false", "no", "off":
 		return false
+	default:
+		return true
 	}
 }
 
 // farmRequireContainerAliveEnabled reports whether the container-liveness
-// sub-gate is armed. Mirrors farmRequireProvisionedEnabled's truthy parsing so
-// both farm sub-gates behave identically.
+// sub-gate is armed. Recognizes the same truthy tokens as
+// farmRequireProvisionedEnabled (1/true/yes/on), but — unlike that sibling —
+// stays an allowlist: only a recognized truthy token arms it, and unset/empty/
+// unrecognized values leave it disarmed (default off). Do not flip this to the
+// denylist/default-armed shape; FARM_REQUIRE_CONTAINER_ALIVE must stay
+// default-off during its staged rollout (see its env var's doc comment).
 func farmRequireContainerAliveEnabled() bool {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv(FarmRequireContainerAliveEnvVar))) {
 	case "1", "true", "yes", "on":
@@ -176,10 +198,13 @@ func authHasProvisionedDeviceBinding(auth *Auth) bool {
 //     stale/missing (authContainerRecentlyAlive).
 //
 // It is a strict no-op (returns false, byte-identical selection behaviour)
-// unless at least one of the two flags is armed. The shared scoping is
-// unchanged: it applies to Claude accounts only (other providers have no
-// claude_device_id / container concept and must never be fail-closed by it),
-// and only to explicitly farm-enrolled accounts (AuthFarmEnrolled,
+// only when BOTH sub-gates are disarmed. Since PG-1, FARM_REQUIRE_PROVISIONED
+// defaults to armed (an explicit falsey value is required to disarm it), so
+// reaching that no-op path today requires explicitly disarming it; the sibling
+// FARM_REQUIRE_CONTAINER_ALIVE still defaults off on its own. The shared
+// scoping is unchanged: it applies to Claude accounts only (other providers
+// have no claude_device_id / container concept and must never be fail-closed
+// by it), and only to explicitly farm-enrolled accounts (AuthFarmEnrolled,
 // farm_enrolled.go / telemetry-device-farm TR1) — every pre-existing Claude
 // account, including every production-stable one, was never marked
 // farm_enrolled and stays immune even while a flag is armed. A Claude account is
@@ -216,9 +241,10 @@ func forkRequireProvisionedBlocked(auth *Auth) bool {
 // quota poller (quota_snapshots.go), the api-call precheck (api_tools.go) and the
 // Claude refresh executor (claude_executor_auth.go) — can reuse the EXACT same
 // supply-atomicity fail-closed predicate instead of re-deriving a looser one. It
-// inherits every gating property verbatim: strict no-op unless
-// FARM_REQUIRE_PROVISIONED is armed, Claude-only, and scoped to explicitly
-// farm-enrolled accounts (pre-existing/production accounts stay immune).
+// inherits every gating property verbatim: armed by default (PG-1 fail-safe —
+// no-op only when FARM_REQUIRE_PROVISIONED is explicitly set to a falsey
+// value), Claude-only, and scoped to explicitly farm-enrolled accounts
+// (pre-existing/production accounts stay immune).
 func RequireProvisionedBlocked(auth *Auth) bool {
 	return forkRequireProvisionedBlocked(auth)
 }

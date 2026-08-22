@@ -108,7 +108,10 @@ func TestAuthContainerRecentlyAlive(t *testing.T) {
 // enrolled Claude account with a stale/missing heartbeat must NOT be blocked
 // when neither farm flag is armed, so serving stays byte-identical.
 func TestForkRequireContainerAlive_BothFlagsOffIsNoop(t *testing.T) {
-	t.Setenv(FarmRequireProvisionedEnvVar, "")
+	// PG-1: FARM_REQUIRE_PROVISIONED now defaults to ARMED, so an empty value no
+	// longer disarms it — force it off explicitly with a recognized falsey
+	// token. FARM_REQUIRE_CONTAINER_ALIVE is unaffected: "" still means off.
+	t.Setenv(FarmRequireProvisionedEnvVar, "0")
 	t.Setenv(FarmRequireContainerAliveEnvVar, "")
 	withFixedGateClock(t, fixedGateNow)
 
@@ -126,7 +129,7 @@ func TestForkRequireContainerAlive_BothFlagsOffIsNoop(t *testing.T) {
 // sub-gate in isolation (provisioning flag OFF): a fresh heartbeat is allowed;
 // expired/missing/invalid heartbeats fail closed.
 func TestForkRequireContainerAlive_AliveArmedOnly(t *testing.T) {
-	t.Setenv(FarmRequireProvisionedEnvVar, "") // provisioning sub-gate off
+	t.Setenv(FarmRequireProvisionedEnvVar, "0") // provisioning sub-gate off (PG-1: "" now defaults armed)
 	t.Setenv(FarmRequireContainerAliveEnvVar, "1")
 	withFixedGateClock(t, fixedGateNow)
 
@@ -158,7 +161,7 @@ func TestForkRequireContainerAlive_AliveArmedOnly(t *testing.T) {
 // pre-existing/production account) is passed through unconditionally even with
 // no heartbeat.
 func TestForkRequireContainerAlive_UnenrolledImmune(t *testing.T) {
-	t.Setenv(FarmRequireProvisionedEnvVar, "")
+	t.Setenv(FarmRequireProvisionedEnvVar, "0") // provisioning sub-gate off (PG-1: "" now defaults armed)
 	t.Setenv(FarmRequireContainerAliveEnvVar, "1")
 	withFixedGateClock(t, fixedGateNow)
 
@@ -177,7 +180,7 @@ func TestForkRequireContainerAlive_UnenrolledImmune(t *testing.T) {
 // Claude-scoped: a farm-enrolled Codex account with no heartbeat is never
 // fail-closed by it.
 func TestForkRequireContainerAlive_NonClaudeImmune(t *testing.T) {
-	t.Setenv(FarmRequireProvisionedEnvVar, "")
+	t.Setenv(FarmRequireProvisionedEnvVar, "0") // provisioning sub-gate off (PG-1: "" now defaults armed)
 	t.Setenv(FarmRequireContainerAliveEnvVar, "1")
 	withFixedGateClock(t, fixedGateNow)
 
@@ -227,7 +230,7 @@ func TestForkRequireContainerAlive_BothSubGatesArmed(t *testing.T) {
 // currently maps every farm-gate skip to blockReasonUnprovisioned, and threading
 // the distinct blockReasonContainerNotAlive is out of scope for this slice.
 func TestForkRequireContainerAlive_SelectorSkipsStale(t *testing.T) {
-	t.Setenv(FarmRequireProvisionedEnvVar, "")
+	t.Setenv(FarmRequireProvisionedEnvVar, "0") // provisioning sub-gate off (PG-1: "" now defaults armed)
 	t.Setenv(FarmRequireContainerAliveEnvVar, "1")
 	withFixedGateClock(t, fixedGateNow)
 
@@ -286,7 +289,7 @@ func TestApplyRuntimeFieldsFromMetadataClearsStaleFarmAliveAtWhenCleared(t *test
 // heartbeat hydrated via ApplyRuntimeFieldsFromMetadata drives the armed gate's
 // decision, proving the metadata->attribute->gate chain is intact.
 func TestGateReadsHydratedFarmAliveAt(t *testing.T) {
-	t.Setenv(FarmRequireProvisionedEnvVar, "")
+	t.Setenv(FarmRequireProvisionedEnvVar, "0") // provisioning sub-gate off (PG-1: "" now defaults armed)
 	t.Setenv(FarmRequireContainerAliveEnvVar, "1")
 	withFixedGateClock(t, fixedGateNow)
 

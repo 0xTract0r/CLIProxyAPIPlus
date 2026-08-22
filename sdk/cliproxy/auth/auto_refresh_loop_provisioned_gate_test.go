@@ -32,7 +32,9 @@ func TestNextRefreshCheckAt_ProvisionedGate(t *testing.T) {
 	}
 
 	t.Run("flag off: enrolled+unprovisioned stays scheduled (byte-identical)", func(t *testing.T) {
-		t.Setenv(FarmRequireProvisionedEnvVar, "")
+		// PG-1: FARM_REQUIRE_PROVISIONED now defaults to ARMED, so "" no longer
+		// means off — force it off explicitly with a recognized falsey token.
+		t.Setenv(FarmRequireProvisionedEnvVar, "0")
 		next, ok := nextRefreshCheckAt(now, enrolledUnprovisioned(), interval)
 		if !ok || !next.Equal(future) {
 			t.Fatalf("nextRefreshCheckAt = (%v, %v), want (%v, true) with flag off", next, ok, future)
