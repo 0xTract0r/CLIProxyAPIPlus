@@ -62,6 +62,16 @@
 反关联-farm供给门	R5-3e供给门接线到配额刷新chokepoint	pattern	return auth, errQuotaRefreshProvisionedBlocked	internal/api/handlers/management/quota_snapshots.go
 反关联-farm供给门	R5-3d供给门接线到claude刷新执行器	pattern	RequireProvisionedBlocked\(auth\)	internal/runtime/executor/claude_executor_auth.go
 反关联-farm供给门	R5-3b供给门接线到api-call预检	pattern	RequireProvisionedBlocked\(auth\)	internal/api/handlers/management/api_tools.go
+反关联-farm容器活性门	FarmRequireContainerAliveEnvVar	symbol	^const FarmRequireContainerAliveEnvVar 	sdk/cliproxy/auth/provisioned_gate.go
+反关联-farm容器活性门	farmRequireContainerAliveEnabled	symbol	^func farmRequireContainerAliveEnabled\(	sdk/cliproxy/auth/provisioned_gate.go
+反关联-farm容器活性门	authContainerRecentlyAlive	symbol	^func authContainerRecentlyAlive\(	sdk/cliproxy/auth/provisioned_gate.go
+反关联-farm容器活性门	FarmContainerAliveStaleThreshold	symbol	^const FarmContainerAliveStaleThreshold 	sdk/cliproxy/auth/provisioned_gate.go
+反关联-farm容器活性门	blockReasonContainerNotAlive	symbol	^const blockReasonContainerNotAlive 	sdk/cliproxy/auth/provisioned_gate.go
+反关联-farm容器活性门	活性门接线到forkRequireProvisioned	pattern	authContainerRecentlyAlive\(auth, provisionedGateNow\(\)\)	sdk/cliproxy/auth/provisioned_gate.go
+反关联-farm容器活性门	FarmContainerAliveAtMetadataKey	symbol	^const FarmContainerAliveAtMetadataKey 	sdk/cliproxy/auth/custom_headers.go
+反关联-farm容器活性门	活性戳hydrate镜像	pattern	applyFarmAliveAtFromMetadata\(auth\)	sdk/cliproxy/auth/custom_headers.go
+反关联-farm容器活性门	活性戳PATCH校验	symbol	^func validateFarmAliveAtPatch\(	internal/api/handlers/management/auth_files_anticorr.go
+反关联-farm容器活性门	活性戳PATCH即时镜像Attribute	symbol	^func syncAuthFileContainerAliveAtAttribute\(	internal/api/handlers/management/auth_files_anticorr.go
 反关联-Codex路径归一化	persistCodexDeviceHighWater	symbol	^func \(e \*CodexExecutor\) persistCodexDeviceHighWater\(	internal/runtime/executor/codex_executor.go
 
 # === G1 关键回退守护(2 条必须成对读:一条必须命中,一条必须不命中) ===
