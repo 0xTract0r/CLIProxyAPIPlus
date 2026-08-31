@@ -74,6 +74,54 @@ func Parse(raw string) (Setting, error) {
 	}
 }
 
+// ErrProxyEgressBlocked is returned by the fail-closed dialer / round tripper
+// installed when an account-scoped proxy setting is missing or invalid. It is
+// surfaced verbatim so the egress-blocked reason is unambiguous in logs and
+// error responses, and it guarantees no network I/O happened before the failure
+// (anti-correlation: never fall through to a direct dial that would expose the
+// real server IP under the account identity).
+var ErrProxyEgressBlocked = errors.New("proxy egress blocked: refusing direct connection to prevent IP exposure")
+
+// blockingDialer is a proxy.Dialer + proxy.ContextDialer that performs zero
+// network I/O and always fails with ErrProxyEgressBlocked. It is installed at
+// the connection layer for account transports whose proxy setting resolved to
+// invalid, so the real client IP can never leak via an accidental direct dial.
+type blockingDialer struct{}
+
+// Dial always fails without opening a connection.
+func (blockingDialer) Dial(string, string) (net.Conn, error) {
+	return nil, ErrProxyEgressBlocked
+}
+
+// DialContext always fails without opening a connection. Implementing it makes
+// blockingDialer satisfy proxy.ContextDialer as well, so context-aware callers
+// (e.g. the uTLS dialContext) also fail closed instead of falling back.
+func (blockingDialer) DialContext(context.Context, string, string) (net.Conn, error) {
+	return nil, ErrProxyEgressBlocked
+}
+
+// BlockingDialer returns a proxy.Dialer (also a proxy.ContextDialer) that fails
+// every dial with ErrProxyEgressBlocked without performing any network I/O.
+func BlockingDialer() proxy.Dialer {
+	return blockingDialer{}
+}
+
+// blockingRoundTripper is an http.RoundTripper that always fails with
+// ErrProxyEgressBlocked before any dial, for account HTTP clients whose proxy
+// setting resolved to invalid. It deliberately has no fallback path.
+type blockingRoundTripper struct{}
+
+// RoundTrip always fails without opening a connection.
+func (blockingRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, ErrProxyEgressBlocked
+}
+
+// BlockingRoundTripper returns an http.RoundTripper that fails every request
+// with ErrProxyEgressBlocked without performing any network I/O.
+func BlockingRoundTripper() http.RoundTripper {
+	return blockingRoundTripper{}
+}
+
 func cloneDefaultTransport() *http.Transport {
 	if transport, ok := http.DefaultTransport.(*http.Transport); ok && transport != nil {
 		return transport.Clone()

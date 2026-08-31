@@ -31,6 +31,55 @@ func (blockingRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
 	return nil, errAccountProxyURLMissing
 }
 
+// accountProxyBlockReason reports why an account-scoped proxy setting must be
+// refused for direct egress, or "" when it is safe to use. An empty setting
+// returns "empty_proxy_url"; a present-but-malformed/unsupported setting
+// (proxyutil.ModeInvalid) returns "invalid_proxy_url". The explicit
+// "direct"/"none" sentinels and any valid proxy URL return "" (allowed):
+// choosing direct egress explicitly is an operator decision, and a valid URL
+// routes through that proxy.
+func accountProxyBlockReason(proxyURL string) string {
+	trimmed := strings.TrimSpace(proxyURL)
+	if trimmed == "" {
+		return "empty_proxy_url"
+	}
+	setting, err := proxyutil.Parse(trimmed)
+	if err != nil || setting.Mode == proxyutil.ModeInvalid {
+		return "invalid_proxy_url"
+	}
+	return ""
+}
+
+// maskEgressAuthID returns a log-safe, partially masked account identifier so
+// egress-blocked logs can be correlated per account without printing the full
+// auth ID (which may embed an email or file path). It never includes the proxy
+// URL or any credential material.
+func maskEgressAuthID(authID string) string {
+	trimmed := strings.TrimSpace(authID)
+	if trimmed == "" {
+		return "<unknown>"
+	}
+	if len(trimmed) <= 8 {
+		return trimmed[:1] + "***"
+	}
+	return trimmed[:4] + "***" + trimmed[len(trimmed)-2:]
+}
+
+// logEgressBlocked emits a redacted structured warning that account egress was
+// blocked. It deliberately logs only the reason, a masked auth ID and an
+// optional site; it NEVER logs the proxy URL or credentials.
+func logEgressBlocked(reason, authID, site string) {
+	fields := log.Fields{
+		"event":   "egress_blocked",
+		"reason":  reason,
+		"auth_id": maskEgressAuthID(authID),
+	}
+	if strings.TrimSpace(site) != "" {
+		fields["site"] = site
+	}
+	log.WithFields(fields).Warn("blocking account egress: refusing direct connection to prevent IP exposure")
+}
+
 // hasContextRoundTripper reports whether the context carries an explicitly injected
 // RoundTripper. Such a transport is a deliberate caller-controlled egress decision,
 // so it is not treated as the accidental "no proxy at all" direct path.
@@ -74,15 +123,18 @@ func newProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 	}
 
 	// Global egress guard. When an account-scoped request resolves to no proxy at
-	// all, the no-proxy fall-through below would build a direct transport (the utls
-	// dialer defaults to proxy.Direct), exposing the real server IP to the upstream
-	// provider (a past incident). Instead, hand back a client whose transport always
-	// errors before any dial, so no network I/O ever happens. This runs before the
-	// runtime transport profile and proxy cache branches.
+	// all (empty) OR to a present-but-invalid proxy_url, the fall-through below
+	// would build a direct transport (the utls dialer defaults to proxy.Direct, and
+	// an invalid proxy makes buildProxyTransport return nil so the client keeps a
+	// direct transport), exposing the real server IP to the upstream provider (a
+	// past incident). Instead, hand back a client whose transport always errors
+	// before any dial, so no network I/O ever happens. This runs before the runtime
+	// transport profile and proxy cache branches.
 	//
-	// The literal "direct"/"none" sentinels stay non-empty here and remain allowed,
-	// because choosing direct egress explicitly is an operator decision. Only the
-	// accidental empty case is blocked.
+	// The literal "direct"/"none" sentinels and any VALID proxy URL are allowed:
+	// choosing direct egress explicitly is an operator decision, and a valid proxy
+	// routes through that proxy. Only empty and invalid values are blocked (see
+	// accountProxyBlockReason).
 	//
 	// auth == nil indicates an infrastructure call (e.g. model registry updates) that
 	// is not account egress; those are intentionally left untouched.
@@ -92,8 +144,8 @@ func newProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 	// decision) and is therefore not an accidental direct connection; in that case the
 	// no-proxy fall-through below routes through that RoundTripper instead of a direct
 	// dialer, so it is not blocked here.
-	if auth != nil && proxyURL == "" && !hasContextRoundTripper(ctx) {
-		log.Warnf("blocking account egress: proxy_url missing for auth %q; refusing direct connection to prevent IP exposure", auth.ID)
+	if reason := accountProxyBlockReason(proxyURL); auth != nil && reason != "" && !hasContextRoundTripper(ctx) {
+		logEgressBlocked(reason, auth.ID, "")
 		httpClient := &http.Client{Transport: blockingRoundTripper{}}
 		if timeout > 0 {
 			httpClient.Timeout = timeout
