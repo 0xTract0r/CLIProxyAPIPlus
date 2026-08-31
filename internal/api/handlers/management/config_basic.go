@@ -14,6 +14,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/proxyutil"
 	log "github.com/sirupsen/logrus"
 	"gopkg.in/yaml.v3"
 )
@@ -360,7 +361,26 @@ func (h *Handler) PutRoutingStrategy(c *gin.Context) {
 // Proxy URL
 func (h *Handler) GetProxyURL(c *gin.Context) { c.JSON(200, gin.H{"proxy-url": h.cfg.ProxyURL}) }
 func (h *Handler) PutProxyURL(c *gin.Context) {
-	h.updateStringField(c, func(v string) { h.cfg.ProxyURL = v })
+	var body struct {
+		Value *string `json:"value"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil || body.Value == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+		return
+	}
+	proxyURL := strings.TrimSpace(*body.Value)
+	// Fail-closed: reject persisting a present-but-invalid global proxy_url. An
+	// invalid value would later force a direct egress that exposes the real server
+	// IP. Empty clears the global proxy; accounts still fall back to their own
+	// per-account egress guard. The explicit "direct"/"none" sentinels are accepted.
+	if proxyURL != "" {
+		if _, err := proxyutil.Parse(proxyURL); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("invalid proxy_url: %v", err)})
+			return
+		}
+	}
+	h.cfg.ProxyURL = proxyURL
+	h.persist(c)
 }
 func (h *Handler) DeleteProxyURL(c *gin.Context) {
 	h.cfg.ProxyURL = ""

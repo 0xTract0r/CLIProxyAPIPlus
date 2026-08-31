@@ -152,7 +152,14 @@ func newUtlsRoundTripper(proxyURL string, clientHello tls.ClientHelloID) *utlsRo
 	if proxyURL != "" {
 		proxyDialer, mode, errBuild := proxyutil.BuildDialer(proxyURL)
 		if errBuild != nil {
-			log.Errorf("utls: failed to configure proxy dialer for %q: %v", proxyutil.Redact(proxyURL), errBuild)
+			// Fail-closed: a present-but-invalid proxy_url (ModeInvalid) must never
+			// fall through to a direct dial, which would expose the real server IP
+			// under the account identity. Install a blocking dialer so the handshake
+			// dial fails before any I/O. Empty proxy (ModeInherit) never reaches here
+			// (guarded by proxyURL != "") and keeps proxy.Direct; empty is handled by
+			// the account-level guard upstream.
+			log.Errorf("utls: egress_blocked reason=invalid_proxy_url proxy=%s: %v", proxyutil.Redact(proxyURL), errBuild)
+			dialer = proxyutil.BlockingDialer()
 		} else if mode != proxyutil.ModeInherit && proxyDialer != nil {
 			dialer = proxyDialer
 		}
@@ -768,6 +775,25 @@ func NewUtlsHTTPClientForProfile(ctx context.Context, cfg *config.Config, auth *
 		proxyURL = strings.TrimSpace(cfg.ProxyURL)
 	}
 
+	// Account-level egress guard (codex serving path, which previously had NO
+	// empty-proxy guard). When an account-scoped request resolves to no proxy
+	// (empty) or a present-but-invalid proxy_url, refuse to build a direct/utls
+	// transport that would dial out under the account identity and expose the real
+	// server IP. An explicitly injected context RoundTripper is a deliberate
+	// caller-controlled egress path and is exempt; auth == nil is an infrastructure
+	// call, not account egress; explicit direct/none and valid proxies pass through
+	// (accountProxyBlockReason returns "").
+	if auth != nil && !hasContextRoundTripper(ctx) {
+		if reason := accountProxyBlockReason(proxyURL); reason != "" {
+			logEgressBlocked(reason, auth.ID, "")
+			client := &http.Client{Transport: proxyutil.BlockingRoundTripper()}
+			if timeout > 0 {
+				client.Timeout = timeout
+			}
+			return client
+		}
+	}
+
 	// effectiveProfileID is the profile actually used to resolve the
 	// ClientHelloID. When the requested profile is unknown it falls back to the
 	// codex-facing default, so the customSpecID must track that same fallback;
@@ -907,6 +933,26 @@ func (r *oauthRefreshRoundTripper) RoundTrip(req *http.Request) (*http.Response,
 // whole request.
 func NewOAuthRefreshUtlsHTTPClient(proxyURL string, profileID string, timeout time.Duration) *http.Client {
 	proxyURL = strings.TrimSpace(proxyURL)
+
+	// Fail-closed on a present-but-invalid proxy_url. This shared constructor
+	// backs claude/codex OAuth refresh, token exchange and codex device-login,
+	// all of which carry the account identity; a malformed proxy must not fall
+	// through to a direct dial that exposes the real server IP.
+	//
+	// Lead ruling: only "invalid" is blocked here. An EMPTY proxy is intentionally
+	// left as direct, because this same constructor also serves new-account
+	// bootstrap / cold-start flows where blocking empty would break account
+	// creation. The empty-refresh fail-closed case is a follow-up left to mainline.
+	if proxyURL != "" {
+		if setting, err := proxyutil.Parse(proxyURL); err != nil || setting.Mode == proxyutil.ModeInvalid {
+			log.Errorf("oauth refresh utls: egress_blocked reason=invalid_proxy_url proxy=%s", proxyutil.Redact(proxyURL))
+			client := &http.Client{Transport: proxyutil.BlockingRoundTripper()}
+			if timeout > 0 {
+				client.Timeout = timeout
+			}
+			return client
+		}
+	}
 
 	effectiveProfileID := profileID
 	clientHello, ok := resolveClaudeClientHelloID(profileID)

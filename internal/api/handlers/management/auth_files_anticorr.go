@@ -2328,6 +2328,51 @@ func validateAuthFileClaudeDeviceIDPatch(value any) error {
 	return nil
 }
 
+// validateAuthFileProxyURLPatch validates a proxy_url PATCH value before it is
+// written to Metadata. An empty string is a valid "clear the proxy" request; any
+// non-empty value must parse as a usable proxy setting (proxyutil.Parse). A
+// malformed or unsupported value (proxyutil.ModeInvalid) is rejected so it can
+// never be persisted and later force a direct egress that exposes the real
+// server IP. The explicit "direct"/"none" sentinels remain accepted as an
+// intentional operator choice.
+func validateAuthFileProxyURLPatch(value any) error {
+	str, ok := value.(string)
+	if !ok {
+		return fmt.Errorf("proxy_url must be a string")
+	}
+	if strings.TrimSpace(str) == "" {
+		return nil
+	}
+	if _, err := proxyutil.Parse(str); err != nil {
+		return fmt.Errorf("invalid proxy_url: %w", err)
+	}
+	return nil
+}
+
+// errAuthFileInvalidProxyURL is the sentinel wrapped by validateStoredAuthProxyURL
+// so upload handlers can map a rejected auth file (present-but-invalid proxy_url)
+// to HTTP 400 while other write errors stay 500.
+var errAuthFileInvalidProxyURL = errors.New("invalid proxy_url in auth file")
+
+// validateStoredAuthProxyURL rejects an auth record whose proxy_url is present
+// but malformed/unsupported, before it is written to disk. A non-empty invalid
+// proxy would later force a direct egress that exposes the real server IP, so it
+// must never be persisted. Empty proxy_url is allowed here (upload path); the
+// account-level egress guard blocks empty at request time.
+func validateStoredAuthProxyURL(auth *coreauth.Auth) error {
+	if auth == nil {
+		return nil
+	}
+	proxyURL := strings.TrimSpace(authProxyURL(auth))
+	if proxyURL == "" {
+		return nil
+	}
+	if _, err := proxyutil.Parse(proxyURL); err != nil {
+		return fmt.Errorf("%w: %v", errAuthFileInvalidProxyURL, err)
+	}
+	return nil
+}
+
 // syncAuthFileClaudeDeviceIDAttribute mirrors a just-patched
 // claude_device_id Metadata value into the live Attributes map (same pattern
 // as syncAuthFilePriorityAttribute / syncAuthFileNoteAttribute) so the

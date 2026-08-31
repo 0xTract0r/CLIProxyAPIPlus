@@ -334,6 +334,18 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 
 		if fieldPath == "headers" {
 			applyAuthFileHeadersPatch(targetAuth, value)
+		} else if fieldPath == "proxy_url" {
+			// Fork anti-corr: a present-but-invalid proxy_url must never be
+			// persisted. An invalid account proxy forces a direct egress that
+			// exposes the real server IP. Empty is allowed (clears the override).
+			if errValidate := validateAuthFileProxyURLPatch(value); errValidate != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": errValidate.Error()})
+				return
+			}
+			if errSet := setAuthFileMetadataValue(targetAuth.Metadata, fieldPath, value); errSet != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": errSet.Error()})
+				return
+			}
 		} else if fieldPath == "claude_device_id" {
 			// Fork anti-corr: the per-account synthetic Claude device_id is
 			// operator-editable but must stay a well-formed UUID so it keeps
