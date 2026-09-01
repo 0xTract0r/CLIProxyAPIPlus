@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher/synthesizer"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
@@ -28,12 +29,36 @@ type routingRuntimeState struct {
 	strategy           string
 	sessionAffinity    bool
 	sessionAffinityTTL time.Duration
+
+	// accountScheduling is the AccountSchedulingConfig snapshot captured for
+	// this commit (openspec/changes/add-adaptive-account-scheduling). It only
+	// matters when strategy == internalconfig.RoutingStrategyAdaptive, and is
+	// deliberately EXCLUDED from selectorShapeEqual below: a change to it
+	// alone (e.g. a tier-weight or warm-up-curve tweak) must never trigger a
+	// selector rebuild -- newRoutingSelectorWithLiveScheduling's live
+	// accessor picks such a change up on the very next Pick instead. This
+	// field also means routingRuntimeState is no longer comparable with
+	// == / != as a whole (AccountSchedulingConfig embeds a slice,
+	// WarmupCurve) -- selectorShapeEqual is the only supported comparison.
+	accountScheduling internalconfig.AccountSchedulingConfig
+}
+
+// selectorShapeEqual reports whether a and b would produce the same *kind* of
+// Selector (same base strategy, same session-affinity wiring) -- i.e. whether
+// SetSelector actually needs to rebuild the selector. See the
+// accountScheduling field doc for why that field is intentionally excluded
+// from this comparison.
+func (a routingRuntimeState) selectorShapeEqual(b routingRuntimeState) bool {
+	return a.strategy == b.strategy &&
+		a.sessionAffinity == b.sessionAffinity &&
+		a.sessionAffinityTTL == b.sessionAffinityTTL
 }
 
 func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
 	state := routingRuntimeState{
 		strategy:           "round-robin",
 		sessionAffinityTTL: time.Hour,
+		accountScheduling:  internalconfig.DefaultAccountSchedulingConfig(),
 	}
 	if cfg == nil {
 		return state
@@ -42,6 +67,11 @@ func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
 	switch strings.ToLower(strings.TrimSpace(cfg.Routing.Strategy)) {
 	case "fill-first", "fillfirst", "ff":
 		state.strategy = "fill-first"
+	case internalconfig.RoutingStrategyAdaptive:
+		// openspec/changes/add-adaptive-account-scheduling: opt into the
+		// tier/quota/warm-up-aware selector. newRoutingSelectorWithLiveScheduling
+		// below is what actually wires this to coreauth.NewAdaptiveSelector.
+		state.strategy = internalconfig.RoutingStrategyAdaptive
 	}
 	// fork: honor both the legacy ClaudeCodeSessionAffinity flag and the new
 	// universal SessionAffinity so existing configs keep session affinity on.
@@ -51,15 +81,66 @@ func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
 			state.sessionAffinityTTL = parsed
 		}
 	}
+	// internal/config/account_scheduling.go's DefaultAccountSchedulingConfig
+	// is already merged into cfg.AccountScheduling by every config-load path
+	// (config_load.go / parse.go) before YAML unmarshal, so this is always a
+	// fully-defaulted snapshot, never a caller-constructed zero value.
+	state.accountScheduling = cfg.AccountScheduling
 	return state
 }
 
+// newRoutingSelector builds a Selector from state alone, scoring the
+// "adaptive" strategy against state.accountScheduling as a fixed snapshot
+// (no live re-read). This is what the pre-Service construction path
+// (builder.go, which has no *Service yet to read a live config from) calls;
+// the config-reload path (applyManagerConfig, below) calls
+// newRoutingSelectorWithLiveScheduling instead so an adaptive selector
+// re-reads AccountSchedulingConfig on every Pick without ever needing to be
+// rebuilt.
 func newRoutingSelector(state routingRuntimeState) coreauth.Selector {
+	return newRoutingSelectorWithLiveScheduling(state, nil)
+}
+
+// newRoutingSelectorWithLiveScheduling is newRoutingSelector plus an optional
+// live AccountSchedulingConfig accessor for the "adaptive" strategy
+// (openspec/changes/add-adaptive-account-scheduling, tasks.md 1.2/5.1). When
+// live is non-nil it is wired via coreauth.WithAdaptiveSchedulingProvider so a
+// config-file edit to warm-up-curve / tier-weight / mature-limit knobs takes
+// effect on the very next Pick without a selector rebuild -- rebuilding would
+// otherwise drop in-flight session-stickiness bindings and reset per-account
+// token buckets (coreauth.AdaptiveSelector self-hosts both). When live is
+// nil, the adaptive selector still scores against state.accountScheduling --
+// just as a fixed snapshot instead of a live read.
+//
+// Every other strategy value (including the pre-existing "round-robin" /
+// "fill-first" behavior) is completely unchanged by this function -- the
+// "adaptive" branch returns before reaching the pre-existing
+// session-affinity-wrapping code below it.
+func newRoutingSelectorWithLiveScheduling(state routingRuntimeState, live func() internalconfig.AccountSchedulingConfig) coreauth.Selector {
 	var selector coreauth.Selector
 	if state.strategy == "fill-first" {
 		selector = &coreauth.FillFirstSelector{}
 	} else {
 		selector = &coreauth.RoundRobinSelector{}
+	}
+	if state.strategy == internalconfig.RoutingStrategyAdaptive {
+		var opts []coreauth.AdaptiveSelectorOption
+		if live != nil {
+			opts = append(opts, coreauth.WithAdaptiveSchedulingProvider(live))
+		}
+		// coreauth.AdaptiveSelector self-hosts session affinity with
+		// design.md D5 maturity grading via its own internal SessionCache --
+		// it must NOT additionally be wrapped in NewSessionAffinitySelectorWithConfig,
+		// which would short-circuit on a cache hit and never let the adaptive
+		// selector see/grade the binding (see adaptive_selector.go's type
+		// doc). So this branch returns directly, skipping the
+		// session-affinity wrap below entirely.
+		return coreauth.NewAdaptiveSelector(coreauth.AdaptiveSelectorConfig{
+			Fallback:        selector,
+			Scheduling:      state.accountScheduling,
+			SessionAffinity: state.sessionAffinity,
+			SessionTTL:      state.sessionAffinityTTL,
+		}, opts...)
 	}
 	if state.sessionAffinity {
 		selector = coreauth.NewSessionAffinitySelectorWithConfig(coreauth.SessionAffinityConfig{
@@ -68,6 +149,28 @@ func newRoutingSelector(state routingRuntimeState) coreauth.Selector {
 		})
 	}
 	return selector
+}
+
+// liveAccountSchedulingConfig reads the current AccountSchedulingConfig off
+// the live *Service config (s.cfg, protected by s.cfgMu -- the same lock
+// commitConfigUpdate uses to swap s.cfg on every config commit/hot-reload).
+// Passed to the adaptive selector via coreauth.WithAdaptiveSchedulingProvider
+// (see newRoutingSelectorWithLiveScheduling) so a config-file edit to the
+// account-scheduling section is picked up on the very next Pick, even on a
+// reload that does not otherwise change routing.strategy / session-affinity
+// (and therefore does not trigger a selector rebuild -- see
+// routingRuntimeState.selectorShapeEqual).
+func (s *Service) liveAccountSchedulingConfig() internalconfig.AccountSchedulingConfig {
+	if s == nil {
+		return internalconfig.DefaultAccountSchedulingConfig()
+	}
+	s.cfgMu.RLock()
+	cfg := s.cfg
+	s.cfgMu.RUnlock()
+	if cfg == nil {
+		return internalconfig.DefaultAccountSchedulingConfig()
+	}
+	return cfg.AccountScheduling
 }
 
 func (s *Service) applyConfigUpdateWithAuthSynthesis(ctx context.Context, newCfg *config.Config, synthesizeConfigAuths bool) bool {
@@ -196,8 +299,8 @@ func (s *Service) applyManagerConfig(ctx context.Context, commit configCommit) b
 		return false
 	}
 	routingState := normalizedRoutingRuntimeState(commit.cfg)
-	if s.appliedRoutingState == nil || *s.appliedRoutingState != routingState {
-		s.coreManager.SetSelector(newRoutingSelector(routingState))
+	if s.appliedRoutingState == nil || !s.appliedRoutingState.selectorShapeEqual(routingState) {
+		s.coreManager.SetSelector(newRoutingSelectorWithLiveScheduling(routingState, s.liveAccountSchedulingConfig))
 		s.appliedRoutingState = &routingState
 	}
 	s.applyRetryConfig(commit.cfg)

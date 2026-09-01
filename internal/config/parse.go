@@ -38,6 +38,8 @@ func ParseConfigBytes(data []byte) (*Config, error) {
 	cfg.AmpCode.RestrictManagementToLocalhost = false
 	cfg.RemoteManagement.PanelGitHubRepository = DefaultPanelGitHubRepository
 	cfg.CredentialInFlight = DefaultCredentialInFlightConfig()
+	// fork(add-adaptive-account-scheduling): keep aligned with LoadConfigOptional.
+	cfg.AccountScheduling = DefaultAccountSchedulingConfig()
 
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("parse config payload: %w", err)
@@ -45,6 +47,9 @@ func ParseConfigBytes(data []byte) (*Config, error) {
 
 	cfg.CredentialConcurrency = cfg.CredentialConcurrency.WithDefaults()
 	if errValidate := cfg.CredentialInFlight.Validate(); errValidate != nil {
+		return nil, errValidate
+	}
+	if errValidate := cfg.AccountScheduling.Validate(); errValidate != nil {
 		return nil, errValidate
 	}
 
