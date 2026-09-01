@@ -103,10 +103,22 @@ func readStreamBootstrap(ctx context.Context, ch <-chan cliproxyexecutor.StreamC
 	}
 }
 
-func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, resultModel string, headers http.Header, buffered []cliproxyexecutor.StreamChunk, remaining <-chan cliproxyexecutor.StreamChunk, aliasResult OAuthModelAliasResult, ephemeralResult bool) *cliproxyexecutor.StreamResult {
+func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, resultModel string, headers http.Header, buffered []cliproxyexecutor.StreamChunk, remaining <-chan cliproxyexecutor.StreamChunk, aliasResult OAuthModelAliasResult, ephemeralResult bool, onComplete ...func()) *cliproxyexecutor.StreamResult {
 	out := make(chan cliproxyexecutor.StreamChunk)
 	go func() {
 		defer close(out)
+		// Adaptive account scheduling (Phase 2): release the account's in-flight
+		// concurrency slot when this forwarding goroutine finishes -- i.e. at
+		// true stream completion (all chunks drained, ctx cancelled, or an early
+		// return). Deferred so it fires on every exit path including a panic, so
+		// the slot is held for the stream's whole lifetime, not just until it
+		// started. onComplete is empty for callers that pass no hook (e.g. the
+		// existing unit tests and Home dispatch), making this a no-op there.
+		for _, done := range onComplete {
+			if done != nil {
+				defer done()
+			}
+		}
 		var failed bool
 		forward := true
 		var rewriter *StreamRewriter
@@ -312,7 +324,20 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			close(closedCh)
 			remaining = closedCh
 		}
-		return m.wrapStreamResult(ctx, auth.Clone(), provider, resultModel, streamResult.Headers, buffered, remaining, aliasResult, ephemeralResult), nil
+		// Adaptive account scheduling (Phase 2): for a real (non-Home) serving
+		// stream, reserve the account's concurrency slot and record its UTC-daily
+		// request now that a stream is actually established, then release the
+		// slot when the wrapped stream completes (plumbed as onComplete). The
+		// request has already gone out here, so the acquire is unconditional
+		// (its within-limit report is intentionally ignored -- we never tear
+		// down a live stream). Home dispatch (ephemeralResult) has its own
+		// concurrency accounting and is deliberately left ungated.
+		if ephemeralResult {
+			return m.wrapStreamResult(ctx, auth.Clone(), provider, resultModel, streamResult.Headers, buffered, remaining, aliasResult, ephemeralResult), nil
+		}
+		slot, _ := m.beginAccountExecution(auth)
+		slot.recordRequest()
+		return m.wrapStreamResult(ctx, auth.Clone(), provider, resultModel, streamResult.Headers, buffered, remaining, aliasResult, ephemeralResult, slot.release), nil
 	}
 	if lastErr == nil {
 		lastErr = &Error{Code: "auth_not_found", Message: "no upstream model available"}

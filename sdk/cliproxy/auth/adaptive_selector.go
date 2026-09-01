@@ -79,6 +79,16 @@ type AdaptiveSelector struct {
 	limiter     *AccountRateLimiter
 	ownsLimiter bool
 
+	// gate is the per-account in-flight concurrency semaphore + UTC-daily
+	// request-budget counter (account_gate.go). The selector reads it at Pick
+	// time to avoid an account already at its concurrency ceiling or past its
+	// warm-up daily budget; the auth Manager's execution path drives the same
+	// gate instance (reached via the AccountGate accessor) to acquire/release a
+	// slot and record each request. Always non-nil after construction (created
+	// here unless injected via WithAdaptiveAccountGate). It holds no background
+	// goroutine, so it needs no Stop.
+	gate *AccountConcurrencyGate
+
 	// cache holds session -> auth stickiness bindings. Nil when session
 	// affinity is disabled.
 	cache           *SessionCache
@@ -157,6 +167,18 @@ func WithAdaptiveRateLimiter(l *AccountRateLimiter) AdaptiveSelectorOption {
 	}
 }
 
+// WithAdaptiveAccountGate injects the per-account concurrency + daily-budget
+// gate instead of letting the selector create its own. Useful for sharing one
+// gate across selectors or for pre-loading counts / driving the UTC clock in
+// tests. nil is ignored.
+func WithAdaptiveAccountGate(g *AccountConcurrencyGate) AdaptiveSelectorOption {
+	return func(s *AdaptiveSelector) {
+		if g != nil {
+			s.gate = g
+		}
+	}
+}
+
 // WithAdaptiveSchedulingProvider makes the selector read config live from fn on
 // every Pick (for hot-reload), overriding the static Scheduling snapshot. nil is
 // ignored.
@@ -196,6 +218,9 @@ func NewAdaptiveSelector(cfg AdaptiveSelectorConfig, opts ...AdaptiveSelectorOpt
 	if s.limiter == nil {
 		s.limiter = NewAccountRateLimiter(WithClock(s.now))
 		s.ownsLimiter = true
+	}
+	if s.gate == nil {
+		s.gate = NewAccountConcurrencyGate(WithGateClock(s.now))
 	}
 	if s.sessionAffinity {
 		ttl := cfg.SessionTTL
@@ -374,6 +399,14 @@ func (s *AdaptiveSelector) scoreCandidates(available []*Auth, cfg internalconfig
 		if weight <= 0 {
 			continue
 		}
+		if s.overDailyBudget(candidate, cfg, now) {
+			// Warming account has spent its UTC-daily budget (design §5.1's
+			// primary warm-up throttle). Drop it from this pick so traffic
+			// routes to accounts with budget left -- mature accounts have no
+			// daily cap and so承接 the overflow (design D4). A new UTC day
+			// resets the counter and re-admits the account.
+			continue
+		}
 		candidates = append(candidates, adaptiveCandidate{auth: candidate, weight: weight})
 	}
 	sort.Slice(candidates, func(i, j int) bool { return candidates[i].auth.ID < candidates[j].auth.ID })
@@ -396,6 +429,15 @@ func (s *AdaptiveSelector) pickFromCandidates(candidates []adaptiveCandidate, cf
 	for len(pool) > 0 {
 		idx := s.weightedIndex(pool)
 		candidate := pool[idx]
+		if !s.hasConcurrencyHeadroom(candidate.auth, cfg, now) {
+			// Account already at its in-flight concurrency ceiling. Drop it
+			// WITHOUT consuming a rate-limit token (the concurrency check comes
+			// before Allow for exactly this reason) and try the next weighted
+			// candidate; a mature account with a higher ceiling naturally
+			// absorbs the overflow.
+			pool = append(pool[:idx], pool[idx+1:]...)
+			continue
+		}
 		rpm, burst := s.rateLimitParams(candidate.auth, cfg, now)
 		if s.limiter.Allow(candidate.auth.ID, rpm, burst) {
 			return candidate.auth, true
@@ -469,6 +511,50 @@ func (s *AdaptiveSelector) isMature(a *Auth, cfg internalconfig.AccountSchedulin
 // leave non-adaptive providers' sticky bindings ungraded.
 func (s *AdaptiveSelector) adaptiveEligible(a *Auth, cfg internalconfig.AccountSchedulingConfig) bool {
 	return a != nil && a.AccountTierBaseWeight(cfg.TierWeights) > 0
+}
+
+// AccountGate exposes the per-account concurrency + daily-budget gate this
+// selector maintains (account_gate.go) so the auth Manager's execution path can
+// drive the SAME instance (acquire/release an in-flight slot, record a request)
+// that Pick gates against -- keeping the selector's avoidance and the execution
+// path's accounting on one live count. It satisfies the accountGateProvider
+// contract the Manager type-asserts on. Never nil after construction.
+func (s *AdaptiveSelector) AccountGate() *AccountConcurrencyGate {
+	return s.gate
+}
+
+// overDailyBudget reports whether a is a warming account that has already met or
+// exceeded its configured UTC-daily budget. Mature accounts (DailyBudget 0 =
+// unbounded, design §5.1) always return false, as does a stage with no
+// configured daily budget or (defensively) a nil gate.
+func (s *AdaptiveSelector) overDailyBudget(a *Auth, cfg internalconfig.AccountSchedulingConfig, now time.Time) bool {
+	if s.gate == nil || a == nil {
+		return false
+	}
+	status := AccountWarmupStatusFor(a, now, cfg)
+	if status.Mature || status.DailyBudget <= 0 {
+		return false
+	}
+	return s.gate.OverDailyBudget(a.ID, status.DailyBudget)
+}
+
+// hasConcurrencyHeadroom reports whether a still has a free in-flight slot under
+// its current stage (or mature) ConcurrencyLimit. AccountWarmupStatus already
+// resolves that single limit for both warming and mature accounts. A
+// non-positive limit ("no ceiling configured for this stage") or a nil gate
+// always reports headroom. This is an advisory Pick-time read; the authoritative
+// slot reservation happens on the execution path (beginAccountExecution), so a
+// small race between this read and that acquire can transiently over-admit by
+// one -- the accepted soft-ceiling behavior.
+func (s *AdaptiveSelector) hasConcurrencyHeadroom(a *Auth, cfg internalconfig.AccountSchedulingConfig, now time.Time) bool {
+	if s.gate == nil || a == nil {
+		return true
+	}
+	limit := AccountWarmupStatusFor(a, now, cfg).ConcurrencyLimit
+	if limit <= 0 {
+		return true
+	}
+	return s.gate.InFlight(a.ID) < limit
 }
 
 // InvalidateAuth removes every sticky binding pointing at authID. The auth
