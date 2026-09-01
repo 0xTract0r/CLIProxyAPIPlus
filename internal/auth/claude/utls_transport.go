@@ -41,7 +41,11 @@ func newUtlsRoundTripper(cfg *config.SDKConfig) *utlsRoundTripper {
 	if cfg != nil {
 		proxyDialer, mode, errBuild := proxyutil.BuildDialer(cfg.ProxyURL)
 		if errBuild != nil {
-			log.Errorf("failed to configure proxy dialer for %q: %v", proxyutil.Redact(cfg.ProxyURL), errBuild)
+			// Fail-closed on an invalid proxy_url: never silently fall back to a
+			// direct dial (which would expose the real server IP under the account
+			// identity). Empty proxy is ModeInherit and keeps proxy.Direct.
+			log.Errorf("claude utls: egress_blocked reason=invalid_proxy_url proxy=%s: %v", proxyutil.Redact(cfg.ProxyURL), errBuild)
+			dialer = proxyutil.BlockingDialer()
 		} else if mode != proxyutil.ModeInherit && proxyDialer != nil {
 			dialer = proxyDialer
 		}
@@ -257,8 +261,14 @@ func NewAnthropicHttpClient(cfg *config.SDKConfig) *http.Client {
 		proxyURL = strings.TrimSpace(cfg.ProxyURL)
 	}
 	transport, mode, errBuild := proxyutil.BuildHTTPTransport(proxyURL)
-	if errBuild != nil {
-		log.Errorf("failed to configure Claude OAuth HTTP transport for %q: %v", proxyURL, errBuild)
+	if errBuild != nil || mode == proxyutil.ModeInvalid {
+		// Fail-closed: a present-but-invalid proxy_url must NOT fall back to the
+		// default (direct) transport, which would expose the real server IP under
+		// the account's OAuth identity. Return a client whose transport always
+		// errors before any dial. Empty (ModeInherit) and explicit direct
+		// (ModeDirect) keep the normal path below.
+		log.Errorf("claude oauth: egress_blocked reason=invalid_proxy_url proxy=%s: %v", proxyutil.Redact(proxyURL), errBuild)
+		return &http.Client{Transport: proxyutil.BlockingRoundTripper(), Timeout: anthropicHTTPClientTimeout}
 	}
 	if transport == nil {
 		if mode == proxyutil.ModeDirect {

@@ -94,7 +94,7 @@ func TestCodexExecutorExecuteIncompleteResponseIsSuccessful(t *testing.T) {
 	defer server.Close()
 
 	executor := NewCodexExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", Attributes: map[string]string{
 		"base_url": server.URL,
 		"api_key":  "test",
 	}}
@@ -122,7 +122,7 @@ func TestCodexExecutorExecuteExplicitTerminalFailureIsNotRequestScoped(t *testin
 	defer server.Close()
 
 	executor := NewCodexExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", Attributes: map[string]string{
 		"base_url": server.URL,
 		"api_key":  "test",
 	}}
@@ -151,7 +151,7 @@ func TestCodexExecutorExecuteMissingCompletionIsRequestScoped(t *testing.T) {
 	defer server.Close()
 
 	executor := NewCodexExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", Attributes: map[string]string{
 		"base_url": server.URL,
 		"api_key":  "test",
 	}}
@@ -180,7 +180,7 @@ func TestCodexExecutorExecuteStreamMissingCompletionIsRequestScoped(t *testing.T
 	defer server.Close()
 
 	executor := NewCodexExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", Attributes: map[string]string{
 		"base_url": server.URL,
 		"api_key":  "test",
 	}}
@@ -220,7 +220,7 @@ func TestCodexExecutorExecuteStreamExplicitTerminalFailureIsNotSuccessful(t *tes
 	defer server.Close()
 
 	executor := NewCodexExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", Attributes: map[string]string{
 		"base_url": server.URL,
 		"api_key":  "test",
 	}}
