@@ -294,11 +294,30 @@ func (s *AdaptiveSelector) resolveSticky(ctx context.Context, provider, model st
 	}
 	if !s.adaptiveEligible(bound, cfg) {
 		// Non-Claude/Codex sticky target: nothing to grade, keep the binding.
+		// Persist it under cacheKey so a binding reached via the first-turn
+		// fallback-key inheritance path (pickWithAffinity's fallbackID lookup) is
+		// also pinned to the primary/full session key -- mirroring
+		// SessionAffinitySelector's fallback-hit rebind at selector.go:489. On the
+		// main GetAndRefresh hit path this Set is a harmless refresh (GetAndRefresh
+		// already extended the TTL). Without it the primary key is never bound, so
+		// every subsequent turn re-derives from the fallback key via the
+		// non-refreshing Get, and the binding expires at that fallback key's
+		// original (never-extended) TTL mid-session -- the design D5 "成熟号软上限
+		// 内保持粘性" stickiness regression this fixes.
+		s.cache.Set(cacheKey, bound.ID)
 		return bound, nil
 	}
 	if s.isMature(bound, cfg, now) {
 		rpm, burst := s.rateLimitParams(bound, cfg, now)
 		if s.limiter.Allow(bound.ID, rpm, burst) {
+			// Keep the mature-within-soft-ceiling binding, and persist it under
+			// cacheKey for the same reason as the non-adaptive branch above: an
+			// inherited first-turn binding must be pinned to the primary session
+			// key (refreshing its TTL) instead of surviving only under the fallback
+			// key, whose non-refreshing Get would otherwise let the binding expire
+			// at its original TTL mid-session (selector.go:489 rebinds identically
+			// on its fallback hit).
+			s.cache.Set(cacheKey, bound.ID)
 			return bound, nil
 		}
 		// At the soft ceiling -> treat as近风控硬阈值, reselect across the pool.

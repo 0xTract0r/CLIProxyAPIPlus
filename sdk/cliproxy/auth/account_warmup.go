@@ -11,8 +11,16 @@ import (
 // its first_production_at anchor, Phase 0 -- account_freshness.go) against
 // the configured warm-up curve (internal/config/account_scheduling.go) to
 // that account's currently effective per-account limits (daily budget / rpm /
-// concurrency) and a 0..1 "freshness factor" for the Phase 1 weight function
-// (design.md D1: weight = tier capacity x quota headroom x freshness factor).
+// concurrency), plus a warm-up-status view of freshness (AccountWarmupStatus.
+// FreshnessFactor).
+//
+// Single source of truth (design D1): the freshness multiplier the live
+// adaptive selector applies to selection weight is owned by
+// AccountFreshnessWeightFactor (account_weight.go), NOT by this file's
+// AccountWarmupStatus.FreshnessFactor -- see that field's doc for the two
+// views' deliberate no-anchor divergence (grading view: cold=0 fail-safe;
+// weight view: 1 bootstrap). AdaptiveSelector reads only Mature and the
+// per-account limits from this file, never FreshnessFactor.
 //
 // Scope boundary: this file only resolves "what stage is this account in
 // right now, and what does that stage allow". It does not itself enforce
@@ -49,15 +57,27 @@ type AccountWarmupStatus struct {
 	// account at this stage.
 	ConcurrencyLimit int
 
-	// FreshnessFactor is the design D1 weight multiplier for this stage, in
-	// [0,1]: exactly 0 for a not-yet-anchored ("cold") account, ramping
-	// upward (strictly less than 1) while inside the configured warm-up
-	// curve, and exactly 1 once Mature is true. It is an explicit resolved
-	// value -- not derived from DailyBudget/RPMLimit/ConcurrencyLimit -- so
-	// operators can tune warm-up throttling (the limits above) independently
-	// of how aggressively the weighted selector should deprioritize a
-	// warming account (see warmupFreshnessFactor for the ramp formula and
-	// its documented rationale).
+	// FreshnessFactor is a warm-up-status *view* of this stage's freshness in
+	// [0,1]: exactly 0 for a not-yet-anchored ("cold") account, ramping upward
+	// (strictly less than 1) while inside the configured warm-up curve, and
+	// exactly 1 once Mature is true. It is an explicit resolved value -- not
+	// derived from DailyBudget/RPMLimit/ConcurrencyLimit -- so warm-up throttling
+	// (the limits above) stays tunable independently of freshness.
+	//
+	// IMPORTANT (single source of truth, design D1): this field is NOT the
+	// multiplier the live adaptive selector applies when weighting accounts. The
+	// selector's freshness axis is owned solely by AccountFreshnessWeightFactor
+	// (account_weight.go); AdaptiveSelector consumes only StageName/DailyBudget/
+	// RPMLimit/ConcurrencyLimit/Mature from this struct, never FreshnessFactor.
+	// The two intentionally diverge on the no-anchor case -- the grading view here
+	// pins an un-anchored account to 0 (fail-safe "cold": most conservative,
+	// anti-ban), whereas the weight view treats it as 1 so a fresh credential is
+	// not perpetually starved and can win a pick to mint its anchor on first real
+	// use (the deliberate bootstrap; see AccountFreshnessWeightFactor). This field
+	// is retained as observability / the warmup-status unit-test contract and must
+	// not be wired into selection weight without reconciling that divergence
+	// (doing so would silently flip un-anchored accounts from selectable to
+	// starved). See warmupFreshnessFactor for the in-curve ramp formula.
 	FreshnessFactor float64
 
 	// Mature reports whether the account is past the configured warm-up

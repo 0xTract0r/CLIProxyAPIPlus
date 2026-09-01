@@ -113,11 +113,21 @@ func AccountQuotaWeightFactor(a *Auth) float64 {
 	return result.Headroom
 }
 
-// AccountFreshnessWeightFactor returns a's current warm-up freshness
-// multiplier in [0,1]: <1 while the account is inside cfg.WarmupCurve's
-// age-based stages (design.md D1/D3/D4: a warming account must be weighted
-// down so traffic -- and especially a workflow-style burst -- prefers a
-// mature account instead), and exactly 1 once the account is mature.
+// AccountFreshnessWeightFactor is THE single source of truth for the freshness
+// axis of the live adaptive selector's weight (design.md D1: weight = tier
+// capacity x quota headroom x freshness factor). It returns a's current warm-up
+// freshness multiplier in [0,1]: <1 while the account is inside cfg.WarmupCurve's
+// age-based stages (design.md D1/D3/D4: a warming account must be weighted down
+// so traffic -- and especially a workflow-style burst -- prefers a mature account
+// instead), and exactly 1 once the account is mature.
+//
+// Do not confuse this with AccountWarmupStatus.FreshnessFactor
+// (account_warmup.go): that is a separate warm-up-status *view* the selector does
+// NOT consume for weighting, and it deliberately diverges from this function on
+// the no-anchor case (the warmup view pins un-anchored accounts to 0 "cold" as an
+// anti-ban fail-safe, whereas this weight view returns 1 -- the bootstrap
+// documented in case 1 below). AccountSelectionWeight consumes only this
+// function; the warmup view exists for observability / the warmup unit tests.
 //
 // "Mature" here covers three cases, all intentionally returning 1 rather
 // than being treated as still-warming:
@@ -190,16 +200,25 @@ func AccountFreshnessWeightFactor(a *Auth, cfg internalconfig.AccountSchedulingC
 // AccountIsMature reports whether a is past its warm-up curve as of now,
 // using the exact same anchor/stage-lookup rules as
 // AccountFreshnessWeightFactor (including the same "no anchor recorded ->
-// mature" and "empty curve -> mature" fallbacks). Exported as a boolean
-// convenience alongside the float factor because design.md D5 / spec.md's
-// "会话粘性与限额冲突分级" requirement (task 4.1, a later phase) needs
-// exactly this warming-vs-mature classification to decide whether a
-// session-sticky target should have its stickiness broken -- without this,
-// that later phase would otherwise have to re-derive maturity by comparing
-// AccountFreshnessWeightFactor's float result to 1.0, which is not a safe
-// equivalence (a warming stage's RPMLimit could coincidentally equal
-// cfg.MatureLimits.RPMLimit under a hand-tuned config, yielding factor==1
-// while the account is still nominally inside the warm-up curve).
+// mature" and "empty curve -> mature" fallbacks). It is the weight-side
+// maturity counterpart of that freshness factor, so it stays consistent with
+// the weight bootstrap: an un-anchored account is reported mature here for the
+// same reason its freshness factor is 1 (do not perpetually starve/throttle a
+// credential that has not yet had a chance to mint its anchor).
+//
+// NOTE (single source of truth): this is NOT the maturity signal the live
+// adaptive selector uses for design D5 / spec.md's "会话粘性与限额冲突分级"
+// stickiness grading. AdaptiveSelector.isMature reads
+// AccountWarmupStatusFor(...).Mature (account_warmup.go) instead, which is
+// fail-safe "cold" (not mature) on the no-anchor case -- deliberately the
+// opposite of this function on that one case, so an un-anchored account can win
+// a weighted pick (weight-side "mature" here) yet does not hold stickiness or
+// absorb floods until actually anchored (grading-side "cold" there). This
+// weight-side classifier is retained as a tested boolean convenience (avoiding
+// an unsafe factor==1 comparison, since a hand-tuned warming stage's RPMLimit
+// could coincidentally equal cfg.MatureLimits.RPMLimit); it must not be
+// swapped in for the selector's grading maturity without reconciling that
+// intentional no-anchor divergence.
 func AccountIsMature(a *Auth, cfg internalconfig.AccountSchedulingConfig, now time.Time) bool {
 	ageDays, ok := AccountAgeDays(a, now)
 	if !ok {

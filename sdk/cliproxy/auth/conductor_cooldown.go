@@ -721,6 +721,29 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		auth.recordRecentRequest(now, result.Success)
 		if result.Success {
 			auth.Success++
+			// openspec/changes/add-adaptive-account-scheduling (G1): mint the
+			// account's first-production freshness anchor on its first real
+			// serving success. MarkResult is the single sink for real serving
+			// results (both the execute and stream paths reach it via
+			// recordExecutionResult; ephemeral Home dispatch and the
+			// count_tokens preflight deliberately do not), so this is the one
+			// correct place to stamp "first actually used to serve a request".
+			// Without it every account's AccountAgeDays stays ok=false, is
+			// judged "cold" by the warm-up curve, and is pinned to the 3rpm
+			// cold cap forever, never maturing -- which makes adaptive
+			// scheduling unusable in practice.
+			//
+			// EnsureAuthFirstProductionAt is append-only and idempotent: it
+			// stamps `now` exactly once and is a cheap map-read no-op on every
+			// later success, so calling it on each success is safe. Locking and
+			// persistence piggyback on MarkResult's existing machinery -- this
+			// runs under m.mu (the same lock every other Metadata mutator in
+			// this package holds, e.g. setAutoQuarantineMetadata), and the
+			// unconditional `m.persist(ctx, auth)` below write-throughs the
+			// minted anchor via the same store.Save path that persists the
+			// Success counter and quota snapshot, so the anchor lands on the
+			// auth volume and survives a restart.
+			EnsureAuthFirstProductionAt(auth, now)
 		} else {
 			auth.Failed++
 		}

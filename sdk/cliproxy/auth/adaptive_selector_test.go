@@ -3,6 +3,8 @@ package auth
 import (
 	"context"
 	"net/http"
+	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -378,6 +380,172 @@ func TestAdaptiveSelectorPropagatesUnavailableError(t *testing.T) {
 	if _, err := s.Pick(context.Background(), "claude", "", cliproxyexecutor.Options{}, nil); err == nil {
 		t.Fatal("Pick with no auths should return an error")
 	}
+}
+
+// TestAdaptiveSelectorStickyInheritsIntoPrimaryKey is the regression test for the
+// first-turn fallback-key inheritance re-bind bug (G3): resolveSticky's two
+// "keep the bound account" branches -- non-adaptive target (!adaptiveEligible) and
+// mature-within-soft-ceiling target -- must persist the binding under the
+// PRIMARY/full session cache key, not only leave it under the short-hash fallback
+// key it was inherited from.
+//
+// White-box rationale: the returned auth alone cannot distinguish the bug from
+// the fix in a fast test, because turn 2 re-inherits the same account from the
+// still-live fallback key regardless. The observable defect is specifically that
+// the primary session key is never populated -- so a long conversation's binding
+// lifetime is pinned to the fallback key's original (never-refreshed) TTL and
+// jumps accounts once that expires mid-session (spec D5 "成熟号软上限内保持粘性"
+// regression). This test therefore asserts directly on the internal cache: after
+// the inheritance turn the primary key MUST be bound.
+func TestAdaptiveSelectorStickyInheritsIntoPrimaryKey(t *testing.T) {
+	cfg := internalconfig.DefaultAccountSchedulingConfig()
+
+	// Turn 1: user message only -> extractMessageHashIDs returns (shortHash, "")
+	// so the first binding is stored under the short-hash key.
+	turn1 := []byte(`{"messages":[{"role":"user","content":"hello world"}]}`)
+	// Turn 2+: the same conversation now carries an assistant reply ->
+	// (fullHash, shortHash); the fullHash primary key starts unbound and the
+	// binding is inherited from the shortHash fallback key.
+	turn2 := []byte(`{"messages":[{"role":"user","content":"hello world"},{"role":"assistant","content":"hi there"},{"role":"user","content":"continue"}]}`)
+
+	primary2, fallback2 := extractSessionIDs(nil, turn2, nil)
+	if primary2 == "" || fallback2 == "" || primary2 == fallback2 {
+		t.Fatalf("test payloads do not exercise the inheritance path: primary=%q fallback=%q", primary2, fallback2)
+	}
+
+	cases := []struct {
+		name     string
+		provider string
+		auths    []*Auth
+	}{
+		{
+			// Exercises the mature-within-soft-ceiling branch (adaptiveEligible +
+			// isMature + limiter.Allow).
+			name:     "mature adaptive target",
+			provider: "claude",
+			auths:    []*Auth{newAdaptiveClaudeAuth("a", "default_claude_max_20x", matureFirstProd())},
+		},
+		{
+			// Exercises the non-adaptive branch (!adaptiveEligible): a provider
+			// with no tier weight binds via the fallback selector and must still be
+			// pinned to the primary key on inheritance.
+			name:     "non-adaptive target",
+			provider: "gemini",
+			auths:    []*Auth{{ID: "g1", Provider: "gemini", Status: StatusActive}},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			primaryKey := tc.provider + "::" + primary2 + "::"
+			s := NewAdaptiveSelector(
+				AdaptiveSelectorConfig{Scheduling: cfg, SessionAffinity: true},
+				WithAdaptiveClock(fixedClock()),
+				WithAdaptiveRand(constRand(0.0)),
+			)
+			defer s.Stop()
+
+			opts1 := cliproxyexecutor.Options{OriginalRequest: turn1}
+			first, err := s.Pick(context.Background(), tc.provider, "", opts1, tc.auths)
+			if err != nil {
+				t.Fatalf("turn 1 Pick error: %v", err)
+			}
+
+			opts2 := cliproxyexecutor.Options{OriginalRequest: turn2}
+			second, err := s.Pick(context.Background(), tc.provider, "", opts2, tc.auths)
+			if err != nil {
+				t.Fatalf("turn 2 Pick error: %v", err)
+			}
+			if second.ID != first.ID {
+				t.Fatalf("turn 2 = %s, want inherited %s", second.ID, first.ID)
+			}
+
+			boundID, ok := s.cache.Get(primaryKey)
+			if !ok {
+				t.Fatalf("primary session key %q was not bound after inheritance (G3 regression)", primaryKey)
+			}
+			if boundID != first.ID {
+				t.Fatalf("primary key bound to %s, want %s", boundID, first.ID)
+			}
+		})
+	}
+}
+
+// TestAdaptiveSelectorConcurrentPickRaceFree drives many goroutines through Pick
+// (and concurrent InvalidateAuth) against one selector so the -race detector can
+// prove the selector's shared mutable state is safe for concurrent use: the
+// per-account token bucket (AccountRateLimiter, which design.md D2 calls the
+// concurrency-critical piece), the session stickiness cache (SessionCache) and
+// the weighted-pick rng. It asserts only liveness (every Pick returns a usable
+// auth, never an error) -- the value of the test is the race detector, not a
+// deterministic distribution -- so it uses the production concurrency-safe rng
+// (rand.Float64, by not injecting WithAdaptiveRand) rather than a single-goroutine
+// constRand, and a fixed clock (a pure constant, safe to read concurrently) to
+// keep warm-up/age math stable without a data race on the clock.
+func TestAdaptiveSelectorConcurrentPickRaceFree(t *testing.T) {
+	cfg := internalconfig.DefaultAccountSchedulingConfig()
+	// A mix of mature and warming Claude accounts exercises both the sticky-mature
+	// keep path and the warming-breaks-to-mature reselect path, and spreads token
+	// buckets across several keys.
+	auths := []*Auth{
+		newAdaptiveClaudeAuth("m1", "default_claude_max_20x", matureFirstProd()),
+		newAdaptiveClaudeAuth("m2", "default_claude_max_5x", matureFirstProd()),
+		newAdaptiveClaudeAuth("w1", "default_claude_max_20x", warmupFirstProd()),
+		newAdaptiveClaudeAuth("w2", "default_claude_max_5x", warmupFirstProd()),
+	}
+
+	s := NewAdaptiveSelector(
+		AdaptiveSelectorConfig{Scheduling: cfg, SessionAffinity: true},
+		WithAdaptiveClock(fixedClock()),
+	)
+	defer s.Stop()
+
+	const (
+		goroutines = 24
+		perG       = 60
+	)
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for g := 0; g < goroutines; g++ {
+		go func(g int) {
+			defer wg.Done()
+			for i := 0; i < perG; i++ {
+				var opts cliproxyexecutor.Options
+				switch g % 3 {
+				case 0:
+					// Shared session key: concurrent GetAndRefresh/Set on one entry.
+					opts = cliproxyexecutor.Options{Headers: http.Header{"X-Session-Id": {"shared"}}}
+				case 1:
+					// Per-goroutine session key: concurrent distinct-key cache writes.
+					opts = cliproxyexecutor.Options{Headers: http.Header{"X-Session-Id": {"sess-" + strconv.Itoa(g)}}}
+				default:
+					// No session: pure weighted path (rng + token bucket only).
+					opts = cliproxyexecutor.Options{}
+				}
+				got, err := s.Pick(context.Background(), "claude", "", opts, auths)
+				if err != nil {
+					t.Errorf("goroutine %d Pick #%d error: %v", g, i, err)
+					return
+				}
+				if got == nil {
+					t.Errorf("goroutine %d Pick #%d returned nil", g, i)
+					return
+				}
+			}
+		}(g)
+	}
+
+	// Concurrently mutate the sticky cache to stress its write path
+	// (InvalidateAuth) against the readers/writers above.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < perG; i++ {
+			s.InvalidateAuth("m1")
+			s.InvalidateAuth("w1")
+		}
+	}()
+
+	wg.Wait()
 }
 
 func authID(a *Auth) string {

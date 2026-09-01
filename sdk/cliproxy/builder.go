@@ -239,7 +239,16 @@ func (b *Builder) Build() (*Service, error) {
 		// normalizedRoutingRuntimeState (service_config.go) so both the builder
 		// and the config-reload path honor the fork's legacy affinity flag.
 		routingState := normalizedRoutingRuntimeState(b.cfg)
-		coreManager = coreauth.NewManager(tokenStore, newRoutingSelector(routingState), nil)
+		// Bootstrap the manager with a throwaway no-op selector (a plain
+		// RoundRobinSelector owns no goroutine). The real, live-scheduling-aware
+		// selector is installed once below, after the *Service exists -- see the
+		// openspec/changes/add-adaptive-account-scheduling (G2) block. Building
+		// the real selector here instead would either (a) miss the live
+		// AccountSchedulingConfig accessor entirely (the *Service does not exist
+		// yet), reintroducing the hot-reload-ignored bug, or (b) create a
+		// goroutine-bearing adaptive/session-affinity selector only to discard
+		// it moments later when we rebind, leaking its reclaim/cache loop.
+		coreManager = coreauth.NewManager(tokenStore, &coreauth.RoundRobinSelector{}, nil)
 		appliedRoutingState = &routingState
 	}
 	// Attach a default RoundTripper provider so providers can opt-in per-auth transports.
@@ -270,6 +279,23 @@ func (b *Builder) Build() (*Service, error) {
 	// auth creation, before persistence) and the persist/plugin/reload hooks, so
 	// both coexist.
 	coreManager.SetHook(authRegistryHook{service: service})
+	// openspec/changes/add-adaptive-account-scheduling (G2): install the manager's
+	// real routing selector now that the *Service -- and therefore its
+	// s.liveAccountSchedulingConfig accessor -- exists. This is what fixes the
+	// "boot straight into adaptive, edit account-scheduling, nothing happens
+	// until restart" bug: a static (live == nil) selector could never pick up
+	// warmup-curve / tier-weights / mature-limits edits, because
+	// applyManagerConfig only rebuilds the selector when
+	// routingRuntimeState.selectorShapeEqual is false and accountScheduling is
+	// deliberately excluded from that comparison -- so an account-scheduling-only
+	// reload never triggers a rebuild. Wiring the live accessor into the selector
+	// here means the very first Pick and every later account-scheduling edit read
+	// the current config live, with no rebuild required. appliedRoutingState is
+	// non-nil exactly when this builder created the manager; a caller-injected
+	// coreManager (WithCoreAuthManager) keeps its own selector untouched.
+	if appliedRoutingState != nil {
+		coreManager.SetSelector(newRoutingSelectorWithLiveScheduling(*appliedRoutingState, service.liveAccountSchedulingConfig))
+	}
 	if b.postAuthHook != nil {
 		service.serverOptions = append(service.serverOptions, api.WithPostAuthHook(b.postAuthHook))
 	}

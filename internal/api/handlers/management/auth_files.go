@@ -481,6 +481,13 @@ func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth) gin.H {
 	// value, projected for the account-settings editing surface.
 	entry["farm_enrolled"] = coreauth.AuthFarmEnrolled(auth)
 	entry["account_settings"] = buildAuthFileAccountSettingsView(auth, h.cfg)
+	// tasks.md 5.2 (add-adaptive-account-scheduling): additive, namespaced
+	// projection of the Phase 0 scheduling primitives (fine-grained subscription
+	// tier, structured quota utilization/headroom, first_production_at anchor,
+	// current warm-up + rate-limit stage) so the management UI / farm-orchestrator
+	// can read them without depending on any other nested sub-object. Read-only
+	// (mints nothing, mutates nothing); "unknown" state is surfaced explicitly.
+	entry["adaptive_scheduling"] = h.buildAdaptiveSchedulingView(auth)
 	if websockets, ok := authWebsocketsValue(auth); ok {
 		entry["websockets"] = websockets
 	}
