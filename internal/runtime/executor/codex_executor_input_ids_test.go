@@ -33,7 +33,7 @@ func TestCodexExecutorExecuteStreamSanitizesOverlongInputItemIDs(t *testing.T) {
 	defer server.Close()
 
 	executor := NewCodexExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{"base_url": server.URL, "api_key": "test"}}
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", Attributes: map[string]string{"base_url": server.URL, "api_key": "test"}}
 	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
 		Model: "gpt-5.4",
 		Payload: []byte(`{"model":"gpt-5.4","stream":true,"input":[` +

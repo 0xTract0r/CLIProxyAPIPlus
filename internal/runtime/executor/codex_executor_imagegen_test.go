@@ -30,6 +30,7 @@ func TestCodexExecutorExecuteResponsesLiteHeaderDoesNotInjectImageGenerationTool
 	executor := NewCodexExecutor(&config.Config{})
 	auth := &cliproxyauth.Auth{
 		Provider: "codex",
+		ProxyURL: "direct",
 		Attributes: map[string]string{
 			"api_key":   "test",
 			"base_url":  server.URL,
@@ -74,6 +75,7 @@ func TestCodexExecutorExecuteStreamResponsesLiteHeaderForcesParallelToolCallsFal
 	executor := NewCodexExecutor(&config.Config{})
 	auth := &cliproxyauth.Auth{
 		Provider: "codex",
+		ProxyURL: "direct",
 		Attributes: map[string]string{
 			"api_key":   "test",
 			"base_url":  server.URL,
