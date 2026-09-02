@@ -57,11 +57,12 @@ import (
 // weight for (anything other than claude/codex, or a tier configured to weight
 // 0) yields no weighted candidate and falls through to the wrapped fallback
 // selector (round-robin by default), so non-Claude/Codex traffic behaves exactly
-// as it does today. Likewise, if every weighted candidate is momentarily
-// rate-limited, the request is served via the fallback selector (spreading the
-// overflow across the pool) rather than being denied -- the token bucket is an
-// outbound smoother, never a hard gate that can manufacture a 429 the upstream
-// did not send.
+// as it does today. If every weighted candidate is momentarily rate-limited the
+// request is still never denied: the overflow is served by a WEIGHTED draw over
+// the same adaptive candidates (still proportional to tier capacity), and only a
+// genuinely non-adaptive / no-candidate pool degrades to the round-robin fallback
+// -- the token bucket is an outbound smoother, never a hard gate that can
+// manufacture a 429 the upstream did not send.
 type AdaptiveSelector struct {
 	// fallback is the base selector used for non-adaptive providers and as the
 	// degraded path when no weighted candidate can currently be served. Never
@@ -259,10 +260,12 @@ func (s *AdaptiveSelector) Pick(ctx context.Context, provider, model string, opt
 		s.logPick(ctx, "weighted-new", provider, model, "", picked, cfg, now)
 		return picked, nil
 	}
-	// Degraded: no adaptive-weighted candidate could be served right now (a
-	// non-adaptive provider, or every weighted candidate is momentarily over its
-	// own rate limit). Serve via the fallback selector rather than deny -- the
-	// token bucket smooths, it never manufactures a 429.
+	// Degraded: no adaptive-weighted candidate exists at all (a non-adaptive
+	// provider, or a pool whose every account scores zero weight / is over its
+	// daily budget). A pool that merely has all token buckets momentarily drained
+	// does NOT reach here -- pickFromCandidates serves that as a weighted overflow
+	// above. Serve via the fallback selector rather than deny -- the token bucket
+	// smooths, it never manufactures a 429.
 	picked, errFallback := s.fallback.Pick(ctx, provider, model, opts, auths)
 	if errFallback == nil {
 		s.logPick(ctx, "fallback-degraded", provider, model, "", picked, cfg, now)
@@ -342,7 +345,7 @@ func (s *AdaptiveSelector) pickWithAffinity(ctx context.Context, provider, model
 			return pickedSticky, true, stickyReason, primaryID, errResolve
 		}
 	}
-	pickedNew, newReason, errSelect := s.selectAndBind(ctx, provider, model, opts, auths, available, cfg, now, cacheKey, false)
+	pickedNew, newReason, errSelect := s.selectAndBind(ctx, provider, model, opts, auths, available, cfg, now, cacheKey)
 	return pickedNew, true, newReason, primaryID, errSelect
 }
 
@@ -359,9 +362,18 @@ func (s *AdaptiveSelector) pickWithAffinity(ctx context.Context, provider, model
 //     (spec.md "成熟号软上限内保持粘性").
 //   - Bound credential is mature but at its ceiling (near the risk hard
 //     threshold): reselect and rebind (spec.md "近风控硬阈值才改选").
-//   - Bound credential is still warming: break stickiness and route to a mature
-//     account, rebinding so subsequent turns follow the mature account (spec.md
-//     "养号号打破粘性改路由成熟号").
+//   - Bound credential is still warming AND a mature account is available:
+//     break stickiness and route to that mature account, rebinding so subsequent
+//     turns follow the mature account (spec.md "养号号打破粘性改路由成熟号").
+//   - Bound credential is still warming but NO mature account exists to route to
+//     (an all-warming pool) AND the bound account can still serve: keep the
+//     warming binding (sticky-keep-warming-no-mature). Breaking stickiness here
+//     would only swap one equally-young account for another -- it cannot better
+//     protect the new account and needlessly discards the session's prompt cache.
+//     If instead the bound warming account can no longer serve (hard
+//     rate-limited / daily-budget-spent / concurrency-full) it falls through to a
+//     full-pool reselection, so the session is never wedged on an unservable
+//     binding.
 //
 // The returned reason string labels which grading branch produced the result
 // (for the observability log only; it never affects the selection). "keep"
@@ -376,7 +388,7 @@ func (s *AdaptiveSelector) resolveSticky(ctx context.Context, provider, model st
 		}
 	}
 	if bound == nil {
-		return s.selectAndBind(ctx, provider, model, opts, auths, available, cfg, now, cacheKey, false)
+		return s.selectAndBind(ctx, provider, model, opts, auths, available, cfg, now, cacheKey)
 	}
 	if !s.adaptiveEligible(bound, cfg) {
 		// Non-Claude/Codex sticky target: nothing to grade, keep the binding.
@@ -407,28 +419,73 @@ func (s *AdaptiveSelector) resolveSticky(ctx context.Context, provider, model st
 			return bound, "sticky-keep-mature", nil
 		}
 		// At the soft ceiling -> treat as近风控硬阈值, reselect across the pool.
-		return s.selectAndBind(ctx, provider, model, opts, auths, available, cfg, now, cacheKey, false)
+		return s.selectAndBind(ctx, provider, model, opts, auths, available, cfg, now, cacheKey)
 	}
-	// Warming sticky target -> break stickiness, prefer a mature account.
-	return s.selectAndBind(ctx, provider, model, opts, auths, available, cfg, now, cacheKey, true)
+	// Warming sticky target. Breaking stickiness is only worthwhile when we can
+	// route onto a MORE-protected (mature) account (design.md D5 "养号号打破粘性
+	// 改路由成熟号"); try that first. With the weighted-overflow pickFromCandidates
+	// this succeeds whenever ANY mature account exists (even one whose bucket is
+	// momentarily drained), so the keep guard below is reached exactly when the
+	// available pool contains no mature account at all.
+	if picked, ok := s.pickFromCandidates(s.scoreCandidates(available, cfg, now, true), cfg, now); ok {
+		s.cache.Set(cacheKey, picked.ID)
+		return picked, "rebind-weighted-mature", nil
+	}
+	// No mature account exists to route to (an all-warming pool). Keep the current
+	// binding AS LONG AS the bound warming account can still serve, so the session
+	// preserves prompt-cache continuity instead of churning credentials every turn
+	// (the all-warming-pool stickiness regression this fixes). This keep guard is
+	// scoped strictly to the "no mature target" case and never overrides an
+	// unservable bound account: a cooled-down / quarantined / removed account is
+	// already absent from `available` (handled by the bound==nil reselect above),
+	// and a hard rate-limited / daily-budget-spent / concurrency-full bound account
+	// fails boundServableForKeep and falls through to the full-pool reselection
+	// below, so we never pin the session to a 429-ing binding.
+	if s.boundServableForKeep(bound, cfg, now) {
+		s.cache.Set(cacheKey, bound.ID)
+		return bound, "sticky-keep-warming-no-mature", nil
+	}
+	// Bound warming account can no longer serve and there is no mature target:
+	// reselect across the full pool (may land on another warming account) rather
+	// than pin the session to an unservable binding.
+	return s.selectAndBind(ctx, provider, model, opts, auths, available, cfg, now, cacheKey)
 }
 
-// selectAndBind performs a weighted pick (optionally restricted to mature
-// accounts) and records the result under cacheKey. When preferMature yields no
-// servable mature candidate it falls back to the full weighted pool, and when
-// even that yields nothing it delegates to the fallback selector (still binding
-// the result so the session stays put).
+// boundServableForKeep reports whether the still-warming bound sticky account can
+// serve this request right now, so resolveSticky may keep its binding when no
+// mature account exists to route to (an all-warming pool). It applies the same
+// gating order as pickFromCandidates -- daily budget and concurrency headroom
+// first (neither consumes a token), then the account's own token bucket -- and,
+// exactly like the mature-keep branch, consumes one token on success so the kept
+// account is charged for this request. A false result -- over daily budget, at
+// its concurrency ceiling, or its token bucket momentarily empty (a hard rate
+// limit) -- means the bound account is NOT servable and the caller must reselect
+// rather than wedge the session on it. It deliberately does NOT re-check base
+// availability / quarantine / cooldown: `bound` was found in the already-filtered
+// `available` slice, so its presence there is that check.
+func (s *AdaptiveSelector) boundServableForKeep(a *Auth, cfg internalconfig.AccountSchedulingConfig, now time.Time) bool {
+	if s.overDailyBudget(a, cfg, now) {
+		return false
+	}
+	if !s.hasConcurrencyHeadroom(a, cfg, now) {
+		return false
+	}
+	rpm, burst := s.rateLimitParams(a, cfg, now)
+	return s.limiter.Allow(a.ID, rpm, burst)
+}
+
+// selectAndBind performs a weighted pick over the full available pool and records
+// the result under cacheKey. When the weighted pool yields nothing (a
+// non-adaptive provider, or no scorable candidate at all) it delegates to the
+// fallback selector, still binding the result so the session stays put.
 //
 // The returned reason string labels which sub-path produced the pick
-// ("rebind-weighted-mature" | "rebind-weighted" | "rebind-fallback"), for the
-// observability log only -- it never affects selection.
-func (s *AdaptiveSelector) selectAndBind(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths, available []*Auth, cfg internalconfig.AccountSchedulingConfig, now time.Time, cacheKey string, preferMature bool) (*Auth, string, error) {
-	if preferMature {
-		if picked, ok := s.pickFromCandidates(s.scoreCandidates(available, cfg, now, true), cfg, now); ok {
-			s.cache.Set(cacheKey, picked.ID)
-			return picked, "rebind-weighted-mature", nil
-		}
-	}
+// ("rebind-weighted" | "rebind-fallback"), for the observability log only -- it
+// never affects selection. The mature-preferring reselection a still-warming
+// sticky target triggers is handled inline by resolveSticky (which also owns the
+// "keep the warming binding when no mature target exists" guard), so this helper
+// itself no longer needs a preferMature mode.
+func (s *AdaptiveSelector) selectAndBind(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths, available []*Auth, cfg internalconfig.AccountSchedulingConfig, now time.Time, cacheKey string) (*Auth, string, error) {
 	if picked, ok := s.pickFromCandidates(s.scoreCandidates(available, cfg, now, false), cfg, now); ok {
 		s.cache.Set(cacheKey, picked.ID)
 		return picked, "rebind-weighted", nil
@@ -481,10 +538,21 @@ func (s *AdaptiveSelector) scoreCandidates(available []*Auth, cfg internalconfig
 // pickFromCandidates draws one credential from candidates proportional to
 // weight, gating each draw on the account's own token bucket: a rate-limited
 // draw is dropped (no token consumed -- AccountRateLimiter.Allow only consumes
-// on success) and the draw repeats over the remaining pool. It returns ok=false
-// only when the pool is empty or every candidate is currently rate-limited, so
-// exactly one token is ever consumed per Pick and always for the returned
-// account.
+// on success) and the draw repeats over the remaining pool. On the servable path
+// it consumes exactly one token, always for the returned account.
+//
+// It returns ok=false ONLY when candidates is empty (a non-adaptive provider, or
+// a pool whose every account scores zero weight / is over its daily budget),
+// leaving the caller to degrade to the round-robin fallback. When the pool is
+// non-empty but every candidate is momentarily over its own token bucket, it does
+// NOT deny: the token bucket is an outbound smoother, never a hard gate, so it
+// draws one final candidate proportional to weight over the ORIGINAL set and
+// returns it (ok=true). No token is consumed on that overflow draw -- every
+// bucket is empty, there is none to take -- and, critically, the draw stays
+// WEIGHTED (reusing weightedIndex) so a rate-limit overflow keeps routing
+// proportionally to tier capacity instead of collapsing onto the uniform
+// round-robin fallback (which would flatten a Max 20x account into an equal share
+// with a Pro account).
 func (s *AdaptiveSelector) pickFromCandidates(candidates []adaptiveCandidate, cfg internalconfig.AccountSchedulingConfig, now time.Time) (*Auth, bool) {
 	if len(candidates) == 0 {
 		return nil, false
@@ -509,7 +577,12 @@ func (s *AdaptiveSelector) pickFromCandidates(candidates []adaptiveCandidate, cf
 		}
 		pool = append(pool[:idx], pool[idx+1:]...)
 	}
-	return nil, false
+	// Overflow: the pool is non-empty but every weighted candidate is momentarily
+	// over its own token bucket (or at its advisory concurrency ceiling). Serve a
+	// weighted draw over the original candidate set rather than deny or flatten to
+	// a uniform fallback -- see the doc comment. No token is taken (every bucket is
+	// already empty).
+	return candidates[s.weightedIndex(candidates)].auth, true
 }
 
 // weightedIndex returns an index into pool chosen proportional to each entry's

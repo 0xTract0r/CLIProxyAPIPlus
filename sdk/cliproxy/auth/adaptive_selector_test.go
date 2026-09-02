@@ -3,6 +3,7 @@ package auth
 import (
 	"bytes"
 	"context"
+	"math/rand"
 	"net/http"
 	"strconv"
 	"strings"
@@ -550,6 +551,220 @@ func TestAdaptiveSelectorConcurrentPickRaceFree(t *testing.T) {
 	}()
 
 	wg.Wait()
+}
+
+// TestAdaptiveSelectorAllWarmupKeepsStickyBinding is the symptom-2 regression: in
+// an all-warming pool (every account is a zero-history new account graded w1, so
+// there is NO mature routing target) a session must KEEP its warming binding
+// across turns (sticky-keep) instead of re-binding to a different equally-young
+// account every turn, which would throw away the session's cross-turn prompt
+// cache for no protective benefit.
+//
+// Discriminating design: the rng sequence binds turn 1 to "a-warm" (draw 0.0) but
+// every later draw targets "b-warm" (draw 0.99). The buggy full-pool weighted
+// rebind consumes that later draw and churns to b-warm; the fixed keep guard
+// consumes NO rng and holds a-warm. The wall clock advances 25s between turns so
+// a-warm's tiny w1 bucket (rpm 3 => 1 token / 20s) refills, proving the keep path
+// re-admits a still-serving bound account rather than being an unconditional pin.
+func TestAdaptiveSelectorAllWarmupKeepsStickyBinding(t *testing.T) {
+	cfg := internalconfig.DefaultAccountSchedulingConfig()
+	aWarm := newAdaptiveClaudeAuth("a-warm", "default_claude_max_20x", warmupFirstProd())
+	bWarm := newAdaptiveClaudeAuth("b-warm", "default_claude_max_20x", warmupFirstProd())
+	auths := []*Auth{aWarm, bWarm}
+
+	now := adaptiveTestNow
+	clock := func() time.Time { return now }
+
+	draws := []float64{0.0, 0.99, 0.99, 0.99}
+	di := 0
+	rng := func() float64 {
+		v := draws[di]
+		if di < len(draws)-1 {
+			di++
+		}
+		return v
+	}
+
+	s := NewAdaptiveSelector(
+		AdaptiveSelectorConfig{Scheduling: cfg, SessionAffinity: true},
+		WithAdaptiveClock(clock),
+		WithAdaptiveRand(rng),
+	)
+	defer s.Stop()
+
+	opts := cliproxyexecutor.Options{Headers: http.Header{"X-Session-Id": {"s1"}}}
+
+	first, err := s.Pick(context.Background(), "claude", "", opts, auths)
+	if err != nil {
+		t.Fatalf("turn 1 Pick error: %v", err)
+	}
+	if first.ID != "a-warm" {
+		t.Fatalf("turn 1 = %s, want a-warm", first.ID)
+	}
+	for turn := 2; turn <= 4; turn++ {
+		now = now.Add(25 * time.Second) // refill a-warm's w1 bucket back to >= 1 token
+		got, errPick := s.Pick(context.Background(), "claude", "", opts, auths)
+		if errPick != nil {
+			t.Fatalf("turn %d Pick error: %v", turn, errPick)
+		}
+		if got.ID != "a-warm" {
+			t.Fatalf("turn %d = %s, want a-warm (all-warming pool must keep its sticky binding, not churn every turn)", turn, got.ID)
+		}
+	}
+}
+
+// TestAdaptiveSelectorAllWarmupBoundUnservableReselects is the symptom-2 boundary
+// guard: the all-warming sticky-keep must NEVER override an unservable bound
+// account. When the bound warming account has hit a hard limit -- its token bucket
+// is empty, or it has spent its w1 daily budget -- the selector must still
+// reselect, because keeping it would 429 the request. Both sub-cases contain no
+// mature account, so without a servability check the keep path would wrongly fire.
+func TestAdaptiveSelectorAllWarmupBoundUnservableReselects(t *testing.T) {
+	t.Run("hard rate limited bound reselects", func(t *testing.T) {
+		cfg := internalconfig.DefaultAccountSchedulingConfig()
+		aWarm := newAdaptiveClaudeAuth("a-warm", "default_claude_max_20x", warmupFirstProd())
+		bWarm := newAdaptiveClaudeAuth("b-warm", "default_claude_max_20x", warmupFirstProd())
+		auths := []*Auth{aWarm, bWarm}
+
+		// Fixed clock: a-warm's single-token w1 bucket, drained by turn 1, never
+		// refills, so it is hard rate-limited on turn 2.
+		s := NewAdaptiveSelector(
+			AdaptiveSelectorConfig{Scheduling: cfg, SessionAffinity: true},
+			WithAdaptiveClock(fixedClock()),
+			WithAdaptiveRand(constRand(0.0)),
+		)
+		defer s.Stop()
+
+		opts := cliproxyexecutor.Options{Headers: http.Header{"X-Session-Id": {"s1"}}}
+		first, err := s.Pick(context.Background(), "claude", "", opts, auths)
+		if err != nil {
+			t.Fatalf("turn 1 Pick error: %v", err)
+		}
+		if first.ID != "a-warm" {
+			t.Fatalf("turn 1 = %s, want a-warm", first.ID)
+		}
+		second, err := s.Pick(context.Background(), "claude", "", opts, auths)
+		if err != nil {
+			t.Fatalf("turn 2 Pick error: %v", err)
+		}
+		if second.ID != "b-warm" {
+			t.Fatalf("turn 2 = %s, want b-warm (bound a-warm is hard rate-limited; keep guard must yield to reselection)", second.ID)
+		}
+	})
+
+	t.Run("over daily budget bound reselects", func(t *testing.T) {
+		cfg := internalconfig.DefaultAccountSchedulingConfig()
+		aWarm := newAdaptiveClaudeAuth("a-warm", "default_claude_max_20x", warmupFirstProd())
+		bWarm := newAdaptiveClaudeAuth("b-warm", "default_claude_max_20x", warmupFirstProd())
+		auths := []*Auth{aWarm, bWarm}
+
+		// A mutable clock (shared by the selector's own rate limiter and the
+		// gate) rather than a fixedClock(): turn 1 spends a-warm's single w1
+		// token (rpm 3, burst 1), and if the clock never advanced it would
+		// still be empty on turn 2, so limiter.Allow alone would force a
+		// reselect and boundServableForKeep's overDailyBudget check would never
+		// be exercised (it would be masked by the rate-limit check). Advancing
+		// the clock ~20s between turns refills that single token, so turn 2's
+		// reselect can ONLY be explained by the daily-budget guard.
+		now := adaptiveTestNow
+		clock := func() time.Time { return now }
+
+		gate := NewAccountConcurrencyGate(WithGateClock(clock))
+		s := NewAdaptiveSelector(
+			AdaptiveSelectorConfig{Scheduling: cfg, SessionAffinity: true},
+			WithAdaptiveClock(clock),
+			WithAdaptiveRand(constRand(0.0)),
+			WithAdaptiveAccountGate(gate),
+		)
+		defer s.Stop()
+
+		opts := cliproxyexecutor.Options{Headers: http.Header{"X-Session-Id": {"s1"}}}
+		first, err := s.Pick(context.Background(), "claude", "", opts, auths)
+		if err != nil {
+			t.Fatalf("turn 1 Pick error: %v", err)
+		}
+		if first.ID != "a-warm" {
+			t.Fatalf("turn 1 = %s, want a-warm", first.ID)
+		}
+
+		// Drive a-warm up to its w1 daily budget so it is over budget on turn 2.
+		w1Budget := cfg.WarmupCurve[0].DailyBudget
+		for i := 0; i < w1Budget; i++ {
+			gate.RecordRequest("a-warm")
+		}
+
+		// Refill a-warm's w1 token bucket (rpm 3 => 1 token / 20s) so that, on
+		// turn 2, limiter.Allow("a-warm", ...) would report true if it were
+		// ever reached -- keeping the daily-budget check load-bearing.
+		now = now.Add(21 * time.Second)
+
+		second, err := s.Pick(context.Background(), "claude", "", opts, auths)
+		if err != nil {
+			t.Fatalf("turn 2 Pick error: %v", err)
+		}
+		if second.ID != "b-warm" {
+			t.Fatalf("turn 2 = %s, want b-warm (bound a-warm is over its w1 daily budget even though its token bucket has refilled; keep guard must yield to reselection)", second.ID)
+		}
+	})
+}
+
+// TestAdaptiveSelectorRateLimitedOverflowStaysWeighted is the symptom-1b guard:
+// when every candidate's token bucket is momentarily drained, the overflow must
+// still distribute proportionally to tier weight rather than collapse onto a
+// uniform round-robin. A Max 20x (weight 10), a Max 5x (weight 2.5) and a Pro
+// (weight 0.5) account, all mature and all pre-drained, are picked many times; a
+// uniform fallback would split ~1/3 each, so asserting a strict 20x > 5x > pro
+// ordering with the 20x taking a clear majority proves the overflow stays
+// weighted. A fixed rng seed keeps the assertion deterministic.
+func TestAdaptiveSelectorRateLimitedOverflowStaysWeighted(t *testing.T) {
+	cfg := internalconfig.DefaultAccountSchedulingConfig()
+	// IDs chosen so the weight-sorted candidate order is [a20, b05, cpro].
+	a20 := newAdaptiveClaudeAuth("a20", "default_claude_max_20x", matureFirstProd())
+	b05 := newAdaptiveClaudeAuth("b05", "default_claude_max_5x", matureFirstProd())
+	cpro := newAdaptiveClaudeAuth("cpro", "default_claude_pro", matureFirstProd())
+	auths := []*Auth{a20, b05, cpro}
+
+	limiter := NewAccountRateLimiter(WithClock(fixedClock()))
+	// Drain every account's mature bucket at the fixed instant so each Pick's
+	// gating loop exhausts and falls into the weighted overflow draw.
+	for _, id := range []string{"a20", "b05", "cpro"} {
+		for i := 0; i < cfg.MatureLimits.Burst; i++ {
+			if !limiter.Allow(id, float64(cfg.MatureLimits.RPMLimit), cfg.MatureLimits.Burst) {
+				t.Fatalf("pre-drain Allow for %s #%d unexpectedly denied", id, i)
+			}
+		}
+	}
+
+	rng := rand.New(rand.NewSource(20260901))
+	s := NewAdaptiveSelector(
+		AdaptiveSelectorConfig{Scheduling: cfg},
+		WithAdaptiveClock(fixedClock()),
+		WithAdaptiveRand(rng.Float64),
+		WithAdaptiveRateLimiter(limiter),
+	)
+	defer s.Stop()
+
+	const picks = 6000
+	counts := map[string]int{}
+	for i := 0; i < picks; i++ {
+		got, err := s.Pick(context.Background(), "claude", "", cliproxyexecutor.Options{}, auths)
+		if err != nil {
+			t.Fatalf("Pick #%d error: %v", i, err)
+		}
+		if got == nil {
+			t.Fatalf("Pick #%d returned nil (overflow must still serve one weighted candidate)", i)
+		}
+		counts[got.ID]++
+	}
+
+	// Weighted, not uniform: 20x (w=10) must dominate 5x (w=2.5) which must beat
+	// pro (w=0.5); a uniform round-robin fallback would instead give ~2000 each.
+	if !(counts["a20"] > counts["b05"] && counts["b05"] > counts["cpro"]) {
+		t.Fatalf("overflow distribution not weight-ordered: 20x=%d 5x=%d pro=%d", counts["a20"], counts["b05"], counts["cpro"])
+	}
+	if counts["a20"] <= picks/2 {
+		t.Fatalf("20x took %d/%d, want a clear majority (uniform fallback would be ~%d) -- overflow collapsed to non-weighted", counts["a20"], picks, picks/3)
+	}
 }
 
 func authID(a *Auth) string {
