@@ -49,7 +49,7 @@ func TestCodexExecutorOptimizeMultiAgentV2(t *testing.T) {
 	defer server.Close()
 
 	payload := codexSpawnAgentTestPayload()
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", Attributes: map[string]string{
 		"base_url": server.URL,
 		"api_key":  "test",
 	}}

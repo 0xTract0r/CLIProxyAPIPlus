@@ -83,8 +83,9 @@ fork路由-OAuth回调	/google/callback	route	"/google/callback"	internal/api/se
 fork路由-OAuth回调	/gitlab/callback	route	"/gitlab/callback"	internal/api/server_routes.go
 fork路由-OAuth回调	/kiro/callback	route	"/kiro/callback"	internal/api/server_routes.go
 
-# === fork 自定义管理端点(4) ===
+# === fork 自定义管理端点(5) ===
 fork路由-管理端点	provider-tls-probe	route	/diagnostics/provider-tls-probe	internal/api/server_management.go
+fork路由-管理端点	proxy-connectivity-probe	route	/diagnostics/proxy-connectivity-probe	internal/api/server_management.go
 fork路由-管理端点	usage/pricing	route	"/usage/pricing"	internal/api/server_management.go
 fork路由-管理端点	quota/snapshots	route	/quota/snapshots	internal/api/server_management.go
 fork路由-管理端点	logs-compress-after-days	route	/logs-compress-after-days	internal/api/server_management.go

@@ -66,6 +66,10 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 				c.JSON(http.StatusBadRequest, gin.H{"error": "file must be .json"})
 				return
 			}
+			if errors.Is(errUpload, errAuthFileInvalidProxyURL) {
+				c.JSON(http.StatusBadRequest, gin.H{"error": errUpload.Error()})
+				return
+			}
 			c.JSON(http.StatusInternalServerError, gin.H{"error": errUpload.Error()})
 			return
 		}
@@ -122,6 +126,10 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 		return
 	}
 	if err = h.writeAuthFile(ctx, filepath.Base(name), data); err != nil {
+		if errors.Is(err, errAuthFileInvalidProxyURL) {
+			c.JSON(400, gin.H{"error": err.Error()})
+			return
+		}
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
 	}
@@ -267,6 +275,13 @@ func (h *Handler) writeAuthFile(ctx context.Context, name string, data []byte) e
 	}
 	auth, err := h.buildAuthFromFileData(dst, data)
 	if err != nil {
+		return err
+	}
+	// Fork anti-corr: reject an auth file carrying a present-but-invalid proxy_url
+	// before it lands on disk. Persisting it would later force a direct egress that
+	// exposes the real server IP. Validated pre-WriteFile so nothing invalid is
+	// stored.
+	if err := validateStoredAuthProxyURL(auth); err != nil {
 		return err
 	}
 	if errWrite := os.WriteFile(dst, data, 0o600); errWrite != nil {

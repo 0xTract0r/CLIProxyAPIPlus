@@ -953,6 +953,7 @@ func (d *codex426RetryDispatcher) RPopAuth(_ context.Context, model string, _ st
 			"id":         credentialID,
 			"provider":   "codex",
 			"status":     "active",
+			"proxy_url":  "direct",
 			"attributes": attributes,
 		},
 		"concurrency": map[string]any{

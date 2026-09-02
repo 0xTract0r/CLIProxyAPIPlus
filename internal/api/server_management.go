@@ -222,6 +222,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/oauth-reauth-history", s.mgmt.ListOAuthReauthHistory)
 		mgmt.GET("/auth-status-history", s.mgmt.ListAuthStatusHistory)
 		mgmt.POST("/diagnostics/provider-tls-probe", s.mgmt.RunProviderTLSProbe)
+		mgmt.POST("/diagnostics/proxy-connectivity-probe", s.mgmt.RunProxyConnectivityProbe)
 		mgmt.POST("/vertex/import", s.mgmt.ImportVertexCredential)
 
 		mgmt.GET("/anthropic-auth-url", s.mgmt.RequestAnthropicToken)
