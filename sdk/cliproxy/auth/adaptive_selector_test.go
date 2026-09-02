@@ -1,12 +1,16 @@
 package auth
 
 import (
+	"bytes"
 	"context"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	log "github.com/sirupsen/logrus"
 
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
@@ -16,8 +20,8 @@ import (
 // StoppableSelector interfaces, and expose the InvalidateAuth shape the auth
 // Manager asserts on (conductor_lifecycle.go).
 var (
-	_ Selector                         = (*AdaptiveSelector)(nil)
-	_ StoppableSelector                = (*AdaptiveSelector)(nil)
+	_ Selector                            = (*AdaptiveSelector)(nil)
+	_ StoppableSelector                   = (*AdaptiveSelector)(nil)
 	_ interface{ InvalidateAuth(string) } = (*AdaptiveSelector)(nil)
 )
 
@@ -553,4 +557,103 @@ func authID(a *Auth) string {
 		return "<nil>"
 	}
 	return a.ID
+}
+
+// captureLogOutput redirects the process-global logrus logger to a buffer for
+// the duration of fn (restoring the previous output and level afterwards) so a
+// test can assert on the adaptive-select Info line. Tests in this package do not
+// call t.Parallel(), so temporarily swapping the global logger is safe here.
+func captureLogOutput(t *testing.T, fn func()) string {
+	t.Helper()
+	var buf bytes.Buffer
+	prevOut := log.StandardLogger().Out
+	prevLevel := log.GetLevel()
+	log.SetOutput(&buf)
+	log.SetLevel(log.InfoLevel)
+	defer func() {
+		log.SetOutput(prevOut)
+		log.SetLevel(prevLevel)
+	}()
+	fn()
+	return buf.String()
+}
+
+// TestAdaptiveSelectorLogsWeightedPick verifies the pure weighted (non-session)
+// path emits exactly one Info line naming the picked account, its fine-grained
+// tier and selection weight -- the per-request observability V1 needs under
+// routing.strategy=adaptive, which otherwise logs nothing.
+func TestAdaptiveSelectorLogsWeightedPick(t *testing.T) {
+	cfg := internalconfig.DefaultAccountSchedulingConfig()
+	auths := []*Auth{newAdaptiveClaudeAuth("a-20x", "default_claude_max_20x", matureFirstProd())}
+
+	var got *Auth
+	out := captureLogOutput(t, func() {
+		s := NewAdaptiveSelector(
+			AdaptiveSelectorConfig{Scheduling: cfg},
+			WithAdaptiveClock(fixedClock()),
+			WithAdaptiveRand(constRand(0.0)),
+		)
+		defer s.Stop()
+		var err error
+		got, err = s.Pick(context.Background(), "claude", "sonnet", cliproxyexecutor.Options{}, auths)
+		if err != nil {
+			t.Fatalf("Pick error: %v", err)
+		}
+	})
+	if got == nil || got.ID != "a-20x" {
+		t.Fatalf("Pick = %v, want a-20x", authID(got))
+	}
+	if lines := strings.Count(out, "adaptive-select:"); lines != 1 {
+		t.Fatalf("want exactly 1 adaptive-select log line, got %d\n%s", lines, out)
+	}
+	for _, want := range []string{"weighted-new", "auth=a-20x", "tier=max_20x", "provider=claude", "model=sonnet", "weight="} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("log output missing %q\ngot: %s", want, out)
+		}
+	}
+}
+
+// TestAdaptiveSelectorLogsStickyKeep verifies a preserved sticky mature binding
+// is logged with a reason distinct from a fresh weighted selection and carries
+// the (truncated) session id, so main.log can tell a kept binding apart from a
+// new pick.
+func TestAdaptiveSelectorLogsStickyKeep(t *testing.T) {
+	cfg := internalconfig.DefaultAccountSchedulingConfig()
+	a := newAdaptiveClaudeAuth("a", "default_claude_max_20x", matureFirstProd())
+	b := newAdaptiveClaudeAuth("b", "default_claude_max_20x", matureFirstProd())
+	auths := []*Auth{a, b}
+
+	s := NewAdaptiveSelector(
+		AdaptiveSelectorConfig{Scheduling: cfg, SessionAffinity: true},
+		WithAdaptiveClock(fixedClock()),
+		WithAdaptiveRand(constRand(0.0)), // first bind targets "a"
+	)
+	defer s.Stop()
+
+	opts := cliproxyexecutor.Options{Headers: http.Header{"X-Session-Id": {"s1"}}}
+
+	// Turn 1: fresh binding -> a rebind/new-weighted reason.
+	firstOut := captureLogOutput(t, func() {
+		if _, err := s.Pick(context.Background(), "claude", "", opts, auths); err != nil {
+			t.Fatalf("first Pick error: %v", err)
+		}
+	})
+	if !strings.Contains(firstOut, "rebind-weighted") {
+		t.Fatalf("first-pick log missing rebind-weighted reason\ngot: %s", firstOut)
+	}
+
+	// Turn 2: the mature bound account within its soft ceiling is kept.
+	secondOut := captureLogOutput(t, func() {
+		if _, err := s.Pick(context.Background(), "claude", "", opts, auths); err != nil {
+			t.Fatalf("second Pick error: %v", err)
+		}
+	})
+	if lines := strings.Count(secondOut, "adaptive-select:"); lines != 1 {
+		t.Fatalf("want exactly 1 adaptive-select log line on the sticky turn, got %d\n%s", lines, secondOut)
+	}
+	for _, want := range []string{"sticky-keep-mature", "auth=a", "session=header:s1", "tier=max_20x"} {
+		if !strings.Contains(secondOut, want) {
+			t.Fatalf("sticky-keep log missing %q\ngot: %s", want, secondOut)
+		}
+	}
 }

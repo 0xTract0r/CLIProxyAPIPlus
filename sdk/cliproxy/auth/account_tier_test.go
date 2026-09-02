@@ -451,3 +451,218 @@ func TestAuth_AccountTierBaseWeight(t *testing.T) {
 		})
 	}
 }
+
+// TestAuth_ClaudeSubscriptionTier_Override covers the manual tier_override
+// (TierOverrideMetadataKey) path: a legal Claude override wins over the
+// rate_limit_tier auto-detection, while an absent/blank/illegal/Codex-scoped
+// override is ignored and the unchanged auto-detection runs.
+func TestAuth_ClaudeSubscriptionTier_Override(t *testing.T) {
+	tests := []struct {
+		name string
+		auth *Auth
+		want ClaudeTier
+	}{
+		{
+			// Override wins over a DIFFERENT recognized rate_limit_tier: proves
+			// precedence, not just fallthrough.
+			name: "override max_20x beats rate_limit_tier default_claude_pro",
+			auth: &Auth{Metadata: map[string]any{
+				TierOverrideMetadataKey: "max_20x",
+				"quota_snapshot": map[string]any{
+					"profile": map[string]any{
+						"organization": map[string]any{"rate_limit_tier": "default_claude_pro"},
+					},
+				},
+			}},
+			want: ClaudeMax20x,
+		},
+		{
+			// The real production test-account scenario: upstream reports the
+			// unrecognized "default_claude_ai" (auto-detect -> Unknown), and the
+			// override makes it testable as max_5x.
+			name: "override max_5x rescues an unrecognized rate_limit_tier",
+			auth: &Auth{Metadata: map[string]any{
+				TierOverrideMetadataKey: "max_5x",
+				"quota_snapshot": map[string]any{
+					"profile": map[string]any{
+						"organization": map[string]any{"rate_limit_tier": "default_claude_ai"},
+					},
+				},
+			}},
+			want: ClaudeMax5x,
+		},
+		{
+			name: "override pro with no quota_snapshot at all",
+			auth: &Auth{Metadata: map[string]any{TierOverrideMetadataKey: "pro"}},
+			want: ClaudePro,
+		},
+		{
+			name: "override is case-insensitive and whitespace tolerant",
+			auth: &Auth{Metadata: map[string]any{TierOverrideMetadataKey: "  Max_20X  "}},
+			want: ClaudeMax20x,
+		},
+		{
+			// Illegal override value must NOT be guessed; falls back to the
+			// recognized rate_limit_tier auto-detection (existing behavior).
+			name: "illegal override falls back to auto-detection",
+			auth: &Auth{Metadata: map[string]any{
+				TierOverrideMetadataKey: "super_ultra",
+				"quota_snapshot": map[string]any{
+					"profile": map[string]any{
+						"organization": map[string]any{"rate_limit_tier": "default_claude_max_20x"},
+					},
+				},
+			}},
+			want: ClaudeMax20x,
+		},
+		{
+			name: "empty override falls back to auto-detection",
+			auth: &Auth{Metadata: map[string]any{
+				TierOverrideMetadataKey: "",
+				"quota_snapshot": map[string]any{
+					"profile": map[string]any{
+						"organization": map[string]any{"rate_limit_tier": "default_claude_max_5x"},
+					},
+				},
+			}},
+			want: ClaudeMax5x,
+		},
+		{
+			// A Codex-scoped override value is not a legal Claude value, so it is
+			// ignored on a Claude read and auto-detection runs.
+			name: "codex-scoped override is ignored by the claude reader",
+			auth: &Auth{Metadata: map[string]any{
+				TierOverrideMetadataKey: "codex_pro",
+				"quota_snapshot": map[string]any{
+					"profile": map[string]any{
+						"organization": map[string]any{"rate_limit_tier": "default_claude_pro"},
+					},
+				},
+			}},
+			want: ClaudePro,
+		},
+		{
+			// Non-string override value (defensive): ignored, auto-detect runs.
+			name: "non-string override value is ignored",
+			auth: &Auth{Metadata: map[string]any{
+				TierOverrideMetadataKey: 42,
+				"quota_snapshot": map[string]any{
+					"profile": map[string]any{
+						"organization": map[string]any{"rate_limit_tier": "default_claude_max_20x"},
+					},
+				},
+			}},
+			want: ClaudeMax20x,
+		},
+		{
+			// No override key and no recognized tier -> unchanged Unknown.
+			name: "no override and unrecognized tier stays unknown",
+			auth: &Auth{Metadata: map[string]any{
+				"quota_snapshot": map[string]any{
+					"profile": map[string]any{
+						"organization": map[string]any{"rate_limit_tier": "default_claude_ai"},
+					},
+				},
+			}},
+			want: ClaudeTierUnknown,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.auth.ClaudeSubscriptionTier(); got != tt.want {
+				t.Fatalf("ClaudeSubscriptionTier() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestAuth_CodexSubscriptionTier_Override covers the Codex side of the manual
+// override: a legal codex_* override wins over plan_type (and works even with an
+// empty Attributes map), while anything else falls back to plan_type unchanged.
+func TestAuth_CodexSubscriptionTier_Override(t *testing.T) {
+	tests := []struct {
+		name string
+		auth *Auth
+		want CodexTier
+	}{
+		{
+			name: "override codex_pro beats plan_type plus",
+			auth: &Auth{
+				Attributes: map[string]string{"plan_type": "plus"},
+				Metadata:   map[string]any{TierOverrideMetadataKey: "codex_pro"},
+			},
+			want: CodexPro,
+		},
+		{
+			name: "override codex_plus with empty attributes",
+			auth: &Auth{Metadata: map[string]any{TierOverrideMetadataKey: "codex_plus"}},
+			want: CodexPlus,
+		},
+		{
+			name: "override case-insensitive",
+			auth: &Auth{Metadata: map[string]any{TierOverrideMetadataKey: "  Codex_Pro  "}},
+			want: CodexPro,
+		},
+		{
+			name: "illegal override falls back to plan_type",
+			auth: &Auth{
+				Attributes: map[string]string{"plan_type": "pro"},
+				Metadata:   map[string]any{TierOverrideMetadataKey: "nonsense"},
+			},
+			want: CodexPro,
+		},
+		{
+			// A Claude-scoped override value is not a legal Codex value, so it is
+			// ignored on a Codex read and plan_type auto-detection runs.
+			name: "claude-scoped override is ignored by the codex reader",
+			auth: &Auth{
+				Attributes: map[string]string{"plan_type": "plus"},
+				Metadata:   map[string]any{TierOverrideMetadataKey: "max_20x"},
+			},
+			want: CodexPlus,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.auth.CodexSubscriptionTier(); got != tt.want {
+				t.Fatalf("CodexSubscriptionTier() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestAuth_AccountTierBaseWeight_Override ties the override end-to-end to the
+// weight lookup: a Claude account whose upstream rate_limit_tier is
+// unrecognized (weight -> Unknown) is lifted to the Max5x weight by a manual
+// override -- the exact mechanism the Phase-1 real-account validation relies on.
+func TestAuth_AccountTierBaseWeight_Override(t *testing.T) {
+	weights := internalconfig.AccountTierWeightsConfig{
+		Claude: internalconfig.ClaudeTierWeights{Max20x: 20, Max5x: 5, Pro: 1, Unknown: 0.5},
+		Codex:  internalconfig.CodexTierWeights{Pro: 10, Plus: 1, Unknown: 0.5},
+	}
+	base := func() *Auth {
+		return &Auth{
+			Provider: "claude",
+			Metadata: map[string]any{
+				"quota_snapshot": map[string]any{
+					"profile": map[string]any{
+						"organization": map[string]any{"rate_limit_tier": "default_claude_ai"},
+					},
+				},
+			},
+		}
+	}
+
+	noOverride := base()
+	if got := noOverride.AccountTierBaseWeight(weights); got != 0.5 {
+		t.Fatalf("without override: AccountTierBaseWeight() = %v, want 0.5 (unknown)", got)
+	}
+
+	withOverride := base()
+	withOverride.Metadata[TierOverrideMetadataKey] = "max_5x"
+	if got := withOverride.AccountTierBaseWeight(weights); got != 5 {
+		t.Fatalf("with override: AccountTierBaseWeight() = %v, want 5 (max_5x)", got)
+	}
+}

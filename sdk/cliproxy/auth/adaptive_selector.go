@@ -4,6 +4,7 @@ import (
 	"context"
 	"math/rand"
 	"sort"
+	"strings"
 	"time"
 
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
@@ -246,35 +247,90 @@ func (s *AdaptiveSelector) Pick(ctx context.Context, provider, model string, opt
 	cfg := s.scheduling()
 
 	if s.sessionAffinity && s.cache != nil {
-		if picked, handled, errPick := s.pickWithAffinity(ctx, provider, model, opts, auths, available, cfg, now); handled {
+		if picked, handled, reason, sessionID, errPick := s.pickWithAffinity(ctx, provider, model, opts, auths, available, cfg, now); handled {
+			if errPick == nil {
+				s.logPick(ctx, reason, provider, model, sessionID, picked, cfg, now)
+			}
 			return picked, errPick
 		}
 	}
 
 	if picked, ok := s.pickFromCandidates(s.scoreCandidates(available, cfg, now, false), cfg, now); ok {
+		s.logPick(ctx, "weighted-new", provider, model, "", picked, cfg, now)
 		return picked, nil
 	}
 	// Degraded: no adaptive-weighted candidate could be served right now (a
 	// non-adaptive provider, or every weighted candidate is momentarily over its
 	// own rate limit). Serve via the fallback selector rather than deny -- the
 	// token bucket smooths, it never manufactures a 429.
-	return s.fallback.Pick(ctx, provider, model, opts, auths)
+	picked, errFallback := s.fallback.Pick(ctx, provider, model, opts, auths)
+	if errFallback == nil {
+		s.logPick(ctx, "fallback-degraded", provider, model, "", picked, cfg, now)
+	}
+	return picked, errFallback
+}
+
+// logPick emits exactly one Info line per resolved Pick, mirroring the
+// SessionAffinitySelector log style in selector.go (reusing selectorLogEntry so
+// the request_id field is attached, and truncateSessionID for the session id)
+// and adding the adaptive-specific tier and selection weight. Without it,
+// routing.strategy=adaptive is invisible in main.log: AdaptiveSelector returns
+// directly and bypasses SessionAffinitySelector, whose Info lines are the only
+// per-request account-hit logging today, so V1 could not observe which account
+// each request landed on or the resulting distribution.
+//
+// reason distinguishes the branch that produced the pick so a preserved sticky
+// binding (sticky-keep-*) reads differently from a fresh weighted reselection
+// (rebind-* / weighted-new) or a degraded fallback (fallback-degraded). It is
+// called once per Pick at each mutually-exclusive terminal decision point, so
+// it never double-logs. A nil pick (only reachable on a fallback error path the
+// caller already excludes) is skipped defensively.
+func (s *AdaptiveSelector) logPick(ctx context.Context, reason, provider, model, sessionID string, picked *Auth, cfg internalconfig.AccountSchedulingConfig, now time.Time) {
+	if picked == nil {
+		return
+	}
+	selectorLogEntry(ctx).Infof(
+		"adaptive-select: %s | session=%s auth=%s tier=%s weight=%.3f provider=%s model=%s",
+		reason, truncateSessionID(sessionID), picked.ID, adaptiveTierLabel(picked), AccountSelectionWeight(picked, cfg, now), provider, model,
+	)
+}
+
+// adaptiveTierLabel renders picked's fine-grained subscription tier for the
+// selection log, namespaced by provider (claude -> "max_20x"/"max_5x"/"pro"/
+// "unknown", codex -> "codex_pro"/"codex_plus"/"codex_unknown"). A provider this
+// scheduler does not tier-weight is logged as its raw provider name so a
+// fallback / non-adaptive pick is still legible in main.log.
+func adaptiveTierLabel(a *Auth) string {
+	if a == nil {
+		return "unknown"
+	}
+	switch strings.ToLower(strings.TrimSpace(a.Provider)) {
+	case "claude":
+		return a.ClaudeSubscriptionTier().String()
+	case "codex":
+		return "codex_" + a.CodexSubscriptionTier().String()
+	default:
+		return a.Provider
+	}
 }
 
 // pickWithAffinity handles the session-sticky path (design.md D5). It returns
 // handled=false only when no session identity could be extracted, in which case
 // the caller falls through to the plain weighted pick. When a session identity
-// exists it always fully resolves (bind + return), returning handled=true.
-func (s *AdaptiveSelector) pickWithAffinity(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths, available []*Auth, cfg internalconfig.AccountSchedulingConfig, now time.Time) (*Auth, bool, error) {
+// exists it always fully resolves (bind + return), returning handled=true. It
+// also surfaces the branch reason (for the one-line-per-pick observability log)
+// and the extracted primary session id, both consumed only by the caller's
+// logPick and having no effect on selection.
+func (s *AdaptiveSelector) pickWithAffinity(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths, available []*Auth, cfg internalconfig.AccountSchedulingConfig, now time.Time) (picked *Auth, handled bool, reason, sessionID string, err error) {
 	primaryID, fallbackID := extractSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
 	if primaryID == "" {
-		return nil, false, nil
+		return nil, false, "", "", nil
 	}
 	cacheKey := provider + "::" + primaryID + "::" + model
 
 	if boundID, ok := s.cache.GetAndRefresh(cacheKey); ok {
-		picked, errResolve := s.resolveSticky(ctx, provider, model, opts, auths, available, cfg, now, cacheKey, boundID)
-		return picked, true, errResolve
+		pickedSticky, stickyReason, errResolve := s.resolveSticky(ctx, provider, model, opts, auths, available, cfg, now, cacheKey, boundID)
+		return pickedSticky, true, stickyReason, primaryID, errResolve
 	}
 	// Inherit a first-turn (short-hash) binding for the full session key so a
 	// conversation does not jump credentials once the assistant reply lands (the
@@ -282,12 +338,12 @@ func (s *AdaptiveSelector) pickWithAffinity(ctx context.Context, provider, model
 	if fallbackID != "" && fallbackID != primaryID {
 		fallbackKey := provider + "::" + fallbackID + "::" + model
 		if boundID, ok := s.cache.Get(fallbackKey); ok {
-			picked, errResolve := s.resolveSticky(ctx, provider, model, opts, auths, available, cfg, now, cacheKey, boundID)
-			return picked, true, errResolve
+			pickedSticky, stickyReason, errResolve := s.resolveSticky(ctx, provider, model, opts, auths, available, cfg, now, cacheKey, boundID)
+			return pickedSticky, true, stickyReason, primaryID, errResolve
 		}
 	}
-	picked, errSelect := s.selectAndBind(ctx, provider, model, opts, auths, available, cfg, now, cacheKey, false)
-	return picked, true, errSelect
+	pickedNew, newReason, errSelect := s.selectAndBind(ctx, provider, model, opts, auths, available, cfg, now, cacheKey, false)
+	return pickedNew, true, newReason, primaryID, errSelect
 }
 
 // resolveSticky applies the design.md D5 maturity grading to an existing sticky
@@ -306,7 +362,12 @@ func (s *AdaptiveSelector) pickWithAffinity(ctx context.Context, provider, model
 //   - Bound credential is still warming: break stickiness and route to a mature
 //     account, rebinding so subsequent turns follow the mature account (spec.md
 //     "养号号打破粘性改路由成熟号").
-func (s *AdaptiveSelector) resolveSticky(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths, available []*Auth, cfg internalconfig.AccountSchedulingConfig, now time.Time, cacheKey, boundID string) (*Auth, error) {
+//
+// The returned reason string labels which grading branch produced the result
+// (for the observability log only; it never affects the selection). "keep"
+// reasons denote a preserved sticky binding, "rebind-*" reasons (inherited from
+// selectAndBind) denote a fresh weighted/fallback reselection.
+func (s *AdaptiveSelector) resolveSticky(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths, available []*Auth, cfg internalconfig.AccountSchedulingConfig, now time.Time, cacheKey, boundID string) (*Auth, string, error) {
 	var bound *Auth
 	for _, candidate := range available {
 		if candidate != nil && candidate.ID == boundID {
@@ -330,7 +391,7 @@ func (s *AdaptiveSelector) resolveSticky(ctx context.Context, provider, model st
 		// original (never-extended) TTL mid-session -- the design D5 "成熟号软上限
 		// 内保持粘性" stickiness regression this fixes.
 		s.cache.Set(cacheKey, bound.ID)
-		return bound, nil
+		return bound, "sticky-keep-nonadaptive", nil
 	}
 	if s.isMature(bound, cfg, now) {
 		rpm, burst := s.rateLimitParams(bound, cfg, now)
@@ -343,7 +404,7 @@ func (s *AdaptiveSelector) resolveSticky(ctx context.Context, provider, model st
 			// at its original TTL mid-session (selector.go:489 rebinds identically
 			// on its fallback hit).
 			s.cache.Set(cacheKey, bound.ID)
-			return bound, nil
+			return bound, "sticky-keep-mature", nil
 		}
 		// At the soft ceiling -> treat as近风控硬阈值, reselect across the pool.
 		return s.selectAndBind(ctx, provider, model, opts, auths, available, cfg, now, cacheKey, false)
@@ -357,22 +418,26 @@ func (s *AdaptiveSelector) resolveSticky(ctx context.Context, provider, model st
 // servable mature candidate it falls back to the full weighted pool, and when
 // even that yields nothing it delegates to the fallback selector (still binding
 // the result so the session stays put).
-func (s *AdaptiveSelector) selectAndBind(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths, available []*Auth, cfg internalconfig.AccountSchedulingConfig, now time.Time, cacheKey string, preferMature bool) (*Auth, error) {
+//
+// The returned reason string labels which sub-path produced the pick
+// ("rebind-weighted-mature" | "rebind-weighted" | "rebind-fallback"), for the
+// observability log only -- it never affects selection.
+func (s *AdaptiveSelector) selectAndBind(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths, available []*Auth, cfg internalconfig.AccountSchedulingConfig, now time.Time, cacheKey string, preferMature bool) (*Auth, string, error) {
 	if preferMature {
 		if picked, ok := s.pickFromCandidates(s.scoreCandidates(available, cfg, now, true), cfg, now); ok {
 			s.cache.Set(cacheKey, picked.ID)
-			return picked, nil
+			return picked, "rebind-weighted-mature", nil
 		}
 	}
 	if picked, ok := s.pickFromCandidates(s.scoreCandidates(available, cfg, now, false), cfg, now); ok {
 		s.cache.Set(cacheKey, picked.ID)
-		return picked, nil
+		return picked, "rebind-weighted", nil
 	}
 	picked, errPick := s.fallback.Pick(ctx, provider, model, opts, auths)
 	if errPick == nil && picked != nil {
 		s.cache.Set(cacheKey, picked.ID)
 	}
-	return picked, errPick
+	return picked, "rebind-fallback", errPick
 }
 
 // adaptiveCandidate pairs a credential with its current selection weight.

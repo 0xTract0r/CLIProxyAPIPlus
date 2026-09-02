@@ -79,6 +79,58 @@ var claudeRateLimitTierValues = map[string]ClaudeTier{
 	"default_claude_pro":     ClaudePro,
 }
 
+// TierOverrideMetadataKey is the stable, TOP-LEVEL auth.Metadata key that
+// manually pins an account's fine-grained subscription tier, taking precedence
+// over the rate_limit_tier / plan_type auto-detection below.
+//
+// Why it exists: the real production test accounts report an upstream
+// rate_limit_tier of "default_claude_ai", which claudeRateLimitTierValues
+// intentionally does NOT map (an unrecognized value must never be guessed into
+// a tier). Without an override those accounts all resolve to ClaudeTierUnknown
+// and cannot exercise weighted selection, so a Phase-1 real-account validation
+// run needs a way to declare "treat this account as max_5x" that is stable
+// across the ~45min quota refresh.
+//
+// Why TOP-LEVEL (mirroring first_production_at / farm_enrolled): the quota
+// refresh replaces the nested quota_snapshot object via auth.Clone() +
+// per-key Set + manager.Update (see internal/api/handlers/management/
+// quota_snapshots.go: Clone copies every top-level Metadata key through, then
+// only quota_snapshot and a few quota_* keys are overwritten). A value poked
+// directly into quota_snapshot.profile.organization.rate_limit_tier would be
+// wiped on the next refresh; a top-level key set here survives untouched.
+//
+// Accepted values are case-insensitive and whitespace-trimmed, and are
+// namespaced by provider so a single flat key is unambiguous about which
+// provider's tier it denotes:
+//
+//   - Claude: "max_20x", "max_5x", "pro"
+//   - Codex:  "codex_pro", "codex_plus"
+//
+// Any other value -- absent, blank, malformed, or cross-provider (a Claude
+// value read by CodexSubscriptionTier, or vice versa) -- is ignored, and the
+// account falls back to the unchanged auto-detection path (existing behavior
+// is completely preserved when no valid override is present).
+const TierOverrideMetadataKey = "tier_override"
+
+// claudeTierOverrideValues maps the legal Claude-side tier_override strings to
+// the ClaudeTier enum. Matching is exact (after lowercasing/trimming) for the
+// same anti-misjudgment reason as claudeRateLimitTierValues.
+var claudeTierOverrideValues = map[string]ClaudeTier{
+	"max_20x": ClaudeMax20x,
+	"max_5x":  ClaudeMax5x,
+	"pro":     ClaudePro,
+}
+
+// codexTierOverrideValues maps the legal Codex-side tier_override strings to
+// the CodexTier enum. They are namespaced with a "codex_" prefix so the single
+// shared tier_override key cannot be ambiguous between Codex "pro" and Claude
+// "pro". (Forward references to CodexPro/CodexPlus, defined later in this file,
+// are fine at package scope.)
+var codexTierOverrideValues = map[string]CodexTier{
+	"codex_pro":  CodexPro,
+	"codex_plus": CodexPlus,
+}
+
 // ClaudeSubscriptionTier returns a's fine-grained Claude subscription tier,
 // read from the already-persisted `Metadata["quota_snapshot"]["profile"]
 // ["organization"]["rate_limit_tier"]` field (design.md §1.2/§6.1 — this data
@@ -92,9 +144,19 @@ var claudeRateLimitTierValues = map[string]ClaudeTier{
 // other existing folding function (spec.md requirement) — do not route this
 // value through Normalize* on the caller side either, or the whole point of
 // this read path is lost.
+//
+// A manual TierOverrideMetadataKey value (see that key's doc) takes precedence
+// over this rate_limit_tier read when it holds a legal Claude tier string; an
+// absent, blank, malformed, or Codex-scoped override is ignored and the
+// rate_limit_tier auto-detection below runs unchanged.
 func (a *Auth) ClaudeSubscriptionTier() ClaudeTier {
 	if a == nil {
 		return ClaudeTierUnknown
+	}
+	if override := tierOverrideValue(a.Metadata); override != "" {
+		if tier, ok := claudeTierOverrideValues[override]; ok {
+			return tier
+		}
 	}
 	raw := nestedMetadataString(a.Metadata, "quota_snapshot", "profile", "organization", "rate_limit_tier")
 	if raw == "" {
@@ -156,8 +218,23 @@ var codexPlanTypeValues = map[string]CodexTier{
 // through any Normalize* folding. Returns CodexTierUnknown for a nil Auth, a
 // nil/empty Attributes map, or any plan_type value not in
 // codexPlanTypeValues.
+//
+// A manual TierOverrideMetadataKey value (see that key's doc) takes precedence
+// over the plan_type attribute when it holds a legal Codex tier string
+// ("codex_pro"/"codex_plus"); an absent, blank, malformed, or Claude-scoped
+// override is ignored and the plan_type auto-detection runs unchanged. The
+// override is honored even when Attributes is empty, so a Codex account whose
+// plan_type was never populated can still be pinned for a validation run.
 func (a *Auth) CodexSubscriptionTier() CodexTier {
-	if a == nil || len(a.Attributes) == 0 {
+	if a == nil {
+		return CodexTierUnknown
+	}
+	if override := tierOverrideValue(a.Metadata); override != "" {
+		if tier, ok := codexTierOverrideValues[override]; ok {
+			return tier
+		}
+	}
+	if len(a.Attributes) == 0 {
 		return CodexTierUnknown
 	}
 	raw := strings.ToLower(strings.TrimSpace(a.Attributes["plan_type"]))
@@ -222,6 +299,27 @@ func (a *Auth) AccountTierBaseWeight(weights internalconfig.AccountTierWeightsCo
 	default:
 		return 0
 	}
+}
+
+// tierOverrideValue reads the normalized (lowercased, whitespace-trimmed)
+// TierOverrideMetadataKey value from meta, or "" when the key is absent, meta
+// is empty, or the stored value is not a string. It deliberately does NOT walk
+// into nested objects: the override is a flat top-level string, which is what
+// keeps it stable across the quota refresh that replaces the nested
+// quota_snapshot object (see TierOverrideMetadataKey's doc).
+func tierOverrideValue(meta map[string]any) string {
+	if len(meta) == 0 {
+		return ""
+	}
+	raw, ok := meta[TierOverrideMetadataKey]
+	if !ok {
+		return ""
+	}
+	s, ok := raw.(string)
+	if !ok {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(s))
 }
 
 // nestedMetadataString walks meta through a sequence of nested-object keys
