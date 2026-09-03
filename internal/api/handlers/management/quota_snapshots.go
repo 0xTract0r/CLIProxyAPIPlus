@@ -227,6 +227,16 @@ func (h *Handler) refreshDueQuotaSnapshots(ctx context.Context, policy QuotaSnap
 		// device_id identity. Strict no-op when FARM_REQUIRE_PROVISIONED is off /
 		// for non-enrolled accounts, so existing polling is unchanged.
 		if coreauth.RequireProvisionedBlocked(auth) {
+			// farm-account-liveness B1 (armed only): the anti-corr fail-closed gate is
+			// skipping this account from health probing. If it was EVER bound to a
+			// container (its device_id is already on-wire exposed) this is a
+			// "health-blind" state, not a healthy one — stamp an explicit marker so the
+			// projection renders it gray + alert instead of a falsely-green cached
+			// snapshot. The gate's leak-prevention semantics are unchanged (never-bound
+			// synthetic accounts are still never probed); this only adds observability.
+			if farmLivenessDetectionEnabled() && coreauth.FarmHealthBlind(auth) {
+				h.stampQuotaHealthBlind(ctx, auth, now)
+			}
 			continue
 		}
 		// Recovered (StatusActive) accounts may still carry a stale
@@ -500,6 +510,10 @@ func (h *Handler) refreshQuotaSnapshot(ctx context.Context, auth *coreauth.Auth,
 	updated.Metadata[quotaSnapshotMetadataKey] = snapshot
 	updated.Metadata[quotaRefreshStatusMetadataKey] = quotaRefreshStatusOK
 	delete(updated.Metadata, quotaRefreshErrorMetadataKey)
+	// farm-account-liveness B1: a fresh successful probe proves the account is
+	// reachable/healthy again, so release any lingering health-blind marker.
+	delete(updated.Metadata, farmHealthBlindMetadataKey)
+	delete(updated.Metadata, farmHealthBlindAtMetadataKey)
 	updated.Metadata[quotaLastRefreshedMetadataKey] = now.Format(time.RFC3339)
 	updated.Metadata[quotaNextRefreshMetadataKey] = quotaSnapshotNextRefreshTime(updated, now, policy).Format(time.RFC3339)
 	if planType != "" {
@@ -603,6 +617,26 @@ func (h *Handler) persistQuotaSnapshotError(ctx context.Context, auth *coreauth.
 		return auth, fmt.Errorf("auth manager unavailable")
 	}
 	now := time.Now().UTC()
+
+	// farm-account-liveness C2 (anti-overwrite, armed only): once a credential is
+	// AUTHORITATIVELY confirmed unauthorized (reauth-required lock present), a
+	// later TRANSIENT probe failure (network timeout / context deadline, etc.)
+	// SHALL NOT roll the confirmed state back to a benign `error`. The incident's
+	// root cause was exactly this: a ~5-minute-later `context deadline exceeded`
+	// overwrote quota_refresh_status=reauth_required back to `error`, hiding the
+	// revocation. Only a successful probe or a manual reauth may clear the lock
+	// (both handled elsewhere), so here we keep the confirmed sub-field and lock
+	// intact and merely reschedule. Reauth-status failures (the confirming signal
+	// itself) fall through so they can still be (re)written.
+	if farmLivenessDetectionEnabled() &&
+		status != quotaRefreshStatusReauthRequired &&
+		coreauth.IsReauthRequiredMetadata(auth.Metadata) {
+		if err := h.persistQuotaSnapshotSchedule(ctx, auth, quotaSnapshotNextRefreshTime(auth, now, policy)); err != nil {
+			return auth, err
+		}
+		return auth, fmt.Errorf("%s", message)
+	}
+
 	updated := auth.Clone()
 	if updated.Metadata == nil {
 		updated.Metadata = make(map[string]any)
@@ -610,12 +644,65 @@ func (h *Handler) persistQuotaSnapshotError(ctx context.Context, auth *coreauth.
 	updated.Metadata[quotaRefreshStatusMetadataKey] = status
 	updated.Metadata[quotaRefreshErrorMetadataKey] = message
 	updated.Metadata[quotaNextRefreshMetadataKey] = quotaSnapshotNextRefreshTime(updated, now, policy).Format(time.RFC3339)
+
+	// farm-account-liveness C1 + C5(a) (authoritative escalation, armed only):
+	// a confirmed `credential unauthorized` (HTTP 401/403 from the quota/profile
+	// probe) must not stop at the non-authoritative quota_refresh_status
+	// sub-field — the management account view reads the AUTHORITATIVE Status /
+	// reauth_required lock, so leaving it in the sub-field is what let a revoked
+	// account keep showing green. Escalate it into the same authoritative
+	// reauth-required lock a terminal refresh failure writes, so the quota
+	// probe layer becomes a real trigger source for the account going red.
+	if farmLivenessDetectionEnabled() && status == quotaRefreshStatusReauthRequired {
+		updated.MarkCredentialUnauthorized(now)
+	}
+
 	updated.UpdatedAt = now
 	saved, err := manager.Update(ctx, updated)
 	if err != nil {
 		return saved, err
 	}
 	return saved, fmt.Errorf("%s", message)
+}
+
+// stampQuotaHealthBlind writes the explicit health-blind signal for an
+// ever-bound farm account the anti-corr gate is skipping from health probing.
+// It is idempotent and self-throttling: it no-ops when the account already
+// carries a stronger authoritative reauth-required lock (a confirmed revocation
+// is more specific than health-blind), and when the marker is already stamped
+// (so the once-per-second poller does not churn Update calls). Only ever called
+// when FARM_LIVENESS_DETECTION_ENABLED is armed.
+func (h *Handler) stampQuotaHealthBlind(ctx context.Context, auth *coreauth.Auth, now time.Time) {
+	if auth == nil {
+		return
+	}
+	if coreauth.IsReauthRequiredMetadata(auth.Metadata) {
+		return
+	}
+	// Self-throttle: the marker is written together with the health_blind quota
+	// status, so an already-health_blind status means the stamp is current and the
+	// once-per-second poller must not churn another Update.
+	if metadataString(auth.Metadata, quotaRefreshStatusMetadataKey) == quotaRefreshStatusHealthBlind {
+		return
+	}
+	manager := h.currentAuthManager()
+	if manager == nil {
+		return
+	}
+	updated := auth.Clone()
+	if updated.Metadata == nil {
+		updated.Metadata = make(map[string]any)
+	}
+	updated.Metadata[quotaRefreshStatusMetadataKey] = quotaRefreshStatusHealthBlind
+	updated.Metadata[quotaRefreshErrorMetadataKey] = healthBlindQuotaErrorMessage
+	updated.Metadata[farmHealthBlindMetadataKey] = true
+	if metadataString(updated.Metadata, farmHealthBlindAtMetadataKey) == "" {
+		updated.Metadata[farmHealthBlindAtMetadataKey] = now.UTC().Format(time.RFC3339)
+	}
+	updated.UpdatedAt = now.UTC()
+	if _, err := manager.Update(ctx, updated); err != nil && !strings.Contains(err.Error(), context.Canceled.Error()) {
+		log.WithError(err).Debugf("management quota: health-blind stamp failed for %s/%s", auth.Provider, auth.ID)
+	}
 }
 
 func (h *Handler) persistQuotaSnapshotSchedule(ctx context.Context, auth *coreauth.Auth, nextRefreshAt time.Time) error {

@@ -735,6 +735,22 @@ const refreshReauthRequiredMessage = "refresh token was already used; sign in ag
 // provider body so tokens cannot leak into auth files or the management UI.
 const refreshReauthRequiredGenericMessage = "refresh token is no longer valid; sign in again to reconnect this account"
 
+// CredentialUnauthorizedReauthCode is the sanitized terminal reauth error code
+// persisted when a NON-serving probe (the background quota/profile refresh in
+// internal/api/handlers/management/quota_snapshots.go, or the serving-independent
+// farm liveness probe) confirms a credential is unauthorized (HTTP 401/403
+// credential unauthorized). It is distinct from the refresh-loop codes
+// (refresh_token_reused / invalid_grant) so diagnostics can tell "a background
+// probe found this credential revoked" apart from "a refresh call was rejected",
+// while sharing the exact same authoritative reauth-required lock so the
+// management UI treats it identically (red, refresh disabled, needs reauth).
+const CredentialUnauthorizedReauthCode = "credential_unauthorized"
+
+// credentialUnauthorizedReauthMessage is the sanitized, user-facing message
+// persisted for a probe-confirmed credential-unauthorized lock. It never echoes
+// the raw provider body.
+const credentialUnauthorizedReauthMessage = "credential rejected as unauthorized by a background liveness probe; sign in again to reconnect this account"
+
 func isReauthRequiredMetadata(meta map[string]any) bool {
 	if len(meta) == 0 {
 		return false
@@ -855,6 +871,12 @@ func classifyTerminalRefreshFailure(code string) string {
 		return classConcurrentReuseRace
 	case "invalid_grant":
 		return classExpiredOrRevokedGeneric
+	case CredentialUnauthorizedReauthCode:
+		// A background probe (quota/profile or liveness) confirmed the credential
+		// itself is unauthorized. Reuse the same "revoked/expired" bucket as a bare
+		// invalid_grant: both mean the credential can no longer authenticate and
+		// needs operator reauth, with no finer distinction claimed.
+		return classExpiredOrRevokedGeneric
 	default:
 		return classUnknownTerminal
 	}
@@ -947,10 +969,14 @@ func ReauthAlertURL(id string) string {
 // reauthMessageForCode returns the sanitized, user-facing message persisted for
 // a given terminal refresh error code.
 func reauthMessageForCode(code string) string {
-	if code == "refresh_token_reused" {
+	switch code {
+	case "refresh_token_reused":
 		return refreshReauthRequiredMessage
+	case CredentialUnauthorizedReauthCode:
+		return credentialUnauthorizedReauthMessage
+	default:
+		return refreshReauthRequiredGenericMessage
 	}
-	return refreshReauthRequiredGenericMessage
 }
 
 func (a *Auth) markRefreshReauthRequired(now time.Time) {
@@ -998,6 +1024,27 @@ func (a *Auth) markRefreshReauthRequiredWithReason(now time.Time, code string) {
 // refresh token was already used by another refresh flow.
 func (a *Auth) MarkRefreshReauthRequired(now time.Time) {
 	a.markRefreshReauthRequired(now)
+}
+
+// MarkCredentialUnauthorized persists the authoritative terminal reauth-required
+// lock for a credential a NON-serving probe confirmed is unauthorized (HTTP
+// 401/403 credential unauthorized). It exists so the background quota/profile
+// refresh (quota_snapshots.go) and the serving-independent farm liveness probe
+// can escalate a confirmed revocation from a non-authoritative sub-field (e.g.
+// quota_refresh_status) into the SAME authoritative reauth-required state that a
+// terminal refresh-call failure writes — so the management UI reads the account
+// as red/needs-reauth instead of silently green.
+//
+// It deliberately reuses markRefreshReauthRequiredWithReason verbatim (only the
+// sanitized error code differs, CredentialUnauthorizedReauthCode): the persisted
+// message is derived from the code and never contains the raw provider body, the
+// refresh loop is short-circuited so a revoked token is never re-hammered
+// (matching the "别重试死 token" invariant), and the lock is restored on load by
+// ApplyReauthRequiredStateFromMetadata. Recovery is symmetric to a
+// refresh-call lock: a completed reauth clears it (clearStaleReauthLockOnSave),
+// and a subsequent successful probe may clear it too (the probe owns that call).
+func (a *Auth) MarkCredentialUnauthorized(now time.Time) {
+	a.markRefreshReauthRequiredWithReason(now, CredentialUnauthorizedReauthCode)
 }
 
 // ApplyReauthRequiredStateFromMetadata restores the terminal reauth-required
