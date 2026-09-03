@@ -64,6 +64,7 @@ type Handler struct {
 	pluginReleaseCache      map[string]pluginReleaseCacheEntry
 	managedHeaderScheduler  *managedHeaderSyncScheduler
 	quotaRefreshCancel      context.CancelFunc
+	farmLivenessProbeCancel context.CancelFunc
 }
 
 type configReloadSnapshot struct {

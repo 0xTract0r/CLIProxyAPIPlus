@@ -198,6 +198,8 @@ func (s *Server) UpdateClientsContext(ctx context.Context, cfg *config.Config) b
 		s.mgmt.SetPluginHost(s.pluginHost)
 		// fork-only: keep the quota snapshot auto-refresh loop aligned with the latest policy.
 		s.mgmt.StartQuotaSnapshotAutoRefresh(context.Background(), managementHandlers.QuotaSnapshotRefreshPolicyFromConfig(cfg))
+		// fork-only: re-evaluate the farm liveness probe arm state on reload.
+		s.mgmt.StartFarmLivenessProbe(context.Background(), managementHandlers.QuotaSnapshotRefreshPolicyFromConfig(cfg))
 	}
 	s.refreshPluginManagementRoutes()
 

@@ -237,6 +237,10 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	// Start the quota snapshot auto-refresh loop (fork-only) so cached quota
 	// snapshots stay warm for the management UI.
 	s.mgmt.StartQuotaSnapshotAutoRefresh(context.Background(), managementHandlers.QuotaSnapshotRefreshPolicyFromConfig(cfg))
+	// Start the serving-independent farm account liveness probe (fork-only,
+	// default off via FARM_LIVENESS_PROBE_ENABLED) so an idle farm account revoked
+	// upstream is detected even with no serving traffic.
+	s.mgmt.StartFarmLivenessProbe(context.Background(), managementHandlers.QuotaSnapshotRefreshPolicyFromConfig(cfg))
 	s.localPassword = optionState.localPassword
 
 	// Home heartbeat gate: when home is enabled, block all endpoints with 503 until the

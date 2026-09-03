@@ -224,3 +224,24 @@ metadata契约键-首投产锚点	首投产锚点铸造接线	pattern	EnsureAuth
 metadata契约键-档位覆盖	TierOverrideMetadataKey	symbol	^const TierOverrideMetadataKey = "tier_override"	sdk/cliproxy/auth/account_tier.go
 管理API字段-自适应调度视图	adaptive_scheduling字段挂载	pattern	entry\["adaptive_scheduling"\] = h\.buildAdaptiveSchedulingView	internal/api/handlers/management/auth_files.go
 管理API字段-自适应调度视图	buildAdaptiveSchedulingView投影	symbol	^func \(h \*Handler\) buildAdaptiveSchedulingView\(	internal/api/handlers/management/auth_files_adaptive_scheduling.go
+
+# farm 账号存活检测(openspec change farm-account-liveness-detection):
+#   授权吊销权威化 + serving-独立存活探针 + 门与健康解耦(health-blind)。
+#   全部默认关灰度;探针只探"曾绑定过容器"的号(device_id已on-wire),防泄漏门语义不放宽。
+反关联-farm存活探针	MarkCredentialUnauthorized授权吊销权威化	symbol	^func \(a \*Auth\) MarkCredentialUnauthorized\(	sdk/cliproxy/auth/types.go
+反关联-farm存活探针	CredentialUnauthorizedReauthCode	symbol	^const CredentialUnauthorizedReauthCode 	sdk/cliproxy/auth/types.go
+反关联-farm存活探针	AuthEverBoundToContainer泄漏边界谓词	symbol	^func AuthEverBoundToContainer\(	sdk/cliproxy/auth/provisioned_gate.go
+反关联-farm存活探针	FarmHealthBlind健康盲区信号	symbol	^func FarmHealthBlind\(	sdk/cliproxy/auth/provisioned_gate.go
+反关联-farm存活探针	探针资格仅限曾绑定号(泄漏边界)	pattern	coreauth\.AuthEverBoundToContainer\(auth\)	internal/api/handlers/management/farm_liveness.go
+反关联-farm存活探针	探针默认关灰度开关	pattern	FarmLivenessProbeEnvVar = "FARM_LIVENESS_PROBE_ENABLED"	internal/api/handlers/management/farm_liveness.go
+反关联-farm存活探针	权威化默认关灰度开关	pattern	FarmLivenessDetectionEnvVar = "FARM_LIVENESS_DETECTION_ENABLED"	internal/api/handlers/management/farm_liveness.go
+反关联-farm存活探针	存活探针loop接线到server	pattern	StartFarmLivenessProbe\(	internal/api/server.go
+反关联-farm存活探针	配额层授权吊销权威化接线	pattern	updated\.MarkCredentialUnauthorized\(now\)	internal/api/handlers/management/quota_snapshots.go
+反关联-farm存活探针	对称恢复清锁	symbol	^func \(a \*Auth\) ClearCredentialUnauthorized\(	sdk/cliproxy/auth/types.go
+反关联-farm存活探针	探针锁判别谓词	symbol	^func IsCredentialUnauthorizedLock\(	sdk/cliproxy/auth/types.go
+反关联-farm存活探针	2-strike阈值防单次误锁	pattern	farmLivenessAuthFailThreshold = 2	internal/api/handlers/management/farm_liveness.go
+反关联-farm存活探针	升级仅限农场号	pattern	coreauth\.AuthFarmEnrolled\(updated\)	internal/api/handlers/management/quota_snapshots.go
+反关联-farm存活探针	配额成功对称恢复接线	pattern	updated\.ClearCredentialUnauthorized\(now\)	internal/api/handlers/management/quota_snapshots.go
+反关联-farm存活探针	锁号再探自愈接线	pattern	farmLivenessRecoveryReprobeEligible\(auth\)	internal/api/handlers/management/quota_snapshots.go
+fork文件-反关联支撑	farm_liveness.go	file	-	internal/api/handlers/management/farm_liveness.go
+fork文件-反关联支撑	farm_liveness_probe.go	file	-	internal/api/handlers/management/farm_liveness_probe.go
