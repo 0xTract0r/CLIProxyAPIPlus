@@ -245,3 +245,9 @@ metadata契约键-档位覆盖	TierOverrideMetadataKey	symbol	^const TierOverrid
 反关联-farm存活探针	锁号再探自愈接线	pattern	farmLivenessRecoveryReprobeEligible\(auth\)	internal/api/handlers/management/quota_snapshots.go
 fork文件-反关联支撑	farm_liveness.go	file	-	internal/api/handlers/management/farm_liveness.go
 fork文件-反关联支撑	farm_liveness_probe.go	file	-	internal/api/handlers/management/farm_liveness_probe.go
+
+# farm serving 版本对齐(A1: openspec farm-serving-version-align):农场号(绑定容器 device_id)在
+#   ResolveClaudeDeviceProfile 直出容器入站 candidate 版本、绕过 floor-up-到-高水位/缓存,消除
+#   serving 版本>容器遥测版本的跨通道不一致(同一 device_id 两个版本=反关联信号);农场观测不喂
+#   入跨账号全局高水位池。上游同步若删掉 farmBound 的 floor-up 绕过分支,下面 pattern 不再命中即红。
+反关联-farm版本对齐	农场号跳过floor-up直出容器candidate版本	pattern	!farmBound && !shouldUpgradeClaudeDeviceProfile\(candidate,	internal/runtime/executor/helps/claude_device_profile.go
