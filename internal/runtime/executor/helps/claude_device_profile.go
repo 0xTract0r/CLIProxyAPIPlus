@@ -105,8 +105,12 @@ const (
 var (
 	claudeCLIVersionPattern = regexp.MustCompile(`^claude-cli/(\d+)\.(\d+)\.(\d+)`)
 
-	claudeDeviceProfileCache            = make(map[string]claudeDeviceProfileCacheEntry)
-	claudeDeviceProfileObservations     = make(map[string][]claudeDeviceProfileObservationEntry)
+	claudeDeviceProfileCache        = make(map[string]claudeDeviceProfileCacheEntry)
+	claudeDeviceProfileObservations = make(map[string][]claudeDeviceProfileObservationEntry)
+	// 反关联 A1：记录哪些观测 cacheKey 属于农场号（绑定容器 device_id）。农场号出站版本
+	// 跟随容器实际版本、不进跨账号全局高水位池，globalClaudeObservedHighWater* 遍历时据此
+	// 跳过农场键，避免农场（可能是冻结旧版）容器的版本经全局回退污染普通号 floor。
+	claudeFarmObservationCacheKeys      = make(map[string]bool)
 	claudeDeviceProfileCacheMu          sync.RWMutex
 	claudeDeviceProfileCacheCleanupOnce sync.Once
 
@@ -232,6 +236,7 @@ func ResetClaudeDeviceProfileCache() {
 	claudeDeviceProfileCacheMu.Lock()
 	claudeDeviceProfileCache = make(map[string]claudeDeviceProfileCacheEntry)
 	claudeDeviceProfileObservations = make(map[string][]claudeDeviceProfileObservationEntry)
+	claudeFarmObservationCacheKeys = make(map[string]bool)
 	claudeDeviceProfileCacheMu.Unlock()
 }
 
@@ -293,7 +298,11 @@ func globalClaudeObservedHighWaterVersion() (claudeCLIVersion, bool) {
 	defer claudeDeviceProfileCacheMu.RUnlock()
 	var best claudeCLIVersion
 	found := false
-	for _, entries := range claudeDeviceProfileObservations {
+	for key, entries := range claudeDeviceProfileObservations {
+		// 反关联 A1：农场号观测不进跨账号全局高水位池。
+		if claudeFarmObservationCacheKeys[key] {
+			continue
+		}
 		for _, entry := range entries {
 			if !entry.profile.hasVersion {
 				continue
@@ -344,7 +353,11 @@ func globalClaudeObservedHighWaterProfile() (ClaudeDeviceProfile, bool) {
 	defer claudeDeviceProfileCacheMu.RUnlock()
 	var best ClaudeDeviceProfile
 	found := false
-	for _, entries := range claudeDeviceProfileObservations {
+	for key, entries := range claudeDeviceProfileObservations {
+		// 反关联 A1：农场号观测不进跨账号全局高水位池。
+		if claudeFarmObservationCacheKeys[key] {
+			continue
+		}
 		for _, entry := range entries {
 			if !entry.profile.hasVersion {
 				continue
@@ -423,6 +436,12 @@ func claudePersistedHighWaterProfile(auth *cliproxyauth.Auth) (ClaudeDeviceProfi
 // cross-account observation would. Returns false when the auth carries no usable
 // persisted triple.
 func SeedClaudeObservedHighWaterFromAuth(auth *cliproxyauth.Auth) bool {
+	// 反关联 A1：农场号出站版本跟随容器实际版本、不进跨账号全局高水位池；因此绝不把
+	// 农场号（历史遗留的）持久化高水位三元组 seed 进全局观测，否则会经全局回退把农场
+	// 容器版本带进普通号 floor。
+	if _, farmBound := cliproxyauth.ClaudeDeviceIDSource(auth); farmBound {
+		return false
+	}
 	profile, ok := claudePersistedHighWaterProfile(auth)
 	if !ok {
 		return false
@@ -727,6 +746,7 @@ func purgeExpiredClaudeDeviceProfiles() {
 		if !entry.expire.After(now) {
 			delete(claudeDeviceProfileCache, key)
 			delete(claudeDeviceProfileObservations, key)
+			delete(claudeFarmObservationCacheKeys, key)
 		}
 	}
 	claudeDeviceProfileCacheMu.Unlock()
@@ -909,6 +929,16 @@ func claudeFallbackBaseline(auth *cliproxyauth.Auth, apiKey string, cfg *config.
 	// UA/pkg/runtime、保留 OS/Arch，此处钉住的平台位不会被后续版本抬升覆盖。
 	baseline = applyFarmDevicePlatformBaseline(auth, baseline, cfg)
 
+	// 反关联 A1：农场号出站版本自动对齐容器实际版本。农场号在 ResolveClaudeDeviceProfile
+	// 里直出容器入站真实版本（candidate），baseline 仅作「无 candidate」时的保守兜底
+	// （floor / 平台已钉 Linux）。这里绝不把版本高水位（尤其跨账号全局与持久化高水位）
+	// 折进农场号 baseline——否则冷启动会声称高于容器实际的版本，重造 serving>遥测 的跨
+	// 通道不一致（同一 device_id 两个版本），也会把别号版本带进本农场号。普通号保持原有
+	// 高水位 floor-up 逻辑不变。
+	if _, farmBound := cliproxyauth.ClaudeDeviceIDSource(auth); farmBound {
+		return baseline
+	}
+
 	// 反关联修复 B（R5）：抬高 floor 时把版本三元组当原子单元处理。
 	// 优先取本账号观测到的最高版本**完整三元组**；本账号零观测时回退全局最高版本
 	// **完整三元组**。三元组（UA/version + pkg + runtime）全部来自同一次真实观测，
@@ -970,6 +1000,10 @@ func ResolveClaudeDeviceProfile(auth *cliproxyauth.Auth, apiKey string, headers 
 	cacheKey := claudeDeviceProfileCacheKey(auth, apiKey)
 	now := time.Now()
 	baseline := claudeFallbackBaseline(auth, apiKey, cfg)
+	// 反关联 A1：农场号（绑定容器 device_id）出站版本直出容器入站真实版本、不 floor-up
+	// 到高水位；此 farmBound 谓词是本函数内农场专属分支的唯一 gate，普通号 !farmBound
+	// 全程走原有逻辑。
+	_, farmBound := cliproxyauth.ClaudeDeviceIDSource(auth)
 	candidate, hasCandidate := extractClaudeDeviceProfile(headers, cfg)
 	if hasCandidate {
 		candidate = pinClaudeDeviceProfilePlatform(candidate, baseline)
@@ -1000,6 +1034,11 @@ func ResolveClaudeDeviceProfile(auth *cliproxyauth.Auth, apiKey string, headers 
 	if hasCandidate {
 		claudeDeviceProfileCacheMu.Lock()
 		recordClaudeDeviceProfileObservation(cacheKey, candidate, now)
+		// 反关联 A1：农场号观测仍记录（供反关联管理端点的诊断历史），但把该 cacheKey 标记
+		// 为农场，globalClaudeObservedHighWater* 遍历时跳过，杜绝农场版本污染普通号全局池。
+		if farmBound {
+			claudeFarmObservationCacheKeys[cacheKey] = true
+		}
 		claudeDeviceProfileCacheMu.Unlock()
 	}
 	// High-water floor-up gate: a shared upstream account must egress as ONE machine
@@ -1013,7 +1052,12 @@ func ResolveClaudeDeviceProfile(auth *cliproxyauth.Auth, apiKey string, headers 
 	// would make one shared account look like "one person, many machine versions" —
 	// the exact anti-correlation tell this unify-to-high-water design prevents, so a
 	// lower version is never passed through.
-	if hasCandidate && !shouldUpgradeClaudeDeviceProfile(candidate, baseline) {
+	// 反关联 A1：农场号跳过 floor-up-到-高水位。农场号绑定单个真实容器、其容器版本冻结，
+	// 出站版本必须逐字等于该容器入站真实版本（candidate），才能与该 device_id 在旁路遥测
+	// 通道声称的版本跨通道自洽；把它 floor-up 到（可能更高的）账号高水位反而制造「同一
+	// device_id 两个版本」的反关联信号。candidate 已在上面过 sanity-ceiling gate，故农场
+	// 直出仍受伪造超高 UA 保护。普通号（共享上游账号）保持 unify-to-high-water 不变。
+	if hasCandidate && !farmBound && !shouldUpgradeClaudeDeviceProfile(candidate, baseline) {
 		hasCandidate = false
 	}
 
@@ -1033,7 +1077,10 @@ func ResolveClaudeDeviceProfile(auth *cliproxyauth.Auth, apiKey string, headers 
 		if cachedValid {
 			entry.profile = normalizeClaudeDeviceProfile(entry.profile, baseline)
 		}
-		if cachedValid && !shouldUpgradeClaudeDeviceProfile(candidate, entry.profile) {
+		// 反关联 A1：农场号跳过 floor-up-到-缓存。若农场容器被重建为更低版本，当前 candidate
+		// 会低于上次缓存的 profile；普通号会保留较高缓存值（unify-to-high-water），但农场号
+		// 必须逐字跟随当前容器版本，故直接落缓存并返回当前 candidate。
+		if cachedValid && !farmBound && !shouldUpgradeClaudeDeviceProfile(candidate, entry.profile) {
 			entry.expire = now.Add(claudeDeviceProfileTTL)
 			claudeDeviceProfileCache[cacheKey] = entry
 			claudeDeviceProfileCacheMu.Unlock()
