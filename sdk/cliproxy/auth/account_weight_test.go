@@ -173,14 +173,25 @@ func TestAccountSelectionWeight_WarmupFactorBelowMature(t *testing.T) {
 		t.Fatalf("warming account weight must stay > 0 (still eligible, just deprioritized), got %v", warmingWeight)
 	}
 
-	// Pin the exact w1 ratio: base(20) x quota(1) x (w1.RPMLimit=3 / mature.RPMLimit=45).
+	// Pin the exact warming value AFTER the FIX 2 warm-up base clamp: a warming
+	// max_20x has its tier base clamped from 20 down to the Claude Pro baseline
+	// (1) because it is not yet mature, so the weight is
+	// Pro(1) x quota(1) x (w1.RPMLimit=3 / mature.RPMLimit=45), NOT the old
+	// unclamped max_20x(20) x (3/45).
 	wantFactor := float64(internalconfig.DefaultAccountWarmupCurve()[0].RPMLimit) / float64(internalconfig.DefaultAccountMatureRPMLimit)
-	want := internalconfig.DefaultAccountTierWeightClaudeMax20x * wantFactor
+	want := internalconfig.DefaultAccountTierWeightClaudePro * wantFactor
 	if warmingWeight != want {
-		t.Fatalf("warming weight = %v, want exactly %v (w1 ratio %v)", warmingWeight, want, wantFactor)
+		t.Fatalf("warming weight = %v, want exactly %v (clamped Pro base x w1 ratio %v)", warmingWeight, want, wantFactor)
 	}
 	if wantFactor >= 1 {
 		t.Fatalf("test fixture invalid: w1 ratio %v should be well below 1", wantFactor)
+	}
+	// Negative control (self-check): were the FIX 2 clamp removed, warmingWeight
+	// would be max_20x(20) x (3/45) ≈ 1.333, which exceeds the mature Pro
+	// weight below -- exactly the warm-up domination bug. Assert it does not.
+	maturePro := AccountSelectionWeight(matureAuth("default_claude_pro", 0), cfg, accountWeightTestNow)
+	if !(warmingWeight <= maturePro) {
+		t.Fatalf("warming max_20x weight(%v) must not exceed mature Pro weight(%v): the clamp failed", warmingWeight, maturePro)
 	}
 }
 
@@ -273,10 +284,33 @@ func TestAccountQuotaWeightFactor(t *testing.T) {
 func TestAccountFreshnessWeightFactor(t *testing.T) {
 	cfg := internalconfig.DefaultAccountSchedulingConfig()
 
-	t.Run("no anchor recorded is treated as mature", func(t *testing.T) {
+	t.Run("no anchor recorded resolves to the cold first-stage factor, not full 1.0", func(t *testing.T) {
+		// FIX 1 (no-anchor bootstrap): a credential with no first_production_at
+		// anchor is design §5.1's "cold" state. It must be weighted at the
+		// curve's FIRST stage's factor (matching coldAccountWarmupStatus), NOT
+		// the old full-1.0 bootstrap that let a fresh high-tier account dominate.
 		got := AccountFreshnessWeightFactor(&Auth{}, cfg, accountWeightTestNow)
+		want := float64(internalconfig.DefaultAccountWarmupCurve()[0].RPMLimit) / float64(internalconfig.DefaultAccountMatureRPMLimit)
+		if got != want {
+			t.Fatalf("factor = %v, want %v (cold curve[0] factor 3/45)", got, want)
+		}
+		// Negative control (self-check): if the no-anchor fix were reverted to
+		// `return 1`, `got` would be 1 and this bound would fail -- i.e. commenting
+		// out FIX 1 turns this assertion red.
+		if !(got > 0 && got < 1) {
+			t.Fatalf("cold factor = %v, want strictly in (0,1): >0 so a fresh account is a trickle candidate not starved, <1 so it cannot dominate the pool", got)
+		}
+	})
+
+	t.Run("no anchor with empty curve stays mature (1)", func(t *testing.T) {
+		// An empty curve means warm-up throttling is disabled entirely -- there
+		// is no first stage to be "cold" relative to, so a no-anchor account
+		// falls through to mature, consistent with the anchored empty-curve path.
+		emptyCfg := cfg
+		emptyCfg.WarmupCurve = nil
+		got := AccountFreshnessWeightFactor(&Auth{}, emptyCfg, accountWeightTestNow)
 		if got != 1 {
-			t.Fatalf("factor = %v, want 1 (no-anchor accounts must not be perpetually throttled)", got)
+			t.Fatalf("factor = %v, want 1 (empty curve disables warm-up throttling even for a no-anchor account)", got)
 		}
 	})
 
@@ -396,4 +430,121 @@ func TestCurrentAccountWarmupStage(t *testing.T) {
 			t.Fatalf("expected the single unbounded stage to match a very large age, got stage=%v found=%v", stage, found)
 		}
 	})
+}
+
+// warmingClaudeAuth builds a Claude auth fixture pinned to tierOverride
+// ("max_20x"/"max_5x"/"pro") -- mirroring how the real production test accounts
+// declare their tier, since their upstream rate_limit_tier ("default_claude_ai")
+// is intentionally left unmapped by claudeRateLimitTierValues. ageDays < 0 omits
+// the first_production_at anchor entirely (design §5.1's no-anchor "cold" state);
+// ageDays >= 0 anchors the account that many days before accountWeightTestNow.
+// utilizationPercent drives the five_hour quota window.
+func warmingClaudeAuth(tierOverride string, ageDays int, utilizationPercent float64) *Auth {
+	meta := map[string]any{
+		TierOverrideMetadataKey: tierOverride,
+		"quota_snapshot": map[string]any{
+			"usage": map[string]any{
+				"five_hour": map[string]any{"utilization": utilizationPercent},
+			},
+		},
+	}
+	if ageDays >= 0 {
+		meta[FirstProductionAtMetadataKey] = accountWeightTestNow.Add(-time.Duration(ageDays) * 24 * time.Hour).Format(time.RFC3339)
+	}
+	return &Auth{Provider: "claude", Metadata: meta}
+}
+
+// TestAccountSelectionWeight_WarmingHighTierNotAboveWarmingPro is the core FIX 2
+// invariant: a still-warming max_20x account must never out-weigh a warming Pro
+// account of the SAME age and quota, because its tier base is clamped down to
+// the Pro baseline during warm-up. Covers the no-anchor cold state and several
+// in-curve ages.
+func TestAccountSelectionWeight_WarmingHighTierNotAboveWarmingPro(t *testing.T) {
+	cfg := internalconfig.DefaultAccountSchedulingConfig()
+	for _, ageDays := range []int{-1 /* no anchor / cold */, 0 /* w1 day 0 */, 3 /* w1 */, 10 /* w2 */, 20 /* w3-4 */} {
+		max20x := AccountSelectionWeight(warmingClaudeAuth("max_20x", ageDays, 25), cfg, accountWeightTestNow)
+		pro := AccountSelectionWeight(warmingClaudeAuth("pro", ageDays, 25), cfg, accountWeightTestNow)
+		if !(max20x <= pro) {
+			// Negative control (self-check): without the FIX 2 base clamp, max20x would be
+			// base(20) x ... and pro base(1) x ..., so max20x > pro and this
+			// fails -- i.e. commenting out the clamp turns this red.
+			t.Fatalf("ageDays=%d: warming max_20x weight(%v) must be <= warming Pro weight(%v) at same age/quota", ageDays, max20x, pro)
+		}
+		if !(max20x > 0) {
+			t.Fatalf("ageDays=%d: warming max_20x weight must stay > 0 (deprioritized, not excluded), got %v", ageDays, max20x)
+		}
+	}
+}
+
+// TestAccountSelectionWeight_MatureTierDistributionUnchanged proves the fixes
+// have ZERO effect on mature accounts: the clamp is skipped (Mature==true) and
+// freshness is 1, so mature weights are exactly the tier base weights and the
+// max_20x:5x:pro distribution is precisely 20:5:1, identical to pre-fix.
+func TestAccountSelectionWeight_MatureTierDistributionUnchanged(t *testing.T) {
+	cfg := internalconfig.DefaultAccountSchedulingConfig()
+	max20x := AccountSelectionWeight(matureAuth("default_claude_max_20x", 0), cfg, accountWeightTestNow)
+	max5x := AccountSelectionWeight(matureAuth("default_claude_max_5x", 0), cfg, accountWeightTestNow)
+	pro := AccountSelectionWeight(matureAuth("default_claude_pro", 0), cfg, accountWeightTestNow)
+
+	// Absolute weights are exactly the tier base weights (quota=1, freshness=1).
+	if max20x != internalconfig.DefaultAccountTierWeightClaudeMax20x {
+		t.Fatalf("mature max_20x weight = %v, want exactly %v (clamp must NOT touch mature accounts)", max20x, internalconfig.DefaultAccountTierWeightClaudeMax20x)
+	}
+	if max5x != internalconfig.DefaultAccountTierWeightClaudeMax5x {
+		t.Fatalf("mature max_5x weight = %v, want exactly %v", max5x, internalconfig.DefaultAccountTierWeightClaudeMax5x)
+	}
+	if pro != internalconfig.DefaultAccountTierWeightClaudePro {
+		t.Fatalf("mature pro weight = %v, want exactly %v", pro, internalconfig.DefaultAccountTierWeightClaudePro)
+	}
+	// Ratio pins (base weights are integer-valued, so these divisions are exact).
+	// Negative control (self-check): an over-broad clamp that fired on mature accounts would
+	// pull max_20x down to 1 and collapse this 20:5:1 ratio, failing here.
+	if max20x/pro != 20.0 {
+		t.Fatalf("mature max_20x/pro ratio = %v, want exactly 20 (distribution drifted)", max20x/pro)
+	}
+	if max5x/pro != 5.0 {
+		t.Fatalf("mature max_5x/pro ratio = %v, want exactly 5 (distribution drifted)", max5x/pro)
+	}
+}
+
+// TestAccountSelectionWeight_NoAnchorMax20xDoesNotDominatePool reproduces the
+// production AC-14 bug end to end: a brand-new no-anchor account pinned max_20x
+// via tier_override, dropped into a pool of mature accounts. Pre-fix, the full
+// 1.0 no-anchor freshness bootstrap (FIX 1) x the un-clamped base 20 (FIX 2)
+// gave it ~74% of the weighted selection share (the observed ~77%). Both fixes
+// together reduce it to a low-weight trickle candidate.
+func TestAccountSelectionWeight_NoAnchorMax20xDoesNotDominatePool(t *testing.T) {
+	cfg := internalconfig.DefaultAccountSchedulingConfig()
+	fresh := warmingClaudeAuth("max_20x", -1 /* no anchor: the exact AC-14 shape */, 0)
+	pool := []*Auth{
+		fresh,
+		matureAuth("default_claude_pro", 0),
+		matureAuth("default_claude_pro", 0),
+		matureAuth("default_claude_max_5x", 0),
+	}
+	var total, freshWeight float64
+	for _, a := range pool {
+		w := AccountSelectionWeight(a, cfg, accountWeightTestNow)
+		total += w
+		if a == fresh {
+			freshWeight = w
+		}
+	}
+	if total <= 0 {
+		t.Fatalf("pool total weight = %v, want > 0", total)
+	}
+	share := freshWeight / total
+	// Post-fix share is ~0.9%. A generous 10% ceiling cleanly separates the fixed
+	// behavior from the ~74% pre-fix domination. Negative control (self-check): reverting
+	// EITHER fix -- no-anchor freshness back to 1, OR removing the base clamp so
+	// base stays 20 -- pushes this share back above 0.10 and turns the assertion
+	// red.
+	if share >= 0.10 {
+		t.Fatalf("no-anchor max_20x selection share = %.4f, want < 0.10 (pre-fix ~0.74 domination bug)", share)
+	}
+	// Still strictly positive so the fresh account can eventually win a pick and
+	// mint its first-production anchor (never starved to 0).
+	if !(freshWeight > 0) {
+		t.Fatalf("fresh account weight must stay > 0, got %v", freshWeight)
+	}
 }

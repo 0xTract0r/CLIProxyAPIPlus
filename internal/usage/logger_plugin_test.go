@@ -8,6 +8,7 @@ import (
 	"time"
 
 	internallogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 )
 
@@ -669,6 +670,245 @@ func TestSnapshotPageWithOptionsKeepsTiedTimestampsInSamePage(t *testing.T) {
 	}
 	if page2.HasMore {
 		t.Fatalf("page2 HasMore = true, want false")
+	}
+}
+
+// TestRequestStatisticsRecordCapturesSessionIDFromRecordField covers the
+// P6 session-aggregation slice: a Record that already carries a SessionID
+// (e.g. a future usage-reporter change that bakes it in at construction time,
+// mirroring how ServiceTier/ReasoningEffort are captured today) must have it
+// persisted onto the stored RequestDetail unchanged.
+func TestRequestStatisticsRecordCapturesSessionIDFromRecordField(t *testing.T) {
+	stats := NewRequestStatistics()
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey:    "test-key",
+		Model:     "gpt-5.4",
+		SessionID: "claude:from-record-field",
+		Detail: coreusage.Detail{
+			InputTokens: 10, OutputTokens: 20, TotalTokens: 30,
+		},
+	})
+
+	snapshot := stats.Snapshot()
+	details := snapshot.APIs["test-key"].Models["gpt-5.4"].Details
+	if len(details) != 1 {
+		t.Fatalf("details len = %d, want 1", len(details))
+	}
+	if got := details[0].SessionID; got != "claude:from-record-field" {
+		t.Fatalf("SessionID = %q, want %q", got, "claude:from-record-field")
+	}
+}
+
+// TestRequestStatisticsRecordCapturesSessionIDFromContextFallback covers the
+// path a request-entry wiring slice will actually use: the record itself
+// carries no SessionID, but ctx was populated via coreauth.WithSessionID
+// (e.g. by the request entry point after calling ExtractSessionID). Record
+// must fall back to reading it off ctx, exactly like RequestID already does
+// via internallogging.GetRequestID.
+func TestRequestStatisticsRecordCapturesSessionIDFromContextFallback(t *testing.T) {
+	stats := NewRequestStatistics()
+	ctx := coreauth.WithSessionID(context.Background(), "claude:from-ctx")
+	stats.Record(ctx, coreusage.Record{
+		APIKey: "test-key",
+		Model:  "gpt-5.4",
+		Detail: coreusage.Detail{
+			InputTokens: 10, OutputTokens: 20, TotalTokens: 30,
+		},
+	})
+
+	snapshot := stats.Snapshot()
+	details := snapshot.APIs["test-key"].Models["gpt-5.4"].Details
+	if len(details) != 1 {
+		t.Fatalf("details len = %d, want 1", len(details))
+	}
+	if got := details[0].SessionID; got != "claude:from-ctx" {
+		t.Fatalf("SessionID = %q, want %q", got, "claude:from-ctx")
+	}
+}
+
+// TestRequestStatisticsRecordSessionIDEmptyWithoutSource covers the "unknown
+// is not a number" contract: when neither the record field nor ctx carries a
+// session id, the stored detail must have an explicitly empty SessionID, not
+// a substituted placeholder.
+func TestRequestStatisticsRecordSessionIDEmptyWithoutSource(t *testing.T) {
+	stats := NewRequestStatistics()
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey: "test-key",
+		Model:  "gpt-5.4",
+		Detail: coreusage.Detail{
+			InputTokens: 10, OutputTokens: 20, TotalTokens: 30,
+		},
+	})
+
+	snapshot := stats.Snapshot()
+	details := snapshot.APIs["test-key"].Models["gpt-5.4"].Details
+	if len(details) != 1 {
+		t.Fatalf("details len = %d, want 1", len(details))
+	}
+	if got := details[0].SessionID; got != "" {
+		t.Fatalf("SessionID = %q, want empty", got)
+	}
+}
+
+// TestSessionAggregateForAuthIndex_ActiveAndClosedBuckets covers the core
+// bucketing contract: a session's most recent recorded request determines
+// whether it counts as active (idle < activeWithin), closed (idle >=
+// closedAfter), or neither (counted in Total only). It also exercises the
+// "most recent wins" rule for a session with multiple recorded requests.
+func TestSessionAggregateForAuthIndex_ActiveAndClosedBuckets(t *testing.T) {
+	stats := NewRequestStatistics()
+	now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	const authIndex = "authidx-buckets-1"
+
+	record := func(sessionID string, at time.Time) {
+		ctx := coreauth.WithSessionID(context.Background(), sessionID)
+		stats.Record(ctx, coreusage.Record{
+			APIKey:      "test-key",
+			Model:       "gpt-5.4",
+			AuthIndex:   authIndex,
+			RequestedAt: at,
+			Detail:      coreusage.Detail{InputTokens: 1, OutputTokens: 1, TotalTokens: 2},
+		})
+	}
+
+	// s-active: two requests, most recent 2min ago -- must win over the older
+	// 30min-ago request when determining idle time (last-seen, not first-seen).
+	record("s-active", now.Add(-30*time.Minute))
+	record("s-active", now.Add(-2*time.Minute))
+	// s-mid: idle 20min, strictly between the two thresholds -- neither bucket.
+	record("s-mid", now.Add(-20*time.Minute))
+	// s-closed: idle 40min, past closedAfter.
+	record("s-closed", now.Add(-40*time.Minute))
+
+	aggregate := stats.SessionAggregateForAuthIndex(authIndex, now, 10*time.Minute, 30*time.Minute)
+	if aggregate.Total != 3 {
+		t.Fatalf("Total = %d, want 3", aggregate.Total)
+	}
+	if aggregate.Active != 1 {
+		t.Fatalf("Active = %d, want 1 (s-active only, using its most recent request)", aggregate.Active)
+	}
+	if aggregate.Closed != 1 {
+		t.Fatalf("Closed = %d, want 1 (s-closed only)", aggregate.Closed)
+	}
+}
+
+// TestSessionAggregateForAuthIndex_EmptySessionIDsExcluded guards the "误并
+// 成一个空 key 大桶" failure mode: requests that carry no session id at all
+// (ExtractSessionID could not classify them) must never be aggregated into a
+// shared "" bucket, no matter how many such requests are recorded for the
+// account.
+func TestSessionAggregateForAuthIndex_EmptySessionIDsExcluded(t *testing.T) {
+	stats := NewRequestStatistics()
+	now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	const authIndex = "authidx-empty-session-1"
+
+	for i := 0; i < 5; i++ {
+		stats.Record(context.Background(), coreusage.Record{
+			APIKey:      "test-key",
+			Model:       "gpt-5.4",
+			AuthIndex:   authIndex,
+			RequestedAt: now.Add(-time.Duration(i) * time.Minute),
+			Detail:      coreusage.Detail{InputTokens: 1, OutputTokens: 1, TotalTokens: 2},
+		})
+	}
+
+	aggregate := stats.SessionAggregateForAuthIndex(authIndex, now, 10*time.Minute, 30*time.Minute)
+	if aggregate.Total != 0 {
+		t.Fatalf("Total = %d, want 0 (empty-session-id requests must never form a bucket)", aggregate.Total)
+	}
+	if aggregate.Active != 0 || aggregate.Closed != 0 {
+		t.Fatalf("Active/Closed = %d/%d, want 0/0", aggregate.Active, aggregate.Closed)
+	}
+}
+
+// TestSessionAggregateForAuthIndex_MessageHashPrimaryIDsNotDoubleCounted
+// covers the level-8 legacy message-hash fallback (extractMessageHashIDs):
+// repeated requests that all resolve to the SAME primary session id (the
+// common case once a conversation has an assistant reply pinned in its
+// history) must count as exactly ONE session, never once per request. It
+// also documents the known, deliberate limitation that a conversation's
+// first-turn (short-hash) id and its later-turn (full-hash) id are not
+// merged into a single session by this aggregation (see
+// SessionAggregateForAuthIndex's doc comment).
+func TestSessionAggregateForAuthIndex_MessageHashPrimaryIDsNotDoubleCounted(t *testing.T) {
+	stats := NewRequestStatistics()
+	now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	const authIndex = "authidx-msg-hash-1"
+
+	turn1Payload := []byte(`{"messages":[` +
+		`{"role":"system","content":"You are a helpful assistant."},` +
+		`{"role":"user","content":"hello there"}` +
+		`]}`)
+	turn2Payload := []byte(`{"messages":[` +
+		`{"role":"system","content":"You are a helpful assistant."},` +
+		`{"role":"user","content":"hello there"},` +
+		`{"role":"assistant","content":"hi, how can I help?"},` +
+		`{"role":"user","content":"what is 2+2?"}` +
+		`]}`)
+
+	idTurn1 := coreauth.ExtractSessionID(nil, turn1Payload, nil)
+	idTurn2 := coreauth.ExtractSessionID(nil, turn2Payload, nil)
+	if idTurn1 == "" || idTurn2 == "" {
+		t.Fatalf("expected non-empty message-hash session ids, got turn1=%q turn2=%q", idTurn1, idTurn2)
+	}
+	if idTurn1 == idTurn2 {
+		t.Fatalf("turn1 (short hash, no assistant) and turn2 (full hash, with assistant) unexpectedly matched: %q", idTurn1)
+	}
+
+	record := func(sessionID string, at time.Time) {
+		ctx := coreauth.WithSessionID(context.Background(), sessionID)
+		stats.Record(ctx, coreusage.Record{
+			APIKey:      "test-key",
+			Model:       "gpt-5.4",
+			AuthIndex:   authIndex,
+			RequestedAt: at,
+			Detail:      coreusage.Detail{InputTokens: 1, OutputTokens: 1, TotalTokens: 2},
+		})
+	}
+
+	// Turn 1 request, classified under the short-hash primary id.
+	record(idTurn1, now.Add(-20*time.Minute))
+	// Turn 2 and a follow-up turn 3 both resolve to the SAME full-hash primary
+	// id (firstUserMsg/firstAssistantMsg are pinned to the conversation's
+	// first occurrences and do not change on later turns) -- publishing two
+	// separate records under it must not inflate the session count.
+	record(idTurn2, now.Add(-5*time.Minute))
+	record(idTurn2, now.Add(-1*time.Minute))
+
+	aggregate := stats.SessionAggregateForAuthIndex(authIndex, now, 10*time.Minute, 30*time.Minute)
+	if aggregate.Total != 2 {
+		t.Fatalf("Total = %d, want 2 (turn1's short-hash session + turn2/3's shared full-hash session, no per-request double count)", aggregate.Total)
+	}
+	if aggregate.Active != 1 {
+		t.Fatalf("Active = %d, want 1 (only the turn2/3 session's latest request -1min falls inside the 10min active window)", aggregate.Active)
+	}
+	if aggregate.Closed != 0 {
+		t.Fatalf("Closed = %d, want 0 (turn1's session is idle 20min, between the active/closed thresholds, not yet closed)", aggregate.Closed)
+	}
+}
+
+// TestSessionAggregateForAuthIndex_UnknownOrEmptyAuthIndex covers defensive
+// handling: an empty authIndex, and an authIndex with no matching recorded
+// details, must both return the zero aggregate rather than matching
+// unrelated accounts' sessions.
+func TestSessionAggregateForAuthIndex_UnknownOrEmptyAuthIndex(t *testing.T) {
+	stats := NewRequestStatistics()
+	now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+
+	ctx := coreauth.WithSessionID(context.Background(), "claude:some-session")
+	stats.Record(ctx, coreusage.Record{
+		APIKey:      "test-key",
+		Model:       "gpt-5.4",
+		AuthIndex:   "authidx-owns-the-session",
+		RequestedAt: now.Add(-time.Minute),
+		Detail:      coreusage.Detail{InputTokens: 1, OutputTokens: 1, TotalTokens: 2},
+	})
+
+	if got := stats.SessionAggregateForAuthIndex("", now, 10*time.Minute, 30*time.Minute); got != (SessionAggregate{}) {
+		t.Fatalf("SessionAggregateForAuthIndex(\"\") = %+v, want zero value", got)
+	}
+	if got := stats.SessionAggregateForAuthIndex("authidx-does-not-exist", now, 10*time.Minute, 30*time.Minute); got != (SessionAggregate{}) {
+		t.Fatalf("SessionAggregateForAuthIndex(unknown) = %+v, want zero value", got)
 	}
 }
 

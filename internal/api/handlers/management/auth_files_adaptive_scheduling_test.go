@@ -1,13 +1,16 @@
 package management
 
 import (
+	"context"
 	"math"
 	"testing"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	usagepkg "github.com/router-for-me/CLIProxyAPI/v7/internal/usage"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 )
 
 // TestBuildAuthFileEntry_AdaptiveScheduling covers tasks.md 5.2
@@ -178,6 +181,87 @@ func TestBuildAuthFileEntry_AdaptiveScheduling(t *testing.T) {
 		}
 		if got := view["subscription_tier"]; got != "pro" {
 			t.Fatalf("subscription_tier = %#v, want %q for a codex pro account", got, "pro")
+		}
+	})
+}
+
+// TestBuildAuthFileEntry_AdaptiveScheduling_SessionCounts covers the P6
+// session-aggregation slice: adaptive_scheduling must additively project
+// sessions_total/sessions_active/sessions_closed, sourced from
+// internal/usage.SessionAggregateForAuthIndex keyed on this account's
+// EnsureIndex(). It also covers the no-usage-store-wired path (existing
+// callers that construct a bare Handler{cfg: ...} without usageStats), which
+// must report explicit zeros rather than omitting the keys or panicking.
+func TestBuildAuthFileEntry_AdaptiveScheduling_SessionCounts(t *testing.T) {
+	// buildAdaptiveSchedulingView (production code, called via buildAuthFileEntry
+	// below) derives its own "now" internally via time.Now() when bucketing
+	// sessions into active/closed -- it is not parameterized. A hardcoded
+	// calendar date here would only agree with that internal now on the day it
+	// was written, so anchor relative offsets to the actual wall clock instead.
+	now := time.Now().UTC()
+
+	t.Run("no usage store wired reports explicit zeros", func(t *testing.T) {
+		h := &Handler{cfg: &config.Config{AccountScheduling: config.DefaultAccountSchedulingConfig()}}
+		auth := &coreauth.Auth{ID: "claude-sessions-nostat", Provider: "claude", Status: coreauth.StatusActive, UpdatedAt: now, Attributes: map[string]string{"runtime_only": "true"}}
+
+		entry := h.buildAuthFileEntry(auth)
+		view, ok := entry["adaptive_scheduling"].(gin.H)
+		if !ok {
+			t.Fatalf("entry[\"adaptive_scheduling\"] = %#v, want gin.H", entry["adaptive_scheduling"])
+		}
+		for _, key := range []string{"sessions_total", "sessions_active", "sessions_closed"} {
+			got, present := view[key]
+			if !present {
+				t.Fatalf("%s absent, want present with 0", key)
+			}
+			if got != 0 {
+				t.Fatalf("%s = %#v, want 0", key, got)
+			}
+		}
+	})
+
+	t.Run("aggregates recorded sessions for this account's AuthIndex only", func(t *testing.T) {
+		stats := usagepkg.NewRequestStatistics()
+		h := &Handler{
+			cfg:        &config.Config{AccountScheduling: config.DefaultAccountSchedulingConfig()},
+			usageStats: stats,
+		}
+		auth := &coreauth.Auth{ID: "claude-sessions-1", Provider: "claude", Status: coreauth.StatusActive, UpdatedAt: now, Attributes: map[string]string{"runtime_only": "true"}}
+		authIndex := auth.EnsureIndex()
+		if authIndex == "" {
+			t.Fatal("auth.EnsureIndex() = \"\", want a non-empty index to key session aggregation on")
+		}
+
+		record := func(idx, sessionID string, at time.Time) {
+			ctx := coreauth.WithSessionID(context.Background(), sessionID)
+			stats.Record(ctx, coreusage.Record{
+				APIKey:      "test-key",
+				Model:       "gpt-5.4",
+				AuthIndex:   idx,
+				RequestedAt: at,
+				Detail:      coreusage.Detail{InputTokens: 1, OutputTokens: 1, TotalTokens: 2},
+			})
+		}
+
+		// This account: one recently-active session, one long-idle (closed) one.
+		record(authIndex, "s-active", now.Add(-1*time.Minute))
+		record(authIndex, "s-closed", now.Add(-45*time.Minute))
+		// A different account's session must not leak into this account's count.
+		record("some-other-authindex", "s-other-account", now.Add(-1*time.Minute))
+
+		entry := h.buildAuthFileEntry(auth)
+		view, ok := entry["adaptive_scheduling"].(gin.H)
+		if !ok {
+			t.Fatalf("entry[\"adaptive_scheduling\"] = %#v, want gin.H", entry["adaptive_scheduling"])
+		}
+		if got := view["sessions_total"]; got != 2 {
+			t.Fatalf("sessions_total = %#v, want 2", got)
+		}
+		if got := view["sessions_active"]; got != 1 {
+			t.Fatalf("sessions_active = %#v, want 1", got)
+		}
+		if got := view["sessions_closed"]; got != 1 {
+			t.Fatalf("sessions_closed = %#v, want 1", got)
 		}
 	})
 }

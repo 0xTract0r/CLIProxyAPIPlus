@@ -1,11 +1,23 @@
 package management
 
 import (
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+)
+
+// SessionActiveWindow / SessionClosedAfter are the default idle-time
+// thresholds for the P6 session-count aggregation projected below
+// (sessions_active/sessions_closed). They are package vars rather than
+// consts so a future config-wiring slice can source them from
+// config.AccountSchedulingConfig without an API change -- this NOCLASH slice
+// intentionally does not add new fields to internal/config.
+var (
+	SessionActiveWindow = 10 * time.Minute
+	SessionClosedAfter  = 30 * time.Minute
 )
 
 // buildAdaptiveSchedulingView projects the Phase 0 adaptive-account-scheduling
@@ -105,6 +117,25 @@ func (h *Handler) buildAdaptiveSchedulingView(auth *coreauth.Auth) gin.H {
 		warmupView["age_days"] = nil
 	}
 	view["warmup"] = warmupView
+
+	// Per-account session count aggregation (P6): distinct SessionID values
+	// observed on this account's recorded request details
+	// (internal/usage.SessionAggregateForAuthIndex), bucketed by idle time.
+	// Read-only and additive like the blocks above. Unlike quota_utilization/
+	// first_production_at, "no sessions observed yet" and "no usage store
+	// wired" are not distinguished from each other here -- both report 0,
+	// since zero recorded sessions is itself a valid, non-"unknown" answer
+	// (there is no missing-snapshot ambiguity the way there is for quota).
+	sessionsTotal, sessionsActive, sessionsClosed := 0, 0, 0
+	if h != nil && h.usageStats != nil {
+		if authIndex := strings.TrimSpace(auth.EnsureIndex()); authIndex != "" {
+			aggregate := h.usageStats.SessionAggregateForAuthIndex(authIndex, now, SessionActiveWindow, SessionClosedAfter)
+			sessionsTotal, sessionsActive, sessionsClosed = aggregate.Total, aggregate.Active, aggregate.Closed
+		}
+	}
+	view["sessions_total"] = sessionsTotal
+	view["sessions_active"] = sessionsActive
+	view["sessions_closed"] = sessionsClosed
 
 	return view
 }

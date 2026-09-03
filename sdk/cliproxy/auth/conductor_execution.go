@@ -24,6 +24,7 @@ import (
 // It supports multiple providers for the same model and round-robins the starting provider per model.
 func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
 	req, opts = cliproxysession.Enrich(req, opts)
+	ctx = contextWithSessionID(ctx, opts)
 	normalized := m.normalizeProviders(providers)
 	if len(normalized) == 0 {
 		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
@@ -69,6 +70,7 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 // It supports multiple providers for the same model and round-robins the starting provider per model.
 func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
 	req, opts = cliproxysession.Enrich(req, opts)
+	ctx = contextWithSessionID(ctx, opts)
 	normalized := m.normalizeProviders(providers)
 	if len(normalized) == 0 {
 		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
@@ -105,6 +107,7 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 // It supports multiple providers for the same model and round-robins the starting provider per model.
 func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
 	req, opts = cliproxysession.Enrich(req, opts)
+	ctx = contextWithSessionID(ctx, opts)
 	if m.HomeEnabled() {
 		if unlockSession := m.lockHomeWebsocketSession(ctx, opts); unlockSession != nil {
 			defer unlockSession()
@@ -885,6 +888,27 @@ func (m *Manager) prepareRequestAuth(ctx context.Context, executor ProviderExecu
 		return saved, nil
 	}
 	return updated, nil
+}
+
+// contextWithSessionID resolves the originating request's session identifier
+// from exactly the inputs SessionAffinitySelector consumes (headers + original
+// request body + metadata, read after cliproxysession.Enrich has folded in any
+// derived-session metadata) and stores it on ctx via WithSessionID. That ctx is
+// the one every execution path threads down to executor.Execute, where the
+// per-request UsageReporter is constructed and reporter.Publish is invoked, so
+// the session id rides all the way to the usage sink; internal/usage's
+// RequestStatistics.Record reads it back via SessionIDFromContext whenever the
+// published Record carries none of its own. This is the single wiring that was
+// missing: the P6 aggregation (sessions_total/active/closed) counted zero under
+// real traffic because nothing populated this ctx value at the request entry.
+//
+// An empty (unclassifiable) session is deliberately left unset -- WithSessionID
+// treats "" as a no-op -- so bare-API-key or otherwise unclassifiable traffic
+// is never folded into a fabricated shared session bucket. Both ExtractSessionID
+// and WithSessionID live in this package, so this helper introduces no new
+// import and cannot create an import cycle back from internal/usage.
+func contextWithSessionID(ctx context.Context, opts cliproxyexecutor.Options) context.Context {
+	return WithSessionID(ctx, ExtractSessionID(opts.Headers, opts.OriginalRequest, opts.Metadata))
 }
 
 func contextWithRequestedModelAlias(ctx context.Context, opts cliproxyexecutor.Options, fallback string) context.Context {
