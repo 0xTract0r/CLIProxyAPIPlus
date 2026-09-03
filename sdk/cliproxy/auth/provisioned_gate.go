@@ -249,6 +249,59 @@ func RequireProvisionedBlocked(auth *Auth) bool {
 	return forkRequireProvisionedBlocked(auth)
 }
 
+// AuthEverBoundToContainer reports whether a Claude account currently carries a
+// VALID container device_id binding (DeviceIDSourceContainerSynced). It reuses
+// the canonical ClaudeDeviceIDSource derivation so it can never disagree with
+// the supply-atomicity gate's own container_synced classification.
+//
+// This is the leak-safety boundary the serving-independent farm liveness probe
+// keys on: a container_synced account has ALREADY exposed exactly this managed
+// device identity on-wire during real serving/quota egress, so re-probing it
+// adds no NEW leak surface.
+//
+// DeviceIDSourceDrift is DELIBERATELY excluded (review F2): a drift account's
+// runtime attribute mirror was cleared (its persisted device_id no longer
+// validates), so a probe would fall back to the per-account SYNTHETIC device_id
+// and could first-expose it on-wire — a new leak. Only a currently-valid,
+// already-on-wire binding is treated as ever-bound-and-safe-to-probe; a
+// never-bound synthetic account and a drifted one both return false and are
+// never probed (the RequireProvisionedBlocked gate keeps blocking them).
+func AuthEverBoundToContainer(auth *Auth) bool {
+	source, _ := ClaudeDeviceIDSource(auth)
+	return source == DeviceIDSourceContainerSynced
+}
+
+// FarmHealthBlind reports whether a farm-enrolled Claude account is currently
+// "health-blind": it was ever bound to a container (its device_id is already
+// on-wire exposed) yet the anti-corr fail-closed gate is presently skipping it
+// from the normal background health probe (RequireProvisionedBlocked is true —
+// typically because its container-liveness heartbeat went stale after the
+// container died). Such an account would otherwise silently keep its last cached
+// (green) health view forever while no mechanism re-checks it.
+//
+// It is the explicit "健康盲区" signal for D2/B1: the anti-corr leak-prevention
+// semantics are NOT relaxed (the gate itself is unchanged and still blocks the
+// normal poller), but callers can surface this predicate to render the account
+// gray + alert (management UI) and/or to drive the serving-independent liveness
+// probe, instead of leaving the account falsely green. It returns false whenever
+// the gate is disarmed (nothing is being blocked) or the account was never bound
+// (never health-probed in the first place, and must not be to avoid a leak).
+func FarmHealthBlind(auth *Auth) bool {
+	if auth == nil {
+		return false
+	}
+	if strings.ToLower(strings.TrimSpace(auth.Provider)) != "claude" {
+		return false
+	}
+	if !AuthFarmEnrolled(auth) {
+		return false
+	}
+	if !AuthEverBoundToContainer(auth) {
+		return false
+	}
+	return forkRequireProvisionedBlocked(auth)
+}
+
 // device_id_source enum values for the farm telemetry contract. These string
 // constants are the single source of truth shared with the management
 // projection (GET /auth-files/account-settings) and, downstream, the frontend
