@@ -245,7 +245,15 @@ func (h *Handler) refreshDueQuotaSnapshots(ctx context.Context, policy QuotaSnap
 		// implicit skip does not pin them forever; the next-refresh schedule below
 		// still throttles re-probing so genuinely unauthorized accounts are not
 		// hammered.
-		if quotaSnapshotImplicitRefreshSkipped(auth) && !quotaSnapshotAuthRecovered(auth) {
+		// farm-account-liveness F1 (detection-only self-heal): a farm account
+		// carrying the probe-set authoritative lock would otherwise be skipped
+		// forever (implicit-skip + not-"recovered" because Status!=Active), leaving
+		// a genuinely recovered credential pinned red with no re-prober when the
+		// liveness probe is not armed. farmLivenessRecoveryReprobeEligible lets the
+		// poller keep re-probing exactly those accounts (throttled by their normal
+		// next-refresh schedule, so a truly revoked token is not hammered); a
+		// successful re-probe then clears the lock via the success path above.
+		if quotaSnapshotImplicitRefreshSkipped(auth) && !quotaSnapshotAuthRecovered(auth) && !farmLivenessRecoveryReprobeEligible(auth) {
 			continue
 		}
 		legacyUnsupported := quotaSnapshotLegacyUnsupportedProviderError(auth)
@@ -514,6 +522,21 @@ func (h *Handler) refreshQuotaSnapshot(ctx context.Context, auth *coreauth.Auth,
 	// reachable/healthy again, so release any lingering health-blind marker.
 	delete(updated.Metadata, farmHealthBlindMetadataKey)
 	delete(updated.Metadata, farmHealthBlindAtMetadataKey)
+	// farm-account-liveness F1 (symmetric recovery): a single successful quota
+	// probe proves the credential is valid, so reset the auth-failure streak and
+	// reliably CLEAR any authoritative probe-set lock. This is unconditional (not
+	// flag-gated): recovery must always work, even if detection was disarmed after
+	// a lock was written, so an account is never pinned red with no way out.
+	// ClearCredentialUnauthorized only clears the probe-set lock — it never
+	// reopens a refresh-token-reuse lock or an operator's explicit refresh-disable.
+	farmLivenessResetAuthFailure(updated.Metadata)
+	if updated.ClearCredentialUnauthorized(now) {
+		log.WithFields(log.Fields{
+			"auth_id":  updated.ID,
+			"provider": updated.Provider,
+			"event":    "farm_liveness_quota_recovered",
+		}).Warn("farm liveness: quota probe succeeded; cleared authoritative credential-unauthorized lock")
+	}
 	updated.Metadata[quotaLastRefreshedMetadataKey] = now.Format(time.RFC3339)
 	updated.Metadata[quotaNextRefreshMetadataKey] = quotaSnapshotNextRefreshTime(updated, now, policy).Format(time.RFC3339)
 	if planType != "" {
@@ -653,8 +676,32 @@ func (h *Handler) persistQuotaSnapshotError(ctx context.Context, auth *coreauth.
 	// account keep showing green. Escalate it into the same authoritative
 	// reauth-required lock a terminal refresh failure writes, so the quota
 	// probe layer becomes a real trigger source for the account going red.
-	if farmLivenessDetectionEnabled() && status == quotaRefreshStatusReauthRequired {
-		updated.MarkCredentialUnauthorized(now)
+	//
+	// Guards (review F1/F1b): (1) 2-STRIKE — a single 401/403 must NOT lock; a
+	// lone WAF/rate-limit 403 or a flaky 401 is common and would false-lock a
+	// healthy account. We require farmLivenessAuthFailThreshold consecutive
+	// confirmations within the window (mirroring the serving auto-quarantine
+	// 401×2 model); before that we only keep the sub-field. (2) FARM-SCOPED —
+	// only farm-enrolled accounts escalate, so this never touches production /
+	// non-farm claude+codex accounts.
+	if farmLivenessDetectionEnabled() && status == quotaRefreshStatusReauthRequired && coreauth.AuthFarmEnrolled(updated) {
+		streak := farmLivenessRecordAuthFailure(updated.Metadata, now)
+		if streak >= farmLivenessAuthFailThreshold {
+			updated.MarkCredentialUnauthorized(now)
+			log.WithFields(log.Fields{
+				"auth_id":  updated.ID,
+				"provider": updated.Provider,
+				"streak":   streak,
+				"event":    "farm_liveness_quota_unauthorized_escalated",
+			}).Warn("farm liveness: quota probe confirmed credential unauthorized to threshold; marked reauth-required")
+		} else {
+			log.WithFields(log.Fields{
+				"auth_id":  updated.ID,
+				"provider": updated.Provider,
+				"streak":   streak,
+				"event":    "farm_liveness_quota_unauthorized_streak",
+			}).Warn("farm liveness: quota probe unauthorized below threshold; not escalated yet")
+		}
 	}
 
 	updated.UpdatedAt = now

@@ -237,5 +237,11 @@ metadata契约键-档位覆盖	TierOverrideMetadataKey	symbol	^const TierOverrid
 反关联-farm存活探针	权威化默认关灰度开关	pattern	FarmLivenessDetectionEnvVar = "FARM_LIVENESS_DETECTION_ENABLED"	internal/api/handlers/management/farm_liveness.go
 反关联-farm存活探针	存活探针loop接线到server	pattern	StartFarmLivenessProbe\(	internal/api/server.go
 反关联-farm存活探针	配额层授权吊销权威化接线	pattern	updated\.MarkCredentialUnauthorized\(now\)	internal/api/handlers/management/quota_snapshots.go
+反关联-farm存活探针	对称恢复清锁	symbol	^func \(a \*Auth\) ClearCredentialUnauthorized\(	sdk/cliproxy/auth/types.go
+反关联-farm存活探针	探针锁判别谓词	symbol	^func IsCredentialUnauthorizedLock\(	sdk/cliproxy/auth/types.go
+反关联-farm存活探针	2-strike阈值防单次误锁	pattern	farmLivenessAuthFailThreshold = 2	internal/api/handlers/management/farm_liveness.go
+反关联-farm存活探针	升级仅限农场号	pattern	coreauth\.AuthFarmEnrolled\(updated\)	internal/api/handlers/management/quota_snapshots.go
+反关联-farm存活探针	配额成功对称恢复接线	pattern	updated\.ClearCredentialUnauthorized\(now\)	internal/api/handlers/management/quota_snapshots.go
+反关联-farm存活探针	锁号再探自愈接线	pattern	farmLivenessRecoveryReprobeEligible\(auth\)	internal/api/handlers/management/quota_snapshots.go
 fork文件-反关联支撑	farm_liveness.go	file	-	internal/api/handlers/management/farm_liveness.go
 fork文件-反关联支撑	farm_liveness_probe.go	file	-	internal/api/handlers/management/farm_liveness_probe.go

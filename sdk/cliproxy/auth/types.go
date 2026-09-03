@@ -1047,6 +1047,65 @@ func (a *Auth) MarkCredentialUnauthorized(now time.Time) {
 	a.markRefreshReauthRequiredWithReason(now, CredentialUnauthorizedReauthCode)
 }
 
+// IsCredentialUnauthorizedLock reports whether metadata carries the AUTOMATIC
+// reauth-required lock specifically written by MarkCredentialUnauthorized (a
+// background probe-confirmed credential-unauthorized), as opposed to a
+// refresh-token-reuse / invalid_grant refresh lock or an operator's explicit
+// refresh-disable. It is the discriminator the recovery path and the poller's
+// re-probe-for-recovery gate use so a probe-set lock can be cleared/re-checked
+// without ever touching the refresh-loop locks (which concern the refresh token,
+// not the access-token credential a probe revalidates).
+func IsCredentialUnauthorizedLock(meta map[string]any) bool {
+	if !isReauthRequiredMetadata(meta) {
+		return false
+	}
+	code, _ := meta["refresh_error_code"].(string)
+	return code == CredentialUnauthorizedReauthCode
+}
+
+// ClearCredentialUnauthorized releases the lock MarkCredentialUnauthorized wrote,
+// and ONLY that lock. It is the symmetric recovery counterpart: a single
+// successful background probe (quota/profile refresh or the liveness probe)
+// proves the credential is valid again and MUST reliably clear the authoritative
+// red state so a recovered account is never pinned forever (review F1: the prior
+// design's recovery was broken). It is a no-op unless the record currently
+// carries the probe-set lock (IsCredentialUnauthorizedLock); it deliberately
+// NEVER clears a refresh-token-reuse / invalid_grant lock (those concern the
+// refresh token, which an access-token probe success does not revalidate) nor an
+// operator's explicit refresh-disable. Returns whether it cleared anything.
+func (a *Auth) ClearCredentialUnauthorized(now time.Time) bool {
+	if a == nil || !IsCredentialUnauthorizedLock(a.Metadata) {
+		return false
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	for _, key := range []string{
+		"refresh_disabled",
+		"refresh_status",
+		"refresh_error_code",
+		"refresh_disabled_reason",
+		"reauth_required",
+		"refresh_disabled_at",
+		"last_refresh_error",
+	} {
+		delete(a.Metadata, key)
+	}
+	if a.StatusMessage == "reauth_required" {
+		a.StatusMessage = ""
+	}
+	if a.Status == StatusError {
+		a.Status = StatusActive
+	}
+	a.Unavailable = false
+	if a.LastError != nil && a.LastError.Code == "reauth_required" {
+		a.LastError = nil
+	}
+	a.NextRefreshAfter = time.Time{}
+	a.UpdatedAt = now
+	return true
+}
+
 // ApplyReauthRequiredStateFromMetadata restores the terminal reauth-required
 // lock written by markRefreshReauthRequiredWithReason from persisted metadata
 // into the runtime Status/StatusMessage/Unavailable/LastError fields the

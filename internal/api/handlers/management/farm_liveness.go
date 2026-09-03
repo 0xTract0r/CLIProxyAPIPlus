@@ -93,6 +93,102 @@ const (
 	healthBlindQuotaErrorMessage = "container liveness heartbeat stale; account skipped by the anti-corr fail-closed gate and cannot be health-probed (health-blind)"
 )
 
+const (
+	// farmLivenessAuthFailStreakKey / farmLivenessAuthFailStreakAtKey persist the
+	// consecutive probe-confirmed credential-unauthorized streak (count + window
+	// start, RFC3339 UTC) shared by BOTH the quota poller and the liveness probe.
+	// It mirrors the existing serving auto-quarantine 401×2 model: a single
+	// confirmed 401/403 is NOT trusted (a lone WAF/rate-limit 403 or a flaky 401
+	// must never lock a healthy account, review F1); only farmLivenessAuthFailThreshold
+	// consecutive confirmations WITHIN farmLivenessAuthFailWindow, with no
+	// intervening success, escalate to the authoritative lock. Any success resets
+	// it; a transient/retryable error neither advances nor resets it.
+	farmLivenessAuthFailStreakKey   = "farm_liveness_authfail_streak"
+	farmLivenessAuthFailStreakAtKey = "farm_liveness_authfail_streak_at"
+	// farmLivenessAuthFailThreshold is the number of consecutive confirmed
+	// credential-unauthorized probe results required to write the authoritative
+	// lock (2, mirroring authAutoQuarantineFailureThreshold).
+	farmLivenessAuthFailThreshold = 2
+	// farmLivenessAuthFailWindow is how long a partial streak survives without a
+	// new confirmation before it is considered stale and restarts at 1. It is set
+	// generously (well above the 45m default quota interval and the 30m probe
+	// staleness throttle) so two SLOW scheduled probes both land inside it, unlike
+	// the serving auto-quarantine window which is fed by frequent live 401s.
+	farmLivenessAuthFailWindow = 3 * time.Hour
+)
+
+// farmLivenessRecordAuthFailure advances the persisted terminal-auth-failure
+// streak on meta and returns the new streak count. A missing or window-expired
+// streak restarts at 1; otherwise it increments. Once at/above the threshold
+// (already locked) it stays pinned at the threshold and only refreshes the
+// window (no unbounded growth, but the streak stays "recent" while we keep
+// re-confirming a revoked account for recovery). Callers own meta exclusively.
+func farmLivenessRecordAuthFailure(meta map[string]any, now time.Time) int {
+	if meta == nil {
+		return 0
+	}
+	streak := metadataInt(meta, farmLivenessAuthFailStreakKey)
+	if streak >= farmLivenessAuthFailThreshold {
+		meta[farmLivenessAuthFailStreakKey] = farmLivenessAuthFailThreshold
+		meta[farmLivenessAuthFailStreakAtKey] = now.UTC().Format(time.RFC3339)
+		return farmLivenessAuthFailThreshold
+	}
+	startAt, ok := metadataTime(meta, farmLivenessAuthFailStreakAtKey)
+	if streak <= 0 || !ok || now.Sub(startAt) > farmLivenessAuthFailWindow {
+		streak = 1
+		meta[farmLivenessAuthFailStreakAtKey] = now.UTC().Format(time.RFC3339)
+	} else {
+		streak++
+	}
+	meta[farmLivenessAuthFailStreakKey] = streak
+	return streak
+}
+
+// farmLivenessResetAuthFailure clears the streak bookkeeping. Called on every
+// successful probe so a recovered account starts clean.
+func farmLivenessResetAuthFailure(meta map[string]any) {
+	if meta == nil {
+		return
+	}
+	delete(meta, farmLivenessAuthFailStreakKey)
+	delete(meta, farmLivenessAuthFailStreakAtKey)
+}
+
+// farmLivenessRecoveryReprobeEligible reports whether the background quota poller
+// should keep re-probing an account it would otherwise skip forever, purely to
+// detect RECOVERY. It fires only for a farm-enrolled account carrying the
+// probe-set authoritative lock (coreauth.IsCredentialUnauthorizedLock) while the
+// detection flag is armed — so a genuinely recovered credential self-heals even
+// in detection-only mode (no liveness probe armed), instead of being pinned red
+// with no way out (review F1). The account's own next-refresh schedule still
+// throttles the re-probe to the normal interval, so a truly-revoked token is not
+// hammered. It never re-opens a refresh-token-reuse lock or an operator disable.
+func farmLivenessRecoveryReprobeEligible(auth *coreauth.Auth) bool {
+	if auth == nil {
+		return false
+	}
+	return farmLivenessDetectionEnabled() &&
+		coreauth.AuthFarmEnrolled(auth) &&
+		coreauth.IsCredentialUnauthorizedLock(auth.Metadata)
+}
+
+// metadataInt reads an integer metadata value, tolerating the float64 form that
+// JSON round-tripping produces on reload as well as native int/int64.
+func metadataInt(meta map[string]any, key string) int {
+	if meta == nil {
+		return 0
+	}
+	switch v := meta[key].(type) {
+	case int:
+		return v
+	case int64:
+		return int(v)
+	case float64:
+		return int(v)
+	}
+	return 0
+}
+
 // farmLivenessDetectionEnabled reports whether Phase 1 authoritative escalation
 // is armed. Allowlist parse (only a recognized truthy token arms it); unset /
 // empty / unrecognized leaves it off, so a deployment never silently escalates

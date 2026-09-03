@@ -249,22 +249,26 @@ func RequireProvisionedBlocked(auth *Auth) bool {
 	return forkRequireProvisionedBlocked(auth)
 }
 
-// AuthEverBoundToContainer reports whether a Claude account was ever bound to a
-// real container device_id — either it currently carries a valid binding
-// (DeviceIDSourceContainerSynced) or a residual, now-invalid binding that once
-// existed (DeviceIDSourceDrift). It reuses the canonical ClaudeDeviceIDSource
-// derivation so it can never disagree with the supply-atomicity gate's own
-// container_synced classification.
+// AuthEverBoundToContainer reports whether a Claude account currently carries a
+// VALID container device_id binding (DeviceIDSourceContainerSynced). It reuses
+// the canonical ClaudeDeviceIDSource derivation so it can never disagree with
+// the supply-atomicity gate's own container_synced classification.
 //
 // This is the leak-safety boundary the serving-independent farm liveness probe
-// keys on: an ever-bound account has ALREADY exposed its synthetic/managed
+// keys on: a container_synced account has ALREADY exposed exactly this managed
 // device identity on-wire during real serving/quota egress, so re-probing it
-// adds no NEW leak surface. An account that was never bound (pure synthetic,
-// DeviceIDSourceSynthetic) must never be probed — that is exactly the leak the
-// RequireProvisionedBlocked gate prevents — so this returns false for it.
+// adds no NEW leak surface.
+//
+// DeviceIDSourceDrift is DELIBERATELY excluded (review F2): a drift account's
+// runtime attribute mirror was cleared (its persisted device_id no longer
+// validates), so a probe would fall back to the per-account SYNTHETIC device_id
+// and could first-expose it on-wire — a new leak. Only a currently-valid,
+// already-on-wire binding is treated as ever-bound-and-safe-to-probe; a
+// never-bound synthetic account and a drifted one both return false and are
+// never probed (the RequireProvisionedBlocked gate keeps blocking them).
 func AuthEverBoundToContainer(auth *Auth) bool {
 	source, _ := ClaudeDeviceIDSource(auth)
-	return source == DeviceIDSourceContainerSynced || source == DeviceIDSourceDrift
+	return source == DeviceIDSourceContainerSynced
 }
 
 // FarmHealthBlind reports whether a farm-enrolled Claude account is currently

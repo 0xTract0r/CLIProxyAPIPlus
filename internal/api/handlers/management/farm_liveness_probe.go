@@ -184,11 +184,15 @@ func (h *Handler) probeAccountLiveness(ctx context.Context, manager *coreauth.Ma
 	h.applyLivenessProbeTransient(ctx, manager, auth, now, err)
 }
 
-// applyLivenessProbeUnauthorized escalates a probe-confirmed credential
-// unauthorized into the authoritative reauth-required lock (A3 closing back into
-// Phase 1's C1). It runs whenever the probe loop is armed — the probe IS the
-// authoritative detector for idle accounts, so it does not depend on the Phase 1
-// detection flag. The quota sub-field is also written for quota-card consistency.
+// applyLivenessProbeUnauthorized records a probe-confirmed credential
+// unauthorized and, only once it reaches the 2-strike threshold, escalates it
+// into the authoritative reauth-required lock (A3 closing back into Phase 1's
+// C1). It shares the SAME persisted streak as the quota poller, so a single
+// probe 401/403 never locks a healthy account (review F1); confirmations from
+// either mechanism cooperate toward the threshold. It runs whenever the probe
+// loop is armed — the probe IS the authoritative detector for idle accounts, so
+// it does not depend on the Phase 1 detection flag. The quota sub-field is also
+// written for quota-card consistency.
 func (h *Handler) applyLivenessProbeUnauthorized(ctx context.Context, manager *coreauth.Manager, auth *coreauth.Auth, message string, now time.Time, policy QuotaSnapshotRefreshPolicy) {
 	updated := auth.Clone()
 	if updated.Metadata == nil {
@@ -198,31 +202,44 @@ func (h *Handler) applyLivenessProbeUnauthorized(ctx context.Context, manager *c
 	updated.Metadata[quotaRefreshErrorMetadataKey] = message
 	updated.Metadata[quotaNextRefreshMetadataKey] = quotaSnapshotNextRefreshTime(updated, now, policy).Format(time.RFC3339)
 	updated.Metadata[farmLivenessProbedAtMetadataKey] = now.Format(time.RFC3339)
-	// A health-blind account that a probe just confirmed dead is no longer merely
-	// blind — it has a concrete authoritative reason. Release the softer marker.
-	delete(updated.Metadata, farmHealthBlindMetadataKey)
-	delete(updated.Metadata, farmHealthBlindAtMetadataKey)
-	updated.MarkCredentialUnauthorized(now)
+
+	streak := farmLivenessRecordAuthFailure(updated.Metadata, now)
+	escalated := streak >= farmLivenessAuthFailThreshold
+	if escalated {
+		// A health-blind account that a probe just confirmed dead to threshold is
+		// no longer merely blind — it has a concrete authoritative reason. Release
+		// the softer marker and write the authoritative lock.
+		delete(updated.Metadata, farmHealthBlindMetadataKey)
+		delete(updated.Metadata, farmHealthBlindAtMetadataKey)
+		updated.MarkCredentialUnauthorized(now)
+	}
 	updated.UpdatedAt = now
 	if _, err := manager.Update(ctx, updated); err != nil && !isContextCanceled(err) {
-		log.WithError(err).Debugf("farm liveness probe: unauthorized escalation failed for %s/%s", auth.Provider, auth.ID)
+		log.WithError(err).Debugf("farm liveness probe: unauthorized write failed for %s/%s", auth.Provider, auth.ID)
 		return
+	}
+	event := "farm_liveness_probe_unauthorized_streak"
+	msg := "farm liveness probe unauthorized below threshold; not escalated yet"
+	if escalated {
+		event = "farm_liveness_probe_unauthorized_escalated"
+		msg = "farm liveness probe confirmed credential unauthorized to threshold; account marked reauth-required"
 	}
 	log.WithFields(log.Fields{
 		"auth_id":  auth.ID,
 		"provider": auth.Provider,
-		"event":    "farm_liveness_probe_unauthorized",
-	}).Warn("farm liveness probe confirmed credential unauthorized; account marked reauth-required")
+		"streak":   streak,
+		"event":    event,
+	}).Warn(msg)
 }
 
 // applyLivenessProbeSuccess records a successful probe: the account is reachable
 // and its credential is valid. It refreshes the quota snapshot (so the account's
-// health view goes fresh/green), clears any lingering health-blind marker, and —
-// this is the C2 recovery path — releases a previously-set automatic
-// reauth-required lock so a genuinely recovered account is not pinned red forever.
-// clearStaleReauthLockOnSave only clears the AUTOMATIC lock
-// (IsReauthRequiredMetadata); an operator's explicit refresh-disable is left
-// untouched.
+// health view goes fresh/green), resets the auth-failure streak, clears any
+// lingering health-blind marker, and — this is the critical F1 symmetric recovery
+// path — reliably releases a previously-set probe-set reauth-required lock so a
+// genuinely recovered account is never pinned red forever.
+// Auth.ClearCredentialUnauthorized only clears the PROBE-SET lock; it never
+// reopens a refresh-token-reuse lock or an operator's explicit refresh-disable.
 func (h *Handler) applyLivenessProbeSuccess(ctx context.Context, manager *coreauth.Manager, auth *coreauth.Auth, snapshot map[string]any, planType string, now time.Time, policy QuotaSnapshotRefreshPolicy) {
 	updated := auth.Clone()
 	if updated.Metadata == nil {
@@ -239,8 +256,8 @@ func (h *Handler) applyLivenessProbeSuccess(ctx context.Context, manager *coreau
 	if planType != "" {
 		updated.Metadata[quotaSnapshotPlanTypeKey] = planType
 	}
-	recovered := coreauth.IsReauthRequiredMetadata(updated.Metadata)
-	clearStaleReauthLockOnSave(updated)
+	farmLivenessResetAuthFailure(updated.Metadata)
+	recovered := updated.ClearCredentialUnauthorized(now)
 	updated.UpdatedAt = now
 	if _, err := manager.Update(ctx, updated); err != nil && !isContextCanceled(err) {
 		log.WithError(err).Debugf("farm liveness probe: success write failed for %s/%s", auth.Provider, auth.ID)
@@ -251,7 +268,7 @@ func (h *Handler) applyLivenessProbeSuccess(ctx context.Context, manager *coreau
 			"auth_id":  auth.ID,
 			"provider": auth.Provider,
 			"event":    "farm_liveness_probe_recovered",
-		}).Info("farm liveness probe succeeded; cleared automatic reauth-required lock")
+		}).Warn("farm liveness probe succeeded; cleared authoritative credential-unauthorized lock")
 	}
 }
 

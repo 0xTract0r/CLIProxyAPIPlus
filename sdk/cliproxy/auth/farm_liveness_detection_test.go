@@ -55,9 +55,9 @@ func TestAuthEverBoundToContainer(t *testing.T) {
 			want: true,
 		},
 		{
-			name: "drift residual invalid binding is ever-bound",
+			name: "drift residual invalid binding is NOT ever-bound (F2: mirror cleared, probing could first-expose synthetic id)",
 			auth: &Auth{Provider: "claude", Metadata: map[string]any{ClaudeDeviceIDMetadataKey: "not-a-valid-device-id"}},
-			want: true,
+			want: false,
 		},
 		{
 			name: "synthetic (never bound) is NOT ever-bound (leak boundary)",
@@ -137,27 +137,74 @@ func TestFarmHealthBlindFalseWhenGateDisarmed(t *testing.T) {
 	}
 }
 
-// TestClearStaleReauthLockRecoversCredentialUnauthorized proves the recovery
-// contract: the automatic lock MarkCredentialUnauthorized writes is releasable
-// (the successful-probe / manual-reauth path), and IsReauthRequiredMetadata is
-// the discriminator used to distinguish it from an operator's explicit
-// refresh-disable.
-func TestClearStaleReauthLockRecoversCredentialUnauthorized(t *testing.T) {
+// TestClearCredentialUnauthorizedSymmetricRecovery proves the F1 symmetric
+// recovery contract: ClearCredentialUnauthorized fully releases the probe-set
+// lock (status back to active, RefreshDisabled false, lock metadata gone).
+func TestClearCredentialUnauthorizedSymmetricRecovery(t *testing.T) {
 	now := time.Now().UTC()
 	auth := &Auth{ID: "claude-1", Provider: "claude"}
 	auth.MarkCredentialUnauthorized(now)
-	if !IsReauthRequiredMetadata(auth.Metadata) {
-		t.Fatal("precondition: lock must be set")
+	if !IsCredentialUnauthorizedLock(auth.Metadata) {
+		t.Fatal("precondition: probe-set lock must be present")
 	}
-	// The management-layer clear (clearStaleReauthLockOnSave) removes exactly these
-	// keys on a successful probe/reauth; mirror the metadata-key contract here.
-	for _, key := range []string{"reauth_required", "refresh_status", "refresh_error_code", "refresh_disabled_reason", "refresh_disabled"} {
-		delete(auth.Metadata, key)
+
+	if !auth.ClearCredentialUnauthorized(now) {
+		t.Fatal("ClearCredentialUnauthorized should report it cleared the lock")
 	}
-	if IsReauthRequiredMetadata(auth.Metadata) {
-		t.Fatal("after clearing the lock keys IsReauthRequiredMetadata must be false")
+	if IsReauthRequiredMetadata(auth.Metadata) || IsCredentialUnauthorizedLock(auth.Metadata) {
+		t.Fatal("after clear the reauth-required lock must be gone")
 	}
 	if auth.RefreshDisabled() {
-		t.Fatal("after clearing the lock keys RefreshDisabled must be false (account can refresh again)")
+		t.Fatal("after clear RefreshDisabled must be false (account can refresh again)")
+	}
+	if auth.Status != StatusActive {
+		t.Fatalf("after clear Status = %v, want StatusActive", auth.Status)
+	}
+	if auth.Unavailable {
+		t.Fatal("after clear Unavailable must be false")
+	}
+}
+
+// TestClearCredentialUnauthorizedIgnoresRefreshTokenReuseLock is the critical
+// safety boundary: an access-token probe success must NOT clear a refresh-token
+// reuse / invalid_grant lock (which concerns the refresh token, not revalidated
+// by an access-token probe). ClearCredentialUnauthorized clears ONLY its own lock.
+func TestClearCredentialUnauthorizedIgnoresRefreshTokenReuseLock(t *testing.T) {
+	now := time.Now().UTC()
+	auth := &Auth{ID: "claude-1", Provider: "claude"}
+	auth.MarkRefreshReauthRequired(now) // refresh_token_reused lock, NOT credential_unauthorized
+	if !IsReauthRequiredMetadata(auth.Metadata) {
+		t.Fatal("precondition: refresh-reuse lock must be present")
+	}
+	if IsCredentialUnauthorizedLock(auth.Metadata) {
+		t.Fatal("a refresh-reuse lock must NOT be classified as a credential-unauthorized lock")
+	}
+
+	if auth.ClearCredentialUnauthorized(now) {
+		t.Fatal("ClearCredentialUnauthorized must be a no-op on a refresh-reuse lock")
+	}
+	if !IsReauthRequiredMetadata(auth.Metadata) {
+		t.Fatal("the refresh-reuse lock must survive ClearCredentialUnauthorized")
+	}
+}
+
+func TestIsCredentialUnauthorizedLock(t *testing.T) {
+	now := time.Now().UTC()
+
+	probe := &Auth{Provider: "claude"}
+	probe.MarkCredentialUnauthorized(now)
+	if !IsCredentialUnauthorizedLock(probe.Metadata) {
+		t.Fatal("probe-set lock should be recognized")
+	}
+
+	reuse := &Auth{Provider: "claude"}
+	reuse.MarkRefreshReauthRequired(now)
+	if IsCredentialUnauthorizedLock(reuse.Metadata) {
+		t.Fatal("refresh-reuse lock must NOT be recognized as credential-unauthorized")
+	}
+
+	operatorDisabled := &Auth{Provider: "claude", Metadata: map[string]any{"refresh_disabled": true}}
+	if IsCredentialUnauthorizedLock(operatorDisabled.Metadata) {
+		t.Fatal("an operator refresh-disable (no reauth_required) must NOT be recognized")
 	}
 }
