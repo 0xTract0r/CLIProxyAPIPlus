@@ -111,6 +111,12 @@ type Config struct {
 	// Routing controls credential selection behavior.
 	Routing RoutingConfig `yaml:"routing" json:"routing"`
 
+	// AccountScheduling configures the adaptive account-scheduling subsystem
+	// (tier/quota-aware weighting, per-account rate limiting, new-account
+	// warm-up curve) consumed when Routing.Strategy is RoutingStrategyAdaptive.
+	// See account_scheduling.go.
+	AccountScheduling AccountSchedulingConfig `yaml:"account-scheduling" json:"account-scheduling"`
+
 	// WebsocketAuth enables or disables authentication for the WebSocket API.
 	WebsocketAuth bool `yaml:"ws-auth" json:"ws-auth"`
 

@@ -237,7 +237,13 @@ type QuotaExceeded struct {
 // RoutingConfig configures how credentials are selected for requests.
 type RoutingConfig struct {
 	// Strategy selects the credential selection strategy.
-	// Supported values: "round-robin" (default), "fill-first".
+	// Supported values: "round-robin" (default), "fill-first", "adaptive".
+	// "adaptive" (openspec/changes/add-adaptive-account-scheduling) opts into
+	// tier/quota-aware weighted selection driven by the AccountScheduling
+	// config section (see RoutingStrategyAdaptive, AccountSchedulingConfig).
+	// Selector wiring for "adaptive" lands in a later phase of that change;
+	// until then this value is accepted by config but falls back to
+	// round-robin selection, same as any other unrecognized value.
 	Strategy string `yaml:"strategy,omitempty" json:"strategy,omitempty"`
 
 	// ClaudeCodeSessionAffinity enables session-sticky routing for Claude Code clients.

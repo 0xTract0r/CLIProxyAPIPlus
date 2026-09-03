@@ -311,21 +311,53 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			}
 			execOpts := opts
 			execReq, execOpts = applyRequestAfterAuthInterceptor(execCtx, executor, provider, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
-			resp, errExec := executor.Execute(execCtx, auth, execReq, execOpts)
-			if errExec != nil {
-				if errCtx := execCtx.Err(); errCtx != nil {
-					return cliproxyexecutor.Response{}, errCtx
+			var resp cliproxyexecutor.Response
+			var errExec error
+			var ctxErr error
+			concurrencyBusy := false
+			func() {
+				// Adaptive account scheduling (Phase 2): reserve this account's
+				// in-flight concurrency slot and record its UTC-daily request
+				// around the actual upstream call. release is deferred so the
+				// slot is freed on EVERY exit of this closure -- success, error,
+				// ctx-cancel early return, or a panic unwinding through
+				// executor.Execute -- because a leaked slot would count the
+				// account permanently busy and drop it out of selection forever.
+				slot, within := m.beginAccountExecution(auth)
+				defer slot.release()
+				if !within {
+					// At the concurrency ceiling and nothing sent yet: fail over
+					// to another credential (execution-side 二次防御) rather than
+					// exceed the ceiling.
+					concurrencyBusy = true
+					return
 				}
-				if refreshed, okRefresh := m.tryRefreshAfterUnauthorized(execCtx, auth, errExec, didRefreshOnUnauthorized); okRefresh {
-					auth = refreshed
-					didRefreshOnUnauthorized = true
-					resp, errExec = executor.Execute(execCtx, auth, execReq, execOpts)
-					if errExec != nil {
-						if errCtx := execCtx.Err(); errCtx != nil {
-							return cliproxyexecutor.Response{}, errCtx
+				slot.recordRequest()
+				resp, errExec = executor.Execute(execCtx, auth, execReq, execOpts)
+				if errExec != nil {
+					if errCtx := execCtx.Err(); errCtx != nil {
+						ctxErr = errCtx
+						return
+					}
+					if refreshed, okRefresh := m.tryRefreshAfterUnauthorized(execCtx, auth, errExec, didRefreshOnUnauthorized); okRefresh {
+						auth = refreshed
+						didRefreshOnUnauthorized = true
+						resp, errExec = executor.Execute(execCtx, auth, execReq, execOpts)
+						if errExec != nil {
+							if errCtx := execCtx.Err(); errCtx != nil {
+								ctxErr = errCtx
+								return
+							}
 						}
 					}
 				}
+			}()
+			if ctxErr != nil {
+				return cliproxyexecutor.Response{}, ctxErr
+			}
+			if concurrencyBusy {
+				lastErr = errAccountConcurrencyBusy(auth.ID)
+				break
 			}
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil}
 			if errExec != nil {

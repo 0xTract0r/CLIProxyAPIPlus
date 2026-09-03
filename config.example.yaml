@@ -221,7 +221,12 @@ quota-exceeded:
 
 # Routing strategy for selecting credentials when multiple match.
 routing:
-  strategy: "round-robin" # round-robin (default), fill-first
+  strategy: "round-robin" # round-robin (default), fill-first, adaptive
+  # "adaptive" (fork, openspec/changes/add-adaptive-account-scheduling) opts into
+  # tier/quota-aware weighted selection + per-account rate limiting + new-account
+  # warm-up throttling, driven by the account-scheduling section below. Selector
+  # wiring for this value lands in a later phase of the same change; until then it
+  # is accepted but falls back to round-robin, same as any other unrecognized value.
   # Enable universal session-sticky routing for all clients.
   # Session IDs are extracted from: metadata.user_id (Claude Code session format),
   # X-Session-ID, Session_id (Codex), X-Amp-Thread-Id (Amp CLI), X-Client-Request-Id (PI),
@@ -230,6 +235,65 @@ routing:
   session-affinity: false # default: false
   # How long session-to-auth bindings are retained. Default: 1h
   session-affinity-ttl: "1h"
+
+# Adaptive account-scheduling (fork, openspec/changes/add-adaptive-account-scheduling).
+# Only takes effect when routing.strategy above is "adaptive"; otherwise ignored.
+# All values below are the built-in defaults (design.md §5, derived from a real
+# production account's observed warm-up trajectory) — uncomment to override.
+# account-scheduling:
+#   # Age-based (days since an account's first-production anchor) warm-up stages.
+#   # Must be contiguous ([min,max) with no gaps/overlaps) and only the last stage
+#   # may leave max-age-days unset. Supplying this list replaces it wholesale.
+#   warmup-curve:
+#     - name: "w1"
+#       min-age-days: 0
+#       max-age-days: 7
+#       daily-budget: 200
+#       rpm-limit: 3
+#       concurrency-limit: 1
+#     - name: "w2"
+#       min-age-days: 7
+#       max-age-days: 14
+#       daily-budget: 500
+#       rpm-limit: 5
+#       concurrency-limit: 1
+#     - name: "w3-4"
+#       min-age-days: 14
+#       max-age-days: 30
+#       daily-budget: 2000
+#       rpm-limit: 12
+#       concurrency-limit: 2
+#     - name: "w5-6"
+#       min-age-days: 30
+#       max-age-days: 45
+#       daily-budget: 4500
+#       rpm-limit: 20
+#       concurrency-limit: 2
+#     - name: "w7-8"
+#       min-age-days: 45
+#       max-age-days: 60
+#       daily-budget: 6500
+#       rpm-limit: 30
+#       concurrency-limit: 3
+#   # Safety ceiling for accounts past the last warm-up stage (age >= 60 days).
+#   # Deliberately generous — calibrated above real observed safe peak usage, so
+#   # it only intervenes on pathological bursts, never on normal throughput.
+#   mature-limits:
+#     rpm-limit: 45
+#     burst: 10
+#     concurrency-limit: 4
+#   # Base capacity weight per subscription tier (relative WITHIN one provider
+#   # only — a Claude weight is never compared against a Codex weight).
+#   tier-weights:
+#     claude:
+#       max-20x: 20
+#       max-5x: 5
+#       pro: 1
+#       unknown: 1 # fallback when rate_limit_tier is missing/unrecognized
+#     codex:
+#       pro: 10
+#       plus: 1
+#       unknown: 1 # fallback for team/business/unrecognized chatgpt_plan_type
 
 # Codex provider behavior.
 codex:

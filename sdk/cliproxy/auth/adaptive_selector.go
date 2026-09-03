@@ -1,0 +1,719 @@
+package auth
+
+import (
+	"context"
+	"math/rand"
+	"sort"
+	"strings"
+	"time"
+
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+)
+
+// AdaptiveSelector is the tier/quota/warm-up-aware credential selector for the
+// adaptive account-scheduling change
+// (openspec/changes/add-adaptive-account-scheduling, tasks.md Phase 1 task 1.2 +
+// Phase 2 task 2.2 + Phase 3 task 3.2 + Phase 4 task 4.1). It implements the
+// existing auth.Selector interface, so the routing layer can select it via
+// routing.strategy == internalconfig.RoutingStrategyAdaptive
+// (sdk/cliproxy/service_config.go:newRoutingSelector, a separate wiring slice --
+// this file is deliberately NOT wired in itself).
+//
+// What it composes (all mechanisms owned by earlier sibling slices; this file
+// only orchestrates them into one Selector):
+//
+//   - Weighted selection over the currently-available credentials, using the
+//     pure AccountSelectionWeight score (account_weight.go: tier base capacity x
+//     quota headroom x freshness factor -- design.md D1). Distribution is
+//     proportional to weight, so a Claude Max 20x account承接 more than a Max 5x
+//     account, and an account low on quota headroom承接 less (spec.md "高容量/
+//     高余量账号承接更多").
+//
+//   - Per-account outbound rate limiting (account_rate_limiter.go, design.md
+//     D2): the account a weighted pick lands on must pass its own token bucket
+//     (rpm/burst derived from its warm-up stage / mature ceiling) BEFORE it is
+//     returned. An account over its instantaneous ceiling is skipped in favour
+//     of the next weighted candidate rather than being handed the request and
+//     left to 429 after the fact (spec.md "每账号限流平滑", task 2.2). Because a
+//     warming account's rpm ceiling is tiny (design §5.1: w1 = 3 rpm) while a
+//     mature account's is generous (design §5.3: ~45 rpm), a workflow-style
+//     burst naturally drains a warming account's bucket after a request or two
+//     and then routes to a mature account for the rest -- the "洪峰路由成熟号"
+//     behaviour (design.md D4, task 3.2) falls out of the weight + token-bucket
+//     combination without any explicit flood detector.
+//
+//   - Session stickiness with maturity grading (design.md D5, task 4.1). When
+//     session affinity is enabled this selector maintains its own SessionCache
+//     and reuses the package's existing session-ID extraction
+//     (extractSessionIDs in selector.go -- NOT re-implemented) so it can see
+//     cache hits directly and grade them, which an outer SessionAffinitySelector
+//     wrapper could not (that wrapper short-circuits on a cache hit and never
+//     consults the inner selector). Therefore the routing wiring MUST build this
+//     selector with SessionAffinity set and MUST NOT additionally wrap it in a
+//     SessionAffinitySelector.
+//
+// Backward compatibility (design.md D7): a provider this scheduler has no tier
+// weight for (anything other than claude/codex, or a tier configured to weight
+// 0) yields no weighted candidate and falls through to the wrapped fallback
+// selector (round-robin by default), so non-Claude/Codex traffic behaves exactly
+// as it does today. If every weighted candidate is momentarily rate-limited the
+// request is still never denied: the overflow is served by a WEIGHTED draw over
+// the same adaptive candidates (still proportional to tier capacity), and only a
+// genuinely non-adaptive / no-candidate pool degrades to the round-robin fallback
+// -- the token bucket is an outbound smoother, never a hard gate that can
+// manufacture a 429 the upstream did not send.
+type AdaptiveSelector struct {
+	// fallback is the base selector used for non-adaptive providers and as the
+	// degraded path when no weighted candidate can currently be served. Never
+	// nil after construction (defaults to &RoundRobinSelector{}).
+	fallback Selector
+
+	// scheduling returns the live AccountSchedulingConfig snapshot to score
+	// against. It is a function (not a stored value) so a hot config reload is
+	// picked up on the next Pick without rebuilding the selector; by default it
+	// closes over the snapshot passed at construction.
+	scheduling func() internalconfig.AccountSchedulingConfig
+
+	// limiter is the per-account token-bucket smoother. Owned (created and
+	// reclaim-looped by this selector) unless injected via
+	// WithAdaptiveRateLimiter, in which case the injector owns its lifecycle.
+	limiter     *AccountRateLimiter
+	ownsLimiter bool
+
+	// gate is the per-account in-flight concurrency semaphore + UTC-daily
+	// request-budget counter (account_gate.go). The selector reads it at Pick
+	// time to avoid an account already at its concurrency ceiling or past its
+	// warm-up daily budget; the auth Manager's execution path drives the same
+	// gate instance (reached via the AccountGate accessor) to acquire/release a
+	// slot and record each request. Always non-nil after construction (created
+	// here unless injected via WithAdaptiveAccountGate). It holds no background
+	// goroutine, so it needs no Stop.
+	gate *AccountConcurrencyGate
+
+	// cache holds session -> auth stickiness bindings. Nil when session
+	// affinity is disabled.
+	cache           *SessionCache
+	sessionAffinity bool
+
+	// now / rng are injectable for deterministic tests (production defaults:
+	// time.Now, rand.Float64). rng MUST return a value in [0,1) and, in
+	// production, MUST be safe for concurrent use (rand.Float64 is).
+	now func() time.Time
+	rng func() float64
+}
+
+// defaultAdaptiveReclaimInterval is how often an owned rate limiter's idle
+// buckets are reclaimed. It only bounds memory for churning accounts and has no
+// effect on rate-limiting decisions, so a coarse cadence is fine.
+const defaultAdaptiveReclaimInterval = 5 * time.Minute
+
+// AdaptiveSelectorConfig is the construction input for NewAdaptiveSelector. It
+// is a struct (rather than positional args) so the routing wiring slice can set
+// only the fields it cares about and so new knobs can be added without breaking
+// that call site.
+type AdaptiveSelectorConfig struct {
+	// Fallback is the base selector for non-adaptive providers and the degraded
+	// (all-rate-limited / no-weighted-candidate) path. Defaults to a
+	// RoundRobinSelector when nil.
+	Fallback Selector
+	// Scheduling is the AccountSchedulingConfig snapshot to score against.
+	// Callers wanting live hot-reload should also pass
+	// WithAdaptiveSchedulingProvider; otherwise this snapshot is used for the
+	// selector's lifetime.
+	Scheduling internalconfig.AccountSchedulingConfig
+	// SessionAffinity enables the design.md D5 sticky-with-grading path. When
+	// false the selector is a pure weighted picker and never binds sessions.
+	SessionAffinity bool
+	// SessionTTL is the stickiness TTL; <=0 defaults to one hour (matching the
+	// existing SessionAffinitySelector default).
+	SessionTTL time.Duration
+}
+
+// AdaptiveSelectorOption customizes an AdaptiveSelector at construction.
+type AdaptiveSelectorOption func(*AdaptiveSelector)
+
+// WithAdaptiveClock injects the wall-clock the selector (and, if it owns one,
+// its rate limiter) reads. nil is ignored. Production uses time.Now.
+func WithAdaptiveClock(now func() time.Time) AdaptiveSelectorOption {
+	return func(s *AdaptiveSelector) {
+		if now != nil {
+			s.now = now
+		}
+	}
+}
+
+// WithAdaptiveRand injects the [0,1) random source used for weighted selection.
+// nil is ignored. The supplied function MUST be safe for concurrent use in
+// production (the default, rand.Float64, is); a test may pass a single-goroutine
+// deterministic source.
+func WithAdaptiveRand(r func() float64) AdaptiveSelectorOption {
+	return func(s *AdaptiveSelector) {
+		if r != nil {
+			s.rng = r
+		}
+	}
+}
+
+// WithAdaptiveRateLimiter injects a rate limiter instead of letting the selector
+// create its own. The injector then owns the limiter's lifecycle (Stop /
+// reclaim loop); the selector will not start a reclaim loop or Stop it. nil is
+// ignored. Useful for sharing one limiter across selectors or for driving it
+// with a mock clock in tests.
+func WithAdaptiveRateLimiter(l *AccountRateLimiter) AdaptiveSelectorOption {
+	return func(s *AdaptiveSelector) {
+		if l != nil {
+			s.limiter = l
+			s.ownsLimiter = false
+		}
+	}
+}
+
+// WithAdaptiveAccountGate injects the per-account concurrency + daily-budget
+// gate instead of letting the selector create its own. Useful for sharing one
+// gate across selectors or for pre-loading counts / driving the UTC clock in
+// tests. nil is ignored.
+func WithAdaptiveAccountGate(g *AccountConcurrencyGate) AdaptiveSelectorOption {
+	return func(s *AdaptiveSelector) {
+		if g != nil {
+			s.gate = g
+		}
+	}
+}
+
+// WithAdaptiveSchedulingProvider makes the selector read config live from fn on
+// every Pick (for hot-reload), overriding the static Scheduling snapshot. nil is
+// ignored.
+func WithAdaptiveSchedulingProvider(fn func() internalconfig.AccountSchedulingConfig) AdaptiveSelectorOption {
+	return func(s *AdaptiveSelector) {
+		if fn != nil {
+			s.scheduling = fn
+		}
+	}
+}
+
+// NewAdaptiveSelector builds an AdaptiveSelector. It creates and starts an owned
+// rate limiter (with an idle-bucket reclaim loop) unless one is injected via
+// WithAdaptiveRateLimiter, and a SessionCache when cfg.SessionAffinity is set.
+// Call Stop to release those resources (the auth Manager does this
+// automatically via the StoppableSelector interface on shutdown / selector
+// replacement).
+func NewAdaptiveSelector(cfg AdaptiveSelectorConfig, opts ...AdaptiveSelectorOption) *AdaptiveSelector {
+	s := &AdaptiveSelector{
+		fallback:        cfg.Fallback,
+		sessionAffinity: cfg.SessionAffinity,
+		now:             time.Now,
+		rng:             rand.Float64,
+	}
+	if s.fallback == nil {
+		s.fallback = &RoundRobinSelector{}
+	}
+	snapshot := cfg.Scheduling
+	s.scheduling = func() internalconfig.AccountSchedulingConfig { return snapshot }
+
+	for _, opt := range opts {
+		if opt != nil {
+			opt(s)
+		}
+	}
+
+	if s.limiter == nil {
+		s.limiter = NewAccountRateLimiter(WithClock(s.now))
+		s.ownsLimiter = true
+	}
+	if s.gate == nil {
+		s.gate = NewAccountConcurrencyGate(WithGateClock(s.now))
+	}
+	if s.sessionAffinity {
+		ttl := cfg.SessionTTL
+		if ttl <= 0 {
+			ttl = time.Hour
+		}
+		s.cache = NewSessionCache(ttl)
+	}
+	if s.ownsLimiter {
+		s.limiter.StartReclaimLoop(defaultAdaptiveReclaimInterval)
+	}
+	return s
+}
+
+// Pick implements Selector. See the type doc for the full strategy.
+func (s *AdaptiveSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
+	now := s.now()
+	available, err := getAvailableAuths(auths, provider, model, now)
+	if err != nil {
+		return nil, err
+	}
+	available = preferCodexWebsocketAuths(ctx, provider, available)
+	cfg := s.scheduling()
+
+	if s.sessionAffinity && s.cache != nil {
+		if picked, handled, reason, sessionID, errPick := s.pickWithAffinity(ctx, provider, model, opts, auths, available, cfg, now); handled {
+			if errPick == nil {
+				s.logPick(ctx, reason, provider, model, sessionID, picked, cfg, now)
+			}
+			return picked, errPick
+		}
+	}
+
+	if picked, ok := s.pickFromCandidates(s.scoreCandidates(available, cfg, now, false), cfg, now); ok {
+		s.logPick(ctx, "weighted-new", provider, model, "", picked, cfg, now)
+		return picked, nil
+	}
+	// Degraded: no adaptive-weighted candidate exists at all (a non-adaptive
+	// provider, or a pool whose every account scores zero weight / is over its
+	// daily budget). A pool that merely has all token buckets momentarily drained
+	// does NOT reach here -- pickFromCandidates serves that as a weighted overflow
+	// above. Serve via the fallback selector rather than deny -- the token bucket
+	// smooths, it never manufactures a 429.
+	picked, errFallback := s.fallback.Pick(ctx, provider, model, opts, auths)
+	if errFallback == nil {
+		s.logPick(ctx, "fallback-degraded", provider, model, "", picked, cfg, now)
+	}
+	return picked, errFallback
+}
+
+// logPick emits exactly one Info line per resolved Pick, mirroring the
+// SessionAffinitySelector log style in selector.go (reusing selectorLogEntry so
+// the request_id field is attached, and truncateSessionID for the session id)
+// and adding the adaptive-specific tier and selection weight. Without it,
+// routing.strategy=adaptive is invisible in main.log: AdaptiveSelector returns
+// directly and bypasses SessionAffinitySelector, whose Info lines are the only
+// per-request account-hit logging today, so V1 could not observe which account
+// each request landed on or the resulting distribution.
+//
+// reason distinguishes the branch that produced the pick so a preserved sticky
+// binding (sticky-keep-*) reads differently from a fresh weighted reselection
+// (rebind-* / weighted-new) or a degraded fallback (fallback-degraded). It is
+// called once per Pick at each mutually-exclusive terminal decision point, so
+// it never double-logs. A nil pick (only reachable on a fallback error path the
+// caller already excludes) is skipped defensively.
+func (s *AdaptiveSelector) logPick(ctx context.Context, reason, provider, model, sessionID string, picked *Auth, cfg internalconfig.AccountSchedulingConfig, now time.Time) {
+	if picked == nil {
+		return
+	}
+	selectorLogEntry(ctx).Infof(
+		"adaptive-select: %s | session=%s auth=%s tier=%s weight=%.3f provider=%s model=%s",
+		reason, truncateSessionID(sessionID), picked.ID, adaptiveTierLabel(picked), AccountSelectionWeight(picked, cfg, now), provider, model,
+	)
+}
+
+// adaptiveTierLabel renders picked's fine-grained subscription tier for the
+// selection log, namespaced by provider (claude -> "max_20x"/"max_5x"/"pro"/
+// "unknown", codex -> "codex_pro"/"codex_plus"/"codex_unknown"). A provider this
+// scheduler does not tier-weight is logged as its raw provider name so a
+// fallback / non-adaptive pick is still legible in main.log.
+func adaptiveTierLabel(a *Auth) string {
+	if a == nil {
+		return "unknown"
+	}
+	switch strings.ToLower(strings.TrimSpace(a.Provider)) {
+	case "claude":
+		return a.ClaudeSubscriptionTier().String()
+	case "codex":
+		return "codex_" + a.CodexSubscriptionTier().String()
+	default:
+		return a.Provider
+	}
+}
+
+// pickWithAffinity handles the session-sticky path (design.md D5). It returns
+// handled=false only when no session identity could be extracted, in which case
+// the caller falls through to the plain weighted pick. When a session identity
+// exists it always fully resolves (bind + return), returning handled=true. It
+// also surfaces the branch reason (for the one-line-per-pick observability log)
+// and the extracted primary session id, both consumed only by the caller's
+// logPick and having no effect on selection.
+func (s *AdaptiveSelector) pickWithAffinity(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths, available []*Auth, cfg internalconfig.AccountSchedulingConfig, now time.Time) (picked *Auth, handled bool, reason, sessionID string, err error) {
+	primaryID, fallbackID := extractSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
+	if primaryID == "" {
+		return nil, false, "", "", nil
+	}
+	cacheKey := provider + "::" + primaryID + "::" + model
+
+	if boundID, ok := s.cache.GetAndRefresh(cacheKey); ok {
+		pickedSticky, stickyReason, errResolve := s.resolveSticky(ctx, provider, model, opts, auths, available, cfg, now, cacheKey, boundID)
+		return pickedSticky, true, stickyReason, primaryID, errResolve
+	}
+	// Inherit a first-turn (short-hash) binding for the full session key so a
+	// conversation does not jump credentials once the assistant reply lands (the
+	// same inheritance the existing SessionAffinitySelector performs).
+	if fallbackID != "" && fallbackID != primaryID {
+		fallbackKey := provider + "::" + fallbackID + "::" + model
+		if boundID, ok := s.cache.Get(fallbackKey); ok {
+			pickedSticky, stickyReason, errResolve := s.resolveSticky(ctx, provider, model, opts, auths, available, cfg, now, cacheKey, boundID)
+			return pickedSticky, true, stickyReason, primaryID, errResolve
+		}
+	}
+	pickedNew, newReason, errSelect := s.selectAndBind(ctx, provider, model, opts, auths, available, cfg, now, cacheKey)
+	return pickedNew, true, newReason, primaryID, errSelect
+}
+
+// resolveSticky applies the design.md D5 maturity grading to an existing sticky
+// binding (boundID) for cacheKey:
+//
+//   - Bound credential no longer available (cooled down / disabled / removed):
+//     reselect and rebind.
+//   - Bound credential is a non-adaptive provider (no tier weight): keep the
+//     binding untouched -- this scheduler owns no smoothing policy for it, so it
+//     behaves exactly like the existing session affinity for those providers.
+//   - Bound credential is mature and within its soft ceiling (token bucket
+//     allows the request): keep the binding, preserving prompt-cache continuity
+//     (spec.md "成熟号软上限内保持粘性").
+//   - Bound credential is mature but at its ceiling (near the risk hard
+//     threshold): reselect and rebind (spec.md "近风控硬阈值才改选").
+//   - Bound credential is still warming AND a mature account is available:
+//     break stickiness and route to that mature account, rebinding so subsequent
+//     turns follow the mature account (spec.md "养号号打破粘性改路由成熟号").
+//   - Bound credential is still warming but NO mature account exists to route to
+//     (an all-warming pool) AND the bound account can still serve: keep the
+//     warming binding (sticky-keep-warming-no-mature). Breaking stickiness here
+//     would only swap one equally-young account for another -- it cannot better
+//     protect the new account and needlessly discards the session's prompt cache.
+//     If instead the bound warming account can no longer serve (hard
+//     rate-limited / daily-budget-spent / concurrency-full) it falls through to a
+//     full-pool reselection, so the session is never wedged on an unservable
+//     binding.
+//
+// The returned reason string labels which grading branch produced the result
+// (for the observability log only; it never affects the selection). "keep"
+// reasons denote a preserved sticky binding, "rebind-*" reasons (inherited from
+// selectAndBind) denote a fresh weighted/fallback reselection.
+func (s *AdaptiveSelector) resolveSticky(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths, available []*Auth, cfg internalconfig.AccountSchedulingConfig, now time.Time, cacheKey, boundID string) (*Auth, string, error) {
+	var bound *Auth
+	for _, candidate := range available {
+		if candidate != nil && candidate.ID == boundID {
+			bound = candidate
+			break
+		}
+	}
+	if bound == nil {
+		return s.selectAndBind(ctx, provider, model, opts, auths, available, cfg, now, cacheKey)
+	}
+	if !s.adaptiveEligible(bound, cfg) {
+		// Non-Claude/Codex sticky target: nothing to grade, keep the binding.
+		// Persist it under cacheKey so a binding reached via the first-turn
+		// fallback-key inheritance path (pickWithAffinity's fallbackID lookup) is
+		// also pinned to the primary/full session key -- mirroring
+		// SessionAffinitySelector's fallback-hit rebind at selector.go:489. On the
+		// main GetAndRefresh hit path this Set is a harmless refresh (GetAndRefresh
+		// already extended the TTL). Without it the primary key is never bound, so
+		// every subsequent turn re-derives from the fallback key via the
+		// non-refreshing Get, and the binding expires at that fallback key's
+		// original (never-extended) TTL mid-session -- the design D5 "成熟号软上限
+		// 内保持粘性" stickiness regression this fixes.
+		s.cache.Set(cacheKey, bound.ID)
+		return bound, "sticky-keep-nonadaptive", nil
+	}
+	if s.isMature(bound, cfg, now) {
+		rpm, burst := s.rateLimitParams(bound, cfg, now)
+		if s.limiter.Allow(bound.ID, rpm, burst) {
+			// Keep the mature-within-soft-ceiling binding, and persist it under
+			// cacheKey for the same reason as the non-adaptive branch above: an
+			// inherited first-turn binding must be pinned to the primary session
+			// key (refreshing its TTL) instead of surviving only under the fallback
+			// key, whose non-refreshing Get would otherwise let the binding expire
+			// at its original TTL mid-session (selector.go:489 rebinds identically
+			// on its fallback hit).
+			s.cache.Set(cacheKey, bound.ID)
+			return bound, "sticky-keep-mature", nil
+		}
+		// At the soft ceiling -> treat as近风控硬阈值, reselect across the pool.
+		return s.selectAndBind(ctx, provider, model, opts, auths, available, cfg, now, cacheKey)
+	}
+	// Warming sticky target. Breaking stickiness is only worthwhile when we can
+	// route onto a MORE-protected (mature) account (design.md D5 "养号号打破粘性
+	// 改路由成熟号"); try that first. With the weighted-overflow pickFromCandidates
+	// this succeeds whenever ANY mature account exists (even one whose bucket is
+	// momentarily drained), so the keep guard below is reached exactly when the
+	// available pool contains no mature account at all.
+	if picked, ok := s.pickFromCandidates(s.scoreCandidates(available, cfg, now, true), cfg, now); ok {
+		s.cache.Set(cacheKey, picked.ID)
+		return picked, "rebind-weighted-mature", nil
+	}
+	// No mature account exists to route to (an all-warming pool). Keep the current
+	// binding AS LONG AS the bound warming account can still serve, so the session
+	// preserves prompt-cache continuity instead of churning credentials every turn
+	// (the all-warming-pool stickiness regression this fixes). This keep guard is
+	// scoped strictly to the "no mature target" case and never overrides an
+	// unservable bound account: a cooled-down / quarantined / removed account is
+	// already absent from `available` (handled by the bound==nil reselect above),
+	// and a hard rate-limited / daily-budget-spent / concurrency-full bound account
+	// fails boundServableForKeep and falls through to the full-pool reselection
+	// below, so we never pin the session to a 429-ing binding.
+	if s.boundServableForKeep(bound, cfg, now) {
+		s.cache.Set(cacheKey, bound.ID)
+		return bound, "sticky-keep-warming-no-mature", nil
+	}
+	// Bound warming account can no longer serve and there is no mature target:
+	// reselect across the full pool (may land on another warming account) rather
+	// than pin the session to an unservable binding.
+	return s.selectAndBind(ctx, provider, model, opts, auths, available, cfg, now, cacheKey)
+}
+
+// boundServableForKeep reports whether the still-warming bound sticky account can
+// serve this request right now, so resolveSticky may keep its binding when no
+// mature account exists to route to (an all-warming pool). It applies the same
+// gating order as pickFromCandidates -- daily budget and concurrency headroom
+// first (neither consumes a token), then the account's own token bucket -- and,
+// exactly like the mature-keep branch, consumes one token on success so the kept
+// account is charged for this request. A false result -- over daily budget, at
+// its concurrency ceiling, or its token bucket momentarily empty (a hard rate
+// limit) -- means the bound account is NOT servable and the caller must reselect
+// rather than wedge the session on it. It deliberately does NOT re-check base
+// availability / quarantine / cooldown: `bound` was found in the already-filtered
+// `available` slice, so its presence there is that check.
+func (s *AdaptiveSelector) boundServableForKeep(a *Auth, cfg internalconfig.AccountSchedulingConfig, now time.Time) bool {
+	if s.overDailyBudget(a, cfg, now) {
+		return false
+	}
+	if !s.hasConcurrencyHeadroom(a, cfg, now) {
+		return false
+	}
+	rpm, burst := s.rateLimitParams(a, cfg, now)
+	return s.limiter.Allow(a.ID, rpm, burst)
+}
+
+// selectAndBind performs a weighted pick over the full available pool and records
+// the result under cacheKey. When the weighted pool yields nothing (a
+// non-adaptive provider, or no scorable candidate at all) it delegates to the
+// fallback selector, still binding the result so the session stays put.
+//
+// The returned reason string labels which sub-path produced the pick
+// ("rebind-weighted" | "rebind-fallback"), for the observability log only -- it
+// never affects selection. The mature-preferring reselection a still-warming
+// sticky target triggers is handled inline by resolveSticky (which also owns the
+// "keep the warming binding when no mature target exists" guard), so this helper
+// itself no longer needs a preferMature mode.
+func (s *AdaptiveSelector) selectAndBind(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths, available []*Auth, cfg internalconfig.AccountSchedulingConfig, now time.Time, cacheKey string) (*Auth, string, error) {
+	if picked, ok := s.pickFromCandidates(s.scoreCandidates(available, cfg, now, false), cfg, now); ok {
+		s.cache.Set(cacheKey, picked.ID)
+		return picked, "rebind-weighted", nil
+	}
+	picked, errPick := s.fallback.Pick(ctx, provider, model, opts, auths)
+	if errPick == nil && picked != nil {
+		s.cache.Set(cacheKey, picked.ID)
+	}
+	return picked, "rebind-fallback", errPick
+}
+
+// adaptiveCandidate pairs a credential with its current selection weight.
+type adaptiveCandidate struct {
+	auth   *Auth
+	weight float64
+}
+
+// scoreCandidates scores every available credential with AccountSelectionWeight,
+// dropping non-positive weights (non-adaptive providers, or a tier configured to
+// weight 0) and -- when matureOnly is set -- every still-warming account. The
+// result is sorted by auth ID so a given rng value maps to a deterministic pick,
+// which keeps weighted selection reproducible in tests.
+func (s *AdaptiveSelector) scoreCandidates(available []*Auth, cfg internalconfig.AccountSchedulingConfig, now time.Time, matureOnly bool) []adaptiveCandidate {
+	candidates := make([]adaptiveCandidate, 0, len(available))
+	for _, candidate := range available {
+		if candidate == nil {
+			continue
+		}
+		if matureOnly && !s.isMature(candidate, cfg, now) {
+			continue
+		}
+		weight := AccountSelectionWeight(candidate, cfg, now)
+		if weight <= 0 {
+			continue
+		}
+		if s.overDailyBudget(candidate, cfg, now) {
+			// Warming account has spent its UTC-daily budget (design §5.1's
+			// primary warm-up throttle). Drop it from this pick so traffic
+			// routes to accounts with budget left -- mature accounts have no
+			// daily cap and so承接 the overflow (design D4). A new UTC day
+			// resets the counter and re-admits the account.
+			continue
+		}
+		candidates = append(candidates, adaptiveCandidate{auth: candidate, weight: weight})
+	}
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].auth.ID < candidates[j].auth.ID })
+	return candidates
+}
+
+// pickFromCandidates draws one credential from candidates proportional to
+// weight, gating each draw on the account's own token bucket: a rate-limited
+// draw is dropped (no token consumed -- AccountRateLimiter.Allow only consumes
+// on success) and the draw repeats over the remaining pool. On the servable path
+// it consumes exactly one token, always for the returned account.
+//
+// It returns ok=false ONLY when candidates is empty (a non-adaptive provider, or
+// a pool whose every account scores zero weight / is over its daily budget),
+// leaving the caller to degrade to the round-robin fallback. When the pool is
+// non-empty but every candidate is momentarily over its own token bucket, it does
+// NOT deny: the token bucket is an outbound smoother, never a hard gate, so it
+// draws one final candidate proportional to weight over the ORIGINAL set and
+// returns it (ok=true). No token is consumed on that overflow draw -- every
+// bucket is empty, there is none to take -- and, critically, the draw stays
+// WEIGHTED (reusing weightedIndex) so a rate-limit overflow keeps routing
+// proportionally to tier capacity instead of collapsing onto the uniform
+// round-robin fallback (which would flatten a Max 20x account into an equal share
+// with a Pro account).
+func (s *AdaptiveSelector) pickFromCandidates(candidates []adaptiveCandidate, cfg internalconfig.AccountSchedulingConfig, now time.Time) (*Auth, bool) {
+	if len(candidates) == 0 {
+		return nil, false
+	}
+	pool := make([]adaptiveCandidate, len(candidates))
+	copy(pool, candidates)
+	for len(pool) > 0 {
+		idx := s.weightedIndex(pool)
+		candidate := pool[idx]
+		if !s.hasConcurrencyHeadroom(candidate.auth, cfg, now) {
+			// Account already at its in-flight concurrency ceiling. Drop it
+			// WITHOUT consuming a rate-limit token (the concurrency check comes
+			// before Allow for exactly this reason) and try the next weighted
+			// candidate; a mature account with a higher ceiling naturally
+			// absorbs the overflow.
+			pool = append(pool[:idx], pool[idx+1:]...)
+			continue
+		}
+		rpm, burst := s.rateLimitParams(candidate.auth, cfg, now)
+		if s.limiter.Allow(candidate.auth.ID, rpm, burst) {
+			return candidate.auth, true
+		}
+		pool = append(pool[:idx], pool[idx+1:]...)
+	}
+	// Overflow: the pool is non-empty but every weighted candidate is momentarily
+	// over its own token bucket (or at its advisory concurrency ceiling). Serve a
+	// weighted draw over the original candidate set rather than deny or flatten to
+	// a uniform fallback -- see the doc comment. No token is taken (every bucket is
+	// already empty).
+	return candidates[s.weightedIndex(candidates)].auth, true
+}
+
+// weightedIndex returns an index into pool chosen proportional to each entry's
+// weight, using s.rng() in [0,1). A non-positive total (should not happen -- the
+// caller drops non-positive weights) degrades to index 0.
+func (s *AdaptiveSelector) weightedIndex(pool []adaptiveCandidate) int {
+	total := 0.0
+	for _, candidate := range pool {
+		total += candidate.weight
+	}
+	if total <= 0 {
+		return 0
+	}
+	target := s.rng() * total
+	acc := 0.0
+	for i, candidate := range pool {
+		acc += candidate.weight
+		if target < acc {
+			return i
+		}
+	}
+	return len(pool) - 1
+}
+
+// rateLimitParams derives the token-bucket rpm/burst for an account at its
+// current warm-up stage. rpm is the stage's (or mature ceiling's) rpm limit;
+// burst is the mature burst allowance for a mature account, otherwise the
+// stage's concurrency limit (a small, tight burst while warming). A burst below
+// 1 is clamped up so a lone request is never wedged behind a zero-capacity
+// bucket (AccountRateLimiter.Allow clamps too; this keeps the intent explicit).
+func (s *AdaptiveSelector) rateLimitParams(a *Auth, cfg internalconfig.AccountSchedulingConfig, now time.Time) (rpm float64, burst int) {
+	status := AccountWarmupStatusFor(a, now, cfg)
+	rpm = float64(status.RPMLimit)
+	if status.Mature {
+		burst = cfg.MatureLimits.Burst
+	} else {
+		burst = status.ConcurrencyLimit
+	}
+	if burst < 1 {
+		burst = 1
+	}
+	return rpm, burst
+}
+
+// isMature reports whether a is past its warm-up curve, derived from the
+// warm-up-status view (account_warmup.go) rather than account_weight.go's
+// AccountIsMature. The two sibling helpers deliberately disagree on the
+// no-anchor case -- AccountIsMature treats a credential with no
+// first_production_at anchor as mature (so the weighted score is not perpetually
+// starved), while AccountWarmupStatusFor treats it as "cold" (not mature). This
+// selector keeps a single internal source of truth by using the warm-up-status
+// view for BOTH maturity grading and rate-limit params, so the same account is
+// never simultaneously "mature" for stickiness and "cold" for rate limiting. The
+// warm-up-status view is also the more conservative (anti-ban fail-safe)
+// interpretation: an un-anchored Claude/Codex credential does not hold
+// stickiness or absorb floods until it has actually been anchored (which the
+// wiring slice is expected to do on real first production use -- see gaps).
+func (s *AdaptiveSelector) isMature(a *Auth, cfg internalconfig.AccountSchedulingConfig, now time.Time) bool {
+	return AccountWarmupStatusFor(a, now, cfg).Mature
+}
+
+// adaptiveEligible reports whether a is a provider/tier this scheduler actually
+// scores (positive configured tier base weight -- claude/codex today). Used to
+// leave non-adaptive providers' sticky bindings ungraded.
+func (s *AdaptiveSelector) adaptiveEligible(a *Auth, cfg internalconfig.AccountSchedulingConfig) bool {
+	return a != nil && a.AccountTierBaseWeight(cfg.TierWeights) > 0
+}
+
+// AccountGate exposes the per-account concurrency + daily-budget gate this
+// selector maintains (account_gate.go) so the auth Manager's execution path can
+// drive the SAME instance (acquire/release an in-flight slot, record a request)
+// that Pick gates against -- keeping the selector's avoidance and the execution
+// path's accounting on one live count. It satisfies the accountGateProvider
+// contract the Manager type-asserts on. Never nil after construction.
+func (s *AdaptiveSelector) AccountGate() *AccountConcurrencyGate {
+	return s.gate
+}
+
+// overDailyBudget reports whether a is a warming account that has already met or
+// exceeded its configured UTC-daily budget. Mature accounts (DailyBudget 0 =
+// unbounded, design §5.1) always return false, as does a stage with no
+// configured daily budget or (defensively) a nil gate.
+func (s *AdaptiveSelector) overDailyBudget(a *Auth, cfg internalconfig.AccountSchedulingConfig, now time.Time) bool {
+	if s.gate == nil || a == nil {
+		return false
+	}
+	status := AccountWarmupStatusFor(a, now, cfg)
+	if status.Mature || status.DailyBudget <= 0 {
+		return false
+	}
+	return s.gate.OverDailyBudget(a.ID, status.DailyBudget)
+}
+
+// hasConcurrencyHeadroom reports whether a still has a free in-flight slot under
+// its current stage (or mature) ConcurrencyLimit. AccountWarmupStatus already
+// resolves that single limit for both warming and mature accounts. A
+// non-positive limit ("no ceiling configured for this stage") or a nil gate
+// always reports headroom. This is an advisory Pick-time read; the authoritative
+// slot reservation happens on the execution path (beginAccountExecution), so a
+// small race between this read and that acquire can transiently over-admit by
+// one -- the accepted soft-ceiling behavior.
+func (s *AdaptiveSelector) hasConcurrencyHeadroom(a *Auth, cfg internalconfig.AccountSchedulingConfig, now time.Time) bool {
+	if s.gate == nil || a == nil {
+		return true
+	}
+	limit := AccountWarmupStatusFor(a, now, cfg).ConcurrencyLimit
+	if limit <= 0 {
+		return true
+	}
+	return s.gate.InFlight(a.ID) < limit
+}
+
+// InvalidateAuth removes every sticky binding pointing at authID. The auth
+// Manager calls this (via an interface assertion, see
+// conductor_lifecycle.go) when a credential cools down or is removed, so a
+// session does not keep resolving to a dead account.
+func (s *AdaptiveSelector) InvalidateAuth(authID string) {
+	if s.cache != nil {
+		s.cache.InvalidateAuth(authID)
+	}
+}
+
+// Stop releases the selector's owned resources (session cache cleanup goroutine
+// and, if the limiter is owned rather than injected, its reclaim loop). It
+// implements StoppableSelector and is safe to call more than once. An injected
+// rate limiter is left running for its owner to Stop.
+func (s *AdaptiveSelector) Stop() {
+	if s.cache != nil {
+		s.cache.Stop()
+	}
+	if s.ownsLimiter && s.limiter != nil {
+		s.limiter.Stop()
+	}
+}
