@@ -30,6 +30,14 @@ type Record struct {
 	AuthIndex    string
 	AuthType     string
 	Source       string
+	// SessionID stores the session identifier resolved via
+	// sdk/cliproxy/auth.ExtractSessionID (headers + payload + metadata) for the
+	// originating request, when the request entry populated it on the request
+	// context via sdk/cliproxy/auth.WithSessionID. Empty means no session
+	// could be classified for this request; usage sinks must not fold that
+	// into a shared "unknown session" bucket (see
+	// internal/usage.SessionAggregateForAuthIndex).
+	SessionID string
 	// ReasoningEffort stores the translated upstream thinking level for request event logs.
 	ReasoningEffort string
 	// ServiceTier stores the client-requested service tier.

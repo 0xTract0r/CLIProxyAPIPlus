@@ -14,6 +14,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	internallogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 )
 
@@ -120,7 +121,13 @@ type RequestDetail struct {
 	// RequestID is the per-request correlation id (see internal/logging.GetRequestID).
 	// It may be empty when the producing context did not carry a request id
 	// (e.g. synthetic/imported records); omitempty preserves compatibility.
-	RequestID     string     `json:"request_id,omitempty"`
+	RequestID string `json:"request_id,omitempty"`
+	// SessionID is the session identifier resolved via
+	// sdk/cliproxy/auth.ExtractSessionID for the originating request (see
+	// coreusage.Record.SessionID). Empty means the request could not be
+	// classified into any session and must never be folded into a shared
+	// empty-key bucket during aggregation (see SessionAggregateForAuthIndex).
+	SessionID     string     `json:"session_id,omitempty"`
 	Tokens        TokenStats `json:"tokens"`
 	Failed        bool       `json:"failed"`
 	CostUSD       float64    `json:"cost_usd,omitempty"`
@@ -271,12 +278,25 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 	dayKey := timestamp.Format("2006-01-02")
 	hourKey := timestamp.Hour()
 	pricing := s.computeDetailPricing(modelName, detail)
+	// SessionID prefers a value already set on the record (e.g. a future
+	// usage-reporter change baking it in at construction time, mirroring how
+	// ServiceTier/ReasoningEffort are captured today) and falls back to
+	// reading it off ctx directly -- the request entry point populates ctx via
+	// coreauth.WithSessionID(ctx, ExtractSessionID(...)), and that ctx flows
+	// unchanged through the executor/reporter chain to this call. Either
+	// source is empty when the request could not be classified into a
+	// session; that is preserved as "" rather than substituted with a guess.
+	sessionID := strings.TrimSpace(record.SessionID)
+	if sessionID == "" {
+		sessionID = coreauth.SessionIDFromContext(ctx)
+	}
 	requestDetail := RequestDetail{
 		Timestamp: timestamp,
 		LatencyMs: normaliseLatency(record.Latency),
 		Source:    record.Source,
 		AuthIndex: record.AuthIndex,
 		RequestID: strings.TrimSpace(internallogging.GetRequestID(ctx)),
+		SessionID: sessionID,
 		Tokens:    detail,
 		Failed:    failed,
 		CostUSD:   microsToUSD(pricing.CostMicros),
@@ -884,6 +904,102 @@ func (s *RequestStatistics) recordPricing(pricing pricingTotals, dayKey string, 
 	s.unfinalizedRequests += pricing.Unfinalized
 	s.costByDayMicros[dayKey] += pricing.CostMicros
 	s.costByHourMicros[hourKey] += pricing.CostMicros
+}
+
+// SessionAggregate summarises per-account session counts derived from
+// recorded request details' SessionID + Timestamp, for the P6 adaptive-
+// scheduling management view (sessions_total/sessions_active/sessions_closed
+// in internal/api/handlers/management/auth_files_adaptive_scheduling.go).
+// Total is the number of distinct non-empty session ids observed for the
+// account across every api/model bucket; Active/Closed classify each of
+// those sessions by how long ago its most recently recorded request was,
+// using the caller-supplied activeWithin/closedAfter thresholds. A session
+// whose idle time falls between the two thresholds counts toward Total only
+// -- it is neither "recently active" nor "closed" yet, which is a real,
+// distinct state rather than something that must be forced into one bucket
+// or the other.
+type SessionAggregate struct {
+	Total  int
+	Active int
+	Closed int
+}
+
+// SessionAggregateForAuthIndex scans every recorded request detail whose
+// AuthIndex matches authIndex (the stable per-account index set on
+// RequestDetail.AuthIndex, see Auth.EnsureIndex) and buckets its distinct
+// SessionID values by idle time relative to now.
+//
+// Requests with an empty SessionID (ExtractSessionID could not classify them
+// into a session) are intentionally excluded from this aggregation entirely
+// -- counting them under a shared "" key would silently merge unrelated
+// bare-API-key / unclassifiable traffic into one fabricated session (or, if
+// counted individually, one inflated "session" per unrelated request), which
+// is the exact "误并成一个空 key 大桶" failure mode this method must avoid.
+//
+// A session identified only by the legacy message-hash fallback
+// (ExtractSessionID level 8) can surface as two distinct entries here: a
+// short-hash id for a conversation's first turn (no assistant reply yet) and
+// a full-hash id once the assistant's reply is present in later turns (see
+// extractMessageHashIDs in selector.go). This method deliberately does not
+// attempt to merge that pair -- doing so would require re-deriving and
+// cross-referencing the fallback id for every stored detail, which this
+// aggregation (built only from what Record already persisted) cannot do
+// without guessing. What it does guarantee is that repeated requests sharing
+// the exact same SessionID (the common case once a session is established)
+// are never double-counted: each distinct SessionID contributes exactly one
+// entry to Total no matter how many requests carried it.
+//
+// This walks the full in-memory detail set (not a persisted index), so it is
+// O(total recorded details) per call; callers building a per-account list
+// view should expect this cost to scale with total request volume across all
+// accounts, not just the one account being queried.
+func (s *RequestStatistics) SessionAggregateForAuthIndex(authIndex string, now time.Time, activeWithin, closedAfter time.Duration) SessionAggregate {
+	result := SessionAggregate{}
+	if s == nil {
+		return result
+	}
+	authIndex = strings.TrimSpace(authIndex)
+	if authIndex == "" {
+		return result
+	}
+
+	lastSeen := make(map[string]time.Time)
+	s.mu.RLock()
+	for _, apiStatsValue := range s.apis {
+		if apiStatsValue == nil {
+			continue
+		}
+		for _, modelStatsValue := range apiStatsValue.Models {
+			if modelStatsValue == nil {
+				continue
+			}
+			for _, detail := range modelStatsValue.Details {
+				if detail.AuthIndex != authIndex {
+					continue
+				}
+				sessionID := strings.TrimSpace(detail.SessionID)
+				if sessionID == "" {
+					continue
+				}
+				if existing, ok := lastSeen[sessionID]; !ok || detail.Timestamp.After(existing) {
+					lastSeen[sessionID] = detail.Timestamp
+				}
+			}
+		}
+	}
+	s.mu.RUnlock()
+
+	for _, lastRequestAt := range lastSeen {
+		result.Total++
+		idle := now.Sub(lastRequestAt)
+		switch {
+		case idle < activeWithin:
+			result.Active++
+		case idle >= closedAfter:
+			result.Closed++
+		}
+	}
+	return result
 }
 
 // PricingSnapshot returns the current pricing catalog and detected models based on observed usage.
