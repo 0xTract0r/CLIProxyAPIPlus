@@ -975,6 +975,16 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		// success always lifts an existing quarantine).
 		m.evaluateAutoQuarantineLocked(auth, result.Success, result.Error, now)
 
+		// Fork dead-proxy dial-failure breaker (farm_dial_breaker.go): maintain the
+		// consecutive dial-failure streak and trip/escalate the short, self-recovering
+		// breaker window for farm accounts whose LEGAL proxy is currently unreachable
+		// (status-0 connectivity failures). Evaluated last (after every other
+		// status/state mutation for this result) so its verdict is never clobbered,
+		// exactly like the quarantine evaluation above. Strict no-op unless the
+		// FARM_PROXY_DIALFAIL_BREAKER_ENABLED flag is armed and the account is
+		// farm-enrolled, so ordinary/non-farm results are byte-identical.
+		m.evaluateDialFailureBreakerLocked(auth, result.Success, result.Error, now)
+
 		_ = m.persist(ctx, auth)
 		authSnapshot = auth.Clone()
 		if trackCooldownState {
