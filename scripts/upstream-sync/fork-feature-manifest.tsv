@@ -224,6 +224,15 @@ metadata契约键-首投产锚点	首投产锚点铸造接线	pattern	EnsureAuth
 metadata契约键-档位覆盖	TierOverrideMetadataKey	symbol	^const TierOverrideMetadataKey = "tier_override"	sdk/cliproxy/auth/account_tier.go
 管理API字段-自适应调度视图	account_scheduling字段挂载	pattern	entry\["account_scheduling"\] = h\.buildAccountSchedulingView	internal/api/handlers/management/auth_files.go
 管理API字段-自适应调度视图	buildAccountSchedulingView投影	symbol	^func \(h \*Handler\) buildAccountSchedulingView\(	internal/api/handlers/management/auth_files_adaptive_scheduling.go
+# 管理写端点(openspec add-adaptive-account-scheduling design §8.3/§8.4):运维经管理 API
+#   设置/清除 account_scheduling.tier_override + rate_scale(取代手改 auth JSON,给现网档位区分度
+#   一条可操作路径)。断言处理器、路由注册、写时校验器与两个 namespaced 写助手仍在;任一被上游
+#   同步覆盖即视为该 fork 写端点丢失。
+管理API写端点-档位速率覆盖	PatchAuthFileAccountScheduling处理器	symbol	^func \(h \*Handler\) PatchAuthFileAccountScheduling\(	internal/api/handlers/management/auth_files_account_scheduling.go
+管理API写端点-档位速率覆盖	account-scheduling路由注册	pattern	mgmt\.PATCH\("/auth-files/account-scheduling"	internal/api/server_management.go
+管理API写端点-档位速率覆盖	tier_override写时校验	symbol	^func NormalizeTierOverride\(	sdk/cliproxy/auth/account_tier.go
+管理API写端点-档位速率覆盖	档位覆盖写助手	symbol	^func \(a \*Auth\) SetAccountTierOverride\(	sdk/cliproxy/auth/account_tier.go
+管理API写端点-档位速率覆盖	速率乘子写助手	symbol	^func \(a \*Auth\) SetAccountRateScale\(	sdk/cliproxy/auth/account_rate_scale.go
 
 # farm 账号存活检测(openspec change farm-account-liveness-detection):
 #   授权吊销权威化 + serving-独立存活探针 + 门与健康解耦(health-blind)。

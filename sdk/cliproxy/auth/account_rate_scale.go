@@ -76,6 +76,41 @@ func positiveFloat(f float64) (float64, bool) {
 	return 0, false
 }
 
+// ParseRateScaleValue exposes parseRateScaleValue for write-time validation at
+// the management tier/rate_scale endpoint: it coerces a raw JSON value (float64,
+// json.Number, int, or a numeric string) into a positive rate-scale multiplier
+// and reports ok=false for anything non-numeric or <= 0. The management handler
+// uses ok=false to return a 4xx instead of persisting an invalid multiplier.
+func ParseRateScaleValue(raw any) (float64, bool) {
+	return parseRateScaleValue(raw)
+}
+
+// SetAccountRateScale persists a per-account rate_scale multiplier into the
+// namespaced account_scheduling object (design §8.3/§8.5). value MUST be > 0
+// (validate via ParseRateScaleValue first); this writer does not re-validate.
+// Metadata is initialized when absent. AccountRateScale then returns this value
+// in preference to the config default.
+func (a *Auth) SetAccountRateScale(value float64) {
+	if a == nil {
+		return
+	}
+	if a.Metadata == nil {
+		a.Metadata = make(map[string]any)
+	}
+	setAccountSchedulingValue(a.Metadata, accountSchedulingRateScaleKey, value)
+}
+
+// ClearAccountRateScale removes rate_scale from BOTH the namespaced
+// account_scheduling object and the legacy bare top-level key (see
+// clearAccountSchedulingValue). AccountRateScale then falls back to the config
+// default account-scheduling.rate-scale, else 1.0 (no throttle).
+func (a *Auth) ClearAccountRateScale() {
+	if a == nil || a.Metadata == nil {
+		return
+	}
+	clearAccountSchedulingValue(a.Metadata, accountSchedulingRateScaleKey)
+}
+
 // scaleLimitRPM scales a derived rpm ceiling by scale. A non-positive rpm
 // (no ceiling / unset) is preserved unchanged; scale is guaranteed > 0 by
 // AccountRateScale, so a positive rpm always stays positive.

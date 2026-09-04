@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"sort"
 	"strings"
 
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
@@ -312,6 +313,85 @@ func (a *Auth) AccountTierBaseWeight(weights internalconfig.AccountTierWeightsCo
 	default:
 		return 0
 	}
+}
+
+// NormalizeTierOverride trims and lowercases value and reports whether it is a
+// legal, provider-appropriate tier_override string (matching exactly the values
+// ClaudeSubscriptionTier / CodexSubscriptionTier honor). The normalized form is
+// returned so callers persist the canonical value. A provider with no
+// tier_override vocabulary (anything other than "claude"/"codex"), a blank value,
+// or a cross-provider value (a Codex value for a Claude account, or vice versa)
+// all return ok=false. This is the write-time validator behind the management
+// tier_override endpoint; it never guesses an unrecognized value into a tier.
+func NormalizeTierOverride(provider, value string) (string, bool) {
+	normalized := strings.ToLower(strings.TrimSpace(value))
+	if normalized == "" {
+		return "", false
+	}
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "claude":
+		if _, ok := claudeTierOverrideValues[normalized]; ok {
+			return normalized, true
+		}
+	case "codex":
+		if _, ok := codexTierOverrideValues[normalized]; ok {
+			return normalized, true
+		}
+	}
+	return "", false
+}
+
+// LegalTierOverrideValues returns the sorted set of legal tier_override strings
+// for provider, for building a helpful 4xx error message when a management
+// tier_override request is rejected. Returns nil for a provider that has no
+// tier_override vocabulary.
+func LegalTierOverrideValues(provider string) []string {
+	var out []string
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "claude":
+		out = make([]string, 0, len(claudeTierOverrideValues))
+		for key := range claudeTierOverrideValues {
+			out = append(out, key)
+		}
+	case "codex":
+		out = make([]string, 0, len(codexTierOverrideValues))
+		for key := range codexTierOverrideValues {
+			out = append(out, key)
+		}
+	default:
+		return nil
+	}
+	sort.Strings(out)
+	return out
+}
+
+// SetAccountTierOverride persists a tier_override into the namespaced
+// account_scheduling object (design §8.5) so it survives the ~45min quota refresh
+// that replaces the nested quota_snapshot object wholesale. value MUST already be
+// normalized + validated by the caller (see NormalizeTierOverride); this writer
+// does not re-validate. Metadata is initialized when absent so a fresh record can
+// be pinned. A subsequent AccountTierSource() reads "override" and
+// ClaudeSubscriptionTier / CodexSubscriptionTier resolve to the pinned tier.
+func (a *Auth) SetAccountTierOverride(value string) {
+	if a == nil {
+		return
+	}
+	if a.Metadata == nil {
+		a.Metadata = make(map[string]any)
+	}
+	setAccountSchedulingValue(a.Metadata, TierOverrideMetadataKey, value)
+}
+
+// ClearAccountTierOverride removes tier_override from BOTH the namespaced
+// account_scheduling object and the legacy bare top-level key (see
+// clearAccountSchedulingValue for why both). With no override present,
+// AccountTierSource() falls back to "auto" (derived on read, not persisted) and
+// the tier resolvers return to rate_limit_tier / plan_type auto-detection.
+func (a *Auth) ClearAccountTierOverride() {
+	if a == nil || a.Metadata == nil {
+		return
+	}
+	clearAccountSchedulingValue(a.Metadata, TierOverrideMetadataKey)
 }
 
 // tierOverrideValue reads the normalized (lowercased, whitespace-trimmed) tier

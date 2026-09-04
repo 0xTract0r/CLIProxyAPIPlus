@@ -116,3 +116,39 @@ func setAccountSchedulingValue(meta map[string]any, key string, value any) {
 	}
 	obj[key] = value
 }
+
+// clearAccountSchedulingValue removes key from BOTH the namespaced
+// account_scheduling object and the legacy bare top-level key. Clearing both is
+// mandatory: accountSchedulingRawValue / accountSchedulingString dual-read the
+// legacy bare key as a fallback (design §8.5 / spec.md "老裸键 dual-read 迁移"),
+// so deleting only the namespaced sub-key would let a stale bare value resurface
+// on the next read. A non-map[string]any object shape (e.g. rebuilt from JSON as
+// map[string]string) is materialized into a writable map[string]any so the delete
+// persists, mirroring setAccountSchedulingValue. When the namespaced object
+// becomes empty it is dropped entirely so no empty "{}" lingers in the persisted
+// metadata. Safe on an empty/absent meta.
+func clearAccountSchedulingValue(meta map[string]any, key string) {
+	if len(meta) == 0 {
+		return
+	}
+	if raw, ok := meta[AccountSchedulingMetadataKey]; ok {
+		obj, isMap := raw.(map[string]any)
+		if !isMap {
+			if existing, ok := metadataObject(raw); ok {
+				obj = make(map[string]any, len(existing))
+				for k, v := range existing {
+					obj[k] = v
+				}
+			}
+		}
+		if obj != nil {
+			delete(obj, key)
+			if len(obj) == 0 {
+				delete(meta, AccountSchedulingMetadataKey)
+			} else {
+				meta[AccountSchedulingMetadataKey] = obj
+			}
+		}
+	}
+	delete(meta, key)
+}

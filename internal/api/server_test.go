@@ -477,6 +477,46 @@ func TestBuildInfoHeadersAvailableOnProofEndpoints(t *testing.T) {
 	}
 }
 
+func TestAccountSchedulingRouteRequiresManagementAuth(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "route-key")
+	gin.SetMode(gin.TestMode)
+
+	tmpDir := t.TempDir()
+	authDir := filepath.Join(tmpDir, "auth")
+	if err := os.MkdirAll(authDir, 0o700); err != nil {
+		t.Fatalf("failed to create auth dir: %v", err)
+	}
+
+	cfg := &proxyconfig.Config{
+		SDKConfig: sdkconfig.SDKConfig{
+			APIKeys: []string{"test-key"},
+		},
+		Port:                   0,
+		AuthDir:                authDir,
+		Debug:                  true,
+		LoggingToFile:          false,
+		UsageStatisticsEnabled: false,
+		RemoteManagement: proxyconfig.RemoteManagement{
+			AllowRemote: true,
+		},
+	}
+	server := NewServer(cfg, auth.NewManager(nil, nil, nil), sdkaccess.NewManager(), filepath.Join(tmpDir, "config.yaml"))
+
+	req := httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/account-scheduling", strings.NewReader(`{"name":"acct.json","tier_override":"max_5x"}`))
+	req.RemoteAddr = "203.0.113.10:12345"
+	req.Header.Set("Content-Type", "application/json")
+
+	rr := httptest.NewRecorder()
+	server.engine.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401; body=%s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "missing management key") {
+		t.Fatalf("body = %q, want missing management key", rr.Body.String())
+	}
+}
+
 func TestProviderTLSProbeRouteRequiresManagementAuth(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "route-key")
 	gin.SetMode(gin.TestMode)
