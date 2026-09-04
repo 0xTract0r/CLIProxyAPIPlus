@@ -74,6 +74,19 @@
 反关联-farm容器活性门	活性戳PATCH即时镜像Attribute	symbol	^func syncAuthFileContainerAliveAtAttribute\(	internal/api/handlers/management/auth_files_anticorr.go
 反关联-Codex路径归一化	persistCodexDeviceHighWater	symbol	^func \(e \*CodexExecutor\) persistCodexDeviceHighWater\(	internal/runtime/executor/codex_executor.go
 
+# === farm 死代理拨号失败熔断(farm-dead-proxy-breaker,默认关·纯调度层)(9) ===
+# 农场号 LEGAL 但连不上的代理(status-0 拨号失败)连续 N 次触发短退避熔断(优先跳过、
+# 自动恢复放回),与「401×2 自动隔离」「空/非法 proxy fail-closed」都不同、绝不放宽后者。
+反关联-farm死代理熔断	FarmDialFailureBreakerEnabledEnvVar	symbol	^const FarmDialFailureBreakerEnabledEnvVar 	sdk/cliproxy/auth/farm_dial_breaker.go
+反关联-farm死代理熔断	blockReasonDialBreaker	symbol	^const blockReasonDialBreaker 	sdk/cliproxy/auth/farm_dial_breaker.go
+反关联-farm死代理熔断	forkDialFailureBreakerBlocked	symbol	^func forkDialFailureBreakerBlocked\(	sdk/cliproxy/auth/farm_dial_breaker.go
+反关联-farm死代理熔断	evaluateDialFailureBreakerLocked	symbol	^func \(m \*Manager\) evaluateDialFailureBreakerLocked\(	sdk/cliproxy/auth/farm_dial_breaker.go
+反关联-farm死代理熔断	isDialFailureResultError	symbol	^func isDialFailureResultError\(	sdk/cliproxy/auth/farm_dial_breaker.go
+反关联-farm死代理熔断	熔断门接线到选号阻断	pattern	forkDialFailureBreakerBlocked\(auth, now\)	sdk/cliproxy/auth/selector.go
+反关联-farm死代理熔断	熔断评估接线到MarkResult	pattern	evaluateDialFailureBreakerLocked\(auth, result.Success	sdk/cliproxy/auth/conductor_cooldown.go
+反关联-farm死代理熔断	熔断非饿死兜底接线到调度器	pattern	pickDialBreakerFallbackLocked	sdk/cliproxy/auth/scheduler.go
+反关联-farm死代理熔断	farm_dial_breaker.go	file	-	sdk/cliproxy/auth/farm_dial_breaker.go
+
 # === G1 关键回退守护(2 条必须成对读:一条必须命中,一条必须不命中) ===
 G1-反关联回退守护	codex_openai_images使用uTLS客户端	pattern	helps\.NewUtlsHTTPClient	internal/runtime/executor/codex_openai_images.go
 G1-反关联回退守护	codex_openai_images禁止裸ProxyAware回退	pattern_absent	helps\.NewProxyAwareHTTPClient	internal/runtime/executor/codex_openai_images.go
