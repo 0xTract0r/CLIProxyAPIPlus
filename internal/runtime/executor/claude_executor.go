@@ -320,6 +320,13 @@ func (e *ClaudeExecutor) persistClaudeDeviceHighWater(auth *cliproxyauth.Auth, a
 	if e == nil || e.authManager == nil || auth == nil {
 		return
 	}
+	// 反关联 A1：农场号出站版本跟随容器实际版本、不走单调高水位，故不把农场号观测持久化
+	// 进 auth.Metadata 高水位——否则重启后会经 SeedClaudeObservedHighWaterFromAuth 回流全局
+	// 观测池、把农场容器版本带进普通号 floor。农场号出站版本无需持久化：容器每次入站都带
+	// 真实版本，冷启动首帧即可直出。
+	if _, farmBound := cliproxyauth.ClaudeDeviceIDSource(auth); farmBound {
+		return
+	}
 	authID := strings.TrimSpace(auth.ID)
 	if authID == "" {
 		return
