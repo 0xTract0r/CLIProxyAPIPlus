@@ -88,4 +88,11 @@ const (
 	// Plus ($20) usage, Plus is the baseline.
 	DefaultAccountTierWeightCodexPro  = 10.0
 	DefaultAccountTierWeightCodexPlus = 1.0
+
+	// DefaultAccountSchedulingRateScale is the global default per-account
+	// safety-test speed multiplier (design §8.3). 1.0 = no effect; a per-account
+	// metadata override (account_scheduling.rate_scale) or this config value can
+	// lower it (< 1) to throttle an account's derived rate ceilings for low-risk
+	// testing, or raise it (> 1). See AccountSchedulingConfig.RateScale.
+	DefaultAccountSchedulingRateScale = 1.0
 )

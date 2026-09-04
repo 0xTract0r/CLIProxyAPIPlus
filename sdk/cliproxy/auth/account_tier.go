@@ -295,31 +295,89 @@ func (a *Auth) AccountTierBaseWeight(weights internalconfig.AccountTierWeightsCo
 	case "claude":
 		return ClaudeTierBaseWeight(a.ClaudeSubscriptionTier(), weights.Claude)
 	case "codex":
-		return CodexTierBaseWeight(a.CodexSubscriptionTier(), weights.Codex)
+		// Codex退回普通轮询, not managed by adaptive scheduling (design §8.2,
+		// spec.md "自适应调度仅适用于 Claude"). Returning 0 base weight makes a
+		// Codex account score 0 in AccountSelectionWeight (so it is dropped from
+		// the weighted candidate set and falls through to the round-robin
+		// fallback) and makes adaptiveEligible / beginAccountExecution treat it
+		// as un-managed (no tier weighting, no warm-up clamp, no per-account
+		// concurrency/daily-budget gate). The configured Codex tier weights
+		// (weights.Codex / CodexTierBaseWeight) and CodexSubscriptionTier are
+		// intentionally left intact -- CodexSubscriptionTier still drives the
+		// observability tier label (adaptiveTierLabel) and the management tier
+		// projection, and the config weights stay as a documented, ready-to-
+		// re-enable placeholder should Codex ever be brought under adaptive
+		// scheduling -- but they are deliberately NOT dispatched here.
+		return 0
 	default:
 		return 0
 	}
 }
 
-// tierOverrideValue reads the normalized (lowercased, whitespace-trimmed)
-// TierOverrideMetadataKey value from meta, or "" when the key is absent, meta
-// is empty, or the stored value is not a string. It deliberately does NOT walk
-// into nested objects: the override is a flat top-level string, which is what
-// keeps it stable across the quota refresh that replaces the nested
-// quota_snapshot object (see TierOverrideMetadataKey's doc).
+// tierOverrideValue reads the normalized (lowercased, whitespace-trimmed) tier
+// override string from meta, or "" when it is absent, meta is empty, or the
+// stored value is not a string. It DUAL-READS (design §8.5 / spec.md "老裸键
+// dual-read 迁移"): the namespaced account_scheduling.tier_override sub-key is
+// preferred, falling back to the legacy bare top-level tier_override key so
+// credentials written before the §8.5 namespace unification keep resolving. Both
+// locations are top-level (the nested object is under a top-level key), which is
+// what keeps the override stable across the quota refresh that replaces the
+// nested quota_snapshot object wholesale (see TierOverrideMetadataKey's doc and
+// AccountSchedulingMetadataKey).
 func tierOverrideValue(meta map[string]any) string {
-	if len(meta) == 0 {
-		return ""
+	return accountSchedulingString(meta, TierOverrideMetadataKey)
+}
+
+// Tier source labels for the management API account_scheduling projection
+// (design §8.4 / spec.md "管理 API 投影下发订阅等级来源"). TierSourceOverride means
+// the account's fine-grained tier is driven by a manual, provider-appropriate
+// tier_override; TierSourceAuto means it is auto-detected from
+// rate_limit_tier / chatgpt_plan_type.
+const (
+	TierSourceAuto     = "auto"
+	TierSourceOverride = "override"
+)
+
+// TierOverrideActive reports whether a valid, provider-appropriate tier_override
+// is set for a -- i.e. the account's fine-grained tier is being driven by a
+// manual override rather than rate_limit_tier / plan_type auto-detection. It is
+// the source of the management projection's tier_source field (design §8.4).
+//
+// It returns true ONLY when the (dual-read) override string maps to a legal tier
+// for a's own provider: a blank, malformed, or cross-provider override (a Codex
+// value on a Claude account, or vice versa) returns false, because the tier
+// resolvers (ClaudeSubscriptionTier / CodexSubscriptionTier) ignore exactly those
+// and the effective tier is still auto-detected -- so tier_source must read
+// "auto" for them, not "override".
+func (a *Auth) TierOverrideActive() bool {
+	if a == nil {
+		return false
 	}
-	raw, ok := meta[TierOverrideMetadataKey]
-	if !ok {
-		return ""
+	override := tierOverrideValue(a.Metadata)
+	if override == "" {
+		return false
 	}
-	s, ok := raw.(string)
-	if !ok {
-		return ""
+	switch strings.ToLower(strings.TrimSpace(a.Provider)) {
+	case "claude":
+		_, ok := claudeTierOverrideValues[override]
+		return ok
+	case "codex":
+		_, ok := codexTierOverrideValues[override]
+		return ok
+	default:
+		return false
 	}
-	return strings.ToLower(strings.TrimSpace(s))
+}
+
+// AccountTierSource returns TierSourceOverride when a's tier is driven by a valid
+// manual override (TierOverrideActive), else TierSourceAuto. It is derived on
+// read from the override's presence, NOT persisted separately (design §8.4: the
+// projection derives tier_source rather than storing a fourth durable field).
+func (a *Auth) AccountTierSource() string {
+	if a.TierOverrideActive() {
+		return TierSourceOverride
+	}
+	return TierSourceAuto
 }
 
 // nestedMetadataString walks meta through a sequence of nested-object keys

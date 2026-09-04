@@ -653,6 +653,13 @@ func (s *AdaptiveSelector) rateLimitParams(a *Auth, cfg internalconfig.AccountSc
 	} else {
 		burst = status.ConcurrencyLimit
 	}
+	// Apply the per-account safety-test rate multiplier (design §8.3) AFTER the
+	// tier/warm-up derivation, so it scales the ceiling the account already sits
+	// at (warming or mature) without touching selection weight. rate_scale=1.0 is
+	// a no-op; a fractional scale is floored so a lone request is never wedged.
+	scale := AccountRateScale(a, cfg)
+	rpm = scaleLimitRPM(rpm, scale)
+	burst = scaleLimitInt(burst, scale)
 	if burst < 1 {
 		burst = 1
 	}
@@ -753,7 +760,11 @@ func (s *AdaptiveSelector) overDailyBudget(a *Auth, cfg internalconfig.AccountSc
 	if status.Mature || status.DailyBudget <= 0 {
 		return false
 	}
-	return s.gate.OverDailyBudget(a.ID, status.DailyBudget)
+	// Scale the warm-up daily budget by the per-account rate multiplier (§8.3)
+	// so a fractional rate_scale tightens the budget too, matching the rpm /
+	// concurrency scaling. scaleLimitInt floors a positive budget at 1.
+	budget := scaleLimitInt(status.DailyBudget, AccountRateScale(a, cfg))
+	return s.gate.OverDailyBudget(a.ID, budget)
 }
 
 // hasConcurrencyHeadroom reports whether a still has a free in-flight slot under
@@ -769,6 +780,10 @@ func (s *AdaptiveSelector) hasConcurrencyHeadroom(a *Auth, cfg internalconfig.Ac
 		return true
 	}
 	limit := AccountWarmupStatusFor(a, now, cfg).ConcurrencyLimit
+	// Scale the concurrency ceiling by the per-account rate multiplier (§8.3),
+	// consistent with the rpm/daily-budget scaling. scaleLimitInt preserves 0
+	// ("no ceiling configured") and floors a positive limit at 1.
+	limit = scaleLimitInt(limit, AccountRateScale(a, cfg))
 	if limit <= 0 {
 		return true
 	}

@@ -487,7 +487,7 @@ func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth) gin.H {
 	// current warm-up + rate-limit stage) so the management UI / farm-orchestrator
 	// can read them without depending on any other nested sub-object. Read-only
 	// (mints nothing, mutates nothing); "unknown" state is surfaced explicitly.
-	entry["adaptive_scheduling"] = h.buildAdaptiveSchedulingView(auth)
+	entry["account_scheduling"] = h.buildAccountSchedulingView(auth)
 	if websockets, ok := authWebsocketsValue(auth); ok {
 		entry["websockets"] = websockets
 	}

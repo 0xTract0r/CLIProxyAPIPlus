@@ -20,13 +20,15 @@ var (
 	SessionClosedAfter  = 30 * time.Minute
 )
 
-// buildAdaptiveSchedulingView projects the Phase 0 adaptive-account-scheduling
-// primitives (openspec/changes/add-adaptive-account-scheduling, tasks.md 5.2)
-// onto the account-list response as a single additive, namespaced sub-object.
+// buildAccountSchedulingView projects the adaptive-account-scheduling primitives
+// (openspec/changes/add-adaptive-account-scheduling, tasks.md 5.2) onto the
+// account-list response as a single additive, namespaced sub-object surfaced
+// under entry["account_scheduling"] (renamed from the earlier "adaptive_scheduling"
+// by the §8.5 namespace unification -- the cpamp frontend reads this object name).
 // It is read-only: every value is derived from data already persisted on the
-// auth record (Metadata quota_snapshot / first_production_at anchor, Attributes
-// plan_type) plus the configured warm-up curve — it never mints an anchor,
-// never mutates auth, and never triggers an upstream fetch.
+// auth record (Metadata quota_snapshot / first_production_at anchor / tier_override,
+// Attributes plan_type) plus the configured warm-up curve — it never mints an
+// anchor, never mutates auth, and never triggers an upstream fetch.
 //
 // The projection deliberately mirrors the "unknown is not a number" contract of
 // the underlying primitives: a missing subscription tier, an unreadable quota
@@ -34,7 +36,7 @@ var (
 // label / JSON null, never silently coerced into "pro" / "0% utilized" /
 // "born just now". Callers (the management UI, the farm-orchestrator
 // passthrough) can therefore distinguish "we don't know yet" from a real value.
-func (h *Handler) buildAdaptiveSchedulingView(auth *coreauth.Auth) gin.H {
+func (h *Handler) buildAccountSchedulingView(auth *coreauth.Auth) gin.H {
 	if auth == nil {
 		return nil
 	}
@@ -54,6 +56,12 @@ func (h *Handler) buildAdaptiveSchedulingView(auth *coreauth.Auth) gin.H {
 	default:
 		view["subscription_tier"] = coreauth.ClaudeTierUnknown.String()
 	}
+
+	// Tier source (design §8.4): whether subscription_tier above came from a
+	// manual, provider-appropriate tier_override ("override") or from
+	// rate_limit_tier / chatgpt_plan_type auto-detection ("auto"). Derived on
+	// read from the (dual-read) override's presence — not persisted separately.
+	view["tier_source"] = auth.AccountTierSource()
 
 	// Structured per-window quota utilization / headroom, plus the single
 	// binding (tightest) window. ok=false means "no usable quota snapshot at
@@ -102,6 +110,11 @@ func (h *Handler) buildAdaptiveSchedulingView(auth *coreauth.Auth) gin.H {
 	if h != nil && h.cfg != nil {
 		scheduling = h.cfg.AccountScheduling
 	}
+	// Effective per-account rate multiplier (design §8.3): the metadata override
+	// account_scheduling.rate_scale when set and valid, else the config default
+	// (account-scheduling.rate-scale), else 1.0. Surfaced so the frontend can
+	// show which accounts are throttled for a safety test.
+	view["rate_scale"] = coreauth.AccountRateScale(auth, scheduling)
 	warmup := coreauth.AccountWarmupStatusFor(auth, now, scheduling)
 	warmupView := gin.H{
 		"stage":             warmup.StageName,

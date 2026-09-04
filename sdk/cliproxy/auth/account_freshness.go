@@ -24,10 +24,16 @@ import (
 // Persisted shape is an RFC3339 timestamp string in UTC, matching the
 // convention already used for other Metadata-carried timestamps in this
 // package (see FarmContainerAliveAtMetadataKey in custom_headers.go and
-// metadataKeyQuarantinedAt in conductor_auto_quarantine.go). It lives in the
-// same auth.Metadata map as quota_snapshot/rate_limit_tier, so it persists to
+// metadataKeyQuarantinedAt in conductor_auto_quarantine.go). It persists to
 // whichever backend already stores Metadata (file store or Postgres store) --
 // no new storage subsystem is introduced (design.md §6.4).
+//
+// As of the §8.5 namespace unification this const names the SUB-KEY inside the
+// top-level account_scheduling object (AccountSchedulingMetadataKey): the anchor
+// is WRITTEN to account_scheduling.first_production_at and READ via dual-read
+// (namespaced sub-key preferred, legacy bare first_production_at key as
+// fallback -- see readFirstProductionAt). It remains a top-level-reachable key
+// either way, so it survives the quota refresh Clone (design.md §6.4).
 const FirstProductionAtMetadataKey = "first_production_at"
 
 // AuthFirstProductionAt returns the persisted first-production anchor for
@@ -46,7 +52,26 @@ func AuthFirstProductionAt(auth *Auth) (time.Time, bool) {
 	if auth == nil || len(auth.Metadata) == 0 {
 		return time.Time{}, false
 	}
-	return parseFirstProductionAtValue(auth.Metadata[FirstProductionAtMetadataKey])
+	return readFirstProductionAt(auth.Metadata)
+}
+
+// readFirstProductionAt dual-reads the first-production anchor (design §8.5 /
+// spec.md "老裸键 dual-read 迁移"): it prefers the namespaced
+// account_scheduling.first_production_at sub-key and falls back to the legacy
+// bare top-level first_production_at key so credentials written before the §8.5
+// namespace unification keep resolving. A present-but-unparseable value in the
+// new location transparently falls back to a valid legacy value rather than
+// masking it. ok is false when neither location holds a parseable timestamp.
+func readFirstProductionAt(meta map[string]any) (time.Time, bool) {
+	if len(meta) == 0 {
+		return time.Time{}, false
+	}
+	if obj, ok := accountSchedulingObject(meta); ok {
+		if parsed, ok := parseFirstProductionAtValue(obj[FirstProductionAtMetadataKey]); ok {
+			return parsed, true
+		}
+	}
+	return parseFirstProductionAtValue(meta[FirstProductionAtMetadataKey])
 }
 
 // EnsureAuthFirstProductionAt returns the account's first-production anchor,
@@ -88,14 +113,18 @@ func EnsureAuthFirstProductionAt(auth *Auth, now time.Time) (anchor time.Time, m
 	if auth == nil {
 		return time.Time{}, false
 	}
-	if existing, ok := parseFirstProductionAtValue(auth.Metadata[FirstProductionAtMetadataKey]); ok {
+	if existing, ok := readFirstProductionAt(auth.Metadata); ok {
 		return existing, false
 	}
 	stamped := now.UTC()
 	if auth.Metadata == nil {
 		auth.Metadata = make(map[string]any)
 	}
-	auth.Metadata[FirstProductionAtMetadataKey] = stamped.Format(time.RFC3339)
+	// Write ONLY to the namespaced location (design §8.5: "写入只走新位置");
+	// dual-read above keeps honoring any legacy bare key, so this is a
+	// non-destructive migration -- an existing legacy anchor is never rewritten,
+	// and a brand-new anchor lands under account_scheduling.first_production_at.
+	setAccountSchedulingValue(auth.Metadata, FirstProductionAtMetadataKey, stamped.Format(time.RFC3339))
 	return stamped, true
 }
 

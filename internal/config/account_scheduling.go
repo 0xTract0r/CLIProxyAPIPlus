@@ -61,6 +61,20 @@ type AccountSchedulingConfig struct {
 	// weight is never compared against a Codex weight, since the two
 	// providers' quota semantics are unrelated (design §5.2).
 	TierWeights AccountTierWeightsConfig `yaml:"tier-weights,omitempty" json:"tier-weights,omitempty"`
+
+	// RateScale is the global default per-account safety-test speed multiplier
+	// (design §8.3, spec.md "per-账号安全测试速率乘子"). It scales every account's
+	// DERIVED rate ceilings -- rpm / burst / concurrency / daily budget -- AFTER
+	// the tier/warm-up derivation, and is deliberately INDEPENDENT of selection
+	// weight (it never changes WHICH account is picked, only how fast the picked
+	// account may go). 1.0 (the default) is a no-op; a value < 1 throttles every
+	// account below its tier/warm-up ceiling for low-risk testing, > 1 lifts it.
+	// A per-account metadata override (account_scheduling.rate_scale) takes
+	// precedence over this global default. MUST be > 0 (see Validate); the
+	// per-account 0-floor that keeps a fractional scale from wedging a limit to
+	// zero lives in the read path (sdk/cliproxy/auth/account_rate_scale.go), not
+	// here.
+	RateScale float64 `yaml:"rate-scale,omitempty" json:"rate-scale,omitempty"`
 }
 
 // AccountWarmupStage describes one age-based warm-up throttling tier.
@@ -173,6 +187,7 @@ func DefaultAccountSchedulingConfig() AccountSchedulingConfig {
 		WarmupCurve:  DefaultAccountWarmupCurve(),
 		MatureLimits: DefaultAccountMatureLimits(),
 		TierWeights:  DefaultAccountTierWeights(),
+		RateScale:    DefaultAccountSchedulingRateScale,
 	}
 }
 
@@ -235,6 +250,9 @@ func (c AccountSchedulingConfig) Validate() error {
 	}
 	if c.MatureLimits.ConcurrencyLimit <= 0 {
 		return fmt.Errorf("account-scheduling.mature-limits.concurrency-limit must be positive")
+	}
+	if c.RateScale <= 0 {
+		return fmt.Errorf("account-scheduling.rate-scale must be positive")
 	}
 	weights := map[string]float64{
 		"tier-weights.claude.max-20x": c.TierWeights.Claude.Max20x,

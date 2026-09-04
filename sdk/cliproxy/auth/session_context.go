@@ -22,7 +22,7 @@ type sessionIDContextKey struct{}
 // it with an empty string, and it never fabricates a placeholder id for a
 // request ExtractSessionID could not classify into any session -- matching
 // the "unknown is not a number" contract already used elsewhere in this
-// package (see buildAdaptiveSchedulingView's doc comment).
+// package (see buildAccountSchedulingView's doc comment).
 func WithSessionID(ctx context.Context, id string) context.Context {
 	if ctx == nil {
 		ctx = context.Background()

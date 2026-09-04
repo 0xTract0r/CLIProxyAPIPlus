@@ -71,7 +71,13 @@ func TestAccountSelectionWeight_TierOrdering(t *testing.T) {
 	}
 }
 
-func TestAccountSelectionWeight_CodexTierOrdering(t *testing.T) {
+// TestAccountSelectionWeight_CodexScoresZero pins the §8.2 claude-only收敛
+// decision: Codex accounts are dropped from adaptive scheduling (AccountTierBaseWeight
+// returns 0 for provider "codex"), so every Codex account scores exactly 0 weight
+// regardless of plan_type -- which makes the adaptive selector skip it and退回
+// 普通轮询 (the round-robin fallback). Before §8.2 Codex pro/plus scored positive,
+// ordered weights; this test would have asserted pro > plus.
+func TestAccountSelectionWeight_CodexScoresZero(t *testing.T) {
 	cfg := internalconfig.DefaultAccountSchedulingConfig()
 	mkCodex := func(planType string) *Auth {
 		return &Auth{
@@ -82,16 +88,10 @@ func TestAccountSelectionWeight_CodexTierOrdering(t *testing.T) {
 			},
 		}
 	}
-	pro := AccountSelectionWeight(mkCodex("pro"), cfg, accountWeightTestNow)
-	plus := AccountSelectionWeight(mkCodex("plus"), cfg, accountWeightTestNow)
-	if !(pro > plus) {
-		t.Fatalf("expected codex pro(%v) > plus(%v)", pro, plus)
-	}
-	// No quota_snapshot at all for Codex here -> quota factor falls back to
-	// the documented unknown headroom, not 1.0.
-	wantPro := internalconfig.DefaultAccountTierWeightCodexPro * unknownAccountQuotaHeadroom
-	if pro != wantPro {
-		t.Fatalf("codex pro weight = %v, want %v (base x unknown-quota fallback x mature freshness)", pro, wantPro)
+	for _, planType := range []string{"pro", "plus", "team", ""} {
+		if got := AccountSelectionWeight(mkCodex(planType), cfg, accountWeightTestNow); got != 0 {
+			t.Fatalf("codex plan_type=%q weight = %v, want 0 (§8.2 claude-only收敛)", planType, got)
+		}
 	}
 }
 

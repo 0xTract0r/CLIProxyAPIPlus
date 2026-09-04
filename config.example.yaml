@@ -300,6 +300,13 @@ routing:
 #       pro: 10
 #       plus: 1
 #       unknown: 1 # fallback for team/business/unrecognized chatgpt_plan_type
+#   # Global default safety-test speed multiplier applied to every account's
+#   # DERIVED rate ceilings (rpm / burst / concurrency / daily budget) AFTER the
+#   # tier/warm-up derivation — independent of selection weight (it never changes
+#   # WHICH account is picked, only how fast the picked account may go). 1.0 = no
+#   # effect; < 1 throttles for low-risk testing, > 1 lifts. A per-account
+#   # override (metadata account_scheduling.rate_scale) takes precedence. Must be > 0.
+#   rate-scale: 1.0
 
 # Codex provider behavior.
 codex:
