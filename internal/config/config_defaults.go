@@ -37,11 +37,12 @@ const (
 // arbitrary user input onto these). Adaptive is new
 // (openspec/changes/add-adaptive-account-scheduling): it opts into
 // tier/quota-aware weighted selection driven by AccountSchedulingConfig
-// (Config.AccountScheduling). Wiring newRoutingSelector to recognize Adaptive
-// and construct the corresponding Selector is Phase 1 (tasks.md 1.2), not
-// this config-schema slice — until that lands, an "adaptive" strategy value
-// falls back to the pre-existing round-robin behavior, matching how any
-// other unrecognized strategy value is already handled.
+// (Config.AccountScheduling). Wiring is live: newRoutingSelector recognizes
+// Adaptive and constructs coreauth.NewAdaptiveSelector for it, so an "adaptive"
+// strategy value takes effect immediately — it is no longer a no-op that falls
+// back to round-robin. Before enabling it, backfill every account's
+// first_production_at anchor, or an un-anchored account is treated as brand-new
+// "cold" and throttled to the tightest warm-up stage.
 const (
 	RoutingStrategyRoundRobin = "round-robin"
 	RoutingStrategyFillFirst  = "fill-first"

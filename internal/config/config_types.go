@@ -241,9 +241,12 @@ type RoutingConfig struct {
 	// "adaptive" (openspec/changes/add-adaptive-account-scheduling) opts into
 	// tier/quota-aware weighted selection driven by the AccountScheduling
 	// config section (see RoutingStrategyAdaptive, AccountSchedulingConfig).
-	// Selector wiring for "adaptive" lands in a later phase of that change;
-	// until then this value is accepted by config but falls back to
-	// round-robin selection, same as any other unrecognized value.
+	// Selector wiring is live: setting "adaptive" takes effect immediately
+	// (sdk/cliproxy/service_config.go constructs coreauth.NewAdaptiveSelector for
+	// it); it is no longer a no-op that falls back to round-robin. Before enabling
+	// it, backfill every account's first_production_at anchor, or an un-anchored
+	// account is treated as brand-new "cold" and throttled to the tightest warm-up
+	// stage.
 	Strategy string `yaml:"strategy,omitempty" json:"strategy,omitempty"`
 
 	// ClaudeCodeSessionAffinity enables session-sticky routing for Claude Code clients.
