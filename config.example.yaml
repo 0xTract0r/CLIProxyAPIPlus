@@ -224,9 +224,15 @@ routing:
   strategy: "round-robin" # round-robin (default), fill-first, adaptive
   # "adaptive" (fork, openspec/changes/add-adaptive-account-scheduling) opts into
   # tier/quota-aware weighted selection + per-account rate limiting + new-account
-  # warm-up throttling, driven by the account-scheduling section below. Selector
-  # wiring for this value lands in a later phase of the same change; until then it
-  # is accepted but falls back to round-robin, same as any other unrecognized value.
+  # warm-up throttling, driven by the account-scheduling section below. Setting
+  # strategy: adaptive takes effect immediately (the selector is wired in via
+  # service_config.go -> NewAdaptiveSelector); it is no longer a no-op that falls
+  # back to round-robin.
+  # Before enabling it, confirm every account's first-production anchor
+  # (first_production_at) is backfilled: an account with no anchor is treated as a
+  # brand-new "cold" credential and throttled to the tightest warm-up stage, so an
+  # un-anchored production fleet would be needlessly rate-limited as if it were all
+  # fresh accounts.
   # Enable universal session-sticky routing for all clients.
   # Session IDs are extracted from: metadata.user_id (Claude Code session format),
   # X-Session-ID, Session_id (Codex), X-Amp-Thread-Id (Amp CLI), X-Client-Request-Id (PI),

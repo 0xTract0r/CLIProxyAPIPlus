@@ -364,3 +364,28 @@ func errAccountConcurrencyBusy(authID string) error {
 		HTTPStatus: http.StatusTooManyRequests,
 	}
 }
+
+// errAccountDailyBudgetExhausted is the retryable error the adaptive selector
+// returns when the ONLY accounts able to serve a request are still-warming
+// accounts that have all spent their UTC-daily warm-up budget. In that thin-pool
+// case the empty-candidate branch would otherwise degrade to the round-robin
+// fallback, which re-picks over the full pool and ignores the daily budget --
+// hammering the very account warm-up is protecting (only the concurrency=1 gate
+// left as a backstop). Denying instead keeps the account protected.
+//
+// It deliberately reuses errAccountConcurrencyBusy's failover semantics (Retryable
+// + 429, no RetryAfter) rather than inventing a new mechanism, so a genuinely
+// budget-exhausted moment surfaces as backpressure the caller can retry, never a
+// hard/terminal failure. A distinct Code is kept only so the two protective
+// denials are legible apart in logs and client errors. Like the concurrency
+// error, it carries no RetryAfter, so Manager.shouldRetryAfterError does not spin
+// on it (a 429 with no cooldown target and no RetryAfter is not retried in place)
+// and it surfaces to the client as backpressure.
+func errAccountDailyBudgetExhausted() error {
+	return &Error{
+		Code:       "account_daily_budget_exhausted",
+		Message:    "all serving accounts are warming and over their daily budget, failing over",
+		Retryable:  true,
+		HTTPStatus: http.StatusTooManyRequests,
+	}
+}

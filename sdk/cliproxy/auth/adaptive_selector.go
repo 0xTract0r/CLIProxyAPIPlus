@@ -61,8 +61,19 @@ import (
 // request is still never denied: the overflow is served by a WEIGHTED draw over
 // the same adaptive candidates (still proportional to tier capacity), and only a
 // genuinely non-adaptive / no-candidate pool degrades to the round-robin fallback
-// -- the token bucket is an outbound smoother, never a hard gate that can
+// -- the rpm token bucket is an outbound smoother, never a hard gate that can
 // manufacture a 429 the upstream did not send.
+//
+// The one deliberate hard gate is the UTC-daily warm-up budget (hole-2 thin-pool
+// fix, dailyBudgetHardGate): when the ONLY accounts able to serve are warming
+// accounts that have ALL spent their daily budget, the selector denies with a
+// retryable 429 (errAccountDailyBudgetExhausted) instead of degrading to the
+// round-robin fallback, because that fallback re-picks over the full pool and
+// would ignore the daily budget -- hammering the very account warm-up is meant to
+// protect (only the concurrency=1 gate left as a backstop). This is scoped
+// strictly to the all-over-budget case: as long as any mature account, any
+// under-budget account, or any non-adaptive account can serve, the request is
+// routed normally and never denied.
 type AdaptiveSelector struct {
 	// fallback is the base selector used for non-adaptive providers and as the
 	// degraded path when no weighted candidate can currently be served. Never
@@ -260,12 +271,25 @@ func (s *AdaptiveSelector) Pick(ctx context.Context, provider, model string, opt
 		s.logPick(ctx, "weighted-new", provider, model, "", picked, cfg, now)
 		return picked, nil
 	}
+	// Hole-2 thin-pool hard gate: if the empty candidate set is caused SOLELY by
+	// every servable account being a warming account that has spent its UTC-daily
+	// budget, deny with a retryable 429 instead of letting the fallback bypass the
+	// budget and hammer them. Returns nil (fall through to the fallback) whenever
+	// any non-over-budget account exists, so it never false-rejects a healthy pool.
+	if gateErr := s.dailyBudgetHardGate(available, cfg, now); gateErr != nil {
+		selectorLogEntry(ctx).Warnf(
+			"adaptive-select: daily-budget-hardgate | every serving account is warming and over its daily budget, denying (retryable) provider=%s model=%s",
+			provider, model,
+		)
+		return nil, gateErr
+	}
 	// Degraded: no adaptive-weighted candidate exists at all (a non-adaptive
-	// provider, or a pool whose every account scores zero weight / is over its
-	// daily budget). A pool that merely has all token buckets momentarily drained
-	// does NOT reach here -- pickFromCandidates serves that as a weighted overflow
-	// above. Serve via the fallback selector rather than deny -- the token bucket
-	// smooths, it never manufactures a 429.
+	// provider, or a pool whose every account scores zero weight). A pool whose
+	// every warming account is over its daily budget does NOT reach here -- the
+	// hard gate above denies that thin-pool case. A pool that merely has all token
+	// buckets momentarily drained does NOT reach here either -- pickFromCandidates
+	// serves that as a weighted overflow above. Serve via the fallback selector
+	// rather than deny -- the token bucket smooths, it never manufactures a 429.
 	picked, errFallback := s.fallback.Pick(ctx, provider, model, opts, auths)
 	if errFallback == nil {
 		s.logPick(ctx, "fallback-degraded", provider, model, "", picked, cfg, now)
@@ -490,6 +514,14 @@ func (s *AdaptiveSelector) selectAndBind(ctx context.Context, provider, model st
 		s.cache.Set(cacheKey, picked.ID)
 		return picked, "rebind-weighted", nil
 	}
+	// Same hole-2 thin-pool hard gate the non-sticky Pick path applies: a sticky
+	// session must not use the fallback to bypass the daily budget onto an
+	// all-over-budget warming pool either. Deny (retryable) instead; the binding is
+	// left untouched so a later turn (with budget restored or a mature account
+	// back) can re-resolve. Only fires when NO non-over-budget account exists.
+	if gateErr := s.dailyBudgetHardGate(available, cfg, now); gateErr != nil {
+		return nil, "rebind-daily-budget-denied", gateErr
+	}
 	picked, errPick := s.fallback.Pick(ctx, provider, model, opts, auths)
 	if errPick == nil && picked != nil {
 		s.cache.Set(cacheKey, picked.ID)
@@ -659,6 +691,54 @@ func (s *AdaptiveSelector) adaptiveEligible(a *Auth, cfg internalconfig.AccountS
 // contract the Manager type-asserts on. Never nil after construction.
 func (s *AdaptiveSelector) AccountGate() *AccountConcurrencyGate {
 	return s.gate
+}
+
+// dailyBudgetHardGate returns errAccountDailyBudgetExhausted (a retryable 429)
+// when the ONLY reason no adaptive candidate can be served is that every account
+// able to serve this request is a still-warming account that has already spent
+// its UTC-daily warm-up budget. In that thin-pool case the round-robin fallback
+// would bypass the daily budget and hammer the very account warm-up is protecting
+// (the hole-2 hard-gate fix), so the caller must deny rather than fall back onto
+// it.
+//
+// It is called ONLY on the empty-candidate path (pickFromCandidates returned
+// ok=false); a non-empty candidate set is always served (as a weighted overflow
+// at worst) and never reaches here. It returns nil -- letting the caller degrade
+// to the fallback exactly as before -- in every other case, so it can NEVER
+// manufacture a denial while any servable alternative exists:
+//
+//   - The first available account that is NOT over its daily budget
+//     short-circuits to nil. That covers a mature account (DailyBudget 0 =
+//     unbounded), a warming account with budget left, and any non-adaptive /
+//     tier-0 account (the gate never counts requests for providers the scheduler
+//     does not manage, so overDailyBudget is always false for them -- design D7
+//     backward compatibility is preserved).
+//   - A pool with no over-budget account at all (an empty pool, or a purely
+//     non-adaptive pool) returns nil: not this gate's concern.
+//
+// `available` is the same post-preferCodexWebsocket pool the fallback selector
+// re-derives and serves over (RoundRobinSelector.Pick applies the identical
+// filter), so this examination exactly predicts what the fallback would otherwise
+// hand out -- the gate denies precisely the requests the fallback would have
+// mis-served, and no others.
+func (s *AdaptiveSelector) dailyBudgetHardGate(available []*Auth, cfg internalconfig.AccountSchedulingConfig, now time.Time) error {
+	hasOverBudget := false
+	for _, a := range available {
+		if a == nil {
+			continue
+		}
+		if s.overDailyBudget(a, cfg, now) {
+			hasOverBudget = true
+			continue
+		}
+		// A servable account that is NOT over its daily budget exists; the fallback
+		// can serve it, so never deny.
+		return nil
+	}
+	if !hasOverBudget {
+		return nil
+	}
+	return errAccountDailyBudgetExhausted()
 }
 
 // overDailyBudget reports whether a is a warming account that has already met or
