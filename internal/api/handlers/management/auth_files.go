@@ -480,6 +480,41 @@ func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth) gin.H {
 	// directly); the nested account_settings.farm_enrolled below is the same
 	// value, projected for the account-settings editing surface.
 	entry["farm_enrolled"] = coreauth.AuthFarmEnrolled(auth)
+	// B1 (farm-account-liveness-detection): project the persisted "health-blind"
+	// signal as a top-level, unconditionally-written boolean -- same pattern as
+	// farm_enrolled / auto_quarantined above -- so the farm-orchestrator
+	// passthrough can read it directly instead of it being trapped Metadata-only.
+	// The value is READ from the persisted Metadata flag
+	// (Metadata[farmHealthBlindMetadataKey], written as a bool by
+	// stampQuotaHealthBlind ONLY while FARM_LIVENESS_DETECTION_ENABLED is armed);
+	// this projection must NOT recompute it via coreauth.FarmHealthBlind, which
+	// re-runs the serving-independent provisioned gate. When detection is off or
+	// the flag is unset, this projects false (safe no-op). The value is normalized
+	// like farm_enrolled (parseBoolAny-style bool/string tolerance) to survive
+	// persistence round-trips.
+	healthBlind := false
+	if auth.Metadata != nil {
+		switch v := auth.Metadata[farmHealthBlindMetadataKey].(type) {
+		case bool:
+			healthBlind = v
+		case string:
+			if parsed, errParse := strconv.ParseBool(strings.TrimSpace(v)); errParse == nil {
+				healthBlind = parsed
+			}
+		}
+	}
+	entry["farm_health_blind"] = healthBlind
+	// Companion first-observed timestamp (Metadata[farmHealthBlindAtMetadataKey],
+	// RFC3339 UTC). Emitted omitempty and mirrors the refresh_disabled_at
+	// non-empty/non-zero gate above: only surfaced when the key exists and the
+	// string is non-empty and not a Go zero time ("0001-01-01T00:00:00Z").
+	if healthBlindAt, ok := auth.Metadata[farmHealthBlindAtMetadataKey].(string); ok {
+		if trimmed := strings.TrimSpace(healthBlindAt); trimmed != "" {
+			if parsed, err := time.Parse(time.RFC3339, trimmed); err != nil || !parsed.IsZero() {
+				entry["farm_health_blind_at"] = trimmed
+			}
+		}
+	}
 	entry["account_settings"] = buildAuthFileAccountSettingsView(auth, h.cfg)
 	// tasks.md 5.2 (add-adaptive-account-scheduling): additive, namespaced
 	// projection of the Phase 0 scheduling primitives (fine-grained subscription
