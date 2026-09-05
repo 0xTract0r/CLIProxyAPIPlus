@@ -18,38 +18,55 @@ import (
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
 
-// PatchAuthFileAccountScheduling sets or clears the two operator-controlled
-// adaptive-scheduling overrides on an account -- account_scheduling.tier_override
-// and account_scheduling.rate_scale (openspec add-adaptive-account-scheduling
-// design §8.3/§8.4/§8.5).
+// PatchAuthFileAccountScheduling sets or clears the operator-controlled
+// adaptive-scheduling overrides on an account -- account_scheduling.tier_override,
+// account_scheduling.rate_scale and account_scheduling.first_production_at
+// (openspec add-adaptive-account-scheduling design §8.3/§8.4/§8.5).
 //
 // It mirrors PatchAuthFileAccountSettings (dedicated fork-only PATCH: locate by
 // name/auth_index, mutate metadata, persist + make the running selector observe
 // it via h.authManager.Update, then return the refreshed projection) but writes
-// ONLY the two scheduling override sub-keys, routed through coreauth's namespaced
+// ONLY the scheduling override sub-keys, routed through coreauth's namespaced
 // writers (SetAccountTierOverride / ClearAccountTierOverride /
-// SetAccountRateScale / ClearAccountRateScale) so they land in the top-level
-// account_scheduling object that survives the ~45min quota refresh.
+// SetAccountRateScale / ClearAccountRateScale /
+// SetAccountFirstProductionAt / ClearAccountFirstProductionAt) so they land in the
+// top-level account_scheduling object that survives the ~45min quota refresh.
 //
 // Request body (application/json):
 //
 //	{
-//	  "name": "<auth id | display name>",     // required
-//	  "auth_index": "<optional stable index>", // optional, for disambiguation
-//	  "tier_override": "max_5x" | "" | null,   // present => set/clear; absent => untouched
-//	  "rate_scale": 0.5 | "" | null             // present => set/clear; absent => untouched
+//	  "name": "<auth id | display name>",           // required
+//	  "auth_index": "<optional stable index>",       // optional, for disambiguation
+//	  "tier_override": "max_5x" | "" | null,         // present => set/clear; absent => untouched
+//	  "rate_scale": 0.5 | "" | null,                  // present => set/clear; absent => untouched
+//	  "first_production_at": "2026-01-02T15:04:05Z" | "" | null // present => set/clear; absent => untouched
 //	}
 //
 // Field presence is what distinguishes intent (decoded via json.RawMessage so an
 // absent field is never confused with an explicit null): at least one of
-// tier_override / rate_scale must be present or the request is a 400. An explicit
-// empty string or JSON null clears that override -- clearing tier_override lets
-// tier_source fall back to "auto" (derived on read by the projection), and
-// clearing rate_scale falls back to the config default, else 1.0.
+// tier_override / rate_scale / first_production_at must be present or the request
+// is a 400. An explicit empty string or JSON null clears that override --
+// clearing tier_override lets tier_source fall back to "auto" (derived on read by
+// the projection), clearing rate_scale falls back to the config default (else
+// 1.0), and clearing first_production_at re-opens the append-only auto-mint path
+// (the next real serving success re-stamps a fresh anchor).
 //
 // Validation: tier_override must be a legal, provider-appropriate tier (claude:
 // max_20x/max_5x/pro; codex: codex_pro/codex_plus) or a 400 with the legal set is
-// returned; rate_scale must parse as a number > 0 or a 400 is returned.
+// returned; rate_scale must parse as a number > 0 or a 400 is returned;
+// first_production_at must be a legal RFC3339 timestamp that is NOT in the future
+// or a 400 is returned.
+//
+// first_production_at is the operator-explicit backfill channel (design §8.5),
+// deliberately distinct from EnsureAuthFirstProductionAt's append-only auto-mint:
+// it exists to migrate accounts that were already aged/in-production BEFORE
+// adaptive scheduling was enabled (which otherwise get auto-minted as brand-new
+// and clamped to the strictest warm-up stage) to their true first-production
+// date. Only a future timestamp is rejected here; any past date is accepted and
+// the operator owns its correctness. WARNING to operators: setting an anchor
+// EARLIER than the truth makes the account look more mature than it is (less
+// warm-up), which is the account-safety-risky direction -- only backfill dates
+// you have actually confirmed for genuinely aged accounts.
 //
 // Auth: registered under the same /v0/management admin auth as its siblings (no
 // new exemption).
@@ -76,8 +93,9 @@ func (h *Handler) PatchAuthFileAccountScheduling(c *gin.Context) {
 
 	tierRaw, tierPresent := req["tier_override"]
 	rateRaw, ratePresent := req["rate_scale"]
-	if !tierPresent && !ratePresent {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "at least one of tier_override or rate_scale is required"})
+	fpRaw, fpPresent := req["first_production_at"]
+	if !tierPresent && !ratePresent && !fpPresent {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "at least one of tier_override, rate_scale or first_production_at is required"})
 		return
 	}
 
@@ -142,6 +160,39 @@ func (h *Handler) PatchAuthFileAccountScheduling(c *gin.Context) {
 				return
 			}
 			targetAuth.SetAccountRateScale(scale)
+		}
+	}
+
+	if fpPresent {
+		value, errDecode := decodeAuthFileFieldValue(fpRaw)
+		if errDecode != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid first_production_at"})
+			return
+		}
+		if isClearAccountSchedulingValue(value) {
+			// Empty string / JSON null -> clear the operator override, handing the
+			// anchor back to the append-only auto-mint (ClearAccountFirstProductionAt).
+			targetAuth.ClearAccountFirstProductionAt()
+		} else {
+			str, isStr := value.(string)
+			if !isStr {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "first_production_at must be an RFC3339 timestamp string"})
+				return
+			}
+			parsed, errParse := time.Parse(time.RFC3339, strings.TrimSpace(str))
+			if errParse != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "first_production_at must be a valid RFC3339 timestamp"})
+				return
+			}
+			// Fail-safe direction (design §8.5): a future anchor is meaningless
+			// (an account cannot be younger than "now") and is rejected. Any past
+			// date is accepted -- the operator owns backfilling only confirmed,
+			// genuinely-aged accounts (setting it too early = artificially mature).
+			if parsed.After(time.Now()) {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "first_production_at must not be in the future"})
+				return
+			}
+			targetAuth.SetAccountFirstProductionAt(parsed)
 		}
 	}
 

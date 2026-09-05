@@ -243,7 +243,7 @@ func TestPatchAuthFileAccountScheduling_NoFields(t *testing.T) {
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), "at least one of tier_override or rate_scale") {
+	if !strings.Contains(rec.Body.String(), "at least one of tier_override, rate_scale or first_production_at") {
 		t.Fatalf("body = %q, want no-fields error", rec.Body.String())
 	}
 }

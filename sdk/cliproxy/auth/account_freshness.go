@@ -128,6 +128,66 @@ func EnsureAuthFirstProductionAt(auth *Auth, now time.Time) (anchor time.Time, m
 	return stamped, true
 }
 
+// SetAccountFirstProductionAt is the OPERATOR-EXPLICIT override channel for the
+// first-production anchor -- deliberately a SEPARATE path from
+// EnsureAuthFirstProductionAt's append-only auto-mint. Where
+// EnsureAuthFirstProductionAt stamps the anchor exactly once (on the credential's
+// first real serving success) and never overwrites it afterward, this writer
+// UNCONDITIONALLY sets the anchor to the caller-supplied instant, overwriting any
+// existing value.
+//
+// Its sole purpose is a one-shot operational migration: an account that was
+// already aged/in-production BEFORE adaptive scheduling was turned on has no
+// anchor yet, so the auto-mint would stamp it as brand-new the first time it
+// serves under adaptive and clamp it to the most restrictive warm-up stage. An
+// operator uses this to backfill such an account's TRUE first-production date so
+// its warm-up stage / maturity reflect reality. Callers are expected to only
+// backfill dates they have actually confirmed (see the management handler doc):
+// setting an anchor earlier than the truth makes an account look more mature than
+// it is (less warm-up), which is the direction that carries account-safety risk.
+//
+// It writes ONLY to the namespaced account_scheduling.first_production_at sub-key
+// -- the exact location EnsureAuthFirstProductionAt writes (design §8.5) -- in
+// UTC, RFC3339-encoded, so an operator-set anchor and an auto-minted anchor are
+// byte-for-byte the same shape and round-trip identically through
+// readFirstProductionAt / the quota-refresh Clone. Because both paths read/write
+// the same key, an explicit set is subsequently HONORED by the auto-mint (the
+// next EnsureAuthFirstProductionAt sees a present anchor and returns it with
+// minted=false, never clobbering the operator's value): the two paths cannot
+// fight over the anchor.
+//
+// t must be a non-zero, not-future instant; validating that is the caller's job
+// (see PatchAuthFileAccountScheduling), mirroring SetAccountTierOverride /
+// SetAccountRateScale which also trust a pre-validated value. Callers mutating a
+// live, shared *Auth must hold the same lock every other Metadata mutator in this
+// package expects.
+func (a *Auth) SetAccountFirstProductionAt(t time.Time) {
+	if a == nil {
+		return
+	}
+	if a.Metadata == nil {
+		a.Metadata = make(map[string]any)
+	}
+	setAccountSchedulingValue(a.Metadata, FirstProductionAtMetadataKey, t.UTC().Format(time.RFC3339))
+}
+
+// ClearAccountFirstProductionAt removes the first-production anchor from BOTH the
+// namespaced account_scheduling object and the legacy bare top-level key (see
+// clearAccountSchedulingValue for why both must be cleared -- otherwise a stale
+// legacy bare value would resurface via readFirstProductionAt's dual-read).
+//
+// It is the inverse of SetAccountFirstProductionAt and deliberately RE-OPENS the
+// append-only auto-mint path: with no anchor present in either location, the next
+// serving success routed through EnsureAuthFirstProductionAt mints a fresh anchor
+// stamped at that moment. An operator uses it to undo an override and hand
+// freshness tracking back to the automatic mechanism.
+func (a *Auth) ClearAccountFirstProductionAt() {
+	if a == nil || a.Metadata == nil {
+		return
+	}
+	clearAccountSchedulingValue(a.Metadata, FirstProductionAtMetadataKey)
+}
+
 // AccountAge returns how long it has been since auth's first-production
 // anchor, as of `now`. ok is false when no anchor is recorded yet (see
 // AuthFirstProductionAt) -- this function never mints one; callers that want
