@@ -226,8 +226,8 @@ func (m *Manager) filterExecutionModels(auth *Auth, routeModel string, candidate
 		return nil
 	}
 	// Fork plan gate: drop the whole candidate set when the account's subscription
-	// tier is not allowed to serve the requested route model (e.g. a non-max Claude
-	// plan asking for Opus, or a non-pro Codex plan asking for spark), and filter any
+	// tier is not allowed to serve the requested route model (e.g. Claude Pro
+	// without credits asking for Opus 1M, or non-pro Codex asking for spark), and filter any
 	// individual upstream candidate the plan cannot serve. This re-checks per request
 	// so a stale scheduler shard snapshot cannot leak a disallowed account.
 	if !authAllowsRouteModel(auth, routeModel) {
