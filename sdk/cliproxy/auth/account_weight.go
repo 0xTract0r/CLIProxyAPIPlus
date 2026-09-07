@@ -243,6 +243,11 @@ func AccountFreshnessWeightFactor(a *Auth, cfg internalconfig.AccountSchedulingC
 	matureRPM := cfg.MatureLimits.RPMLimit
 
 	ageDays, ok := AccountAgeDays(a, now)
+	// ANCHOR-Q4 (design §10.2): apply the same health-cap clamp the grading view
+	// uses, so a distressed account's freshness weight drops in lock-step with its
+	// lowered effective stage instead of tracking calendar age. No-op when the gate
+	// is disabled or the account carries no restricting cap.
+	ageDays, ok = effectiveWarmupAge(a, cfg, ageDays, ok)
 	if !ok {
 		// No first-production anchor yet -> design §5.1's "cold" state (case 1
 		// in the doc). Weight it at the curve's FIRST (most-restrictive) stage's
@@ -322,6 +327,11 @@ func warmupRPMFreshnessFactor(stageRPM, matureRPM int) float64 {
 // intentional no-anchor divergence.
 func AccountIsMature(a *Auth, cfg internalconfig.AccountSchedulingConfig, now time.Time) bool {
 	ageDays, ok := AccountAgeDays(a, now)
+	// ANCHOR-Q4 (design §10.2): honor the health cap here too, so a health-demoted
+	// account is not reported "mature" on the weight side while the grading view
+	// treats it as warming. No-op when the gate is disabled / the account is
+	// un-capped.
+	ageDays, ok = effectiveWarmupAge(a, cfg, ageDays, ok)
 	if !ok {
 		return true
 	}

@@ -61,6 +61,69 @@ type AccountSchedulingConfig struct {
 	// weight is never compared against a Codex weight, since the two
 	// providers' quota semantics are unrelated (design §5.2).
 	TierWeights AccountTierWeightsConfig `yaml:"tier-weights,omitempty" json:"tier-weights,omitempty"`
+
+	// RateScale is the global default per-account safety-test speed multiplier
+	// (design §8.3, spec.md "per-账号安全测试速率乘子"). It scales every account's
+	// DERIVED rate ceilings -- rpm / burst / concurrency / daily budget -- AFTER
+	// the tier/warm-up derivation, and is deliberately INDEPENDENT of selection
+	// weight (it never changes WHICH account is picked, only how fast the picked
+	// account may go). 1.0 (the default) is a no-op; a value < 1 throttles every
+	// account below its tier/warm-up ceiling for low-risk testing, > 1 lifts it.
+	// A per-account metadata override (account_scheduling.rate_scale) takes
+	// precedence over this global default. MUST be > 0 (see Validate); the
+	// per-account 0-floor that keeps a fractional scale from wedging a limit to
+	// zero lives in the read path (sdk/cliproxy/auth/account_rate_scale.go), not
+	// here.
+	RateScale float64 `yaml:"rate-scale,omitempty" json:"rate-scale,omitempty"`
+
+	// HealthGate configures the health-gated warm-up ramp (ANCHOR-Q4, design §10):
+	// warm-up promotion depends on an account's recent health (early risk-control
+	// signals) on top of calendar age. When enabled, an account showing distress
+	// (a recent failure cluster, or an escalated 429 backoff level) has its
+	// effective warm-up stage clamped DOWN (never up — fail-safe), lowering its
+	// rpm / daily budget / concurrency and its freshness weight until it recovers.
+	// The effective stage is min(age-based stage, health-allowed stage). See
+	// sdk/cliproxy/auth/account_health_gate.go for the read/write logic that
+	// consumes this. Claude-only (design §10.7). When disabled the effective stage
+	// equals the age-based stage — identical to the pre-ANCHOR-Q4 behavior.
+	HealthGate AccountHealthGateConfig `yaml:"health-gate,omitempty" json:"health-gate,omitempty"`
+}
+
+// AccountHealthGateConfig configures the health-gated warm-up ramp (ANCHOR-Q4,
+// design §10.6). All fields are config-overridable with conservative defaults
+// (DefaultAccountHealthGateConfig); design.md pins no exact numbers, so the
+// defaults are fail-safe (bias toward slowing down). The two distress signals
+// (FailureClusterThreshold over ObservationWindowMinutes, and
+// BackoffLevelThreshold) are OR-ed — either one on its own marks distress.
+type AccountHealthGateConfig struct {
+	// Enabled turns the health gate on. Default true (design §10.6). When false
+	// the effective warm-up stage always equals the age-based stage (no clamp),
+	// matching pre-ANCHOR-Q4 behavior exactly. A zero-value config (Enabled
+	// false) is therefore a safe no-op.
+	Enabled bool `yaml:"enabled" json:"enabled"`
+
+	// FailureClusterThreshold is the number of failed requests within
+	// ObservationWindowMinutes that marks distress (design §10.3, the
+	// recentRequests success/failed ring). 0 disables this signal.
+	FailureClusterThreshold int `yaml:"failure-cluster-threshold,omitempty" json:"failure-cluster-threshold,omitempty"`
+
+	// BackoffLevelThreshold is the Quota.BackoffLevel (escalating plan-quota 429
+	// backoff exponent) at or above which distress is marked (design §10.3). 0
+	// disables this signal.
+	BackoffLevelThreshold int `yaml:"backoff-level-threshold,omitempty" json:"backoff-level-threshold,omitempty"`
+
+	// ObservationWindowMinutes is how far back the failure cluster is summed over
+	// the recentRequests ring. Only meaningful when FailureClusterThreshold > 0.
+	ObservationWindowMinutes int `yaml:"observation-window-minutes,omitempty" json:"observation-window-minutes,omitempty"`
+
+	// DemoteStep is how many warm-up stages the effective cap drops per distress
+	// hit. MUST be >= 1 when enabled (see Validate). Only ever lowers the cap.
+	DemoteStep int `yaml:"demote-step,omitempty" json:"demote-step,omitempty"`
+
+	// PromoteCooldownMinutes is the minimum time since the last distress before a
+	// healthy request may re-raise the cap by one stage (design §10.4 "升档冷静期").
+	// MUST be > 0 when enabled.
+	PromoteCooldownMinutes int `yaml:"promote-cooldown-minutes,omitempty" json:"promote-cooldown-minutes,omitempty"`
 }
 
 // AccountWarmupStage describes one age-based warm-up throttling tier.
@@ -173,6 +236,22 @@ func DefaultAccountSchedulingConfig() AccountSchedulingConfig {
 		WarmupCurve:  DefaultAccountWarmupCurve(),
 		MatureLimits: DefaultAccountMatureLimits(),
 		TierWeights:  DefaultAccountTierWeights(),
+		RateScale:    DefaultAccountSchedulingRateScale,
+		HealthGate:   DefaultAccountHealthGateConfig(),
+	}
+}
+
+// DefaultAccountHealthGateConfig returns the ANCHOR-Q4 health-gate defaults
+// (design §10.6). Enabled by default; the thresholds/windows are conservative
+// fail-safe values (config_defaults.go), not design-pinned numerics.
+func DefaultAccountHealthGateConfig() AccountHealthGateConfig {
+	return AccountHealthGateConfig{
+		Enabled:                  DefaultAccountHealthGateEnabled,
+		FailureClusterThreshold:  DefaultAccountHealthGateFailureClusterThreshold,
+		BackoffLevelThreshold:    DefaultAccountHealthGateBackoffLevelThreshold,
+		ObservationWindowMinutes: DefaultAccountHealthGateObservationWindowMinutes,
+		DemoteStep:               DefaultAccountHealthGateDemoteStep,
+		PromoteCooldownMinutes:   DefaultAccountHealthGatePromoteCooldownMinutes,
 	}
 }
 
@@ -236,6 +315,9 @@ func (c AccountSchedulingConfig) Validate() error {
 	if c.MatureLimits.ConcurrencyLimit <= 0 {
 		return fmt.Errorf("account-scheduling.mature-limits.concurrency-limit must be positive")
 	}
+	if c.RateScale <= 0 {
+		return fmt.Errorf("account-scheduling.rate-scale must be positive")
+	}
 	weights := map[string]float64{
 		"tier-weights.claude.max-20x": c.TierWeights.Claude.Max20x,
 		"tier-weights.claude.max-5x":  c.TierWeights.Claude.Max5x,
@@ -254,6 +336,40 @@ func (c AccountSchedulingConfig) Validate() error {
 		if weights[key] <= 0 {
 			return fmt.Errorf("account-scheduling.%s must be positive", key)
 		}
+	}
+	if errHealth := c.HealthGate.validate(); errHealth != nil {
+		return errHealth
+	}
+	return nil
+}
+
+// validate checks the health-gate config for well-formedness. It is a no-op when
+// the gate is disabled (a zero-value / disabled gate must never fail load — that
+// is the backward-compatible off state), and otherwise requires the fields the
+// read/write state machine relies on to be sane (at least one distress signal,
+// a positive observation window when the failure-cluster signal is used, a
+// demote step of at least one, and a positive promote cooldown).
+func (h AccountHealthGateConfig) validate() error {
+	if !h.Enabled {
+		return nil
+	}
+	if h.FailureClusterThreshold < 0 {
+		return fmt.Errorf("account-scheduling.health-gate.failure-cluster-threshold must not be negative")
+	}
+	if h.BackoffLevelThreshold < 0 {
+		return fmt.Errorf("account-scheduling.health-gate.backoff-level-threshold must not be negative")
+	}
+	if h.FailureClusterThreshold == 0 && h.BackoffLevelThreshold == 0 {
+		return fmt.Errorf("account-scheduling.health-gate.enabled requires at least one of failure-cluster-threshold / backoff-level-threshold to be positive")
+	}
+	if h.FailureClusterThreshold > 0 && h.ObservationWindowMinutes <= 0 {
+		return fmt.Errorf("account-scheduling.health-gate.observation-window-minutes must be positive when failure-cluster-threshold is set")
+	}
+	if h.DemoteStep < 1 {
+		return fmt.Errorf("account-scheduling.health-gate.demote-step must be at least 1")
+	}
+	if h.PromoteCooldownMinutes <= 0 {
+		return fmt.Errorf("account-scheduling.health-gate.promote-cooldown-minutes must be positive")
 	}
 	return nil
 }

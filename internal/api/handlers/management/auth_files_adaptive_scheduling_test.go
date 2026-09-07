@@ -17,7 +17,7 @@ import (
 // (add-adaptive-account-scheduling): buildAuthFileEntry must additively project
 // the Phase 0 scheduling primitives (fine-grained subscription tier, structured
 // quota utilization/headroom, first_production_at anchor, current warm-up +
-// rate-limit stage) under entry["adaptive_scheduling"], reading only
+// rate-limit stage) under entry["account_scheduling"], reading only
 // already-persisted record data and surfacing "unknown" state explicitly
 // (JSON null / "unknown" label) rather than coercing it to a guessed value.
 func TestBuildAuthFileEntry_AdaptiveScheduling(t *testing.T) {
@@ -51,13 +51,22 @@ func TestBuildAuthFileEntry_AdaptiveScheduling(t *testing.T) {
 		if entry == nil {
 			t.Fatal("buildAuthFileEntry() = nil, want an entry")
 		}
-		view, ok := entry["adaptive_scheduling"].(gin.H)
+		view, ok := entry["account_scheduling"].(gin.H)
 		if !ok {
-			t.Fatalf("entry[\"adaptive_scheduling\"] = %#v, want gin.H", entry["adaptive_scheduling"])
+			t.Fatalf("entry[\"account_scheduling\"] = %#v, want gin.H", entry["account_scheduling"])
 		}
 
 		if got := view["subscription_tier"]; got != "max_20x" {
 			t.Fatalf("subscription_tier = %#v, want %q", got, "max_20x")
+		}
+
+		// §8.4: auto-detected tier (no tier_override) -> tier_source "auto".
+		if got := view["tier_source"]; got != "auto" {
+			t.Fatalf("tier_source = %#v, want %q for an auto-detected tier", got, "auto")
+		}
+		// §8.3: default rate_scale (no override, default config) -> 1.0.
+		if got, ok := view["rate_scale"].(float64); !ok || math.Abs(got-1.0) > 1e-9 {
+			t.Fatalf("rate_scale = %#v, want 1.0", view["rate_scale"])
 		}
 
 		if got, gotOK := view["first_production_at"].(string); !gotOK || got != anchor {
@@ -124,9 +133,9 @@ func TestBuildAuthFileEntry_AdaptiveScheduling(t *testing.T) {
 		if entry == nil {
 			t.Fatal("buildAuthFileEntry() = nil, want an entry")
 		}
-		view, ok := entry["adaptive_scheduling"].(gin.H)
+		view, ok := entry["account_scheduling"].(gin.H)
 		if !ok {
-			t.Fatalf("entry[\"adaptive_scheduling\"] = %#v, want gin.H", entry["adaptive_scheduling"])
+			t.Fatalf("entry[\"account_scheduling\"] = %#v, want gin.H", entry["account_scheduling"])
 		}
 
 		if got := view["subscription_tier"]; got != "unknown" {
@@ -175,25 +184,148 @@ func TestBuildAuthFileEntry_AdaptiveScheduling(t *testing.T) {
 		if entry == nil {
 			t.Fatal("buildAuthFileEntry() = nil, want an entry")
 		}
-		view, ok := entry["adaptive_scheduling"].(gin.H)
+		view, ok := entry["account_scheduling"].(gin.H)
 		if !ok {
-			t.Fatalf("entry[\"adaptive_scheduling\"] = %#v, want gin.H", entry["adaptive_scheduling"])
+			t.Fatalf("entry[\"account_scheduling\"] = %#v, want gin.H", entry["account_scheduling"])
 		}
 		if got := view["subscription_tier"]; got != "pro" {
 			t.Fatalf("subscription_tier = %#v, want %q for a codex pro account", got, "pro")
+		}
+		if got := view["tier_source"]; got != "auto" {
+			t.Fatalf("tier_source = %#v, want %q for an auto-detected codex tier", got, "auto")
+		}
+	})
+
+	t.Run("namespaced tier_override and rate_scale surface as override and scaled value", func(t *testing.T) {
+		auth := &coreauth.Auth{
+			ID:         "claude-adaptive-override-1",
+			Provider:   "claude",
+			Status:     coreauth.StatusActive,
+			UpdatedAt:  time.Now(),
+			Attributes: map[string]string{"runtime_only": "true"},
+			Metadata: map[string]any{
+				// No rate_limit_tier at all: the shown tier comes purely from the
+				// manual override, so tier_source must read "override".
+				coreauth.AccountSchedulingMetadataKey: map[string]any{
+					"tier_override": "max_5x",
+					"rate_scale":    0.5,
+				},
+			},
+		}
+
+		entry := h.buildAuthFileEntry(auth)
+		view, ok := entry["account_scheduling"].(gin.H)
+		if !ok {
+			t.Fatalf("entry[\"account_scheduling\"] = %#v, want gin.H", entry["account_scheduling"])
+		}
+		if got := view["subscription_tier"]; got != "max_5x" {
+			t.Fatalf("subscription_tier = %#v, want %q (from tier_override)", got, "max_5x")
+		}
+		if got := view["tier_source"]; got != "override" {
+			t.Fatalf("tier_source = %#v, want %q for a manual override", got, "override")
+		}
+		if got, ok := view["rate_scale"].(float64); !ok || math.Abs(got-0.5) > 1e-9 {
+			t.Fatalf("rate_scale = %#v, want 0.5 from the per-account override", view["rate_scale"])
+		}
+	})
+}
+
+// TestBuildAuthFileEntry_AdaptiveScheduling_HealthGate covers the ANCHOR-Q4
+// (design §10.5/§10.7) projection: account_scheduling must additively surface the
+// health-gated warm-up ramp state -- in_distress plus the warmup_health_stage_cap /
+// warmup_last_distress_at pair -- following the same "unknown is not a number"
+// contract as the blocks above. An account that has never shown distress reports
+// in_distress=false and an explicit null cap / null last-distress (present keys, not
+// absent, and never coerced to 0 / "just now"). A distressed, health-capped account
+// reports in_distress=true, an integer cap, and an RFC3339 last-distress string.
+func TestBuildAuthFileEntry_AdaptiveScheduling_HealthGate(t *testing.T) {
+	h := &Handler{cfg: &config.Config{AccountScheduling: config.DefaultAccountSchedulingConfig()}}
+	anchor := time.Now().Add(-10 * 24 * time.Hour).UTC().Format(time.RFC3339)
+
+	t.Run("healthy account reports false / null health-gate fields", func(t *testing.T) {
+		auth := &coreauth.Auth{
+			ID:         "claude-healthgate-healthy",
+			Provider:   "claude",
+			Status:     coreauth.StatusActive,
+			UpdatedAt:  time.Now(),
+			Attributes: map[string]string{"runtime_only": "true"},
+			Metadata:   map[string]any{"first_production_at": anchor},
+		}
+
+		entry := h.buildAuthFileEntry(auth)
+		view, ok := entry["account_scheduling"].(gin.H)
+		if !ok {
+			t.Fatalf("entry[\"account_scheduling\"] = %#v, want gin.H", entry["account_scheduling"])
+		}
+
+		if got, ok := view["in_distress"].(bool); !ok || got {
+			t.Fatalf("in_distress = %#v, want false", view["in_distress"])
+		}
+		capVal, capPresent := view["warmup_health_stage_cap"]
+		if !capPresent {
+			t.Fatal("warmup_health_stage_cap key absent, want present with null value")
+		}
+		if capVal != nil {
+			t.Fatalf("warmup_health_stage_cap = %#v, want nil for an account with no cap", capVal)
+		}
+		ldVal, ldPresent := view["warmup_last_distress_at"]
+		if !ldPresent {
+			t.Fatal("warmup_last_distress_at key absent, want present with null value")
+		}
+		if ldVal != nil {
+			t.Fatalf("warmup_last_distress_at = %#v, want nil for an account that never showed distress", ldVal)
+		}
+	})
+
+	t.Run("distressed capped account reports true / typed health-gate fields", func(t *testing.T) {
+		lastDistress := time.Now().Add(-5 * time.Minute).UTC().Format(time.RFC3339)
+		auth := &coreauth.Auth{
+			ID:         "claude-healthgate-distressed",
+			Provider:   "claude",
+			Status:     coreauth.StatusActive,
+			UpdatedAt:  time.Now(),
+			Attributes: map[string]string{"runtime_only": "true"},
+			Metadata: map[string]any{
+				"first_production_at": anchor,
+				// Persisted health-gate state lives inside the namespaced
+				// account_scheduling object (design §10.5), the same sub-keys the
+				// core writers use.
+				coreauth.AccountSchedulingMetadataKey: map[string]any{
+					"warmup_health_stage_cap": 2,
+					"warmup_last_distress_at": lastDistress,
+				},
+			},
+		}
+		// BackoffLevel >= the default threshold (1) trips the in_distress signal.
+		auth.Quota.BackoffLevel = 2
+
+		entry := h.buildAuthFileEntry(auth)
+		view, ok := entry["account_scheduling"].(gin.H)
+		if !ok {
+			t.Fatalf("entry[\"account_scheduling\"] = %#v, want gin.H", entry["account_scheduling"])
+		}
+
+		if got, ok := view["in_distress"].(bool); !ok || !got {
+			t.Fatalf("in_distress = %#v, want true (BackoffLevel 2 >= threshold 1)", view["in_distress"])
+		}
+		if got, ok := view["warmup_health_stage_cap"].(int); !ok || got != 2 {
+			t.Fatalf("warmup_health_stage_cap = %#v, want int 2", view["warmup_health_stage_cap"])
+		}
+		if got, ok := view["warmup_last_distress_at"].(string); !ok || got != lastDistress {
+			t.Fatalf("warmup_last_distress_at = %#v, want %q", view["warmup_last_distress_at"], lastDistress)
 		}
 	})
 }
 
 // TestBuildAuthFileEntry_AdaptiveScheduling_SessionCounts covers the P6
-// session-aggregation slice: adaptive_scheduling must additively project
+// session-aggregation slice: account_scheduling must additively project
 // sessions_total/sessions_active/sessions_closed, sourced from
 // internal/usage.SessionAggregateForAuthIndex keyed on this account's
 // EnsureIndex(). It also covers the no-usage-store-wired path (existing
 // callers that construct a bare Handler{cfg: ...} without usageStats), which
 // must report explicit zeros rather than omitting the keys or panicking.
 func TestBuildAuthFileEntry_AdaptiveScheduling_SessionCounts(t *testing.T) {
-	// buildAdaptiveSchedulingView (production code, called via buildAuthFileEntry
+	// buildAccountSchedulingView (production code, called via buildAuthFileEntry
 	// below) derives its own "now" internally via time.Now() when bucketing
 	// sessions into active/closed -- it is not parameterized. A hardcoded
 	// calendar date here would only agree with that internal now on the day it
@@ -205,9 +337,9 @@ func TestBuildAuthFileEntry_AdaptiveScheduling_SessionCounts(t *testing.T) {
 		auth := &coreauth.Auth{ID: "claude-sessions-nostat", Provider: "claude", Status: coreauth.StatusActive, UpdatedAt: now, Attributes: map[string]string{"runtime_only": "true"}}
 
 		entry := h.buildAuthFileEntry(auth)
-		view, ok := entry["adaptive_scheduling"].(gin.H)
+		view, ok := entry["account_scheduling"].(gin.H)
 		if !ok {
-			t.Fatalf("entry[\"adaptive_scheduling\"] = %#v, want gin.H", entry["adaptive_scheduling"])
+			t.Fatalf("entry[\"account_scheduling\"] = %#v, want gin.H", entry["account_scheduling"])
 		}
 		for _, key := range []string{"sessions_total", "sessions_active", "sessions_closed"} {
 			got, present := view[key]
@@ -250,9 +382,9 @@ func TestBuildAuthFileEntry_AdaptiveScheduling_SessionCounts(t *testing.T) {
 		record("some-other-authindex", "s-other-account", now.Add(-1*time.Minute))
 
 		entry := h.buildAuthFileEntry(auth)
-		view, ok := entry["adaptive_scheduling"].(gin.H)
+		view, ok := entry["account_scheduling"].(gin.H)
 		if !ok {
-			t.Fatalf("entry[\"adaptive_scheduling\"] = %#v, want gin.H", entry["adaptive_scheduling"])
+			t.Fatalf("entry[\"account_scheduling\"] = %#v, want gin.H", entry["account_scheduling"])
 		}
 		if got := view["sessions_total"]; got != 2 {
 			t.Fatalf("sessions_total = %#v, want 2", got)

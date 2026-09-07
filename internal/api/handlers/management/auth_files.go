@@ -522,7 +522,17 @@ func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth) gin.H {
 	// current warm-up + rate-limit stage) so the management UI / farm-orchestrator
 	// can read them without depending on any other nested sub-object. Read-only
 	// (mints nothing, mutates nothing); "unknown" state is surfaced explicitly.
-	entry["adaptive_scheduling"] = h.buildAdaptiveSchedulingView(auth)
+	entry["account_scheduling"] = h.buildAccountSchedulingView(auth)
+	// §8.5 renamed this projection from "adaptive_scheduling" to
+	// "account_scheduling". Dual-emit the legacy name with the identical value as a
+	// transition-safety measure so any consumer still reading the old name is not
+	// silently broken by the rename. A grep of the whole umbrella confirms no active
+	// consumer reads the old name today (cpamp reads the new name; the
+	// farm-orchestrator decodes neither into its AuthFileEntry and does not use
+	// strict decoding), so this is purely precautionary and can be dropped once the
+	// legacy name is confirmed dead everywhere. Sharing the same built value is safe:
+	// this response map is JSON-serialized read-only right after and never mutated.
+	entry["adaptive_scheduling"] = entry["account_scheduling"]
 	if websockets, ok := authWebsocketsValue(auth); ok {
 		entry["websockets"] = websockets
 	}

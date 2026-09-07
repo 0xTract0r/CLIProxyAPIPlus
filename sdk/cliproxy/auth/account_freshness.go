@@ -24,10 +24,16 @@ import (
 // Persisted shape is an RFC3339 timestamp string in UTC, matching the
 // convention already used for other Metadata-carried timestamps in this
 // package (see FarmContainerAliveAtMetadataKey in custom_headers.go and
-// metadataKeyQuarantinedAt in conductor_auto_quarantine.go). It lives in the
-// same auth.Metadata map as quota_snapshot/rate_limit_tier, so it persists to
+// metadataKeyQuarantinedAt in conductor_auto_quarantine.go). It persists to
 // whichever backend already stores Metadata (file store or Postgres store) --
 // no new storage subsystem is introduced (design.md §6.4).
+//
+// As of the §8.5 namespace unification this const names the SUB-KEY inside the
+// top-level account_scheduling object (AccountSchedulingMetadataKey): the anchor
+// is WRITTEN to account_scheduling.first_production_at and READ via dual-read
+// (namespaced sub-key preferred, legacy bare first_production_at key as
+// fallback -- see readFirstProductionAt). It remains a top-level-reachable key
+// either way, so it survives the quota refresh Clone (design.md §6.4).
 const FirstProductionAtMetadataKey = "first_production_at"
 
 // AuthFirstProductionAt returns the persisted first-production anchor for
@@ -46,7 +52,26 @@ func AuthFirstProductionAt(auth *Auth) (time.Time, bool) {
 	if auth == nil || len(auth.Metadata) == 0 {
 		return time.Time{}, false
 	}
-	return parseFirstProductionAtValue(auth.Metadata[FirstProductionAtMetadataKey])
+	return readFirstProductionAt(auth.Metadata)
+}
+
+// readFirstProductionAt dual-reads the first-production anchor (design §8.5 /
+// spec.md "老裸键 dual-read 迁移"): it prefers the namespaced
+// account_scheduling.first_production_at sub-key and falls back to the legacy
+// bare top-level first_production_at key so credentials written before the §8.5
+// namespace unification keep resolving. A present-but-unparseable value in the
+// new location transparently falls back to a valid legacy value rather than
+// masking it. ok is false when neither location holds a parseable timestamp.
+func readFirstProductionAt(meta map[string]any) (time.Time, bool) {
+	if len(meta) == 0 {
+		return time.Time{}, false
+	}
+	if obj, ok := accountSchedulingObject(meta); ok {
+		if parsed, ok := parseFirstProductionAtValue(obj[FirstProductionAtMetadataKey]); ok {
+			return parsed, true
+		}
+	}
+	return parseFirstProductionAtValue(meta[FirstProductionAtMetadataKey])
 }
 
 // EnsureAuthFirstProductionAt returns the account's first-production anchor,
@@ -88,15 +113,79 @@ func EnsureAuthFirstProductionAt(auth *Auth, now time.Time) (anchor time.Time, m
 	if auth == nil {
 		return time.Time{}, false
 	}
-	if existing, ok := parseFirstProductionAtValue(auth.Metadata[FirstProductionAtMetadataKey]); ok {
+	if existing, ok := readFirstProductionAt(auth.Metadata); ok {
 		return existing, false
 	}
 	stamped := now.UTC()
 	if auth.Metadata == nil {
 		auth.Metadata = make(map[string]any)
 	}
-	auth.Metadata[FirstProductionAtMetadataKey] = stamped.Format(time.RFC3339)
+	// Write ONLY to the namespaced location (design §8.5: "写入只走新位置");
+	// dual-read above keeps honoring any legacy bare key, so this is a
+	// non-destructive migration -- an existing legacy anchor is never rewritten,
+	// and a brand-new anchor lands under account_scheduling.first_production_at.
+	setAccountSchedulingValue(auth.Metadata, FirstProductionAtMetadataKey, stamped.Format(time.RFC3339))
 	return stamped, true
+}
+
+// SetAccountFirstProductionAt is the OPERATOR-EXPLICIT override channel for the
+// first-production anchor -- deliberately a SEPARATE path from
+// EnsureAuthFirstProductionAt's append-only auto-mint. Where
+// EnsureAuthFirstProductionAt stamps the anchor exactly once (on the credential's
+// first real serving success) and never overwrites it afterward, this writer
+// UNCONDITIONALLY sets the anchor to the caller-supplied instant, overwriting any
+// existing value.
+//
+// Its sole purpose is a one-shot operational migration: an account that was
+// already aged/in-production BEFORE adaptive scheduling was turned on has no
+// anchor yet, so the auto-mint would stamp it as brand-new the first time it
+// serves under adaptive and clamp it to the most restrictive warm-up stage. An
+// operator uses this to backfill such an account's TRUE first-production date so
+// its warm-up stage / maturity reflect reality. Callers are expected to only
+// backfill dates they have actually confirmed (see the management handler doc):
+// setting an anchor earlier than the truth makes an account look more mature than
+// it is (less warm-up), which is the direction that carries account-safety risk.
+//
+// It writes ONLY to the namespaced account_scheduling.first_production_at sub-key
+// -- the exact location EnsureAuthFirstProductionAt writes (design §8.5) -- in
+// UTC, RFC3339-encoded, so an operator-set anchor and an auto-minted anchor are
+// byte-for-byte the same shape and round-trip identically through
+// readFirstProductionAt / the quota-refresh Clone. Because both paths read/write
+// the same key, an explicit set is subsequently HONORED by the auto-mint (the
+// next EnsureAuthFirstProductionAt sees a present anchor and returns it with
+// minted=false, never clobbering the operator's value): the two paths cannot
+// fight over the anchor.
+//
+// t must be a non-zero, not-future instant; validating that is the caller's job
+// (see PatchAuthFileAccountScheduling), mirroring SetAccountTierOverride /
+// SetAccountRateScale which also trust a pre-validated value. Callers mutating a
+// live, shared *Auth must hold the same lock every other Metadata mutator in this
+// package expects.
+func (a *Auth) SetAccountFirstProductionAt(t time.Time) {
+	if a == nil {
+		return
+	}
+	if a.Metadata == nil {
+		a.Metadata = make(map[string]any)
+	}
+	setAccountSchedulingValue(a.Metadata, FirstProductionAtMetadataKey, t.UTC().Format(time.RFC3339))
+}
+
+// ClearAccountFirstProductionAt removes the first-production anchor from BOTH the
+// namespaced account_scheduling object and the legacy bare top-level key (see
+// clearAccountSchedulingValue for why both must be cleared -- otherwise a stale
+// legacy bare value would resurface via readFirstProductionAt's dual-read).
+//
+// It is the inverse of SetAccountFirstProductionAt and deliberately RE-OPENS the
+// append-only auto-mint path: with no anchor present in either location, the next
+// serving success routed through EnsureAuthFirstProductionAt mints a fresh anchor
+// stamped at that moment. An operator uses it to undo an override and hand
+// freshness tracking back to the automatic mechanism.
+func (a *Auth) ClearAccountFirstProductionAt() {
+	if a == nil || a.Metadata == nil {
+		return
+	}
+	clearAccountSchedulingValue(a.Metadata, FirstProductionAtMetadataKey)
 }
 
 // AccountAge returns how long it has been since auth's first-production

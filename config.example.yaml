@@ -300,6 +300,32 @@ routing:
 #       pro: 10
 #       plus: 1
 #       unknown: 1 # fallback for team/business/unrecognized chatgpt_plan_type
+#   # Global default safety-test speed multiplier applied to every account's
+#   # DERIVED rate ceilings (rpm / burst / concurrency / daily budget) AFTER the
+#   # tier/warm-up derivation — independent of selection weight (it never changes
+#   # WHICH account is picked, only how fast the picked account may go). 1.0 = no
+#   # effect; < 1 throttles for low-risk testing, > 1 lifts. A per-account
+#   # override (metadata account_scheduling.rate_scale) takes precedence. Must be > 0.
+#   rate-scale: 1.0
+#   # Health-gated warm-up ramp (ANCHOR-Q4, design.md §10). Warm-up promotion
+#   # depends on account health, not calendar age alone: an account showing an
+#   # early risk-control signal (a recent failure cluster, or an escalated 429
+#   # backoff level) has its EFFECTIVE warm-up stage clamped DOWN (never up —
+#   # fail-safe) until it recovers, lowering its rpm / daily budget / concurrency
+#   # and its selection weight. Effective stage = min(age-based stage, health cap).
+#   # Claude-only. Enabled by default; disable to fall back to pure age-based ramp.
+#   health-gate:
+#     enabled: true
+#     # >= this many failed requests within observation-window-minutes = distress.
+#     failure-cluster-threshold: 3
+#     # Quota backoff level (escalating plan-quota 429 exponent) >= this = distress.
+#     backoff-level-threshold: 1
+#     # Window (minutes) over which the failure cluster is summed.
+#     observation-window-minutes: 30
+#     # How many warm-up stages the effective cap drops per distress hit.
+#     demote-step: 1
+#     # Minutes of no-distress health required before the cap re-raises one stage.
+#     promote-cooldown-minutes: 30
 
 # Codex provider behavior.
 codex:

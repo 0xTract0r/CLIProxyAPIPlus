@@ -415,12 +415,25 @@ func TestAuth_AccountTierBaseWeight(t *testing.T) {
 			want: 1,
 		},
 		{
-			name: "codex provider dispatches to codex weights",
+			// §8.2: Codex is deliberately dropped from adaptive scheduling by
+			// returning a 0 base weight, so it退回普通轮询. CodexTierBaseWeight
+			// itself still maps plan_type -> configured weight (see
+			// TestCodexTierBaseWeight), but AccountTierBaseWeight no longer
+			// dispatches Codex through it.
+			name: "codex provider returns 0 base weight (claude-only收敛, §8.2)",
 			auth: &Auth{
 				Provider:   "codex",
 				Attributes: map[string]string{"plan_type": "plus"},
 			},
-			want: 1,
+			want: 0,
+		},
+		{
+			name: "codex pro also returns 0 base weight (§8.2)",
+			auth: &Auth{
+				Provider:   "codex",
+				Attributes: map[string]string{"plan_type": "pro"},
+			},
+			want: 0,
 		},
 		{
 			name: "claude account with unrecognized tier falls back to claude unknown weight",

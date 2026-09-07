@@ -363,6 +363,25 @@ func (a *Auth) Clone() *Auth {
 		for key, value := range a.Metadata {
 			copyAuth.Metadata[key] = value
 		}
+		// account_scheduling is the ONE nested Metadata object that hot-path writers
+		// mutate IN PLACE under m.mu: MarkResult -> EnsureAuthFirstProductionAt /
+		// evaluateAccountHealthGateLocked, plus the operator PATCH
+		// (SetAccount*/ClearAccount* -> setAccountSchedulingValue) all reach into the
+		// same nested map[string]any and assign sub-keys WITHOUT replacing the object.
+		// The shallow map copy above would leave every clone SHARING that nested map,
+		// so a lock-free reader of a clone (management List/GetByID ->
+		// buildAccountSchedulingView on the dashboard poll, or a scheduler snapshot)
+		// would read the map while a writer mutates it and trip a fatal runtime
+		// "concurrent map read and map write". Give each clone its OWN deep copy of
+		// this single object so reads are fully isolated from the in-place writes.
+		// Every OTHER top-level Metadata value keeps its existing shallow-copy
+		// semantics: they are either immutable scalars or nested objects that are only
+		// ever replaced wholesale (e.g. quota_snapshot, claude device high-water — see
+		// claude_device_high_water_test.go), never mutated in place, so a clone never
+		// shares a half-written state of them.
+		if raw, ok := copyAuth.Metadata[AccountSchedulingMetadataKey]; ok {
+			copyAuth.Metadata[AccountSchedulingMetadataKey] = deepCopyMetadataValue(raw)
+		}
 	}
 	if len(a.ModelStates) > 0 {
 		copyAuth.ModelStates = make(map[string]*ModelState, len(a.ModelStates))
@@ -377,6 +396,41 @@ func (a *Auth) Clone() *Auth {
 	// preserveQuarantineFieldsOnStaleWriteback relies on. See its field
 	// comment above.
 	return &copyAuth
+}
+
+// deepCopyMetadataValue recursively duplicates the mutable containers
+// (map[string]any, map[string]string, []any) reachable from v so the returned
+// value shares no map/slice backing store with the original. Scalar values
+// (strings, numbers, bools, time.Time, ...) are returned unchanged since they
+// are safe to share by value. Auth.Clone uses it to give each clone its own copy
+// of the in-place-mutated account_scheduling object (see the concurrency note in
+// Clone); it is deliberately generic/recursive so a future nested sub-object
+// inside account_scheduling is isolated too, and so both the map[string]any shape
+// (persisted-then-reloaded from JSON, and the shape setAccountSchedulingValue
+// writes) and any rebuilt map[string]string shape are handled.
+func deepCopyMetadataValue(v any) any {
+	switch typed := v.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(typed))
+		for k, val := range typed {
+			out[k] = deepCopyMetadataValue(val)
+		}
+		return out
+	case map[string]string:
+		out := make(map[string]string, len(typed))
+		for k, val := range typed {
+			out[k] = val
+		}
+		return out
+	case []any:
+		out := make([]any, len(typed))
+		for i, val := range typed {
+			out[i] = deepCopyMetadataValue(val)
+		}
+		return out
+	default:
+		return v
+	}
 }
 
 func stableAuthIndex(seed string) string {

@@ -35,6 +35,7 @@ func TestLoadConfigOptionalAccountSchedulingPartialOverrideMergesWithDefaults(t 
 	// its default value via yaml.v3's field-level merge into the pre-filled
 	// struct (see the pre-fill-before-unmarshal comment in config_load.go).
 	data := []byte(`account-scheduling:
+  rate-scale: 0.25
   tier-weights:
     claude:
       max-20x: 25
@@ -50,6 +51,9 @@ func TestLoadConfigOptionalAccountSchedulingPartialOverrideMergesWithDefaults(t 
 
 	if got := cfg.AccountScheduling.TierWeights.Claude.Max20x; got != 25 {
 		t.Fatalf("tier-weights.claude.max-20x = %v, want 25 (override)", got)
+	}
+	if got := cfg.AccountScheduling.RateScale; got != 0.25 {
+		t.Fatalf("rate-scale = %v, want 0.25 (override)", got)
 	}
 	if got := cfg.AccountScheduling.TierWeights.Claude.Max5x; got != DefaultAccountTierWeightClaudeMax5x {
 		t.Fatalf("tier-weights.claude.max-5x = %v, want default %v (untouched sibling)", got, DefaultAccountTierWeightClaudeMax5x)
@@ -202,6 +206,13 @@ func TestAccountSchedulingConfigValidate(t *testing.T) {
 				c.TierWeights.Claude.Max20x = 0
 			},
 			wantErr: "tier-weights.claude.max-20x must be positive",
+		},
+		{
+			name: "non-positive rate scale",
+			mutate: func(c *AccountSchedulingConfig) {
+				c.RateScale = 0
+			},
+			wantErr: "rate-scale must be positive",
 		},
 	}
 

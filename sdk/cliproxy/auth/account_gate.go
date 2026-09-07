@@ -322,6 +322,10 @@ func (m *Manager) beginAccountExecution(auth *Auth) (*accountExecutionSlot, bool
 		return nil, true
 	}
 	limit := AccountWarmupStatusFor(auth, time.Now(), cfg).ConcurrencyLimit
+	// Scale the concurrency ceiling by the per-account rate multiplier (§8.3) so
+	// the execution-path acquire enforces the SAME scaled limit the selector's
+	// Pick-time hasConcurrencyHeadroom read avoids against (one source of truth).
+	limit = scaleLimitInt(limit, AccountRateScale(auth, cfg))
 	within := gate.Acquire(auth.ID, limit)
 	return &accountExecutionSlot{gate: gate, authID: auth.ID}, within
 }
