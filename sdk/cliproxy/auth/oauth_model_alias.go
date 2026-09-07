@@ -268,6 +268,10 @@ func (m *Manager) resolveOAuthModelAliasWithResult(auth *Auth, requestedModel st
 		return OAuthModelAliasResult{}
 	}
 	if result := resolveUpstreamModelFromAliases(OAuthModelAliasesFromAttributes(authAttributes(auth)), requestedModel); result.UpstreamModel != "" {
+		if channel == "claude" &&
+			(!authAllowsClaudeRouteModel(auth, requestedModel) || !authAllowsClaudeRouteModel(auth, result.UpstreamModel)) {
+			return OAuthModelAliasResult{}
+		}
 		return result
 	}
 	return resolveUpstreamModelFromAliasTable(m, auth, requestedModel, channel)
@@ -432,8 +436,7 @@ func resolveUpstreamModelFromAliasTable(m *Manager, auth *Auth, requestedModel, 
 		// the alias table maps to one. Checked against both the requested
 		// candidate and the resolved upstream model.
 		if channel == "claude" &&
-			(registry.IsClaudeOpusModelID(candidate) || registry.IsClaudeOpusModelID(targetModel)) &&
-			!authAllowsClaudeOpusModel(auth) {
+			(!authAllowsClaudeRouteModel(auth, candidate) || !authAllowsClaudeRouteModel(auth, targetModel)) {
 			return OAuthModelAliasResult{}
 		}
 

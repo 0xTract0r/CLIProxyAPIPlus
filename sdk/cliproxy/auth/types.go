@@ -1337,6 +1337,38 @@ func (a *Auth) RequestRetryOverride() (int, bool) {
 	return 0, false
 }
 
+// ClaudeUsageCreditsEnabled reads the same persisted entitlement for catalog
+// registration and request routing. It never enables billing upstream.
+func (a *Auth) ClaudeUsageCreditsEnabled() bool {
+	if a == nil {
+		return false
+	}
+	truthy := func(value any) bool {
+		switch v := value.(type) {
+		case bool:
+			return v
+		case string:
+			switch strings.ToLower(strings.TrimSpace(v)) {
+			case "1", "true", "yes", "y", "enabled", "on":
+				return true
+			}
+		}
+		return false
+	}
+	for _, key := range []string{"usage_credits_enabled", "extra_usage_enabled", "has_extra_usage_enabled"} {
+		if truthy(a.Attributes[key]) || truthy(a.Metadata[key]) {
+			return true
+		}
+	}
+	snapshot, _ := a.Metadata["quota_snapshot"].(map[string]any)
+	usage, _ := snapshot["usage"].(map[string]any)
+	extra, _ := usage["extra_usage"].(map[string]any)
+	if extra == nil {
+		extra, _ = usage["extraUsage"].(map[string]any)
+	}
+	return truthy(extra["is_enabled"]) || truthy(extra["isEnabled"]) || truthy(extra["enabled"])
+}
+
 func parseBoolAny(val any) (bool, bool) {
 	switch typed := val.(type) {
 	case bool:

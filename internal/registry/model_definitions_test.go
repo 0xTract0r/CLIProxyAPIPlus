@@ -60,8 +60,8 @@ func TestCodexFastModeMetadataAppliedToCatalogs(t *testing.T) {
 }
 
 func TestProviderSpecificPlanCapabilities(t *testing.T) {
-	if ClaudePlanAllowsOpus("pro") {
-		t.Fatal("Claude Pro must not allow Opus")
+	if !ClaudePlanAllowsOpus("pro") {
+		t.Fatal("Claude Pro must allow ordinary Opus")
 	}
 	if !ClaudePlanAllowsOpus("max") {
 		t.Fatal("Claude Max must allow Opus")
@@ -84,15 +84,15 @@ func TestClaudeSonnet46StaticModelHas1MContext(t *testing.T) {
 	}
 }
 
-func TestClaudeModelsForPlanFiltersAllOpusForNonHighTier(t *testing.T) {
-	if model := findModelInfo(GetClaudeModelsForPlan("pro", false), "claude-opus-4-7"); model != nil {
-		t.Fatalf("expected Claude Pro without usage credits to exclude base Opus, got %+v", model)
+func TestClaudeModelsForPlanSeparatesOpusAndLongContext(t *testing.T) {
+	if model := findModelInfo(GetClaudeModelsForPlan("pro", false), "claude-opus-4-7"); model == nil {
+		t.Fatal("expected Claude Pro without usage credits to include base Opus")
 	}
 	if model := findModelInfo(GetClaudeModelsForPlan("pro", false), "claude-sonnet-4-6"); model == nil {
 		t.Fatal("expected Claude Pro without usage credits to keep non-Opus Sonnet route")
 	}
-	if model := findModelInfo(GetClaudeModelsForPlan("pro", true), "claude-opus-4-7"); model != nil {
-		t.Fatalf("expected Claude Pro with usage credits to still exclude base Opus, got %+v", model)
+	if model := findModelInfo(GetClaudeModelsForPlan("pro", true), "claude-opus-4-7"); model == nil {
+		t.Fatal("expected Claude Pro with usage credits to include base Opus")
 	}
 	if model := findModelInfo(GetClaudeModelsForPlan("max", false), "claude-opus-4-7"); model == nil {
 		t.Fatal("expected Claude Max to include base Opus")
@@ -108,14 +108,31 @@ func TestClaudeModelsForPlanFiltersAllOpusForNonHighTier(t *testing.T) {
 		{ID: "opus[1m]"},
 		{ID: "claude-sonnet-4-6"},
 	}
-	proModels := FilterClaudeModelsForPlan(aliased, "pro", true)
-	for _, blocked := range []string{"claude-opus-4-7", "claude-opus-4-6", "claude-opus-4-7[1m]", "opus[1m]"} {
+	proModels := FilterClaudeModelsForPlan(aliased, "pro", false)
+	for _, blocked := range []string{"claude-opus-4-7[1m]", "opus[1m]"} {
 		if model := findModelInfo(proModels, blocked); model != nil {
-			t.Fatalf("expected Claude Pro with usage credits to exclude %s, got %+v", blocked, model)
+			t.Fatalf("expected Claude Pro without usage credits to exclude %s, got %+v", blocked, model)
 		}
 	}
 	if model := findModelInfo(proModels, "claude-sonnet-4-6"); model == nil {
 		t.Fatal("expected Claude Pro filter to keep Sonnet")
+	}
+	for _, allowed := range []string{"claude-opus-4-7", "claude-opus-4-6"} {
+		if findModelInfo(proModels, allowed) == nil {
+			t.Fatalf("expected ordinary Opus %s for Pro without credits", allowed)
+		}
+	}
+	for _, model := range aliased {
+		if findModelInfo(FilterClaudeModelsForPlan(aliased, "pro", true), model.ID) == nil {
+			t.Fatalf("expected Pro with credits to keep %s", model.ID)
+		}
+	}
+	for _, plan := range []string{"", "free", "unknown"} {
+		for _, credits := range []bool{false, true} {
+			if ClaudePlanAllowsOpus(plan) || ClaudePlanAllowsOpusLongContext(plan, credits) {
+				t.Fatalf("unexpected Opus access for plan %q, credits %v", plan, credits)
+			}
+		}
 	}
 	maxModels := FilterClaudeModelsForPlan(aliased, "max", false)
 	for _, allowed := range []string{"claude-opus-4-7", "claude-opus-4-6", "claude-opus-4-7[1m]", "opus[1m]"} {
