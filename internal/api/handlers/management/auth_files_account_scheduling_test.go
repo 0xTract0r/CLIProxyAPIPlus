@@ -255,3 +255,38 @@ func TestPatchAuthFileAccountScheduling_NotFound(t *testing.T) {
 		t.Fatalf("status = %d, want 404; body=%s", rec.Code, rec.Body.String())
 	}
 }
+
+// TestPatchAuthFileAccountScheduling_RejectsNonClaude covers the Claude-only
+// provider gate: a non-Claude (codex) account must be rejected with a 400 BEFORE
+// any metadata mutation, so codex/grok/gemini records can never acquire an
+// account_scheduling object.
+func TestPatchAuthFileAccountScheduling_RejectsNonClaude(t *testing.T) {
+	h, manager := newAccountSchedulingTestHandler(t, "codex")
+
+	// rate_scale 0.5 is provider-neutral and otherwise legal (> 0), so the ONLY
+	// reason to reject this request is the Claude-only provider gate -- not field
+	// validation. That makes this a clean assertion that the gate is what fires.
+	rec := patchAccountScheduling(t, h, `{"name":"acct.json","rate_scale":0.5}`)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "Claude") {
+		t.Fatalf("body = %q, want error mentioning Claude", rec.Body.String())
+	}
+
+	// The gate must short-circuit before mutating: no account_scheduling object
+	// may be written onto a non-Claude record...
+	updated, ok := manager.GetByID("acct.json")
+	if !ok || updated == nil {
+		t.Fatalf("auth record missing after rejected patch")
+	}
+	if _, present := updated.Metadata[coreauth.AccountSchedulingMetadataKey]; present {
+		t.Fatalf("account_scheduling object was written on a non-Claude account: %#v", updated.Metadata)
+	}
+	// ...and rate_scale must remain at the config default (unset), proving the
+	// requested mutation never landed.
+	if got := coreauth.AccountRateScale(updated, config.AccountSchedulingConfig{}); got != 1.0 {
+		t.Fatalf("rate_scale mutated on rejected non-Claude patch = %v, want default 1.0", got)
+	}
+}
