@@ -95,4 +95,37 @@ const (
 	// lower it (< 1) to throttle an account's derived rate ceilings for low-risk
 	// testing, or raise it (> 1). See AccountSchedulingConfig.RateScale.
 	DefaultAccountSchedulingRateScale = 1.0
+
+	// Health-gated warm-up ramp defaults (ANCHOR-Q4,
+	// openspec/changes/add-adaptive-account-scheduling/design.md §10). The gate
+	// makes warm-up promotion depend on account health (early risk-control
+	// signals) rather than calendar age alone: distress decelerates (only
+	// lowers) the effective warm-up stage; sustained health re-ramps. design.md
+	// §10 does not pin these numbers, so they are conservative fail-safe
+	// defaults (revisit against real 201 data — see this slice's gaps).
+	//
+	// DefaultAccountHealthGateEnabled: on by default (design §10.6 "启用开关
+	// default 开"). A zero-value AccountSchedulingConfig (e.g. hand-built in a
+	// test that bypasses DefaultAccountSchedulingConfig) leaves it false, which
+	// makes the whole gate a no-op — effective stage == age stage, i.e. exactly
+	// the pre-ANCHOR-Q4 behavior.
+	DefaultAccountHealthGateEnabled = true
+	// DefaultAccountHealthGateFailureClusterThreshold: >= this many failed
+	// requests inside the observation window = distress (recentRequests ring,
+	// success/failed only — design §10.3 "近窗口失败聚簇").
+	DefaultAccountHealthGateFailureClusterThreshold = 3
+	// DefaultAccountHealthGateBackoffLevelThreshold: Quota.BackoffLevel (the
+	// escalating plan-quota 429 backoff exponent) >= this = distress (design
+	// §10.3 "429 退避计数 BackoffLevel 抬升"). 1 = any active plan-quota backoff.
+	DefaultAccountHealthGateBackoffLevelThreshold = 1
+	// DefaultAccountHealthGateObservationWindowMinutes: how far back the
+	// recent-window failure cluster is summed. 30min ≈ 3 recentRequests buckets.
+	DefaultAccountHealthGateObservationWindowMinutes = 30
+	// DefaultAccountHealthGateDemoteStep: how many warm-up stages the effective
+	// cap drops per distress hit (only ever lowers — fail-safe).
+	DefaultAccountHealthGateDemoteStep = 1
+	// DefaultAccountHealthGatePromoteCooldownMinutes: minimum time since the
+	// last distress before a healthy request may re-raise the cap one stage
+	// (design §10.4 "升档冷静期").
+	DefaultAccountHealthGatePromoteCooldownMinutes = 30
 )

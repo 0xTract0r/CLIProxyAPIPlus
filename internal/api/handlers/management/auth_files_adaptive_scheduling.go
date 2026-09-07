@@ -131,6 +131,25 @@ func (h *Handler) buildAccountSchedulingView(auth *coreauth.Auth) gin.H {
 	}
 	view["warmup"] = warmupView
 
+	// Health-gated warm-up ramp state (ANCHOR-Q4, design §10.5). Additive and
+	// read-only, mirroring the "unknown is not a number" contract: an account
+	// that has never shown distress reports a null cap / last-distress and
+	// in_distress=false. The warmup.stage above already reflects the EFFECTIVE
+	// (health-capped) stage while warmup.age_days shows the real calendar age, so
+	// the frontend can render "aged X days but decelerated to <stage>". These
+	// three fields expose why (design §10.7 "增 distress / 健康档字段供前端展示").
+	view["in_distress"] = coreauth.AccountInDistress(auth, scheduling, now)
+	if capIdx, ok := coreauth.AccountHealthStageCap(auth); ok {
+		view["warmup_health_stage_cap"] = capIdx
+	} else {
+		view["warmup_health_stage_cap"] = nil
+	}
+	if lastDistress, ok := coreauth.AccountLastDistressAt(auth); ok {
+		view["warmup_last_distress_at"] = lastDistress.UTC().Format(time.RFC3339)
+	} else {
+		view["warmup_last_distress_at"] = nil
+	}
+
 	// Per-account session count aggregation (P6): distinct SessionID values
 	// observed on this account's recorded request details
 	// (internal/usage.SessionAggregateForAuthIndex), bucketed by idle time.

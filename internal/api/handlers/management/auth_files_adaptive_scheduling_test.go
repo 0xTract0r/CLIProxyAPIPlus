@@ -230,6 +230,93 @@ func TestBuildAuthFileEntry_AdaptiveScheduling(t *testing.T) {
 	})
 }
 
+// TestBuildAuthFileEntry_AdaptiveScheduling_HealthGate covers the ANCHOR-Q4
+// (design §10.5/§10.7) projection: account_scheduling must additively surface the
+// health-gated warm-up ramp state -- in_distress plus the warmup_health_stage_cap /
+// warmup_last_distress_at pair -- following the same "unknown is not a number"
+// contract as the blocks above. An account that has never shown distress reports
+// in_distress=false and an explicit null cap / null last-distress (present keys, not
+// absent, and never coerced to 0 / "just now"). A distressed, health-capped account
+// reports in_distress=true, an integer cap, and an RFC3339 last-distress string.
+func TestBuildAuthFileEntry_AdaptiveScheduling_HealthGate(t *testing.T) {
+	h := &Handler{cfg: &config.Config{AccountScheduling: config.DefaultAccountSchedulingConfig()}}
+	anchor := time.Now().Add(-10 * 24 * time.Hour).UTC().Format(time.RFC3339)
+
+	t.Run("healthy account reports false / null health-gate fields", func(t *testing.T) {
+		auth := &coreauth.Auth{
+			ID:         "claude-healthgate-healthy",
+			Provider:   "claude",
+			Status:     coreauth.StatusActive,
+			UpdatedAt:  time.Now(),
+			Attributes: map[string]string{"runtime_only": "true"},
+			Metadata:   map[string]any{"first_production_at": anchor},
+		}
+
+		entry := h.buildAuthFileEntry(auth)
+		view, ok := entry["account_scheduling"].(gin.H)
+		if !ok {
+			t.Fatalf("entry[\"account_scheduling\"] = %#v, want gin.H", entry["account_scheduling"])
+		}
+
+		if got, ok := view["in_distress"].(bool); !ok || got {
+			t.Fatalf("in_distress = %#v, want false", view["in_distress"])
+		}
+		capVal, capPresent := view["warmup_health_stage_cap"]
+		if !capPresent {
+			t.Fatal("warmup_health_stage_cap key absent, want present with null value")
+		}
+		if capVal != nil {
+			t.Fatalf("warmup_health_stage_cap = %#v, want nil for an account with no cap", capVal)
+		}
+		ldVal, ldPresent := view["warmup_last_distress_at"]
+		if !ldPresent {
+			t.Fatal("warmup_last_distress_at key absent, want present with null value")
+		}
+		if ldVal != nil {
+			t.Fatalf("warmup_last_distress_at = %#v, want nil for an account that never showed distress", ldVal)
+		}
+	})
+
+	t.Run("distressed capped account reports true / typed health-gate fields", func(t *testing.T) {
+		lastDistress := time.Now().Add(-5 * time.Minute).UTC().Format(time.RFC3339)
+		auth := &coreauth.Auth{
+			ID:         "claude-healthgate-distressed",
+			Provider:   "claude",
+			Status:     coreauth.StatusActive,
+			UpdatedAt:  time.Now(),
+			Attributes: map[string]string{"runtime_only": "true"},
+			Metadata: map[string]any{
+				"first_production_at": anchor,
+				// Persisted health-gate state lives inside the namespaced
+				// account_scheduling object (design §10.5), the same sub-keys the
+				// core writers use.
+				coreauth.AccountSchedulingMetadataKey: map[string]any{
+					"warmup_health_stage_cap": 2,
+					"warmup_last_distress_at": lastDistress,
+				},
+			},
+		}
+		// BackoffLevel >= the default threshold (1) trips the in_distress signal.
+		auth.Quota.BackoffLevel = 2
+
+		entry := h.buildAuthFileEntry(auth)
+		view, ok := entry["account_scheduling"].(gin.H)
+		if !ok {
+			t.Fatalf("entry[\"account_scheduling\"] = %#v, want gin.H", entry["account_scheduling"])
+		}
+
+		if got, ok := view["in_distress"].(bool); !ok || !got {
+			t.Fatalf("in_distress = %#v, want true (BackoffLevel 2 >= threshold 1)", view["in_distress"])
+		}
+		if got, ok := view["warmup_health_stage_cap"].(int); !ok || got != 2 {
+			t.Fatalf("warmup_health_stage_cap = %#v, want int 2", view["warmup_health_stage_cap"])
+		}
+		if got, ok := view["warmup_last_distress_at"].(string); !ok || got != lastDistress {
+			t.Fatalf("warmup_last_distress_at = %#v, want %q", view["warmup_last_distress_at"], lastDistress)
+		}
+	})
+}
+
 // TestBuildAuthFileEntry_AdaptiveScheduling_SessionCounts covers the P6
 // session-aggregation slice: account_scheduling must additively project
 // sessions_total/sessions_active/sessions_closed, sourced from

@@ -975,6 +975,17 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		// success always lifts an existing quarantine).
 		m.evaluateAutoQuarantineLocked(auth, result.Success, result.Error, now)
 
+		// openspec/changes/add-adaptive-account-scheduling ANCHOR-Q4 (design §10):
+		// update the health-gated warm-up cap from this result's fresh signals.
+		// Placed AFTER every status/quota mutation above (so Quota.BackoffLevel and
+		// the recentRequests ring updated by recordRecentRequest are current) and
+		// BEFORE the unconditional persist below, so a cap change is written through
+		// the same store.Save path that persists first_production_at and the quota
+		// snapshot -- landing on the auth volume and surviving a restart (design
+		// §10.5). Claude-only + gated on config, and a no-op that mutates nothing on
+		// the healthy steady state (see evaluateAccountHealthGate).
+		m.evaluateAccountHealthGateLocked(auth, result.Success, now)
+
 		_ = m.persist(ctx, auth)
 		authSnapshot = auth.Clone()
 		if trackCooldownState {
