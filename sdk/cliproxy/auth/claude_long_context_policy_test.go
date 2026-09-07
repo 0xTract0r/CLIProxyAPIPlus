@@ -244,6 +244,96 @@ func longClaudePayload() []byte {
 	return []byte(`{"messages":[{"role":"user","content":"` + strings.Repeat("abcd ", 190000) + `"}]}`)
 }
 
+func TestClaudeSonnet5LongContextPolicyBoundaries(t *testing.T) {
+	tests := []struct {
+		name, model, requested string
+		tokens                 int
+		wantStatus             int
+	}{
+		{name: "native 1m", model: "claude-sonnet-5", tokens: 212779},
+		{name: "explicit 1m", model: "claude-sonnet-5[1m]", tokens: 212779},
+		{name: "thinking suffix", model: "claude-sonnet-5(high)", tokens: 212779},
+		{name: "both suffixes", model: "claude-sonnet-5[1m](high)", tokens: 212779},
+		{name: "client alias metadata", model: "claude-sonnet-5", requested: "sonnet[1m]", tokens: 212779},
+		{name: "1m boundary", model: "claude-sonnet-5", tokens: 1000000},
+		{name: "above 1m", model: "claude-sonnet-5", tokens: 1000001, wantStatus: 413},
+		{name: "old sonnet", model: "claude-sonnet-4-6", tokens: 212779, wantStatus: 400},
+		{name: "metadata cannot unlock old sonnet", model: "claude-sonnet-4-6", requested: "claude-sonnet-5", tokens: 212779, wantStatus: 400},
+		{name: "unresolved alias", model: "sonnet[1m]", tokens: 212779, wantStatus: 400},
+		{name: "unknown version", model: "claude-sonnet-50", tokens: 212779, wantStatus: 400},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := NewManager(nil, nil, nil)
+			payload := []byte(`{"messages":[{"role":"user","content":"` + strings.Repeat("abcd", tt.tokens) + `"}]}`)
+			for _, policy := range []string{
+				internalconfig.ClaudeSonnetLongContextPolicyFailWithHint,
+				internalconfig.ClaudeSonnetLongContextPolicyCompact,
+				internalconfig.ClaudeSonnetLongContextPolicyRouteToOpus1M,
+			} {
+				m.SetConfig(&internalconfig.Config{Claude: internalconfig.ClaudeConfig{SonnetLongContextPolicy: policy}})
+				err := m.guardClaudeLongContextPolicy([]string{"claude"},
+					cliproxyexecutor.Request{Model: tt.model, Payload: payload},
+					cliproxyexecutor.Options{Metadata: map[string]any{cliproxyexecutor.RequestedModelMetadataKey: tt.requested}})
+				if tt.wantStatus == 0 {
+					if err != nil {
+						t.Fatalf("policy %s rejected native 1M: %v", policy, err)
+					}
+				} else if err == nil || statusCodeFromError(err) != tt.wantStatus {
+					t.Fatalf("policy %s error = %v, want status %d", policy, err, tt.wantStatus)
+				}
+			}
+		})
+	}
+}
+
+func TestManager_ClaudeSonnet5LongContextReachesExecutor(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		t.Run(map[bool]string{false: "non-stream", true: "stream"}[stream], func(t *testing.T) {
+			m := NewManager(nil, nil, nil)
+			executor := &authFallbackExecutor{id: "claude"}
+			m.RegisterExecutor(executor)
+			auth := &Auth{
+				ID: "sonnet5-long-context", Provider: "claude", ProxyURL: "http://test-proxy:8080",
+				Metadata: map[string]any{"plan_type": "max", "extra_usage_enabled": false},
+			}
+			if _, err := m.Register(context.Background(), auth); err != nil {
+				t.Fatal(err)
+			}
+			const model = "claude-sonnet-5"
+			reg := registry.GetGlobalRegistry()
+			reg.RegisterClient(auth.ID, "claude", []*registry.ModelInfo{{ID: model}})
+			t.Cleanup(func() { reg.UnregisterClient(auth.ID) })
+			req := cliproxyexecutor.Request{Model: model, Payload: longClaudePayload()}
+			opts := cliproxyexecutor.Options{Metadata: map[string]any{cliproxyexecutor.RequestedModelMetadataKey: "sonnet[1m]"}}
+			if stream {
+				result, err := m.ExecuteStream(context.Background(), []string{"claude"}, req, opts)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var output string
+				for chunk := range result.Chunks {
+					if chunk.Err != nil {
+						t.Fatal(chunk.Err)
+					}
+					output += string(chunk.Payload)
+				}
+				if output != auth.ID || len(executor.StreamCalls()) != 1 {
+					t.Fatalf("unexpected stream result %q, calls %v", output, executor.StreamCalls())
+				}
+			} else {
+				result, err := m.Execute(context.Background(), []string{"claude"}, req, opts)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if string(result.Payload) != auth.ID || len(executor.ExecuteCalls()) != 1 {
+					t.Fatalf("unexpected result %q, calls %v", result.Payload, executor.ExecuteCalls())
+				}
+			}
+		})
+	}
+}
+
 func hugeClaudePayload() []byte {
 	return []byte(`{"messages":[{"role":"user","content":"` + strings.Repeat("abcd ", 850000) + `"}]}`)
 }
