@@ -62,6 +62,9 @@ func authAllowsRouteModel(auth *Auth, model string) bool {
 }
 
 func authAllowsClaudeRouteModel(auth *Auth, model string) bool {
+	if registry.IsClaudeOpus1MAlias(canonicalModelKey(model)) {
+		return registry.ClaudePlanAllowsOpusLongContext(authClaudeSubscriptionPlanType(auth), auth.ClaudeUsageCreditsEnabled())
+	}
 	if !registry.IsClaudeOpusModelID(canonicalModelKey(model)) {
 		return true
 	}

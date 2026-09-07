@@ -421,9 +421,56 @@ func TestSchedulerPick_CodexWebsocketPrefersWebsocketEnabledAcrossPriorities(t *
 	}
 }
 
-func TestManagerExecute_ClaudeOpusSkipsProEvenWithStaleRegistry(t *testing.T) {
+func TestManagerExecute_ClaudeProOpusEntitlement(t *testing.T) {
+	for _, legacy := range []bool{false, true} {
+		for _, credits := range []bool{false, true} {
+			for _, model := range []string{"claude-opus-4-6", "claude-opus-4-7[1m]"} {
+				name := model + "/credits=" + strconv.FormatBool(credits) + "/legacy=" + strconv.FormatBool(legacy)
+				t.Run(name, func(t *testing.T) {
+					const authID = "claude-pro-entitlement"
+					registerSchedulerModels(t, "claude", model, authID)
+					var selector Selector = &RoundRobinSelector{}
+					if legacy {
+						selector = &trackingSelector{}
+					}
+					manager := NewManager(nil, selector, nil)
+					manager.scheduler.setGlobalProxyConfigured(true)
+					manager.executors["claude"] = schedulerTestExecutor{}
+					_, err := manager.Register(context.Background(), &Auth{
+						ID: authID, Provider: "claude",
+						Metadata: map[string]any{
+							"plan_type": "pro",
+							"quota_snapshot": map[string]any{
+								"usage": map[string]any{"extra_usage": map[string]any{"is_enabled": credits}},
+							},
+						},
+					})
+					if err != nil {
+						t.Fatal(err)
+					}
+					selected := ""
+					meta := map[string]any{
+						cliproxyexecutor.SelectedAuthCallbackMetadataKey: func(id string) { selected = id },
+					}
+					_, err = manager.Execute(context.Background(), []string{"claude"},
+						cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{Metadata: meta})
+					if model == "claude-opus-4-7[1m]" && !credits {
+						var authErr *Error
+						if !errors.As(err, &authErr) || authErr.Code != "auth_not_found" {
+							t.Fatalf("expected 1M entitlement rejection, got %v", err)
+						}
+					} else if err != nil || selected != authID {
+						t.Fatalf("expected Pro to serve %s, selected=%q error=%v", model, selected, err)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestManagerExecute_ClaudeOpus1MSkipsProWithoutCreditsWithStaleRegistry(t *testing.T) {
 	ctx := context.Background()
-	model := "claude-opus-4-7"
+	model := "claude-opus-4-7[1m]"
 	registerSchedulerModels(t, "claude", model, "claude-pro-stale", "claude-max-stale")
 
 	manager := NewManager(nil, &RoundRobinSelector{}, nil)
@@ -491,7 +538,7 @@ func TestManagerExecute_ClaudeOpusAllowsReauthRequiredLastKnownMaxPlan(t *testin
 	}
 }
 
-func TestManagerExecute_ClaudeOpusRejectsProOnlyStaleRegistry(t *testing.T) {
+func TestManagerExecute_ClaudeOpusRejectsUnknownPlanStaleRegistry(t *testing.T) {
 	ctx := context.Background()
 	model := "claude-opus-4-7"
 	registerSchedulerModels(t, "claude", model, "claude-pro-only-stale")
@@ -504,7 +551,7 @@ func TestManagerExecute_ClaudeOpusRejectsProOnlyStaleRegistry(t *testing.T) {
 		ID:       "claude-pro-only-stale",
 		Provider: "claude",
 		Attributes: map[string]string{
-			"plan_type":           "pro",
+			"plan_type":           "",
 			"extra_usage_enabled": "true",
 		},
 	}); errRegister != nil {
@@ -521,9 +568,9 @@ func TestManagerExecute_ClaudeOpusRejectsProOnlyStaleRegistry(t *testing.T) {
 	}
 }
 
-func TestManagerExecute_ClaudeOpusLegacySelectorFiltersProBeforePick(t *testing.T) {
+func TestManagerExecute_ClaudeOpus1MLegacySelectorFiltersProWithoutCredits(t *testing.T) {
 	ctx := context.Background()
-	model := "claude-opus-4-7"
+	model := "claude-opus-4-7[1m]"
 	registerSchedulerModels(t, "claude", model, "claude-pro-legacy-stale")
 
 	selector := &trackingSelector{}
@@ -535,7 +582,7 @@ func TestManagerExecute_ClaudeOpusLegacySelectorFiltersProBeforePick(t *testing.
 		Provider: "claude",
 		Attributes: map[string]string{
 			"plan_type":           "pro",
-			"extra_usage_enabled": "true",
+			"extra_usage_enabled": "false",
 		},
 	}); errRegister != nil {
 		t.Fatalf("Register() error = %v", errRegister)

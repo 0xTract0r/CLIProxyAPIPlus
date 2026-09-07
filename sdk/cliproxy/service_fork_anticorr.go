@@ -115,28 +115,9 @@ func authCodexSubscriptionPlanType(auth *coreauth.Auth) string {
 }
 
 // claudeUsageCreditsEnabled reports whether the auth has extra/credit usage enabled,
-// which unlocks Opus-tier models for Pro plans that would otherwise be gated out.
+// which unlocks Opus 1M for Pro; ordinary Opus does not require credits.
 func claudeUsageCreditsEnabled(auth *coreauth.Auth) bool {
-	if auth == nil {
-		return false
-	}
-	if auth.Attributes != nil {
-		for _, key := range []string{"usage_credits_enabled", "extra_usage_enabled", "has_extra_usage_enabled"} {
-			if authTruthy(auth.Attributes[key]) {
-				return true
-			}
-		}
-	}
-	if authMetadataBool(auth.Metadata, "usage_credits_enabled", "extra_usage_enabled", "has_extra_usage_enabled") {
-		return true
-	}
-	snapshot := authMetadataMap(auth.Metadata, "quota_snapshot")
-	usage := nestedStringMap(snapshot, "usage")
-	extraUsage := nestedStringMap(usage, "extra_usage")
-	if extraUsage == nil {
-		extraUsage = nestedStringMap(usage, "extraUsage")
-	}
-	return mapBool(extraUsage, "is_enabled", "isEnabled", "enabled")
+	return auth.ClaudeUsageCreditsEnabled()
 }
 
 func authMetadataBool(meta map[string]any, keys ...string) bool {

@@ -218,7 +218,7 @@ func TestResolveOAuthUpstreamModel_GatesClaudeOpus1MAliasByPlan(t *testing.T) {
 			want: "",
 		},
 		{
-			name: "pro with credits still blocks alias",
+			name: "pro with credits allows alias",
 			auth: &Auth{
 				Provider: "claude",
 				Attributes: map[string]string{
@@ -227,7 +227,7 @@ func TestResolveOAuthUpstreamModel_GatesClaudeOpus1MAliasByPlan(t *testing.T) {
 					"extra_usage_enabled": "true",
 				},
 			},
-			want: "",
+			want: "claude-opus-4-7",
 		},
 		{
 			name: "max allows alias",
@@ -264,7 +264,7 @@ func TestResolveOAuthUpstreamModel_GatesClaudeOpus1MAliasByPlan(t *testing.T) {
 				t.Fatalf("resolveOAuthUpstreamModel(claude-opus-4-7[1m]) = %q, want %q", got, tt.want)
 			}
 			wantCustomAlias := ""
-			if tt.want != "" {
+			if tt.want != "" || tt.name == "pro without credits blocks alias" {
 				wantCustomAlias = "claude-opus-4-6"
 			}
 			if got := mgr.resolveOAuthUpstreamModel(tt.auth, "my-opus"); got != wantCustomAlias {
@@ -272,6 +272,13 @@ func TestResolveOAuthUpstreamModel_GatesClaudeOpus1MAliasByPlan(t *testing.T) {
 			}
 			if got := mgr.resolveOAuthUpstreamModel(tt.auth, "claude-opus-4-7"); got != "" {
 				t.Fatalf("base claude-opus-4-7 should not need alias resolution, got %q", got)
+			}
+			SetOAuthModelAliasesAttribute(tt.auth, aliases["claude"])
+			if got := mgr.resolveOAuthUpstreamModel(tt.auth, "opus[1m]"); got != tt.want {
+				t.Fatalf("per-auth opus[1m] = %q, want %q", got, tt.want)
+			}
+			if got := mgr.resolveOAuthUpstreamModel(tt.auth, "my-opus"); got != wantCustomAlias {
+				t.Fatalf("per-auth my-opus = %q, want %q", got, wantCustomAlias)
 			}
 		})
 	}

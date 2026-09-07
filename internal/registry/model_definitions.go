@@ -45,7 +45,7 @@ func GetClaudeModels() []*ModelInfo {
 }
 
 // GetClaudeModelsForPlan returns Claude model definitions that are safe for a
-// known subscription plan. Opus is only available to Claude high-tier plans.
+// known subscription plan. Pro supports Opus; extended context needs credits.
 func GetClaudeModelsForPlan(plan string, usageCreditsEnabled bool) []*ModelInfo {
 	return FilterClaudeModelsForPlan(GetClaudeModels(), plan, usageCreditsEnabled)
 }
@@ -128,8 +128,7 @@ func FilterCodexModelsForPlan(models []*ModelInfo, plan string) []*ModelInfo {
 	return out
 }
 
-// FilterClaudeModelsForPlan removes Claude Opus models that need a high-tier
-// Claude subscription. Usage credits do not change Opus eligibility.
+// FilterClaudeModelsForPlan separates ordinary Opus access from 1M entitlement.
 func FilterClaudeModelsForPlan(models []*ModelInfo, plan string, usageCreditsEnabled bool) []*ModelInfo {
 	if len(models) == 0 {
 		return nil
@@ -142,7 +141,8 @@ func FilterClaudeModelsForPlan(models []*ModelInfo, plan string, usageCreditsEna
 		if model == nil {
 			continue
 		}
-		if IsClaudeOpusModelInfo(model) {
+		if IsClaudeOpusModelInfo(model) && (!ClaudePlanAllowsOpus(plan) ||
+			IsClaudeOpus1MAlias(model.ID) || IsClaudeOpus1MAlias(model.DisplayName)) {
 			continue
 		}
 		out = append(out, model)
@@ -156,14 +156,17 @@ func CodexPlanAllowsSpark(plan string) bool {
 
 func ClaudePlanAllowsOpus(plan string) bool {
 	switch NormalizeClaudeSubscriptionPlan(plan) {
-	case "max", "team", "business", "enterprise":
+	case "pro", "max", "team", "business", "enterprise":
 		return true
 	default:
 		return false
 	}
 }
 
-func ClaudePlanAllowsOpusLongContext(plan string, _ bool) bool {
+func ClaudePlanAllowsOpusLongContext(plan string, usageCreditsEnabled bool) bool {
+	if NormalizeClaudeSubscriptionPlan(plan) == "pro" {
+		return usageCreditsEnabled
+	}
 	return ClaudePlanAllowsOpus(plan)
 }
 

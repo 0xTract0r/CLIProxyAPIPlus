@@ -33,6 +33,19 @@ func (m *Manager) guardClaudeLongContextPolicy(providers []string, req cliproxye
 		}
 	}
 
+	// Sonnet 5 has a native 1M window. Claude Code strips [1m] before sending
+	// the request, so the legacy Sonnet 200K/extra-usage policy must not gate it.
+	// Prefer the request's execution model over client-facing alias metadata.
+	// Keep unresolved aliases and unknown model versions conservative.
+	model := strings.TrimSpace(req.Model)
+	if model == "" {
+		model = requestedModel
+	}
+	model = strings.TrimSuffix(strings.ToLower(canonicalModelKey(model)), "[1m]")
+	if model == "claude-sonnet-5" {
+		return nil
+	}
+
 	if !isClaudeSonnetPolicyModel(requestedModel) && !isClaudeSonnetPolicyModel(req.Model) {
 		return nil
 	}

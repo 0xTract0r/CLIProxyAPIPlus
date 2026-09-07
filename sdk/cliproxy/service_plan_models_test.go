@@ -110,7 +110,7 @@ func TestCoreAuthUpdateHookRefreshesPlanFilteredModelRegistry(t *testing.T) {
 		baseModel    string
 	}{
 		{
-			name: "claude max to pro removes opus",
+			name: "claude max to pro removes only opus 1m",
 			initialAuth: &coreauth.Auth{
 				ID:       "claude-plan-update-hook",
 				Provider: "claude",
@@ -127,8 +127,8 @@ func TestCoreAuthUpdateHookRefreshesPlanFilteredModelRegistry(t *testing.T) {
 				Status:   coreauth.StatusActive,
 				Metadata: map[string]any{"plan_type": "pro"},
 			},
-			premiumModel: "claude-opus-4-7",
-			baseModel:    "claude-sonnet-4-6",
+			premiumModel: "opus[1m]",
+			baseModel:    "claude-opus-4-7",
 		},
 		{
 			name: "codex pro to plus removes spark",
@@ -175,7 +175,7 @@ func TestCoreAuthUpdateHookRefreshesPlanFilteredModelRegistry(t *testing.T) {
 	}
 }
 
-func TestRegisterModelsForAuth_ClaudePlanFiltersOpusByHighTier(t *testing.T) {
+func TestRegisterModelsForAuth_ClaudePlanSeparatesOpusAndLongContext(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.SanitizeOAuthModelAlias()
 	service := &Service{cfg: cfg}
@@ -194,7 +194,7 @@ func TestRegisterModelsForAuth_ClaudePlanFiltersOpusByHighTier(t *testing.T) {
 				Status:   coreauth.StatusActive,
 				Metadata: map[string]any{"plan_type": "pro"},
 			},
-			wantBaseOpus:    false,
+			wantBaseOpus:    true,
 			wantOpus1MAlias: false,
 		},
 		{
@@ -212,8 +212,8 @@ func TestRegisterModelsForAuth_ClaudePlanFiltersOpusByHighTier(t *testing.T) {
 					},
 				},
 			},
-			wantBaseOpus:    false,
-			wantOpus1MAlias: false,
+			wantBaseOpus:    true,
+			wantOpus1MAlias: true,
 		},
 		{
 			name: "max",
@@ -260,8 +260,8 @@ func TestRegisterModelsForAuth_ClaudePlanFiltersOpusByHighTier(t *testing.T) {
 					},
 				},
 			},
-			wantBaseOpus:    false,
-			wantOpus1MAlias: false,
+			wantBaseOpus:    true,
+			wantOpus1MAlias: true,
 		},
 		{
 			name: "unknown local plan",

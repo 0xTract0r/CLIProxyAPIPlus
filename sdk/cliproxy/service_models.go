@@ -103,7 +103,7 @@ func (s *Service) registerModelsForAuthWithCache(ctx context.Context, a *coreaut
 		models = applyAntigravityFetchedModelCapabilities(models, s.fetchAntigravityModelCapabilityHintsForAuth(ctx, a))
 		models = applyExcludedModels(models, excluded)
 	case "claude":
-		// fork(anticorr): gate Opus/high-tier Claude models by subscription plan
+		// fork(anticorr): distinguish Opus access from extended-context entitlement
 		// and usage-credit status instead of advertising the full catalog.
 		claudePlanType := authClaudeSubscriptionPlanType(a)
 		claudeUsageCredits := claudeUsageCreditsEnabled(a)
