@@ -134,6 +134,37 @@ Codex 的 `quota_snapshot.usage` 结构目前尚未在本仓库对真实生产�
 - `age_days` (number | null)：账号自 `first_production_at` 起的整数天龄。`"cold"`
   （未锚定）状态下为 `null`。
 
+### 2.5 `account_scheduling` 命名空间改名与新增投影字段
+
+自 §8.5 命名空间统一后，投影以对象名 **`account_scheduling`** 下发（cpamp 前端读取的
+canonical 名称）；旧名 **`adaptive_scheduling`** 仍以逐字节相同的值并列下发，作为过渡兼容
+（dual-emit 位置：`internal/api/handlers/management/auth_files.go`）。优先读
+`account_scheduling`；两个对象都携带 2.1–2.4 节的全部字段，外加以下字段（投影：
+`buildAccountSchedulingView`）。
+
+- `tier_source` (string, `"auto"` | `"override"`)：`subscription_tier`（2.1 节）是来自
+  手动、且 provider 匹配的 `tier_override`（`"override"`），还是来自 `rate_limit_tier` /
+  `chatgpt_plan_type` 自动识别（`"auto"`）。读时从 override 是否存在派生得出，并非单独持久化的
+  字段。空值、非法值或跨 provider 的 override 读作 `"auto"`——与 tier 解析器恰好忽略这些的行为
+  一致。前端据此显示"手动"档位标。
+- `rate_scale` (number, > 0)：作用在该账号派生速率上限上的有效乘子（见 3.4 节）。`1.0` 表示不
+  缩放。
+- `in_distress` (bool)：账号当前是否出现养号健康门控识别的风控征兆（见 3.6 节）。纯观测；门控
+  关闭时为 `false`。
+- `warmup_health_stage_cap` (number | null)：持久化的健康允许最高养号档位索引（`0` = 第一档/
+  最严格档）。没有记录任何降档时为 `null`（账号从未被减速过）——`null` 绝不能读成"被压到第 0
+  档"。
+- `warmup_last_distress_at` (string, RFC3339 UTC | null)：最近一次记录到的风控征兆的墙钟时间。
+  账号从未出过征兆时为 `null`。
+- `sessions_total` / `sessions_active` / `sessions_closed` (number)：该账号已记录请求上观测到的
+  去重 session-id 计数，按空闲时长分桶（默认 10 分钟内为活跃、30 分钟后为关闭）。`0` 可能表示"尚未
+  观测到任何 session"或"未接入用量存储"——两者刻意不区分（零 session 本身就是一个有效答案，不像
+  `quota_utilization` 那样存在"快照缺失"的歧义）。
+
+与 2.4 节的关系：养号健康门控生效后，`warmup.stage` / `rpm_limit` / `daily_budget` /
+`concurrency_limit` 反映的是**有效（被健康门控压低后）**的档位，而 `warmup.age_days` 仍是原始
+自然日账龄——因此读者可以呈现"账龄 N 天但被减速到 `<stage>`"（见 3.6 节）。
+
 ## 3. 运维说明
 
 ### 3.1 `tier_override` 手动标记
@@ -153,7 +184,10 @@ Codex 的 `quota_snapshot.usage` 结构目前尚未在本仓库对真实生产�
 - 该 key 是**顶层** `metadata` 字段，不是嵌套在 `quota_snapshot` 内部——这是刻意设计：
   额度轮询刷新时会整体替换 `quota_snapshot` 子对象，写进 `quota_snapshot` 内部的值会在
   下一次刷新（约 45 分钟一轮）被覆盖冲掉，写在顶层则不受影响。
-- 当前没有专门的管理写入端点来设置这个字段，只能直接编辑账号的 auth JSON 文件。
+- 现在有专门的 admin 管理端点在运行时设置/清除这个字段：
+  `PATCH /v0/management/auth-files/account-scheduling`（见 3.5 节）。直接编辑 auth JSON 仍然
+  有效（旧的裸顶层 key 会被 dual-read），但 canonical 写入位置已改为命名空间化的
+  `account_scheduling` 对象（见 3.3 节）；端点写在那里并重载运行中的选择器。
 - 典型用途：自动识别不准（如上述 `default_claude_ai` 场景）、或需要人为模拟/测试某个
   等级的加权选号行为时使用。
 
@@ -178,6 +212,177 @@ Codex 的 `quota_snapshot.usage` 结构目前尚未在本仓库对真实生产�
   `mature-limits`。**没有**这个锚点的账号（`"cold"` 态）会被限制在曲线**第一档**（也就是
   最严格的一档）的限流阈值下，但选号权重侧的新鲜度系数按 `1` 处理（见 2.4 节的分歧说明），
   以便这类账号仍有机会赢得一次选中、从而完成自己的锚定。
+- **运维回填通道**：除上面 append-only 的自动铸造外，运维可以通过
+  `PATCH /v0/management/auth-files/account-scheduling`（见 3.5 节）显式设置或清除这个锚点。它用来
+  迁移那些在启用自适应调度**之前**就已经养号/投产的账号——否则自动铸造会把它们打成全新账号并压到最
+  严格的养号档。只有未来时间戳会被拒绝；任何过去日期都被接受，正确性由运维负责。把锚点设得**早于**真实
+  时间会让账号显得比实际更成熟（养号更少），这是有账号安全风险的方向，所以只回填你确认过的日期。清除后
+  重新打开自动铸造（下一次真实成功服务会重新打一个新锚点）。
+
+### 3.3 `account_scheduling` metadata 命名空间（dual-read / dual-emit）
+
+所有运维/自动的调度状态都放在账号 auth JSON `metadata` 里一个**顶层** `account_scheduling`
+对象下。持久化子键：`tier_override`、`first_production_at`、`rate_scale`、
+`warmup_health_stage_cap`、`warmup_last_distress_at`（`tier_source` 是投影读时派生的，不持久
+化）。把它们放在一个顶层对象、而不是嵌套在 `quota_snapshot` 内部，正是它们能在约 45 分钟一轮的额度
+刷新后存活的原因：刷新会整体替换 `quota_snapshot` 子对象，但 `Auth.Clone` 会把每个顶层 metadata
+key 原样拷贝过去。
+
+- **dual-read（迁移）**：读时优先命名空间化子键，回退到旧的**裸顶层** key。只有 `tier_override`
+  和 `first_production_at` 有 §8.5 之前的裸键形态，所以只有这两个做 dual-read；`rate_scale`、
+  `warmup_health_stage_cap`、`warmup_last_distress_at` 是在对象内部引入的，没有裸键形态。
+- **写入只走新位置**：铸造/设置一律写命名空间化子键，绝不写裸键——这是非破坏性迁移（已有的旧值读时
+  仍被认，但绝不被改写）。
+- **清除同时删两处**：清除这些字段中的任何一个都会同时删掉命名空间化子键和旧裸键，这样下一次刷新时就
+  不会有陈旧的裸值通过 dual-read 复活。
+- **投影 dual-emit**：账号列表响应同时下发 `account_scheduling`（canonical）和
+  `adaptive_scheduling`（旧名，值相同）——见 2.5 节。
+
+### 3.4 `rate_scale`：per-账号安全测试速率乘子
+
+`rate_scale` 是作用在账号**派生**速率上限——rpm / burst / 并发 / 日预算——上的速率乘子，在
+tier/养号档位推导**之后**再乘。它刻意**独立于选号权重**：从不改变选择器*选中哪个*账号，只改变被
+选中账号*能跑多快*。
+
+- **config 默认值**：`account-scheduling.rate-scale`（float，默认 **`1.0`**）。
+- **per-账号覆盖**：metadata `account_scheduling.rate_scale`（dual-read 也认旧裸键
+  `rate_scale`），可通过 3.5 节的端点设置。
+- **解析顺序**：合法的 per-账号覆盖（存在且 `> 0`）→ config 默认值（`> 0` 时）→ `1.0`。任一层
+  出现非正或无法解析的值都会跳过、用下一层，所以有效乘子始终 `> 0`，`1.0` 始终是安全的空操作。
+- **`1.0` = 无影响**；`< 1` 把每个上限压到低于其 tier/养号档位值（用于低风险安全测试）；`> 1`
+  抬高。
+- **养号期同样生效**：它缩放账号当前所在的那个上限（养号阶段或成熟态上限），并不局限于成熟号。
+- **floor 保正数、绝不缩成 0**：config 加载时会拒绝非正的 `rate-scale`；读路径上分数乘子会把派生的
+  整数上限四舍五入到最近整数并 floor 到 `1`，所以小乘子能压慢一个账号，但绝不会把一个正的上限永久卡到
+  `0`。非正/无上限的值（例如成熟号 `0` = 日预算不限）保持不变。
+
+### 3.5 管理端点：`PATCH /v0/management/auth-files/account-scheduling`
+
+admin 门控（与同类 auth-file 端点相同的 `/v0/management` admin 鉴权——`X-Management-Key: <key>`
+或 `Authorization: Bearer <key>`，无新增豁免）。它在运行时设置或清除账号的运维覆盖——
+`tier_override`、`rate_scale`、`first_production_at`——持久化后让运行中的选择器观察到
+（`authManager.Update`），并返回刷新后的投影。
+
+请求体（`application/json`）：
+
+- `name` (string, **必填**)：auth id / 文件名 / 显示名。
+- `auth_index` (string, 可选)：消歧。
+- `tier_override` / `rate_scale` / `first_production_at`：字段**是否存在**决定意图——不传 = 不
+  改；显式空字符串或 JSON `null` = 清除；给值 = 设置。三者中**至少一个**必须存在，否则 `400`。
+
+per-provider 校验：
+
+- `tier_override`：必须是该账号 provider 的合法值（claude：`max_20x` / `max_5x` / `pro`；
+  codex：`codex_pro` / `codex_plus`），否则 `400` 并带 `legal_values` 列表。
+- `rate_scale`：数字 `> 0`，否则 `400`。
+- `first_production_at`：RFC3339 **且不在未来**，否则 `400`；任何过去日期都接受。
+
+清除是双删（命名空间化 + 旧裸键，防复活）：清 `tier_override` 让 `tier_source` 回退到
+`"auto"`；清 `rate_scale` 回退到 config 默认值（否则 `1.0`）；清 `first_production_at` 重新打开
+append-only 自动铸造。其他响应：`400` 请求体非法/无覆盖字段；`404` 账号未找到；`409`
+plugin-virtual auth；`503` auth manager 不可用；`500` 持久化失败。
+
+设置示例（钉死档位、限速到一半、回填锚点）：
+
+```bash
+curl -sS -X PATCH https://<host>/v0/management/auth-files/account-scheduling \
+  -H "X-Management-Key: <management-key>" \
+  -H "Content-Type: application/json" \
+  -d '{
+        "name": "AC-14.json",
+        "tier_override": "max_5x",
+        "rate_scale": 0.5,
+        "first_production_at": "2026-06-01T00:00:00Z"
+      }'
+```
+
+清除示例（空字符串或 `null` 清除；`first_production_at` 不传即不改）：
+
+```bash
+curl -sS -X PATCH https://<host>/v0/management/auth-files/account-scheduling \
+  -H "X-Management-Key: <management-key>" \
+  -H "Content-Type: application/json" \
+  -d '{ "name": "AC-14.json", "tier_override": "", "rate_scale": null }'
+```
+
+成功 `200` 响应（`account_scheduling` 的值就是刷新后的完整投影——2.1–2.5 节）：
+
+```json
+{
+  "name": "AC-14",
+  "account_scheduling": {
+    "subscription_tier": "max_5x",
+    "tier_source": "override",
+    "rate_scale": 0.5,
+    "quota_utilization": { "windows": { }, "binding_window": { } },
+    "first_production_at": "2026-06-01T00:00:00Z",
+    "warmup": {
+      "stage": "w7-8", "mature": false, "freshness_factor": 0.9,
+      "daily_budget": 6500, "rpm_limit": 30, "concurrency_limit": 3, "age_days": 55
+    },
+    "in_distress": false,
+    "warmup_health_stage_cap": null,
+    "warmup_last_distress_at": null,
+    "sessions_total": 0, "sessions_active": 0, "sessions_closed": 0
+  }
+}
+```
+
+### 3.6 养号健康门控（ANCHOR-Q4）
+
+养号升档不再纯按账龄：账号是**按账龄 *和* 健康**一起爬养号曲线的。有效养号档 =
+`min(账龄档, 健康允许的档位上限)`；出现风控早期征兆会把上限压下来、并一直压住直到账号恢复。仅限
+Claude 账号（Codex/xAI/Gemini 不受自适应养号管理，写路径不会给它们记录 cap）。
+
+关键不变量：
+
+- **只降不升**（fail-safe）：门控绝不会把账号推到高于其账龄本身应得的档位。
+- **出征兆减速退档**：命中一次征兆，上限按 `demote-step` 档下降（floor 到最严格档），并打上
+  `warmup_last_distress_at`。评级视图（rpm / 日预算 / 并发）和选号权重视图（新鲜度系数 / 成熟度）都从
+  同一个读侧 clamp 看到被压低的档位。
+- **回升缓慢且受健康门控**：只有一次健康的*成功*，且当前有 cap、距上次征兆已 >=
+  `promote-cooldown-minutes`，才把上限**回升一档**；每步都重新起算冷静期，所以每个冷静期最多回升
+  一档。上限回到账龄应得档后就整体清掉（回到纯账龄）。回升要求健康 + 冷静期——账号不能只靠熬账龄在持续
+  失败时爬升。
+- **成熟号排除**（不降档）：越过整条曲线的账号按纯账龄治理；成熟号出征兆已由冷却 / 额度降权 /
+  自动隔离覆盖，刻意不把它推回养号日预算硬门控。
+- **cold 号跳过**：未锚定（"cold"）的账号不带 cap。
+
+配置（`account-scheduling.health-gate.*`；默认值是保守的 fail-safe 取值——design 没钉死具体数字，
+待用 201 真实数据校准）：
+
+| 字段 | 默认 | 含义 |
+| --- | --- | --- |
+| `enabled` | `true` | 总开关。`false` = 有效档恒等于账龄档（ANCHOR-Q4 之前的行为）。 |
+| `failure-cluster-threshold` | `3` | 观察窗口内标记为 distress 的失败请求数。`0` 关闭该信号。 |
+| `backoff-level-threshold` | `1` | `Quota.BackoffLevel`（不断抬升的 plan-quota 429 退避指数）达到该值即标记 distress。`1` = 任意活跃的 plan-quota 退避。`0` 关闭该信号。 |
+| `observation-window-minutes` | `30` | 失败聚簇往回累计多久（仅当 `failure-cluster-threshold > 0` 时有意义）。 |
+| `demote-step` | `1` | 每次命中征兆上限下降的档数（启用时必须 `>= 1`）。 |
+| `promote-cooldown-minutes` | `30` | 距上次征兆多久后、一次健康成功才能把上限回升一档（启用时必须 `> 0`）。 |
+
+两个 distress 信号是 **OR** 关系——失败聚簇或退避层级任一单独成立即标记 distress。`enabled` 时
+config 加载要求两个阈值中至少一个为正。
+
+运维读取（投影，2.5 节）：`in_distress`（当前正在报征兆）、`warmup_health_stage_cap`（持久化的
+cap，`null` = 无）、`warmup_last_distress_at`（上次减速的时间）。对比 `warmup.stage`（有效、被压低
+后）和 `warmup.age_days`（原始账龄），就能看出一个被压到低于账龄的账号。
+
+信号精度（v1）：门控只用 core 已经在跟踪的两个信号——近窗口失败聚簇和 `Quota.BackoffLevel`——**不**
+新增精确的 429 分类。硬失败（隔离 / 重认证 / 活跃冷却）不归这一层管；它们已经被从可选池里过滤掉。上面的
+阈值都是保守默认值，待用 201 真实流量校准。
+
+### 3.7 账号页展示（cpamp 管理前端）
+
+cpamp 账号页直接渲染 2.5 节的投影字段；运维这样读：
+
+- **订阅档徽标**（`20x` / `5x` / `Pro` / `未知`）：`subscription_tier`。上游返回未收录的
+  `rate_limit_tier`（如 `default_claude_ai`）时显示 `未知` 是预期，不是 bug——若该账号应参与按档
+  加权选号，用 `tier_override`（3.1 / 3.5 节）钉死一个档位。
+- **养号徽标**：`warmup.stage`（有效/被压低后的档位）配 `warmup.age_days`。
+- **"手动"标**：`tier_source = "override"`。
+- **会话数**：`sessions_total` / `sessions_active` / `sessions_closed`。
+- **减速态**：`in_distress = true`（配合 `warmup_health_stage_cap` /
+  `warmup_last_distress_at`）表示健康门控把这个账号减速了。
 
 ## 4. 注意事项
 

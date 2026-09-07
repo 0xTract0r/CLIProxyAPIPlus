@@ -182,6 +182,46 @@ The warm-up/rate-limit stage the account is currently in:
 - `age_days` (number | null): the account's whole-day age since `first_production_at`.
   `null` while in the `"cold"` (unanchored) state.
 
+### 2.5 `account_scheduling` namespace rename and the additional projection fields
+
+Since the §8.5 namespace unification the projection is surfaced under the object
+name **`account_scheduling`** (the canonical name the cpamp frontend reads); the
+legacy name **`adaptive_scheduling`** is still emitted alongside it with the
+byte-identical value as a transition-safety measure (dual-emit site:
+`internal/api/handlers/management/auth_files.go`). Prefer reading
+`account_scheduling`; both objects carry every field in sections 2.1–2.4 plus the
+fields below (projection: `buildAccountSchedulingView`).
+
+- `tier_source` (string, `"auto"` | `"override"`): whether `subscription_tier`
+  (section 2.1) came from a manual, provider-appropriate `tier_override`
+  (`"override"`) or from `rate_limit_tier` / `chatgpt_plan_type` auto-detection
+  (`"auto"`). Derived on read from the override's presence — it is not a separately
+  persisted field. A blank, malformed, or cross-provider override reads `"auto"`,
+  matching the fact that the tier resolvers ignore exactly those. This is the field
+  a frontend reads to show a "manual" tier badge.
+- `rate_scale` (number, > 0): the effective per-account rate multiplier applied to
+  this account's derived rate ceilings (see section 3.4). `1.0` means no scaling.
+- `in_distress` (bool): whether the account currently shows an early risk-control
+  signal per the health gate (see section 3.6). Purely observational; `false` when
+  the gate is disabled.
+- `warmup_health_stage_cap` (number | null): the persisted health-allowed maximum
+  warm-up stage index (`0` = the first / strictest stage). `null` when no cap is
+  recorded (the account has never been decelerated) — never read `null` as "capped
+  to stage 0".
+- `warmup_last_distress_at` (string, RFC3339 UTC | null): wall-clock of the most
+  recent recorded distress. `null` when the account has never shown distress.
+- `sessions_total` / `sessions_active` / `sessions_closed` (number): distinct
+  session-id counts observed on this account's recorded requests, bucketed by idle
+  time (active within 10 min, closed after 30 min, by default). `0` can mean either
+  "no sessions observed yet" or "no usage store wired" — the two are deliberately
+  not distinguished (zero sessions is itself a valid answer, unlike the
+  missing-snapshot ambiguity of `quota_utilization`).
+
+Interaction with section 2.4: once the health gate is active, `warmup.stage` /
+`rpm_limit` / `daily_budget` / `concurrency_limit` reflect the **effective**
+(health-capped) stage, while `warmup.age_days` still reports the raw calendar age —
+so a reader can render "aged N days but decelerated to `<stage>`" (see section 3.6).
+
 ## 3. Operational Notes
 
 ### 3.1 The `tier_override` manual marker
@@ -208,8 +248,11 @@ tier-weighted selection. Operators can manually "pin" a tier:
   `quota_snapshot` sub-object wholesale, so a value written inside `quota_snapshot` would
   get overwritten and lost on the next refresh cycle (roughly every 45 minutes), whereas
   a value written at the top level is unaffected.
-- There is currently no dedicated management write endpoint for setting this field; it
-  can only be set by directly editing the account's auth JSON file.
+- A dedicated admin management endpoint now sets/clears this field at runtime:
+  `PATCH /v0/management/auth-files/account-scheduling` (see section 3.5). Hand-editing
+  the auth JSON still works (the legacy bare top-level key is dual-read), but the
+  canonical write location is now the namespaced `account_scheduling` object (see
+  section 3.3); the endpoint writes there and reloads the running selector.
 - Typical use: auto-detection is inaccurate (as in the `default_claude_ai` case above),
   or when a specific tier's weighted-selection behavior needs to be manually
   simulated/tested.
@@ -244,6 +287,220 @@ stage of `warmup-curve` it falls into and its freshness weighting factor.
   its freshness factor on the selection-weighting side is treated as `1` (see the
   divergence note in section 2.4), so that such accounts still get a chance to win a
   selection and thereby complete their own anchoring.
+- **Operator backfill channel**: beyond the append-only auto-mint above, an operator
+  can explicitly set or clear this anchor via
+  `PATCH /v0/management/auth-files/account-scheduling` (see section 3.5). This exists
+  to migrate accounts that were already aged/in-production **before** adaptive
+  scheduling was enabled — the auto-mint would otherwise stamp them as brand-new and
+  clamp them to the strictest warm-up stage. Only a future timestamp is rejected; any
+  past date is accepted and the operator owns its correctness. Setting an anchor
+  **earlier** than the truth makes the account look more mature than it is (less
+  warm-up), which is the account-safety-risky direction, so only backfill dates you
+  have actually confirmed. Clearing it re-opens the auto-mint (the next real serving
+  success re-stamps a fresh anchor).
+
+### 3.3 The `account_scheduling` metadata namespace (dual-read / dual-emit)
+
+All operator/auto scheduling state lives under a single **top-level**
+`account_scheduling` object in the account's auth JSON `metadata`. Persisted
+sub-keys: `tier_override`, `first_production_at`, `rate_scale`,
+`warmup_health_stage_cap`, `warmup_last_distress_at` (`tier_source` is derived on
+read for the projection, not stored). Keeping them under one top-level object — not
+nested inside `quota_snapshot` — is what makes them survive the ~45-minute quota
+refresh: that refresh replaces the whole `quota_snapshot` sub-object, but
+`Auth.Clone` copies every top-level metadata key through untouched.
+
+- **Dual-read (migration)**: reads prefer the namespaced sub-key and fall back to a
+  legacy **bare top-level** key. Only `tier_override` and `first_production_at` had a
+  pre-§8.5 bare form, so only those two are dual-read; `rate_scale`,
+  `warmup_health_stage_cap` and `warmup_last_distress_at` were introduced inside the
+  object and have no bare form.
+- **Write goes only to the new location**: minting/setting always writes the
+  namespaced sub-key, never the bare key — a non-destructive migration (an existing
+  legacy value is honored on read but never rewritten).
+- **Clear deletes both locations**: clearing any of these removes both the namespaced
+  sub-key and the legacy bare key, so a stale bare value cannot resurface through
+  dual-read on the next refresh.
+- **Projection dual-emit**: the account-list response emits both `account_scheduling`
+  (canonical) and `adaptive_scheduling` (legacy, identical value) — see section 2.5.
+
+### 3.4 `rate_scale`: per-account safety-test rate multiplier
+
+`rate_scale` is a speed multiplier applied to an account's **derived** rate ceilings
+— rpm / burst / concurrency / daily budget — **after** the tier/warm-up derivation.
+It is deliberately **independent of selection weight**: it never changes *which*
+account the selector picks, only how fast the picked account may go.
+
+- **Config default**: `account-scheduling.rate-scale` (float, default **`1.0`**).
+- **Per-account override**: metadata `account_scheduling.rate_scale` (dual-read also
+  honors a legacy bare `rate_scale`), settable via the endpoint in section 3.5.
+- **Resolution order**: a valid per-account override (present and `> 0`) → the config
+  default (when `> 0`) → `1.0`. A non-positive or unparseable value at any layer is
+  skipped in favor of the next, so the effective multiplier is always `> 0` and `1.0`
+  is always a safe no-op.
+- **`1.0` = no effect**; `< 1` throttles every ceiling below its tier/warm-up value
+  (for low-risk safety testing); `> 1` lifts it.
+- **Applies during warm-up too**: it scales whichever ceiling the account currently
+  sits at (a warming stage or the mature ceiling), so it is not limited to mature
+  accounts.
+- **Floors keep a limit positive, never zero**: config load rejects a non-positive
+  `rate-scale`; on the read path a fractional scale rounds a derived integer ceiling
+  to the nearest whole unit and floors it at `1`, so a small scale can throttle an
+  account but can never wedge a positive limit to a permanent `0`. A non-positive /
+  unbounded ceiling (e.g. a mature account's `0` = unlimited daily budget) is left
+  unchanged.
+
+### 3.5 Management endpoint: `PATCH /v0/management/auth-files/account-scheduling`
+
+Admin-gated (the same `/v0/management` admin auth as its sibling auth-file
+endpoints — `X-Management-Key: <key>` or `Authorization: Bearer <key>`, no new
+exemption). It sets or clears an account's operator overrides — `tier_override`,
+`rate_scale`, `first_production_at` — at runtime, persists them, makes the running
+selector observe them (`authManager.Update`), and returns the refreshed projection.
+
+Request body (`application/json`):
+
+- `name` (string, **required**): auth id / filename / display name.
+- `auth_index` (string, optional): disambiguation.
+- `tier_override` / `rate_scale` / `first_production_at`: field **presence** drives
+  intent — absent = leave untouched; explicit empty string or JSON `null` = clear; a
+  value = set. **At least one** of the three must be present, else `400`.
+
+Per-provider validation:
+
+- `tier_override`: legal for the account's provider (claude: `max_20x` / `max_5x` /
+  `pro`; codex: `codex_pro` / `codex_plus`), else `400` with a `legal_values` list.
+- `rate_scale`: a number `> 0`, else `400`.
+- `first_production_at`: RFC3339 **and not in the future**, else `400`; any past date
+  is accepted.
+
+Clearing double-deletes (namespaced + legacy bare, to prevent a stale value
+resurfacing): clearing `tier_override` lets `tier_source` fall back to `"auto"`;
+clearing `rate_scale` falls back to the config default (else `1.0`); clearing
+`first_production_at` re-opens the append-only auto-mint. Other responses: `400`
+invalid body / no override field; `404` account not found; `409` plugin-virtual
+auth; `503` auth manager unavailable; `500` persist failure.
+
+Set example (pin tier, throttle to half rate, backfill anchor):
+
+```bash
+curl -sS -X PATCH https://<host>/v0/management/auth-files/account-scheduling \
+  -H "X-Management-Key: <management-key>" \
+  -H "Content-Type: application/json" \
+  -d '{
+        "name": "AC-14.json",
+        "tier_override": "max_5x",
+        "rate_scale": 0.5,
+        "first_production_at": "2026-06-01T00:00:00Z"
+      }'
+```
+
+Clear example (empty string or `null` clears; leaves `first_production_at` untouched):
+
+```bash
+curl -sS -X PATCH https://<host>/v0/management/auth-files/account-scheduling \
+  -H "X-Management-Key: <management-key>" \
+  -H "Content-Type: application/json" \
+  -d '{ "name": "AC-14.json", "tier_override": "", "rate_scale": null }'
+```
+
+Success `200` response (the `account_scheduling` value is the full refreshed
+projection — sections 2.1–2.5):
+
+```json
+{
+  "name": "AC-14",
+  "account_scheduling": {
+    "subscription_tier": "max_5x",
+    "tier_source": "override",
+    "rate_scale": 0.5,
+    "quota_utilization": { "windows": { }, "binding_window": { } },
+    "first_production_at": "2026-06-01T00:00:00Z",
+    "warmup": {
+      "stage": "w7-8", "mature": false, "freshness_factor": 0.9,
+      "daily_budget": 6500, "rpm_limit": 30, "concurrency_limit": 3, "age_days": 55
+    },
+    "in_distress": false,
+    "warmup_health_stage_cap": null,
+    "warmup_last_distress_at": null,
+    "sessions_total": 0, "sessions_active": 0, "sessions_closed": 0
+  }
+}
+```
+
+### 3.6 Health-gated warm-up ramp (ANCHOR-Q4)
+
+Warm-up promotion is no longer purely age-based: an account climbs the warm-up curve
+by **age *and* health**. The effective warm-up stage is
+`min(age-based stage, health-allowed stage cap)`; an early risk-control signal clamps
+the cap down and holds it there until the account recovers. Claude accounts only
+(Codex/xAI/Gemini are not under adaptive warm-up, so the write path never records a
+cap for them).
+
+Key invariants:
+
+- **Only ever lowers, never raises** (fail-safe): the gate can never push an account
+  above the stage its age already earns.
+- **Distress decelerates**: on a distress hit the cap drops by `demote-step` stages
+  (floored at the strictest stage) and `warmup_last_distress_at` is stamped. Both the
+  grading view (rpm / daily budget / concurrency) and the selection-weight view
+  (freshness factor / maturity) see the lowered stage from one shared read-side clamp.
+- **Recovery is slow and health-gated**: only a healthy *success*, with a cap present
+  and at least `promote-cooldown-minutes` since the last distress, raises the cap by
+  **one** stage; each step re-arms the cooldown, so at most one stage is regained per
+  cooldown window. Once the cap reaches the age-deserved stage it is dropped entirely
+  (pure age again). Promotion requires health + cooldown — an account cannot climb by
+  simply aging while it keeps failing.
+- **Mature accounts are out of scope** (never demoted): an account past the whole
+  curve is governed by pure age; a mature account showing distress is already covered
+  by cooldown / quota-deweight / auto-quarantine and is deliberately not pushed back
+  into a warm-up daily-budget hard gate.
+- **Cold accounts are skipped**: an un-anchored ("cold") account carries no cap.
+
+Config (`account-scheduling.health-gate.*`; defaults are conservative fail-safe
+values — design pins no exact numbers, pending calibration against real 201 data):
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `true` | Master switch. `false` = effective stage always equals the age stage (pre-ANCHOR-Q4 behavior). |
+| `failure-cluster-threshold` | `3` | Failed requests within the observation window that mark distress. `0` disables this signal. |
+| `backoff-level-threshold` | `1` | `Quota.BackoffLevel` (escalating plan-quota 429 backoff exponent) at or above which distress is marked. `1` = any active plan-quota backoff. `0` disables this signal. |
+| `observation-window-minutes` | `30` | How far back the failure cluster is summed (only meaningful when `failure-cluster-threshold > 0`). |
+| `demote-step` | `1` | Warm-up stages the cap drops per distress hit (must be `>= 1` when enabled). |
+| `promote-cooldown-minutes` | `30` | Minimum time since the last distress before a healthy success may re-raise the cap by one stage (must be `> 0` when enabled). |
+
+The two distress signals are **OR-ed** — either the failure cluster or the backoff
+level alone marks distress. When `enabled`, config load requires at least one of the
+two thresholds to be positive.
+
+Operational reads (projection, section 2.5): `in_distress` (currently signalling),
+`warmup_health_stage_cap` (the persisted cap, `null` = none), and
+`warmup_last_distress_at` (when it last decelerated). Compare `warmup.stage`
+(effective, capped) against `warmup.age_days` (raw age) to spot an account that has
+been decelerated below its age.
+
+Signal fidelity (v1): the gate uses only the two signals core already tracks —
+recent-request failure clusters and `Quota.BackoffLevel` — and adds **no** precise
+429 classification. Hard failures (quarantine / reauth / active cooldown) are not
+this layer's concern; they are already filtered out of the selectable pool. The
+thresholds above are conservative defaults awaiting calibration against real 201
+traffic.
+
+### 3.7 Reading the account page (cpamp management UI)
+
+The cpamp account page renders the section 2.5 projection fields directly; operators
+read them as:
+
+- **Subscription-tier badge** (`20x` / `5x` / `Pro` / `unknown`):
+  `subscription_tier`. `unknown` is expected, not a bug, when the upstream returns an
+  unmapped `rate_limit_tier` (e.g. `default_claude_ai`) — pin a tier via
+  `tier_override` (sections 3.1 / 3.5) if the account should participate in
+  tier-weighted selection.
+- **Warm-up badge**: `warmup.stage` (effective/capped stage) with `warmup.age_days`.
+- **"Manual" marker**: `tier_source = "override"`.
+- **Session counts**: `sessions_total` / `sessions_active` / `sessions_closed`.
+- **Decelerated state**: `in_distress = true` (with `warmup_health_stage_cap` /
+  `warmup_last_distress_at`) means the health gate has slowed this account down.
 
 ## 4. Caveats
 
