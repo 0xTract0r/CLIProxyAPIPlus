@@ -289,6 +289,9 @@ func (s *authScheduler) pickSingleWithStrategy(ctx context.Context, provider, mo
 	if picked := shard.pickReadyLocked(preferWebsocket, strategy, predicate); picked != nil {
 		return picked, nil
 	}
+	if fallback := shard.pickDialBreakerFallbackLocked(predicate); fallback != nil {
+		return fallback, nil
+	}
 	return nil, shard.unavailableErrorLocked(provider, model, predicate)
 }
 
@@ -358,6 +361,9 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 		if picked := shard.pickReadyLocked(false, strategy, predicate); picked != nil {
 			return picked, providerKey, nil
 		}
+		if fallback := shard.pickDialBreakerFallbackLocked(predicate); fallback != nil {
+			return fallback, providerKey, nil
+		}
 		return nil, "", shard.unavailableErrorLocked("mixed", model, predicate)
 	}
 
@@ -386,6 +392,18 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 		}
 	}
 	if !hasCandidate {
+		// Dead-proxy dial-failure breaker non-starvation: before erroring, try a
+		// cross-shard breaker-only last-resort pick so a fully-breaker-blocked farm
+		// never collapses to "no auth available". No-op when the feature is off.
+		for providerIndex, providerKey := range normalized {
+			shard := candidateShards[providerIndex]
+			if shard == nil {
+				continue
+			}
+			if fallback := shard.pickDialBreakerFallbackLocked(predicate); fallback != nil {
+				return fallback, providerKey, nil
+			}
+		}
 		return nil, "", s.mixedUnavailableErrorLocked(normalized, model, tried)
 	}
 
@@ -885,6 +903,50 @@ func (m *modelScheduler) readyCountAtPriorityLocked(preferWebsocket bool, priori
 		return len(bucket.ws.flat)
 	}
 	return len(bucket.all.flat)
+}
+
+// pickDialBreakerFallbackLocked is the built-in scheduler's dead-proxy
+// dial-failure breaker non-starvation fallback. It is called only after
+// pickReadyLocked found nothing ready: if some entries are blocked SOLELY by the
+// soft dial breaker (they would be ready if the breaker were ignored), it returns
+// one as a last-resort probe so the request never collapses to "no auth
+// available" (which would defeat failover) and can still probe-recover. It
+// respects the same predicate (pinned/tried) as the ready pick and picks
+// deterministically by auth ID. Strict no-op when the breaker feature is off (no
+// entry is ever breaker-blocked), so it returns nil and pre-flag behaviour is
+// byte-identical.
+func (m *modelScheduler) pickDialBreakerFallbackLocked(predicate func(*scheduledAuth) bool) *Auth {
+	if m == nil {
+		return nil
+	}
+	now := time.Now()
+	var picked *scheduledAuth
+	for _, entry := range m.entries {
+		if entry == nil || entry.auth == nil {
+			continue
+		}
+		if predicate != nil && !predicate(entry) {
+			continue
+		}
+		// Must be currently blocked by the dial breaker...
+		if !forkDialFailureBreakerBlocked(entry.auth, now) {
+			continue
+		}
+		// ...and blocked ONLY by it: if ignoring the breaker still leaves it
+		// blocked (disabled/quarantine/reauth/cooldown/etc.), it is a genuine skip,
+		// not a last-resort probe candidate.
+		blocked, _, _ := isAuthBlockedForModelOpts(entry.auth, m.modelKey, now, false)
+		if blocked {
+			continue
+		}
+		if picked == nil || entry.auth.ID < picked.auth.ID {
+			picked = entry
+		}
+	}
+	if picked == nil {
+		return nil
+	}
+	return picked.auth
 }
 
 // unavailableErrorLocked returns the correct unavailable or cooldown error for the shard.

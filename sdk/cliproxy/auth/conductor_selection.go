@@ -286,6 +286,7 @@ func (m *Manager) availableAuthsForRouteModel(auths []*Auth, provider, routeMode
 	availableByPriority := make(map[int][]*Auth)
 	cooldownCount := 0
 	var earliest time.Time
+	var breakerFallback []*Auth
 	for _, candidate := range auths {
 		checkModel := m.selectionModelForAuth(candidate, routeModel)
 		// Fork plan gate: skip accounts whose subscription tier is not allowed to
@@ -304,10 +305,20 @@ func (m *Manager) availableAuthsForRouteModel(auths []*Auth, provider, routeMode
 			if !next.IsZero() && (earliest.IsZero() || next.Before(earliest)) {
 				earliest = next
 			}
+			continue
+		}
+		// Fork dead-proxy dial-failure breaker non-starvation (see selector.go):
+		// remember accounts blocked solely by the soft dial breaker as the
+		// last-resort pool. A no-op when the feature is off.
+		if reason == blockReasonDialBreaker {
+			breakerFallback = append(breakerFallback, candidate)
 		}
 	}
 
 	if len(availableByPriority) == 0 {
+		if len(breakerFallback) > 0 {
+			return dialBreakerFallbackList(breakerFallback), nil
+		}
 		if cooldownCount == len(auths) && !earliest.IsZero() {
 			providerForError := provider
 			if providerForError == "mixed" {

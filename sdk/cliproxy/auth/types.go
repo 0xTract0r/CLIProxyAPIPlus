@@ -138,6 +138,22 @@ type Auth struct {
 	terminalAuthFailureStreak        int       `json:"-"`
 	terminalAuthFailureStreakStartAt time.Time `json:"-"`
 
+	// dialFailureStreak / dialFailureStreakStartAt / dialBreakerUntil back the
+	// fork-only dead-proxy dial-failure breaker (farm_dial_breaker.go). Like the
+	// terminalAuthFailureStreak fields above they are intentionally NOT persisted
+	// (json:"-"): a dial breaker is a SHORT, self-recovering network-layer skip, so
+	// a process restart simply starts fresh, which is a strict safety bias (never
+	// parks an account longer than a live process would). Being plain value fields
+	// they are carried by Auth.Clone's shallow struct copy automatically, so the
+	// breaker window propagates into the scheduler snapshots the selector reads,
+	// without touching the persistence / stale-writeback machinery. dialBreakerUntil
+	// is the wall-clock instant until which the selector skips this farm account;
+	// the streak/start pair is the in-memory consecutive-dial-failure bookkeeping
+	// evaluateDialFailureBreakerLocked maintains under m.mu.
+	dialFailureStreak        int       `json:"-"`
+	dialFailureStreakStartAt time.Time `json:"-"`
+	dialBreakerUntil         time.Time `json:"-"`
+
 	// quarantineStateAt is an in-memory-only (never persisted) freshness clock
 	// for the AutoQuarantined lock: markAutoQuarantine/clearAutoQuarantine
 	// always stamp it to the real wall-clock time they run at, whether or not

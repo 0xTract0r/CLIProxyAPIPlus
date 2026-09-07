@@ -197,7 +197,7 @@ func preferCodexWebsocketAuths(ctx context.Context, provider string, available [
 	return available
 }
 
-func collectAvailableByPriority(auths []*Auth, model string, now time.Time) (available map[int][]*Auth, cooldownCount int, earliest time.Time) {
+func collectAvailableByPriority(auths []*Auth, model string, now time.Time) (available map[int][]*Auth, cooldownCount int, earliest time.Time, breakerFallback []*Auth) {
 	available = make(map[int][]*Auth)
 	for i := 0; i < len(auths); i++ {
 		candidate := auths[i]
@@ -212,9 +212,18 @@ func collectAvailableByPriority(auths []*Auth, model string, now time.Time) (ava
 			if !next.IsZero() && (earliest.IsZero() || next.Before(earliest)) {
 				earliest = next
 			}
+			continue
+		}
+		// Fork dead-proxy dial-failure breaker non-starvation: remember accounts
+		// blocked SOLELY by the (soft) dial breaker. If nothing else is available
+		// they are the last-resort pool so the request never collapses to "no auth
+		// available" and can still probe-recover. A no-op when the feature is off
+		// (no account is ever blockReasonDialBreaker).
+		if reason == blockReasonDialBreaker {
+			breakerFallback = append(breakerFallback, candidate)
 		}
 	}
-	return available, cooldownCount, earliest
+	return available, cooldownCount, earliest, breakerFallback
 }
 
 func getAvailableAuths(auths []*Auth, provider, model string, now time.Time) ([]*Auth, error) {
@@ -222,8 +231,15 @@ func getAvailableAuths(auths []*Auth, provider, model string, now time.Time) ([]
 		return nil, &Error{Code: "auth_not_found", Message: "no auth candidates"}
 	}
 
-	availableByPriority, cooldownCount, earliest := collectAvailableByPriority(auths, model, now)
+	availableByPriority, cooldownCount, earliest, breakerFallback := collectAvailableByPriority(auths, model, now)
 	if len(availableByPriority) == 0 {
+		// Dead-proxy dial-failure breaker non-starvation: before erroring, if the
+		// only thing keeping every candidate out is the soft dial breaker, pick from
+		// the breaker-blocked pool as a last resort (which doubles as a recovery
+		// probe) rather than failing the request. Empty when the feature is off.
+		if len(breakerFallback) > 0 {
+			return dialBreakerFallbackList(breakerFallback), nil
+		}
 		if cooldownCount == len(auths) && !earliest.IsZero() {
 			providerForError := provider
 			if providerForError == "mixed" {
@@ -304,6 +320,16 @@ func (s *FillFirstSelector) Pick(ctx context.Context, provider, model string, op
 }
 
 func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, blockReason, time.Time) {
+	return isAuthBlockedForModelOpts(auth, model, now, true)
+}
+
+// isAuthBlockedForModelOpts is isAuthBlockedForModel with an explicit
+// honorDialBreaker toggle. The public 3-arg wrapper always honors the breaker;
+// the selection-aggregation non-starvation fallbacks (legacy pools + built-in
+// scheduler) re-evaluate with honorDialBreaker=false so an account blocked SOLELY
+// by the dead-proxy dial breaker can still be picked as a last resort when every
+// candidate is breaker-blocked, instead of collapsing to "no auth available".
+func isAuthBlockedForModelOpts(auth *Auth, model string, now time.Time, honorDialBreaker bool) (bool, blockReason, time.Time) {
 	if auth == nil {
 		return true, blockReasonOther, time.Time{}
 	}
@@ -342,6 +368,20 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 	// is a strict no-op when the flag is unset (see forkRequireProvisionedBlocked).
 	if forkRequireProvisionedBlocked(auth) {
 		return true, blockReasonUnprovisioned, time.Time{}
+	}
+	// Fork dead-proxy dial-failure breaker (farm_dial_breaker.go): a SOFT,
+	// self-recovering skip for a farm account whose LEGAL per-account proxy is
+	// currently unreachable. Checked after the terminal locks above (so a truly
+	// dead/disabled/quarantined/unprovisioned account still reports its own
+	// terminal reason) but before the model/quota cooldown checks below (so a
+	// breaker-only skip is reported with its own distinct reason, which the
+	// non-starvation fallback keys on). It returns dialBreakerUntil as the retry
+	// time so the built-in scheduler classifies it as a timed block and
+	// promoteExpiredLocked auto-restores it the moment the window elapses. Strict
+	// no-op unless the feature is armed AND the account is farm-enrolled AND the
+	// window is still open; honorDialBreaker=false skips it for the fallback pass.
+	if honorDialBreaker && forkDialFailureBreakerBlocked(auth, now) {
+		return true, blockReasonDialBreaker, auth.dialBreakerUntil
 	}
 	if model != "" {
 		if len(auth.ModelStates) > 0 {
