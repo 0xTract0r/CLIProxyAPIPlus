@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"strings"
 	"testing"
 
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
@@ -218,7 +219,7 @@ func TestResolveOAuthUpstreamModel_GatesClaudeOpus1MAliasByPlan(t *testing.T) {
 			want: "",
 		},
 		{
-			name: "pro with credits allows alias",
+			name: "pro with credits blocks alias",
 			auth: &Auth{
 				Provider: "claude",
 				Attributes: map[string]string{
@@ -227,7 +228,7 @@ func TestResolveOAuthUpstreamModel_GatesClaudeOpus1MAliasByPlan(t *testing.T) {
 					"extra_usage_enabled": "true",
 				},
 			},
-			want: "claude-opus-4-7",
+			want: "",
 		},
 		{
 			name: "max allows alias",
@@ -264,7 +265,7 @@ func TestResolveOAuthUpstreamModel_GatesClaudeOpus1MAliasByPlan(t *testing.T) {
 				t.Fatalf("resolveOAuthUpstreamModel(claude-opus-4-7[1m]) = %q, want %q", got, tt.want)
 			}
 			wantCustomAlias := ""
-			if tt.want != "" || tt.name == "pro without credits blocks alias" {
+			if tt.want != "" || strings.HasPrefix(tt.name, "pro ") {
 				wantCustomAlias = "claude-opus-4-6"
 			}
 			if got := mgr.resolveOAuthUpstreamModel(tt.auth, "my-opus"); got != wantCustomAlias {

@@ -91,6 +91,11 @@ func (m *Manager) executeHome(ctx context.Context, providers []string, req clipr
 			execOpts := opts
 			execOpts.ExecutionLifecycle = selection
 			execReq, execOpts = applyRequestAfterAuthInterceptor(execCtx, selection.Executor, selection.Provider, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
+			if !authAllowsClaudeContext(preparedAuth, execReq.Model, execOpts) {
+				releaseAttempt()
+				selection.End("subscription_ineligible")
+				return cliproxyexecutor.Response{}, claudeContextEntitlementError()
+			}
 			if errCtx := execCtx.Err(); errCtx != nil {
 				releaseAttempt()
 				selection.End("attempt_canceled")
