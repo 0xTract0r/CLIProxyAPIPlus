@@ -115,6 +115,15 @@ func (h *Handler) PatchAuthFileAccountScheduling(c *gin.Context) {
 		return
 	}
 
+	// Claude-only controls: account scheduling is scoped to Claude accounts
+	// (mirroring the serving-side codex->0 AccountTierBaseWeight and the claude-only
+	// read projection in buildAuthFileEntry). Reject overrides on non-Claude
+	// accounts so codex/grok/gemini records cannot acquire a scheduling object.
+	if providerKey(targetAuth) != "claude" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "account-scheduling controls apply to Claude accounts only"})
+		return
+	}
+
 	if targetAuth.Metadata == nil {
 		targetAuth.Metadata = make(map[string]any)
 	}

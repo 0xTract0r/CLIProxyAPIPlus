@@ -170,7 +170,12 @@ func TestBuildAuthFileEntry_AdaptiveScheduling(t *testing.T) {
 		}
 	})
 
-	t.Run("codex auth reports its own plan tier", func(t *testing.T) {
+	t.Run("codex auth carries no account_scheduling projection (claude-only)", func(t *testing.T) {
+		// Requirement change: the account-scheduling projection is claude-only
+		// (mirroring the serving-side codex->0 AccountTierBaseWeight). A non-Claude
+		// account must carry neither the current key nor the legacy dual-emit name,
+		// so nothing downstream renders a bogus subscription_tier="unknown" / warm-up
+		// state on a codex/grok/gemini card.
 		auth := &coreauth.Auth{
 			ID:         "codex-adaptive-1",
 			Provider:   "codex",
@@ -184,15 +189,14 @@ func TestBuildAuthFileEntry_AdaptiveScheduling(t *testing.T) {
 		if entry == nil {
 			t.Fatal("buildAuthFileEntry() = nil, want an entry")
 		}
-		view, ok := entry["account_scheduling"].(gin.H)
-		if !ok {
-			t.Fatalf("entry[\"account_scheduling\"] = %#v, want gin.H", entry["account_scheduling"])
+		if _, ok := entry["account_scheduling"].(gin.H); ok {
+			t.Fatalf("entry[\"account_scheduling\"] = %#v, want absent for a non-claude account", entry["account_scheduling"])
 		}
-		if got := view["subscription_tier"]; got != "pro" {
-			t.Fatalf("subscription_tier = %#v, want %q for a codex pro account", got, "pro")
+		if _, present := entry["account_scheduling"]; present {
+			t.Fatalf("entry[\"account_scheduling\"] present = %#v, want absent for a non-claude account", entry["account_scheduling"])
 		}
-		if got := view["tier_source"]; got != "auto" {
-			t.Fatalf("tier_source = %#v, want %q for an auto-detected codex tier", got, "auto")
+		if _, present := entry["adaptive_scheduling"]; present {
+			t.Fatalf("entry[\"adaptive_scheduling\"] present = %#v, want absent for a non-claude account", entry["adaptive_scheduling"])
 		}
 	})
 
