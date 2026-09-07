@@ -213,7 +213,7 @@ func TestRegisterModelsForAuth_ClaudePlanSeparatesOpusAndLongContext(t *testing.
 				},
 			},
 			wantBaseOpus:    true,
-			wantOpus1MAlias: true,
+			wantOpus1MAlias: false,
 		},
 		{
 			name: "max",
@@ -261,7 +261,7 @@ func TestRegisterModelsForAuth_ClaudePlanSeparatesOpusAndLongContext(t *testing.
 				},
 			},
 			wantBaseOpus:    true,
-			wantOpus1MAlias: true,
+			wantOpus1MAlias: false,
 		},
 		{
 			name: "unknown local plan",

@@ -454,7 +454,7 @@ func TestManagerExecute_ClaudeProOpusEntitlement(t *testing.T) {
 					}
 					_, err = manager.Execute(context.Background(), []string{"claude"},
 						cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{Metadata: meta})
-					if model == "claude-opus-4-7[1m]" && !credits {
+					if model == "claude-opus-4-7[1m]" {
 						var authErr *Error
 						if !errors.As(err, &authErr) || authErr.Code != "auth_not_found" {
 							t.Fatalf("expected 1M entitlement rejection, got %v", err)

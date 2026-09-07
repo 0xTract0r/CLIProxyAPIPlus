@@ -45,7 +45,7 @@ func GetClaudeModels() []*ModelInfo {
 }
 
 // GetClaudeModelsForPlan returns Claude model definitions that are safe for a
-// known subscription plan. Pro supports Opus; extended context needs credits.
+// known subscription plan. Only included subscription capabilities are exposed.
 func GetClaudeModelsForPlan(plan string, usageCreditsEnabled bool) []*ModelInfo {
 	return FilterClaudeModelsForPlan(GetClaudeModels(), plan, usageCreditsEnabled)
 }
@@ -163,9 +163,11 @@ func ClaudePlanAllowsOpus(plan string) bool {
 	}
 }
 
-func ClaudePlanAllowsOpusLongContext(plan string, usageCreditsEnabled bool) bool {
+// OAuth routing uses included subscription capabilities only. A persisted
+// credits flag must never silently opt an account into additional billing.
+func ClaudePlanAllowsOpusLongContext(plan string, _ bool) bool {
 	if NormalizeClaudeSubscriptionPlan(plan) == "pro" {
-		return usageCreditsEnabled
+		return false
 	}
 	return ClaudePlanAllowsOpus(plan)
 }

@@ -123,8 +123,10 @@ func TestClaudeModelsForPlanSeparatesOpusAndLongContext(t *testing.T) {
 		}
 	}
 	for _, model := range aliased {
-		if findModelInfo(FilterClaudeModelsForPlan(aliased, "pro", true), model.ID) == nil {
-			t.Fatalf("expected Pro with credits to keep %s", model.ID)
+		got := findModelInfo(FilterClaudeModelsForPlan(aliased, "pro", true), model.ID) != nil
+		want := findModelInfo(proModels, model.ID) != nil
+		if got != want {
+			t.Fatalf("credits must not change included capabilities for %s", model.ID)
 		}
 	}
 	for _, plan := range []string{"", "free", "unknown"} {

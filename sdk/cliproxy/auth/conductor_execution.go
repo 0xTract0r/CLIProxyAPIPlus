@@ -23,6 +23,7 @@ import (
 // Execute performs a non-streaming execution using the configured selector and executor.
 // It supports multiple providers for the same model and round-robins the starting provider per model.
 func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	opts = withClaudeContext1M(req.Model, opts)
 	req, opts = cliproxysession.Enrich(req, opts)
 	ctx = contextWithSessionID(ctx, opts)
 	normalized := m.normalizeProviders(providers)
@@ -106,6 +107,7 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 // ExecuteStream performs a streaming execution using the configured selector and executor.
 // It supports multiple providers for the same model and round-robins the starting provider per model.
 func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	opts = withClaudeContext1M(req.Model, opts)
 	req, opts = cliproxysession.Enrich(req, opts)
 	ctx = contextWithSessionID(ctx, opts)
 	if m.HomeEnabled() {
@@ -314,6 +316,9 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			}
 			execOpts := opts
 			execReq, execOpts = applyRequestAfterAuthInterceptor(execCtx, executor, provider, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
+			if !authAllowsClaudeContext(auth, execReq.Model, execOpts) {
+				return cliproxyexecutor.Response{}, claudeContextEntitlementError()
+			}
 			var resp cliproxyexecutor.Response
 			var errExec error
 			var ctxErr error
