@@ -21,6 +21,10 @@
 
 ## 1. 概述
 
+> **适用范围：仅 Claude 账号。** 本特性——调度投影、加权选号、养号、下文的管理端点——只
+> 作用于 Claude 账号。非 Claude 账号（Codex / Gemini / xAI 等）完全不受影响：
+> `GET /v0/management/auth-files` 不会给它们返回 `account_scheduling` 投影对象。
+
 自适应调度决定*每次请求由哪个账号服务*：按订阅容量、实时额度、新鲜度给账号打分选号，
 而不是简单轮询（round-robin）。
 
@@ -39,11 +43,8 @@
 weight = tier 基础容量权重 x (1 - 额度利用率) x 新鲜度系数
 ```
 
-- **tier 基础容量权重**按 provider 分别配置：
+- **tier 基础容量权重**按 Claude 订阅档配置：
   - Claude 区分四档：`max_20x` / `max_5x` / `pro` / `unknown`。
-  - Codex 区分三档：`pro` / `plus` / `unknown`。
-  - 两套权重只在各自 provider 内部比较，从不跨 provider 比较（一个 Claude 权重和一个
-    Codex 权重没有可比性）。
 - **额度余量**取账号最紧张的那个额度窗口（利用率最高），不取任意窗口或平均值。
   - 例：`five_hour` 窗口已经打到 90% 的号，即便 `seven_day` 窗口还有余量，也不算安全可用。
   - 额度快照完全读不到时：取一个中性偏保守的兜底值，绝不当作"0% 已用"。
@@ -76,7 +77,7 @@ weight = tier 基础容量权重 x (1 - 额度利用率) x 新鲜度系数
 
 | 粘性目标状态 | 行为 |
 | --- | --- |
-| **非 Claude/Codex 账号**（本调度器不打分的 provider） | 不做分级，行为等同现有 session-affinity。 |
+| **非 Claude 账号**（本调度器不打分的 provider） | 不做分级，行为等同现有 session-affinity。 |
 | **成熟且未打到软上限**（token bucket 仍允许放行） | 保持粘性，维持 prompt cache 连续性。 |
 | **成熟但已打到软上限**（视为接近风控硬阈值） | 打破粘性，在全池重新加权选择。 |
 | **仍在养号期、且池子里存在可用的成熟账号** | 打破粘性，改路由到成熟账号并重新绑定（后续轮次跟随该成熟账号）。 |
@@ -84,7 +85,7 @@ weight = tier 基础容量权重 x (1 - 额度利用率) x 新鲜度系数
 
 ### 降级行为
 
-本调度器不识别的 provider（非 claude/codex），或某个等级被显式配置为权重 `0`，都会被排除出
+本调度器不识别的 provider（非 claude），或某个等级被显式配置为权重 `0`，都会被排除出
 加权候选，回退到 `Fallback`（默认 `RoundRobinSelector`）——与策略未启用时的行为一致，不
 影响这些 provider 的现有请求路径。
 
@@ -109,12 +110,10 @@ weight = tier 基础容量权重 x (1 - 额度利用率) x 新鲜度系数
 
 账号的精细订阅等级。
 
-- Claude 值域：`max_20x` / `max_5x` / `pro` / `unknown`。
-- Codex 值域：`pro` / `plus` / `unknown`。
-- provider 既非 `claude` 也非 `codex` 时，固定返回 Claude 一侧的 `unknown` 标签（两套枚举
-  完全独立，不混用同一套值域）。
-- 来源：Claude 读 `Metadata.quota_snapshot.profile.organization.rate_limit_tier`；Codex 读
-  `Attributes.plan_type`。两者都可以被顶层 `metadata.tier_override` 手动覆盖（§3.1）。
+- 该字段仅对 Claude 账号存在。
+- 值域：`max_20x` / `max_5x` / `pro` / `unknown`。
+- 来源：`Metadata.quota_snapshot.profile.organization.rate_limit_tier`。可以被顶层
+  `metadata.tier_override` 手动覆盖（§3.1）。
 
 ### 2.2 `quota_utilization` (object | null)
 
@@ -133,12 +132,6 @@ weight = tier 基础容量权重 x (1 - 额度利用率) x 新鲜度系数
 | `binding_window.window` | string | 绑定窗口名。 |
 | `binding_window.headroom` | number, 0-1 | |
 | `binding_window.resets_at` | string, RFC3339 UTC，可选 | |
-
-Codex 说明：Codex 的 `quota_snapshot.usage` 结构目前尚未在本仓库对真实生产账号抓包确认过。
-已知社区逆向信息显示它可能把窗口嵌套在 `rate_limit.primary_window` / `secondary_window`
-下、用 `percent_left` 而非顶层 `utilization` 字段表达。这种情况下解析器大概率识别不到任何
-窗口，`quota_utilization` 会正确显示为 `null`（"未知"），而不会把 `percent_left` 误读成
-`utilization`。
 
 ### 2.3 `first_production_at` (string, RFC3339 UTC | null)
 
@@ -205,12 +198,9 @@ canonical 名称）。旧名 **`adaptive_scheduling`** 仍以逐字节相同的�
 
 - 通过端点（§3.5）设置，或手工编辑 auth JSON：在顶层 `"metadata"` 对象里加一个字符串字段
   `"tier_override"`。
-- Claude 侧合法取值：`"max_20x"` / `"max_5x"` / `"pro"`。
-- Codex 侧合法取值：`"codex_pro"` / `"codex_plus"`（用 `codex_` 前缀和 Claude 的 `"pro"`
-  区分，避免同一个 key 在两个 provider 下语义冲突）。
-- 取值不区分大小写、自动去除首尾空白。空值、非法值、或跨 provider 的值（比如给 Codex 账号
-  写了 Claude 的 `"max_20x"`）都会被忽略，自动回退到自动识别路径——没有合法覆盖时现有行为
-  完全不受影响。
+- 合法取值：`"max_20x"` / `"max_5x"` / `"pro"`。
+- 取值不区分大小写、自动去除首尾空白。空值或非法值都会被忽略，自动回退到自动识别路径——
+  没有合法覆盖时现有行为完全不受影响。
 
 为什么放在顶层、而不是 `quota_snapshot` 内部：额度轮询刷新（约 45 分钟一轮）会整体替换
 `quota_snapshot` 子对象，写进它内部的值会在下一次刷新被覆盖冲掉；写在顶层则不受影响。
@@ -317,10 +307,10 @@ canonical 写入方——它写到命名空间化的 `account_scheduling` 对象
 | `auth_index` | 可选 | 消歧。 |
 | `tier_override` / `rate_scale` / `first_production_at` | **至少一个存在** | 字段**是否存在**决定意图——不传 = 不改；显式空字符串或 JSON `null` = 清除；给值 = 设置。三者中至少一个必须存在，否则 `400`。 |
 
-per-provider 校验：
+校验：
 
-- `tier_override`：必须是该账号 provider 的合法值（claude：`max_20x` / `max_5x` / `pro`；
-  codex：`codex_pro` / `codex_plus`），否则 `400` 并带 `legal_values` 列表。
+- `tier_override`：必须是 `max_20x` / `max_5x` / `pro` 之一，否则 `400` 并带
+  `legal_values` 列表。
 - `rate_scale`：数字 `> 0`，否则 `400`。
 - `first_production_at`：RFC3339 **且不在未来**，否则 `400`；任何过去日期都接受。
 
@@ -383,7 +373,7 @@ curl -sS -X PATCH https://<host>/v0/management/auth-files/account-scheduling \
 
 养号升档受健康门控、不再纯按账龄：账号是**按账龄 *和* 健康**一起爬养号曲线的。有效养号档 =
 `min(账龄档, 健康允许的档位上限)`；出现风控早期征兆会把上限压下来、并一直压住直到账号恢复。
-仅限 Claude 账号（Codex / xAI / Gemini 不受自适应养号管理，写路径不会给它们记录 cap）。
+仅作用于 Claude 账号，与本特性整体适用范围一致（§1）。
 
 关键不变量：
 

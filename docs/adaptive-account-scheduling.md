@@ -23,6 +23,12 @@ Common operator tasks and where each one lives:
 
 ## 1. Overview
 
+> **Scope: Claude accounts only.** This feature — the scheduling projection, weighted
+> selection, adaptive warm-up, and the management endpoint below — applies only to Claude
+> accounts. Non-Claude accounts (Codex, Gemini, xAI, etc.) are completely unaffected:
+> `GET /v0/management/auth-files` never returns an `account_scheduling` projection object
+> for them.
+
 Adaptive scheduling picks *which* account serves each request by scoring accounts on
 subscription capacity, live quota, and freshness — instead of plain round-robin.
 
@@ -43,11 +49,8 @@ Core formula:
 weight = tier base capacity weight x (1 - quota utilization) x freshness factor
 ```
 
-- **Tier base capacity weight** is configured per provider, separately:
+- **Tier base capacity weight** is configured per Claude subscription tier:
   - Claude has four tiers: `max_20x` / `max_5x` / `pro` / `unknown`.
-  - Codex has three tiers: `pro` / `plus` / `unknown`.
-  - The two weight sets are only ever compared within their own provider, never across
-    (a Claude weight and a Codex weight are not comparable).
 - **Quota headroom** is taken from the account's tightest quota window (the highest
   utilization), not from an arbitrary window or an average.
   - Example: an account whose `five_hour` window is already at 90% is not treated as
@@ -88,7 +91,7 @@ which simply returns immediately on a cache hit and never consults the inner sel
 
 | Sticky target state | Behavior |
 | --- | --- |
-| **Non-Claude/Codex account** (a provider this scheduler does not score) | No tiering; behavior is identical to existing session-affinity. |
+| **Non-Claude account** (a provider this scheduler does not score) | No tiering; behavior is identical to existing session-affinity. |
 | **Mature, soft ceiling not hit** (token bucket still permits it) | Stickiness kept, preserving prompt-cache continuity. |
 | **Mature, soft ceiling already hit** (treated as approaching the hard risk-control threshold) | Stickiness broken; a fresh weighted selection is made across the whole pool. |
 | **Still warming up, a usable mature account exists** | Stickiness broken; routed to a mature account, with rebinding (subsequent rounds follow that mature account). |
@@ -96,7 +99,7 @@ which simply returns immediately on a cache hit and never consults the inner sel
 
 ### Fallback behavior
 
-Providers this scheduler does not recognize (anything other than claude/codex), or any
+Providers this scheduler does not recognize (anything other than claude), or any
 tier explicitly configured with weight `0`, are excluded from weighted candidacy and fall
 back to `Fallback` (default `RoundRobinSelector`) — identical to the behavior when the
 strategy is not enabled, with no impact on the existing request path for those providers.
@@ -126,13 +129,10 @@ Unknown state is always explicit and never silently guessed:
 
 The account's fine-grained subscription tier.
 
-- Claude value domain: `max_20x` / `max_5x` / `pro` / `unknown`.
-- Codex value domain: `pro` / `plus` / `unknown`.
-- When the provider is neither `claude` nor `codex`, this always returns the Claude-side
-  `unknown` label (the two enums are fully independent and never share a value domain).
-- Source: Claude reads `Metadata.quota_snapshot.profile.organization.rate_limit_tier`;
-  Codex reads `Attributes.plan_type`. Both can be manually overridden by the top-level
-  `metadata.tier_override` (§3.1).
+- This field exists for Claude accounts only.
+- Value domain: `max_20x` / `max_5x` / `pro` / `unknown`.
+- Source: `Metadata.quota_snapshot.profile.organization.rate_limit_tier`. Can be manually
+  overridden by the top-level `metadata.tier_override` (§3.1).
 
 ### 2.2 `quota_utilization` (object | null)
 
@@ -152,13 +152,6 @@ as "0% used".
 | `binding_window.window` | string | The bound window's name. |
 | `binding_window.headroom` | number, 0-1 | |
 | `binding_window.resets_at` | string, RFC3339 UTC, optional | |
-
-Codex note: the Codex `quota_snapshot.usage` shape has not yet been confirmed in this
-repository against a real production account capture. Known community reverse-engineering
-suggests it may nest windows under `rate_limit.primary_window` / `secondary_window` and
-express them with `percent_left` rather than a top-level `utilization` field. In that case
-the parser will most likely recognize no window, and `quota_utilization` will correctly
-show as `null` ("unknown") rather than misreading `percent_left` as `utilization`.
 
 ### 2.3 `first_production_at` (string, RFC3339 UTC | null)
 
@@ -235,14 +228,10 @@ How to set it:
 
 - Set it via the endpoint (§3.5), or hand-edit the auth JSON by adding a string field
   `"tier_override"` to the top-level `"metadata"` object.
-- Legal Claude-side values: `"max_20x"` / `"max_5x"` / `"pro"`.
-- Legal Codex-side values: `"codex_pro"` / `"codex_plus"` (the `codex_` prefix
-  distinguishes these from Claude's `"pro"`, so the same key can't carry conflicting
-  meaning across the two providers).
-- The value is case-insensitive and automatically trimmed. An empty value, an illegal
-  value, or a value from the wrong provider (e.g. writing Claude's `"max_20x"` onto a
-  Codex account) is ignored and falls back to the auto-detection path — existing behavior
-  is completely unaffected when no legal override is present.
+- Legal values: `"max_20x"` / `"max_5x"` / `"pro"`.
+- The value is case-insensitive and automatically trimmed. An empty value or an illegal
+  value is ignored and falls back to the auto-detection path — existing behavior is
+  completely unaffected when no legal override is present.
 
 Why it lives at the top level, not inside `quota_snapshot`: quota polling refresh (roughly
 every 45 minutes) replaces the entire `quota_snapshot` sub-object wholesale, so a value
@@ -369,10 +358,10 @@ Request body (`application/json`):
 | `auth_index` | no | disambiguation. |
 | `tier_override` / `rate_scale` / `first_production_at` | **≥ 1 present** | Field **presence** drives intent — absent = leave untouched; explicit empty string or JSON `null` = clear; a value = set. At least one of the three must be present, else `400`. |
 
-Per-provider validation:
+Validation:
 
-- `tier_override`: legal for the account's provider (claude: `max_20x` / `max_5x` / `pro`;
-  codex: `codex_pro` / `codex_plus`), else `400` with a `legal_values` list.
+- `tier_override`: must be one of `max_20x` / `max_5x` / `pro`, else `400` with a
+  `legal_values` list.
 - `rate_scale`: a number `> 0`, else `400`.
 - `first_production_at`: RFC3339 **and not in the future**, else `400`; any past date is
   accepted.
@@ -439,8 +428,8 @@ curl -sS -X PATCH https://<host>/v0/management/auth-files/account-scheduling \
 Warm-up promotion is gated by health, not age alone: an account climbs the curve by
 **age *and* health**. The effective warm-up stage is
 `min(age-based stage, health-allowed stage cap)`; an early risk-control signal clamps the
-cap down and holds it there until the account recovers. Claude accounts only (Codex / xAI /
-Gemini are not under adaptive warm-up, so the write path never records a cap for them).
+cap down and holds it there until the account recovers. This applies to Claude accounts
+only, consistent with this feature's overall scope (§1).
 
 Key invariants:
 
