@@ -401,3 +401,165 @@ func TestBuildAuthFileEntry_AdaptiveScheduling_SessionCounts(t *testing.T) {
 		}
 	})
 }
+
+// TestBuildAuthFileEntry_AdaptiveScheduling_AnchorCandidates covers the additive,
+// read-only anchor_candidates projection: account_scheduling must surface the two
+// candidate timestamps the frontend offers as one-click picks for the
+// first_production_at anchor -- first_auth_at (from
+// account_settings.runtime_identity_state.current.created_at) and last_activity_at
+// (from claude_device_high_water.last_seen_at). It follows the "omit rather than
+// emit a zero/empty time" contract: a field is present only when its source parses
+// as a non-zero RFC3339 timestamp, and the whole object is omitted when both
+// sources are absent. It mints nothing and never touches first_production_at.
+func TestBuildAuthFileEntry_AdaptiveScheduling_AnchorCandidates(t *testing.T) {
+	h := &Handler{cfg: &config.Config{AccountScheduling: config.DefaultAccountSchedulingConfig()}}
+	now := time.Now().UTC()
+
+	t.Run("both sources present surface exact normalized values", func(t *testing.T) {
+		firstAuth := now.Add(-30 * 24 * time.Hour).UTC().Format(time.RFC3339)
+		lastServed := now.Add(-2 * time.Hour).UTC().Format(time.RFC3339)
+		auth := &coreauth.Auth{
+			ID:         "claude-anchor-candidates-1",
+			Provider:   "claude",
+			Status:     coreauth.StatusActive,
+			UpdatedAt:  now,
+			Attributes: map[string]string{"runtime_only": "true"},
+			Metadata: map[string]any{
+				"account_settings": map[string]any{
+					"runtime_identity_state": map[string]any{
+						"current": map[string]any{
+							"created_at": firstAuth,
+						},
+					},
+				},
+				coreauth.ClaudeDeviceHighWaterMetadataKey: map[string]any{
+					"user_agent":   "claude-cli/2.1.211 (external, cli)",
+					"last_seen_at": lastServed,
+				},
+			},
+		}
+
+		entry := h.buildAuthFileEntry(auth)
+		view, ok := entry["account_scheduling"].(gin.H)
+		if !ok {
+			t.Fatalf("entry[\"account_scheduling\"] = %#v, want gin.H", entry["account_scheduling"])
+		}
+		candidates, ok := view["anchor_candidates"].(gin.H)
+		if !ok {
+			t.Fatalf("anchor_candidates = %#v, want gin.H", view["anchor_candidates"])
+		}
+		if got := candidates["first_auth_at"]; got != firstAuth {
+			t.Fatalf("anchor_candidates.first_auth_at = %#v, want %q (runtime_identity_state.current.created_at)", got, firstAuth)
+		}
+		if got := candidates["last_activity_at"]; got != lastServed {
+			t.Fatalf("anchor_candidates.last_activity_at = %#v, want %q (claude_device_high_water.last_seen_at)", got, lastServed)
+		}
+	})
+
+	t.Run("only first_auth_at present omits last_activity_at", func(t *testing.T) {
+		firstAuth := now.Add(-15 * 24 * time.Hour).UTC().Format(time.RFC3339)
+		auth := &coreauth.Auth{
+			ID:         "claude-anchor-candidates-firstonly",
+			Provider:   "claude",
+			Status:     coreauth.StatusActive,
+			UpdatedAt:  now,
+			Attributes: map[string]string{"runtime_only": "true"},
+			Metadata: map[string]any{
+				"account_settings": map[string]any{
+					"runtime_identity_state": map[string]any{
+						"current": map[string]any{
+							"created_at": firstAuth,
+						},
+					},
+				},
+			},
+		}
+
+		entry := h.buildAuthFileEntry(auth)
+		view := entry["account_scheduling"].(gin.H)
+		candidates, ok := view["anchor_candidates"].(gin.H)
+		if !ok {
+			t.Fatalf("anchor_candidates = %#v, want gin.H", view["anchor_candidates"])
+		}
+		if got := candidates["first_auth_at"]; got != firstAuth {
+			t.Fatalf("anchor_candidates.first_auth_at = %#v, want %q", got, firstAuth)
+		}
+		if _, present := candidates["last_activity_at"]; present {
+			t.Fatalf("anchor_candidates.last_activity_at present = %#v, want omitted when high-water is absent", candidates["last_activity_at"])
+		}
+	})
+
+	t.Run("only last_activity_at present omits first_auth_at", func(t *testing.T) {
+		lastServed := now.Add(-90 * time.Minute).UTC().Format(time.RFC3339)
+		auth := &coreauth.Auth{
+			ID:         "claude-anchor-candidates-lastonly",
+			Provider:   "claude",
+			Status:     coreauth.StatusActive,
+			UpdatedAt:  now,
+			Attributes: map[string]string{"runtime_only": "true"},
+			Metadata: map[string]any{
+				coreauth.ClaudeDeviceHighWaterMetadataKey: map[string]any{
+					"user_agent":   "claude-cli/2.1.211 (external, cli)",
+					"last_seen_at": lastServed,
+				},
+			},
+		}
+
+		entry := h.buildAuthFileEntry(auth)
+		view := entry["account_scheduling"].(gin.H)
+		candidates, ok := view["anchor_candidates"].(gin.H)
+		if !ok {
+			t.Fatalf("anchor_candidates = %#v, want gin.H", view["anchor_candidates"])
+		}
+		if got := candidates["last_activity_at"]; got != lastServed {
+			t.Fatalf("anchor_candidates.last_activity_at = %#v, want %q", got, lastServed)
+		}
+		if _, present := candidates["first_auth_at"]; present {
+			t.Fatalf("anchor_candidates.first_auth_at present = %#v, want omitted when runtime identity created_at is absent", candidates["first_auth_at"])
+		}
+	})
+
+	t.Run("no sources omit the whole anchor_candidates object", func(t *testing.T) {
+		auth := &coreauth.Auth{
+			ID:         "claude-anchor-candidates-none",
+			Provider:   "claude",
+			Status:     coreauth.StatusActive,
+			UpdatedAt:  now,
+			Attributes: map[string]string{"runtime_only": "true"},
+			Metadata:   map[string]any{},
+		}
+
+		entry := h.buildAuthFileEntry(auth)
+		view := entry["account_scheduling"].(gin.H)
+		if _, present := view["anchor_candidates"]; present {
+			t.Fatalf("anchor_candidates present = %#v, want omitted when neither source exists", view["anchor_candidates"])
+		}
+	})
+
+	t.Run("codex auth carries no anchor_candidates (claude-only gate)", func(t *testing.T) {
+		// The whole account_scheduling projection (and therefore anchor_candidates)
+		// is claude-only; a codex account, even with a runtime_identity_state and a
+		// device high-water present, must not surface account_scheduling at all.
+		auth := &coreauth.Auth{
+			ID:         "codex-anchor-candidates-1",
+			Provider:   "codex",
+			Status:     coreauth.StatusActive,
+			UpdatedAt:  now,
+			Attributes: map[string]string{"runtime_only": "true", "plan_type": "pro"},
+			Metadata: map[string]any{
+				"account_settings": map[string]any{
+					"runtime_identity_state": map[string]any{
+						"current": map[string]any{
+							"created_at": now.Add(-24 * time.Hour).UTC().Format(time.RFC3339),
+						},
+					},
+				},
+			},
+		}
+
+		entry := h.buildAuthFileEntry(auth)
+		if _, present := entry["account_scheduling"]; present {
+			t.Fatalf("entry[\"account_scheduling\"] present = %#v, want absent for a non-claude account", entry["account_scheduling"])
+		}
+	})
+}
