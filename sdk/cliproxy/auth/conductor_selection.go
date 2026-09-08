@@ -1032,6 +1032,9 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		if modelKey != "" && !m.authSupportsRouteModel(registryRef, candidate, model) {
 			continue
 		}
+		if !m.authAllowsClaudeContextRequest(candidate, model, opts) {
+			continue
+		}
 		candidates = append(candidates, candidate)
 	}
 	if len(candidates) == 0 {
@@ -1200,6 +1203,7 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 		return nil, nil, &Error{Code: "executor_not_found", Message: "executor not registered"}
 	}
 	disallowFreeAuth := disallowFreeAuthFromMetadata(opts.Metadata)
+	tried = m.excludeClaudeContextAuths(model, opts, tried)
 	for {
 		selected, errPick := m.scheduler.pickSingle(ctx, provider, model, opts, tried)
 		if errPick != nil && model != "" && shouldRetrySchedulerPick(errPick) {
@@ -1289,6 +1293,9 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 			continue
 		}
 		if modelKey != "" && !m.authSupportsRouteModel(registryRef, candidate, model) {
+			continue
+		}
+		if !m.authAllowsClaudeContextRequest(candidate, model, opts) {
 			continue
 		}
 		candidates = append(candidates, candidate)
@@ -1388,6 +1395,7 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 	}
 
 	disallowFreeAuth := disallowFreeAuthFromMetadata(opts.Metadata)
+	tried = m.excludeClaudeContextAuths(model, opts, tried)
 	for {
 		selected, providerKey, errPick := m.scheduler.pickMixed(ctx, eligibleProviders, model, opts, tried)
 		if errPick != nil && model != "" && shouldRetrySchedulerPick(errPick) {

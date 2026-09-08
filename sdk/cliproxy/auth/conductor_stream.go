@@ -220,6 +220,9 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		}
 		execOpts := opts
 		execReq, execOpts = applyRequestAfterAuthInterceptor(ctx, executor, provider, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
+		if !authAllowsClaudeContext(auth, execReq.Model, execOpts) {
+			return nil, claudeContextEntitlementError()
+		}
 		if errCtx := ctx.Err(); errCtx != nil {
 			return nil, errCtx
 		}

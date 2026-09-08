@@ -115,7 +115,7 @@ func authCodexSubscriptionPlanType(auth *coreauth.Auth) string {
 }
 
 // claudeUsageCreditsEnabled reports whether the auth has extra/credit usage enabled,
-// which unlocks Opus 1M for Pro; ordinary Opus does not require credits.
+// for reporting/compatibility. It does not opt routing into paid capabilities.
 func claudeUsageCreditsEnabled(auth *coreauth.Auth) bool {
 	return auth.ClaudeUsageCreditsEnabled()
 }

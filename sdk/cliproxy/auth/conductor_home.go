@@ -692,6 +692,10 @@ func (m *Manager) pickHomeDispatchSelection(ctx context.Context, model string, o
 		return nil, errRetained
 	}
 	if retainedOK {
+		if !m.authAllowsClaudeContextRequest(retained.Auth, requestedModel, opts) {
+			retained.End("subscription_ineligible")
+			return nil, claudeContextEntitlementError()
+		}
 		return retained, nil
 	}
 	if sessionID := homeExecutionSessionIDFromMetadata(opts.Metadata); sessionID != "" {
@@ -830,6 +834,10 @@ func (m *Manager) pickHomeDispatchSelection(ctx context.Context, model string, o
 		return nil, errIdentity
 	}
 	logicalProvider := strings.ToLower(strings.TrimSpace(auth.Provider))
+	if !m.authAllowsClaudeContextRequest(&auth, requestedModel, opts) {
+		endScope()
+		return nil, claudeContextEntitlementError()
+	}
 	executorKey := executorKeyFromAuth(&auth)
 	if logicalProvider == "" || executorKey == "" {
 		endScope()
