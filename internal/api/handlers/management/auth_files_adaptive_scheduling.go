@@ -169,5 +169,61 @@ func (h *Handler) buildAccountSchedulingView(auth *coreauth.Auth) gin.H {
 	view["sessions_active"] = sessionsActive
 	view["sessions_closed"] = sessionsClosed
 
+	// anchor_candidates (read-only): source timestamps the frontend can offer as
+	// one-click picks for the first_production_at anchor. Purely additive and
+	// read-only -- it reads only already-persisted data via the existing typed
+	// readers, mints nothing, mutates nothing, and follows the "omit rather than
+	// emit a zero/empty time" contract of the blocks above.
+	//   - first_auth_at:  account_settings.runtime_identity_state.current.created_at,
+	//     the anti-correlation runtime-identity assignment time (when this account
+	//     was first onboarded to this system), read through readAccountSettingsMetadata.
+	//   - last_activity_at: claude_device_high_water.last_seen_at, read through
+	//     coreauth.ClaudeDeviceHighWaterFromMetadata. This is the device version
+	//     high-water's last_seen, which is written only when the CLI version
+	//     high-water is *raised* (not on every serve), so it reflects the most
+	//     recent version activity rather than a per-request serving time. Named
+	//     "last_activity" (not "last_served") on purpose: for an account that has
+	//     only ever run one version this is ~= its first serving time, but for an
+	//     older account that upgraded versions it can skew later than any single
+	//     serve.
+	// Each field is emitted only when its source parses as a non-zero RFC3339
+	// timestamp (re-normalized to RFC3339 UTC to match the other time fields); a
+	// missing/empty/unparseable source omits that field, and if both are absent the
+	// whole anchor_candidates object is omitted (never an empty object).
+	anchorCandidates := gin.H{}
+	var accountCfg *config.Config
+	if h != nil {
+		accountCfg = h.cfg
+	}
+	if stored := readAccountSettingsMetadata(auth, accountCfg); stored.RuntimeIdentityState != nil && stored.RuntimeIdentityState.Current != nil {
+		if ts, ok := parseAnchorCandidateTimestamp(stored.RuntimeIdentityState.Current.CreatedAt); ok {
+			anchorCandidates["first_auth_at"] = ts
+		}
+	}
+	if hw, ok := coreauth.ClaudeDeviceHighWaterFromMetadata(auth.Metadata); ok {
+		if ts, ok := parseAnchorCandidateTimestamp(hw.LastSeenAt); ok {
+			anchorCandidates["last_activity_at"] = ts
+		}
+	}
+	if len(anchorCandidates) > 0 {
+		view["anchor_candidates"] = anchorCandidates
+	}
+
 	return view
+}
+
+// parseAnchorCandidateTimestamp normalizes a persisted RFC3339 timestamp string
+// into an RFC3339 UTC string, returning ok=false for an empty, Go-zero, or
+// unparseable value. Callers omit the field entirely on ok=false, matching the
+// scheduling projection's "omit rather than emit a zero/empty time" contract.
+func parseAnchorCandidateTimestamp(raw string) (string, bool) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", false
+	}
+	parsed, err := time.Parse(time.RFC3339, trimmed)
+	if err != nil || parsed.IsZero() {
+		return "", false
+	}
+	return parsed.UTC().Format(time.RFC3339), true
 }
