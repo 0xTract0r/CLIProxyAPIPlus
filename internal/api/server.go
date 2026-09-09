@@ -336,7 +336,7 @@ func (s *Server) Start() error {
 			NextProtos:   []string{"h2", "http/1.1"},
 		}
 		s.server.TLSConfig = tlsConfig
-		if errHTTP2 := http2.ConfigureServer(s.server, &http2.Server{}); errHTTP2 != nil {
+		if errHTTP2 := http2.ConfigureServer(s.server, newInboundHTTP2Server()); errHTTP2 != nil {
 			log.Warnf("failed to configure HTTP/2: %v", errHTTP2)
 		}
 		listener = tls.NewListener(listener, tlsConfig)
@@ -398,6 +398,30 @@ func (s *Server) Start() error {
 			return fmt.Errorf("failed to start HTTP server: %v", errServe)
 		}
 		return nil
+	}
+}
+
+// newInboundHTTP2Server returns the inbound HTTP/2 server configuration.
+//
+// It explicitly enables idle-connection keepalive: after ReadIdleTimeout of no
+// frames on an otherwise idle connection, the server sends an HTTP/2 PING to
+// probe liveness; if no ACK arrives within PingTimeout the connection is treated
+// as dead and closed (a GOAWAY is emitted). This prevents an inbound idle
+// connection that was silently dropped by an intermediary from surfacing as
+// "error sending request" when a client that keeps a long-lived HTTP/2
+// connection pool (e.g. the codex CLI in interactive mode) later reuses it.
+//
+// These are inbound idle-connection keepalive intervals, not per-request
+// deadlines: they never bound the duration of an in-flight request or stream,
+// they only probe and reap connections that have gone idle.
+//
+// Fork stability customisation guarded by the fork survival audit
+// (scripts/upstream-sync/fork-feature-manifest.tsv). Do NOT revert this back to
+// an empty &http2.Server{} during an upstream sync.
+func newInboundHTTP2Server() *http2.Server {
+	return &http2.Server{
+		ReadIdleTimeout: 15 * time.Second,
+		PingTimeout:     15 * time.Second,
 	}
 }
 

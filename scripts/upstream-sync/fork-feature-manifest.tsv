@@ -277,3 +277,14 @@ fork文件-反关联支撑	farm_liveness_probe.go	file	-	internal/api/handlers/m
 #   serving 版本>容器遥测版本的跨通道不一致(同一 device_id 两个版本=反关联信号);农场观测不喂
 #   入跨账号全局高水位池。上游同步若删掉 farmBound 的 floor-up 绕过分支,下面 pattern 不再命中即红。
 反关联-farm版本对齐	农场号跳过floor-up直出容器candidate版本	pattern	!farmBound && !shouldUpgradeClaudeDeviceProfile\(candidate,	internal/runtime/executor/helps/claude_device_profile.go
+
+# === 入站 HTTP/2 空闲连接保活(inbound-h2-idle-keepalive,fork 稳定性)(2) ===
+# 补硬:入站 HTTP/2 配置抽成 newInboundHTTP2Server() 显式设 ReadIdleTimeout+PingTimeout,
+#   服务端周期性 PING 探活空闲连接、超时判死即关(发 GOAWAY),防止被中间网络静默掐断的
+#   空闲入站连接在客户端(维持长连接池的 codex CLI 交互模式)复用时报 error sending request。
+#   上游同步若把 ConfigureServer 的第二参还原成空 &http2.Server{},保活会静默丢失——仅靠
+#   helper 符号定义存在性发现不了"符号还在但调用点被换回空配置",这里既断言 helper 定义、
+#   也断言接线到 ConfigureServer 的调用点仍在。行为级断言另见
+#   internal/api/server_h2_keepalive_test.go(断言 ReadIdleTimeout/PingTimeout 仍为正)。
+fork稳定性-入站HTTP2保活	newInboundHTTP2Server	symbol	^func newInboundHTTP2Server\(	internal/api/server.go
+fork稳定性-入站HTTP2保活	保活helper接线到ConfigureServer	pattern	http2\.ConfigureServer\(s\.server, newInboundHTTP2Server\(\)\)	internal/api/server.go
