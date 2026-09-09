@@ -344,6 +344,15 @@ func normalizeRoutingStrategy(strategy string) (string, bool) {
 		return "round-robin", true
 	case "fill-first", "fillfirst", "ff":
 		return "fill-first", true
+	case config.RoutingStrategyAdaptive:
+		// fork: accept the adaptive account-scheduling strategy so operators can
+		// hot-switch routing.strategy to "adaptive" via PUT
+		// /v0/management/routing/strategy instead of only via a config edit +
+		// container restart. The selector assembly layer already honors this
+		// exact value (sdk/cliproxy/service_config.go's
+		// internalconfig.RoutingStrategyAdaptive branch); match it precisely and
+		// do not invent aliases.
+		return config.RoutingStrategyAdaptive, true
 	default:
 		return "", false
 	}

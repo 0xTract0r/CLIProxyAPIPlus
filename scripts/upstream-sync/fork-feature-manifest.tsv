@@ -231,6 +231,11 @@ H4-farm自动纳管开关	gate包住applyAuthFarmEnrolledMetadata	pattern	config
 调度层-自适应账号调度	RoutingStrategyAdaptive门控常量	symbol	RoutingStrategyAdaptive[[:space:]]+= "adaptive"	internal/config/config_defaults.go
 调度层-自适应账号调度	自适应选号器装配接线	pattern	coreauth\.NewAdaptiveSelector\(coreauth\.AdaptiveSelectorConfig\{	sdk/cliproxy/service_config.go
 调度层-自适应账号调度	自适应门控接线到strategy分支	pattern	state\.strategy == internalconfig\.RoutingStrategyAdaptive	sdk/cliproxy/service_config.go
+# 管理端 adaptive 热切入口:normalizeRoutingStrategy 接受 RoutingStrategyAdaptive,使
+#   PUT /v0/management/routing/strategy 能把 routing.strategy 热切到 "adaptive"(此前只认
+#   round-robin/fill-first,启用 adaptive 必须改配置 + 重启容器)。上游同步若覆盖 config_basic.go
+#   会静默删掉这个 case,管理 API 又会拒收 adaptive——这里断言该 case 仍在。
+调度层-自适应账号调度	管理端adaptive热切入口normalizeRoutingStrategy	pattern	case config\.RoutingStrategyAdaptive:	internal/api/handlers/management/config_basic.go
 metadata契约键-首投产锚点	FirstProductionAtMetadataKey	symbol	^const FirstProductionAtMetadataKey = "first_production_at"	sdk/cliproxy/auth/account_freshness.go
 metadata契约键-首投产锚点	EnsureAuthFirstProductionAt定义	symbol	^func EnsureAuthFirstProductionAt\(	sdk/cliproxy/auth/account_freshness.go
 metadata契约键-首投产锚点	首投产锚点铸造接线	pattern	EnsureAuthFirstProductionAt\(auth, now\)	sdk/cliproxy/auth/conductor_cooldown.go
