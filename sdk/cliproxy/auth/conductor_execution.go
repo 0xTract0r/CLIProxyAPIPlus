@@ -272,6 +272,14 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		if homeMode {
 			pickOpts = withHomeAuthCount(opts, homeAuthCount)
 		}
+		// ERR-3 failover mature-only preference: once at least one credential has
+		// already been tried (this pick is a failover retry), hint the adaptive
+		// selector to prefer routing the retry to a mature account rather than a
+		// warming (养号) account. The hint falls back to the full pool when no mature
+		// account exists, so an all-warming fleet still serves (never hard-fails).
+		if len(tried) > 0 {
+			pickOpts = withFailoverMatureOnly(pickOpts)
+		}
 		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, pickOpts, tried)
 		if errPick != nil {
 			if shouldReturnLastErrorOnPickFailure(homeMode, lastErr, errPick) {
@@ -430,6 +438,14 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		if homeMode {
 			pickOpts = withHomeAuthCount(opts, homeAuthCount)
 		}
+		// ERR-3 failover mature-only preference: once at least one credential has
+		// already been tried (this pick is a failover retry), hint the adaptive
+		// selector to prefer routing the retry to a mature account rather than a
+		// warming (养号) account. The hint falls back to the full pool when no mature
+		// account exists, so an all-warming fleet still serves (never hard-fails).
+		if len(tried) > 0 {
+			pickOpts = withFailoverMatureOnly(pickOpts)
+		}
 		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, pickOpts, tried)
 		if errPick != nil {
 			if shouldReturnLastErrorOnPickFailure(homeMode, lastErr, errPick) {
@@ -558,6 +574,12 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		pickOpts := opts
 		if homeMode {
 			pickOpts = withHomeAuthCount(opts, homeAuthCount)
+		}
+		// ERR-3 failover mature-only preference: see executeMixedOnce. Only the
+		// non-home path consults the adaptive selector; the home dispatch path
+		// ignores the hint, so setting it on pickOpts either way is harmless.
+		if len(tried) > 0 {
+			pickOpts = withFailoverMatureOnly(pickOpts)
 		}
 
 		var selection *HomeDispatchSelection
@@ -758,6 +780,53 @@ func withHomeAuthCount(opts cliproxyexecutor.Options, count int) cliproxyexecuto
 	meta[homeAuthCountMetadataKey] = count
 	opts.Metadata = meta
 	return opts
+}
+
+// failoverMatureOnlyMetadataKey flags a pick as an ERR-3 failover retry that
+// should prefer a mature account. It is an internal, in-process-only options hint
+// set by the execution loops (withFailoverMatureOnly) on retry rounds and read by
+// the adaptive selector (failoverMatureOnlyFromMetadata); it never crosses a
+// process / executor boundary, so it lives here as a package-private key rather
+// than on the shared executor options-key surface.
+const failoverMatureOnlyMetadataKey = "cliproxy.internal.failover_mature_only"
+
+// withFailoverMatureOnly returns opts carrying the ERR-3 failover mature-only
+// hint. It clones opts.Metadata (mirroring withHomeAuthCount) so the base options
+// threaded into executor.Execute are never mutated -- only the per-pick pickOpts
+// carries the hint, and only on failover retry rounds.
+func withFailoverMatureOnly(opts cliproxyexecutor.Options) cliproxyexecutor.Options {
+	meta := make(map[string]any, len(opts.Metadata)+1)
+	for k, v := range opts.Metadata {
+		meta[k] = v
+	}
+	meta[failoverMatureOnlyMetadataKey] = true
+	opts.Metadata = meta
+	return opts
+}
+
+// failoverMatureOnlyFromMetadata reports whether the ERR-3 failover mature-only
+// hint is set. Absent (the first-attempt default) it returns false, keeping the
+// first-round selection byte-identical to before this change.
+func failoverMatureOnlyFromMetadata(meta map[string]any) bool {
+	if len(meta) == 0 {
+		return false
+	}
+	raw, ok := meta[failoverMatureOnlyMetadataKey]
+	if !ok || raw == nil {
+		return false
+	}
+	switch val := raw.(type) {
+	case bool:
+		return val
+	case string:
+		parsed, err := strconv.ParseBool(strings.TrimSpace(val))
+		return err == nil && parsed
+	case []byte:
+		parsed, err := strconv.ParseBool(strings.TrimSpace(string(val)))
+		return err == nil && parsed
+	default:
+		return false
+	}
 }
 
 func homeAuthCountFromMetadata(meta map[string]any) int {

@@ -282,8 +282,17 @@ func (s *AdaptiveSelector) Pick(ctx context.Context, provider, model string, opt
 		}
 	}
 
-	if picked, ok := s.pickFromCandidates(s.scoreCandidates(available, cfg, now, false), cfg, now); ok {
-		s.logPick(ctx, "weighted-new", provider, model, "", picked, cfg, now)
+	// ERR-3 failover mature-only preference: on a failover retry the execution loop
+	// sets this hint so the retry prefers a mature account over a warming (养号) one;
+	// scoreFailoverCandidates falls back to the full pool when no mature account
+	// exists, so an all-warming fleet still serves.
+	failoverMatureOnly := failoverMatureOnlyFromMetadata(opts.Metadata)
+	if picked, ok := s.pickFromCandidates(s.scoreFailoverCandidates(available, cfg, now, failoverMatureOnly), cfg, now); ok {
+		reason := "weighted-new"
+		if failoverMatureOnly {
+			reason = "weighted-new-failover"
+		}
+		s.logPick(ctx, reason, provider, model, "", picked, cfg, now)
 		return picked, nil
 	}
 	// Hole-2 thin-pool hard gate: if the empty candidate set is caused SOLELY by
@@ -539,7 +548,14 @@ func (s *AdaptiveSelector) boundServableForKeep(a *Auth, cfg internalconfig.Acco
 // "keep the warming binding when no mature target exists" guard), so this helper
 // itself no longer needs a preferMature mode.
 func (s *AdaptiveSelector) selectAndBind(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths, available []*Auth, cfg internalconfig.AccountSchedulingConfig, now time.Time, cacheKey string) (*Auth, string, error) {
-	if picked, ok := s.pickFromCandidates(s.scoreCandidates(available, cfg, now, false), cfg, now); ok {
+	// ERR-3 failover mature-only preference threaded through the sticky reselection
+	// path: on a failover retry the bound account was already tried and is absent
+	// from `available` (so resolveSticky reaches this reselection), and the retry
+	// should prefer a mature account here too. scoreFailoverCandidates falls back to
+	// the full pool when no mature account exists, so a sticky session on an
+	// all-warming fleet still reselects a servable warming account.
+	failoverMatureOnly := failoverMatureOnlyFromMetadata(opts.Metadata)
+	if picked, ok := s.pickFromCandidates(s.scoreFailoverCandidates(available, cfg, now, failoverMatureOnly), cfg, now); ok {
 		s.cache.Set(cacheKey, picked.ID)
 		return picked, "rebind-weighted", nil
 	}
@@ -601,6 +617,27 @@ func (s *AdaptiveSelector) scoreCandidates(available []*Auth, cfg internalconfig
 	}
 	sort.Slice(candidates, func(i, j int) bool { return candidates[i].auth.ID < candidates[j].auth.ID })
 	return candidates
+}
+
+// scoreFailoverCandidates scores the available pool for a fresh (non-sticky-keep)
+// weighted pick, honoring the ERR-3 failover mature-only preference. When
+// matureOnly is set (a failover retry -- the request has already tried and failed
+// at least one credential) it first scores ONLY mature accounts, so retry traffic
+// prefers成熟号 over养号号; and ONLY when that yields no candidate (an all-warming
+// fleet, with no mature account to route to) does it fall back to scoring the full
+// pool, so a pure warming fleet's failover still serves rather than hard-failing
+// (兜底红线). When matureOnly is false it is exactly scoreCandidates(...,false) --
+// the unchanged first-attempt behavior. Because mature accounts always pass the
+// mature filter, this never locally excludes or 429s a mature account (PROD-3b);
+// the empty-mature fallback is the only path that widens the pool, and it widens
+// it to the same set the pre-ERR-3 code always used.
+func (s *AdaptiveSelector) scoreFailoverCandidates(available []*Auth, cfg internalconfig.AccountSchedulingConfig, now time.Time, matureOnly bool) []adaptiveCandidate {
+	if matureOnly {
+		if mature := s.scoreCandidates(available, cfg, now, true); len(mature) > 0 {
+			return mature
+		}
+	}
+	return s.scoreCandidates(available, cfg, now, false)
 }
 
 // pickFromCandidates draws one credential from candidates proportional to

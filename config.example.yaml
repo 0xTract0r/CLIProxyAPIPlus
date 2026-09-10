@@ -171,12 +171,13 @@ passthrough-headers: false
 request-retry: 3
 
 # Maximum number of different credentials a single failed request may try
-# (cross-credential failover cap). 0 -- or any negative value, which the loader
-# clamps to 0 -- keeps the legacy behavior of trying EVERY available credential,
-# which lets one bad request walk the whole fleet and can burn many accounts on a
-# single upstream fault. harden-account-scheduling-limiter recommends a small
-# bounded cap (2 = DefaultMaxRetryCredentials) so a couple of genuine failovers
-# still work without fleet-wide blast radius.
+# (cross-credential failover cap). Left unset, or set explicitly to 0, this
+# defaults to 2 (DefaultMaxRetryCredentials) so a couple of genuine failovers
+# still work without letting one bad request walk the whole fleet and burn many
+# accounts on a single upstream fault (harden-account-scheduling-limiter ERR-2).
+# A positive value below is an explicit cap, used as-is. Set to -1 to opt back
+# into the legacy unbounded behavior of trying EVERY available credential --
+# only use this escape hatch if you understand the blast-radius trade-off.
 max-retry-credentials: 2
 
 # Maximum wait time in seconds for a cooled-down credential before triggering a retry.

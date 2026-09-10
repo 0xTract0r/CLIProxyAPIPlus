@@ -173,9 +173,12 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 		cfg.RedisUsageQueueRetentionSeconds = 3600
 	}
 
-	if cfg.MaxRetryCredentials < 0 {
-		cfg.MaxRetryCredentials = 0
-	}
+	// fork(harden-account-scheduling-limiter ERR-2): do NOT clamp a negative
+	// max-retry-credentials to 0 here. yaml cannot tell "omitted" from an
+	// explicit 0, so 0 now defaults to a bounded cap (DefaultMaxRetryCredentials)
+	// in auth.Manager.SetRetryConfig; a negative value is instead the explicit
+	// "-1 = unbounded try-all" escape hatch and must survive un-clamped to reach
+	// that call. Only SetRetryConfig maps 0/negative to their runtime meaning.
 
 	cfg.NormalizePluginsConfig()
 	if errResolvePluginsDir := cfg.ResolvePluginsDir(); errResolvePluginsDir != nil && cfg.Plugins.Enabled {
