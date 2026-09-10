@@ -1,7 +1,10 @@
 package auth
 
 import (
+	"encoding/json"
 	"net/http"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -67,22 +70,63 @@ type AccountConcurrencyGate struct {
 	// bounded by the set of accounts with active traffic, not by history.
 	inflight map[string]int
 
-	// daily maps authID -> that account's request count for a single UTC day.
-	// A stale-day entry reads as 0 (see dailyCountLocked) and is reset in place
-	// on the next RecordRequest, so the map is bounded by the credential set.
-	daily map[string]*dailyCounter
+	// daily maps authID -> that account's rolling 24-hour REQUEST counter
+	// (harden-account-scheduling-limiter P2). It replaced the earlier single
+	// UTC-calendar-day counter, which both reset the whole day's budget on a
+	// process restart (fail-open) and let an account spend up to a double budget
+	// straddling a UTC midnight. A rolling 24h window keyed off hourly buckets
+	// fixes both (design §2.1 A3). Entries are bounded by the credential set;
+	// stale (>24h) buckets read as 0.
+	daily map[string]*rollingWindow
+
+	// tokens maps authID -> that account's rolling 24-hour BILLABLE-TOKEN counter
+	// (P3 token hygiene). Same rolling-window mechanism as daily, but the unit is
+	// billable tokens rather than requests. It is inert until the token-counting
+	// sink (internal/usage, a separate slice) records into it; until then every
+	// account's token count stays 0 and the token gate never fires.
+	tokens map[string]*rollingWindow
 
 	// now is the injected clock (default time.Now); it exists so tests can drive
-	// the UTC-day rollover deterministically. It must be safe for concurrent use
-	// in production (time.Now is).
+	// the rolling-window hour rollover deterministically. It must be safe for
+	// concurrent use in production (time.Now is).
 	now func() time.Time
 }
 
-// dailyCounter is one account's request count scoped to a single UTC day. day
-// is the UTC day index (Unix seconds / 86400); count is that day's requests.
-type dailyCounter struct {
-	day   int64
+// dailyWindowBucketCount / dailyWindowBucketSeconds define the rolling-window
+// resolution: 24 hourly buckets covering the trailing 24 hours. An hour index is
+// unixSeconds/3600 (the Unix epoch is UTC midnight so hour 0 is stable), and a
+// bucket's ring slot is hourIndex % 24, so each of the last 24 distinct hours
+// maps to its own slot and a bucket tagged with an older hour reads as stale (0).
+const (
+	dailyWindowBucketCount   = 24
+	dailyWindowBucketSeconds = 3600
+)
+
+// rollingWindow is one account's trailing-24h counter as a fixed ring of hourly
+// buckets. Fixed-size (not a growing map) so memory is bounded per account, and
+// the ring naturally prunes: a slot whose tagged hour is older than the current
+// window is treated as empty on both write (reset in place) and read (skipped).
+type rollingWindow struct {
+	buckets [dailyWindowBucketCount]rollingWindowBucket
+}
+
+// rollingWindowBucket is one hour's tally within a rollingWindow. hour is the
+// hour index this slot currently holds (0 = never written / 1970, always stale);
+// count is that hour's tally (requests for the daily window, billable tokens for
+// the token window).
+type rollingWindowBucket struct {
+	hour  int64
 	count int
+}
+
+// DailyWindowBucket is the persistable (JSON-round-trippable) form of one
+// rolling-window bucket, used to survive a process restart (P2 persistence):
+// MarkResult writes the account's current window buckets into its auth.Metadata
+// account_scheduling.daily_budget_window, and the selector/execution path seeds a
+// cold in-memory gate from that persisted value on the first touch after restart.
+type DailyWindowBucket struct {
+	Hour  int64 `json:"h"`
+	Count int   `json:"c"`
 }
 
 // AccountConcurrencyGateOption customizes a gate at construction.
@@ -103,7 +147,8 @@ func WithGateClock(now func() time.Time) AccountConcurrencyGateOption {
 func NewAccountConcurrencyGate(opts ...AccountConcurrencyGateOption) *AccountConcurrencyGate {
 	g := &AccountConcurrencyGate{
 		inflight: make(map[string]int),
-		daily:    make(map[string]*dailyCounter),
+		daily:    make(map[string]*rollingWindow),
+		tokens:   make(map[string]*rollingWindow),
 		now:      time.Now,
 	}
 	for _, opt := range opts {
@@ -174,69 +219,306 @@ func (g *AccountConcurrencyGate) InFlight(authID string) int {
 	return g.inflight[authID]
 }
 
-// currentDay returns the UTC day index (Unix seconds / 86400). Because the Unix
-// epoch is itself UTC midnight and 86400 divides evenly, this lands exactly on
-// UTC calendar-day boundaries, so a request at 23:59:59Z and one at 00:00:00Z
-// fall in different buckets -- the design §5.1 "每天" reset.
-func (g *AccountConcurrencyGate) currentDay() int64 {
-	return g.now().UTC().Unix() / 86400
+// currentHour returns the current hour index (Unix seconds / 3600). Because the
+// Unix epoch is UTC midnight and 3600 divides evenly, this lands exactly on hour
+// boundaries; the rolling window sums the trailing 24 of these, so a request at
+// 23:59:59Z and one at 00:00:00Z stay in the SAME 24h window (the "跨 UTC 午夜双倍"
+// fix) and only drop off once they are a full 24h in the past.
+func (g *AccountConcurrencyGate) currentHour() int64 {
+	return g.now().Unix() / dailyWindowBucketSeconds
 }
 
-// RecordRequest counts one real outbound request for authID against today's
-// (UTC) budget, resetting the account's counter to this day first if its last
-// recorded request was on an earlier day. Call it exactly where a request is
-// actually sent upstream so the count reflects real exposure. A "" authID is a
-// no-op.
+// hourRingIndex maps an hour index onto its rolling-window ring slot, normalized
+// non-negative.
+func hourRingIndex(hour int64) int {
+	idx := hour % dailyWindowBucketCount
+	if idx < 0 {
+		idx += dailyWindowBucketCount
+	}
+	return int(idx)
+}
+
+// recordRollingLocked adds delta to authID's window (requests or tokens) in the
+// current hour's bucket, resetting a stale slot first. Caller holds g.mu.
+func recordRollingLocked(windows map[string]*rollingWindow, authID string, hour int64, delta int) {
+	w := windows[authID]
+	if w == nil {
+		w = &rollingWindow{}
+		windows[authID] = w
+	}
+	b := &w.buckets[hourRingIndex(hour)]
+	if b.hour != hour {
+		b.hour = hour
+		b.count = 0
+	}
+	b.count += delta
+}
+
+// rollingCountLocked sums authID's window over the trailing 24h (buckets whose
+// tagged hour is within (hour-24, hour]). A stale slot (older hour, or the 1970
+// zero value) contributes 0. Caller holds g.mu.
+func rollingCountLocked(windows map[string]*rollingWindow, authID string, hour int64) int {
+	w := windows[authID]
+	if w == nil {
+		return 0
+	}
+	sum := 0
+	for _, b := range w.buckets {
+		if b.count != 0 && b.hour > hour-dailyWindowBucketCount && b.hour <= hour {
+			sum += b.count
+		}
+	}
+	return sum
+}
+
+// seedRollingLocked lazily populates authID's window from a persisted snapshot,
+// but ONLY when the gate has no live entry for authID yet (a cold gate after a
+// process restart). Once a live entry exists the in-memory window is
+// authoritative and the (possibly stale) persisted seed is ignored -- exactly why
+// seeding from a stale auth clone is harmless (design P2: "此刻持久值即真值,克隆
+// 过期无害"). An empty seed never creates an entry. Caller holds g.mu.
+func seedRollingLocked(windows map[string]*rollingWindow, authID string, seed []DailyWindowBucket) {
+	if len(seed) == 0 {
+		return
+	}
+	if _, ok := windows[authID]; ok {
+		return
+	}
+	w := &rollingWindow{}
+	for _, sb := range seed {
+		if sb.Count == 0 {
+			continue
+		}
+		slot := &w.buckets[hourRingIndex(sb.Hour)]
+		// On a ring-slot collision keep the newer (larger) hour.
+		if sb.Hour >= slot.hour {
+			slot.hour = sb.Hour
+			slot.count = sb.Count
+		}
+	}
+	windows[authID] = w
+}
+
+// snapshotRollingLocked returns authID's non-stale, non-empty window buckets for
+// persistence. Caller holds g.mu.
+func snapshotRollingLocked(windows map[string]*rollingWindow, authID string, hour int64) []DailyWindowBucket {
+	w := windows[authID]
+	if w == nil {
+		return nil
+	}
+	out := make([]DailyWindowBucket, 0, dailyWindowBucketCount)
+	for _, b := range w.buckets {
+		if b.count != 0 && b.hour > hour-dailyWindowBucketCount && b.hour <= hour {
+			out = append(out, DailyWindowBucket{Hour: b.hour, Count: b.count})
+		}
+	}
+	return out
+}
+
+// RecordRequest counts one real outbound request for authID against its rolling
+// 24-hour request budget in the current hour bucket. A "" authID is a no-op.
 func (g *AccountConcurrencyGate) RecordRequest(authID string) {
 	if authID == "" {
 		return
 	}
-	day := g.currentDay()
+	hour := g.currentHour()
 	g.mu.Lock()
-	entry := g.daily[authID]
-	if entry == nil || entry.day != day {
-		entry = &dailyCounter{day: day}
-		g.daily[authID] = entry
-	}
-	entry.count++
+	recordRollingLocked(g.daily, authID, hour, 1)
 	g.mu.Unlock()
 }
 
-// DailyCount returns how many requests authID has recorded so far during the
-// current UTC day (0 if none today, including when its only recorded requests
-// were on an earlier day). A "" authID returns 0.
+// RecordRequestWindow records one request for authID and returns the account's
+// updated rolling-window buckets for the caller to persist, lazily seeding a cold
+// gate from `seed` first (restart re-seed). A "" authID is a no-op returning nil.
+func (g *AccountConcurrencyGate) RecordRequestWindow(authID string, seed []DailyWindowBucket) []DailyWindowBucket {
+	if authID == "" {
+		return nil
+	}
+	hour := g.currentHour()
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	seedRollingLocked(g.daily, authID, seed)
+	recordRollingLocked(g.daily, authID, hour, 1)
+	return snapshotRollingLocked(g.daily, authID, hour)
+}
+
+// DailyCount returns how many requests authID has recorded over the trailing 24
+// hours (0 if none). A "" authID returns 0.
 func (g *AccountConcurrencyGate) DailyCount(authID string) int {
 	if authID == "" {
 		return 0
 	}
-	day := g.currentDay()
+	hour := g.currentHour()
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	return g.dailyCountLocked(authID, day)
+	return rollingCountLocked(g.daily, authID, hour)
 }
 
-// dailyCountLocked reads authID's count for the given UTC day, treating a
-// stale-day entry as 0. Caller must hold g.mu.
-func (g *AccountConcurrencyGate) dailyCountLocked(authID string, day int64) int {
-	entry := g.daily[authID]
-	if entry == nil || entry.day != day {
-		return 0
-	}
-	return entry.count
-}
-
-// OverDailyBudget reports whether authID has met or exceeded a positive daily
-// budget for the current UTC day. A non-positive budget means "unbounded"
-// (mature accounts, design §5.1: quota headroom governs, not a fixed daily
-// cap) and always returns false. A "" authID returns false.
+// OverDailyBudget reports whether authID has met or exceeded a positive rolling
+// 24h request budget. A non-positive budget means "unbounded" (mature accounts,
+// design §5.1: quota headroom governs, not a fixed daily cap) and always returns
+// false. A "" authID returns false.
 func (g *AccountConcurrencyGate) OverDailyBudget(authID string, budget int) bool {
 	if authID == "" || budget <= 0 {
 		return false
 	}
-	day := g.currentDay()
+	hour := g.currentHour()
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	return g.dailyCountLocked(authID, day) >= budget
+	return rollingCountLocked(g.daily, authID, hour) >= budget
+}
+
+// OverDailyBudgetWindow is OverDailyBudget with a lazy restart re-seed: it
+// populates a cold gate's window from `seed` (the persisted auth.Metadata value)
+// before evaluating, so an account's already-spent budget survives a process
+// restart instead of resetting to 0 (P2 fail-open fix).
+func (g *AccountConcurrencyGate) OverDailyBudgetWindow(authID string, budget int, seed []DailyWindowBucket) bool {
+	if authID == "" || budget <= 0 {
+		return false
+	}
+	hour := g.currentHour()
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	seedRollingLocked(g.daily, authID, seed)
+	return rollingCountLocked(g.daily, authID, hour) >= budget
+}
+
+// RecordTokens counts billable tokens for authID against its rolling 24h token
+// budget (P3). A "" authID or non-positive tokens is a no-op. This is the write
+// side the (not-yet-wired) internal/usage billable-token sink will call.
+func (g *AccountConcurrencyGate) RecordTokens(authID string, tokens int) {
+	if authID == "" || tokens <= 0 {
+		return
+	}
+	hour := g.currentHour()
+	g.mu.Lock()
+	recordRollingLocked(g.tokens, authID, hour, tokens)
+	g.mu.Unlock()
+}
+
+// RecordTokensWindow records billable tokens for authID and returns the updated
+// token-window buckets for persistence, lazily seeding a cold gate from `seed`.
+func (g *AccountConcurrencyGate) RecordTokensWindow(authID string, tokens int, seed []DailyWindowBucket) []DailyWindowBucket {
+	if authID == "" {
+		return nil
+	}
+	hour := g.currentHour()
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	seedRollingLocked(g.tokens, authID, seed)
+	if tokens > 0 {
+		recordRollingLocked(g.tokens, authID, hour, tokens)
+	}
+	return snapshotRollingLocked(g.tokens, authID, hour)
+}
+
+// TokenCount returns billable tokens recorded for authID over the trailing 24h.
+func (g *AccountConcurrencyGate) TokenCount(authID string) int {
+	if authID == "" {
+		return 0
+	}
+	hour := g.currentHour()
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return rollingCountLocked(g.tokens, authID, hour)
+}
+
+// OverTokenBudget reports whether authID has met or exceeded a positive rolling
+// 24h billable-token budget. Non-positive budget = unbounded (mature accounts) =
+// false. Lazily seeds a cold gate from `seed` (restart re-seed). A "" authID
+// returns false.
+func (g *AccountConcurrencyGate) OverTokenBudget(authID string, budget int, seed []DailyWindowBucket) bool {
+	if authID == "" || budget <= 0 {
+		return false
+	}
+	hour := g.currentHour()
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	seedRollingLocked(g.tokens, authID, seed)
+	return rollingCountLocked(g.tokens, authID, hour) >= budget
+}
+
+// ---------------------------------------------------------------------------
+// Rolling-window persistence (P2/P3): the counters are in-memory truth, but the
+// current window is mirrored into auth.Metadata.account_scheduling so a process
+// restart re-seeds an account's already-spent budget instead of losing it. These
+// helpers translate between the in-memory []DailyWindowBucket and the JSON-safe
+// metadata shape (a list of {h,c} objects, numbers round-tripping as float64).
+// ---------------------------------------------------------------------------
+
+const (
+	// accountSchedulingDailyWindowKey / accountSchedulingTokenWindowKey are the
+	// account_scheduling sub-keys the rolling REQUEST / TOKEN windows persist
+	// under. They sit next to rate_scale / first_production_at in the same
+	// top-level account_scheduling object, so Auth.Clone carries them through a
+	// quota refresh (account_scheduling_metadata.go).
+	accountSchedulingDailyWindowKey = "daily_budget_window"
+	accountSchedulingTokenWindowKey = "token_budget_window"
+)
+
+// dailyWindowToMetadata renders window buckets as the JSON-safe list stored under
+// account_scheduling. A nil/empty window renders as an empty list so a spent
+// window that fully aged out clears the persisted value rather than lingering.
+func dailyWindowToMetadata(buckets []DailyWindowBucket) []any {
+	out := make([]any, 0, len(buckets))
+	for _, b := range buckets {
+		out = append(out, map[string]any{"h": b.Hour, "c": b.Count})
+	}
+	return out
+}
+
+// readDailyWindowBuckets parses the persisted rolling-window list stored under
+// account_scheduling[key], tolerating the numeric shapes a JSON round-trip yields
+// (float64 / json.Number) as well as in-memory int fixtures. Returns nil when
+// absent or malformed.
+func readDailyWindowBuckets(meta map[string]any, key string) []DailyWindowBucket {
+	raw, ok := accountSchedulingRawValue(meta, key)
+	if !ok {
+		return nil
+	}
+	list, ok := raw.([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]DailyWindowBucket, 0, len(list))
+	for _, item := range list {
+		obj, ok := metadataObject(item)
+		if !ok {
+			continue
+		}
+		hour, okHour := metadataInt64(obj["h"])
+		count, okCount := metadataInt64(obj["c"])
+		if !okHour || !okCount {
+			continue
+		}
+		out = append(out, DailyWindowBucket{Hour: hour, Count: int(count)})
+	}
+	return out
+}
+
+// metadataInt64 coerces a metadata numeric value (float64 / json.Number / int /
+// int64 / numeric string) into an int64, mirroring parseRateScaleValue's shape
+// tolerance for persisted-and-reloaded auth.Metadata.
+func metadataInt64(raw any) (int64, bool) {
+	switch v := raw.(type) {
+	case float64:
+		return int64(v), true
+	case float32:
+		return int64(v), true
+	case int:
+		return int64(v), true
+	case int64:
+		return v, true
+	case json.Number:
+		if n, err := v.Int64(); err == nil {
+			return n, true
+		}
+	case string:
+		if n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err == nil {
+			return n, true
+		}
+	}
+	return 0, false
 }
 
 // ---------------------------------------------------------------------------
@@ -268,6 +550,22 @@ func (m *Manager) accountConcurrencyGate() *AccountConcurrencyGate {
 	return nil
 }
 
+// accountConcurrencyGateLocked is accountConcurrencyGate for callers that ALREADY
+// hold m.mu (read or write). It reads m.selector directly instead of going through
+// Selector(), which re-acquires m.mu.RLock() -- calling that while m.mu is held
+// self-deadlocks the non-reentrant RWMutex (e.g. MarkResult holds m.mu.Lock() and
+// then records the warm-up daily budget). Same semantics otherwise: nil when the
+// current selector is not the adaptive one, so the whole mechanism stays inert.
+func (m *Manager) accountConcurrencyGateLocked() *AccountConcurrencyGate {
+	if m == nil {
+		return nil
+	}
+	if provider, ok := m.selector.(accountGateProvider); ok && provider != nil {
+		return provider.AccountGate()
+	}
+	return nil
+}
+
 // accountSchedulingConfig reads the live AccountSchedulingConfig from the
 // runtime config snapshot (the same snapshot the rest of the execution path
 // reads). An unset/zero config yields a zero AccountSchedulingConfig, which
@@ -281,11 +579,16 @@ func (m *Manager) accountSchedulingConfig() internalconfig.AccountSchedulingConf
 }
 
 // accountExecutionSlot is a one-request handle over the gate: it remembers which
-// account's slot was taken so recordRequest and release act on the same authID
-// and the same gate instance, even if the Manager's selector is swapped
-// mid-request (the captured gate pointer, not a fresh lookup, is released). A
-// nil slot (no active gate) makes every method a no-op, so callers need no
-// gate-presence branching.
+// account's slot was taken so release acts on the same authID and the same gate
+// instance, even if the Manager's selector is swapped mid-request (the captured
+// gate pointer, not a fresh lookup, is released). A nil slot (no active gate)
+// makes every method a no-op, so callers need no gate-presence branching.
+//
+// Note (P2): the rolling-24h daily-budget REQUEST count is no longer driven from
+// this slot on the execution path. It moved to MarkResult (the single result
+// sink), so a request is counted "on result" rather than "on send" -- a
+// concurrency-busy failover never reaches MarkResult and so records no phantom
+// count. The slot now carries ONLY the in-flight concurrency reservation.
 type accountExecutionSlot struct {
 	gate     *AccountConcurrencyGate
 	authID   string
@@ -303,10 +606,10 @@ type accountExecutionSlot struct {
 //
 // The caller MUST call slot.release() exactly once when the request's in-flight
 // lifetime ends (via defer on the non-stream path; plumbed into the stream
-// wrapper's completion on the stream path). It should call slot.recordRequest()
-// once at the point a request is actually sent upstream. When within is false
-// the caller may release immediately and fail over (non-stream, nothing sent
-// yet) instead of proceeding over the ceiling.
+// wrapper's completion on the stream path). When within is false the caller may
+// release immediately and fail over (non-stream, nothing sent yet) instead of
+// proceeding over the ceiling. Daily-budget request counting is NOT done here
+// anymore -- it happens in MarkResult (see the slot type doc).
 func (m *Manager) beginAccountExecution(auth *Auth) (*accountExecutionSlot, bool) {
 	gate := m.accountConcurrencyGate()
 	if gate == nil || auth == nil || auth.ID == "" {
@@ -328,15 +631,6 @@ func (m *Manager) beginAccountExecution(auth *Auth) (*accountExecutionSlot, bool
 	limit = scaleLimitInt(limit, AccountRateScale(auth, cfg))
 	within := gate.Acquire(auth.ID, limit)
 	return &accountExecutionSlot{gate: gate, authID: auth.ID}, within
-}
-
-// recordRequest counts this account's request against its UTC-daily budget. Safe
-// on a nil slot.
-func (s *accountExecutionSlot) recordRequest() {
-	if s == nil || s.gate == nil {
-		return
-	}
-	s.gate.RecordRequest(s.authID)
 }
 
 // release drops the in-flight slot exactly once. Safe on a nil slot and safe to

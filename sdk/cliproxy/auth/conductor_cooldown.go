@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"net/http"
 	"sort"
 	"strings"
@@ -137,6 +138,13 @@ func (m *Manager) setConfigSnapshotLocked(cfg *internalconfig.Config) bool {
 	if m.scheduler != nil {
 		m.scheduler.setGlobalProxyConfigured(strings.TrimSpace(cfg.ProxyURL) != "")
 	}
+	// Harden P3: (re-)register this manager's billable-token sink so the usage
+	// pipeline (internal/usage) feeds the SAME adaptive gate the selector reads. The
+	// bound method is stable, so re-registering on every config apply is idempotent;
+	// the method itself is a strict no-op unless an adaptive gate is active and the
+	// account is a warming account with a positive token budget, so this stays inert
+	// under the default (unbounded) token config.
+	RegisterAccountBillableTokenSink(m.recordBillableTokensForAccount)
 	clearedCooldowns := m.clearDisabledCooldownStates(cfg)
 	if clearedCooldowns && oldCooldownStore != nil {
 		m.mu.Lock()
@@ -718,7 +726,18 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		if trackCooldownState {
 			cooldownRecordsBefore = m.cooldownStateRecordsForAuthLocked(auth, now)
 		}
-		auth.recordRecentRequest(now, result.Success)
+		// Harden ERR (error classification, design §2.3 A5): feed the health-gate
+		// failure cluster (the recentRequests failed ring, which
+		// evaluateAccountHealthGateLocked below reads) only for real successes and
+		// account-level deterministic symptoms (plan-quota 429 / 403 / 401 /
+		// invalid_grant). Upstream capacity / transport-transient failures (529 /
+		// 408 / 5xx / connection) are retry-only and must NOT accumulate a cluster
+		// that demotes a warming account for an upstream blip. auth.Failed below
+		// stays a lifetime failure counter, incremented on every failure regardless
+		// of this classification (a management/observability stat, not the cluster).
+		if result.Success || resultFeedsFailureCluster(result) {
+			auth.recordRecentRequest(now, result.Success)
+		}
 		if result.Success {
 			auth.Success++
 			// openspec/changes/add-adaptive-account-scheduling (G1): mint the
@@ -747,6 +766,14 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		} else {
 			auth.Failed++
 		}
+
+		// Harden P2: count this result against a still-warming, adaptive-eligible
+		// account's rolling-24h warm-up REQUEST budget and persist the window into
+		// auth.Metadata so it survives a process restart. Moved here from the
+		// execution path's slot.recordRequest so a concurrency-busy failover -- which
+		// never reaches MarkResult -- records no phantom count (semantics: "count on
+		// result" not "count on send"). A no-op for mature / non-adaptive accounts.
+		m.recordWarmupDailyBudgetLocked(auth, now)
 
 		if result.Success {
 			if result.Model != "" {
@@ -913,6 +940,14 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 								if isPlanQuota {
 									if hasRetryAfter {
 										next = now.Add(*result.RetryAfter)
+									} else if reset, okReset := claudeRealtimeQuotaReset(auth, now); okReset {
+										// Harden P1b: cool precisely by the exhausted window's own
+										// reset (already clamped <= 1h in accountRealtimeRejectedReset)
+										// instead of an escalating fixed ladder, so a Claude account
+										// recovers exactly when its 5h/7d window actually resets. The
+										// backoff ladder is deliberately NOT escalated for a
+										// precisely-timed recovery.
+										next = reset
 									} else {
 										next, backoffLevel = quotaCooldownAfterFailure(state.Quota, now)
 									}
@@ -945,7 +980,12 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 									shouldSuspendModel = true
 								}
 							}
-						case 408, 500, 502, 503, 504:
+						case 408, 500, 502, 503, 504, 529:
+							// Harden ERR: 529 overloaded is an upstream-capacity
+							// signal, handled here as a brief transient cooldown +
+							// retry (never a plan-quota escalation, never a health
+							// cluster feed) instead of the pre-harden default of no
+							// cooldown.
 							if disableCooling {
 								state.NextRetryAfter = time.Time{}
 							} else {
@@ -1025,6 +1065,133 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 
 	m.hook.OnResult(ctx, result)
 	m.publishErrorEvent(result, authSnapshot)
+}
+
+// resultFeedsFailureCluster reports whether a FAILED result is an account-level
+// deterministic symptom that should feed the health-gate failure cluster (the
+// recentRequests failed ring): plan-quota 429 (an explicit usage/plan-quota
+// marker OR an upstream Retry-After hint), 403, 401, or an invalid_grant. Upstream
+// capacity / transport-transient failures (529 / 408 / 5xx, and any transport /
+// connection error with no HTTP status) return false so they are retry-only and
+// never demote a warming account for an upstream blip (harden ERR, design §2.3
+// A5). A Success:false result carrying no *Error defaults to true so a bare
+// provider-reported failure keeps its historical recent-request accounting.
+func resultFeedsFailureCluster(result Result) bool {
+	if result.Success {
+		return true
+	}
+	err := result.Error
+	if err == nil {
+		return true
+	}
+	if isInvalidGrantResultError(err) {
+		return true
+	}
+	switch statusCodeFromResult(err) {
+	case http.StatusUnauthorized, http.StatusForbidden: // 401 / 403 -> account symptom
+		return true
+	case http.StatusTooManyRequests: // 429: only plan-quota is an account symptom
+		hasRetryAfter := result.RetryAfter != nil && *result.RetryAfter > 0
+		return hasRetryAfter || resultIndicatesPlanQuota(err)
+	case 408, 500, 502, 503, 504, 529: // upstream capacity / transient -> retry only
+		return false
+	case 0: // transport / connection error (no HTTP response) -> retry only
+		return false
+	default:
+		return true
+	}
+}
+
+// recordWarmupDailyBudgetLocked counts one result against a still-warming,
+// adaptive-eligible account's rolling-24h warm-up REQUEST budget and persists the
+// updated window into auth.Metadata (harden P2). It runs under m.mu (the lock
+// every Metadata mutator in this package holds); the caller's unconditional
+// m.persist write-throughs the window onto the auth volume so it survives a
+// restart. A strict no-op when no gate is active, the provider is not
+// adaptive-managed (positive tier weight), or the account is mature / has no
+// warm-up daily budget -- so mature and non-Claude/Codex traffic is byte-identical.
+func (m *Manager) recordWarmupDailyBudgetLocked(auth *Auth, now time.Time) {
+	// Must use the *Locked gate lookup: this runs under m.mu (write) from
+	// MarkResult, and accountConcurrencyGate()'s Selector() RLock would deadlock.
+	gate := m.accountConcurrencyGateLocked()
+	if gate == nil || auth == nil || auth.ID == "" {
+		return
+	}
+	cfg := m.accountSchedulingConfig()
+	if auth.AccountTierBaseWeight(cfg.TierWeights) <= 0 {
+		return
+	}
+	status := AccountWarmupStatusFor(auth, now, cfg)
+	if status.Mature || status.DailyBudget <= 0 {
+		return
+	}
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	seed := readDailyWindowBuckets(auth.Metadata, accountSchedulingDailyWindowKey)
+	updated := gate.RecordRequestWindow(auth.ID, seed)
+	setAccountSchedulingValue(auth.Metadata, accountSchedulingDailyWindowKey, dailyWindowToMetadata(updated))
+}
+
+// recordBillableTokensForAccount counts a completed request's non-cache-read
+// billable tokens against a still-warming, adaptive-eligible account's rolling-24h
+// billable-token budget and persists the updated window into auth.Metadata (harden
+// P3 sink -- this is what activates the first batch's inert token gate). Registered
+// as the package billable-token sink (RegisterAccountBillableTokenSink) and driven
+// from internal/usage's per-request record path, which runs on the usage
+// dispatcher goroutine (not under any manager lock), so this method takes m.mu
+// itself. A strict no-op when no adaptive gate is active, the provider is not
+// adaptive-managed, the account is mature, or the account's stage has no positive
+// token budget (0 = unbounded, the default) -- so mature/non-Claude-Codex traffic
+// and the default token config are byte-identical.
+func (m *Manager) recordBillableTokensForAccount(authID string, billableTokens int) {
+	if m == nil || billableTokens <= 0 {
+		return
+	}
+	authID = strings.TrimSpace(authID)
+	if authID == "" {
+		return
+	}
+	now := time.Now()
+	var snapshot *Auth
+	m.mu.Lock()
+	gate := m.accountConcurrencyGateLocked()
+	auth := m.auths[authID]
+	if gate == nil || auth == nil || auth.ID == "" {
+		m.mu.Unlock()
+		return
+	}
+	cfg := m.accountSchedulingConfig()
+	if auth.AccountTierBaseWeight(cfg.TierWeights) <= 0 {
+		m.mu.Unlock()
+		return
+	}
+	status := AccountWarmupStatusFor(auth, now, cfg)
+	if status.Mature {
+		m.mu.Unlock()
+		return
+	}
+	budget := resolveTokenDailyBudget(cfg, status)
+	if budget <= 0 {
+		// Token gate not configured for this stage: stay inert (do not even record,
+		// so the default unbounded token config is byte-identical).
+		m.mu.Unlock()
+		return
+	}
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	seed := readDailyWindowBuckets(auth.Metadata, accountSchedulingTokenWindowKey)
+	updated := gate.RecordTokensWindow(auth.ID, billableTokens, seed)
+	setAccountSchedulingValue(auth.Metadata, accountSchedulingTokenWindowKey, dailyWindowToMetadata(updated))
+	auth.UpdatedAt = now
+	_ = m.persist(context.Background(), auth)
+	snapshot = auth.Clone()
+	m.mu.Unlock()
+
+	if m.scheduler != nil && snapshot != nil {
+		m.scheduler.upsertAuth(snapshot)
+	}
 }
 
 func (m *Manager) recordExecutionResult(ctx context.Context, result Result, auth *Auth, ephemeral bool) {
@@ -1801,7 +1968,7 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 		}
 		auth.Quota.NextRecoverAt = next
 		auth.NextRetryAfter = next
-	case 408, 500, 502, 503, 504:
+	case 408, 500, 502, 503, 504, 529:
 		auth.StatusMessage = "transient upstream error"
 		if disableCooling {
 			auth.NextRetryAfter = time.Time{}
@@ -1844,8 +2011,41 @@ func nextQuotaCooldown(prevLevel int, disableCooling bool) (time.Duration, int) 
 	if cooldown < quotaBackoffBase {
 		cooldown = quotaBackoffBase
 	}
+	// The level/cap decision uses the un-jittered ladder value; only the returned
+	// duration is jittered (harden ERR full jitter), so the escalation ladder stays
+	// deterministic while the wake times spread.
 	if cooldown >= quotaBackoffMax {
-		return quotaBackoffMax, prevLevel
+		return planQuotaCooldownJitter(quotaBackoffMax), prevLevel
 	}
-	return cooldown, prevLevel + 1
+	return planQuotaCooldownJitter(cooldown), prevLevel + 1
+}
+
+// planQuotaCooldownJitter multiplies a plan-quota cooldown by a full-jitter factor
+// in [0.5, 1.0] (harden ERR). A fleet that all 429'd inside the same window would
+// otherwise wake in lockstep and stampede the first credential to recover; the
+// jitter spreads their retries. It uses the package's existing math/rand/v2 source
+// (also used by jitteredCooldownWait), never touches the backoff level -- only the
+// duration -- and returns a non-positive input unchanged.
+func planQuotaCooldownJitter(d time.Duration) time.Duration {
+	if d <= 0 {
+		return d
+	}
+	factor := 0.5 + 0.5*rand.Float64()
+	jittered := time.Duration(float64(d) * factor)
+	if jittered <= 0 {
+		jittered = 1
+	}
+	return jittered
+}
+
+// claudeRealtimeQuotaReset returns the exhausted-window reset a Claude account
+// should cool down to on a plan-quota 429 (harden P1b), or ok=false for a
+// non-Claude account or when no usable real-time reset has been harvested yet (so
+// the caller falls back to the escalating ladder). The reset is already clamped to
+// at most one hour out by accountRealtimeRejectedReset.
+func claudeRealtimeQuotaReset(auth *Auth, now time.Time) (time.Time, bool) {
+	if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), "claude") {
+		return time.Time{}, false
+	}
+	return accountRealtimeRejectedReset(auth.ID, now)
 }

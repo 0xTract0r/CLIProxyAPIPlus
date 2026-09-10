@@ -170,9 +170,15 @@ passthrough-headers: false
 # Number of times to retry a request. Retries will occur if the HTTP response code is 403, 408, 500, 502, 503, or 504.
 request-retry: 3
 
-# Maximum number of different credentials to try for one failed request.
-# Set to 0 to keep legacy behavior (try all available credentials).
-max-retry-credentials: 0
+# Maximum number of different credentials a single failed request may try
+# (cross-credential failover cap). Left unset, or set explicitly to 0, this
+# defaults to 2 (DefaultMaxRetryCredentials) so a couple of genuine failovers
+# still work without letting one bad request walk the whole fleet and burn many
+# accounts on a single upstream fault (harden-account-scheduling-limiter ERR-2).
+# A positive value below is an explicit cap, used as-is. Set to -1 to opt back
+# into the legacy unbounded behavior of trying EVERY available credential --
+# only use this escape hatch if you understand the blast-radius trade-off.
+max-retry-credentials: 2
 
 # Maximum wait time in seconds for a cooled-down credential before triggering a retry.
 max-retry-interval: 30
@@ -250,6 +256,8 @@ routing:
 #   # Age-based (days since an account's first-production anchor) warm-up stages.
 #   # Must be contiguous ([min,max) with no gaps/overlaps) and only the last stage
 #   # may leave max-age-days unset. Supplying this list replaces it wholesale.
+#   # Each stage may also set an optional token-daily-budget (harden P3, shown on
+#   # w1 below); 0 or omitted = unbounded (no token gate) for that stage.
 #   warmup-curve:
 #     - name: "w1"
 #       min-age-days: 0
@@ -257,6 +265,9 @@ routing:
 #       daily-budget: 200
 #       rpm-limit: 3
 #       concurrency-limit: 1
+#       token-daily-budget: 0   # optional (harden P3): rolling-24h billable-token hard gate for
+#                               # this warming stage (excludes cache-read/ITPM, counts cache-write).
+#                               # 0 = unbounded (safe default until real budgets are calibrated).
 #     - name: "w2"
 #       min-age-days: 7
 #       max-age-days: 14
@@ -288,6 +299,9 @@ routing:
 #     rpm-limit: 45
 #     burst: 10
 #     concurrency-limit: 4
+#     token-daily-budget: 0   # harden P3 mature counterpart; deliberately 0 (unbounded) and
+#                             # expected to stay so -- mature accounts are quota-driven and must
+#                             # never be token-gated in day-to-day serving. MUST be >= 0.
 #   # Base capacity weight per subscription tier (relative WITHIN one provider
 #   # only — a Claude weight is never compared against a Codex weight).
 #   tier-weights:
@@ -307,6 +321,15 @@ routing:
 #   # effect; < 1 throttles for low-risk testing, > 1 lifts. A per-account
 #   # override (metadata account_scheduling.rate_scale) takes precedence. Must be > 0.
 #   rate-scale: 1.0
+#   # Anti-streak rotation cap (harden P1a). Max times a still-WARMING account may be
+#   # picked CONSECUTIVELY before the selector rotates to another available account,
+#   # plus an LRU tie-break among exactly-equal-weight candidates. Trims instantaneous
+#   # concentration on one warming account WITHOUT changing the long-term per-tier
+#   # share (it only forces rotation once ANY alternative can serve, and is scoped to
+#   # warming accounts). 0 (default) disables both the streak cap and the LRU tie-break,
+#   # keeping the pre-P1a pure-weighted selection byte-identical; a small single-digit
+#   # value is the intended production setting. MUST be >= 0.
+#   anti-streak-limit: 0
 #   # Health-gated warm-up ramp (ANCHOR-Q4, design.md §10). Warm-up promotion
 #   # depends on account health, not calendar age alone: an account showing an
 #   # early risk-control signal (a recent failure cluster, or an escalated 429

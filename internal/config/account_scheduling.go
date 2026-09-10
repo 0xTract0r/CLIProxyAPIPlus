@@ -76,6 +76,19 @@ type AccountSchedulingConfig struct {
 	// here.
 	RateScale float64 `yaml:"rate-scale,omitempty" json:"rate-scale,omitempty"`
 
+	// AntiStreakLimit is the harden-account-scheduling-limiter P1a knob: the
+	// maximum number of times a still-WARMING account may be selected
+	// consecutively before the selector rotates the pick to another available
+	// account, plus an LRU tie-break among exactly-equal-weight candidates. It
+	// only reduces the INSTANTANEOUS承流 concentration variance; it does NOT
+	// change the long-term per-tier share (e.g. 20:5:1) because it is scoped to
+	// warming accounts and only forces rotation once ANY alternative can serve.
+	// 0 (the default) disables both anti-streak and the LRU tie-break entirely,
+	// leaving the pre-P1a pure-weighted selection behavior byte-identical; a
+	// small single-digit value (design §4 P1a "个位数") is the intended
+	// production setting. MUST be >= 0 (see Validate).
+	AntiStreakLimit int `yaml:"anti-streak-limit,omitempty" json:"anti-streak-limit,omitempty"`
+
 	// HealthGate configures the health-gated warm-up ramp (ANCHOR-Q4, design §10):
 	// warm-up promotion depends on an account's recent health (early risk-control
 	// signals) on top of calendar age. When enabled, an account showing distress
@@ -162,6 +175,15 @@ type AccountWarmupStage struct {
 	// ConcurrencyLimit is the max concurrent in-flight requests this stage
 	// allows for one account.
 	ConcurrencyLimit int `yaml:"concurrency-limit" json:"concurrency-limit"`
+
+	// TokenDailyBudget is the harden-account-scheduling-limiter P3 per-stage
+	// billable-token daily budget (rolling 24h), a token-dimension hygiene hard
+	// gate for warming accounts that fire large-token requests under a compliant
+	// request count (design §4 P3 / spec.md "token 额度卫生"). 0 means unbounded
+	// (no token gate) and is the safe default until real production token
+	// budgets are calibrated AND the billable-token counting sink is wired (that
+	// sink lives in internal/usage and is a separate slice). MUST be >= 0.
+	TokenDailyBudget int `yaml:"token-daily-budget,omitempty" json:"token-daily-budget,omitempty"`
 }
 
 // AccountMatureLimitsConfig defines the per-account safety ceiling applied
@@ -178,6 +200,13 @@ type AccountMatureLimitsConfig struct {
 	// ConcurrencyLimit is the max concurrent in-flight requests for one
 	// mature account.
 	ConcurrencyLimit int `yaml:"concurrency-limit,omitempty" json:"concurrency-limit,omitempty"`
+
+	// TokenDailyBudget is the mature-account counterpart of
+	// AccountWarmupStage.TokenDailyBudget (P3). It is deliberately 0 (unbounded)
+	// by default and expected to stay so: mature accounts are quota-driven and
+	// must never be token-gated in day-to-day serving (design §4 P3 "成熟号无界、
+	// 日常无感"). MUST be >= 0.
+	TokenDailyBudget int `yaml:"token-daily-budget,omitempty" json:"token-daily-budget,omitempty"`
 }
 
 // AccountTierWeightsConfig groups per-provider base capacity weight tables.
@@ -315,8 +344,14 @@ func (c AccountSchedulingConfig) Validate() error {
 	if c.MatureLimits.ConcurrencyLimit <= 0 {
 		return fmt.Errorf("account-scheduling.mature-limits.concurrency-limit must be positive")
 	}
+	if c.MatureLimits.TokenDailyBudget < 0 {
+		return fmt.Errorf("account-scheduling.mature-limits.token-daily-budget must not be negative")
+	}
 	if c.RateScale <= 0 {
 		return fmt.Errorf("account-scheduling.rate-scale must be positive")
+	}
+	if c.AntiStreakLimit < 0 {
+		return fmt.Errorf("account-scheduling.anti-streak-limit must not be negative")
 	}
 	weights := map[string]float64{
 		"tier-weights.claude.max-20x": c.TierWeights.Claude.Max20x,
@@ -390,6 +425,9 @@ func validateAccountWarmupCurve(stages []AccountWarmupStage) error {
 		}
 		if stage.DailyBudget < 0 {
 			return fmt.Errorf("account-scheduling.warmup-curve[%d].daily-budget must not be negative", i)
+		}
+		if stage.TokenDailyBudget < 0 {
+			return fmt.Errorf("account-scheduling.warmup-curve[%d].token-daily-budget must not be negative", i)
 		}
 		if stage.RPMLimit <= 0 {
 			return fmt.Errorf("account-scheduling.warmup-curve[%d].rpm-limit must be positive", i)

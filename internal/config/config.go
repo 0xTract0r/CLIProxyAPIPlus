@@ -4,6 +4,23 @@
 // debug settings, proxy configuration, and API keys.
 package config
 
+// DefaultMaxRetryCredentials is the cross-credential failover cap applied by default for
+// a single failed request (harden-account-scheduling-limiter ERR-2). The legacy behavior
+// of 0 ("keep trying every available credential") lets one bad request walk the entire
+// fleet and can burn many accounts on a single upstream fault; this small bounded cap
+// contains that blast radius while still allowing a couple of genuine failovers.
+//
+// Wiring: because MaxRetryCredentials is a plain int, yaml cannot distinguish "left
+// unset" from an explicit 0, so both land in config as 0. Rather than changing the
+// upstream Config field to *int, this default is applied at the fork's runtime-wiring
+// edge -- auth.Manager.SetRetryConfig (sdk/cliproxy/auth/conductor_lifecycle.go) --
+// which maps a 0 it receives to this constant. A negative value (e.g. -1) is the
+// explicit escape hatch that restores the legacy unbounded try-all behavior; see the
+// SetRetryConfig doc comment and the matching fork notes in
+// internal/config/parse.go / internal/config/config_load.go (which must NOT clamp
+// negative values to 0, or the escape hatch never reaches SetRetryConfig).
+const DefaultMaxRetryCredentials = 2
+
 // Config represents the application's configuration, loaded from a YAML file.
 type Config struct {
 	SDKConfig `yaml:",inline"`
@@ -100,7 +117,13 @@ type Config struct {
 	// RequestRetry defines the retry times when the request failed.
 	RequestRetry int `yaml:"request-retry" json:"request-retry"`
 	// MaxRetryCredentials defines the maximum number of credentials to try for a failed request.
-	// Set to 0 or a negative value to keep trying all available credentials (legacy behavior).
+	// 0 (including left unset -- an omitted int and an explicit 0 are indistinguishable in
+	// yaml) now defaults to DefaultMaxRetryCredentials (2) at the auth.Manager.SetRetryConfig
+	// runtime-wiring edge, bounding the account-burn blast radius of a single upstream fault.
+	// A negative value (e.g. -1) is the explicit escape hatch that restores the legacy
+	// unbounded "try every available credential" failover; it is preserved as-is through
+	// config load (parse.go / config_load.go do not clamp it to 0) and mapped to unbounded
+	// only at SetRetryConfig. A positive value is used as an explicit cap, as-is.
 	MaxRetryCredentials int `yaml:"max-retry-credentials" json:"max-retry-credentials"`
 	// MaxRetryInterval defines the maximum wait time in seconds before retrying a cooled-down credential.
 	MaxRetryInterval int `yaml:"max-retry-interval" json:"max-retry-interval"`

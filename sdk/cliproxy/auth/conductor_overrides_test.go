@@ -320,7 +320,12 @@ func (e *retryAfterStatusError) RetryAfter() *time.Duration {
 	return &d
 }
 
-func newCredentialRetryLimitTestManager(t *testing.T, maxRetryCredentials int) (*Manager, *credentialRetryLimitExecutor) {
+// authCount credentials are registered so that an explicit cap, the unset/0 default
+// (DefaultMaxRetryCredentials), and the explicit negative unbounded escape hatch each
+// produce a distinct call count in TestManager_MaxRetryCredentials_LimitsCrossCredentialRetries
+// -- with only 2 credentials, the default cap and true unbounded would coincidentally
+// both walk every credential and the test could not tell them apart.
+func newCredentialRetryLimitTestManager(t *testing.T, maxRetryCredentials int, authCount int) (*Manager, *credentialRetryLimitExecutor) {
 	t.Helper()
 
 	m := NewManager(nil, nil, nil)
@@ -330,23 +335,24 @@ func newCredentialRetryLimitTestManager(t *testing.T, maxRetryCredentials int) (
 	m.RegisterExecutor(executor)
 
 	baseID := uuid.NewString()
-	auth1 := &Auth{ProxyURL: "http://test-proxy:8080", ID: baseID + "-auth-1", Provider: "claude"}
-	auth2 := &Auth{ProxyURL: "http://test-proxy:8080", ID: baseID + "-auth-2", Provider: "claude"}
-
 	// Auth selection requires that the global model registry knows each credential supports the model.
 	reg := registry.GetGlobalRegistry()
-	reg.RegisterClient(auth1.ID, "claude", []*registry.ModelInfo{{ID: "test-model"}})
-	reg.RegisterClient(auth2.ID, "claude", []*registry.ModelInfo{{ID: "test-model"}})
+	auths := make([]*Auth, 0, authCount)
+	for i := 0; i < authCount; i++ {
+		auth := &Auth{ProxyURL: "http://test-proxy:8080", ID: fmt.Sprintf("%s-auth-%d", baseID, i+1), Provider: "claude"}
+		auths = append(auths, auth)
+		reg.RegisterClient(auth.ID, "claude", []*registry.ModelInfo{{ID: "test-model"}})
+	}
 	t.Cleanup(func() {
-		reg.UnregisterClient(auth1.ID)
-		reg.UnregisterClient(auth2.ID)
+		for _, auth := range auths {
+			reg.UnregisterClient(auth.ID)
+		}
 	})
 
-	if _, errRegister := m.Register(context.Background(), auth1); errRegister != nil {
-		t.Fatalf("register auth1: %v", errRegister)
-	}
-	if _, errRegister := m.Register(context.Background(), auth2); errRegister != nil {
-		t.Fatalf("register auth2: %v", errRegister)
+	for _, auth := range auths {
+		if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+			t.Fatalf("register auth %s: %v", auth.ID, errRegister)
+		}
 	}
 
 	return m, executor
@@ -381,10 +387,14 @@ func TestManager_MaxRetryCredentials_LimitsCrossCredentialRetries(t *testing.T) 
 		},
 	}
 
+	// fork(harden-account-scheduling-limiter ERR-2): 3 credentials so the explicit cap,
+	// the unset/0 default cap, and the explicit unbounded escape hatch are distinguishable.
+	const authCount = 3
+
 	for _, tc := range testCases {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
-			limitedManager, limitedExecutor := newCredentialRetryLimitTestManager(t, 1)
+			limitedManager, limitedExecutor := newCredentialRetryLimitTestManager(t, 1, authCount)
 			if errInvoke := tc.invoke(limitedManager); errInvoke == nil {
 				t.Fatalf("expected error for limited retry execution")
 			}
@@ -392,12 +402,25 @@ func TestManager_MaxRetryCredentials_LimitsCrossCredentialRetries(t *testing.T) 
 				t.Fatalf("expected 1 call with max-retry-credentials=1, got %d", calls)
 			}
 
-			unlimitedManager, unlimitedExecutor := newCredentialRetryLimitTestManager(t, 0)
+			// max-retry-credentials=0 is indistinguishable from "left unset" in yaml and
+			// now defaults to DefaultMaxRetryCredentials (2), not the legacy unbounded
+			// try-all -- see auth.Manager.SetRetryConfig.
+			defaultManager, defaultExecutor := newCredentialRetryLimitTestManager(t, 0, authCount)
+			if errInvoke := tc.invoke(defaultManager); errInvoke == nil {
+				t.Fatalf("expected error for default-cap retry execution")
+			}
+			if calls := defaultExecutor.Calls(); calls != 2 {
+				t.Fatalf("expected 2 calls with max-retry-credentials unset/0 (defaults to DefaultMaxRetryCredentials=2), got %d", calls)
+			}
+
+			// A negative value is the explicit escape hatch that restores the legacy
+			// unbounded try-all failover (walks every available credential).
+			unlimitedManager, unlimitedExecutor := newCredentialRetryLimitTestManager(t, -1, authCount)
 			if errInvoke := tc.invoke(unlimitedManager); errInvoke == nil {
 				t.Fatalf("expected error for unlimited retry execution")
 			}
-			if calls := unlimitedExecutor.Calls(); calls != 2 {
-				t.Fatalf("expected 2 calls with max-retry-credentials=0, got %d", calls)
+			if calls := unlimitedExecutor.Calls(); calls != authCount {
+				t.Fatalf("expected %d calls with max-retry-credentials=-1 (explicit unbounded escape hatch), got %d", authCount, calls)
 			}
 		})
 	}

@@ -5,6 +5,8 @@ import (
 	"math/rand"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
@@ -112,6 +114,19 @@ type AdaptiveSelector struct {
 	// production, MUST be safe for concurrent use (rand.Float64 is).
 	now func() time.Time
 	rng func() float64
+
+	// pickMu guards the harden-account-scheduling-limiter P1a anti-streak state
+	// below. It is ONLY touched when a Pick's config carries AntiStreakLimit > 0
+	// (the feature is off by default), so the default pure-weighted path takes no
+	// extra lock and its concurrency profile is unchanged.
+	pickMu sync.Mutex
+	// lastWarmPickID / warmPickStreak track the most recently picked WARMING
+	// account and how many times in a row it has been selected, so the anti-streak
+	// rule can rotate off it once the streak hits AntiStreakLimit. A mature /
+	// non-adaptive pick clears the streak (it only counts consecutive warming
+	// picks). Guarded by pickMu.
+	lastWarmPickID string
+	warmPickStreak int
 }
 
 // defaultAdaptiveReclaimInterval is how often an owned rate limiter's idle
@@ -267,8 +282,17 @@ func (s *AdaptiveSelector) Pick(ctx context.Context, provider, model string, opt
 		}
 	}
 
-	if picked, ok := s.pickFromCandidates(s.scoreCandidates(available, cfg, now, false), cfg, now); ok {
-		s.logPick(ctx, "weighted-new", provider, model, "", picked, cfg, now)
+	// ERR-3 failover mature-only preference: on a failover retry the execution loop
+	// sets this hint so the retry prefers a mature account over a warming (养号) one;
+	// scoreFailoverCandidates falls back to the full pool when no mature account
+	// exists, so an all-warming fleet still serves.
+	failoverMatureOnly := failoverMatureOnlyFromMetadata(opts.Metadata)
+	if picked, ok := s.pickFromCandidates(s.scoreFailoverCandidates(available, cfg, now, failoverMatureOnly), cfg, now); ok {
+		reason := "weighted-new"
+		if failoverMatureOnly {
+			reason = "weighted-new-failover"
+		}
+		s.logPick(ctx, reason, provider, model, "", picked, cfg, now)
 		return picked, nil
 	}
 	// Hole-2 thin-pool hard gate: if the empty candidate set is caused SOLELY by
@@ -279,6 +303,20 @@ func (s *AdaptiveSelector) Pick(ctx context.Context, provider, model string, opt
 	if gateErr := s.dailyBudgetHardGate(available, cfg, now); gateErr != nil {
 		selectorLogEntry(ctx).Warnf(
 			"adaptive-select: daily-budget-hardgate | every serving account is warming and over its daily budget, denying (retryable) provider=%s model=%s",
+			provider, model,
+		)
+		return nil, gateErr
+	}
+	// Harden P0(b) concurrency hard gate: if the ONLY servable accounts are warming
+	// accounts already at their in-flight concurrency ceiling, deny (retryable)
+	// instead of degrading to the round-robin fallback -- which ignores the
+	// concurrency gate entirely and would re-admit a concurrency-full warming
+	// account (the same thin-pool bypass the daily-budget hard gate closes). Scoped
+	// so a mature / under-headroom / non-adaptive alternative always routes
+	// normally (a mature account in the pool guarantees this returns nil, PROD-3b).
+	if gateErr := s.concurrencyHardGate(available, cfg, now); gateErr != nil {
+		selectorLogEntry(ctx).Warnf(
+			"adaptive-select: concurrency-hardgate | every serving account is warming and at its concurrency ceiling, denying (retryable) provider=%s model=%s",
 			provider, model,
 		)
 		return nil, gateErr
@@ -488,7 +526,7 @@ func (s *AdaptiveSelector) resolveSticky(ctx context.Context, provider, model st
 // availability / quarantine / cooldown: `bound` was found in the already-filtered
 // `available` slice, so its presence there is that check.
 func (s *AdaptiveSelector) boundServableForKeep(a *Auth, cfg internalconfig.AccountSchedulingConfig, now time.Time) bool {
-	if s.overDailyBudget(a, cfg, now) {
+	if s.overWarmupBudget(a, cfg, now) {
 		return false
 	}
 	if !s.hasConcurrencyHeadroom(a, cfg, now) {
@@ -510,7 +548,14 @@ func (s *AdaptiveSelector) boundServableForKeep(a *Auth, cfg internalconfig.Acco
 // "keep the warming binding when no mature target exists" guard), so this helper
 // itself no longer needs a preferMature mode.
 func (s *AdaptiveSelector) selectAndBind(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths, available []*Auth, cfg internalconfig.AccountSchedulingConfig, now time.Time, cacheKey string) (*Auth, string, error) {
-	if picked, ok := s.pickFromCandidates(s.scoreCandidates(available, cfg, now, false), cfg, now); ok {
+	// ERR-3 failover mature-only preference threaded through the sticky reselection
+	// path: on a failover retry the bound account was already tried and is absent
+	// from `available` (so resolveSticky reaches this reselection), and the retry
+	// should prefer a mature account here too. scoreFailoverCandidates falls back to
+	// the full pool when no mature account exists, so a sticky session on an
+	// all-warming fleet still reselects a servable warming account.
+	failoverMatureOnly := failoverMatureOnlyFromMetadata(opts.Metadata)
+	if picked, ok := s.pickFromCandidates(s.scoreFailoverCandidates(available, cfg, now, failoverMatureOnly), cfg, now); ok {
 		s.cache.Set(cacheKey, picked.ID)
 		return picked, "rebind-weighted", nil
 	}
@@ -521,6 +566,13 @@ func (s *AdaptiveSelector) selectAndBind(ctx context.Context, provider, model st
 	// back) can re-resolve. Only fires when NO non-over-budget account exists.
 	if gateErr := s.dailyBudgetHardGate(available, cfg, now); gateErr != nil {
 		return nil, "rebind-daily-budget-denied", gateErr
+	}
+	// Same harden P0(b) concurrency hard gate the non-sticky Pick path applies: a
+	// sticky session must not use the fallback to bypass the concurrency gate onto
+	// an all-concurrency-full warming pool either. Only fires when NO compliant
+	// server exists.
+	if gateErr := s.concurrencyHardGate(available, cfg, now); gateErr != nil {
+		return nil, "rebind-concurrency-denied", gateErr
 	}
 	picked, errPick := s.fallback.Pick(ctx, provider, model, opts, auths)
 	if errPick == nil && picked != nil {
@@ -553,12 +605,12 @@ func (s *AdaptiveSelector) scoreCandidates(available []*Auth, cfg internalconfig
 		if weight <= 0 {
 			continue
 		}
-		if s.overDailyBudget(candidate, cfg, now) {
-			// Warming account has spent its UTC-daily budget (design §5.1's
-			// primary warm-up throttle). Drop it from this pick so traffic
-			// routes to accounts with budget left -- mature accounts have no
-			// daily cap and so承接 the overflow (design D4). A new UTC day
-			// resets the counter and re-admits the account.
+		if s.overWarmupBudget(candidate, cfg, now) {
+			// Warming account has spent its rolling-24h request budget (P2, design
+			// §5.1's primary warm-up throttle) OR its billable-token budget (P3).
+			// Drop it from this pick so traffic routes to accounts with budget
+			// left -- mature accounts have no daily cap and so承接 the overflow
+			// (design D4). The budget frees again as the rolling window advances.
 			continue
 		}
 		candidates = append(candidates, adaptiveCandidate{auth: candidate, weight: weight})
@@ -567,24 +619,47 @@ func (s *AdaptiveSelector) scoreCandidates(available []*Auth, cfg internalconfig
 	return candidates
 }
 
+// scoreFailoverCandidates scores the available pool for a fresh (non-sticky-keep)
+// weighted pick, honoring the ERR-3 failover mature-only preference. When
+// matureOnly is set (a failover retry -- the request has already tried and failed
+// at least one credential) it first scores ONLY mature accounts, so retry traffic
+// prefers成熟号 over养号号; and ONLY when that yields no candidate (an all-warming
+// fleet, with no mature account to route to) does it fall back to scoring the full
+// pool, so a pure warming fleet's failover still serves rather than hard-failing
+// (兜底红线). When matureOnly is false it is exactly scoreCandidates(...,false) --
+// the unchanged first-attempt behavior. Because mature accounts always pass the
+// mature filter, this never locally excludes or 429s a mature account (PROD-3b);
+// the empty-mature fallback is the only path that widens the pool, and it widens
+// it to the same set the pre-ERR-3 code always used.
+func (s *AdaptiveSelector) scoreFailoverCandidates(available []*Auth, cfg internalconfig.AccountSchedulingConfig, now time.Time, matureOnly bool) []adaptiveCandidate {
+	if matureOnly {
+		if mature := s.scoreCandidates(available, cfg, now, true); len(mature) > 0 {
+			return mature
+		}
+	}
+	return s.scoreCandidates(available, cfg, now, false)
+}
+
 // pickFromCandidates draws one credential from candidates proportional to
 // weight, gating each draw on the account's own token bucket: a rate-limited
 // draw is dropped (no token consumed -- AccountRateLimiter.Allow only consumes
 // on success) and the draw repeats over the remaining pool. On the servable path
 // it consumes exactly one token, always for the returned account.
 //
-// It returns ok=false ONLY when candidates is empty (a non-adaptive provider, or
-// a pool whose every account scores zero weight / is over its daily budget),
-// leaving the caller to degrade to the round-robin fallback. When the pool is
-// non-empty but every candidate is momentarily over its own token bucket, it does
-// NOT deny: the token bucket is an outbound smoother, never a hard gate, so it
-// draws one final candidate proportional to weight over the ORIGINAL set and
-// returns it (ok=true). No token is consumed on that overflow draw -- every
-// bucket is empty, there is none to take -- and, critically, the draw stays
-// WEIGHTED (reusing weightedIndex) so a rate-limit overflow keeps routing
-// proportionally to tier capacity instead of collapsing onto the uniform
-// round-robin fallback (which would flatten a Max 20x account into an equal share
-// with a Pro account).
+// It returns ok=false when candidates is empty (a non-adaptive provider, or a
+// pool whose every account scores zero weight / is over its warm-up budget) OR
+// (harden P0(a)) when the overflow pool is empty because every non-mature
+// candidate is at its concurrency ceiling, leaving the caller to run the
+// concurrency / daily hard gates or degrade to the round-robin fallback. When the
+// pool is non-empty and at least one candidate can still absorb overflow (a mature
+// account, or a warming account with a free in-flight slot), it does NOT deny: the
+// token bucket is an outbound smoother, never a hard gate, so it draws one final
+// candidate proportional to weight over that overflow pool and returns it
+// (ok=true). No token is consumed on that overflow draw -- every bucket is empty,
+// there is none to take -- and, critically, the draw stays WEIGHTED (reusing
+// weightedIndex) so a rate-limit overflow keeps routing proportionally to tier
+// capacity instead of collapsing onto the uniform round-robin fallback (which
+// would flatten a Max 20x account into an equal share with a Pro account).
 func (s *AdaptiveSelector) pickFromCandidates(candidates []adaptiveCandidate, cfg internalconfig.AccountSchedulingConfig, now time.Time) (*Auth, bool) {
 	if len(candidates) == 0 {
 		return nil, false
@@ -594,6 +669,15 @@ func (s *AdaptiveSelector) pickFromCandidates(candidates []adaptiveCandidate, cf
 	for len(pool) > 0 {
 		idx := s.weightedIndex(pool)
 		candidate := pool[idx]
+		if s.antiStreakShouldSkip(candidate.auth, cfg, now, len(pool)) {
+			// Harden P1a anti-streak: this warming account has been selected
+			// AntiStreakLimit times in a row and an alternative exists -- rotate
+			// off it WITHOUT consuming a rate-limit token, cutting the
+			// instantaneous concentration. Long-term per-tier share is unchanged
+			// (rotation only after the streak cap, only with an alternative).
+			pool = append(pool[:idx], pool[idx+1:]...)
+			continue
+		}
 		if !s.hasConcurrencyHeadroom(candidate.auth, cfg, now) {
 			// Account already at its in-flight concurrency ceiling. Drop it
 			// WITHOUT consuming a rate-limit token (the concurrency check comes
@@ -605,16 +689,34 @@ func (s *AdaptiveSelector) pickFromCandidates(candidates []adaptiveCandidate, cf
 		}
 		rpm, burst := s.rateLimitParams(candidate.auth, cfg, now)
 		if s.limiter.Allow(candidate.auth.ID, rpm, burst) {
+			s.notePick(candidate.auth, cfg, now)
 			return candidate.auth, true
 		}
 		pool = append(pool[:idx], pool[idx+1:]...)
 	}
 	// Overflow: the pool is non-empty but every weighted candidate is momentarily
 	// over its own token bucket (or at its advisory concurrency ceiling). Serve a
-	// weighted draw over the original candidate set rather than deny or flatten to
-	// a uniform fallback -- see the doc comment. No token is taken (every bucket is
-	// already empty).
-	return candidates[s.weightedIndex(candidates)].auth, true
+	// weighted draw, but ONLY over accounts that may still absorb overflow: mature
+	// accounts (which keep their overflow tolerance so a mature account is never
+	// handed a locally-manufactured 429, PROD-3b) plus warming accounts that still
+	// have a free in-flight slot. A warming account already AT its concurrency
+	// ceiling is excluded here so the per-account concurrency gate is真受约束 for
+	// warming main traffic (harden P0(a)) instead of the pre-harden behavior of
+	// re-admitting it over the original set. An empty overflow pool returns
+	// ok=false so the caller runs the concurrency / daily hard gates (or the
+	// fallback) rather than force a stream onto an over-ceiling warming account.
+	overflow := make([]adaptiveCandidate, 0, len(candidates))
+	for _, c := range candidates {
+		if s.isMature(c.auth, cfg, now) || s.hasConcurrencyHeadroom(c.auth, cfg, now) {
+			overflow = append(overflow, c)
+		}
+	}
+	if len(overflow) == 0 {
+		return nil, false
+	}
+	picked := overflow[s.weightedIndex(overflow)].auth
+	s.notePick(picked, cfg, now)
+	return picked, true
 }
 
 // weightedIndex returns an index into pool chosen proportional to each entry's
@@ -660,6 +762,18 @@ func (s *AdaptiveSelector) rateLimitParams(a *Auth, cfg internalconfig.AccountSc
 	scale := AccountRateScale(a, cfg)
 	rpm = scaleLimitRPM(rpm, scale)
 	burst = scaleLimitInt(burst, scale)
+	// Harden P3 quota-aware pacing: softly slow a still-WARMING account's rpm when
+	// it is out-pacing its fair share to reset (or when its quota burn sample is
+	// stale -- fail safe to the floor). Applied AFTER the stage/scale derivation so
+	// it composes on the ceiling the account already sits at, and ONLY to rpm (never
+	// burst). Mature accounts are deliberately untouched (无感): status.Mature short-
+	// circuits before the multiplier is even read, so the mature max_20x:5x:pro
+	// smoothing profile is byte-identical to before.
+	if rpm > 0 && !status.Mature {
+		if pace := s.pacingRPMMultiplier(a, now); pace < 1 {
+			rpm *= pace
+		}
+	}
 	if burst < 1 {
 		burst = 1
 	}
@@ -734,12 +848,13 @@ func (s *AdaptiveSelector) dailyBudgetHardGate(available []*Auth, cfg internalco
 		if a == nil {
 			continue
 		}
-		if s.overDailyBudget(a, cfg, now) {
+		if s.overWarmupBudget(a, cfg, now) {
 			hasOverBudget = true
 			continue
 		}
-		// A servable account that is NOT over its daily budget exists; the fallback
-		// can serve it, so never deny.
+		// A servable account that is NOT over its warm-up budget exists; the
+		// fallback can serve it, so never deny (a concurrency-full-but-under-budget
+		// account still defers to concurrencyHardGate downstream).
 		return nil
 	}
 	if !hasOverBudget {
@@ -764,7 +879,248 @@ func (s *AdaptiveSelector) overDailyBudget(a *Auth, cfg internalconfig.AccountSc
 	// so a fractional rate_scale tightens the budget too, matching the rpm /
 	// concurrency scaling. scaleLimitInt floors a positive budget at 1.
 	budget := scaleLimitInt(status.DailyBudget, AccountRateScale(a, cfg))
-	return s.gate.OverDailyBudget(a.ID, budget)
+	// Harden P2: pass the persisted rolling-window buckets from the (possibly
+	// stale) auth clone so a cold gate re-seeds this account's already-spent budget
+	// after a process restart instead of resetting it to 0 (fail-open fix). The
+	// seed is honored only when the gate has no live entry yet; the in-memory count
+	// is authoritative thereafter, so a stale clone is harmless.
+	seed := readDailyWindowBuckets(a.Metadata, accountSchedulingDailyWindowKey)
+	return s.gate.OverDailyBudgetWindow(a.ID, budget, seed)
+}
+
+// overTokenBudget reports whether a is a warming account that has met or exceeded
+// its configured billable-token daily budget over the rolling 24h window (harden
+// P3). Mature accounts (unbounded) and any account/stage with no configured token
+// budget return false. It is INERT until the billable-token counting sink
+// (internal/usage, a separate slice) records tokens into the gate: until then
+// every account's token count is 0, so this always returns false and adds no
+// behavior on its own -- the mechanism and config knob land now, the sink later.
+func (s *AdaptiveSelector) overTokenBudget(a *Auth, cfg internalconfig.AccountSchedulingConfig, now time.Time) bool {
+	if s.gate == nil || a == nil {
+		return false
+	}
+	if AccountWarmupStatusFor(a, now, cfg).Mature {
+		return false
+	}
+	budget := s.tokenDailyBudgetFor(a, cfg, now)
+	if budget <= 0 {
+		return false
+	}
+	budget = scaleLimitInt(budget, AccountRateScale(a, cfg))
+	seed := readDailyWindowBuckets(a.Metadata, accountSchedulingTokenWindowKey)
+	return s.gate.OverTokenBudget(a.ID, budget, seed)
+}
+
+// tokenDailyBudgetFor resolves the billable-token daily budget for a at its
+// current warm-up stage (harden P3). AccountWarmupStatus does not itself carry the
+// token budget (adding it would touch the account_warmup.go stage-resolution
+// slice, out of this change's file scope), so this re-derives it from the same
+// resolved StageName: the matching warmup-curve stage, curve[0] for the
+// not-yet-anchored "cold" state, or MatureLimits when mature. 0 = unbounded.
+func (s *AdaptiveSelector) tokenDailyBudgetFor(a *Auth, cfg internalconfig.AccountSchedulingConfig, now time.Time) int {
+	return resolveTokenDailyBudget(cfg, AccountWarmupStatusFor(a, now, cfg))
+}
+
+// resolveTokenDailyBudget resolves the billable-token daily budget for a resolved
+// warm-up status against cfg (harden P3). It is the shared free-function form of
+// tokenDailyBudgetFor so the Manager's token sink (recordBillableTokensForAccount)
+// resolves the SAME budget the selector's overTokenBudget gate reads, without
+// duplicating the stage-lookup logic. 0 = unbounded.
+func resolveTokenDailyBudget(cfg internalconfig.AccountSchedulingConfig, status AccountWarmupStatus) int {
+	if status.Mature {
+		return cfg.MatureLimits.TokenDailyBudget
+	}
+	for _, stage := range cfg.WarmupCurve {
+		if stage.Name == status.StageName {
+			return stage.TokenDailyBudget
+		}
+	}
+	// "cold" (no anchor yet) resolves to the first (most restrictive) stage's
+	// limits -- mirror that here for its token budget too.
+	if len(cfg.WarmupCurve) > 0 {
+		return cfg.WarmupCurve[0].TokenDailyBudget
+	}
+	return 0
+}
+
+// -----------------------------------------------------------------------------
+// P3 billable-token sink registration (harden-account-scheduling-limiter).
+//
+// The billable-token gate/bucket landed inert in the first batch (no sink fed it,
+// so every token count stayed 0). This is the sink hook: internal/usage (which
+// imports this package) calls RecordAccountBillableTokens per completed request,
+// and it routes to the Manager method registered here via a package var. Keeping
+// the reference as a package var -- rather than an internal/usage -> Manager import
+// -- avoids an import cycle (internal/usage already imports this package) and keeps
+// the mechanism inert until a Manager registers.
+// -----------------------------------------------------------------------------
+
+// accountBillableTokenSink holds the active Manager's bound token-recording method.
+var accountBillableTokenSink atomic.Pointer[func(authID string, billableTokens int)]
+
+// RegisterAccountBillableTokenSink installs (or, with nil, clears) the billable-
+// token sink. The Manager registers its own bound method on config apply.
+func RegisterAccountBillableTokenSink(fn func(authID string, billableTokens int)) {
+	if fn == nil {
+		accountBillableTokenSink.Store(nil)
+		return
+	}
+	accountBillableTokenSink.Store(&fn)
+}
+
+// RecordAccountBillableTokens routes a completed request's non-cache-read billable
+// token count to the registered sink (harden P3). Called from internal/usage's
+// per-request record path. A non-positive count or an unregistered sink is a no-op,
+// so with no adaptive Manager / no token budget configured this changes nothing.
+func RecordAccountBillableTokens(authID string, billableTokens int) {
+	if billableTokens <= 0 {
+		return
+	}
+	if fn := accountBillableTokenSink.Load(); fn != nil {
+		(*fn)(authID, billableTokens)
+	}
+}
+
+// pacingSnapshotStaleAfter is how old the last quota burn sample may be before the
+// pacing multiplier fails safe to the floor for a warming account. Package var so a
+// future config-wiring slice can tune it without an API change.
+var pacingSnapshotStaleAfter = 15 * time.Minute
+
+// pacingRPMMultiplier returns the quota-aware pacing multiplier for a WARMING
+// account (harden P3). The caller MUST only apply it to warming accounts (mature
+// accounts stay无感). It is 1 (no slowdown) unless the account has a fresh burn
+// signal showing it is out-pacing its fair share to reset, in which case it is that
+// dry-run pacing factor; a burn sample older than pacingSnapshotStaleAfter fails
+// safe to the pacing floor (stale quota headroom cannot be trusted, so slow the
+// account we are protecting). An account with NO burn history yet (a brand-new /
+// never-quota-polled account, or a provider whose quota this subsystem does not
+// poll) is NOT throttled -- multiplier 1 -- so warm-up is never frozen for lack of
+// data.
+func (s *AdaptiveSelector) pacingRPMMultiplier(a *Auth, now time.Time) float64 {
+	st := ReadAccountBurnState(a)
+	if st.HasPrev && now.Sub(st.PrevAt) > pacingSnapshotStaleAfter {
+		return PacingFactorFloor
+	}
+	obs := AccountPacingObservabilityFor(a, now)
+	if !obs.HasPacingFactor {
+		return 1
+	}
+	return obs.PacingFactorDryRun
+}
+
+// overWarmupBudget is the combined warm-up budget predicate: a warming account is
+// "over budget" -- and so is dropped from selection and can trip the thin-pool
+// hard gate -- if it has spent EITHER its rolling-24h request budget (P2) OR its
+// rolling-24h billable-token budget (P3). Mature accounts are never over budget.
+// Because the token window is inert until its sink is wired, this is byte-for-byte
+// equivalent to overDailyBudget until then.
+func (s *AdaptiveSelector) overWarmupBudget(a *Auth, cfg internalconfig.AccountSchedulingConfig, now time.Time) bool {
+	return s.overDailyBudget(a, cfg, now) || s.overTokenBudget(a, cfg, now)
+}
+
+// canServeCompliantly reports whether a can serve a request right now without
+// violating a warm-up budget or a warming account's concurrency ceiling. It is
+// the "any servable alternative exists" probe the thin-pool hard gates use to stay
+// strictly scoped (find one servable account and short-circuit to nil, "宁漏拦不
+// 误拦"):
+//   - a non-adaptive account is never gated (design D7) -> always servable;
+//   - a mature account keeps overflow tolerance (never locally 429'd) -> servable;
+//   - a warming account is servable only while under budget AND with a free slot.
+func (s *AdaptiveSelector) canServeCompliantly(a *Auth, cfg internalconfig.AccountSchedulingConfig, now time.Time) bool {
+	if a == nil {
+		return false
+	}
+	if !s.adaptiveEligible(a, cfg) {
+		return true
+	}
+	if s.isMature(a, cfg, now) {
+		return true
+	}
+	if s.overWarmupBudget(a, cfg, now) {
+		return false
+	}
+	return s.hasConcurrencyHeadroom(a, cfg, now)
+}
+
+// concurrencyHardGate returns errAccountConcurrencyBusy (a retryable 429) when the
+// ONLY reason no adaptive candidate can be served is that every servable account
+// is a still-warming account already at its in-flight concurrency ceiling (harden
+// P0(b)). Like dailyBudgetHardGate it is called only on the empty-candidate path
+// and denies precisely the requests the round-robin fallback would otherwise
+// mis-serve onto a concurrency-full warming account (the fallback ignores the
+// concurrency gate entirely).
+//
+// It NEVER denies while any compliant server exists (a mature account, an
+// under-budget warming account with a free slot, or any non-adaptive account), so
+// a mature account in the pool guarantees nil (PROD-3b: a mature account is never
+// the cause of a local 429). It returns nil unless it both finds no compliant
+// server AND observes at least one concurrency-full warming account, so an
+// all-over-budget pool (dailyBudgetHardGate's concern) or a genuinely empty pool
+// falls through unchanged. Mirrors dailyBudgetHardGate's short-circuit ordering:
+// the first compliant server returns nil immediately.
+func (s *AdaptiveSelector) concurrencyHardGate(available []*Auth, cfg internalconfig.AccountSchedulingConfig, now time.Time) error {
+	concurrencyFullWarming := false
+	for _, a := range available {
+		if a == nil {
+			continue
+		}
+		if s.canServeCompliantly(a, cfg, now) {
+			return nil
+		}
+		if s.adaptiveEligible(a, cfg) && !s.isMature(a, cfg, now) &&
+			!s.overWarmupBudget(a, cfg, now) && !s.hasConcurrencyHeadroom(a, cfg, now) {
+			concurrencyFullWarming = true
+		}
+	}
+	if concurrencyFullWarming {
+		return errAccountConcurrencyBusy("")
+	}
+	return nil
+}
+
+// antiStreakShouldSkip reports whether the harden P1a anti-streak rule should skip
+// picking a on this draw: only when enabled (cfg.AntiStreakLimit > 0), an
+// alternative exists in the pool (poolSize > 1), a is a still-WARMING account
+// (mature accounts' long-term share is left untouched), and a has already been
+// picked AntiStreakLimit times in a row. Skipping forces the draw to rotate to
+// another available account, cutting the instantaneous承流 concentration without
+// changing the long-term per-tier share (rotation only fires after the streak cap
+// and only when an alternative exists).
+func (s *AdaptiveSelector) antiStreakShouldSkip(a *Auth, cfg internalconfig.AccountSchedulingConfig, now time.Time, poolSize int) bool {
+	if cfg.AntiStreakLimit <= 0 || poolSize <= 1 || a == nil {
+		return false
+	}
+	if !s.adaptiveEligible(a, cfg) || s.isMature(a, cfg, now) {
+		return false
+	}
+	s.pickMu.Lock()
+	defer s.pickMu.Unlock()
+	return a.ID == s.lastWarmPickID && s.warmPickStreak >= cfg.AntiStreakLimit
+}
+
+// notePick records the resolved pick for the anti-streak rule (a no-op unless
+// enabled). A repeated warming account advances the streak; a different warming
+// account starts a new streak; a mature / non-adaptive pick clears it (the streak
+// only tracks CONSECUTIVE warming picks). Called exactly once per resolved
+// weighted/overflow pick.
+func (s *AdaptiveSelector) notePick(a *Auth, cfg internalconfig.AccountSchedulingConfig, now time.Time) {
+	if cfg.AntiStreakLimit <= 0 || a == nil {
+		return
+	}
+	warming := s.adaptiveEligible(a, cfg) && !s.isMature(a, cfg, now)
+	s.pickMu.Lock()
+	defer s.pickMu.Unlock()
+	if !warming {
+		s.lastWarmPickID = ""
+		s.warmPickStreak = 0
+		return
+	}
+	if a.ID == s.lastWarmPickID {
+		s.warmPickStreak++
+	} else {
+		s.lastWarmPickID = a.ID
+		s.warmPickStreak = 1
+	}
 }
 
 // hasConcurrencyHeadroom reports whether a still has a free in-flight slot under

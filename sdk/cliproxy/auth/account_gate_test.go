@@ -167,33 +167,46 @@ func TestAccountDailyBudgetUnbounded(t *testing.T) {
 	}
 }
 
-// TestAccountDailyBudgetUTCDayReset verifies the daily counter resets on a UTC
-// day boundary: a request just before midnight and one just after fall in
-// different day buckets, and yesterday's count reads as 0 today.
-func TestAccountDailyBudgetUTCDayReset(t *testing.T) {
+// TestAccountDailyBudgetRollingWindow verifies the harden P2 rolling-24h window
+// replacing the old UTC-calendar-day counter: requests do NOT reset at UTC
+// midnight (the "跨 UTC 午夜双倍" fix -- crossing midnight no longer re-grants a
+// full budget) and only age out once they are a full 24h in the past.
+func TestAccountDailyBudgetRollingWindow(t *testing.T) {
 	now := time.Date(2026, 9, 1, 23, 59, 30, 0, time.UTC)
 	g := NewAccountConcurrencyGate(WithGateClock(func() time.Time { return now }))
 
 	g.RecordRequest("a")
 	g.RecordRequest("a")
 	if got := g.DailyCount("a"); got != 2 {
-		t.Fatalf("DailyCount day1 = %d, want 2", got)
+		t.Fatalf("DailyCount = %d, want 2", got)
 	}
 	if !g.OverDailyBudget("a", 2) {
-		t.Fatalf("OverDailyBudget(2) day1 = false, want true")
+		t.Fatalf("OverDailyBudget(2) = false, want true")
 	}
 
-	// Advance past UTC midnight into the next day.
-	now = time.Date(2026, 9, 2, 0, 0, 30, 0, time.UTC)
+	// Cross UTC midnight by ~31 minutes: the two requests are still within the
+	// trailing 24h, so the rolling window must NOT reset -- an account cannot spend
+	// a fresh full budget just by straddling midnight.
+	now = time.Date(2026, 9, 2, 0, 30, 0, 0, time.UTC)
+	if got := g.DailyCount("a"); got != 2 {
+		t.Fatalf("DailyCount after UTC midnight = %d, want 2 (rolling 24h, no calendar-day reset)", got)
+	}
+	if !g.OverDailyBudget("a", 2) {
+		t.Fatalf("OverDailyBudget(2) after midnight = false, want true (still 2 within 24h)")
+	}
+
+	// Advance past the full 24h window: the old requests age out, the window reads
+	// 0 again, and the account is re-admitted.
+	now = time.Date(2026, 9, 3, 0, 0, 30, 0, time.UTC)
 	if got := g.DailyCount("a"); got != 0 {
-		t.Fatalf("DailyCount day2 (pre-record) = %d, want 0 (reset on new UTC day)", got)
+		t.Fatalf("DailyCount 24h+ later = %d, want 0 (aged out of rolling window)", got)
 	}
 	if g.OverDailyBudget("a", 2) {
-		t.Fatalf("OverDailyBudget(2) day2 = true, want false (budget reset)")
+		t.Fatalf("OverDailyBudget(2) 24h+ later = true, want false (window aged out)")
 	}
 	g.RecordRequest("a")
 	if got := g.DailyCount("a"); got != 1 {
-		t.Fatalf("DailyCount day2 (post-record) = %d, want 1", got)
+		t.Fatalf("DailyCount after re-record = %d, want 1", got)
 	}
 }
 

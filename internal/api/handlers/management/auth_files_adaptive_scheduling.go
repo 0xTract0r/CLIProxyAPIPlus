@@ -94,6 +94,36 @@ func (h *Handler) buildAccountSchedulingView(auth *coreauth.Auth) gin.H {
 		view["quota_utilization"] = nil
 	}
 
+	// Burn-rate / pacing observability (harden-account-scheduling-limiter design
+	// §4.0 OBS layer). This projection itself is read-only and additive, derived
+	// from the persisted EWMA burn state (written at each quota refresh, see
+	// coreauth.UpdateAccountBurnObservability) plus the live binding-window
+	// headroom/reset. NOTE: the value surfaced here as pacing_factor_dryrun is NO
+	// LONGER dry-run -- as of batch-2 the same factor IS multiplied into the rpm
+	// ceiling of WARMING accounts by the adaptive selector (mature accounts are
+	// exempt). The wire key "pacing_factor_dryrun" is kept unchanged because the
+	// frontend depends on it, so the name is misleading; see the field doc on
+	// coreauth.AccountPacingObservability.PacingFactorDryRun for the authoritative
+	// explanation. Follows the sibling "unknown is null" contract -- fewer than two
+	// same-window samples (no burn history), or a binding window without a
+	// resets_at, surface null rather than 0.
+	pacing := coreauth.AccountPacingObservabilityFor(auth, now)
+	if pacing.HasBurnRate {
+		view["burn_rate_per_hour"] = pacing.BurnRatePerHour
+	} else {
+		view["burn_rate_per_hour"] = nil
+	}
+	if pacing.HasProjection {
+		view["projected_exhaustion_at"] = pacing.ProjectedExhaustionAt.UTC().Format(time.RFC3339)
+	} else {
+		view["projected_exhaustion_at"] = nil
+	}
+	if pacing.HasPacingFactor {
+		view["pacing_factor_dryrun"] = pacing.PacingFactorDryRun
+	} else {
+		view["pacing_factor_dryrun"] = nil
+	}
+
 	// first_production_at freshness anchor. Read-only reader (never mints): an
 	// un-anchored account outputs explicit null per the slice brief.
 	if anchor, ok := coreauth.AuthFirstProductionAt(auth); ok {

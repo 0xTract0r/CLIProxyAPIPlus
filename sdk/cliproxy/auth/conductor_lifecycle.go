@@ -10,6 +10,17 @@ import (
 )
 
 // SetRetryConfig updates retry attempts, credential retry limit and cooldown wait interval.
+//
+// fork(harden-account-scheduling-limiter ERR-2): maxRetryCredentials default wiring.
+// yaml cannot distinguish an omitted max-retry-credentials from an explicit 0, so both
+// land here as 0 and now default to internalconfig.DefaultMaxRetryCredentials (2) --
+// bounding the cross-credential failover blast radius of one failed request instead of
+// the legacy "walk every available credential" behavior. A negative value (e.g. -1) is
+// the explicit escape hatch for that legacy unbounded behavior: it is stored as 0, which
+// conductor_execution.go's `maxRetryCredentials > 0` cap check already treats as
+// unbounded. A positive value is used as-is. Negative values must reach this call
+// un-clamped -- see the matching fork notes in internal/config/parse.go and
+// internal/config/config_load.go.
 func (m *Manager) SetRetryConfig(retry int, maxRetryInterval time.Duration, maxRetryCredentials int) {
 	if m == nil {
 		return
@@ -17,7 +28,10 @@ func (m *Manager) SetRetryConfig(retry int, maxRetryInterval time.Duration, maxR
 	if retry < 0 {
 		retry = 0
 	}
-	if maxRetryCredentials < 0 {
+	switch {
+	case maxRetryCredentials == 0:
+		maxRetryCredentials = internalconfig.DefaultMaxRetryCredentials
+	case maxRetryCredentials < 0:
 		maxRetryCredentials = 0
 	}
 	if maxRetryInterval < 0 {

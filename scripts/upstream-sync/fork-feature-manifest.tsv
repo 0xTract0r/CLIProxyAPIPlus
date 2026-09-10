@@ -282,3 +282,38 @@ fork文件-反关联支撑	farm_liveness_probe.go	file	-	internal/api/handlers/m
 #   serving 版本>容器遥测版本的跨通道不一致(同一 device_id 两个版本=反关联信号);农场观测不喂
 #   入跨账号全局高水位池。上游同步若删掉 farmBound 的 floor-up 绕过分支,下面 pattern 不再命中即红。
 反关联-farm版本对齐	农场号跳过floor-up直出容器candidate版本	pattern	!farmBound && !shouldUpgradeClaudeDeviceProfile\(candidate,	internal/runtime/executor/helps/claude_device_profile.go
+
+# === 二期加固: 账号调度限流器加固(harden-account-scheduling-limiter)fork 新增守护(18) ===
+# 补硬:限流器加固在自适应调度基础上新增四类纯 core 后端硬门/观测/token 维度接线(无 serving/
+#   出站指纹改动),均属【调度策略/账号新鲜度/账号卫生】,非指纹反关联,category 标"调度层"。
+#   ① P0b 并发硬门 concurrencyHardGate/canServeCompliantly:薄池(仅剩 warming 号且已达并发上限)
+#      时拒绝(可重试 429 errAccountConcurrencyBusy),不降级到 round-robin fallback 重放满并发号;
+#      成熟/有余量/非自适应号在池里即返回 nil 正常路由。接线在 adaptive_selector Pick 路径。
+#      日预算硬门 dailyBudgetHardGate/errAccountDailyBudgetExhausted 是同型薄池闸的姊妹。
+#   ② burn 观测(OBS)写挂载点 UpdateAccountBurnObservability(配额刷新时采样,喂 dry-run 配速/
+#      提前耗尽观测)+ AccountPacingObservabilityFor(读投影,供配速与管理面视图)。
+#   ③ P1b 上游实时限额头解析 IngestServingRateHeaders(每请求经 usage sink 消费上游
+#      anthropic-ratelimit-unified-* / X-Codex-* 头,喂实时余量覆盖层)。
+#   ④ P3 token 维度卫生:每请求 billable-token(排除 cache-read)经 usage sink 计入 warming 号
+#      滚动 24h token 窗口(RecordAccountBillableTokens -> 包级 sink -> recordBillableTokensForAccount
+#      -> RecordTokensWindow),OverTokenBudget 判超预算;成熟/非自适应/0 预算严格 no-op。
+#   上游同步若覆盖这些文件会静默丢掉硬门/观测/token 接线——仅靠符号存在性发现不了整条接线被拆,
+#   这里断言符号定义 + 装配/挂载接线点仍在。均 anchor 到生产文件(第 5 列),不误命中 *_test.go。
+调度层-限流器加固	concurrencyHardGate并发硬门定义	symbol	^func \(s \*AdaptiveSelector\) concurrencyHardGate\(	sdk/cliproxy/auth/adaptive_selector.go
+调度层-限流器加固	canServeCompliantly合规可服务谓词	symbol	^func \(s \*AdaptiveSelector\) canServeCompliantly\(	sdk/cliproxy/auth/adaptive_selector.go
+调度层-限流器加固	并发硬门接线到Pick路径	pattern	s\.concurrencyHardGate\(available, cfg, now\)	sdk/cliproxy/auth/adaptive_selector.go
+调度层-限流器加固	errAccountConcurrencyBusy可重试429	symbol	^func errAccountConcurrencyBusy\(	sdk/cliproxy/auth/account_gate.go
+调度层-限流器加固	dailyBudgetHardGate日预算硬门定义	symbol	^func \(s \*AdaptiveSelector\) dailyBudgetHardGate\(	sdk/cliproxy/auth/adaptive_selector.go
+调度层-限流器加固	errAccountDailyBudgetExhausted可重试429	symbol	^func errAccountDailyBudgetExhausted\(	sdk/cliproxy/auth/account_gate.go
+调度层-限流器加固	UpdateAccountBurnObservability_burn观测采样	symbol	^func UpdateAccountBurnObservability\(	sdk/cliproxy/auth/account_quota.go
+调度层-限流器加固	burn观测采样接线到配额刷新	pattern	coreauth\.UpdateAccountBurnObservability\(auth, updated, now\)	internal/api/handlers/management/quota_snapshots.go
+调度层-限流器加固	AccountPacingObservabilityFor配速观测读	symbol	^func AccountPacingObservabilityFor\(	sdk/cliproxy/auth/account_quota.go
+调度层-限流器加固	IngestServingRateHeaders上游实时限额头解析	symbol	^func IngestServingRateHeaders\(	sdk/cliproxy/auth/account_quota.go
+调度层-限流器加固	P1b实时限额头接线到usage-sink	pattern	coreauth\.IngestServingRateHeaders\(	internal/usage/logger_plugin.go
+调度层-限流器加固	RecordAccountBillableTokens_token计入入口	symbol	^func RecordAccountBillableTokens\(	sdk/cliproxy/auth/adaptive_selector.go
+调度层-限流器加固	RegisterAccountBillableTokenSink_token_sink注册	symbol	^func RegisterAccountBillableTokenSink\(	sdk/cliproxy/auth/adaptive_selector.go
+调度层-限流器加固	recordBillableTokensForAccount_token写窗口	symbol	^func \(m \*Manager\) recordBillableTokensForAccount\(	sdk/cliproxy/auth/conductor_cooldown.go
+调度层-限流器加固	P3_token_sink注册接线	pattern	RegisterAccountBillableTokenSink\(m\.recordBillableTokensForAccount\)	sdk/cliproxy/auth/conductor_cooldown.go
+调度层-限流器加固	P3_token计入接线到usage-sink	pattern	coreauth\.RecordAccountBillableTokens\(	internal/usage/logger_plugin.go
+调度层-限流器加固	OverTokenBudget超预算判定	symbol	^func \(g \*AccountConcurrencyGate\) OverTokenBudget\(	sdk/cliproxy/auth/account_gate.go
+调度层-限流器加固	RecordTokensWindow滚动窗口记账	symbol	^func \(g \*AccountConcurrencyGate\) RecordTokensWindow\(	sdk/cliproxy/auth/account_gate.go
