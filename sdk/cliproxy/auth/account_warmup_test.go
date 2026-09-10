@@ -18,13 +18,13 @@ func TestAccountWarmupStageForAge_DefaultCurveBoundaries(t *testing.T) {
 	mature := internalconfig.DefaultAccountMatureLimits()
 
 	tests := []struct {
-		name             string
-		ageDays          int
-		wantStage        string
-		wantDailyBudget  int
-		wantRPMLimit     int
-		wantConcurrency  int
-		wantMature       bool
+		name            string
+		ageDays         int
+		wantStage       string
+		wantDailyBudget int
+		wantRPMLimit    int
+		wantConcurrency int
+		wantMature      bool
 	}{
 		{"day 0 -> w1 start", 0, "w1", 200, 3, 1, false},
 		{"day 6 -> still w1", 6, "w1", 200, 3, 1, false},

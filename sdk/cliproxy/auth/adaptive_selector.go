@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
@@ -724,6 +725,18 @@ func (s *AdaptiveSelector) rateLimitParams(a *Auth, cfg internalconfig.AccountSc
 	scale := AccountRateScale(a, cfg)
 	rpm = scaleLimitRPM(rpm, scale)
 	burst = scaleLimitInt(burst, scale)
+	// Harden P3 quota-aware pacing: softly slow a still-WARMING account's rpm when
+	// it is out-pacing its fair share to reset (or when its quota burn sample is
+	// stale -- fail safe to the floor). Applied AFTER the stage/scale derivation so
+	// it composes on the ceiling the account already sits at, and ONLY to rpm (never
+	// burst). Mature accounts are deliberately untouched (无感): status.Mature short-
+	// circuits before the multiplier is even read, so the mature max_20x:5x:pro
+	// smoothing profile is byte-identical to before.
+	if rpm > 0 && !status.Mature {
+		if pace := s.pacingRPMMultiplier(a, now); pace < 1 {
+			rpm *= pace
+		}
+	}
 	if burst < 1 {
 		burst = 1
 	}
@@ -868,7 +881,15 @@ func (s *AdaptiveSelector) overTokenBudget(a *Auth, cfg internalconfig.AccountSc
 // resolved StageName: the matching warmup-curve stage, curve[0] for the
 // not-yet-anchored "cold" state, or MatureLimits when mature. 0 = unbounded.
 func (s *AdaptiveSelector) tokenDailyBudgetFor(a *Auth, cfg internalconfig.AccountSchedulingConfig, now time.Time) int {
-	status := AccountWarmupStatusFor(a, now, cfg)
+	return resolveTokenDailyBudget(cfg, AccountWarmupStatusFor(a, now, cfg))
+}
+
+// resolveTokenDailyBudget resolves the billable-token daily budget for a resolved
+// warm-up status against cfg (harden P3). It is the shared free-function form of
+// tokenDailyBudgetFor so the Manager's token sink (recordBillableTokensForAccount)
+// resolves the SAME budget the selector's overTokenBudget gate reads, without
+// duplicating the stage-lookup logic. 0 = unbounded.
+func resolveTokenDailyBudget(cfg internalconfig.AccountSchedulingConfig, status AccountWarmupStatus) int {
 	if status.Mature {
 		return cfg.MatureLimits.TokenDailyBudget
 	}
@@ -883,6 +904,71 @@ func (s *AdaptiveSelector) tokenDailyBudgetFor(a *Auth, cfg internalconfig.Accou
 		return cfg.WarmupCurve[0].TokenDailyBudget
 	}
 	return 0
+}
+
+// -----------------------------------------------------------------------------
+// P3 billable-token sink registration (harden-account-scheduling-limiter).
+//
+// The billable-token gate/bucket landed inert in the first batch (no sink fed it,
+// so every token count stayed 0). This is the sink hook: internal/usage (which
+// imports this package) calls RecordAccountBillableTokens per completed request,
+// and it routes to the Manager method registered here via a package var. Keeping
+// the reference as a package var -- rather than an internal/usage -> Manager import
+// -- avoids an import cycle (internal/usage already imports this package) and keeps
+// the mechanism inert until a Manager registers.
+// -----------------------------------------------------------------------------
+
+// accountBillableTokenSink holds the active Manager's bound token-recording method.
+var accountBillableTokenSink atomic.Pointer[func(authID string, billableTokens int)]
+
+// RegisterAccountBillableTokenSink installs (or, with nil, clears) the billable-
+// token sink. The Manager registers its own bound method on config apply.
+func RegisterAccountBillableTokenSink(fn func(authID string, billableTokens int)) {
+	if fn == nil {
+		accountBillableTokenSink.Store(nil)
+		return
+	}
+	accountBillableTokenSink.Store(&fn)
+}
+
+// RecordAccountBillableTokens routes a completed request's non-cache-read billable
+// token count to the registered sink (harden P3). Called from internal/usage's
+// per-request record path. A non-positive count or an unregistered sink is a no-op,
+// so with no adaptive Manager / no token budget configured this changes nothing.
+func RecordAccountBillableTokens(authID string, billableTokens int) {
+	if billableTokens <= 0 {
+		return
+	}
+	if fn := accountBillableTokenSink.Load(); fn != nil {
+		(*fn)(authID, billableTokens)
+	}
+}
+
+// pacingSnapshotStaleAfter is how old the last quota burn sample may be before the
+// pacing multiplier fails safe to the floor for a warming account. Package var so a
+// future config-wiring slice can tune it without an API change.
+var pacingSnapshotStaleAfter = 15 * time.Minute
+
+// pacingRPMMultiplier returns the quota-aware pacing multiplier for a WARMING
+// account (harden P3). The caller MUST only apply it to warming accounts (mature
+// accounts stay无感). It is 1 (no slowdown) unless the account has a fresh burn
+// signal showing it is out-pacing its fair share to reset, in which case it is that
+// dry-run pacing factor; a burn sample older than pacingSnapshotStaleAfter fails
+// safe to the pacing floor (stale quota headroom cannot be trusted, so slow the
+// account we are protecting). An account with NO burn history yet (a brand-new /
+// never-quota-polled account, or a provider whose quota this subsystem does not
+// poll) is NOT throttled -- multiplier 1 -- so warm-up is never frozen for lack of
+// data.
+func (s *AdaptiveSelector) pacingRPMMultiplier(a *Auth, now time.Time) float64 {
+	st := ReadAccountBurnState(a)
+	if st.HasPrev && now.Sub(st.PrevAt) > pacingSnapshotStaleAfter {
+		return PacingFactorFloor
+	}
+	obs := AccountPacingObservabilityFor(a, now)
+	if !obs.HasPacingFactor {
+		return 1
+	}
+	return obs.PacingFactorDryRun
 }
 
 // overWarmupBudget is the combined warm-up budget predicate: a warming account is

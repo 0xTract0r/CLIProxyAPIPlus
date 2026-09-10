@@ -4,6 +4,24 @@
 // debug settings, proxy configuration, and API keys.
 package config
 
+// DefaultMaxRetryCredentials is the RECOMMENDED cross-credential failover cap for a
+// single failed request (harden-account-scheduling-limiter ERR). The legacy behavior
+// of 0 ("keep trying every available credential") lets one bad request walk the entire
+// fleet and can burn many accounts on a single upstream fault; a small bounded cap
+// contains that blast radius while still allowing a couple of genuine failovers.
+//
+// NOTE: this constant is currently NOT auto-applied anywhere -- it is a documented
+// recommendation only, not wired into config load. Because MaxRetryCredentials is a
+// plain int, yaml cannot distinguish "left unset" from an explicit 0, so the config
+// layer has no way to substitute this default only-when-omitted; an omitted value and
+// a deliberate 0 both stay at legacy unbounded try-all failover (negatives are also
+// normalized to 0 -> try-all). To actually cap failover blast-radius today you must
+// set max-retry-credentials explicitly in the live config.yaml (e.g. 2). Wiring this
+// default automatically requires a *int / sentinel change in the config-load layer
+// (internal/config/parse.go, internal/config/config_load.go) and is a separate
+// follow-up.
+const DefaultMaxRetryCredentials = 2
+
 // Config represents the application's configuration, loaded from a YAML file.
 type Config struct {
 	SDKConfig `yaml:",inline"`
@@ -100,7 +118,15 @@ type Config struct {
 	// RequestRetry defines the retry times when the request failed.
 	RequestRetry int `yaml:"request-retry" json:"request-retry"`
 	// MaxRetryCredentials defines the maximum number of credentials to try for a failed request.
-	// Set to 0 or a negative value to keep trying all available credentials (legacy behavior).
+	// 0 (including left unset -- an omitted int and an explicit 0 are indistinguishable in
+	// yaml) keeps the legacy unbounded try-all failover; negative values are normalized to 0
+	// (config_load.go / parse.go) and so behave identically. A positive value caps how many
+	// credentials one failed request may walk before giving up, bounding the account-burn
+	// blast radius of a single upstream fault.
+	// DefaultMaxRetryCredentials (2) is only a RECOMMENDED value and is NOT auto-applied when
+	// this field is unset -- you must set max-retry-credentials explicitly in config.yaml to
+	// get a bounded cap (see the DefaultMaxRetryCredentials doc for the config-load follow-up
+	// needed to wire it automatically -- harden-account-scheduling-limiter ERR).
 	MaxRetryCredentials int `yaml:"max-retry-credentials" json:"max-retry-credentials"`
 	// MaxRetryInterval defines the maximum wait time in seconds before retrying a cooled-down credential.
 	MaxRetryInterval int `yaml:"max-retry-interval" json:"max-retry-interval"`

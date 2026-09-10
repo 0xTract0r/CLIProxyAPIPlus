@@ -260,6 +260,21 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 		timestamp = time.Now()
 	}
 	detail := normaliseDetail(record.Detail)
+	// Harden P1b/P3: feed the adaptive account scheduler off this completed request.
+	//   - real-time upstream rate-limit headers -> the per-account live headroom
+	//     overlay (selection prefers it over the slower quota snapshot);
+	//   - non-cache-read billable tokens -> the per-account warm-up token budget
+	//     (activates the first batch's inert token gate).
+	// Both are strict no-ops unless an adaptive Manager is active, so ordinary
+	// deployments are byte-identical. Done here in the single usage sink so stream
+	// and non-stream requests are covered uniformly (the executor paths that publish
+	// usage all funnel through here).
+	if scheduleAuthID := strings.TrimSpace(record.AuthID); scheduleAuthID != "" {
+		coreauth.IngestServingRateHeaders(record.Provider, scheduleAuthID, record.ResponseHeaders, timestamp)
+		if gateTokens := schedulerBillableTokens(detail); gateTokens > 0 {
+			coreauth.RecordAccountBillableTokens(scheduleAuthID, int(gateTokens))
+		}
+	}
 	totalTokens := detail.TotalTokens
 	totalBillableTokens := detail.BillableTokens
 	statsKey := record.APIKey
@@ -1293,6 +1308,24 @@ func billableTokenCount(tokens TokenStats) int64 {
 	}
 	cacheRead := maxInt64(tokens.CacheReadTokens, tokens.CachedTokens)
 	return total + cacheRead + tokens.CacheWriteTokens
+}
+
+// schedulerBillableTokens is the non-cache-read billable token count fed into the
+// adaptive per-account warm-up token budget (harden P3). It deliberately EXCLUDES
+// cache-read tokens (ITPM semantics: cached reads do not count toward the input-
+// token-per-minute pressure the warm-up token budget guards), unlike
+// billableTokenCount which adds them for cost/pricing accounting. Cache-WRITE
+// tokens (a real, billed write) are kept. Returns 0 when nothing is countable.
+func schedulerBillableTokens(tokens TokenStats) int64 {
+	total := tokens.TotalTokens
+	if total == 0 {
+		total = tokens.InputTokens + tokens.OutputTokens + tokens.ReasoningTokens
+	}
+	v := total + tokens.CacheWriteTokens
+	if v < 0 {
+		return 0
+	}
+	return v
 }
 
 func normaliseLatency(latency time.Duration) int64 {

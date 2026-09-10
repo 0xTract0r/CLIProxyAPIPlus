@@ -119,8 +119,11 @@ func TestApplyAuthFailureStateQuotaBackoffOncePerWindow(t *testing.T) {
 		t.Fatalf("expected BackoffLevel 1 after first failure, got %d", auth.Quota.BackoffLevel)
 	}
 	firstRecover := auth.Quota.NextRecoverAt
-	if !firstRecover.Equal(now.Add(time.Second)) {
-		t.Fatalf("expected first window to close at %v, got %v", now.Add(time.Second), firstRecover)
+	// Harden ERR: plan-quota cooldown is full-jittered in [0.5, 1.0] x base, so the
+	// level-0 window (base 1s) closes somewhere in [now+0.5s, now+1s] rather than at
+	// an exact now+1s. The backoff LEVEL is unaffected by the jitter (asserted above).
+	if d := firstRecover.Sub(now); d < 500*time.Millisecond || d > time.Second {
+		t.Fatalf("expected first window in [now+0.5s, now+1s], got +%v", d)
 	}
 
 	// In-window failure keeps the current window and level.
@@ -137,8 +140,10 @@ func TestApplyAuthFailureStateQuotaBackoffOncePerWindow(t *testing.T) {
 	if auth.Quota.BackoffLevel != 2 {
 		t.Fatalf("expected BackoffLevel 2 after post-window failure, got %d", auth.Quota.BackoffLevel)
 	}
-	if !auth.Quota.NextRecoverAt.Equal(now.Add(4 * time.Second)) {
-		t.Fatalf("expected second window to close at %v, got %v", now.Add(4*time.Second), auth.Quota.NextRecoverAt)
+	// Level-1 base (2s) full-jittered to [1s, 2s] and applied at now+2s: the fresh
+	// window closes in [now+3s, now+4s].
+	if d := auth.Quota.NextRecoverAt.Sub(now); d < 3*time.Second || d > 4*time.Second {
+		t.Fatalf("expected second window in [now+3s, now+4s], got +%v", d)
 	}
 
 	// A provider supplied retry hint always takes effect, even in-window.
