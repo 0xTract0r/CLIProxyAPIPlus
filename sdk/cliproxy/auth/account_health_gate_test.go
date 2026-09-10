@@ -556,6 +556,15 @@ func planQuotaError() *Error {
 	return &Error{HTTPStatus: http.StatusTooManyRequests, Message: `{"type":"error","error":{"type":"rate_limit_error","message":"usage limit reached; quota exceeded"}}`}
 }
 
+// forbiddenError is a 403 -- an ACCOUNT-level deterministic symptom that feeds the
+// health-gate failure cluster under harden ERR (design §2.3 A5), unlike a bare
+// transient 429. It does not escalate Quota.BackoffLevel and (being a 403, not a
+// 401) does not trip auto-quarantine, so it isolates the failure-cluster distress
+// signal for the cluster-demote test below.
+func forbiddenError() *Error {
+	return &Error{HTTPStatus: http.StatusForbidden, Message: "forbidden"}
+}
+
 func TestManagerMarkResult_HealthGateBackoffSignalDemotes(t *testing.T) {
 	mgr := NewManager(nil, nil, nil)
 	mgr.runtimeConfig.Store(&internalconfig.Config{AccountScheduling: healthGateTestConfig()})
@@ -599,15 +608,53 @@ func TestManagerMarkResult_HealthGateFailureClusterDemotes(t *testing.T) {
 		t.Fatalf("Register error: %v", err)
 	}
 
-	// Three transient 429s (rate_limit, no plan-quota) do NOT escalate BackoffLevel
-	// but DO accumulate a failure cluster >= threshold 3 -> demote once.
+	// Three account-level symptoms (403s, no plan-quota escalation) do NOT bump
+	// BackoffLevel but DO accumulate a failure cluster >= threshold 3 -> demote
+	// once. Harden ERR (design §2.3 A5) narrowed the cluster feed to account-level
+	// symptoms, so this now uses forbiddenError() (a 403) rather than a bare
+	// transient 429; see TestManagerMarkResult_HealthGateTransient429DoesNotDemote
+	// for the complementary guard that a transient 429 no longer feeds the cluster.
 	for i := 0; i < 3; i++ {
-		mgr.MarkResult(ctx, Result{AuthID: "claude-cluster", Provider: "claude", Model: "claude-sonnet-4", Success: false, Error: rateLimitError()})
+		mgr.MarkResult(ctx, Result{AuthID: "claude-cluster", Provider: "claude", Model: "claude-sonnet-4", Success: false, Error: forbiddenError()})
 	}
 
 	got, _ := mgr.GetByID("claude-cluster")
 	if cap, ok := AccountHealthStageCap(got); !ok || cap != 3 {
 		t.Fatalf("cap after failure cluster = (%d,%v), want (3,true) [ageIdx 4 - 1]", cap, ok)
+	}
+}
+
+// TestManagerMarkResult_HealthGateTransient429DoesNotDemote is the harden ERR
+// (design §2.3 A5) guard: a burst of transient (non-plan-quota) 429s -- an
+// upstream capacity / TPM blip, not an account symptom -- must NOT accumulate a
+// health-gate failure cluster and so must NOT demote a warming account. Before
+// the error-classification fix, upstream容量抖动 fed the cluster and needlessly
+// 降档 warming accounts.
+func TestManagerMarkResult_HealthGateTransient429DoesNotDemote(t *testing.T) {
+	mgr := NewManager(nil, nil, nil)
+	mgr.runtimeConfig.Store(&internalconfig.Config{AccountScheduling: healthGateTestConfig()})
+	ctx := WithSkipPersist(context.Background())
+
+	a := &Auth{ID: "claude-transient", Provider: "claude", Metadata: map[string]any{}}
+	a.SetAccountFirstProductionAt(time.Now().Add(-50 * 24 * time.Hour)) // warming, ageIdx 4
+	if _, err := mgr.Register(ctx, a); err != nil {
+		t.Fatalf("Register error: %v", err)
+	}
+
+	// Five transient 429s (bare rate_limit, no plan-quota, no Retry-After).
+	for i := 0; i < 5; i++ {
+		mgr.MarkResult(ctx, Result{AuthID: "claude-transient", Provider: "claude", Model: "claude-sonnet-4", Success: false, Error: rateLimitError()})
+	}
+
+	got, _ := mgr.GetByID("claude-transient")
+	if got.Quota.BackoffLevel != 0 {
+		t.Fatalf("transient 429 must not escalate BackoffLevel, got %d", got.Quota.BackoffLevel)
+	}
+	if cap, ok := AccountHealthStageCap(got); ok {
+		t.Fatalf("transient 429 burst must NOT demote via the health cluster, got cap=(%d,%v)", cap, ok)
+	}
+	if _, lok := AccountLastDistressAt(got); lok {
+		t.Fatal("transient 429 burst must NOT stamp last_distress_at (not an account symptom)")
 	}
 }
 

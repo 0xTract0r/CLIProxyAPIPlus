@@ -214,6 +214,27 @@ func TestAccountSchedulingConfigValidate(t *testing.T) {
 			},
 			wantErr: "rate-scale must be positive",
 		},
+		{
+			name: "negative warmup token budget",
+			mutate: func(c *AccountSchedulingConfig) {
+				c.WarmupCurve[0].TokenDailyBudget = -1
+			},
+			wantErr: "warmup-curve[0].token-daily-budget must not be negative",
+		},
+		{
+			name: "negative mature token budget",
+			mutate: func(c *AccountSchedulingConfig) {
+				c.MatureLimits.TokenDailyBudget = -1
+			},
+			wantErr: "mature-limits.token-daily-budget must not be negative",
+		},
+		{
+			name: "negative anti-streak limit",
+			mutate: func(c *AccountSchedulingConfig) {
+				c.AntiStreakLimit = -1
+			},
+			wantErr: "anti-streak-limit must not be negative",
+		},
 	}
 
 	for _, tt := range tests {

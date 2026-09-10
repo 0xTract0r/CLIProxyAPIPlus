@@ -28,7 +28,9 @@ import (
 // Claude's quota_snapshot.usage (the raw https://api.anthropic.com/api/oauth/usage
 // response body) is a flat object whose usage-window entries look like
 // {"five_hour":{"utilization":8.0,"resets_at":"2026-01-22T09:00:00Z"},
-//  "seven_day":{...},"seven_day_sonnet":{...},"extra_usage":{"is_enabled":false}}.
+//
+//	"seven_day":{...},"seven_day_sonnet":{...},"extra_usage":{"is_enabled":false}}.
+//
 // utilization is a 0-100 percentage, not a 0-1 fraction. This file detects
 // window objects generically (any object under "usage" carrying a numeric
 // "utilization" field) rather than hardcoding the window name set, so it
@@ -216,6 +218,277 @@ func AccountQuotaHeadroom(auth *Auth) (AccountQuotaHeadroomResult, bool) {
 		return AccountQuotaHeadroomResult{}, false
 	}
 	return tightest, true
+}
+
+// -----------------------------------------------------------------------------
+// OBS observability layer (harden-account-scheduling-limiter design §4.0).
+//
+// This block adds three DERIVED, observability-only metrics on top of the quota
+// windows parsed above: an EWMA burn rate (ΔUtilization% per hour of the binding
+// window), a projected exhaustion time, and a dry-run pacing factor. They are
+// "只算不拦" (compute-only): NOTHING here multiplies into any rpm / concurrency /
+// selection weight / gate -- the burn state is persisted for the management
+// projection and future calibration, and the pacing factor is emitted as a
+// dry-run number only. It NEVER changes selection or limiting behaviour.
+//
+// Why the EWMA state lives in the account_scheduling object (not quota_snapshot):
+// the ~3.5min quota refresh replaces the whole quota_snapshot object wholesale,
+// which would wipe any per-refresh history stored inside it. account_scheduling
+// is a TOP-LEVEL metadata key that Auth.Clone carries through untouched (see
+// account_scheduling_metadata.go), so the {prev_util, prev_at, burn_rate_ewma,
+// projected_exhaustion_at} tuple survives across refresh cycles.
+// -----------------------------------------------------------------------------
+
+// account_scheduling sub-keys holding the persisted EWMA burn state. They live
+// inside the same namespaced object as rate_scale / tier_source and are written
+// exclusively through setAccountSchedulingValue (never bare top-level keys).
+const (
+	accountSchedulingBurnPrevWindowKey       = "burn_prev_window"
+	accountSchedulingBurnPrevUtilKey         = "burn_prev_util_percent"
+	accountSchedulingBurnPrevAtKey           = "burn_prev_at"
+	accountSchedulingBurnRateEWMAKey         = "burn_rate_ewma_per_hour"
+	accountSchedulingBurnProjectedExhaustKey = "burn_projected_exhaustion_at"
+)
+
+// Calibration knobs (design §5 marks these "待校准"). They are package vars, not
+// consts, so a future config-wiring slice can source them without an API change
+// (mirroring SessionActiveWindow in the management projection). Changing them
+// affects only the observability numbers, never any real limit.
+var (
+	// BurnRateEWMAAlpha is the EWMA smoothing factor in [0,1]: higher reacts
+	// faster to the latest sample, lower is smoother. 0.3 is a deliberately
+	// smooth starting point pending real burn-curve calibration.
+	BurnRateEWMAAlpha = 0.3
+	// PacingFactorK is the target pace factor at exactly the fair burn rate. At
+	// k=1 the dry-run factor is 1 (no pace-down) while burn <= fair, and drops
+	// below 1 only when the account burns faster than its fair share to reset.
+	PacingFactorK = 1.0
+	// PacingFactorFloor is the lower clamp on the dry-run pacing factor, so a
+	// runaway burn can never drive the (dry-run) factor to zero.
+	PacingFactorFloor = 0.1
+)
+
+const (
+	// burnRateEpsilon treats any |burn| at or below this as "not burning".
+	burnRateEpsilon = 1e-9
+	// burnProjectionMaxHours caps how far out projected_exhaustion_at may be. A
+	// tiny burn over full headroom would otherwise project centuries away (and
+	// risk time.Duration overflow); beyond this horizon we report "no projection"
+	// (null) rather than a meaningless far-future timestamp.
+	burnProjectionMaxHours = 365 * 24
+)
+
+// AccountBurnState is the persisted EWMA burn observability tuple for one auth,
+// recovered from its account_scheduling sub-object. Has* flags follow the
+// "unknown is not a number" contract: a field with Has*=false has no meaningful
+// value yet (e.g. only one sample seen so far) and MUST be surfaced as null, not 0.
+type AccountBurnState struct {
+	// PrevWindow is the binding-window name at the previous sample (used to
+	// detect a window switch, which makes a cross-window delta meaningless).
+	PrevWindow string
+	// PrevUtilizationPercent is the previous binding-window utilization% (0-100).
+	PrevUtilizationPercent float64
+	// PrevAt is when the previous sample was taken.
+	PrevAt time.Time
+	// HasPrev reports whether a usable previous sample (PrevAt) exists.
+	HasPrev bool
+	// BurnRatePerHour is the smoothed EWMA burn rate in utilization-percentage
+	// points per hour of the binding window.
+	BurnRatePerHour float64
+	// HasBurnRate reports whether a burn rate has been computed (>=2 same-window
+	// samples). False until then.
+	HasBurnRate bool
+	// ProjectedExhaustionAt is now+headroom/burn at the last write, when burning.
+	ProjectedExhaustionAt time.Time
+	// HasProjection reports whether a projection exists (positive burn, bounded horizon).
+	HasProjection bool
+}
+
+// ReadAccountBurnState recovers the persisted EWMA burn state from an auth's
+// account_scheduling sub-object. A nil/empty auth or absent state yields a
+// zero-value struct with every Has*=false (all "unknown").
+func ReadAccountBurnState(auth *Auth) AccountBurnState {
+	var st AccountBurnState
+	if auth == nil || len(auth.Metadata) == 0 {
+		return st
+	}
+	if raw, ok := accountSchedulingRawValue(auth.Metadata, accountSchedulingBurnPrevAtKey); ok {
+		if ts, ok := parseFirstProductionAtValue(raw); ok {
+			st.PrevAt = ts
+			st.HasPrev = true
+		}
+	}
+	if raw, ok := accountSchedulingRawValue(auth.Metadata, accountSchedulingBurnPrevUtilKey); ok {
+		if v, ok := accountQuotaNumericValue(raw); ok {
+			st.PrevUtilizationPercent = v
+		}
+	}
+	st.PrevWindow = accountSchedulingString(auth.Metadata, accountSchedulingBurnPrevWindowKey)
+	if raw, ok := accountSchedulingRawValue(auth.Metadata, accountSchedulingBurnRateEWMAKey); ok {
+		if v, ok := accountQuotaNumericValue(raw); ok {
+			st.BurnRatePerHour = v
+			st.HasBurnRate = true
+		}
+	}
+	if raw, ok := accountSchedulingRawValue(auth.Metadata, accountSchedulingBurnProjectedExhaustKey); ok {
+		if ts, ok := parseFirstProductionAtValue(raw); ok {
+			st.ProjectedExhaustionAt = ts
+			st.HasProjection = true
+		}
+	}
+	return st
+}
+
+// UpdateAccountBurnObservability samples the freshly-refreshed quota snapshot on
+// updatedAuth against the previous persisted sample on prevAuth, updates the EWMA
+// burn rate + projected exhaustion, and persists the new state into updatedAuth's
+// account_scheduling sub-object via setAccountSchedulingValue. It is called from
+// the single quota refresh write-back point (quota_snapshots.go) where a fresh
+// utilization%, a fixed cadence, a live auth and a persist all coincide.
+//
+// Observability-only: it derives numbers and NEVER touches any selection / limit /
+// gate field. When the fresh snapshot has no usable quota window (unknown -- e.g.
+// a Codex account, or a probe that returned nothing parseable) it leaves any
+// existing burn state untouched rather than fabricating a burn rate from unknown.
+func UpdateAccountBurnObservability(prevAuth, updatedAuth *Auth, now time.Time) {
+	if updatedAuth == nil {
+		return
+	}
+	headroom, ok := AccountQuotaHeadroom(updatedAuth)
+	if !ok {
+		// Unknown quota: safe default is to leave state as-is, never invent a rate.
+		return
+	}
+	if updatedAuth.Metadata == nil {
+		updatedAuth.Metadata = make(map[string]any)
+	}
+
+	newUtil := clampUtilizationPercent((1 - headroom.Headroom) * 100)
+	newWindow := headroom.Window
+
+	// Capture the previous sample BEFORE overwriting the baseline below (prevAuth
+	// and updatedAuth may be the same pointer in a test / in-process caller).
+	prev := ReadAccountBurnState(prevAuth)
+
+	// Always advance the baseline to this fresh sample.
+	setAccountSchedulingValue(updatedAuth.Metadata, accountSchedulingBurnPrevWindowKey, newWindow)
+	setAccountSchedulingValue(updatedAuth.Metadata, accountSchedulingBurnPrevUtilKey, newUtil)
+	setAccountSchedulingValue(updatedAuth.Metadata, accountSchedulingBurnPrevAtKey, now.UTC().Format(time.RFC3339))
+
+	// A rate is only meaningful between two same-window samples with a forward
+	// clock. First sample ever, a window switch, or a non-advancing clock -> drop
+	// any stale rate/projection so they read null until two same-window samples exist.
+	if !prev.HasPrev || !strings.EqualFold(prev.PrevWindow, newWindow) {
+		clearAccountSchedulingValue(updatedAuth.Metadata, accountSchedulingBurnRateEWMAKey)
+		clearAccountSchedulingValue(updatedAuth.Metadata, accountSchedulingBurnProjectedExhaustKey)
+		return
+	}
+	deltaHours := now.Sub(prev.PrevAt).Hours()
+	if deltaHours <= 0 {
+		clearAccountSchedulingValue(updatedAuth.Metadata, accountSchedulingBurnRateEWMAKey)
+		clearAccountSchedulingValue(updatedAuth.Metadata, accountSchedulingBurnProjectedExhaustKey)
+		return
+	}
+
+	instant := (newUtil - prev.PrevUtilizationPercent) / deltaHours
+	if instant < 0 {
+		// Utilization dropped (mid-window reset / upstream jitter): there is no
+		// positive burn to project. Feed 0 so the EWMA decays toward "not burning".
+		instant = 0
+	}
+	ewma := instant
+	if prev.HasBurnRate {
+		ewma = BurnRateEWMAAlpha*instant + (1-BurnRateEWMAAlpha)*prev.BurnRatePerHour
+	}
+	setAccountSchedulingValue(updatedAuth.Metadata, accountSchedulingBurnRateEWMAKey, ewma)
+
+	// projected_exhaustion_at = now + remainingHeadroomPoints / burn, only while
+	// actually burning and within a bounded horizon.
+	remainingPoints := headroom.Headroom * 100
+	if ewma > burnRateEpsilon && remainingPoints > 0 {
+		if hours := remainingPoints / ewma; hours <= burnProjectionMaxHours {
+			projected := now.UTC().Add(time.Duration(hours * float64(time.Hour)))
+			setAccountSchedulingValue(updatedAuth.Metadata, accountSchedulingBurnProjectedExhaustKey, projected.Format(time.RFC3339))
+			return
+		}
+	}
+	clearAccountSchedulingValue(updatedAuth.Metadata, accountSchedulingBurnProjectedExhaustKey)
+}
+
+// AccountPacingObservability is the read-side, dry-run observability view derived
+// from the persisted burn state plus the live binding-window headroom/reset. Every
+// value is dry-run: PacingFactorDryRun is NEVER multiplied into a real rpm/limit.
+type AccountPacingObservability struct {
+	BurnRatePerHour       float64
+	HasBurnRate           bool
+	ProjectedExhaustionAt time.Time
+	HasProjection         bool
+	// PacingFactorDryRun is p = clamp(k*fair/burn, p_floor, 1), fair =
+	// remainingHeadroomPoints / hoursUntilReset. Dry-run only.
+	PacingFactorDryRun float64
+	HasPacingFactor    bool
+}
+
+// AccountPacingObservabilityFor computes the dry-run pacing observability for an
+// auth at time now. burn rate + projection are passed through from the persisted
+// state; the pacing factor is derived fresh from the binding window's live
+// headroom and resets_at. Any of the three is reported as unknown (Has*=false)
+// rather than a fabricated number:
+//   - no burn history (fewer than two same-window samples) -> pacing unknown;
+//   - binding window missing resets_at, or already at/past reset -> pacing unknown
+//     ("resets_at 缺失窗口跳过").
+//
+// It is a pure read: it reads only persisted state and never mutates auth or gates.
+func AccountPacingObservabilityFor(auth *Auth, now time.Time) AccountPacingObservability {
+	var out AccountPacingObservability
+	st := ReadAccountBurnState(auth)
+	out.BurnRatePerHour = st.BurnRatePerHour
+	out.HasBurnRate = st.HasBurnRate
+	out.ProjectedExhaustionAt = st.ProjectedExhaustionAt
+	out.HasProjection = st.HasProjection
+
+	if !st.HasBurnRate {
+		return out
+	}
+	headroom, ok := AccountQuotaHeadroom(auth)
+	if !ok || headroom.ResetsAt.IsZero() {
+		return out
+	}
+	hoursUntilReset := headroom.ResetsAt.Sub(now).Hours()
+	if hoursUntilReset <= 0 {
+		return out
+	}
+	fair := (headroom.Headroom * 100) / hoursUntilReset
+	var p float64
+	if st.BurnRatePerHour <= burnRateEpsilon {
+		// Burn has decayed to ~0: not pacing down.
+		p = 1
+	} else {
+		p = PacingFactorK * fair / st.BurnRatePerHour
+	}
+	out.PacingFactorDryRun = clampPacingFactor(p)
+	out.HasPacingFactor = true
+	return out
+}
+
+func clampUtilizationPercent(v float64) float64 {
+	if v < 0 {
+		return 0
+	}
+	if v > 100 {
+		return 100
+	}
+	return v
+}
+
+func clampPacingFactor(p float64) float64 {
+	if p < PacingFactorFloor {
+		return PacingFactorFloor
+	}
+	if p > 1 {
+		return 1
+	}
+	return p
 }
 
 // accountQuotaNumericValue parses a JSON-decoded value (float64, json.Number,

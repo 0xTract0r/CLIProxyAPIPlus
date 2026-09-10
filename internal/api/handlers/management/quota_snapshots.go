@@ -542,6 +542,16 @@ func (h *Handler) refreshQuotaSnapshot(ctx context.Context, auth *coreauth.Auth,
 	if planType != "" {
 		updated.Metadata[quotaSnapshotPlanTypeKey] = planType
 	}
+	// OBS observability layer (harden-account-scheduling-limiter design §4.0):
+	// this is the single write-back point where a fresh utilization%, a fixed
+	// refresh cadence, a live auth and a persist all coincide, so it is where the
+	// EWMA burn rate / projected exhaustion are derived. It samples the previous
+	// persisted state on `auth` against this fresh snapshot on `updated`, and
+	// persists the new burn state into updated's account_scheduling sub-object
+	// (which survives the wholesale quota_snapshot replacement, unlike anything
+	// nested inside quota_snapshot). Compute-only: it never changes selection,
+	// limiting or gating behaviour.
+	coreauth.UpdateAccountBurnObservability(auth, updated, now)
 	updated.UpdatedAt = now
 	return manager.Update(ctx, updated)
 }

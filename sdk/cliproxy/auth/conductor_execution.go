@@ -325,12 +325,16 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			concurrencyBusy := false
 			func() {
 				// Adaptive account scheduling (Phase 2): reserve this account's
-				// in-flight concurrency slot and record its UTC-daily request
-				// around the actual upstream call. release is deferred so the
-				// slot is freed on EVERY exit of this closure -- success, error,
-				// ctx-cancel early return, or a panic unwinding through
-				// executor.Execute -- because a leaked slot would count the
-				// account permanently busy and drop it out of selection forever.
+				// in-flight concurrency slot around the actual upstream call.
+				// release is deferred so the slot is freed on EVERY exit of this
+				// closure -- success, error, ctx-cancel early return, or a panic
+				// unwinding through executor.Execute -- because a leaked slot
+				// would count the account permanently busy and drop it out of
+				// selection forever. The rolling-24h daily-budget REQUEST count
+				// is NOT recorded here anymore; it moved to MarkResult (the single
+				// result sink), so a concurrency-busy failover -- which returns
+				// before executor.Execute and never reaches MarkResult -- records
+				// no phantom count (harden P2).
 				slot, within := m.beginAccountExecution(auth)
 				defer slot.release()
 				if !within {
@@ -340,7 +344,6 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 					concurrencyBusy = true
 					return
 				}
-				slot.recordRequest()
 				resp, errExec = executor.Execute(execCtx, auth, execReq, execOpts)
 				if errExec != nil {
 					if errCtx := execCtx.Err(); errCtx != nil {

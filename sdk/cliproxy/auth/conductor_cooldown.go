@@ -718,7 +718,18 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		if trackCooldownState {
 			cooldownRecordsBefore = m.cooldownStateRecordsForAuthLocked(auth, now)
 		}
-		auth.recordRecentRequest(now, result.Success)
+		// Harden ERR (error classification, design §2.3 A5): feed the health-gate
+		// failure cluster (the recentRequests failed ring, which
+		// evaluateAccountHealthGateLocked below reads) only for real successes and
+		// account-level deterministic symptoms (plan-quota 429 / 403 / 401 /
+		// invalid_grant). Upstream capacity / transport-transient failures (529 /
+		// 408 / 5xx / connection) are retry-only and must NOT accumulate a cluster
+		// that demotes a warming account for an upstream blip. auth.Failed below
+		// stays a lifetime failure counter, incremented on every failure regardless
+		// of this classification (a management/observability stat, not the cluster).
+		if result.Success || resultFeedsFailureCluster(result) {
+			auth.recordRecentRequest(now, result.Success)
+		}
 		if result.Success {
 			auth.Success++
 			// openspec/changes/add-adaptive-account-scheduling (G1): mint the
@@ -747,6 +758,14 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		} else {
 			auth.Failed++
 		}
+
+		// Harden P2: count this result against a still-warming, adaptive-eligible
+		// account's rolling-24h warm-up REQUEST budget and persist the window into
+		// auth.Metadata so it survives a process restart. Moved here from the
+		// execution path's slot.recordRequest so a concurrency-busy failover -- which
+		// never reaches MarkResult -- records no phantom count (semantics: "count on
+		// result" not "count on send"). A no-op for mature / non-adaptive accounts.
+		m.recordWarmupDailyBudgetLocked(auth, now)
 
 		if result.Success {
 			if result.Model != "" {
@@ -945,7 +964,12 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 									shouldSuspendModel = true
 								}
 							}
-						case 408, 500, 502, 503, 504:
+						case 408, 500, 502, 503, 504, 529:
+							// Harden ERR: 529 overloaded is an upstream-capacity
+							// signal, handled here as a brief transient cooldown +
+							// retry (never a plan-quota escalation, never a health
+							// cluster feed) instead of the pre-harden default of no
+							// cooldown.
 							if disableCooling {
 								state.NextRetryAfter = time.Time{}
 							} else {
@@ -1025,6 +1049,72 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 
 	m.hook.OnResult(ctx, result)
 	m.publishErrorEvent(result, authSnapshot)
+}
+
+// resultFeedsFailureCluster reports whether a FAILED result is an account-level
+// deterministic symptom that should feed the health-gate failure cluster (the
+// recentRequests failed ring): plan-quota 429 (an explicit usage/plan-quota
+// marker OR an upstream Retry-After hint), 403, 401, or an invalid_grant. Upstream
+// capacity / transport-transient failures (529 / 408 / 5xx, and any transport /
+// connection error with no HTTP status) return false so they are retry-only and
+// never demote a warming account for an upstream blip (harden ERR, design §2.3
+// A5). A Success:false result carrying no *Error defaults to true so a bare
+// provider-reported failure keeps its historical recent-request accounting.
+func resultFeedsFailureCluster(result Result) bool {
+	if result.Success {
+		return true
+	}
+	err := result.Error
+	if err == nil {
+		return true
+	}
+	if isInvalidGrantResultError(err) {
+		return true
+	}
+	switch statusCodeFromResult(err) {
+	case http.StatusUnauthorized, http.StatusForbidden: // 401 / 403 -> account symptom
+		return true
+	case http.StatusTooManyRequests: // 429: only plan-quota is an account symptom
+		hasRetryAfter := result.RetryAfter != nil && *result.RetryAfter > 0
+		return hasRetryAfter || resultIndicatesPlanQuota(err)
+	case 408, 500, 502, 503, 504, 529: // upstream capacity / transient -> retry only
+		return false
+	case 0: // transport / connection error (no HTTP response) -> retry only
+		return false
+	default:
+		return true
+	}
+}
+
+// recordWarmupDailyBudgetLocked counts one result against a still-warming,
+// adaptive-eligible account's rolling-24h warm-up REQUEST budget and persists the
+// updated window into auth.Metadata (harden P2). It runs under m.mu (the lock
+// every Metadata mutator in this package holds); the caller's unconditional
+// m.persist write-throughs the window onto the auth volume so it survives a
+// restart. A strict no-op when no gate is active, the provider is not
+// adaptive-managed (positive tier weight), or the account is mature / has no
+// warm-up daily budget -- so mature and non-Claude/Codex traffic is byte-identical.
+func (m *Manager) recordWarmupDailyBudgetLocked(auth *Auth, now time.Time) {
+	// Must use the *Locked gate lookup: this runs under m.mu (write) from
+	// MarkResult, and accountConcurrencyGate()'s Selector() RLock would deadlock.
+	gate := m.accountConcurrencyGateLocked()
+	if gate == nil || auth == nil || auth.ID == "" {
+		return
+	}
+	cfg := m.accountSchedulingConfig()
+	if auth.AccountTierBaseWeight(cfg.TierWeights) <= 0 {
+		return
+	}
+	status := AccountWarmupStatusFor(auth, now, cfg)
+	if status.Mature || status.DailyBudget <= 0 {
+		return
+	}
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	seed := readDailyWindowBuckets(auth.Metadata, accountSchedulingDailyWindowKey)
+	updated := gate.RecordRequestWindow(auth.ID, seed)
+	setAccountSchedulingValue(auth.Metadata, accountSchedulingDailyWindowKey, dailyWindowToMetadata(updated))
 }
 
 func (m *Manager) recordExecutionResult(ctx context.Context, result Result, auth *Auth, ephemeral bool) {
@@ -1801,7 +1891,7 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 		}
 		auth.Quota.NextRecoverAt = next
 		auth.NextRetryAfter = next
-	case 408, 500, 502, 503, 504:
+	case 408, 500, 502, 503, 504, 529:
 		auth.StatusMessage = "transient upstream error"
 		if disableCooling {
 			auth.NextRetryAfter = time.Time{}

@@ -328,18 +328,19 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			remaining = closedCh
 		}
 		// Adaptive account scheduling (Phase 2): for a real (non-Home) serving
-		// stream, reserve the account's concurrency slot and record its UTC-daily
-		// request now that a stream is actually established, then release the
-		// slot when the wrapped stream completes (plumbed as onComplete). The
-		// request has already gone out here, so the acquire is unconditional
-		// (its within-limit report is intentionally ignored -- we never tear
-		// down a live stream). Home dispatch (ephemeralResult) has its own
-		// concurrency accounting and is deliberately left ungated.
+		// stream, reserve the account's concurrency slot now that a stream is
+		// actually established, then release the slot when the wrapped stream
+		// completes (plumbed as onComplete). The request has already gone out
+		// here, so the acquire is unconditional (its within-limit report is
+		// intentionally ignored -- we never tear down a live stream). The
+		// rolling-24h daily-budget REQUEST count is NOT recorded here anymore; it
+		// moved to MarkResult (the single result sink), which the wrapped stream
+		// reaches on completion (harden P2). Home dispatch (ephemeralResult) has
+		// its own concurrency accounting and is deliberately left ungated.
 		if ephemeralResult {
 			return m.wrapStreamResult(ctx, auth.Clone(), provider, resultModel, streamResult.Headers, buffered, remaining, aliasResult, ephemeralResult), nil
 		}
 		slot, _ := m.beginAccountExecution(auth)
-		slot.recordRequest()
 		return m.wrapStreamResult(ctx, auth.Clone(), provider, resultModel, streamResult.Headers, buffered, remaining, aliasResult, ephemeralResult, slot.release), nil
 	}
 	if lastErr == nil {
