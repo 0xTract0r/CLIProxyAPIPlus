@@ -240,6 +240,13 @@ metadata契约键-首投产锚点	FirstProductionAtMetadataKey	symbol	^const Fir
 metadata契约键-首投产锚点	EnsureAuthFirstProductionAt定义	symbol	^func EnsureAuthFirstProductionAt\(	sdk/cliproxy/auth/account_freshness.go
 metadata契约键-首投产锚点	首投产锚点铸造接线	pattern	EnsureAuthFirstProductionAt\(auth, now\)	sdk/cliproxy/auth/conductor_cooldown.go
 metadata契约键-档位覆盖	TierOverrideMetadataKey	symbol	^const TierOverrideMetadataKey = "tier_override"	sdk/cliproxy/auth/account_tier.go
+# 订阅等级自动识别的"通用 rate_limit_tier 回退":真实 Google Play Pro 号上游返回通用
+#   rate_limit_tier="default_claude_ai"(不在 claudeRateLimitTierValues 精确映射表)会落
+#   Unknown;claudeTierFromCoarseSignals 用 quota profile 里已落盘的粗粒度 has_claude_pro /
+#   organization_type=claude_pro 把这类号提升为 Pro(仅提升到无歧义的单档 Pro,绝不从布尔
+#   猜 max_5x/20x)。上游同步若覆盖 account_tier.go 会静默删掉这条回退,现网 Pro 号又会全落
+#   Unknown——断言该回退符号仍在。行为守护见 account_tier_test.go TestAuth_ClaudeSubscriptionTier_CoarseSignalFallback。
+订阅等级识别-通用tier回退	通用rate_limit_tier回退到Pro识别	symbol	^func claudeTierFromCoarseSignals\(	sdk/cliproxy/auth/account_tier.go
 管理API字段-自适应调度视图	account_scheduling字段挂载	pattern	entry\["account_scheduling"\] = h\.buildAccountSchedulingView	internal/api/handlers/management/auth_files.go
 管理API字段-自适应调度视图	buildAccountSchedulingView投影	symbol	^func \(h \*Handler\) buildAccountSchedulingView\(	internal/api/handlers/management/auth_files_adaptive_scheduling.go
 # 管理写端点(openspec add-adaptive-account-scheduling design §8.3/§8.4/§8.5):运维经管理 API
