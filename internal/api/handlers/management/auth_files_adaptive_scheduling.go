@@ -161,6 +161,27 @@ func (h *Handler) buildAccountSchedulingView(auth *coreauth.Auth) gin.H {
 	}
 	view["warmup"] = warmupView
 
+	// Effective (post-rate_scale) outbound ceilings the adaptive selector actually
+	// enforces for this account. The warmup block above carries the PRE-scale stage
+	// numbers (rpm_limit / concurrency_limit / daily_budget) and rate_scale is
+	// surfaced separately, so the frontend would otherwise have to multiply them
+	// itself; this exposes the resolved product directly so it can show "may run up
+	// to N rpm / M concurrent". Derived by the single-source coreauth.AccountEffectiveLimits
+	// so this projection can never drift from the serving-side rate / daily /
+	// concurrency / token gates. daily_budget / token_daily_budget of 0 means
+	// unbounded (a mature account or an uncapped stage), and pacing_applies=true
+	// flags a still-warming account whose rpm may be transiently paced BELOW the rpm
+	// ceiling shown here (see pacing_factor_dryrun).
+	effective := coreauth.AccountEffectiveLimits(auth, now, scheduling)
+	view["effective_limits"] = gin.H{
+		"rpm":                effective.RPM,
+		"burst":              effective.Burst,
+		"concurrency":        effective.Concurrency,
+		"daily_budget":       effective.DailyBudget,
+		"token_daily_budget": effective.TokenDailyBudget,
+		"pacing_applies":     effective.PacingApplies,
+	}
+
 	// Health-gated warm-up ramp state (ANCHOR-Q4, design §10.5). Additive and
 	// read-only, mirroring the "unknown is not a number" contract: an account
 	// that has never shown distress reports a null cap / last-distress and

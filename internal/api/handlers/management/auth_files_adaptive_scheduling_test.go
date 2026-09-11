@@ -234,6 +234,129 @@ func TestBuildAuthFileEntry_AdaptiveScheduling(t *testing.T) {
 	})
 }
 
+// TestBuildAuthFileEntry_AdaptiveScheduling_EffectiveLimits covers the additive
+// effective_limits projection: account_scheduling must surface the ACTUAL
+// post-rate_scale outbound ceilings the adaptive selector enforces
+// (rpm/burst/concurrency/daily_budget/token_daily_budget as ints plus a
+// pacing_applies bool), derived from coreauth.AccountEffectiveLimits. It locks both
+// the wire shape (snake_case keys, JSON types) and the mature vs warming values
+// under the default scheduling config.
+func TestBuildAuthFileEntry_AdaptiveScheduling_EffectiveLimits(t *testing.T) {
+	h := &Handler{cfg: &config.Config{AccountScheduling: config.DefaultAccountSchedulingConfig()}}
+
+	effectiveLimits := func(t *testing.T, auth *coreauth.Auth) gin.H {
+		t.Helper()
+		entry := h.buildAuthFileEntry(auth)
+		view, ok := entry["account_scheduling"].(gin.H)
+		if !ok {
+			t.Fatalf("entry[\"account_scheduling\"] = %#v, want gin.H", entry["account_scheduling"])
+		}
+		eff, ok := view["effective_limits"].(gin.H)
+		if !ok {
+			t.Fatalf("effective_limits = %#v, want gin.H", view["effective_limits"])
+		}
+		return eff
+	}
+
+	assertInt := func(t *testing.T, eff gin.H, key string, want int) {
+		t.Helper()
+		got, ok := eff[key].(int)
+		if !ok {
+			t.Fatalf("effective_limits.%s = %#v, want int", key, eff[key])
+		}
+		if got != want {
+			t.Fatalf("effective_limits.%s = %d, want %d", key, got, want)
+		}
+	}
+
+	t.Run("mature account exposes scaled mature ceiling, pacing_applies=false", func(t *testing.T) {
+		anchor := time.Now().Add(-200 * 24 * time.Hour).UTC().Format(time.RFC3339)
+		auth := &coreauth.Auth{
+			ID:         "claude-eff-mature",
+			Provider:   "claude",
+			Status:     coreauth.StatusActive,
+			UpdatedAt:  time.Now(),
+			Attributes: map[string]string{"runtime_only": "true"},
+			Metadata: map[string]any{
+				"first_production_at": anchor,
+				"quota_snapshot": map[string]any{
+					"profile": map[string]any{
+						"organization": map[string]any{"rate_limit_tier": "default_claude_max_20x"},
+					},
+				},
+			},
+		}
+
+		eff := effectiveLimits(t, auth)
+		// Default MatureLimits: rpm 45, burst 10, concurrency 4; daily/token unbounded.
+		assertInt(t, eff, "rpm", 45)
+		assertInt(t, eff, "burst", 10)
+		assertInt(t, eff, "concurrency", 4)
+		assertInt(t, eff, "daily_budget", 0)
+		assertInt(t, eff, "token_daily_budget", 0)
+		if got, ok := eff["pacing_applies"].(bool); !ok || got {
+			t.Fatalf("effective_limits.pacing_applies = %#v, want false for a mature account", eff["pacing_applies"])
+		}
+	})
+
+	t.Run("warming account exposes scaled stage ceiling, pacing_applies=true", func(t *testing.T) {
+		// 10 days old -> default curve stage w2: rpm 5, concurrency 1, daily 500.
+		anchor := time.Now().Add(-10 * 24 * time.Hour).UTC().Format(time.RFC3339)
+		auth := &coreauth.Auth{
+			ID:         "claude-eff-warming",
+			Provider:   "claude",
+			Status:     coreauth.StatusActive,
+			UpdatedAt:  time.Now(),
+			Attributes: map[string]string{"runtime_only": "true"},
+			Metadata: map[string]any{
+				"first_production_at": anchor,
+				"quota_snapshot": map[string]any{
+					"profile": map[string]any{
+						"organization": map[string]any{"rate_limit_tier": "default_claude_max_20x"},
+					},
+				},
+			},
+		}
+
+		eff := effectiveLimits(t, auth)
+		assertInt(t, eff, "rpm", 5)
+		assertInt(t, eff, "burst", 1)
+		assertInt(t, eff, "concurrency", 1)
+		assertInt(t, eff, "daily_budget", 500)
+		assertInt(t, eff, "token_daily_budget", 0)
+		if got, ok := eff["pacing_applies"].(bool); !ok || !got {
+			t.Fatalf("effective_limits.pacing_applies = %#v, want true for a warming account", eff["pacing_applies"])
+		}
+	})
+
+	t.Run("per-account rate_scale scales the exposed ceiling", func(t *testing.T) {
+		anchor := time.Now().Add(-200 * 24 * time.Hour).UTC().Format(time.RFC3339)
+		auth := &coreauth.Auth{
+			ID:         "claude-eff-scaled",
+			Provider:   "claude",
+			Status:     coreauth.StatusActive,
+			UpdatedAt:  time.Now(),
+			Attributes: map[string]string{"runtime_only": "true"},
+			Metadata: map[string]any{
+				"first_production_at": anchor,
+				"quota_snapshot": map[string]any{
+					"profile": map[string]any{
+						"organization": map[string]any{"rate_limit_tier": "default_claude_max_20x"},
+					},
+				},
+				coreauth.AccountSchedulingMetadataKey: map[string]any{"rate_scale": 0.5},
+			},
+		}
+
+		eff := effectiveLimits(t, auth)
+		// Mature 45/10/4 halved: rpm round(22.5)=23, burst 5, concurrency 2.
+		assertInt(t, eff, "rpm", 23)
+		assertInt(t, eff, "burst", 5)
+		assertInt(t, eff, "concurrency", 2)
+		assertInt(t, eff, "daily_budget", 0)
+	})
+}
+
 // TestBuildAuthFileEntry_AdaptiveScheduling_HealthGate covers the ANCHOR-Q4
 // (design §10.5/§10.7) projection: account_scheduling must additively surface the
 // health-gated warm-up ramp state -- in_distress plus the warmup_health_stage_cap /
