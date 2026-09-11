@@ -100,3 +100,14 @@ func TestTelemetryFailureAndOptionalFields(t *testing.T) {
 		t.Fatal("legacy record gains telemetry")
 	}
 }
+
+func TestTelemetryWebsocketResponseDone(t *testing.T) {
+	r := NewUsageReporter(context.Background(), "codex", "test", nil)
+	r.SetWebsocketTelemetry()
+	r.ObserveContentEvent([]byte(`{"type":"response.output_text.delta","delta":"x"}`))
+	r.ObserveContentEvent([]byte(`{"type":"response.done","response":{"status":"completed"}}`))
+	v := r.telemetrySnapshot(false, usage.Failure{})
+	if v.StreamCompleted == nil || !*v.StreamCompleted || v.FinishReason != "completed" {
+		t.Fatalf("response.done missed: %+v", v)
+	}
+}

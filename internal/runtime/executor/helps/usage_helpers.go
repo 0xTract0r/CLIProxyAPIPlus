@@ -42,6 +42,8 @@ type UsageReporter struct {
 	ttftStart    time.Time
 	ttftSet      bool
 	once         sync.Once
+
+	decodedContentTelemetry bool
 }
 
 type usageExecutor interface {
@@ -193,6 +195,12 @@ func (r *UsageReporter) buildAdditionalModelRecord(model string, detail usage.De
 func (r *UsageReporter) PublishFailure(ctx context.Context, errs ...error) {
 	r.observeFailure(errs...)
 	r.publishWithOutcome(ctx, usage.Detail{}, true, failFromErrors(errs...))
+}
+
+// PublishFailureWithDetail preserves already observed tokens when a stream fails.
+func (r *UsageReporter) PublishFailureWithDetail(ctx context.Context, detail usage.Detail, err error) {
+	r.observeFailure(err)
+	r.publishWithOutcome(ctx, detail, true, failFromErrors(err))
 }
 
 func (r *UsageReporter) TrackFailure(ctx context.Context, errPtr *error) {

@@ -89,7 +89,21 @@ func (r *UsageReporter) SetWebsocketTelemetry() {
 	r.telemetry.Transport = "websocket"
 	r.telemetry.ObservationKind = "protocol_content_events"
 }
+
+// UseDecodedContentTelemetry selects executor protocol-line observation before any
+// HTTP reads. Raw transport reads still measure first-body latency, but must not
+// parse encoded bytes or pre-read terminal events before the executor handles them.
+func (r *UsageReporter) UseDecodedContentTelemetry() {
+	if r == nil {
+		return
+	}
+	r.decodedContentTelemetry = true
+}
+
 func (r *UsageReporter) bodyObserver(resp *http.Response) func([]byte) {
+	if r.decodedContentTelemetry {
+		return nil
+	}
 	if !strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
 		return nil
 	}
@@ -159,7 +173,7 @@ func (r *UsageReporter) ObserveContentEvent(payload []byte) {
 			for _, p := range []string{"delta.text", "delta.thinking", "delta.partial_json"} {
 				content = content || root.Get(p).String() != ""
 			}
-		case "response.completed", "message_stop":
+		case "response.completed", "response.done", "message_stop":
 			recognized = true
 			done = true
 			finish = "completed"
