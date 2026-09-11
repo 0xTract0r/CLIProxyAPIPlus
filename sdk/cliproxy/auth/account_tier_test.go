@@ -148,6 +148,197 @@ func TestAuth_ClaudeSubscriptionTier(t *testing.T) {
 	}
 }
 
+// TestAuth_ClaudeSubscriptionTier_CoarseSignalFallback pins down the coarse
+// Pro/Max fallback that rescues accounts whose upstream rate_limit_tier is
+// missing or a generic/unrecognized value (production-observed: Google Play Pro
+// accounts report "default_claude_ai", which claudeRateLimitTierValues
+// intentionally does not map). The fallback promotes an unambiguous Pro signal
+// (has_claude_pro / organization_type == "claude_pro") to ClaudePro, but must
+// NEVER guess a Max sub-tier from a boolean has_claude_max / a "max" org type —
+// those stay ClaudeTierUnknown (spec.md "SHALL NOT 误判为某一档").
+//
+// Mutation guard: if the `return claudeTierFromCoarseSignals(a.Metadata)` line
+// in ClaudeSubscriptionTier is reverted to `return ClaudeTierUnknown`, every
+// "want: ClaudePro" case below fails.
+func TestAuth_ClaudeSubscriptionTier_CoarseSignalFallback(t *testing.T) {
+	tests := []struct {
+		name string
+		auth *Auth
+		want ClaudeTier
+	}{
+		{
+			// The exact production scenario: a Google Play Pro account whose
+			// upstream rate_limit_tier is the generic "default_claude_ai" but
+			// whose profile carries has_claude_pro=true + organization_type=
+			// claude_pro. Before the fallback this resolved to Unknown.
+			name: "google play pro (default_claude_ai + has_claude_pro + org claude_pro) -> pro",
+			auth: &Auth{Metadata: map[string]any{
+				"quota_snapshot": map[string]any{
+					"profile": map[string]any{
+						"account": map[string]any{
+							"has_claude_pro": true,
+							"has_claude_max": false,
+						},
+						"organization": map[string]any{
+							"rate_limit_tier":   "default_claude_ai",
+							"organization_type": "claude_pro",
+						},
+					},
+				},
+			}},
+			want: ClaudePro,
+		},
+		{
+			name: "pro via has_claude_pro only (no organization_type) -> pro",
+			auth: &Auth{Metadata: map[string]any{
+				"quota_snapshot": map[string]any{
+					"profile": map[string]any{
+						"account":      map[string]any{"has_claude_pro": true},
+						"organization": map[string]any{"rate_limit_tier": "default_claude_ai"},
+					},
+				},
+			}},
+			want: ClaudePro,
+		},
+		{
+			name: "pro via organization_type == claude_pro only (no bool flag) -> pro",
+			auth: &Auth{Metadata: map[string]any{
+				"quota_snapshot": map[string]any{
+					"profile": map[string]any{
+						"organization": map[string]any{
+							"rate_limit_tier":   "default_claude_ai",
+							"organization_type": "claude_pro",
+						},
+					},
+				},
+			}},
+			want: ClaudePro,
+		},
+		{
+			name: "pro flag under older profile.subscription shape -> pro",
+			auth: &Auth{Metadata: map[string]any{
+				"quota_snapshot": map[string]any{
+					"profile": map[string]any{
+						"subscription": map[string]any{"has_claude_pro": true},
+						"organization": map[string]any{"rate_limit_tier": "default_claude_ai"},
+					},
+				},
+			}},
+			want: ClaudePro,
+		},
+		{
+			// Missing rate_limit_tier entirely still hits the fallback.
+			name: "pro flag with no rate_limit_tier key at all -> pro",
+			auth: &Auth{Metadata: map[string]any{
+				"quota_snapshot": map[string]any{
+					"profile": map[string]any{
+						"account": map[string]any{"has_claude_pro": true},
+					},
+				},
+			}},
+			want: ClaudePro,
+		},
+		{
+			// A boolean Max flag cannot distinguish max_5x from max_20x, so the
+			// account MUST stay Unknown rather than be guessed into a Max tier —
+			// and it must NOT fall through to the Pro branch either.
+			name: "has_claude_max true with generic tier is NOT guessed -> unknown",
+			auth: &Auth{Metadata: map[string]any{
+				"quota_snapshot": map[string]any{
+					"profile": map[string]any{
+						"account":      map[string]any{"has_claude_max": true},
+						"organization": map[string]any{"rate_limit_tier": "default_claude_ai"},
+					},
+				},
+			}},
+			want: ClaudeTierUnknown,
+		},
+		{
+			name: "organization_type saying max is NOT guessed -> unknown",
+			auth: &Auth{Metadata: map[string]any{
+				"quota_snapshot": map[string]any{
+					"profile": map[string]any{
+						"organization": map[string]any{
+							"rate_limit_tier":   "default_claude_ai",
+							"organization_type": "claude_max",
+						},
+					},
+				},
+			}},
+			want: ClaudeTierUnknown,
+		},
+		{
+			// Defensive: contradictory flags (both max and pro true). Max wins
+			// -> Unknown, never Pro, so a Max account is never downgraded to Pro.
+			name: "both has_claude_max and has_claude_pro true -> unknown (max wins, no downgrade)",
+			auth: &Auth{Metadata: map[string]any{
+				"quota_snapshot": map[string]any{
+					"profile": map[string]any{
+						"account": map[string]any{
+							"has_claude_max": true,
+							"has_claude_pro": true,
+						},
+						"organization": map[string]any{"rate_limit_tier": "default_claude_ai"},
+					},
+				},
+			}},
+			want: ClaudeTierUnknown,
+		},
+		{
+			// No coarse signal at all -> unchanged Unknown (regression guard for
+			// the pre-existing behavior).
+			name: "generic tier with no coarse signal stays unknown",
+			auth: &Auth{Metadata: map[string]any{
+				"quota_snapshot": map[string]any{
+					"profile": map[string]any{
+						"organization": map[string]any{"rate_limit_tier": "default_claude_ai"},
+					},
+				},
+			}},
+			want: ClaudeTierUnknown,
+		},
+		{
+			// A recognized rate_limit_tier is resolved BEFORE the fallback, so a
+			// contradictory has_claude_max flag never overrides it: proves the
+			// fallback only runs for unrecognized values and does not disturb the
+			// existing exact-match mapping.
+			name: "recognized default_claude_pro wins over contradictory has_claude_max flag",
+			auth: &Auth{Metadata: map[string]any{
+				"quota_snapshot": map[string]any{
+					"profile": map[string]any{
+						"account":      map[string]any{"has_claude_max": true},
+						"organization": map[string]any{"rate_limit_tier": "default_claude_pro"},
+					},
+				},
+			}},
+			want: ClaudePro,
+		},
+		{
+			// tier_override still has top precedence: it wins over both a generic
+			// rate_limit_tier and the coarse Pro flag.
+			name: "tier_override max_20x beats generic tier + has_claude_pro fallback",
+			auth: &Auth{Metadata: map[string]any{
+				TierOverrideMetadataKey: "max_20x",
+				"quota_snapshot": map[string]any{
+					"profile": map[string]any{
+						"account":      map[string]any{"has_claude_pro": true},
+						"organization": map[string]any{"rate_limit_tier": "default_claude_ai"},
+					},
+				},
+			}},
+			want: ClaudeMax20x,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.auth.ClaudeSubscriptionTier(); got != tt.want {
+				t.Fatalf("ClaudeSubscriptionTier() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 // TestAuth_ClaudeSubscriptionTier_DoesNotFold pins down the spec.md
 // requirement that this read path SHALL NOT collapse through the existing
 // NormalizeClaudeSubscriptionPlan folding function: two accounts that

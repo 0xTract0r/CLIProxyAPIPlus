@@ -137,9 +137,19 @@ var codexTierOverrideValues = map[string]CodexTier{
 // ["organization"]["rate_limit_tier"]` field (design.md §1.2/§6.1 — this data
 // is already on disk today, just never consumed at this granularity; no new
 // fetch, no new persistence). Returns ClaudeTierUnknown for a nil Auth, a
-// missing quota_snapshot, or any rate_limit_tier value not in
-// claudeRateLimitTierValues — it never panics and never misjudges an
-// unrecognized value into a specific tier.
+// missing quota_snapshot, or any rate_limit_tier value that neither maps in
+// claudeRateLimitTierValues nor can be rescued by the coarse-signal fallback
+// below — it never panics and never misjudges an unrecognized value into a
+// specific tier.
+//
+// When rate_limit_tier is missing or a generic/unrecognized value (production-
+// observed: Google Play Pro accounts report the generic "default_claude_ai",
+// which is intentionally NOT in claudeRateLimitTierValues), it consults the
+// coarse Pro/Max flags Anthropic already persists in the same quota profile
+// (has_claude_pro / has_claude_max / organization_type) to promote the common
+// "Pro account resolves to unknown" case to ClaudePro. That fallback only ever
+// yields the unambiguous single-tier Pro — it never guesses a Max sub-tier from
+// a boolean (see claudeTierFromCoarseSignals).
 //
 // This does NOT go through registry.NormalizeClaudeSubscriptionPlan or any
 // other existing folding function (spec.md requirement) — do not route this
@@ -160,13 +170,79 @@ func (a *Auth) ClaudeSubscriptionTier() ClaudeTier {
 		}
 	}
 	raw := nestedMetadataString(a.Metadata, "quota_snapshot", "profile", "organization", "rate_limit_tier")
-	if raw == "" {
-		return ClaudeTierUnknown
-	}
 	if tier, ok := claudeRateLimitTierValues[strings.ToLower(raw)]; ok {
 		return tier
 	}
+	// rate_limit_tier is missing or a generic/unrecognized value (e.g.
+	// "default_claude_ai" reported by Google Play Pro accounts). Fall back to
+	// the coarse Pro/Max flags already on disk so those accounts are not all
+	// stranded at Unknown; the fallback never guesses a Max sub-tier.
+	return claudeTierFromCoarseSignals(a.Metadata)
+}
+
+// claudeMaxFlagKeys / claudeProFlagKeys are the boolean quota-profile flag keys
+// that indicate a Max / Pro entitlement. hasTruthyMetadataKey compacts keys
+// (case- and underscore-insensitive), so the underscore spellings here also
+// match camelCase variants (hasClaudeMax / hasClaudePro / hasMax / hasPro).
+var (
+	claudeMaxFlagKeys = []string{"has_claude_max", "has_max"}
+	claudeProFlagKeys = []string{"has_claude_pro", "has_pro"}
+)
+
+// claudeTierFromCoarseSignals is the conservative fallback used ONLY when the
+// upstream rate_limit_tier is missing or a generic/unrecognized value that
+// claudeRateLimitTierValues does not map. It re-uses the coarse Pro/Max flags
+// Anthropic already persists in the quota profile —
+// quota_snapshot.profile.account.has_claude_pro / has_claude_max (current shape,
+// also seen under profile.subscription / profile itself) and
+// quota_snapshot.profile.organization.organization_type — to rescue the common
+// production case where a real Pro account reports the generic
+// "default_claude_ai" rate_limit_tier and would otherwise resolve to Unknown.
+//
+// It NEVER guesses a Max sub-tier: has_claude_max, or an organization_type that
+// says "max", is a boolean-grade signal that cannot distinguish max_5x from
+// max_20x, so any Max signal deliberately stays ClaudeTierUnknown rather than
+// risk a wrong-tier misjudgment (spec.md "SHALL NOT 误判为某一档"). Only the
+// unambiguous single-tier Pro promotion is applied; everything else preserves
+// the pre-existing Unknown result, so no recognized rate_limit_tier or
+// tier_override behavior is affected (those are handled before this is reached).
+func claudeTierFromCoarseSignals(meta map[string]any) ClaudeTier {
+	profile := nestedMetadataObject(meta, "quota_snapshot", "profile")
+	if len(profile) == 0 {
+		return ClaudeTierUnknown
+	}
+	orgType := strings.ToLower(nestedMetadataString(profile, "organization", "organization_type"))
+	// Max first: an account carrying a Max flag is definitely not Pro, and a
+	// boolean/coarse label cannot split max_5x from max_20x, so keep Unknown
+	// instead of guessing a specific Max sub-tier.
+	if profileHasClaudeFlag(profile, claudeMaxFlagKeys) || strings.Contains(orgType, "max") {
+		return ClaudeTierUnknown
+	}
+	if profileHasClaudeFlag(profile, claudeProFlagKeys) || orgType == "claude_pro" {
+		return ClaudePro
+	}
 	return ClaudeTierUnknown
+}
+
+// profileHasClaudeFlag reports whether any of the boolean flag keys is truthy at
+// the quota profile's top level or inside its "account" / "subscription"
+// sub-objects. Anthropic has been observed to place has_claude_pro/has_claude_max
+// under profile.account (current shape), profile.subscription (older shape), and
+// occasionally profile itself, so all three are consulted (matching the tolerant
+// inferClaudePlanType read path in quota_snapshots.go). Reuses
+// hasTruthyMetadataKey, which compacts keys and coerces bool-ish values.
+func profileHasClaudeFlag(profile map[string]any, keys []string) bool {
+	if hasTruthyMetadataKey(profile, keys...) {
+		return true
+	}
+	for _, section := range []string{"account", "subscription"} {
+		if sub, ok := metadataObject(profile[section]); ok {
+			if hasTruthyMetadataKey(sub, keys...) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // CodexTier identifies a Codex account's subscription tier from the raw
@@ -491,4 +567,29 @@ func nestedMetadataString(meta map[string]any, path ...string) string {
 		current = nested
 	}
 	return ""
+}
+
+// nestedMetadataObject walks meta through a sequence of nested-object keys and
+// returns the object found at the final key, or nil if meta is empty or any hop
+// along the path is missing or not an object. Like nestedMetadataString it
+// reuses metadataObject, so it accepts the same tolerant shapes (map[string]any,
+// map[string]string, or anything JSON-marshalable into one) the rest of the Auth
+// metadata-reading code already tolerates.
+func nestedMetadataObject(meta map[string]any, path ...string) map[string]any {
+	current := meta
+	for _, key := range path {
+		if len(current) == 0 {
+			return nil
+		}
+		raw, ok := current[key]
+		if !ok {
+			return nil
+		}
+		nested, ok := metadataObject(raw)
+		if !ok {
+			return nil
+		}
+		current = nested
+	}
+	return current
 }
