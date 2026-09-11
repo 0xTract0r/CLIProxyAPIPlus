@@ -84,6 +84,7 @@ func (p *usageQueuePlugin) HandleUsage(ctx context.Context, record coreusage.Rec
 	fail := resolveFail(ctx, record, failed)
 
 	detail := requestDetail{
+		Telemetry:       record.Telemetry,
 		Timestamp:       timestamp,
 		LatencyMs:       record.Latency.Milliseconds(),
 		TTFTMs:          record.TTFT.Milliseconds(),
@@ -136,16 +137,17 @@ type queuedUsageDetail struct {
 }
 
 type requestDetail struct {
-	Timestamp       time.Time   `json:"timestamp"`
-	LatencyMs       int64       `json:"latency_ms"`
-	TTFTMs          int64       `json:"ttft_ms"`
-	Source          string      `json:"source"`
-	AuthIndex       string      `json:"auth_index"`
-	Tokens          tokenStats  `json:"tokens"`
-	Failed          bool        `json:"failed"`
-	Generate        bool        `json:"generate"`
-	Fail            failDetail  `json:"fail"`
-	ResponseHeaders http.Header `json:"response_headers,omitempty"`
+	Telemetry       *coreusage.Telemetry `json:"telemetry,omitempty"`
+	Timestamp       time.Time            `json:"timestamp"`
+	LatencyMs       int64                `json:"latency_ms"`
+	TTFTMs          int64                `json:"ttft_ms"`
+	Source          string               `json:"source"`
+	AuthIndex       string               `json:"auth_index"`
+	Tokens          tokenStats           `json:"tokens"`
+	Failed          bool                 `json:"failed"`
+	Generate        bool                 `json:"generate"`
+	Fail            failDetail           `json:"fail"`
+	ResponseHeaders http.Header          `json:"response_headers,omitempty"`
 }
 
 type tokenStats struct {

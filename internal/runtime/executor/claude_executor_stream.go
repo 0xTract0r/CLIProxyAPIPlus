@@ -34,6 +34,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	}
 
 	reporter := helps.NewExecutorUsageReporter(ctx, e, baseModel, auth)
+	reporter.UseDecodedContentTelemetry()
 	defer reporter.TrackFailure(ctx, &err)
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("claude")
@@ -200,6 +201,44 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	out := make(chan cliproxyexecutor.StreamChunk)
 	go func() {
 		defer close(out)
+		var streamUsage helps.StreamUsageBuffer
+		var streamErr error
+		terminalSeen, usageFlushed := false, false
+		flushUsage := func(errFinal error) {
+			if usageFlushed {
+				return
+			}
+			usageFlushed = true
+			if detail, ok := streamUsage.Detail(); ok {
+				if errFinal != nil {
+					reporter.PublishFailureWithDetail(ctx, detail, errFinal)
+				} else {
+					reporter.Publish(ctx, detail)
+				}
+			} else if errFinal != nil {
+				reporter.PublishFailure(ctx, errFinal)
+			}
+		}
+		observeLine := func(line []byte) {
+			payload := helps.JSONPayload(line)
+			reporter.ObserveContentEvent(payload)
+			if detail, ok := helps.ParseClaudeStreamUsage(line); ok {
+				streamUsage.Observe(detail, true)
+			}
+			if gjson.GetBytes(payload, "type").String() == "message_stop" {
+				terminalSeen = true
+				flushUsage(nil)
+			}
+		}
+		defer func() {
+			if streamErr == nil {
+				streamErr = ctx.Err()
+			}
+			if streamErr == nil && !terminalSeen {
+				streamErr = io.ErrUnexpectedEOF
+			}
+			flushUsage(streamErr)
+		}()
 		defer func() {
 			if errClose := decodedBody.Close(); errClose != nil {
 				log.Errorf("response body close error: %v", errClose)
@@ -223,10 +262,9 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			scanner.Buffer(nil, 52_428_800) // 50MB
 			for scanner.Scan() {
 				line := scanner.Bytes()
+				observeLine(line)
 				helps.AppendAPIResponseChunk(ctx, e.cfg, line)
-				if detail, ok := helps.ParseClaudeStreamUsage(line); ok {
-					reporter.Publish(ctx, detail)
-				}
+
 				line = restoreClaudeOAuthToolNamesFromStreamLine(line, claudeToolPrefix, auth.ToolPrefixDisabled(), oauthToolNamesReverseMap)
 				line = e.restoreResponseModel(line, req.Model)
 				if !emitRepaired(line) {
@@ -242,7 +280,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			}
 			if errScan := scanner.Err(); errScan != nil {
 				helps.RecordAPIResponseError(ctx, e.cfg, errScan)
-				reporter.PublishFailure(ctx, errScan)
+				streamErr = errScan
 				select {
 				case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
 				case <-ctx.Done():
@@ -277,10 +315,9 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		}
 		for scanner.Scan() {
 			line := scanner.Bytes()
+			observeLine(line)
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
-			if detail, ok := helps.ParseClaudeStreamUsage(line); ok {
-				reporter.Publish(ctx, detail)
-			}
+
 			line = restoreClaudeOAuthToolNamesFromStreamLine(line, claudeToolPrefix, auth.ToolPrefixDisabled(), oauthToolNamesReverseMap)
 			line = e.restoreResponseModel(line, req.Model)
 			if !translateAndEmit(line) {
@@ -289,7 +326,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		}
 		if errScan := scanner.Err(); errScan != nil {
 			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
-			reporter.PublishFailure(ctx, errScan)
+			streamErr = errScan
 			select {
 			case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
 			case <-ctx.Done():

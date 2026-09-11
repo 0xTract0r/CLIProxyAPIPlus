@@ -20,7 +20,8 @@ const AutoServiceTier = "auto"
 
 // Record contains the usage statistics captured for a single provider request.
 type Record struct {
-	Provider string
+	Telemetry *Telemetry `json:"telemetry,omitempty"`
+	Provider  string
 	// ExecutorType stores the concrete executor type that handled the request.
 	ExecutorType string
 	Model        string
