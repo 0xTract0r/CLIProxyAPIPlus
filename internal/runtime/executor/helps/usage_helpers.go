@@ -22,6 +22,8 @@ import (
 )
 
 type UsageReporter struct {
+	telemetryMu  sync.Mutex
+	telemetry    usage.Telemetry
 	provider     string
 	executorType string
 	model        string
@@ -74,6 +76,7 @@ func NewUsageReporter(ctx context.Context, provider, model string, auth *cliprox
 		serviceTier: usage.ServiceTierFromContext(ctx),
 		generate:    usage.GenerateFromContext(ctx),
 	}
+	reporter.initTelemetry(ctx)
 	if auth != nil {
 		reporter.authID = auth.ID
 		reporter.authIndex = auth.EnsureIndex()
@@ -132,10 +135,13 @@ func (r *UsageReporter) ObserveResponse(resp *http.Response) {
 		return
 	}
 	r.StartResponseTTFT()
+	r.observeHeaders(resp)
 	resp.Body = &usageTTFTReadCloser{
 		ReadCloser: resp.Body,
+		observe:    r.bodyObserver(resp),
 		mark: func() {
 			r.MarkFirstResponseByte()
+			r.observeFirstBody()
 		},
 	}
 }
@@ -185,6 +191,7 @@ func (r *UsageReporter) buildAdditionalModelRecord(model string, detail usage.De
 }
 
 func (r *UsageReporter) PublishFailure(ctx context.Context, errs ...error) {
+	r.observeFailure(errs...)
 	r.publishWithOutcome(ctx, usage.Detail{}, true, failFromErrors(errs...))
 }
 
@@ -256,6 +263,7 @@ func (r *UsageReporter) buildRecordForModel(model string, detail usage.Detail, f
 		return usage.Record{Model: model, Detail: detail, Failed: failed, Fail: fail, Generate: usage.GenerateFlag(true)}
 	}
 	return usage.Record{
+		Telemetry:           r.telemetrySnapshot(failed, fail),
 		Provider:            r.provider,
 		ExecutorType:        r.executorType,
 		Model:               model,
@@ -340,7 +348,7 @@ type usageTTFTRoundTripper struct {
 
 func (t usageTTFTRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	t.reporter.StartResponseTTFT()
-	resp, errRoundTrip := t.base.RoundTrip(req)
+	resp, errRoundTrip := t.base.RoundTrip(t.reporter.traceRequest(req))
 	if errRoundTrip != nil {
 		return resp, errRoundTrip
 	}
@@ -350,8 +358,9 @@ func (t usageTTFTRoundTripper) RoundTrip(req *http.Request) (*http.Response, err
 
 type usageTTFTReadCloser struct {
 	io.ReadCloser
-	once sync.Once
-	mark func()
+	once    sync.Once
+	mark    func()
+	observe func([]byte)
 }
 
 func (r *usageTTFTReadCloser) Read(p []byte) (int, error) {
@@ -361,6 +370,9 @@ func (r *usageTTFTReadCloser) Read(p []byte) (int, error) {
 	n, errRead := r.ReadCloser.Read(p)
 	if n > 0 && r.mark != nil {
 		r.once.Do(r.mark)
+	}
+	if n > 0 && r.observe != nil {
+		r.observe(p[:n])
 	}
 	return n, errRead
 }
