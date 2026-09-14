@@ -21,6 +21,35 @@ Common operator tasks and where each one lives:
 | See why one account was decelerated | `in_distress` / `warmup_health_stage_cap` / `warmup_last_distress_at`; compare `warmup.stage` vs `warmup.age_days` | §3.6 / §3.7 |
 | Change an operator override (tier / rate / anchor) | `PATCH /v0/management/auth-files/account-scheduling` | §3.5 |
 
+## Recommended values quick reference
+
+> These recommended values used to be buried in the ops deployment doc, out of sight when
+> reading the parameters; this section lifts them into the parameter reference so you can
+> see what to set right here. **The authoritative source for deployment-time configuration
+> remains `docs/operations/deploy/remote-core-maintenance.md`** (in the umbrella
+> `cliproxy-stack` repo); this table is only a quick reference and that doc wins on any
+> discrepancy.
+
+| Parameter | Default | Recommended | Notes |
+| --- | --- | --- | --- |
+| `account-scheduling.rate-scale` / per-account `rate_scale` (§3.4) | `1.0` | `1.0` (no scaling) | Effective rate-limit multiplier (scales rpm/burst/concurrency/daily-budget). **There is no "set X for old accounts / Y for new accounts" scenario number** — the default is simply `1.0`; only set a specific account `< 1` for a low-risk slow test, tuning as needed. Do not copy a fixed number. Must be `> 0`. |
+| `account-scheduling.anti-streak-limit` (anti-streak) | `0` (off) | **`3`** (production) | Force-rotate a **warm-up account** away once it has been picked ≤ this many times in a row. Applies only to warm-up accounts (mature accounts are exempt) and is cache-safe (does not change the long-term 20:5:1 share); largely idle when a single mature account carries all traffic (no warm-up accounts to rotate to). |
+| `account-scheduling.warmup-curve[*].token-daily-budget` (warm-up account token daily budget) | `0` (unbounded) | **`0` — pending real-traffic calibration** | Rolling-24h billable-token hard gate for warm-up accounts. **No concrete positive value has been calibrated yet**: run a real-traffic gray release to see the burn curve first, then set it — **do not just pick a number**. Mature accounts' `mature-limits.token-daily-budget` stays `0` (unbounded). |
+| `account-scheduling.tier-weights.claude` | `max_20x:20 / max_5x:5 / pro:1 / unknown:1` | Same as default (20:5:1) | Weighted selection by Claude subscription tier. |
+| `max-retry-credentials` (top-level, not inside `account-scheduling`) | `2` | `2` | How many accounts a single failed request may fail over across. `-1` = escape hatch (traverse the whole pool; use with care). |
+| warm-up curve (`warmup-curve` per-stage rpm / concurrency / daily-budget) | see stage table | see stage table | The rpm / concurrency / daily-budget of each warm-up stage (cold / w1 / w2 / w3-4 / w5-6 / w7-8 / mature) live in the default curve referenced by §1 "Progressive ramp-up during a new account's warm-up period", or the warm-up stage table in `docs/operations/deploy/remote-core-maintenance.md` — not repeated here. |
+
+Honest caveats:
+
+- Everything above is a **global config-file knob** (the `account-scheduling` section of the
+  remote `config.yaml` plus the top-level `max-retry-credentials`) and is **not editable from
+  the settings-page UI**. The settings-page UI only exposes three per-account controls:
+  `tier` (subscription tier, §3.1), `rate_scale` (rate multiplier, §3.4), and the
+  first-production anchor `first_production_at` (§3.2).
+- **The authoritative source for deployment-time configuration is
+  `docs/operations/deploy/remote-core-maintenance.md`** (in the umbrella `cliproxy-stack`
+  repo); this table is a quick reference and that doc is the source of truth.
+
 ## 1. Overview
 
 > **Scope: Claude accounts only.** This feature — the scheduling projection, weighted
