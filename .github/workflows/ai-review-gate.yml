@@ -1,0 +1,202 @@
+name: AI Review Gate
+
+on:
+  # Evaluate each new head even before this workflow reaches the default branch.
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+  pull_request_review:
+    types:
+      - submitted
+      - edited
+      - dismissed
+  issue_comment:
+    types:
+      - created
+      - edited
+      - deleted
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+
+concurrency:
+  group: ai-review-gate-${{ github.event.pull_request.number || github.event.issue.number || github.run_id }}-${{ github.event_name == 'issue_comment' && !contains(github.event.comment.body || '', 'AI_REVIEW_STATUS:') && !contains(github.event.changes.body.from || '', 'AI_REVIEW_STATUS:') && github.run_id || 'marker' }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    name: Require AI review marker
+    if: ${{ github.event_name == 'pull_request' || github.event_name == 'pull_request_review' || (github.event_name == 'issue_comment' && github.event.issue.pull_request && (github.event.action == 'deleted' || contains(github.event.comment.body || '', 'AI_REVIEW_STATUS:') || contains(github.event.changes.body.from || '', 'AI_REVIEW_STATUS:'))) }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check AI review marker
+        uses: actions/github-script@v7
+        env:
+          STRICT_THIRD_PARTY: ${{ vars.AI_REVIEW_STRICT_THIRD_PARTY || '0' }}
+          TRUSTED_REVIEWERS: ${{ vars.AI_REVIEW_TRUSTED_REVIEWERS || '' }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const strictThirdParty = ['1', 'true', 'yes'].includes(
+              String(process.env.STRICT_THIRD_PARTY || '').toLowerCase()
+            );
+            const trustedReviewerLogins = new Set(
+              String(process.env.TRUSTED_REVIEWERS || '')
+                .split(/[\s,]+/)
+                .map((login) => login.trim().toLowerCase())
+                .filter(Boolean)
+            );
+            const trustedAssociations = new Set(['OWNER', 'MEMBER', 'COLLABORATOR']);
+            const markerPattern = /AI_REVIEW_STATUS:\s*(approved|changes_requested)\b[\s\S]*?AI_REVIEW_HEAD:\s*([0-9a-f]{7,40})/i;
+            const commentBody = context.payload.comment?.body || '';
+            const previousCommentBody = context.payload.changes?.body?.from || '';
+
+            if (
+              context.eventName === 'issue_comment' &&
+              ['created', 'edited', 'deleted'].includes(context.payload.action) &&
+              !markerPattern.test(commentBody) &&
+              !markerPattern.test(previousCommentBody)
+            ) {
+              core.info('Issue comment does not contain an AI review marker; skipping gate evaluation.');
+              await core.summary
+                .addHeading('AI Review Gate')
+                .addList([
+                  `Event: issue_comment.${context.payload.action}`,
+                  'Result: ignored non-marker comment',
+                ])
+                .write();
+              return;
+            }
+
+            const prNumber =
+              context.payload.pull_request?.number ||
+              context.payload.issue?.number ||
+              context.payload.review?.pull_request_url?.split('/').pop();
+
+            if (!prNumber) {
+              core.setFailed('Unable to determine pull request number.');
+              return;
+            }
+
+            const { data: pr } = await github.rest.pulls.get({
+              owner,
+              repo,
+              pull_number: Number(prNumber),
+            });
+
+            const headSha = pr.head.sha;
+            const prAuthor = pr.user.login;
+            const markers = [];
+
+            const markerField = (body, name) => {
+              const match = body.match(new RegExp(`^${name}:\\s*(.+?)\\s*$`, 'im'));
+              return match ? match[1].trim() : '';
+            };
+
+            const pushMarker = ({ body, source, author, association, at, url }) => {
+              const match = body.match(markerPattern);
+              if (!match) return;
+              markers.push({
+                source,
+                status: match[1].toLowerCase(),
+                markerHead: match[2].toLowerCase(),
+                mode: markerField(body, 'AI_REVIEW_MODE').toLowerCase(),
+                reviewer: markerField(body, 'AI_REVIEWER'),
+                session: markerField(body, 'AI_REVIEW_SESSION'),
+                author: author || '',
+                association: association || '',
+                at,
+                url,
+              });
+            };
+
+            const isTrustedMarkerAuthor = (marker) => {
+              if (!marker.author) return false;
+              if (trustedReviewerLogins.has(marker.author.toLowerCase())) return true;
+              return trustedAssociations.has(String(marker.association || '').toUpperCase());
+            };
+
+            const reviews = await github.paginate(github.rest.pulls.listReviews, {
+              owner,
+              repo,
+              pull_number: Number(prNumber),
+              per_page: 100,
+            });
+
+            for (const review of reviews) {
+              if (!review.body) continue;
+              if (String(review.state || '').toUpperCase() === 'DISMISSED') continue;
+              pushMarker({
+                body: review.body,
+                source: 'review',
+                author: review.user?.login || '',
+                association: review.author_association || '',
+                at: review.submitted_at || review.updated_at || review.created_at,
+                url: review.html_url,
+              });
+            }
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner,
+              repo,
+              issue_number: Number(prNumber),
+              per_page: 100,
+            });
+
+            for (const comment of comments) {
+              if (!comment.body) continue;
+              pushMarker({
+                body: comment.body,
+                source: 'comment',
+                author: comment.user?.login || '',
+                association: comment.author_association || '',
+                at: comment.updated_at || comment.created_at,
+                url: comment.html_url,
+              });
+            }
+
+            const currentHeadMarkers = markers
+              .filter((marker) => headSha.toLowerCase().startsWith(marker.markerHead))
+              .filter((marker) => {
+                if (!isTrustedMarkerAuthor(marker)) return false;
+                if (marker.author !== prAuthor) return true;
+                if (strictThirdParty) return false;
+                return marker.mode === 'independent-ai-session' &&
+                  Boolean(marker.reviewer || marker.session);
+              })
+              .sort((a, b) => new Date(b.at) - new Date(a.at));
+
+            if (currentHeadMarkers.length === 0) {
+              const modeHint = strictThirdParty
+                ? 'Expected AI_REVIEW_STATUS and AI_REVIEW_HEAD from a trusted GitHub user other than the PR author.'
+                : 'Expected a trusted non-author marker, or trusted same-account marker with AI_REVIEW_MODE: independent-ai-session and AI_REVIEWER/AI_REVIEW_SESSION.';
+              core.setFailed(
+                `No eligible AI review marker found for PR #${prNumber} head ${headSha}. ${modeHint}`
+              );
+              return;
+            }
+
+            const latest = currentHeadMarkers[0];
+            core.info(`Latest AI review marker: ${latest.status} by ${latest.author} at ${latest.at}`);
+            core.info(`Marker source: ${latest.source} ${latest.url}`);
+
+            if (latest.status !== 'approved') {
+              core.setFailed(`Latest eligible AI review marker is ${latest.status}, not approved.`);
+              return;
+            }
+
+            await core.summary
+              .addHeading('AI Review Gate')
+              .addList([
+                `PR: #${prNumber}`,
+                `Head: ${headSha}`,
+                `Reviewer: ${latest.author}`,
+                `Mode: ${latest.mode || 'github-third-party'}`,
+                `Status: ${latest.status}`,
+                `Marker: ${latest.url}`,
+              ])
+              .write();
