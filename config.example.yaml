@@ -330,6 +330,13 @@ routing:
 #   # keeping the pre-P1a pure-weighted selection byte-identical; a small single-digit
 #   # value is the intended production setting. MUST be >= 0.
 #   anti-streak-limit: 0
+#   # Opt-in Claude service opportunities; not a total request/token share.
+#   warmup-serving-reserve: 0
+#   # Non-renewing binding age; zero disables the age fallback.
+#   warmup-serving-max-binding-age-seconds: 0
+#   # Per-process rolling-hour estimated input rebuild budget; zero disables
+#   # all proactive migration, including idle/context-reset windows.
+#   warmup-serving-migration-token-budget: 0
 #   # Health-gated warm-up ramp (ANCHOR-Q4, design.md §10). Warm-up promotion
 #   # depends on account health, not calendar age alone: an account showing an
 #   # early risk-control signal (a recent failure cluster, or an escalated 429

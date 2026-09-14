@@ -1,6 +1,9 @@
 package config
 
-import "fmt"
+import (
+	"fmt"
+	"math"
+)
 
 // AccountSchedulingConfig configures the adaptive account-scheduling subsystem
 // consumed by the "adaptive" routing.strategy value (see RoutingConfig.Strategy
@@ -88,6 +91,22 @@ type AccountSchedulingConfig struct {
 	// small single-digit value (design §4 P1a "个位数") is the intended
 	// production setting. MUST be >= 0 (see Validate).
 	AntiStreakLimit int `yaml:"anti-streak-limit,omitempty" json:"anti-streak-limit,omitempty"`
+
+	// WarmupServingReserve reserves a fraction of new independent service
+	// opportunities for warming Claude accounts. Zero disables all serving
+	// reserve behavior, including child identities and proactive migration.
+	// This probability is neither a total traffic cap nor a guaranteed floor.
+	WarmupServingReserve float64 `yaml:"warmup-serving-reserve,omitempty" json:"warmup-serving-reserve,omitempty"`
+
+	// WarmupServingMaxBindingAgeSeconds enables non-renewing binding-age
+	// reassessment. Zero disables the age fallback; natural windows still
+	// require a positive migration budget.
+	WarmupServingMaxBindingAgeSeconds int `yaml:"warmup-serving-max-binding-age-seconds,omitempty" json:"warmup-serving-max-binding-age-seconds,omitempty"`
+
+	// WarmupServingMigrationTokenBudget caps estimated input reconstruction
+	// tokens for proactive migration over a rolling hour in this process.
+	// Zero disables all proactive migration of existing bindings.
+	WarmupServingMigrationTokenBudget int `yaml:"warmup-serving-migration-token-budget,omitempty" json:"warmup-serving-migration-token-budget,omitempty"`
 
 	// HealthGate configures the health-gated warm-up ramp (ANCHOR-Q4, design §10):
 	// warm-up promotion depends on an account's recent health (early risk-control
@@ -332,6 +351,12 @@ func DefaultAccountTierWeights() AccountTierWeightsConfig {
 // overlaps, positive limits) — it does not and cannot validate anything
 // about live account state, which is Phase 1-4's concern.
 func (c AccountSchedulingConfig) Validate() error {
+	if math.IsNaN(c.WarmupServingReserve) || math.IsInf(c.WarmupServingReserve, 0) || c.WarmupServingReserve < 0 || c.WarmupServingReserve >= 1 {
+		return fmt.Errorf("account-scheduling.warmup-serving-reserve must be finite and in [0,1)")
+	}
+	if c.WarmupServingMaxBindingAgeSeconds < 0 || c.WarmupServingMigrationTokenBudget < 0 {
+		return fmt.Errorf("account-scheduling warmup serving age and migration budget must not be negative")
+	}
 	if errStages := validateAccountWarmupCurve(c.WarmupCurve); errStages != nil {
 		return errStages
 	}

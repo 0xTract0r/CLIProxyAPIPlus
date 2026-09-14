@@ -324,3 +324,8 @@ fork文件-反关联支撑	farm_liveness_probe.go	file	-	internal/api/handlers/m
 调度层-限流器加固	P3_token计入接线到usage-sink	pattern	coreauth\.RecordAccountBillableTokens\(	internal/usage/logger_plugin.go
 调度层-限流器加固	OverTokenBudget超预算判定	symbol	^func \(g \*AccountConcurrencyGate\) OverTokenBudget\(	sdk/cliproxy/auth/account_gate.go
 调度层-限流器加固	RecordTokensWindow滚动窗口记账	symbol	^func \(g \*AccountConcurrencyGate\) RecordTokensWindow\(	sdk/cliproxy/auth/account_gate.go
+
+# Warm-up serving reserve: opt-in routing, guarded stickiness and bounded migration.
+scheduling-warmup-reserve	pick-entry	pattern	s\.pickWithWarmupServing\(	sdk/cliproxy/auth/adaptive_selector.go
+scheduling-warmup-reserve	guarded-keep	pattern	s\.boundServableForKeep\(boundAuth, cfg, now\)	sdk/cliproxy/auth/warmup_serving.go
+scheduling-warmup-reserve	mixed-manager-regression	symbol	^func TestWarmupServingManagerMixedClaudeRoute\(	sdk/cliproxy/auth/warmup_serving_test.go

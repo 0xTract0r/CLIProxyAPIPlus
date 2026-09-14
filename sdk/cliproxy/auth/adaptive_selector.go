@@ -127,6 +127,13 @@ type AdaptiveSelector struct {
 	// picks). Guarded by pickMu.
 	lastWarmPickID string
 	warmPickStreak int
+
+	// servingMu serializes only opt-in selection/state, never upstream IO.
+	servingMu       sync.Mutex
+	servingActive   atomic.Bool
+	servingAccounts map[string]warmupServingAccount
+	servingCharges  []warmupMigrationCharge
+	servingOrder    uint64
 }
 
 // defaultAdaptiveReclaimInterval is how often an owned rate limiter's idle
@@ -272,6 +279,13 @@ func (s *AdaptiveSelector) Pick(ctx context.Context, provider, model string, opt
 	}
 	available = preferCodexWebsocketAuths(ctx, provider, available)
 	cfg := s.scheduling()
+	if cfg.WarmupServingReserve > 0 && warmupServingClaudeRoute(provider, available) {
+		if picked, handled, errServing := s.pickWithWarmupServing(ctx, provider, model, opts, auths, available, cfg, now); handled {
+			return picked, errServing
+		}
+	} else if cfg.WarmupServingReserve <= 0 && s.servingActive.Load() {
+		s.clearWarmupServing()
+	}
 
 	if s.sessionAffinity && s.cache != nil {
 		if picked, handled, reason, sessionID, errPick := s.pickWithAffinity(ctx, provider, model, opts, auths, available, cfg, now); handled {
@@ -1151,6 +1165,9 @@ func (s *AdaptiveSelector) hasConcurrencyHeadroom(a *Auth, cfg internalconfig.Ac
 // conductor_lifecycle.go) when a credential cools down or is removed, so a
 // session does not keep resolving to a dead account.
 func (s *AdaptiveSelector) InvalidateAuth(authID string) {
+	s.servingMu.Lock()
+	defer s.servingMu.Unlock()
+	delete(s.servingAccounts, authID)
 	if s.cache != nil {
 		s.cache.InvalidateAuth(authID)
 	}
@@ -1161,6 +1178,7 @@ func (s *AdaptiveSelector) InvalidateAuth(authID string) {
 // implements StoppableSelector and is safe to call more than once. An injected
 // rate limiter is left running for its owner to Stop.
 func (s *AdaptiveSelector) Stop() {
+	s.clearWarmupServing()
 	if s.cache != nil {
 		s.cache.Stop()
 	}
