@@ -9,6 +9,7 @@ import (
 type sessionEntry struct {
 	authID    string
 	expiresAt time.Time
+	serving   *warmupServingSession
 }
 
 // SessionCache provides TTL-based session to auth mapping with automatic cleanup.
@@ -17,6 +18,8 @@ type SessionCache struct {
 	entries map[string]sessionEntry
 	ttl     time.Duration
 	stopCh  chan struct{}
+	// Opt-in expiry markers prevent an expired binding from becoming an extra reserve draw.
+	servingExpired map[string]time.Time
 }
 
 // NewSessionCache creates a cache with the specified TTL.
@@ -48,7 +51,10 @@ func (c *SessionCache) Get(sessionID string) (string, bool) {
 	}
 	if time.Now().After(entry.expiresAt) {
 		c.mu.Lock()
-		delete(c.entries, sessionID)
+		if current, exists := c.entries[sessionID]; exists && current.expiresAt.Equal(entry.expiresAt) {
+			c.rememberServingExpiryLocked(sessionID, entry)
+			delete(c.entries, sessionID)
+		}
 		c.mu.Unlock()
 		return "", false
 	}
@@ -69,6 +75,7 @@ func (c *SessionCache) GetAndRefresh(sessionID string) (string, bool) {
 		return "", false
 	}
 	if now.After(entry.expiresAt) {
+		c.rememberServingExpiryLocked(sessionID, entry)
 		delete(c.entries, sessionID)
 		c.mu.Unlock()
 		return "", false
@@ -145,6 +152,7 @@ func (c *SessionCache) cleanup() {
 	c.mu.Lock()
 	for sid, entry := range c.entries {
 		if now.After(entry.expiresAt) {
+			c.rememberServingExpiryLocked(sid, entry)
 			delete(c.entries, sid)
 		}
 	}

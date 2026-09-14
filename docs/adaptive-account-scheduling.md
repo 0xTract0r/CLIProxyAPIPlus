@@ -556,6 +556,57 @@ How the cpamp account page renders the §2.5 projection fields for operators:
     restarts; only the rate-limit / daily-budget / concurrency "counter" state gets
     rebuilt.
 
+## Opt-in warm-up serving reserve
+
+All three settings default to zero under `account-scheduling`:
+
+```yaml
+warmup-serving-reserve: 0
+warmup-serving-max-binding-age-seconds: 0
+warmup-serving-migration-token-budget: 0
+```
+
+A positive reserve enables additional new-session opportunities for eligible warming
+Claude accounts, including independently identified fresh Claude Code children. The
+probability is not a total request/token share or a guaranteed minimum. Existing
+health, request/token budget, concurrency and rate-smoothing rules still apply.
+Reserved sessions keep their account while `boundServableForKeep` permits it; exhausted
+or unavailable accounts reselect normally. First-production anchors still require a
+real successful response.
+
+Child identity uses the root session and `x-claude-code-agent-id`; nested children use
+`x-claude-code-parent-agent-id` to find their parent. Resume keeps the child binding.
+With no reliable parent sample, or inherited history/fork evidence, the child prefers
+the parent's account. Summaries retain hashes and sizes, never request text. The
+Manager's `mixed` route is supported only when its current candidates are all Claude;
+heterogeneous provider pools keep the previous policy.
+
+A positive migration budget permits reassessment of **existing** bindings after
+cache-expiry idle windows or substantial verified context shortening. A positive maximum
+binding age additionally permits age-based reassessment without renewing that age on
+every turn. Requests must have a conservative text input-cost estimate, an idle source
+account and a warming target whose real outbound count has not advanced throughout an
+observation period (the configured binding age, capped at 24 hours, or one hour when
+age fallback is disabled). Recently assigned targets wait the same period. Selection
+counts are kept separate from actual outbound attempts and never count as successes.
+
+The migration budget is a per-process rolling-hour **estimate** of input reconstruction
+tokens, reserved atomically before selection. Opaque/media input, insufficient budget,
+no underserved target, or an in-flight source suppresses migration. The source check is
+an instantaneous account-level observation, not a distributed session lock. A cached
+assistant prefix followed by an uncached user task also suppresses migration: this
+protects the observed Claude Code compaction request shape, but is deliberately broader
+than compaction and does not claim to identify every compaction implementation.
+
+Unknown cache TTLs conservatively use one hour. Idle reassessment needs a surviving
+session binding; configure a session-affinity TTL longer than the cache TTL to exercise
+that path. Expired bindings keep a bounded one-hour marker that suppresses an additional
+reserve lottery and uses ordinary reselection instead. Cache entries/markers are capped
+at 4096; migration charges are likewise bounded. No new persistence store is introduced.
+Setting reserve back to zero clears child bindings, pins and reserve/migration state;
+ordinary root bindings and the previous D5 policy remain. The single-account/all-warming
+case continues to use the existing normal selection and safety gates.
+
 ## Code index
 
 Symbol/file locations, moved out of the prose above (verified against the current code as
@@ -564,6 +615,7 @@ of 2026-09):
 | Mechanism / field | Code location |
 | --- | --- |
 | Selection weighting (`AccountSelectionWeight`) | `sdk/cliproxy/auth/account_weight.go` |
+| Opt-in service reserve, child identity and migration | `sdk/cliproxy/auth/warmup_serving.go` |
 | Per-account token bucket (`AccountRateLimiter`) | `sdk/cliproxy/auth/account_rate_limiter.go` |
 | Management-API projection write site | `internal/api/handlers/management/auth_files.go` (~line 490) |
 | Legacy projection builder (`buildAdaptiveSchedulingView`) | `internal/api/handlers/management/auth_files_adaptive_scheduling.go` |
