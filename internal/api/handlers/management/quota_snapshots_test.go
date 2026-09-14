@@ -1429,7 +1429,8 @@ func TestQuotaSnapshotStartupReschedulesFutureNextWhenPolicyShortens(t *testing.
 	if !ok {
 		t.Fatal("next refresh timestamp missing")
 	}
-	minNext := start.Add(time.Minute)
+	// Schedule metadata uses RFC3339 seconds; compare its lower bound at the same precision.
+	minNext := start.Add(time.Minute).Truncate(time.Second)
 	maxNext := start.Add(2*time.Minute + 2*time.Second)
 	if next.Before(minNext) || next.After(maxNext) {
 		t.Fatalf("next refresh = %s, want within %s..%s", next.Format(time.RFC3339Nano), minNext.Format(time.RFC3339Nano), maxNext.Format(time.RFC3339Nano))
