@@ -19,6 +19,29 @@
 | 查某号为啥被减速 | `in_distress` / `warmup_health_stage_cap` / `warmup_last_distress_at`；对比 `warmup.stage` vs `warmup.age_days` | §3.6 / §3.7 |
 | 改运维覆盖（档位 / 速率 / 锚点） | `PATCH /v0/management/auth-files/account-scheduling` | §3.5 |
 
+## 推荐取值速查
+
+> 这些推荐值原本埋在运维部署文档里，读参数时看不到；本节把它们提炼到参数专题，方便读参数
+> 时直接看到该配多少。**部署时配置的权威真源仍是 `docs/operations/deploy/remote-core-maintenance.md`**
+> （在 umbrella `cliproxy-stack` 仓库），本表只是速查，任何出入以那份文档为准。
+
+| 参数 | 默认值 | 推荐值 | 说明 |
+| --- | --- | --- | --- |
+| `account-scheduling.rate-scale` / per-account `rate_scale`（§3.4） | `1.0` | `1.0`（不缩放） | 有效限流乘子（缩放 rpm/burst/并发/日预算）。**没有"老号该设多少 / 新号该设多少"的场景化数字**——默认就是 `1.0`，只在对某个具体号做低风险慢速测时才把该号设 `< 1`，按需微调，别照抄一个固定数。必须 `> 0`。 |
+| `account-scheduling.anti-streak-limit`（反连击） | `0`（关） | **`3`**（生产） | 同一**养号号**连续被选 ≤ 该值即强制轮换到其它可用号。只作用于养号号（成熟号豁免）、缓存安全（不改长期 20:5:1 份额）；当池子里只有单个成熟号扛全部流量时基本空转（没有可轮换的养号号）。 |
+| `account-scheduling.warmup-curve[*].token-daily-budget`（养号号 token 日预算） | `0`（无界） | **`0` —— 待真流量校准** | 养号号 rolling-24h billable-token 硬闸。**具体正值尚未标定**：要先跑真流量灰度看清 burn 曲线再设，**不要直接拍一个数字**。成熟号的 `mature-limits.token-daily-budget` 恒 `0`（无界）。 |
+| `account-scheduling.tier-weights.claude` | `max_20x:20 / max_5x:5 / pro:1 / unknown:1` | 同默认（20:5:1） | 按 Claude 订阅档加权选号。 |
+| `max-retry-credentials`（顶层，非 `account-scheduling` 内） | `2` | `2` | 单个失败请求最多跨几个号 failover。`-1` = 逃生口（遍历全池，慎用）。 |
+| warmup 曲线（`warmup-curve` 各档 rpm / 并发 / 日预算） | 见档位表 | 见档位表 | 各养号档（cold / w1 / w2 / w3-4 / w5-6 / w7-8 / mature）的 rpm / 并发 / 日预算，见 §1「新号养号期渐进放量」引用的默认曲线，或 `docs/operations/deploy/remote-core-maintenance.md` 的 warmup 档位表——此处不重复数字。 |
+
+诚实附注：
+
+- 上表都是**全局 config 文件旋钮**（远端 `config.yaml` 的 `account-scheduling` 段 + 顶层
+  `max-retry-credentials`），**设置页 UI 不可编辑**。设置页 UI 只暴露 per-account 的三项：
+  `tier`（订阅档，§3.1）、`rate_scale`（速率乘子，§3.4）、首投锚点 `first_production_at`（§3.2）。
+- **部署时配置的权威真源是 `docs/operations/deploy/remote-core-maintenance.md`**（在 umbrella
+  `cliproxy-stack` 仓库），本表是速查，取值以那份文档为准。
+
 ## 1. 概述
 
 > **适用范围：仅 Claude 账号。** 本特性——调度投影、加权选号、养号、下文的管理端点——只
