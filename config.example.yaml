@@ -330,12 +330,22 @@ routing:
 #   # keeping the pre-P1a pure-weighted selection byte-identical; a small single-digit
 #   # value is the intended production setting. MUST be >= 0.
 #   anti-streak-limit: 0
-#   # Opt-in Claude service opportunities; not a total request/token share.
+#   # Warm-up reserve: default 0 disables it; this production profile explicitly uses 0.15.
+#   # 养号新会话预留概率：默认0=关闭；本项目生产已显式配置0.15。
+#   # Persist the value in new configs; normal deployments must preserve existing runtime values.
+#   # 新建配置若要启用，请明确填0.15；普通部署保留现有生产配置，不必每次重设。
+#   # Shared opportunity probability, not a per-account guarantee or total request/token share.
+#   # 养号号共享这份机会，不是每号各15%，也不是总请求/token占比上限。
 #   warmup-serving-reserve: 0
-#   # Non-renewing binding age; zero disables the age fallback.
+#   # Non-renewing binding age in seconds; 0 disables the age fallback.
+#   # 绑定年龄阈值（秒），不会因续聊而重置；默认0=关闭年龄兜底。
+#   # Age migration also needs reserve enabled, a positive migration budget and safety eligibility.
+#   # 年龄迁移还要求预留已启用、迁移预算为正及其他安全条件满足。
 #   warmup-serving-max-binding-age-seconds: 0
-#   # Per-process rolling-hour estimated input rebuild budget; zero disables
-#   # all proactive migration, including idle/context-reset windows.
+#   # Per-process rolling-hour estimated input rebuild budget, not a daily account token budget.
+#   # 本进程滚动1小时的输入缓存重建估算预算；不是账号每日token预算。
+#   # Zero disables all proactive migration, including idle and context-reset windows.
+#   # 默认0=关闭所有已有会话主动迁移，包括空闲和上下文重建窗口。
 #   warmup-serving-migration-token-budget: 0
 #   # Health-gated warm-up ramp (ANCHOR-Q4, design.md §10). Warm-up promotion
 #   # depends on account health, not calendar age alone: an account showing an
