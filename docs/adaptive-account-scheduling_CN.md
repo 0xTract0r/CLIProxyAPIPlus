@@ -1,8 +1,11 @@
 # 自适应账号调度（Adaptive Account Scheduling）
 
+[English](adaptive-account-scheduling.md)
+
 > 实现对应 `openspec/changes/add-adaptive-account-scheduling`。config 字段定义已在
 > `core/config.example.yaml` 的 `account-scheduling` 段完整覆盖，本文不重复列出，只补充
-> 管理 API 的只读字段参考和运维说明。字段/行为已对照 2026-09 当前代码核实。代码/符号位置
+> 管理 API 的只读字段参考、运维说明及养号服务预留扩展（`add-warmup-serving-reserve`）。
+> 字段/行为已对照 2026-09 当前代码核实。代码/符号位置
 > 统一收敛在文末[代码索引](#代码索引)，不再逐句内联在每个论断后面。
 
 ## 运维速查
@@ -12,6 +15,7 @@
 | 我想… | 用什么 | 在哪 |
 | --- | --- | --- |
 | 启用自适应调度 | `routing.strategy: "adaptive"` | §1 |
+| 启用养号机会并核对生产值 | `warmup-serving-reserve`及迁移参数 | [养号服务预留](#养号服务预留) |
 | 读某号的订阅档 / 额度 / 养号态 | `GET /v0/management/auth-files` 的 `account_scheduling` 投影 | §2 |
 | 给某号钉死订阅档 | `tier_override`（端点或 auth JSON） | §3.1 / §3.5 |
 | 迁移老号 / 回填养号锚点 | `first_production_at`（端点回填） | §3.2 / §3.5 |
@@ -27,6 +31,9 @@
 
 | 参数 | 默认值 | 推荐值 | 说明 |
 | --- | --- | --- | --- |
+| `account-scheduling.warmup-serving-reserve` | `0`（关） | `0.15`（本项目生产） | 多个养号号共享新机会概率，不是总流量上限；需明确保存才能启用。见[养号服务预留](#养号服务预留)。 |
+| `account-scheduling.warmup-serving-max-binding-age-seconds` | `0` | `0`（年龄兜底关闭） | 不随续聊重置的年龄，单位秒；仅设正值不会自动启用迁移。 |
+| `account-scheduling.warmup-serving-migration-token-budget` | `0` | `0`（主动迁移关闭） | 本进程滚动1小时输入重建估算预算，与账号每日token预算分开。 |
 | `account-scheduling.rate-scale` / per-account `rate_scale`（§3.4） | `1.0` | `1.0`（不缩放） | 有效限流乘子（缩放 rpm/burst/并发/日预算）。**没有"老号该设多少 / 新号该设多少"的场景化数字**——默认就是 `1.0`，只在对某个具体号做低风险慢速测时才把该号设 `< 1`，按需微调，别照抄一个固定数。必须 `> 0`。 |
 | `account-scheduling.anti-streak-limit`（反连击） | `0`（关） | **`3`**（生产） | 同一**养号号**连续被选 ≤ 该值即强制轮换到其它可用号。只作用于养号号（成熟号豁免）、缓存安全（不改长期 20:5:1 份额）；当池子里只有单个成熟号扛全部流量时基本空转（没有可轮换的养号号）。 |
 | `account-scheduling.warmup-curve[*].token-daily-budget`（养号号 token 日预算） | `0`（无界） | **`0` —— 待真流量校准** | 养号号 rolling-24h billable-token 硬闸。**具体正值尚未标定**：要先跑真流量灰度看清 burn 曲线再设，**不要直接拍一个数字**。成熟号的 `mature-limits.token-daily-budget` 恒 `0`（无界）。 |
@@ -457,19 +464,46 @@ cpamp 账号页直接渲染 §2.5 的投影字段；运维这样读：
 - **成熟号放开限制**：账号越过整条 `warmup-curve`（默认账龄 >= 60 天）后进入
   `mature-limits`：不再设固定日预算，改为按额度余量驱动；RPM / 并发 / 突发上限也放宽到一个
   刻意留有余量、只拦截病态突发流量的水位（不是日常吞吐会碰到的水位）。
-- **重启后限流 / 日预算计数从内存态、非持久态重建**：per-account token bucket
-  （`AccountRateLimiter`）、每日请求计数与并发在途计数（`AccountConcurrencyGate`）全部只
-  存在进程内存里，**不落盘、不持久**。进程重启后：
-  - token bucket 重新从"满桶"状态起步（允许一次性把配置的 burst 用满）；
-  - 当日请求计数、并发在途计数都清零重新累计。
+- **重启时要区分不同状态**：每账号RPM token bucket和在途并发计数属于进程内状态，重启后重新初始化。养号请求预算已采用按小时分桶的滚动24小时窗口，保存于auth metadata的`account_scheduling.daily_budget_window`，新建gate会从已保存的桶恢复；不是有意在重启后把日请求预算清零。
+- 正的token日预算通过usage结算记录到`account_scheduling.token_budget_window`，同样支持恢复；值为0时，这项保护及对应记录均不启用。请求计数经`MarkResult`，token计数经usage sink；已完成记录的持久化不等于发送前原子预约，也不保证崩溃时所有未完成请求都已入账。
+- `first_production_at`锚点同样保存在auth metadata，重启不会重置。预算窗口写入/恢复实现见`account_gate.go`和`conductor_cooldown.go`。
 
-  这意味着重启前后的实际效果是**偏宽松而不是偏保守**——比如某账号当天已经打满
-  `daily_budget`，进程重启会让这个计数清零，该账号当天实质上重新获得了一轮配额余量。这是
-  设计上刻意接受的"安全出错方向"（宁可跨重启边界稍微多放一点，也不为这套本质上短生命周期
-  的计数状态另起一套持久化子系统），不是缺陷。
-  - 与此相对，**`first_production_at` 锚点是持久化的**（写在账号 auth JSON 文件的
-    `metadata` 里），完全不受进程重启影响——决定养号档位的账龄判断在重启前后保持一致，
-    只有限流 / 日预算 / 并发这些"计数器"状态会重建。
+## 养号服务预留
+
+
+三个参数都位于`account-scheduling`，代码默认值均为0。默认关闭是为了让未配置的新安装和已有部署升级时保持原调度；**缺省不等于自动采用生产推荐值**。
+
+| 参数 | 中文含义 | 默认值 | 本项目生产启用值 |
+| --- | --- | ---: | ---: |
+| `warmup-serving-reserve` | 新独立服务机会的养号预留概率，合法范围`0 <= 值 < 1` | 0（关闭） | 0.15 |
+| `warmup-serving-max-binding-age-seconds` | 不随续聊重置的绑定年龄阈值，单位秒；兼作持续缺服务观察周期 | 0（关闭年龄兜底） | 0 |
+| `warmup-serving-migration-token-budget` | 本进程滚动1小时内，已有会话迁移的输入缓存重建token估算预算 | 0（关闭全部主动迁移） | 0 |
+
+生产启用值是2026-09-15明确保存的环境配置，不是程序内置默认值。需要在新环境启用相同策略时，将下面字段合并到原配置对应段，不能用这一小段覆盖整个配置文件：
+
+```yaml
+routing:
+  strategy: adaptive
+  session-affinity: true
+account-scheduling:
+  warmup-serving-reserve: 0.15                    # 开启15%新机会预留
+  warmup-serving-max-binding-age-seconds: 0      # 不启用年龄兜底迁移
+  warmup-serving-migration-token-budget: 0       # 不主动迁移已有长会话
+```
+
+**防漏配**：复制通用`config.example.yaml`仍默认关闭；新建/恢复生产配置时必须核对上面三项及adaptive/会话粘性。已经保存的0.15不会仅因正常重启而丢失；部署也应保留原运行态配置，不能用模板里的0覆盖它。验收要读取实际配置，而不能仅凭示例文件或功能已部署判断启用。
+
+正的预留概率为可服务Claude养号号增加新会话和已可靠识别的fresh子代理机会。多个养号号共享这份概率，它不是总请求/token占比上限，也不是有限样本的最低请求保证。既有健康、请求/token预算、并发和速率平滑继续适用；RPM存在软溢出，不能当成硬限额。预留会话仅在`boundServableForKeep`允许时留号，额度或健康不足仍重选；首次生产锚点仍只由真实成功响应建立。
+
+子代理身份使用root session与`x-claude-code-agent-id`；嵌套子代理借助`x-claude-code-parent-agent-id`定位父级。resume沿用子绑定。缺少可靠父样本、继承历史或有fork证据时，优先可用父号；记录只保留hash和大小，不保存正文。Manager的`mixed`入口仅在当前候选全为Claude时进入此逻辑，异构provider池维持原策略。子代理识别和预留pin没有另加独立开关。
+
+预留开启且迁移预算为正时，**已有会话**才可在缓存已过期的空闲窗口或已验证的上下文显著缩短后重评估；最大绑定年龄为正时，再增加按年龄重评估。年龄不会因每轮续聊而重置。还要求文本输入成本可保守估算、来源账号无在途请求、目标养号号持续缺服务。观察周期采用配置的绑定年龄（最多24小时）；年龄关闭时采用1小时，最近刚被分配的目标同样等待该周期。选号计数与实际发送分开，不能算作成功。
+
+迁移预算是输入重建token的**估算**，不是账号每日token总预算；选号前原子预约滚动小时预算。媒体/不透明输入、预算不足、没有缺服务目标或来源账号在途时不迁移。无在途判断是账号瞬时观察，不是分布式会话锁。“cached assistant前缀＋uncached user尾部”也抑制迁移，以保护实测compact摘要形状；这比compact本身更宽，不能宣称识别全部compact实现。
+
+未知缓存TTL按保守1小时处理。空闲迁移要求会话绑定仍存活，绑定TTL应长于缓存TTL；绑定过期后保留最多1小时的有界标记，抑制额外预留抽签并走普通重选。缓存/标记容量上限4096，迁移费用记录同样有界，不引入新持久化存储。
+
+将预留改回0会清理子绑定、pin及预留/迁移状态，普通root绑定和旧D5策略保留；单账号/全养号池继续走现有普通选号和安全门控。新提出的流量节奏硬限制不属于本功能，尚未实现。
 
 ## 代码索引
 
@@ -478,6 +512,7 @@ cpamp 账号页直接渲染 §2.5 的投影字段；运维这样读：
 | 机制 / 字段 | 代码位置 |
 | --- | --- |
 | 选号加权（`AccountSelectionWeight`） | `sdk/cliproxy/auth/account_weight.go` |
+| 养号服务预留、子代理身份与有限迁移 | `sdk/cliproxy/auth/warmup_serving.go` |
 | 每账号 token bucket（`AccountRateLimiter`） | `sdk/cliproxy/auth/account_rate_limiter.go` |
 | 管理 API 投影写入点 | `internal/api/handlers/management/auth_files.go`（约第 490 行） |
 | 旧名投影构建（`buildAdaptiveSchedulingView`） | `internal/api/handlers/management/auth_files_adaptive_scheduling.go` |

@@ -1,9 +1,12 @@
 # Adaptive Account Scheduling
 
+[简体中文](adaptive-account-scheduling_CN.md)
+
 > Implements `openspec/changes/add-adaptive-account-scheduling`. Config field definitions
 > are already fully covered in the `account-scheduling` section of
 > `core/config.example.yaml` and are not repeated here; this document only adds the
-> management API read-only field reference and operational notes. Fields/behavior have
+> management API read-only field reference, operational notes and the serving-reserve
+> extension (`add-warmup-serving-reserve`). Fields/behavior have
 > been verified against the current code as of 2026-09. Code/symbol locations are
 > consolidated in the [Code index](#code-index) at the end, not inlined after each claim.
 
@@ -14,6 +17,7 @@ Common operator tasks and where each one lives:
 | I want to… | Use | Where |
 | --- | --- | --- |
 | Turn adaptive scheduling on | `routing.strategy: "adaptive"` | §1 |
+| Enable warming opportunities and check production values | `warmup-serving-reserve` and migration controls | [Serving reserve](#opt-in-warm-up-serving-reserve) |
 | Read an account's tier / quota / warm-up state | `GET /v0/management/auth-files` → the `account_scheduling` projection | §2 |
 | Pin a subscription tier on one account | `tier_override` (endpoint or auth JSON) | §3.1 / §3.5 |
 | Migrate an old account / backfill its warm-up anchor | `first_production_at` (endpoint backfill) | §3.2 / §3.5 |
@@ -32,6 +36,9 @@ Common operator tasks and where each one lives:
 
 | Parameter | Default | Recommended | Notes |
 | --- | --- | --- | --- |
+| `account-scheduling.warmup-serving-reserve` | `0` (off) | `0.15` (this production profile) | Shared new-opportunity probability, not a total traffic cap; explicitly persist it to enable. See [Serving reserve](#opt-in-warm-up-serving-reserve). |
+| `account-scheduling.warmup-serving-max-binding-age-seconds` | `0` | `0` (age fallback off) | Non-renewing age in seconds; a positive value alone does not enable migration. |
+| `account-scheduling.warmup-serving-migration-token-budget` | `0` | `0` (proactive migration off) | Per-process rolling-hour estimated input reconstruction budget, separate from daily account tokens. |
 | `account-scheduling.rate-scale` / per-account `rate_scale` (§3.4) | `1.0` | `1.0` (no scaling) | Effective rate-limit multiplier (scales rpm/burst/concurrency/daily-budget). **There is no "set X for old accounts / Y for new accounts" scenario number** — the default is simply `1.0`; only set a specific account `< 1` for a low-risk slow test, tuning as needed. Do not copy a fixed number. Must be `> 0`. |
 | `account-scheduling.anti-streak-limit` (anti-streak) | `0` (off) | **`3`** (production) | Force-rotate a **warm-up account** away once it has been picked ≤ this many times in a row. Applies only to warm-up accounts (mature accounts are exempt) and is cache-safe (does not change the long-term 20:5:1 share); largely idle when a single mature account carries all traffic (no warm-up accounts to rotate to). |
 | `account-scheduling.warmup-curve[*].token-daily-budget` (warm-up account token daily budget) | `0` (unbounded) | **`0` — pending real-traffic calibration** | Rolling-24h billable-token hard gate for warm-up accounts. **No concrete positive value has been calibrated yet**: run a real-traffic gray release to see the burn curve first, then set it — **do not just pick a number**. Mature accounts' `mature-limits.token-daily-budget` stays `0` (unbounded). |
@@ -533,79 +540,45 @@ How the cpamp account page renders the §2.5 projection fields for operators:
   instead by quota headroom; RPM / concurrency / burst ceilings are also relaxed to a level
   that deliberately leaves headroom and only intercepts pathological bursts (not a level
   normal throughput would ever hit).
-- **Rate-limit / daily-budget counters are rebuilt from in-memory, non-persistent state
-  after a restart**: the per-account token bucket (`AccountRateLimiter`), the daily request
-  counter, and the in-flight concurrency counter (`AccountConcurrencyGate`) all live purely
-  in process memory — **none of it is written to disk or persisted**. After a process
-  restart:
-  - the token bucket starts fresh from a "full bucket" state (allowing the configured burst
-    to be used up all at once);
-  - the day's request counter and in-flight concurrency counter both reset to zero and
-    start accumulating again.
-
-  So the practical effect across a restart boundary is **biased toward being more
-  permissive, not more conservative** — for example, if an account has already hit its
-  `daily_budget` for the day, a restart zeroes that counter and the account effectively
-  regains a fresh round of budget headroom for the rest of that day. This is a deliberately
-  accepted "safe direction to err in" by design (better to occasionally allow a bit more
-  across a restart boundary than to build a separate persistence subsystem for what is
-  fundamentally short-lived counter state) — it is not a defect.
-  - In contrast, the **`first_production_at` anchor is persisted** (written into the
-    `metadata` of the account's auth JSON file) and is completely unaffected by a process
-    restart — the age judgment that determines warm-up tier stays consistent across
-    restarts; only the rate-limit / daily-budget / concurrency "counter" state gets
-    rebuilt.
+- **Restart behavior differs by state:** the per-account RPM token bucket and in-flight concurrency counters are process-local and restart from their initial state. The warming request budget instead uses a rolling 24-hour window of hourly buckets, persisted in auth metadata as `account_scheduling.daily_budget_window`; a cold gate restores those saved buckets. It does not intentionally reset the day's request budget to zero on restart.
+- With a positive daily token budget, completed usage is recorded in `account_scheduling.token_budget_window` and restored similarly. A zero token budget leaves that protection and its recording disabled. Request counting runs through `MarkResult`, while token accounting runs through the usage sink; persisted completed records do not constitute an atomic pre-send reservation or a crash-proof guarantee for unfinished requests.
+- The `first_production_at` anchor is also persisted in auth metadata and is not reset by a process restart. See `account_gate.go` and `conductor_cooldown.go` for budget-window persistence and restoration.
 
 ## Opt-in warm-up serving reserve
 
-All three settings default to zero under `account-scheduling`:
+All three fields belong to `account-scheduling` and default to zero. The disabled default preserves existing routing for unconfigured installations and upgrades; **omitting a field does not automatically select the production recommendation**.
+
+| Parameter | Meaning | Default | This production profile |
+| --- | --- | ---: | ---: |
+| `warmup-serving-reserve` | Probability of reserving a new independent service opportunity for warming accounts; finite `0 <= value < 1` | 0 (disabled) | 0.15 |
+| `warmup-serving-max-binding-age-seconds` | Non-renewing binding-age threshold in seconds; also controls the underserved observation period | 0 (age fallback disabled) | 0 |
+| `warmup-serving-migration-token-budget` | Per-process rolling-hour estimate budget for input-cache reconstruction when migrating existing bindings | 0 (all proactive migration disabled) | 0 |
+
+The production values were explicitly persisted on 2026-09-15; they are environment configuration, not built-in defaults. To enable the same policy in a new environment, merge these fields into the corresponding sections of the existing configuration rather than replacing the entire file:
 
 ```yaml
-warmup-serving-reserve: 0
-warmup-serving-max-binding-age-seconds: 0
-warmup-serving-migration-token-budget: 0
+routing:
+  strategy: adaptive
+  session-affinity: true
+account-scheduling:
+  warmup-serving-reserve: 0.15                    # Enable the 15% new-opportunity reserve
+  warmup-serving-max-binding-age-seconds: 0      # Keep age fallback disabled
+  warmup-serving-migration-token-budget: 0       # Keep proactive migration disabled
 ```
 
-A positive reserve enables additional new-session opportunities for eligible warming
-Claude accounts, including independently identified fresh Claude Code children. The
-probability is not a total request/token share or a guaranteed minimum. Existing
-health, request/token budget, concurrency and rate-smoothing rules still apply.
-Reserved sessions keep their account while `boundServableForKeep` permits it; exhausted
-or unavailable accounts reselect normally. First-production anchors still require a
-real successful response.
+**Avoid missing configuration:** the generic `config.example.yaml` remains disabled by default. When creating or restoring a production configuration, check these three fields plus adaptive routing and session affinity. A persisted 0.15 survives a normal restart; deployment must preserve the existing runtime configuration instead of overwriting it with template zeros. Verify the actual configuration, not merely the example file or deployed feature version.
 
-Child identity uses the root session and `x-claude-code-agent-id`; nested children use
-`x-claude-code-parent-agent-id` to find their parent. Resume keeps the child binding.
-With no reliable parent sample, or inherited history/fork evidence, the child prefers
-the parent's account. Summaries retain hashes and sizes, never request text. The
-Manager's `mixed` route is supported only when its current candidates are all Claude;
-heterogeneous provider pools keep the previous policy.
+A positive reserve adds new-session opportunities for eligible warming Claude accounts, including reliably identified fresh children. Warming accounts share the probability; it is neither a total request/token share cap nor a guaranteed minimum in a finite sample. Existing health, request/token budget, concurrency and rate-smoothing rules still apply. RPM has soft overflow and is not a hard ceiling. Reserved sessions keep their account only while `boundServableForKeep` permits it; exhausted or unavailable accounts reselect normally. First-production anchors still require a real successful response.
 
-A positive migration budget permits reassessment of **existing** bindings after
-cache-expiry idle windows or substantial verified context shortening. A positive maximum
-binding age additionally permits age-based reassessment without renewing that age on
-every turn. Requests must have a conservative text input-cost estimate, an idle source
-account and a warming target whose real outbound count has not advanced throughout an
-observation period (the configured binding age, capped at 24 hours, or one hour when
-age fallback is disabled). Recently assigned targets wait the same period. Selection
-counts are kept separate from actual outbound attempts and never count as successes.
+Child identity uses the root session and `x-claude-code-agent-id`; nested children use `x-claude-code-parent-agent-id` to find their parent. Resume keeps the child binding. With no reliable parent sample, inherited history or fork evidence, children prefer an available parent account. Summaries retain hashes and sizes, never request text. The Manager's `mixed` route is supported only when its current candidates are all Claude; heterogeneous provider pools keep the previous policy. Child identity and reserve pins have no separate enable switch.
 
-The migration budget is a per-process rolling-hour **estimate** of input reconstruction
-tokens, reserved atomically before selection. Opaque/media input, insufficient budget,
-no underserved target, or an in-flight source suppresses migration. The source check is
-an instantaneous account-level observation, not a distributed session lock. A cached
-assistant prefix followed by an uncached user task also suppresses migration: this
-protects the observed Claude Code compaction request shape, but is deliberately broader
-than compaction and does not claim to identify every compaction implementation.
+With reserve enabled and a positive migration budget, **existing bindings** can be reassessed after cache-expiry idle windows or substantial verified context shortening. A positive maximum binding age additionally enables age-based reassessment; turns do not renew that age. Requests need a conservative text-input cost estimate, a source account without in-flight requests, and a warming target whose real outbound count has not advanced throughout the observation period. That period uses the configured binding age, capped at 24 hours, or one hour when age fallback is disabled. Recently assigned targets wait the same period. Selection counts remain separate from actual outbound attempts and never count as successes.
 
-Unknown cache TTLs conservatively use one hour. Idle reassessment needs a surviving
-session binding; configure a session-affinity TTL longer than the cache TTL to exercise
-that path. Expired bindings keep a bounded one-hour marker that suppresses an additional
-reserve lottery and uses ordinary reselection instead. Cache entries/markers are capped
-at 4096; migration charges are likewise bounded. No new persistence store is introduced.
-Setting reserve back to zero clears child bindings, pins and reserve/migration state;
-ordinary root bindings and the previous D5 policy remain. The single-account/all-warming
-case continues to use the existing normal selection and safety gates.
+The migration budget is an **estimate** of input reconstruction tokens, not an account's daily token budget; rolling-hour credit is reserved atomically before selection. Opaque/media input, insufficient budget, no underserved target or an in-flight source suppresses migration. The source check is an instantaneous account-level observation, not a distributed session lock. A cached assistant prefix followed by an uncached user task also suppresses migration to protect the observed compaction request shape; this is deliberately broader than compaction and does not identify every implementation.
+
+Unknown cache TTLs conservatively use one hour. Idle reassessment needs a surviving session binding, so the affinity TTL should exceed the cache TTL. Expired bindings retain a bounded one-hour marker that suppresses an additional reserve lottery and uses ordinary reselection. Cache entries/markers are capped at 4096, migration charges are likewise bounded, and no new persistence store is introduced.
+
+Setting reserve back to zero clears child bindings, pins and reserve/migration state; ordinary root bindings and the previous D5 policy remain. Single-account/all-warming pools continue to use the existing normal selection and safety gates. The newly proposed hard traffic-pacing controls are a separate, unimplemented change.
 
 ## Code index
 
