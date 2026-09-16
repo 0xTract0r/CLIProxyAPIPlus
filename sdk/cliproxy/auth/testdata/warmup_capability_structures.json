@@ -1,0 +1,365 @@
+{
+  "provenance": "Two production-observed message structures captured on 2026-09-16. Prompts, tool values and skill names/descriptions are replaced; fixed CLI catalog framing, role/block/key layout, catalog section/entry/continuation counts and string equality relationships are retained. Top-level unrelated tool schemas/identity fields omitted. No credentials or business text.",
+  "cases": [
+    {
+      "name": "observed_capability_child_1",
+      "expected_parent_messages": 6,
+      "expected_child_messages": 2,
+      "original_auxiliary_characters": 14904,
+      "original_auxiliary_lines": 104,
+      "original_tool_entries": 17,
+      "original_skill_entries": 79,
+      "parent": {
+        "system": [
+          {
+            "type": "text",
+            "text": "x-anthropic-billing-header: synthetic billing metadata"
+          },
+          {
+            "type": "text",
+            "text": "sanitized-text-0001",
+            "cache_control": {
+              "type": "ephemeral"
+            }
+          },
+          {
+            "type": "text",
+            "text": "sanitized-text-0002",
+            "cache_control": {
+              "type": "ephemeral"
+            }
+          }
+        ],
+        "messages": [
+          {
+            "role": "user",
+            "content": "sanitized-text-0003"
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "thinking",
+                "thinking": "",
+                "signature": "sanitized-text-0004"
+              },
+              {
+                "type": "text",
+                "text": "sanitized-text-0005"
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "sanitized-text-0006"
+              },
+              {
+                "type": "text",
+                "text": "sanitized-text-0007"
+              },
+              {
+                "type": "text",
+                "text": "sanitized-text-0008"
+              },
+              {
+                "type": "text",
+                "text": "sanitized-text-0009"
+              },
+              {
+                "type": "text",
+                "text": "sanitized-text-0010"
+              },
+              {
+                "type": "text",
+                "text": "sanitized-text-0011"
+              }
+            ]
+          },
+          {
+            "role": "system",
+            "content": "sanitized-text-0012"
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "thinking",
+                "thinking": "",
+                "signature": "sanitized-text-0013"
+              },
+              {
+                "type": "text",
+                "text": "sanitized-text-0014"
+              },
+              {
+                "type": "tool_use",
+                "id": "sanitized-text-0015",
+                "name": "sanitized-text-0016",
+                "input": {
+                  "command": "sanitized-text-0017",
+                  "description": "sanitized-text-0018"
+                },
+                "caller": {
+                  "type": "direct"
+                },
+                "cache_control": {
+                  "type": "ephemeral"
+                }
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "tool_use_id": "sanitized-text-0015",
+                "type": "tool_result",
+                "content": "sanitized-text-0019",
+                "is_error": false,
+                "cache_control": {
+                  "type": "ephemeral"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "child": {
+        "system": [
+          {
+            "type": "text",
+            "text": "x-anthropic-billing-header: synthetic billing metadata"
+          },
+          {
+            "type": "text",
+            "text": "sanitized-text-0020",
+            "cache_control": {
+              "type": "ephemeral"
+            }
+          },
+          {
+            "type": "text",
+            "text": "sanitized-text-0021",
+            "cache_control": {
+              "type": "ephemeral"
+            }
+          }
+        ],
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "sanitized-text-0006"
+              },
+              {
+                "type": "text",
+                "text": "sanitized-text-0007"
+              },
+              {
+                "type": "text",
+                "text": "sanitized-text-0022"
+              }
+            ]
+          },
+          {
+            "role": "system",
+            "content": [
+              {
+                "type": "text",
+                "text": "The following deferred tools are now available via ToolSearch. Their schemas are NOT loaded — calling them directly will fail with InputValidationError. Use ToolSearch with query \"select:<name>[,<name>...]\" to load tool schemas before calling them:\nSyntheticTool01\nSyntheticTool02\nSyntheticTool03\nSyntheticTool04\nSyntheticTool05\nSyntheticTool06\nSyntheticTool07\nSyntheticTool08\nSyntheticTool09\nSyntheticTool10\nSyntheticTool11\nSyntheticTool12\nSyntheticTool13\nSyntheticTool14\nSyntheticTool15\nSyntheticTool16\nSyntheticTool17\n\nThe following skills are available for use with the Skill tool:\n\n- synthetic-skill-1: Sanitized capability description 1.\n- synthetic-skill-2: Sanitized capability description 2.\n- synthetic-skill-3: Sanitized capability description 3.\n- synthetic-skill-4: Sanitized capability description 4.\n- synthetic-skill-5: Sanitized capability description 5.\n- synthetic-skill-6: Sanitized capability description 6.\n- synthetic-skill-7: Sanitized capability description 7.\n- synthetic-skill-8: Sanitized capability description 8.\n- synthetic-skill-9: Sanitized capability description 9.\n- synthetic-skill-10: Sanitized capability description 10.\n- synthetic-skill-11: Sanitized capability description 11.\n- synthetic-skill-12: Sanitized capability description 12.\n- synthetic-skill-13: Sanitized capability description 13.\n- synthetic-skill-14: Sanitized capability description 14.\n- synthetic-skill-15: Sanitized capability description 15.\n- synthetic-skill-16: Sanitized capability description 16.\n- synthetic-skill-17: Sanitized capability description 17.\n- synthetic-skill-18: Sanitized capability description 18.\n- synthetic-skill-19: Sanitized capability description 19.\n- synthetic-skill-20: Sanitized capability description 20.\n- synthetic-skill-21: Sanitized capability description 21.\n- synthetic-skill-22: Sanitized capability description 22.\n- synthetic-skill-23: Sanitized capability description 23.\n- synthetic-skill-24: Sanitized capability description 24.\n- synthetic-skill-25: Sanitized capability description 25.\n- synthetic-skill-26: Sanitized capability description 26.\n- synthetic-skill-27: Sanitized capability description 27.\n- synthetic-skill-28: Sanitized capability description 28.\n- synthetic-skill-29: Sanitized capability description 29.\n- synthetic-skill-30: Sanitized capability description 30.\n- synthetic-skill-31: Sanitized capability description 31.\n- synthetic-skill-32: Sanitized capability description 32.\n- synthetic-skill-33: Sanitized capability description 33.\n- synthetic-skill-34: Sanitized capability description 34.\n- synthetic-skill-35: Sanitized capability description 35.\n- synthetic-skill-36: Sanitized capability description 36.\n- synthetic-skill-37: Sanitized capability description 37.\n- synthetic-skill-38: Sanitized capability description 38.\n- synthetic-skill-39: Sanitized capability description 39.\n- synthetic-skill-40: Sanitized capability description 40.\n- synthetic-skill-41: Sanitized capability description 41.\n- synthetic-skill-42: Sanitized capability description 42.\n- synthetic-skill-43: Sanitized capability description 43.\n- synthetic-skill-44: Sanitized capability description 44.\n- synthetic-skill-45: Sanitized capability description 45.\n- synthetic-skill-46: Sanitized capability description 46.\n- synthetic-skill-47: Sanitized capability description 47.\n- synthetic-skill-48: Sanitized capability description 48.\n- synthetic-skill-49: Sanitized capability description 49.\n- synthetic-skill-50: Sanitized capability description 50.\n- synthetic-skill-51: Sanitized capability description 51.\n- synthetic-skill-52: Sanitized capability description 52.\n- synthetic-skill-53: Sanitized capability description 53.\n- synthetic-skill-54: Sanitized capability description 54.\n- synthetic-skill-55: Sanitized capability description 55.\n- synthetic-skill-56: Sanitized capability description 56.\n- synthetic-skill-57: Sanitized capability description 57.\n- synthetic-skill-58: Sanitized capability description 58.\n- synthetic-skill-59: Sanitized capability description 59.\n- synthetic-skill-60: Sanitized capability description 60.\n- synthetic-skill-61: Sanitized capability description 61.\n- synthetic-skill-62: Sanitized capability description 62.\n- synthetic-skill-63: Sanitized capability description 63.\n- synthetic:skill-64: Sanitized capability description 64.\n- synthetic:skill-65: Sanitized capability description 65.\n- synthetic-skill-66: Sanitized capability description 66.\n- synthetic-skill-67: Sanitized capability description 67.\n- synthetic-skill-68: Sanitized capability description 68.\n- synthetic-skill-69: Sanitized capability description 69.\n- synthetic-skill-70: Sanitized capability description 70.\n- synthetic-skill-71: Sanitized capability description 71.\n- synthetic-skill-72: Sanitized capability description 72.\n- synthetic-skill-73: Sanitized capability description 73.\n- synthetic-skill-74: Sanitized capability description 74.\n- synthetic-skill-75: Sanitized capability description 75.\nAdditional sanitized description line 76.\nAdditional sanitized description line 77.\n- synthetic-skill-76: Sanitized capability description 76.\n- synthetic-skill-77: Sanitized capability description 77.\n- synthetic-skill-78: Sanitized capability description 78.\n- synthetic-skill-79: Sanitized capability description 79.\n\nToday's date is 2026-09-16.",
+                "cache_control": {
+                  "type": "ephemeral"
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "observed_capability_child_2",
+      "expected_parent_messages": 6,
+      "expected_child_messages": 2,
+      "original_auxiliary_characters": 14904,
+      "original_auxiliary_lines": 104,
+      "original_tool_entries": 17,
+      "original_skill_entries": 79,
+      "parent": {
+        "system": [
+          {
+            "type": "text",
+            "text": "x-anthropic-billing-header: synthetic billing metadata"
+          },
+          {
+            "type": "text",
+            "text": "sanitized-text-0001",
+            "cache_control": {
+              "type": "ephemeral"
+            }
+          },
+          {
+            "type": "text",
+            "text": "sanitized-text-0002",
+            "cache_control": {
+              "type": "ephemeral"
+            }
+          }
+        ],
+        "messages": [
+          {
+            "role": "user",
+            "content": "sanitized-text-0003"
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "thinking",
+                "thinking": "",
+                "signature": "sanitized-text-0004"
+              },
+              {
+                "type": "text",
+                "text": "sanitized-text-0005"
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "sanitized-text-0006"
+              },
+              {
+                "type": "text",
+                "text": "sanitized-text-0007"
+              },
+              {
+                "type": "text",
+                "text": "sanitized-text-0008"
+              },
+              {
+                "type": "text",
+                "text": "sanitized-text-0009"
+              },
+              {
+                "type": "text",
+                "text": "sanitized-text-0010"
+              },
+              {
+                "type": "text",
+                "text": "sanitized-text-0011"
+              }
+            ]
+          },
+          {
+            "role": "system",
+            "content": "sanitized-text-0012"
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "thinking",
+                "thinking": "",
+                "signature": "sanitized-text-0013"
+              },
+              {
+                "type": "text",
+                "text": "sanitized-text-0014"
+              },
+              {
+                "type": "tool_use",
+                "id": "sanitized-text-0015",
+                "name": "sanitized-text-0016",
+                "input": {
+                  "command": "sanitized-text-0017",
+                  "description": "sanitized-text-0018"
+                },
+                "caller": {
+                  "type": "direct"
+                },
+                "cache_control": {
+                  "type": "ephemeral"
+                }
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "tool_use_id": "sanitized-text-0015",
+                "type": "tool_result",
+                "content": "sanitized-text-0019",
+                "is_error": false,
+                "cache_control": {
+                  "type": "ephemeral"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "child": {
+        "system": [
+          {
+            "type": "text",
+            "text": "x-anthropic-billing-header: synthetic billing metadata"
+          },
+          {
+            "type": "text",
+            "text": "sanitized-text-0020",
+            "cache_control": {
+              "type": "ephemeral"
+            }
+          },
+          {
+            "type": "text",
+            "text": "sanitized-text-0021",
+            "cache_control": {
+              "type": "ephemeral"
+            }
+          }
+        ],
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "sanitized-text-0006"
+              },
+              {
+                "type": "text",
+                "text": "sanitized-text-0007"
+              },
+              {
+                "type": "text",
+                "text": "sanitized-text-0023"
+              }
+            ]
+          },
+          {
+            "role": "system",
+            "content": [
+              {
+                "type": "text",
+                "text": "The following deferred tools are now available via ToolSearch. Their schemas are NOT loaded — calling them directly will fail with InputValidationError. Use ToolSearch with query \"select:<name>[,<name>...]\" to load tool schemas before calling them:\nSyntheticTool01\nSyntheticTool02\nSyntheticTool03\nSyntheticTool04\nSyntheticTool05\nSyntheticTool06\nSyntheticTool07\nSyntheticTool08\nSyntheticTool09\nSyntheticTool10\nSyntheticTool11\nSyntheticTool12\nSyntheticTool13\nSyntheticTool14\nSyntheticTool15\nSyntheticTool16\nSyntheticTool17\n\nThe following skills are available for use with the Skill tool:\n\n- synthetic-skill-1: Sanitized capability description 1.\n- synthetic-skill-2: Sanitized capability description 2.\n- synthetic-skill-3: Sanitized capability description 3.\n- synthetic-skill-4: Sanitized capability description 4.\n- synthetic-skill-5: Sanitized capability description 5.\n- synthetic-skill-6: Sanitized capability description 6.\n- synthetic-skill-7: Sanitized capability description 7.\n- synthetic-skill-8: Sanitized capability description 8.\n- synthetic-skill-9: Sanitized capability description 9.\n- synthetic-skill-10: Sanitized capability description 10.\n- synthetic-skill-11: Sanitized capability description 11.\n- synthetic-skill-12: Sanitized capability description 12.\n- synthetic-skill-13: Sanitized capability description 13.\n- synthetic-skill-14: Sanitized capability description 14.\n- synthetic-skill-15: Sanitized capability description 15.\n- synthetic-skill-16: Sanitized capability description 16.\n- synthetic-skill-17: Sanitized capability description 17.\n- synthetic-skill-18: Sanitized capability description 18.\n- synthetic-skill-19: Sanitized capability description 19.\n- synthetic-skill-20: Sanitized capability description 20.\n- synthetic-skill-21: Sanitized capability description 21.\n- synthetic-skill-22: Sanitized capability description 22.\n- synthetic-skill-23: Sanitized capability description 23.\n- synthetic-skill-24: Sanitized capability description 24.\n- synthetic-skill-25: Sanitized capability description 25.\n- synthetic-skill-26: Sanitized capability description 26.\n- synthetic-skill-27: Sanitized capability description 27.\n- synthetic-skill-28: Sanitized capability description 28.\n- synthetic-skill-29: Sanitized capability description 29.\n- synthetic-skill-30: Sanitized capability description 30.\n- synthetic-skill-31: Sanitized capability description 31.\n- synthetic-skill-32: Sanitized capability description 32.\n- synthetic-skill-33: Sanitized capability description 33.\n- synthetic-skill-34: Sanitized capability description 34.\n- synthetic-skill-35: Sanitized capability description 35.\n- synthetic-skill-36: Sanitized capability description 36.\n- synthetic-skill-37: Sanitized capability description 37.\n- synthetic-skill-38: Sanitized capability description 38.\n- synthetic-skill-39: Sanitized capability description 39.\n- synthetic-skill-40: Sanitized capability description 40.\n- synthetic-skill-41: Sanitized capability description 41.\n- synthetic-skill-42: Sanitized capability description 42.\n- synthetic-skill-43: Sanitized capability description 43.\n- synthetic-skill-44: Sanitized capability description 44.\n- synthetic-skill-45: Sanitized capability description 45.\n- synthetic-skill-46: Sanitized capability description 46.\n- synthetic-skill-47: Sanitized capability description 47.\n- synthetic-skill-48: Sanitized capability description 48.\n- synthetic-skill-49: Sanitized capability description 49.\n- synthetic-skill-50: Sanitized capability description 50.\n- synthetic-skill-51: Sanitized capability description 51.\n- synthetic-skill-52: Sanitized capability description 52.\n- synthetic-skill-53: Sanitized capability description 53.\n- synthetic-skill-54: Sanitized capability description 54.\n- synthetic-skill-55: Sanitized capability description 55.\n- synthetic-skill-56: Sanitized capability description 56.\n- synthetic-skill-57: Sanitized capability description 57.\n- synthetic-skill-58: Sanitized capability description 58.\n- synthetic-skill-59: Sanitized capability description 59.\n- synthetic-skill-60: Sanitized capability description 60.\n- synthetic-skill-61: Sanitized capability description 61.\n- synthetic-skill-62: Sanitized capability description 62.\n- synthetic-skill-63: Sanitized capability description 63.\n- synthetic:skill-64: Sanitized capability description 64.\n- synthetic:skill-65: Sanitized capability description 65.\n- synthetic-skill-66: Sanitized capability description 66.\n- synthetic-skill-67: Sanitized capability description 67.\n- synthetic-skill-68: Sanitized capability description 68.\n- synthetic-skill-69: Sanitized capability description 69.\n- synthetic-skill-70: Sanitized capability description 70.\n- synthetic-skill-71: Sanitized capability description 71.\n- synthetic-skill-72: Sanitized capability description 72.\n- synthetic-skill-73: Sanitized capability description 73.\n- synthetic-skill-74: Sanitized capability description 74.\n- synthetic-skill-75: Sanitized capability description 75.\nAdditional sanitized description line 76.\nAdditional sanitized description line 77.\n- synthetic-skill-76: Sanitized capability description 76.\n- synthetic-skill-77: Sanitized capability description 77.\n- synthetic-skill-78: Sanitized capability description 78.\n- synthetic-skill-79: Sanitized capability description 79.\n\nToday's date is 2026-09-16.",
+                "cache_control": {
+                  "type": "ephemeral"
+                }
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -487,7 +487,7 @@ func summarizeWarmupRequest(payload []byte) warmupRequestSummary {
 	first, _ := json.Marshal(withoutWarmupCacheControl(messages[0]))
 	summary.first = sha256.Sum256(first)
 	summary.messages = len(messages)
-	summary.singleUser = warmupFreshUserMessage(messages[0]) && (len(messages) == 1 || (len(messages) == 2 && warmupDateMessage(messages[1])))
+	summary.singleUser = warmupFreshUserMessage(messages[0]) && (len(messages) == 1 || (len(messages) == 2 && warmupAuxiliaryMessage(messages[1])))
 	// Inspect identity by message/content position, not type fields in tool input.
 	// Keep the previous conservative migration-cost gate independently unchanged.
 	summary.identityKnown = warmupIdentityMessages(messages)
