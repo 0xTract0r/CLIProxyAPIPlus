@@ -117,6 +117,7 @@ type warmupRequestSummary struct {
 	system, tools, first    [32]byte
 	messages, inputCost     int
 	known, singleUser, fork bool
+	identityKnown           bool
 	uncachedTail            bool
 	cacheTTL                time.Duration
 }
@@ -460,7 +461,7 @@ func (s *AdaptiveSelector) tryWarmupMigration(ctx context.Context, bound *Auth, 
 }
 
 func isFreshWarmupChild(child, parent warmupRequestSummary) bool {
-	return child.known && parent.known && !child.fork && child.singleUser && child.first != parent.first && child.system != parent.system
+	return child.identityKnown && parent.identityKnown && !child.fork && child.singleUser && child.first != parent.first && child.system != parent.system
 }
 
 func summarizeWarmupRequest(payload []byte) warmupRequestSummary {
@@ -486,8 +487,10 @@ func summarizeWarmupRequest(payload []byte) warmupRequestSummary {
 	first, _ := json.Marshal(withoutWarmupCacheControl(messages[0]))
 	summary.first = sha256.Sum256(first)
 	summary.messages = len(messages)
-	firstMessage, _ := messages[0].(map[string]any)
-	summary.singleUser = len(messages) == 1 && firstMessage["role"] == "user"
+	summary.singleUser = warmupFreshUserMessage(messages[0]) && (len(messages) == 1 || (len(messages) == 2 && warmupDateMessage(messages[1])))
+	// Inspect identity by message/content position, not type fields in tool input.
+	// Keep the previous conservative migration-cost gate independently unchanged.
+	summary.identityKnown = warmupIdentityMessages(messages)
 	// Byte count plus framing overhead is deliberately conservative for text;
 	// media, opaque blocks and unrecognized content cannot use this estimate.
 	summary.known = warmupTextOnly(messages)
@@ -593,6 +596,183 @@ func withoutWarmupCacheControl(value any) any {
 	default:
 		return value
 	}
+}
+
+// Only a text user task can prove freshness; a lone tool_result may be resumed history.
+func warmupFreshUserMessage(value any) bool {
+	message, ok := value.(map[string]any)
+	if !ok || message["role"] != "user" || !warmupIdentityContent(message["content"], false) {
+		return false
+	}
+	if text, ok := message["content"].(string); ok {
+		return strings.TrimSpace(text) != ""
+	}
+	blocks, _ := message["content"].([]any)
+	if len(blocks) == 0 {
+		return false
+	}
+	for _, raw := range blocks {
+		if block, _ := raw.(map[string]any); block["type"] != "text" || !warmupStringField(block, "text", true) {
+			return false
+		}
+	}
+	return true
+}
+
+// Recognize only the observed trailing date notice, not arbitrary system context.
+// The original request and existing hash inputs remain unchanged;
+// message counts, input cost and cache TTL retain their existing accounting.
+func warmupDateMessage(value any) bool {
+	message, ok := value.(map[string]any)
+	if !ok || !warmupOnlyKeys(message, "role", "content") || message["role"] != "system" {
+		return false
+	}
+	content, ok := message["content"].([]any)
+	if !ok || len(content) != 1 || !warmupIdentityContent(content, false) {
+		return false
+	}
+	block, _ := content[0].(map[string]any)
+	text, ok := block["text"].(string)
+	const prefix = "Today's date is "
+	if !ok || len(text) != len(prefix)+len("2006-01-02.") || !strings.HasPrefix(text, prefix) || !strings.HasSuffix(text, ".") {
+		return false
+	}
+	_, err := time.Parse("2006-01-02", text[len(prefix):len(text)-1])
+	return err == nil
+}
+
+func warmupIdentityMessages(messages []any) bool {
+	for _, raw := range messages {
+		message, ok := raw.(map[string]any)
+		if !ok || !warmupOnlyKeys(message, "role", "content") {
+			return false
+		}
+		switch message["role"] {
+		case "user", "assistant":
+			if !warmupIdentityContent(message["content"], false) {
+				return false
+			}
+		case "system":
+			// Text CLI notices remain history, regardless of their position.
+			// singleUser separately rejects them as fresh-child evidence.
+			if !warmupIdentityText(message["content"]) {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func warmupIdentityText(value any) bool {
+	if !warmupIdentityContent(value, false) {
+		return false
+	}
+	if blocks, ok := value.([]any); ok {
+		for _, raw := range blocks {
+			if raw.(map[string]any)["type"] != "text" {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// caller is metadata and input is ordinary JSON; only content arrays hold blocks.
+// tool_reference is recognized only inside tool_result; unknown/media stays opaque.
+func warmupIdentityContent(value any, toolResult bool) bool {
+	if _, ok := value.(string); ok {
+		return true
+	}
+	blocks, ok := value.([]any)
+	if !ok {
+		return false
+	}
+	for _, raw := range blocks {
+		block, ok := raw.(map[string]any)
+		if !ok || !warmupIdentityCacheControl(block) {
+			return false
+		}
+		switch block["type"] {
+		case "text":
+			if !warmupOnlyKeys(block, "type", "text", "cache_control") || !warmupStringField(block, "text", false) {
+				return false
+			}
+		case "thinking":
+			if toolResult || !warmupOnlyKeys(block, "type", "thinking", "signature", "cache_control") || !warmupStringField(block, "thinking", false) {
+				return false
+			}
+			if _, exists := block["signature"]; exists && !warmupStringField(block, "signature", false) {
+				return false
+			}
+		case "tool_use":
+			if toolResult || !warmupOnlyKeys(block, "type", "id", "name", "input", "caller", "cache_control") || !warmupStringField(block, "id", true) || !warmupStringField(block, "name", true) {
+				return false
+			}
+			if _, ok := block["input"].(map[string]any); !ok {
+				return false
+			}
+			if rawCaller, exists := block["caller"]; exists {
+				caller, ok := rawCaller.(map[string]any)
+				if !ok || len(caller) != 1 || caller["type"] != "direct" {
+					return false
+				}
+			}
+		case "tool_result":
+			if toolResult || !warmupOnlyKeys(block, "type", "tool_use_id", "content", "is_error", "cache_control") || !warmupStringField(block, "tool_use_id", true) || !warmupIdentityContent(block["content"], true) {
+				return false
+			}
+			if rawError, exists := block["is_error"]; exists {
+				if _, ok := rawError.(bool); !ok {
+					return false
+				}
+			}
+		case "tool_reference":
+			if !toolResult || !warmupOnlyKeys(block, "type", "tool_name") || !warmupStringField(block, "tool_name", true) {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func warmupIdentityCacheControl(block map[string]any) bool {
+	raw, exists := block["cache_control"]
+	if !exists {
+		return true
+	}
+	cc, ok := raw.(map[string]any)
+	if !ok || !warmupOnlyKeys(cc, "type", "ttl") || cc["type"] != "ephemeral" {
+		return false
+	}
+	if ttl, exists := cc["ttl"]; exists && ttl != "5m" && ttl != "1h" {
+		return false
+	}
+	return true
+}
+
+func warmupOnlyKeys(value map[string]any, keys ...string) bool {
+	for key := range value {
+		found := false
+		for _, allowed := range keys {
+			if key == allowed {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+func warmupStringField(value map[string]any, key string, nonempty bool) bool {
+	text, ok := value[key].(string)
+	return ok && (!nonempty || text != "")
 }
 
 func warmupTextOnly(value any) bool {
