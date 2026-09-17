@@ -134,6 +134,8 @@ type AdaptiveSelector struct {
 	servingAccounts map[string]warmupServingAccount
 	servingCharges  []warmupMigrationCharge
 	servingOrder    uint64
+	servingRevision uint64
+	servingEpoch    uint64
 }
 
 // defaultAdaptiveReclaimInterval is how often an owned rate limiter's idle
@@ -279,7 +281,8 @@ func (s *AdaptiveSelector) Pick(ctx context.Context, provider, model string, opt
 	}
 	available = preferCodexWebsocketAuths(ctx, provider, available)
 	cfg := s.scheduling()
-	if cfg.WarmupServingReserve > 0 && warmupServingClaudeRoute(provider, available) {
+	countOnly := cfg.WarmupServingReserve > 0 && warmupCountPurpose(ctx) && warmupServingClaudeRoute(provider, available)
+	if cfg.WarmupServingReserve > 0 && !countOnly && warmupServingClaudeRoute(provider, available) {
 		if picked, handled, errServing := s.pickWithWarmupServing(ctx, provider, model, opts, auths, available, cfg, now); handled {
 			return picked, errServing
 		}
@@ -287,12 +290,20 @@ func (s *AdaptiveSelector) Pick(ctx context.Context, provider, model string, opt
 		s.clearWarmupServing()
 	}
 
-	if s.sessionAffinity && s.cache != nil {
+	if !countOnly && s.sessionAffinity && s.cache != nil {
 		if picked, handled, reason, sessionID, errPick := s.pickWithAffinity(ctx, provider, model, opts, auths, available, cfg, now); handled {
 			if errPick == nil {
 				s.logPick(ctx, reason, provider, model, sessionID, picked, cfg, now)
 			}
 			return picked, errPick
+		}
+	}
+	if countOnly {
+		if matureOnly, _, _ := warmupSelectionPolicy(ctx); matureOnly {
+			if picked, ok := s.pickFromCandidates(s.scoreCandidates(available, cfg, now, true), cfg, now); ok {
+				return picked, nil
+			}
+			return nil, newWarmupBusyError()
 		}
 	}
 
@@ -301,7 +312,7 @@ func (s *AdaptiveSelector) Pick(ctx context.Context, provider, model string, opt
 	// scoreFailoverCandidates falls back to the full pool when no mature account
 	// exists, so an all-warming fleet still serves.
 	failoverMatureOnly := failoverMatureOnlyFromMetadata(opts.Metadata)
-	if picked, ok := s.pickFromCandidates(s.scoreFailoverCandidates(available, cfg, now, failoverMatureOnly), cfg, now); ok {
+	if picked, ok := s.pickFromCandidatesForRequest(ctx, s.scoreFailoverCandidates(available, cfg, now, failoverMatureOnly), cfg, now); ok {
 		reason := "weighted-new"
 		if failoverMatureOnly {
 			reason = "weighted-new-failover"
@@ -517,7 +528,9 @@ func (s *AdaptiveSelector) resolveSticky(ctx context.Context, provider, model st
 	// and a hard rate-limited / daily-budget-spent / concurrency-full bound account
 	// fails boundServableForKeep and falls through to the full-pool reselection
 	// below, so we never pin the session to a 429-ing binding.
-	if s.boundServableForKeep(bound, cfg, now) {
+	receiptReady := warmupRateChargeAvailable(ctx, bound.ID) && !s.overWarmupBudget(bound, cfg, now) && s.hasConcurrencyHeadroom(bound, cfg, now)
+	if receiptReady || s.boundServableForKeep(bound, cfg, now) {
+		warmupRecordRateCharge(ctx, bound.ID, true)
 		s.cache.Set(cacheKey, bound.ID)
 		return bound, "sticky-keep-warming-no-mature", nil
 	}
@@ -569,7 +582,7 @@ func (s *AdaptiveSelector) selectAndBind(ctx context.Context, provider, model st
 	// the full pool when no mature account exists, so a sticky session on an
 	// all-warming fleet still reselects a servable warming account.
 	failoverMatureOnly := failoverMatureOnlyFromMetadata(opts.Metadata)
-	if picked, ok := s.pickFromCandidates(s.scoreFailoverCandidates(available, cfg, now, failoverMatureOnly), cfg, now); ok {
+	if picked, ok := s.pickFromCandidatesForRequest(ctx, s.scoreFailoverCandidates(available, cfg, now, failoverMatureOnly), cfg, now); ok {
 		s.cache.Set(cacheKey, picked.ID)
 		return picked, "rebind-weighted", nil
 	}
@@ -675,8 +688,21 @@ func (s *AdaptiveSelector) scoreFailoverCandidates(available []*Auth, cfg intern
 // capacity instead of collapsing onto the uniform round-robin fallback (which
 // would flatten a Max 20x account into an equal share with a Pro account).
 func (s *AdaptiveSelector) pickFromCandidates(candidates []adaptiveCandidate, cfg internalconfig.AccountSchedulingConfig, now time.Time) (*Auth, bool) {
+	picked, ok, _ := s.pickFromCandidatesResult(nil, candidates, cfg, now)
+	return picked, ok
+}
+
+func (s *AdaptiveSelector) pickFromCandidatesForRequest(ctx context.Context, candidates []adaptiveCandidate, cfg internalconfig.AccountSchedulingConfig, now time.Time) (*Auth, bool) {
+	picked, ok, charged := s.pickFromCandidatesResult(ctx, candidates, cfg, now)
+	if ok && cfg.WarmupServingReserve > 0 && strings.EqualFold(picked.Provider, "claude") && !s.isMature(picked, cfg, now) {
+		warmupRecordRateCharge(ctx, picked.ID, charged)
+	}
+	return picked, ok
+}
+
+func (s *AdaptiveSelector) pickFromCandidatesResult(ctx context.Context, candidates []adaptiveCandidate, cfg internalconfig.AccountSchedulingConfig, now time.Time) (*Auth, bool, bool) {
 	if len(candidates) == 0 {
-		return nil, false
+		return nil, false, false
 	}
 	pool := make([]adaptiveCandidate, len(candidates))
 	copy(pool, candidates)
@@ -702,9 +728,9 @@ func (s *AdaptiveSelector) pickFromCandidates(candidates []adaptiveCandidate, cf
 			continue
 		}
 		rpm, burst := s.rateLimitParams(candidate.auth, cfg, now)
-		if s.limiter.Allow(candidate.auth.ID, rpm, burst) {
+		if warmupRateChargeAvailable(ctx, candidate.auth.ID) || s.limiter.Allow(candidate.auth.ID, rpm, burst) {
 			s.notePick(candidate.auth, cfg, now)
-			return candidate.auth, true
+			return candidate.auth, true, true
 		}
 		pool = append(pool[:idx], pool[idx+1:]...)
 	}
@@ -726,11 +752,11 @@ func (s *AdaptiveSelector) pickFromCandidates(candidates []adaptiveCandidate, cf
 		}
 	}
 	if len(overflow) == 0 {
-		return nil, false
+		return nil, false, false
 	}
 	picked := overflow[s.weightedIndex(overflow)].auth
 	s.notePick(picked, cfg, now)
-	return picked, true
+	return picked, true, false
 }
 
 // weightedIndex returns an index into pool chosen proportional to each entry's

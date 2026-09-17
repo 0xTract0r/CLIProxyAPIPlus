@@ -106,6 +106,9 @@ func (c *SessionCache) Invalidate(sessionID string) {
 		return
 	}
 	c.mu.Lock()
+	if entry, ok := c.entries[sessionID]; ok {
+		c.rememberServingExpiryLocked(sessionID, entry)
+	}
 	delete(c.entries, sessionID)
 	c.mu.Unlock()
 }
@@ -119,6 +122,7 @@ func (c *SessionCache) InvalidateAuth(authID string) {
 	c.mu.Lock()
 	for sid, entry := range c.entries {
 		if entry.authID == authID {
+			c.rememberServingExpiryLocked(sid, entry)
 			delete(c.entries, sid)
 		}
 	}
