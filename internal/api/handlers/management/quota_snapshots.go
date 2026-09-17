@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -20,6 +21,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
+	"github.com/tidwall/gjson"
 )
 
 const (
@@ -29,6 +31,15 @@ const (
 	quotaLastRefreshedMetadataKey = "quota_last_refreshed_at"
 	quotaNextRefreshMetadataKey   = "quota_next_refresh_after"
 	quotaSnapshotPlanTypeKey      = "plan_type"
+	// quotaRefreshHTTPStatusMetadataKey / quotaRefreshRetryAfterMetadataKey record
+	// the upstream HTTP status and the parsed Retry-After hint of the last failed
+	// quota probe. They are pure observability: without them a failed probe left
+	// only the fixed quotaHTTPError sentence in quota_refresh_error, which cannot
+	// distinguish a genuine rate limit from a degraded credential (both 429 on the
+	// Anthropic oauth endpoints). Both keys are derived runtime state and are
+	// therefore registered in reauthRuntimeMetadataKeys so a re-auth clears them.
+	quotaRefreshHTTPStatusMetadataKey = "quota_refresh_http_status"
+	quotaRefreshRetryAfterMetadataKey = "quota_refresh_retry_after_seconds"
 
 	quotaRefreshStatusOK              = "ok"
 	quotaRefreshStatusStale           = "stale"
@@ -48,6 +59,24 @@ const (
 	quotaSnapshotRefreshRetryDelay      = time.Minute
 	quotaSnapshotStartupJitterMax       = time.Minute
 	quotaSnapshotProviderTimeout        = 15 * time.Second
+
+	// quotaErrorBodyReadLimit bounds how much of a non-2xx quota response body is
+	// read before field extraction. Provider error bodies are small JSON
+	// documents; the cap keeps a hostile or truncated stream from being buffered.
+	quotaErrorBodyReadLimit = 64 << 10
+	// quotaErrorFieldMaxRunes bounds each extracted error field so the persisted
+	// metadata stays compact even when a provider returns a long message.
+	quotaErrorFieldMaxRunes = 200
+
+	// quotaRefreshFailureLogInterval throttles the background poller's failure
+	// logs per (auth, signature) pair. The poller ticks once per second, so an
+	// unthrottled warn would flood main.log with one line per failing account per
+	// tick; a changed signature (status/error class) still logs immediately.
+	quotaRefreshFailureLogInterval = 15 * time.Minute
+	// quotaRefreshSkipLogInterval throttles the sticky-skip visibility log. The
+	// skip branch is silent by design and can freeze polling indefinitely, so it
+	// needs a heartbeat, but at a much lower rate than the failure log.
+	quotaRefreshSkipLogInterval = time.Hour
 )
 
 type QuotaSnapshotRefreshPolicy struct {
@@ -97,19 +126,30 @@ type quotaSnapshotPayload struct {
 }
 
 type quotaRefreshResult struct {
-	AuthID      string   `json:"auth_id"`
-	AuthIndex   string   `json:"auth_index,omitempty"`
-	Name        string   `json:"name,omitempty"`
-	Provider    string   `json:"provider"`
-	Label       string   `json:"label,omitempty"`
-	Status      string   `json:"status"`
-	Error       string   `json:"error,omitempty"`
-	ErrorClass  string   `json:"error_class,omitempty"`
-	ElapsedMS   int64    `json:"elapsed_ms"`
-	Refreshed   bool     `json:"refreshed"`
-	ProxySource string   `json:"proxy_source,omitempty"`
-	ProxyHash   string   `json:"proxy_hash,omitempty"`
-	TargetURLs  []string `json:"target_urls,omitempty"`
+	AuthID     string `json:"auth_id"`
+	AuthIndex  string `json:"auth_index,omitempty"`
+	Name       string `json:"name,omitempty"`
+	Provider   string `json:"provider"`
+	Label      string `json:"label,omitempty"`
+	Status     string `json:"status"`
+	Error      string `json:"error,omitempty"`
+	ErrorClass string `json:"error_class,omitempty"`
+	// HTTPStatus / RetryAfterSeconds / ProviderErrorType / ProviderErrorMessage
+	// surface the observation captured from a non-2xx quota response. They are
+	// omitempty so successful refreshes and non-HTTP failures keep their current
+	// response shape. ProviderErrorType/Message are the allow-listed error.type
+	// and error.message fields only (string-typed, truncated); the rest of the
+	// upstream body is discarded. Allow-listed is not scrubbed — see
+	// quotaErrorFieldsFromBody for the residual risk.
+	HTTPStatus           int      `json:"http_status,omitempty"`
+	RetryAfterSeconds    int64    `json:"retry_after_seconds,omitempty"`
+	ProviderErrorType    string   `json:"provider_error_type,omitempty"`
+	ProviderErrorMessage string   `json:"provider_error_message,omitempty"`
+	ElapsedMS            int64    `json:"elapsed_ms"`
+	Refreshed            bool     `json:"refreshed"`
+	ProxySource          string   `json:"proxy_source,omitempty"`
+	ProxyHash            string   `json:"proxy_hash,omitempty"`
+	TargetURLs           []string `json:"target_urls,omitempty"`
 }
 
 func QuotaSnapshotRefreshPolicyFromConfig(cfg *config.Config) QuotaSnapshotRefreshPolicy {
@@ -254,6 +294,9 @@ func (h *Handler) refreshDueQuotaSnapshots(ctx context.Context, policy QuotaSnap
 		// next-refresh schedule, so a truly revoked token is not hammered); a
 		// successful re-probe then clears the lock via the success path above.
 		if quotaSnapshotImplicitRefreshSkipped(auth) && !quotaSnapshotAuthRecovered(auth) && !farmLivenessRecoveryReprobeEligible(auth) {
+			// Observability only: the predicate and the continue are unchanged, we
+			// just stop the freeze from being externally invisible.
+			h.logQuotaStickySkip(auth, now)
 			continue
 		}
 		legacyUnsupported := quotaSnapshotLegacyUnsupportedProviderError(auth)
@@ -290,10 +333,131 @@ func (h *Handler) refreshDueQuotaSnapshots(ctx context.Context, policy QuotaSnap
 				continue
 			}
 		}
-		if _, err := h.refreshQuotaSnapshot(ctx, auth, policy); err != nil && !strings.Contains(err.Error(), context.Canceled.Error()) {
-			log.WithError(err).Debugf("management quota: refresh failed for %s/%s", auth.Provider, auth.ID)
+		if updated, err := h.refreshQuotaSnapshot(ctx, auth, policy); err != nil && !strings.Contains(err.Error(), context.Canceled.Error()) {
+			// Previously Debugf, i.e. invisible at the production Info level. The
+			// failure detail now lands in the log at Warn, throttled per account.
+			// updated carries the freshly persisted status when available, so the
+			// error class is derived from post-write state.
+			logged := auth
+			if updated != nil {
+				logged = updated
+			}
+			h.logQuotaBackgroundRefreshFailure(logged, err, time.Now().UTC())
 		}
 	}
+}
+
+// quotaRefreshLogEntry is one throttle slot: the last emitted signature for a
+// key and when it was emitted.
+type quotaRefreshLogEntry struct {
+	signature string
+	loggedAt  time.Time
+}
+
+// quotaRefreshLogAllowed implements the background poller's log throttle.
+//
+// Strategy: state-change-OR-interval, keyed per (event, auth). A line is emitted
+// when the signature changes (a new status / error class / HTTP status for this
+// account is news and must be visible immediately) and otherwise at most once
+// per minInterval while the signature keeps repeating. This was chosen over a
+// global rate limit because the poller ticks once per second over ALL accounts:
+// a global limiter would let one noisy account starve the others, while a
+// per-account interval alone would hide a state transition for up to the whole
+// interval.
+//
+// Memory: entries are refreshed in place, so repeated logging for the same key
+// does not grow the map. Entries are never DELETED though, so the real bound is
+// the number of distinct (event, authID) pairs seen during the process
+// lifetime — deleting an account, or re-authenticating it into a new ID, leaves
+// a residual entry behind for as long as the process runs. That is accepted
+// rather than fixed: each entry is a short string plus a timestamp, the account
+// count is in the low tens, and a deployment restarts the process.
+func (h *Handler) quotaRefreshLogAllowed(event, authID, signature string, now time.Time, minInterval time.Duration) bool {
+	if h == nil {
+		return true
+	}
+	key := event + "|" + authID
+	h.quotaRefreshLogMu.Lock()
+	defer h.quotaRefreshLogMu.Unlock()
+	if h.quotaRefreshLogState == nil {
+		h.quotaRefreshLogState = make(map[string]quotaRefreshLogEntry)
+	}
+	previous, found := h.quotaRefreshLogState[key]
+	if found && previous.signature == signature && now.Sub(previous.loggedAt) < minInterval {
+		return false
+	}
+	h.quotaRefreshLogState[key] = quotaRefreshLogEntry{signature: signature, loggedAt: now}
+	return true
+}
+
+// logQuotaBackgroundRefreshFailure makes a background quota refresh failure
+// visible in production. The failure used to be logged at Debug only, while the
+// production log level is Info, so a two-hour quota outage left no trace at all.
+// The line is throttled (see quotaRefreshLogAllowed) so N failing accounts
+// cannot flood the log on the once-per-second tick.
+func (h *Handler) logQuotaBackgroundRefreshFailure(auth *coreauth.Auth, err error, now time.Time) {
+	if auth == nil || err == nil {
+		return
+	}
+	observation := quotaProbeObservationFromError(err)
+	errorClass := quotaSnapshotErrorClass(err, metadataString(auth.Metadata, quotaRefreshStatusMetadataKey))
+	signature := fmt.Sprintf("%s|%d|%s", errorClass, observation.StatusCode, observation.ErrorType)
+	if !h.quotaRefreshLogAllowed("background_refresh_failed", auth.ID, signature, now, quotaRefreshFailureLogInterval) {
+		return
+	}
+	fields := log.Fields{
+		"auth_id":     auth.ID,
+		"auth_index":  auth.Index,
+		"name":        auth.FileName,
+		"provider":    auth.Provider,
+		"error_class": errorClass,
+		"event":       "quota_background_refresh_failed",
+	}
+	if observation.StatusCode > 0 {
+		fields["http_status"] = observation.StatusCode
+	}
+	if observation.RetryAfter > 0 {
+		fields["retry_after_seconds"] = int64(observation.RetryAfter.Round(time.Second) / time.Second)
+	}
+	if observation.ErrorType != "" {
+		fields["provider_error_type"] = observation.ErrorType
+	}
+	if observation.ErrorMessage != "" {
+		fields["provider_error_message"] = observation.ErrorMessage
+	}
+	log.WithFields(fields).WithError(err).Warn("management quota: background refresh failed")
+}
+
+// logQuotaStickySkip makes the sticky implicit-skip branch observable. That
+// branch deliberately continues without probing AND without advancing
+// quota_next_refresh_after, so an account can stay frozen indefinitely with no
+// external signal at all (one test account sat frozen for 38h and was only
+// found through the auth file mtime). This log does not change the skip
+// decision; it only records it, at a low throttled rate because the state is
+// expected to persist across many ticks.
+func (h *Handler) logQuotaStickySkip(auth *coreauth.Auth, now time.Time) {
+	if auth == nil {
+		return
+	}
+	status := metadataString(auth.Metadata, quotaRefreshStatusMetadataKey)
+	if !h.quotaRefreshLogAllowed("sticky_skip", auth.ID, status, now, quotaRefreshSkipLogInterval) {
+		return
+	}
+	fields := log.Fields{
+		"auth_id":      auth.ID,
+		"auth_index":   auth.Index,
+		"name":         auth.FileName,
+		"provider":     auth.Provider,
+		"quota_status": status,
+		"event":        "quota_background_refresh_sticky_skip",
+	}
+	if next := metadataString(auth.Metadata, quotaNextRefreshMetadataKey); next != "" {
+		fields["quota_next_refresh_after"] = next
+	}
+	if last := metadataString(auth.Metadata, quotaLastRefreshedMetadataKey); last != "" {
+		fields["quota_last_refreshed_at"] = last
+	}
+	log.WithFields(fields).Warn("management quota: account skipped by sticky reauth-required state; polling is frozen until it is re-authenticated or explicitly refreshed")
 }
 
 // GetQuotaSnapshots returns persisted core quota snapshots without contacting
@@ -499,7 +663,7 @@ func (h *Handler) refreshQuotaSnapshot(ctx context.Context, auth *coreauth.Auth,
 			}
 			return auth, fmt.Errorf("quota refresh executor unavailable for provider %s", auth.Provider)
 		}
-		return h.persistQuotaSnapshotError(ctx, auth, quotaRefreshStatusUnsupported, quotaUnsupportedProviderMessage, policy)
+		return h.persistQuotaSnapshotError(ctx, auth, quotaRefreshStatusUnsupported, quotaUnsupportedProviderMessage, policy, quotaProbeObservation{})
 	}
 
 	now := time.Now().UTC()
@@ -508,7 +672,7 @@ func (h *Handler) refreshQuotaSnapshot(ctx context.Context, auth *coreauth.Auth,
 	snapshot, planType, err := fetchProviderQuotaSnapshot(providerCtx, exec, auth)
 	if err != nil {
 		status, message := quotaSnapshotErrorStatusAndMessage(err)
-		return h.persistQuotaSnapshotError(ctx, auth, status, message, policy)
+		return h.persistQuotaSnapshotError(ctx, auth, status, message, policy, quotaProbeObservationFromError(err))
 	}
 
 	updated := auth.Clone()
@@ -518,6 +682,9 @@ func (h *Handler) refreshQuotaSnapshot(ctx context.Context, auth *coreauth.Auth,
 	updated.Metadata[quotaSnapshotMetadataKey] = snapshot
 	updated.Metadata[quotaRefreshStatusMetadataKey] = quotaRefreshStatusOK
 	delete(updated.Metadata, quotaRefreshErrorMetadataKey)
+	// A fresh success invalidates the previous failure's observation, so drop it
+	// together with the error message it belonged to.
+	clearQuotaFailureObservation(updated.Metadata)
 	// farm-account-liveness B1: a fresh successful probe proves the account is
 	// reachable/healthy again, so release any lingering health-blind marker.
 	delete(updated.Metadata, farmHealthBlindMetadataKey)
@@ -585,6 +752,10 @@ func (h *Handler) refreshQuotaSnapshotResult(ctx context.Context, auth *coreauth
 		if result.Error == "" {
 			result.Error = err.Error()
 		}
+		// Surface the failure observation on the explicit refresh response so an
+		// operator triggering POST /v0/management/quota/refresh sees the upstream
+		// status and Retry-After directly instead of only the fixed message.
+		result.applyProbeObservation(quotaProbeObservationFromError(err))
 	} else if result.Status == quotaRefreshStatusOK {
 		result.Refreshed = true
 	}
@@ -618,6 +789,27 @@ func quotaRefreshResultFromAuth(auth *coreauth.Auth) quotaRefreshResult {
 	return result
 }
 
+// applyProbeObservation copies the observability-only failure detail onto the
+// refresh result. Zero values are left untouched so the omitempty JSON shape of
+// a successful or non-HTTP failure result is unchanged.
+func (r *quotaRefreshResult) applyProbeObservation(observation quotaProbeObservation) {
+	if r == nil {
+		return
+	}
+	if observation.StatusCode > 0 {
+		r.HTTPStatus = observation.StatusCode
+	}
+	if observation.RetryAfter > 0 {
+		r.RetryAfterSeconds = int64(observation.RetryAfter.Round(time.Second) / time.Second)
+	}
+	if observation.ErrorType != "" {
+		r.ProviderErrorType = observation.ErrorType
+	}
+	if observation.ErrorMessage != "" {
+		r.ProviderErrorMessage = observation.ErrorMessage
+	}
+}
+
 func logQuotaRefreshResult(result quotaRefreshResult, err error) {
 	fields := log.Fields{
 		"auth_id":      result.AuthID,
@@ -632,6 +824,15 @@ func logQuotaRefreshResult(result quotaRefreshResult, err error) {
 		"proxy_hash":   result.ProxyHash,
 		"target_urls":  strings.Join(result.TargetURLs, ","),
 	}
+	if result.HTTPStatus > 0 {
+		fields["http_status"] = result.HTTPStatus
+	}
+	if result.RetryAfterSeconds > 0 {
+		fields["retry_after_seconds"] = result.RetryAfterSeconds
+	}
+	if result.ProviderErrorType != "" {
+		fields["provider_error_type"] = result.ProviderErrorType
+	}
 	entry := log.WithFields(fields)
 	if err != nil || result.Status == quotaRefreshStatusError || result.Status == quotaRefreshStatusReauthRequired {
 		if err != nil {
@@ -643,7 +844,11 @@ func logQuotaRefreshResult(result quotaRefreshResult, err error) {
 	entry.Info("management quota refresh account completed")
 }
 
-func (h *Handler) persistQuotaSnapshotError(ctx context.Context, auth *coreauth.Auth, status, message string, policy QuotaSnapshotRefreshPolicy) (*coreauth.Auth, error) {
+// persistQuotaSnapshotError records a failed quota probe. observation carries
+// the observability-only detail (upstream status, Retry-After, allow-listed
+// error.type/error.message) of the failure; it never affects the persisted
+// status, the fixed error message or the next-refresh schedule.
+func (h *Handler) persistQuotaSnapshotError(ctx context.Context, auth *coreauth.Auth, status, message string, policy QuotaSnapshotRefreshPolicy, observation quotaProbeObservation) (*coreauth.Auth, error) {
 	policy = policy.normalized()
 	manager := h.currentAuthManager()
 	if manager == nil || auth == nil {
@@ -667,7 +872,7 @@ func (h *Handler) persistQuotaSnapshotError(ctx context.Context, auth *coreauth.
 		if err := h.persistQuotaSnapshotSchedule(ctx, auth, quotaSnapshotNextRefreshTime(auth, now, policy)); err != nil {
 			return auth, err
 		}
-		return auth, fmt.Errorf("%s", message)
+		return auth, &quotaPersistedError{message: message, observation: observation}
 	}
 
 	updated := auth.Clone()
@@ -677,6 +882,23 @@ func (h *Handler) persistQuotaSnapshotError(ctx context.Context, auth *coreauth.
 	updated.Metadata[quotaRefreshStatusMetadataKey] = status
 	updated.Metadata[quotaRefreshErrorMetadataKey] = message
 	updated.Metadata[quotaNextRefreshMetadataKey] = quotaSnapshotNextRefreshTime(updated, now, policy).Format(time.RFC3339)
+	// Observability keys for the last failed probe. This writer rewrites or drops
+	// both together with the status/message above, so the pair always describes
+	// the failure persisted here. The pair must be kept consistent at EVERY writer
+	// of quota_refresh_status, not just this one — see
+	// clearQuotaFailureObservation for the other status writers and why. Both keys
+	// are also registered in reauthRuntimeMetadataKeys so a re-auth drops them
+	// along with the rest of the derived quota runtime state.
+	if observation.StatusCode > 0 {
+		updated.Metadata[quotaRefreshHTTPStatusMetadataKey] = observation.StatusCode
+	} else {
+		delete(updated.Metadata, quotaRefreshHTTPStatusMetadataKey)
+	}
+	if observation.RetryAfter > 0 {
+		updated.Metadata[quotaRefreshRetryAfterMetadataKey] = int64(observation.RetryAfter.Round(time.Second) / time.Second)
+	} else {
+		delete(updated.Metadata, quotaRefreshRetryAfterMetadataKey)
+	}
 
 	// farm-account-liveness C1 + C5(a) (authoritative escalation, armed only):
 	// a confirmed `credential unauthorized` (HTTP 401/403 from the quota/profile
@@ -719,7 +941,7 @@ func (h *Handler) persistQuotaSnapshotError(ctx context.Context, auth *coreauth.
 	if err != nil {
 		return saved, err
 	}
-	return saved, fmt.Errorf("%s", message)
+	return saved, &quotaPersistedError{message: message, observation: observation}
 }
 
 // stampQuotaHealthBlind writes the explicit health-blind signal for an
@@ -752,6 +974,9 @@ func (h *Handler) stampQuotaHealthBlind(ctx context.Context, auth *coreauth.Auth
 	}
 	updated.Metadata[quotaRefreshStatusMetadataKey] = quotaRefreshStatusHealthBlind
 	updated.Metadata[quotaRefreshErrorMetadataKey] = healthBlindQuotaErrorMessage
+	// health_blind means "not probed", so any retained per-probe observation
+	// belongs to an older failure and must not travel with the new status.
+	clearQuotaFailureObservation(updated.Metadata)
 	updated.Metadata[farmHealthBlindMetadataKey] = true
 	if metadataString(updated.Metadata, farmHealthBlindAtMetadataKey) == "" {
 		updated.Metadata[farmHealthBlindAtMetadataKey] = now.UTC().Format(time.RFC3339)
@@ -821,10 +1046,27 @@ func fetchQuotaJSON(ctx context.Context, exec coreauth.ProviderExecutor, auth *c
 		return nil, fmt.Errorf("empty response")
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		// Observability: the failure path used to discard the body and the whole
+		// header set, leaving only the fixed non-success sentence to diagnose an
+		// outage with. Read a bounded prefix of the body and keep the allow-listed
+		// error.type / error.message plus the Retry-After hint. The body is read
+		// raw (no Content-Encoding decoding) on purpose: a compressed or truncated
+		// error body must degrade to empty fields rather than fail the request
+		// differently than before.
+		var errorType, errorMessage string
 		if resp.Body != nil {
+			raw, errRead := io.ReadAll(io.LimitReader(resp.Body, quotaErrorBodyReadLimit))
+			if errRead == nil {
+				errorType, errorMessage = quotaErrorFieldsFromBody(raw)
+			}
 			_ = resp.Body.Close()
 		}
-		return nil, &quotaHTTPError{StatusCode: resp.StatusCode}
+		return nil, &quotaHTTPError{
+			StatusCode:   resp.StatusCode,
+			RetryAfter:   quotaRetryAfterFromHeader(resp.Header, time.Now()),
+			ErrorType:    errorType,
+			ErrorMessage: errorMessage,
+		}
 	}
 	body, err := quotaResponseBodyReader(resp)
 	if err != nil {
@@ -849,21 +1091,221 @@ func fetchQuotaJSON(ctx context.Context, exec coreauth.ProviderExecutor, auth *c
 	return payload, nil
 }
 
+// quotaHTTPError carries the observation extracted from a non-2xx quota
+// response. StatusCode is the only field that participates in behaviour
+// (quotaHTTPStatusRequiresReauth / quotaSnapshotErrorClass); RetryAfter,
+// ErrorType and ErrorMessage are observability-only and never change scheduling
+// or reauth decisions.
+//
+// Their sinks are NOT the same, which matters for the privacy argument below:
+// StatusCode and RetryAfter are the only two written to auth metadata
+// (quota_refresh_http_status / quota_refresh_retry_after_seconds, see
+// persistQuotaSnapshotError). ErrorType and ErrorMessage are never persisted at
+// all — they reach only the process log (logQuotaBackgroundRefreshFailure logs
+// both, logQuotaRefreshResult logs the type only) and the refresh API response
+// (quotaRefreshResult.applyProbeObservation).
 type quotaHTTPError struct {
 	StatusCode int
+	// RetryAfter is the parsed Retry-After header hint, zero when absent or
+	// malformed. It is recorded so an operator can tell a genuine rate limit
+	// (server-supplied backoff) from a degraded credential, which the Anthropic
+	// oauth endpoints also answer with 429.
+	RetryAfter time.Duration
+	// ErrorType / ErrorMessage are the allow-listed error.type and error.message
+	// fields of the upstream body. Everything else in the body is discarded on
+	// purpose: quota error bodies can echo organization uuids or account emails,
+	// which must never reach persisted metadata. The two kept fields are NOT
+	// scrubbed internally — see quotaErrorFieldsFromBody for the residual risk
+	// that a middlebox error page puts URL / org text inside error.message.
+	ErrorType    string
+	ErrorMessage string
 }
 
+// Error keeps the historical wording byte-for-byte. Downstream code matches on
+// this text (quotaSnapshotLegacyReauthRequired infers 401/403 from persisted
+// error strings, quotaSnapshotErrorClass falls back to a "non-success status"
+// substring), so the added observation fields are deliberately NOT rendered
+// here; they travel through metadata, the refresh result and logs instead.
 func (e *quotaHTTPError) Error() string {
 	return fmt.Sprintf("quota endpoint returned non-success status %d", e.StatusCode)
+}
+
+// quotaRetryAfterFromHeader parses a Retry-After header, supporting both the
+// delay-seconds and the HTTP-date forms.
+//
+// This is an intentional ~15-line copy of retryAfterFromHeader in
+// internal/runtime/executor/usage_limit_retry.go:93. That helper is package
+// private and the management layer must not import the runtime executor package
+// (management -> executor would couple the management API to request execution),
+// so duplicating the parse is preferred over exporting a cross-package symbol
+// for an observability-only field. Keep both copies in sync if the parsing rules
+// change.
+func quotaRetryAfterFromHeader(headers http.Header, now time.Time) time.Duration {
+	if headers == nil {
+		return 0
+	}
+	raw := strings.TrimSpace(headers.Get("Retry-After"))
+	if raw == "" {
+		return 0
+	}
+	if seconds, err := strconv.ParseInt(raw, 10, 64); err == nil && seconds > 0 {
+		return time.Duration(seconds) * time.Second
+	}
+	if resetAt, err := http.ParseTime(raw); err == nil && resetAt.After(now) {
+		return resetAt.Sub(now)
+	}
+	return 0
+}
+
+// quotaErrorFieldsFromBody applies a two-field ALLOW-LIST to a non-2xx quota
+// body: only error.type and error.message are read, both are required to be JSON
+// strings, and both are truncated. The raw body is never returned, so the
+// organization uuids / emails / tokens quota error bodies can echo stay out of
+// auth metadata and out of the management UI.
+//
+// This is an allow-list, NOT redaction: nothing inside the two kept fields is
+// scrubbed. A KNOWN RESIDUAL RISK remains — a legitimately string-typed
+// error.message is forwarded verbatim to its sinks (the process log and the
+// refresh API response; neither kept field is written to auth metadata), and a
+// non-Anthropic middlebox in the chain (corporate proxy, WAF, load balancer
+// error page) can put the request URL or organization-related text into that
+// string. The allow-list bounds the blast radius to two short fields; it does
+// not guarantee the content is identifier-free. Do not treat these fields as
+// sanitized.
+func quotaErrorFieldsFromBody(body []byte) (string, string) {
+	if len(body) == 0 {
+		return "", ""
+	}
+	return truncateQuotaErrorField(quotaErrorStringField(body, "error.type")),
+		truncateQuotaErrorField(quotaErrorStringField(body, "error.message"))
+}
+
+// quotaErrorStringField reads path out of body only when it holds a JSON string.
+//
+// The type check is load-bearing, not defensive noise: gjson's Result.String()
+// returns the RAW JSON text for object and array results (gjson.go, `case JSON:
+// return t.Raw`), so a body shaped like
+// {"error":{"message":{"account_email":"..."}}} would copy the entire nested
+// object through the allow-list verbatim and persist it. Truncation cannot save
+// that case because leak markers are short. Numbers / bools / null are dropped
+// for the same reason the fields are documented as strings: no coercion into
+// persisted text.
+func quotaErrorStringField(body []byte, path string) string {
+	result := gjson.GetBytes(body, path)
+	if result.Type != gjson.String {
+		return ""
+	}
+	return result.Str
+}
+
+func truncateQuotaErrorField(value string) string {
+	value = strings.TrimSpace(value)
+	runes := []rune(value)
+	if len(runes) <= quotaErrorFieldMaxRunes {
+		return value
+	}
+	return string(runes[:quotaErrorFieldMaxRunes]) + "..."
 }
 
 type quotaReauthRequiredError struct {
 	Provider   string
 	StatusCode int
+	// RetryAfter / ErrorType / ErrorMessage carry the same observation as
+	// quotaHTTPError. They are copied over rather than wrapped: adding Unwrap
+	// here would make errors.As(err, **quotaHTTPError) start succeeding for
+	// reauth errors and silently change quotaSnapshotErrorClass / reauth
+	// classification, which must stay untouched.
+	RetryAfter   time.Duration
+	ErrorType    string
+	ErrorMessage string
 }
 
+// Error keeps returning only the sanitized, tokenless message. Existing tests
+// assert the upstream body never reaches this string, so the observation fields
+// must not be rendered here.
 func (e *quotaReauthRequiredError) Error() string {
 	return quotaCredentialUnauthorizedMessage(e.Provider)
+}
+
+// quotaProbeObservation is the observability-only view of a failed quota probe.
+// It never participates in scheduling, reauth or selection decisions.
+type quotaProbeObservation struct {
+	StatusCode   int
+	RetryAfter   time.Duration
+	ErrorType    string
+	ErrorMessage string
+}
+
+// clearQuotaFailureObservation drops the last-failed-probe observability pair.
+//
+// It exists because quota_refresh_status has FIVE writers and only
+// persistQuotaSnapshotError writes the observation. Every other writer moves the
+// status to a value that contradicts a retained failure observation, so each one
+// has to clear the pair or the account keeps advertising a stale upstream status
+// after it recovered. The concrete regression: an account 429s
+// (status=error, http_status=429, retry_after=300), a later liveness probe
+// succeeds and flips status=ok — without this call the account still reports
+// http_status=429 / retry_after=300 and the management view shows a rate limit
+// that is long gone.
+//
+// Callers clear UNCONDITIONALLY, deliberately not gated on
+// farmLivenessDetectionEnabled(): whether the pair is stale must not depend on
+// which rollout flag happens to be armed, and a flag flip must not resurrect an
+// old observation.
+func clearQuotaFailureObservation(meta map[string]any) {
+	if meta == nil {
+		return
+	}
+	delete(meta, quotaRefreshHTTPStatusMetadataKey)
+	delete(meta, quotaRefreshRetryAfterMetadataKey)
+}
+
+// quotaProbeObservationFromError reads the observation out of either failure
+// error shape. Both are matched explicitly because quotaReauthErrorForProvider
+// replaces a 401/403 quotaHTTPError with a quotaReauthRequiredError instead of
+// wrapping it.
+func quotaProbeObservationFromError(err error) quotaProbeObservation {
+	if err == nil {
+		return quotaProbeObservation{}
+	}
+	var httpErr *quotaHTTPError
+	if errors.As(err, &httpErr) && httpErr != nil {
+		return quotaProbeObservation{
+			StatusCode:   httpErr.StatusCode,
+			RetryAfter:   httpErr.RetryAfter,
+			ErrorType:    httpErr.ErrorType,
+			ErrorMessage: httpErr.ErrorMessage,
+		}
+	}
+	var reauthErr *quotaReauthRequiredError
+	if errors.As(err, &reauthErr) && reauthErr != nil {
+		return quotaProbeObservation{
+			StatusCode:   reauthErr.StatusCode,
+			RetryAfter:   reauthErr.RetryAfter,
+			ErrorType:    reauthErr.ErrorType,
+			ErrorMessage: reauthErr.ErrorMessage,
+		}
+	}
+	var persistedErr *quotaPersistedError
+	if errors.As(err, &persistedErr) && persistedErr != nil {
+		return persistedErr.observation
+	}
+	return quotaProbeObservation{}
+}
+
+// quotaPersistedError is what persistQuotaSnapshotError returns after recording
+// a failure. Error() reproduces the exact message the previous
+// fmt.Errorf("%s", message) produced, so every caller that matches on the text
+// is unaffected; the struct only additionally ferries the observation to the
+// caller for logging and for the refresh result, because the persisted message
+// itself is deliberately tokenless and carries no status/Retry-After detail.
+type quotaPersistedError struct {
+	message     string
+	observation quotaProbeObservation
+}
+
+func (e *quotaPersistedError) Error() string {
+	return e.message
 }
 
 func quotaCredentialUnauthorizedMessage(provider string) string {
@@ -879,7 +1321,14 @@ func quotaCredentialUnauthorizedMessage(provider string) string {
 
 func quotaReauthErrorForProvider(provider string, err error) error {
 	if code, ok := quotaHTTPStatusCode(err); ok && quotaHTTPStatusRequiresReauth(code) {
-		return &quotaReauthRequiredError{Provider: provider, StatusCode: code}
+		observation := quotaProbeObservationFromError(err)
+		return &quotaReauthRequiredError{
+			Provider:     provider,
+			StatusCode:   code,
+			RetryAfter:   observation.RetryAfter,
+			ErrorType:    observation.ErrorType,
+			ErrorMessage: observation.ErrorMessage,
+		}
 	}
 	return err
 }

@@ -200,6 +200,10 @@ func (h *Handler) applyLivenessProbeUnauthorized(ctx context.Context, manager *c
 	}
 	updated.Metadata[quotaRefreshStatusMetadataKey] = quotaRefreshStatusReauthRequired
 	updated.Metadata[quotaRefreshErrorMetadataKey] = message
+	// This writer replaces the status/message without writing an observation of
+	// its own, so a retained pair would describe an older, unrelated failure
+	// (e.g. a previous 429 riding along on a reauth_required account).
+	clearQuotaFailureObservation(updated.Metadata)
 	updated.Metadata[quotaNextRefreshMetadataKey] = quotaSnapshotNextRefreshTime(updated, now, policy).Format(time.RFC3339)
 	updated.Metadata[farmLivenessProbedAtMetadataKey] = now.Format(time.RFC3339)
 
@@ -248,6 +252,10 @@ func (h *Handler) applyLivenessProbeSuccess(ctx context.Context, manager *coreau
 	updated.Metadata[quotaSnapshotMetadataKey] = snapshot
 	updated.Metadata[quotaRefreshStatusMetadataKey] = quotaRefreshStatusOK
 	delete(updated.Metadata, quotaRefreshErrorMetadataKey)
+	// The probe just succeeded, so the previous failure's upstream status /
+	// Retry-After are stale; dropping them here is what keeps a recovered
+	// account from still showing the 429 it has moved past.
+	clearQuotaFailureObservation(updated.Metadata)
 	delete(updated.Metadata, farmHealthBlindMetadataKey)
 	delete(updated.Metadata, farmHealthBlindAtMetadataKey)
 	updated.Metadata[quotaLastRefreshedMetadataKey] = now.Format(time.RFC3339)

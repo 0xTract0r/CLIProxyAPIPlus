@@ -65,6 +65,12 @@ type Handler struct {
 	managedHeaderScheduler  *managedHeaderSyncScheduler
 	quotaRefreshCancel      context.CancelFunc
 	farmLivenessProbeCancel context.CancelFunc
+	// quotaRefreshLogMu / quotaRefreshLogState throttle the background quota
+	// poller's observability logs (see quotaRefreshLogAllowed). The poller ticks
+	// once per second across every account, so an unthrottled log line would
+	// flood the process log.
+	quotaRefreshLogMu    sync.Mutex
+	quotaRefreshLogState map[string]quotaRefreshLogEntry
 }
 
 type configReloadSnapshot struct {

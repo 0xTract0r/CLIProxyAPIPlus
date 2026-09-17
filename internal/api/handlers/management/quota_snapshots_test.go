@@ -41,6 +41,9 @@ type quotaSnapshotTestResponse struct {
 	contentEncoding string
 	delay           time.Duration
 	err             error
+	// header carries extra response headers (e.g. Retry-After) for the quota
+	// failure-observability tests. Nil keeps the previous behaviour exactly.
+	header http.Header
 }
 
 func (e *quotaSnapshotTestExecutor) Identifier() string { return e.provider }
@@ -116,6 +119,11 @@ func (e *quotaSnapshotTestExecutor) HttpRequest(ctx context.Context, auth *corea
 	header := http.Header{"Content-Type": []string{"application/json"}}
 	if response.contentEncoding != "" {
 		header.Set("Content-Encoding", response.contentEncoding)
+	}
+	for name, values := range response.header {
+		for _, value := range values {
+			header.Add(name, value)
+		}
 	}
 	return &http.Response{
 		StatusCode: response.statusCode,
