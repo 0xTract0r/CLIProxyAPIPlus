@@ -2748,6 +2748,12 @@ var reauthRuntimeMetadataKeys = map[string]struct{}{
 	quotaRefreshStatusMetadataKey: {},
 	quotaRefreshErrorMetadataKey:  {},
 	quotaNextRefreshMetadataKey:   {},
+	// Observability detail of the last failed quota probe. It describes the
+	// pre-re-auth credential, so it must be dropped with the rest of the derived
+	// quota runtime state; a surviving 401/429 observation would keep describing
+	// a credential that has already been replaced.
+	quotaRefreshHTTPStatusMetadataKey: {},
+	quotaRefreshRetryAfterMetadataKey: {},
 }
 
 func isReauthUserDefinedMetadataKey(key string) bool {
