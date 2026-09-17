@@ -784,6 +784,10 @@ func (m *Manager) shouldRetryAfterError(err error, attempt int, providers []stri
 	if err == nil {
 		return 0, false
 	}
+	var warmupBusy *warmupBusyError
+	if errors.As(err, &warmupBusy) {
+		return 0, false
+	}
 	var homeBusy *HomeConcurrencyBusyError
 	if errors.As(err, &homeBusy) && homeBusy != nil {
 		return 0, false
@@ -990,6 +994,17 @@ func (m *Manager) routeAwareSelectionRequired(auth *Auth, routeModel string) boo
 }
 
 func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, error) {
+	var auth *Auth
+	var executor ProviderExecutor
+	err := runWarmupSelection(ctx, func(current context.Context) error {
+		var err error
+		auth, executor, err = m.pickNextLegacyOnce(current, provider, model, opts, tried)
+		return err
+	})
+	return auth, executor, err
+}
+
+func (m *Manager) pickNextLegacyOnce(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, error) {
 	if m.HomeEnabled() {
 		auth, exec, _, err := m.pickNextViaHome(ctx, model, opts, tried)
 		return auth, exec, err
@@ -1237,6 +1252,18 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 }
 
 func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, string, error) {
+	var auth *Auth
+	var executor ProviderExecutor
+	var provider string
+	err := runWarmupSelection(ctx, func(current context.Context) error {
+		var err error
+		auth, executor, provider, err = m.pickNextMixedLegacyOnce(current, providers, model, opts, tried)
+		return err
+	})
+	return auth, executor, provider, err
+}
+
+func (m *Manager) pickNextMixedLegacyOnce(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, string, error) {
 	if m.HomeEnabled() {
 		return m.pickNextViaHome(ctx, model, opts, tried)
 	}

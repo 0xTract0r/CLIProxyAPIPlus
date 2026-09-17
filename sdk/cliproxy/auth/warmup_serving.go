@@ -118,12 +118,17 @@ type warmupRequestSummary struct {
 	messages, inputCost     int
 	known, singleUser, fork bool
 	identityKnown           bool
+	task                    [32]byte
+	taskBytes               int
 	uncachedTail            bool
 	cacheTTL                time.Duration
 }
 
 type warmupServingSession struct {
 	reserved, child, parentAffine bool
+	protected                     bool
+	source                        string
+	revision                      uint64
 	assignedAt, lastSeen          time.Time
 	summary                       warmupRequestSummary
 }
@@ -148,6 +153,7 @@ func (s *AdaptiveSelector) clearWarmupServing() {
 }
 
 func (s *AdaptiveSelector) clearWarmupServingLocked() {
+	s.servingEpoch++
 	s.servingAccounts = nil
 	s.servingCharges = nil
 	s.servingOrder = 0
@@ -155,9 +161,9 @@ func (s *AdaptiveSelector) clearWarmupServingLocked() {
 	if s.cache != nil {
 		s.cache.mu.Lock()
 		defer s.cache.mu.Unlock()
-		s.cache.servingExpired = nil
 		for key, entry := range s.cache.entries {
 			if entry.serving != nil && entry.serving.child {
+				s.cache.rememberServingExpiryLocked(key, entry)
 				delete(s.cache.entries, key)
 			} else if entry.serving != nil {
 				entry.serving = nil
@@ -185,13 +191,18 @@ func (s *AdaptiveSelector) servingEntry(key string, now time.Time) (sessionEntry
 	return entry, true
 }
 
-func (s *AdaptiveSelector) setServingEntry(key, authID string, state warmupServingSession, now time.Time) {
+func (s *AdaptiveSelector) setServingEntry(key, authID string, state warmupServingSession, now time.Time) uint64 {
 	state.lastSeen = now
 	if state.assignedAt.IsZero() {
 		state.assignedAt = now
 	}
 	s.cache.mu.Lock()
 	defer s.cache.mu.Unlock()
+	previous, exists := s.cache.entries[key]
+	if state.revision == 0 || !exists || previous.serving == nil || previous.authID != authID || previous.serving.revision != state.revision {
+		s.servingRevision++
+		state.revision = s.servingRevision
+	}
 	if _, exists := s.cache.entries[key]; !exists && len(s.cache.entries) >= warmupServingCapacity {
 		oldestKey := ""
 		var oldest time.Time
@@ -205,6 +216,7 @@ func (s *AdaptiveSelector) setServingEntry(key, authID string, state warmupServi
 	}
 	delete(s.cache.servingExpired, key)
 	s.cache.entries[key] = sessionEntry{authID: authID, expiresAt: time.Now().Add(s.cache.ttl), serving: &state}
+	return state.revision
 }
 
 func warmupChildKey(rootKey, agentID string) string {
@@ -233,8 +245,16 @@ func (s *AdaptiveSelector) pickWithWarmupServing(ctx context.Context, provider, 
 	}
 	identityConflict := headerRoot != "" && primaryID != "claude:"+headerRoot
 	if !s.sessionAffinity || s.cache == nil || primaryID == "" {
-		if !retry && agentID == "" {
-			if picked, ok := s.reserveWarmingPick(available, cfg, now, true, ""); ok {
+		matureOnly, suppressReserve, _ := warmupSelectionPolicy(ctx)
+		if matureOnly {
+			picked, ok := s.pickFromCandidates(s.scoreCandidates(available, cfg, now, true), cfg, now)
+			if !ok {
+				return nil, true, newWarmupBusyError()
+			}
+			return picked, true, nil
+		}
+		if !suppressReserve && !retry && agentID == "" {
+			if picked, ok := s.reserveWarmingPick(ctx, available, cfg, now, true, ""); ok {
 				s.logPick(ctx, "reserve-warming-new", provider, model, "", picked, cfg, now)
 				return picked, true, nil
 			}
@@ -253,12 +273,50 @@ func (s *AdaptiveSelector) pickWithWarmupServing(ctx context.Context, provider, 
 	}
 	summary := summarizeWarmupRequest(opts.OriginalRequest)
 	entry, bound := s.servingEntry(key, now)
+	bindingKey := key
+	matureOnly, suppressReserve, proof := warmupSelectionPolicy(ctx)
+	staleProof := proof != nil && (proof.selector != s || proof.epoch != s.servingEpoch || proof.key != key || !bound || entry.serving == nil || proof.revision != entry.serving.revision || proof.authID != entry.authID)
+	if staleProof {
+		// Re-read current state after every wait; never copy back the old proof.
+		suppressReserve = true
+	}
 	// An alias may inherit an existing root binding, but never a parent's child
 	// identity. Such inheritance is not a fresh reserve opportunity.
 	if !bound && !child && fallbackID != "" && fallbackID != primaryID {
-		entry, bound = s.servingEntry(provider+"::"+fallbackID+"::"+model, now)
+		fallbackKey := provider + "::" + fallbackID + "::" + model
+		entry, bound = s.servingEntry(fallbackKey, now)
+		if bound {
+			// Alias overlap shares the existing owner's ticket, while a normal
+			// successful alias selection still commits only its own new key.
+			bindingKey = fallbackKey
+		}
 	}
-	newOpportunity := !bound && !s.cache.recentServingExpiry(key)
+	borrow, borrowProof := warmupBorrowPolicy(ctx)
+	if !borrow && bound && entry.serving != nil && entry.serving.protected && !retry {
+		for _, candidate := range available {
+			if candidate == nil || candidate.ID != entry.authID || s.isMature(candidate, cfg, now) || s.overWarmupBudget(candidate, cfg, now) {
+				continue
+			}
+			sameWait := borrowProof != nil && borrowProof.selector == s && borrowProof.key == bindingKey && borrowProof.authID == entry.authID && borrowProof.revision == entry.serving.revision && borrowProof.epoch == s.servingEpoch
+			borrow = sameWait || s.gate.InFlight(candidate.ID) > 0
+			break
+		}
+	}
+	if borrow {
+		// The original request owns this binding. Borrowed attempts must not
+		// renew its TTL, replace its summary, or commit a retry's selected auth.
+		warmupMarkBorrow(ctx)
+		picked, ok := s.pickFromCandidates(s.scoreCandidates(available, cfg, now, true), cfg, now)
+		if !ok {
+			return nil, true, newWarmupBusyError()
+		}
+		s.logPick(ctx, "warmup-concurrent-borrow-mature", provider, model, primaryID, picked, cfg, now)
+		return picked, true, nil
+	}
+	newOpportunity := !bound && !suppressReserve && !s.cache.recentServingExpiry(key)
+	if !child && !summary.singleUser {
+		newOpportunity = false
+	}
 	if !bound && !child && fallbackID != "" {
 		newOpportunity = newOpportunity && !s.cache.recentServingExpiry(provider+"::"+fallbackID+"::"+model)
 	}
@@ -269,7 +327,7 @@ func (s *AdaptiveSelector) pickWithWarmupServing(ctx context.Context, provider, 
 	reasonPrefix := ""
 	if child && !bound {
 		parent, parentOK := s.servingEntry(parentKey, now)
-		fresh := !identityConflict && parentOK && parent.serving != nil && isFreshWarmupChild(summary, parent.serving.summary)
+		fresh := !identityConflict && parentOK && parent.serving != nil && isFreshWarmupChild(summary, parent.serving.summary) && !warmupInheritedTaskPrefix(opts.OriginalRequest, parent.serving.summary)
 		state.parentAffine = !fresh
 		if fresh {
 			reasonPrefix = "child-fresh/"
@@ -279,6 +337,10 @@ func (s *AdaptiveSelector) pickWithWarmupServing(ctx context.Context, provider, 
 				entry, bound = parent, true
 				if parent.serving != nil {
 					state.reserved = parent.serving.reserved
+					state.protected = parent.serving.protected
+					if state.protected {
+						state.source = "inherited"
+					}
 				}
 			}
 		}
@@ -286,7 +348,39 @@ func (s *AdaptiveSelector) pickWithWarmupServing(ctx context.Context, provider, 
 	var picked *Auth
 	var reason string
 	var err error
-	if bound && !retry {
+	if matureOnly && staleProof && bound && entry.serving != nil {
+		for _, candidate := range available {
+			if candidate == nil || candidate.ID != entry.authID || s.overWarmupBudget(candidate, cfg, now) || !s.hasConcurrencyHeadroom(candidate, cfg, now) || s.pendingWarmupBudgetBusy(candidate, cfg, now) {
+				continue
+			}
+			rpm, burst := s.rateLimitParams(candidate, cfg, now)
+			allowed := warmupRateChargeAvailable(ctx, candidate.ID)
+			if !allowed {
+				allowed, _ = s.limiter.AllowOrDelay(candidate.ID, rpm, burst)
+			}
+			if allowed {
+				picked, reason = candidate, "warmup-wait-current-binding"
+				warmupRecordRateCharge(ctx, candidate.ID, true)
+			}
+			break
+		}
+	}
+	if matureOnly && picked == nil {
+		picked, ok := s.pickFromCandidates(s.scoreCandidates(available, cfg, now, true), cfg, now)
+		if !ok {
+			return nil, true, newWarmupBusyError()
+		}
+		state.reserved, state.protected, state.source = false, false, ""
+		if !bound || picked.ID != entry.authID {
+			state.assignedAt = now
+		}
+		state.summary = summary
+		revision := s.setServingEntry(key, picked.ID, state, now)
+		warmupRecordBinding(ctx, s, key, picked.ID, revision, s.servingEpoch, false)
+		s.logPick(ctx, "warmup-wait-handoff-mature", provider, model, primaryID, picked, cfg, now)
+		return picked, true, nil
+	}
+	if picked == nil && bound && !retry {
 		var boundAuth *Auth
 		for _, a := range available {
 			if a != nil && a.ID == entry.authID {
@@ -298,31 +392,57 @@ func (s *AdaptiveSelector) pickWithWarmupServing(ctx context.Context, provider, 
 			picked, reason = s.tryWarmupMigration(ctx, boundAuth, available, state, summary, cfg, now)
 			if picked != nil {
 				state.reserved, state.assignedAt = true, now
+				state.protected, state.source = true, "migration"
 			}
 		}
-		if picked == nil && boundAuth != nil && state.reserved && !s.isMature(boundAuth, cfg, now) && s.boundServableForKeep(boundAuth, cfg, now) {
-			picked, reason = boundAuth, "sticky-keep-warming-reserved"
+		if picked == nil && boundAuth != nil && state.protected && !s.isMature(boundAuth, cfg, now) && !s.overWarmupBudget(boundAuth, cfg, now) {
+			delay := 100 * time.Millisecond
+			if s.hasConcurrencyHeadroom(boundAuth, cfg, now) && !s.pendingWarmupBudgetBusy(boundAuth, cfg, now) {
+				rpm, burst := s.rateLimitParams(boundAuth, cfg, now)
+				allowed, next := warmupRateChargeAvailable(ctx, boundAuth.ID), time.Duration(0)
+				if !allowed {
+					allowed, next = s.limiter.AllowOrDelay(boundAuth.ID, rpm, burst)
+				}
+				if allowed {
+					picked, reason = boundAuth, "sticky-keep-warming-protected"
+					warmupRecordRateCharge(ctx, picked.ID, true)
+				} else {
+					delay = next
+				}
+			}
+			if picked == nil {
+				return nil, true, &warmupSelectionWait{selector: s, key: bindingKey, authID: boundAuth.ID, revision: state.revision, epoch: s.servingEpoch, delay: delay}
+			}
 		}
 		if picked == nil {
 			// Failed keeps are ordinary reselection, never new reserve draws.
 			picked, reason, err = s.resolveSticky(ctx, provider, model, opts, auths, available, cfg, now, key, entry.authID)
-			state.reserved = false
+			state.reserved, state.protected, state.source = false, false, ""
 		}
-	} else if newOpportunity && !retry && !state.parentAffine {
-		if chosen, ok := s.reserveWarmingPick(available, cfg, now, true, ""); ok {
+	} else if picked == nil && newOpportunity && !retry && !state.parentAffine {
+		if chosen, ok := s.reserveWarmingPick(ctx, available, cfg, now, true, ""); ok {
 			picked, reason, state.reserved = chosen, "reserve-warming-new", true
+			state.protected, state.source = true, "reserve"
 		}
 	}
 	if picked == nil && err == nil {
 		picked, reason, err = s.selectAndBind(ctx, provider, model, opts, auths, available, cfg, now, key)
 		state.reserved = false
+		state.protected, state.source = false, ""
+		if err == nil && picked != nil && newOpportunity && !retry && !state.parentAffine && !s.isMature(picked, cfg, now) && len(s.scoreCandidates(available, cfg, now, true)) > 0 {
+			state.protected, state.source = true, "weighted"
+		}
 	}
 	if err == nil && picked != nil {
+		if state.protected {
+			reason += "/protected-" + state.source
+		}
 		if !bound || picked.ID != entry.authID {
 			state.assignedAt = now
 		}
 		state.summary = summary
-		s.setServingEntry(key, picked.ID, state, now)
+		revision := s.setServingEntry(key, picked.ID, state, now)
+		warmupRecordBinding(ctx, s, key, picked.ID, revision, s.servingEpoch, state.protected)
 		s.logPick(ctx, reasonPrefix+reason, provider, model, primaryID, picked, cfg, now)
 	}
 	return picked, true, err
@@ -362,7 +482,7 @@ func (s *AdaptiveSelector) observeServingAccounts(available []*Auth, cfg interna
 // The candidate floor only chooses among warming accounts; the outer lottery
 // governs new opportunities. Existing request/concurrency/health gates and the
 // original weighted limiter (including its soft overflow) remain authoritative.
-func (s *AdaptiveSelector) reserveWarmingPick(available []*Auth, cfg internalconfig.AccountSchedulingConfig, now time.Time, lottery bool, exclude string) (*Auth, bool) {
+func (s *AdaptiveSelector) reserveWarmingPick(ctx context.Context, available []*Auth, cfg internalconfig.AccountSchedulingConfig, now time.Time, lottery bool, exclude string) (*Auth, bool) {
 	if cfg.WarmupServingReserve <= 0 || len(s.scoreCandidates(available, cfg, now, true)) == 0 {
 		return nil, false
 	}
@@ -390,7 +510,7 @@ func (s *AdaptiveSelector) reserveWarmingPick(available []*Auth, cfg internalcon
 	if len(filtered) == 0 || (lottery && s.rng() >= cfg.WarmupServingReserve) {
 		return nil, false
 	}
-	picked, ok := s.pickFromCandidates(filtered, cfg, now)
+	picked, ok := s.pickFromCandidatesForRequest(ctx, filtered, cfg, now)
 	if ok {
 		state := s.servingAccounts[picked.ID]
 		s.servingOrder++
@@ -450,7 +570,7 @@ func (s *AdaptiveSelector) tryWarmupMigration(ctx context.Context, bound *Auth, 
 	// This reservation and selection share servingMu with every opted-in Pick.
 	// No other request can spend the budget or move the binding in between.
 	s.servingCharges = append(s.servingCharges, warmupMigrationCharge{at: now, tokens: next.inputCost})
-	picked, ok := s.reserveWarmingPick(available, cfg, now, false, bound.ID)
+	picked, ok := s.reserveWarmingPick(ctx, available, cfg, now, false, bound.ID)
 	if !ok {
 		s.servingCharges = s.servingCharges[:len(s.servingCharges)-1]
 		selectorLogEntry(ctx).Debug("adaptive-select: migration-skip-no-target")
@@ -461,7 +581,7 @@ func (s *AdaptiveSelector) tryWarmupMigration(ctx context.Context, bound *Auth, 
 }
 
 func isFreshWarmupChild(child, parent warmupRequestSummary) bool {
-	return child.identityKnown && parent.identityKnown && !child.fork && child.singleUser && child.first != parent.first && child.system != parent.system
+	return child.identityKnown && parent.identityKnown && !child.fork && child.singleUser && child.first != parent.first && child.system != parent.system && child.taskBytes > 0 && parent.taskBytes > 0 && child.task != parent.task
 }
 
 func summarizeWarmupRequest(payload []byte) warmupRequestSummary {
@@ -487,7 +607,10 @@ func summarizeWarmupRequest(payload []byte) warmupRequestSummary {
 	first, _ := json.Marshal(withoutWarmupCacheControl(messages[0]))
 	summary.first = sha256.Sum256(first)
 	summary.messages = len(messages)
-	summary.singleUser = warmupFreshUserMessage(messages[0]) && (len(messages) == 1 || (len(messages) == 2 && warmupAuxiliaryMessage(messages[1])))
+	summary.singleUser = warmupFreshUserMessage(messages[0]) && (len(messages) == 1 || warmupAuxiliaryMessages(messages[1:]))
+	if task := warmupCanonicalTask(messages[0]); task != "" {
+		summary.task, summary.taskBytes = sha256.Sum256([]byte(task)), len(task)
+	}
 	// Inspect identity by message/content position, not type fields in tool input.
 	// Keep the previous conservative migration-cost gate independently unchanged.
 	summary.identityKnown = warmupIdentityMessages(messages)

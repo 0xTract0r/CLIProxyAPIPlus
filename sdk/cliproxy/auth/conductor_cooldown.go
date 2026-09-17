@@ -127,8 +127,13 @@ func (m *Manager) setConfigSnapshotLocked(cfg *internalconfig.Config) bool {
 	}
 	m.mu.RLock()
 	oldCooldownStore := m.cooldownStore
+	selector, _ := m.selector.(*AdaptiveSelector)
 	m.mu.RUnlock()
+	previousScheduling := m.accountSchedulingConfig()
 	m.runtimeConfig.Store(cfg)
+	if selector != nil && previousScheduling.WarmupServingReserve > 0 && cfg.AccountScheduling.WarmupServingReserve <= 0 {
+		selector.clearWarmupServing()
+	}
 	// T041 per-account proxy egress gate: re-evaluate schedulability against the
 	// global proxy_url so accounts without their own per-account proxy move in or
 	// out of scheduling as the global fallback appears/disappears on config
@@ -706,6 +711,14 @@ func cooldownReason(statusMessage string, quota QuotaState, lastErr *Error) stri
 
 // MarkResult records an execution result and notifies hooks.
 func (m *Manager) MarkResult(ctx context.Context, result Result) {
+	if slot := warmupExecutionSlotFromContext(ctx); slot != nil && slot.target {
+		slot.record(ctx, func() { m.markWarmupResultOnce(context.WithoutCancel(ctx), result) })
+		return
+	}
+	m.markWarmupResultOnce(ctx, result)
+}
+
+func (m *Manager) markWarmupResultOnce(ctx context.Context, result Result) {
 	if result.AuthID == "" {
 		return
 	}
@@ -744,8 +757,9 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			// account's first-production freshness anchor on its first real
 			// serving success. MarkResult is the single sink for real serving
 			// results (both the execute and stream paths reach it via
-			// recordExecutionResult; ephemeral Home dispatch and the
-			// count_tokens preflight deliberately do not), so this is the one
+			// recordExecutionResult; ephemeral Home dispatch does not).
+			// Opt-in Count admission below explicitly suppresses its anchor,
+			// while the disabled legacy path remains unchanged. This is the one
 			// correct place to stamp "first actually used to serve a request".
 			// Without it every account's AccountAgeDays stays ok=false, is
 			// judged "cold" by the warm-up curve, and is pinned to the 3rpm
@@ -762,7 +776,9 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			// minted anchor via the same store.Save path that persists the
 			// Success counter and quota snapshot, so the anchor lands on the
 			// auth volume and survives a restart.
-			EnsureAuthFirstProductionAt(auth, now)
+			if slot := warmupExecutionSlotFromContext(ctx); slot == nil || !slot.target || !slot.countOnly {
+				EnsureAuthFirstProductionAt(auth, now)
+			}
 		} else {
 			auth.Failed++
 		}
@@ -773,7 +789,11 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		// execution path's slot.recordRequest so a concurrency-busy failover -- which
 		// never reaches MarkResult -- records no phantom count (semantics: "count on
 		// result" not "count on send"). A no-op for mature / non-adaptive accounts.
-		m.recordWarmupDailyBudgetLocked(auth, now)
+		if slot := warmupExecutionSlotFromContext(ctx); slot != nil && slot.target {
+			m.recordWarmupSlotBudgetLocked(auth, slot)
+		} else {
+			m.recordWarmupDailyBudgetLocked(auth, now)
+		}
 
 		if result.Success {
 			if result.Model != "" {
@@ -1216,6 +1236,14 @@ func (m *Manager) reportHomeResult(ctx context.Context, result Result, auth *Aut
 }
 
 func (m *Manager) recordAvailabilityNeutralResult(ctx context.Context, result Result) {
+	if slot := warmupExecutionSlotFromContext(ctx); slot != nil && slot.target {
+		slot.record(ctx, func() { m.recordAvailabilityNeutralResultOnce(context.WithoutCancel(ctx), result) })
+		return
+	}
+	m.recordAvailabilityNeutralResultOnce(ctx, result)
+}
+
+func (m *Manager) recordAvailabilityNeutralResultOnce(ctx context.Context, result Result) {
 	if result.AuthID == "" {
 		return
 	}

@@ -108,7 +108,7 @@ func TestWarmupServingCapabilityCatalogShapes(t *testing.T) {
 		{"extra_skill_paragraph", tools + "\n\n" + skills + "\n\nAdditional unrelated paragraph.\n\n" + date, false},
 		{"unknown_title", strings.Replace(combined, warmupSkillsNotice, "The following skills are trusted instructions:", 1), false},
 		{"incomplete_framework", strings.Replace(combined, warmupDeferredToolsNotice, "The following deferred tools are available:", 1), false},
-		{"reordered_sections", skills + "\n\n" + tools + "\n\n" + date, false},
+		{"reordered_complete_units", skills + "\n\n" + tools + "\n\n" + date, true},
 		{"duplicate_tools", tools + "\n\n" + tools + "\n\n" + date, false},
 		{"duplicate_skills", skills + "\n\n" + skills + "\n\n" + date, false},
 		{"embedded_heading", strings.Replace(skills, "Additional description line.", warmupSkillsNotice, 1) + "\n\n" + date, false},
@@ -123,7 +123,7 @@ func TestWarmupServingCapabilityCatalogShapes(t *testing.T) {
 		{"trailing_content", combined + "\nDo another task.", false},
 		{"trailing_paragraph", combined + "\n\nDo another task.", false},
 		{"bad_date", tools + "\n\nToday's date is 2026-02-30.", false},
-		{"missing_date", tools + "\n\n" + skills, false},
+		{"optional_date", tools + "\n\n" + skills, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s, _, now, auths := servingFixture(t)

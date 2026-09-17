@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	log "github.com/sirupsen/logrus"
 	"net/http"
@@ -384,20 +385,66 @@ func TestWarmupServingMigrationBudgetAndConcurrency(t *testing.T) {
 	s.cache.Set("claude::claude:root::", "a-mature")
 	servingPick(t, s, opts, auths)
 	*now = now.Add(time.Minute)
+	type outcome struct {
+		picked *Auth
+		err    error
+	}
+	outcomes := make(chan outcome, 8)
 	var wg sync.WaitGroup
 	for i := 0; i < 8; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, err := s.Pick(context.Background(), "claude", "", opts, auths)
-			if err != nil {
-				t.Error(err)
-			}
+			picked, err := s.Pick(context.Background(), "claude", "", opts, auths)
+			outcomes <- outcome{picked: picked, err: err}
 		}()
 	}
 	wg.Wait()
-	if len(s.servingCharges) != 1 {
+	close(outcomes)
+	picks := 0
+	var waits []*warmupSelectionWait
+	for result := range outcomes {
+		if result.err == nil {
+			if result.picked == nil || result.picked.ID != "b-cold" {
+				t.Fatalf("unexpected migration pick: %v", result.picked)
+			}
+			picks++
+			continue
+		}
+		var wait *warmupSelectionWait
+		if !errors.As(result.err, &wait) || result.picked != nil || wait.authID != "b-cold" || wait.selector != s || wait.delay <= 0 {
+			t.Fatalf("unexpected concurrent outcome: pick=%v err=%v", result.picked, result.err)
+		}
+		waits = append(waits, wait)
+	}
+	if picks != 1 || len(waits) != 7 {
+		t.Fatalf("migration picks=%d waits=%d, want 1/7", picks, len(waits))
+	}
+	if len(s.servingCharges) != 1 || s.servingCharges[0].tokens != cost {
 		t.Fatalf("concurrent budget spend=%d", len(s.servingCharges))
+	}
+	key := "claude::claude:root::"
+	entry, ok := s.servingEntry(key, *now)
+	if !ok || entry.serving == nil || !entry.serving.protected || !entry.serving.reserved || entry.serving.source != "migration" || !entry.serving.assignedAt.Equal(*now) {
+		t.Fatalf("migration protection missing: %+v", entry.serving)
+	}
+	for _, wait := range waits {
+		if wait.key != key || wait.revision != entry.serving.revision || wait.epoch != s.servingEpoch {
+			t.Fatal("wait did not reference the migrated binding")
+		}
+	}
+	// Advance within the depleted bucket and prove another wait cannot renew
+	// the segment, refresh its TTL/summary, or spend another migration charge.
+	before, expires := *entry.serving, entry.expiresAt
+	*now = now.Add(time.Millisecond)
+	picked, err := s.Pick(context.Background(), "claude", "", opts, auths)
+	var wait *warmupSelectionWait
+	if picked != nil || !errors.As(err, &wait) {
+		t.Fatalf("expected typed wait, got pick=%v err=%v", picked, err)
+	}
+	entry, ok = s.servingEntry(key, *now)
+	if !ok || entry.serving == nil || *entry.serving != before || !entry.expiresAt.Equal(expires) || len(s.servingCharges) != 1 || s.servingCharges[0].tokens != cost {
+		t.Fatal("waiting refreshed the protected binding or migration budget")
 	}
 	// A second root cannot overspend the shared hour, even on a natural reset.
 	second := servingOptions("next", "", "parent", "task")
