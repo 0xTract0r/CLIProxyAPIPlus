@@ -336,6 +336,8 @@ routing:
 #   # 新建配置若要启用，请明确填0.15；普通部署保留现有生产配置，不必每次重设。
 #   # Shared opportunity probability, not a per-account guarantee or total request/token share.
 #   # 养号号共享这份机会，不是每号各15%，也不是总请求/token占比上限。
+#   # Enabled Claude warming execution also uses bounded sticky waiting and pre-send admission.
+#   # 开启后Claude养号执行同时采用有界粘性等待与发包前准入，详见中英文调度文档。
 #   warmup-serving-reserve: 0
 #   # Non-renewing binding age in seconds; 0 disables the age fallback.
 #   # 绑定年龄阈值（秒），不会因续聊而重置；默认0=关闭年龄兜底。

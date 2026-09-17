@@ -26,6 +26,7 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 	opts = withClaudeContext1M(req.Model, opts)
 	req, opts = cliproxysession.Enrich(req, opts)
 	ctx = contextWithSessionID(ctx, opts)
+	ctx = withWarmupRequestState(ctx, warmupPurposeServe)
 	normalized := m.normalizeProviders(providers)
 	if len(normalized) == 0 {
 		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
@@ -72,6 +73,7 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
 	req, opts = cliproxysession.Enrich(req, opts)
 	ctx = contextWithSessionID(ctx, opts)
+	ctx = withWarmupRequestState(ctx, warmupPurposeCount)
 	normalized := m.normalizeProviders(providers)
 	if len(normalized) == 0 {
 		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
@@ -110,6 +112,7 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 	opts = withClaudeContext1M(req.Model, opts)
 	req, opts = cliproxysession.Enrich(req, opts)
 	ctx = contextWithSessionID(ctx, opts)
+	ctx = withWarmupRequestState(ctx, warmupPurposeServe)
 	if m.HomeEnabled() {
 		if unlockSession := m.lockHomeWebsocketSession(ctx, opts); unlockSession != nil {
 			defer unlockSession()
@@ -261,8 +264,9 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 	tried := make(map[string]struct{})
 	attempted := make(map[string]struct{})
 	var lastErr error
+selectionLoop:
 	for {
-		if !homeMode && maxRetryCredentials > 0 && len(attempted) >= maxRetryCredentials {
+		if !homeMode && maxRetryCredentials > 0 && len(attempted) >= maxRetryCredentials && !warmupCanResumeCredential(ctx, attempted) {
 			if lastErr != nil {
 				return cliproxyexecutor.Response{}, lastErr
 			}
@@ -288,10 +292,19 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			return cliproxyexecutor.Response{}, errPick
 		}
 
+		if !homeMode && maxRetryCredentials > 0 && len(attempted) >= maxRetryCredentials {
+			if _, already := attempted[auth.ID]; !already {
+				if lastErr != nil {
+					return cliproxyexecutor.Response{}, lastErr
+				}
+				return cliproxyexecutor.Response{}, newWarmupBusyError()
+			}
+		}
 		entry := logEntryWithRequestID(ctx)
 		debugLogAuthSelection(entry, auth, provider, routeModel)
 		publishSelectedAuthMetadata(opts.Metadata, auth)
 
+		selectionSerial := warmupSendSerial(ctx)
 		tried[auth.ID] = struct{}{}
 		execCtx := ctx
 		if rt := m.roundTripperFor(auth); rt != nil {
@@ -301,6 +314,10 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		execCtx = contextWithRequestedModelAlias(execCtx, opts, routeModel)
 
 		models, pooled, aliasResult := m.preparedExecutionModelsWithAlias(auth, routeModel)
+		models, resumeErr := warmupResumeModels(ctx, auth.ID, models)
+		if resumeErr != nil {
+			return cliproxyexecutor.Response{}, resumeErr
+		}
 		if len(models) == 0 {
 			continue
 		}
@@ -327,48 +344,57 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			if !authAllowsClaudeContext(auth, execReq.Model, execOpts) {
 				return cliproxyexecutor.Response{}, claudeContextEntitlementError()
 			}
+			slot, target, admissionErr := m.admitWarmupExecution(execCtx, auth, routeModel, execOpts)
+			if admissionErr != nil {
+				if isWarmupAdmissionReselect(admissionErr) {
+					warmupSetModelResume(ctx, auth.ID, upstreamModel)
+					delete(tried, auth.ID)
+					if warmupSendSerial(ctx) == selectionSerial {
+						delete(tried, auth.ID)
+						delete(attempted, auth.ID)
+					}
+					if authErr != nil {
+						lastErr = authErr
+					}
+					continue selectionLoop
+				}
+				return cliproxyexecutor.Response{}, admissionErr
+			}
+			modelCtx := withWarmupExecutionSlot(execCtx, slot)
+			defer slot.close(modelCtx)
 			var resp cliproxyexecutor.Response
-			var errExec error
-			var ctxErr error
+			var errExec, ctxErr error
 			concurrencyBusy := false
 			func() {
-				// Adaptive account scheduling (Phase 2): reserve this account's
-				// in-flight concurrency slot around the actual upstream call.
-				// release is deferred so the slot is freed on EVERY exit of this
-				// closure -- success, error, ctx-cancel early return, or a panic
-				// unwinding through executor.Execute -- because a leaked slot
-				// would count the account permanently busy and drop it out of
-				// selection forever. The rolling-24h daily-budget REQUEST count
-				// is NOT recorded here anymore; it moved to MarkResult (the single
-				// result sink), so a concurrency-busy failover -- which returns
-				// before executor.Execute and never reaches MarkResult -- records
-				// no phantom count (harden P2).
-				slot, within := m.beginAccountExecution(auth)
-				defer slot.release()
-				if !within {
-					// At the concurrency ceiling and nothing sent yet: fail over
-					// to another credential (execution-side 二次防御) rather than
-					// exceed the ceiling.
-					concurrencyBusy = true
-					return
-				}
-				resp, errExec = executor.Execute(execCtx, auth, execReq, execOpts)
-				if errExec != nil {
-					if errCtx := execCtx.Err(); errCtx != nil {
-						ctxErr = errCtx
+				if !target {
+					legacySlot, within := m.beginAccountExecution(auth)
+					defer legacySlot.release()
+					if !within {
+						concurrencyBusy = true
 						return
 					}
-					if refreshed, okRefresh := m.tryRefreshAfterUnauthorized(execCtx, auth, errExec, didRefreshOnUnauthorized); okRefresh {
-						auth = refreshed
-						didRefreshOnUnauthorized = true
-						resp, errExec = executor.Execute(execCtx, auth, execReq, execOpts)
+				}
+				if ctxErr = warmupBeforeSend(modelCtx, slot); ctxErr != nil {
+					return
+				}
+				resp, errExec = executor.Execute(modelCtx, auth, execReq, execOpts)
+				if errExec != nil {
+					if ctxErr = modelCtx.Err(); ctxErr != nil {
+						return
+					}
+					if refreshed, ok := m.tryRefreshAfterUnauthorized(modelCtx, auth, errExec, didRefreshOnUnauthorized); ok {
+						auth, didRefreshOnUnauthorized = refreshed, true
+						if ctxErr = warmupBeforeSend(modelCtx, slot); ctxErr != nil {
+							return
+						}
+						resp, errExec = executor.Execute(modelCtx, auth, execReq, execOpts)
 						if errExec != nil {
-							if errCtx := execCtx.Err(); errCtx != nil {
-								ctxErr = errCtx
-								return
-							}
+							ctxErr = modelCtx.Err()
 						}
 					}
+				}
+				if target && modelCtx.Err() != nil {
+					ctxErr = modelCtx.Err()
 				}
 			}()
 			if ctxErr != nil {
@@ -384,7 +410,8 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				if ra := retryAfterFromError(errExec); ra != nil {
 					result.RetryAfter = ra
 				}
-				m.MarkResult(execCtx, result)
+				m.MarkResult(modelCtx, result)
+				slot.close(modelCtx)
 				if isRequestInvalidError(errExec) {
 					return cliproxyexecutor.Response{}, errExec
 				}
@@ -398,7 +425,8 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				result.QuotaExceeded = true
 				result.RetryAfter = retryAfter
 			}
-			m.MarkResult(execCtx, result)
+			m.MarkResult(modelCtx, result)
+			slot.close(modelCtx)
 			rewriteForceMappedResponse(&resp, aliasResult)
 			return resp, nil
 		}
@@ -427,8 +455,9 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 	tried := make(map[string]struct{})
 	attempted := make(map[string]struct{})
 	var lastErr error
+selectionLoop:
 	for {
-		if !homeMode && maxRetryCredentials > 0 && len(attempted) >= maxRetryCredentials {
+		if !homeMode && maxRetryCredentials > 0 && len(attempted) >= maxRetryCredentials && !warmupCanResumeCredential(ctx, attempted) {
 			if lastErr != nil {
 				return cliproxyexecutor.Response{}, lastErr
 			}
@@ -454,10 +483,19 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			return cliproxyexecutor.Response{}, errPick
 		}
 
+		if !homeMode && maxRetryCredentials > 0 && len(attempted) >= maxRetryCredentials {
+			if _, already := attempted[auth.ID]; !already {
+				if lastErr != nil {
+					return cliproxyexecutor.Response{}, lastErr
+				}
+				return cliproxyexecutor.Response{}, newWarmupBusyError()
+			}
+		}
 		entry := logEntryWithRequestID(ctx)
 		debugLogAuthSelection(entry, auth, provider, routeModel)
 		publishSelectedAuthMetadata(opts.Metadata, auth)
 
+		selectionSerial := warmupSendSerial(ctx)
 		tried[auth.ID] = struct{}{}
 		execCtx := ctx
 		if rt := m.roundTripperFor(auth); rt != nil {
@@ -467,6 +505,10 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		execCtx = contextWithRequestedModelAlias(execCtx, opts, routeModel)
 
 		models, pooled, aliasResult := m.preparedExecutionModelsWithAlias(auth, routeModel)
+		models, resumeErr := warmupResumeModels(ctx, auth.ID, models)
+		if resumeErr != nil {
+			return cliproxyexecutor.Response{}, resumeErr
+		}
 		if len(models) == 0 {
 			continue
 		}
@@ -490,7 +532,28 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			}
 			execOpts := opts
 			execReq, execOpts = applyRequestAfterAuthInterceptor(execCtx, executor, provider, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
-			resp, errExec := executor.CountTokens(execCtx, auth, execReq, execOpts)
+			slot, target, admissionErr := m.admitWarmupExecution(execCtx, auth, routeModel, execOpts)
+			if admissionErr != nil {
+				if isWarmupAdmissionReselect(admissionErr) {
+					warmupSetModelResume(ctx, auth.ID, upstreamModel)
+					delete(tried, auth.ID)
+					if warmupSendSerial(ctx) == selectionSerial {
+						delete(tried, auth.ID)
+						delete(attempted, auth.ID)
+					}
+					if authErr != nil {
+						lastErr = authErr
+					}
+					continue selectionLoop
+				}
+				return cliproxyexecutor.Response{}, admissionErr
+			}
+			modelCtx := withWarmupExecutionSlot(execCtx, slot)
+			defer slot.close(modelCtx)
+			if err := warmupBeforeSend(modelCtx, slot); err != nil {
+				return cliproxyexecutor.Response{}, err
+			}
+			resp, errExec := executor.CountTokens(modelCtx, auth, execReq, execOpts)
 			if errExec != nil {
 				if errCtx := execCtx.Err(); errCtx != nil {
 					return cliproxyexecutor.Response{}, errCtx
@@ -498,13 +561,19 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				if refreshed, okRefresh := m.tryRefreshAfterUnauthorized(execCtx, auth, errExec, didRefreshOnUnauthorized); okRefresh {
 					auth = refreshed
 					didRefreshOnUnauthorized = true
-					resp, errExec = executor.CountTokens(execCtx, auth, execReq, execOpts)
+					if err := warmupBeforeSend(modelCtx, slot); err != nil {
+						return cliproxyexecutor.Response{}, err
+					}
+					resp, errExec = executor.CountTokens(modelCtx, auth, execReq, execOpts)
 					if errExec != nil {
 						if errCtx := execCtx.Err(); errCtx != nil {
 							return cliproxyexecutor.Response{}, errCtx
 						}
 					}
 				}
+			}
+			if target && modelCtx.Err() != nil {
+				return cliproxyexecutor.Response{}, modelCtx.Err()
 			}
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil}
 			if errExec != nil {
@@ -517,9 +586,11 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				// the failure for hooks and metrics without suspending a model
 				// that remains usable through the messages endpoint.
 				if isCountTokensEndpointNotFoundError(errExec, execReq.Model) {
-					m.recordAvailabilityNeutralResult(execCtx, result)
+					m.recordAvailabilityNeutralResult(modelCtx, result)
+					slot.close(modelCtx)
 				} else {
-					m.MarkResult(execCtx, result)
+					m.MarkResult(modelCtx, result)
+					slot.close(modelCtx)
 				}
 				if isRequestInvalidError(errExec) {
 					return cliproxyexecutor.Response{}, errExec
@@ -534,7 +605,8 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				result.QuotaExceeded = true
 				result.RetryAfter = retryAfter
 			}
-			m.MarkResult(execCtx, result)
+			m.MarkResult(modelCtx, result)
+			slot.close(modelCtx)
 			rewriteForceMappedResponse(&resp, aliasResult)
 			return resp, nil
 		}
@@ -565,7 +637,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 	attempted := make(map[string]struct{})
 	var lastErr error
 	for {
-		if !homeMode && maxRetryCredentials > 0 && len(attempted) >= maxRetryCredentials {
+		if !homeMode && maxRetryCredentials > 0 && len(attempted) >= maxRetryCredentials && !warmupCanResumeCredential(ctx, attempted) {
 			if lastErr != nil {
 				return nil, lastErr
 			}
@@ -610,6 +682,14 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			return nil, &Error{Code: "executor_not_found", Message: "executor not registered"}
 		}
 
+		if !homeMode && maxRetryCredentials > 0 && len(attempted) >= maxRetryCredentials {
+			if _, already := attempted[auth.ID]; !already {
+				if lastErr != nil {
+					return nil, lastErr
+				}
+				return nil, newWarmupBusyError()
+			}
+		}
 		entry := logEntryWithRequestID(ctx)
 		debugLogAuthSelection(entry, auth, provider, routeModel)
 		if selection != nil {
@@ -620,6 +700,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		}
 		publishSelectedAuthMetadata(opts.Metadata, auth)
 
+		selectionSerial := warmupSendSerial(ctx)
 		tried[auth.ID] = struct{}{}
 		execCtx := ctx
 		releaseAttempt := func() {}
@@ -636,6 +717,10 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			execCtx = context.WithValue(execCtx, "cliproxy.roundtripper", rt)
 		}
 		models, pooled, aliasResult := m.preparedExecutionModelsWithAlias(auth, routeModel)
+		models, resumeErr := warmupResumeModels(ctx, auth.ID, models)
+		if resumeErr != nil {
+			return nil, resumeErr
+		}
 		if selection != nil && aliasResult.ForceMapping && responseAlias != "" {
 			aliasResult.OriginalAlias = responseAlias
 		}
@@ -686,6 +771,22 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		}
 		streamResult, errStream := m.executeStreamWithModelPool(execCtx, executor, auth, provider, execReq, execOpts, routeModel, streamExecutionModel, models, pooled, aliasResult, !homeMode, selection != nil)
 		if errStream != nil {
+			if isWarmupAdmissionReselect(errStream) {
+				var local *warmupAdmissionReselect
+				if errors.As(errStream, &local) && local.previous != nil {
+					lastErr = local.previous
+				}
+				delete(tried, auth.ID)
+				if warmupSendSerial(ctx) == selectionSerial {
+					delete(tried, auth.ID)
+					delete(attempted, auth.ID)
+				}
+				continue
+			}
+			var busy *warmupBusyError
+			if errors.As(errStream, &busy) {
+				return nil, errStream
+			}
 			if selection != nil {
 				releaseAttempt()
 				if errEnd := m.endHomeSelectionBeforeRedispatch(ctx, selection, "stream_start_failed"); errEnd != nil {

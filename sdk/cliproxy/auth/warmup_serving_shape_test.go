@@ -129,7 +129,7 @@ func TestWarmupServingParentSystemHistoryReserve(t *testing.T) {
 }
 
 func TestWarmupServingChildShapeConservativeBoundaries(t *testing.T) {
-	cases := []string{"arbitrary-system", "date-extra-text", "invalid-date", "string-date", "multiple-systems", "system-before-user", "history", "fork", "media-child", "unknown-child", "result-only-child", "media-parent", "unknown-parent", "media-system-parent", "unknown-system-parent", "extra-field-system-parent", "unknown-caller", "caller-extra-field", "malformed-reference", "reference-extra-field", "reference-outside-result", "identity-conflict", "missing-parent"}
+	cases := []string{"arbitrary-system", "date-extra-text", "invalid-date", "string-unknown-system", "multiple-systems", "system-before-user", "history", "fork", "media-child", "unknown-child", "result-only-child", "media-parent", "unknown-parent", "media-system-parent", "unknown-system-parent", "extra-field-system-parent", "unknown-caller", "caller-extra-field", "malformed-reference", "reference-extra-field", "reference-outside-result", "identity-conflict", "missing-parent"}
 	for _, name := range cases {
 		t.Run(name, func(t *testing.T) {
 			s, _, now, auths := servingFixture(t)
@@ -144,8 +144,8 @@ func TestWarmupServingChildShapeConservativeBoundaries(t *testing.T) {
 				messages[1] = servingShapeText("system", "Today's date is 2026-09-15. Continue the parent's work.")
 			case "invalid-date":
 				messages[1] = servingShapeText("system", "Today's date is 2026-02-30.")
-			case "string-date":
-				messages[1] = map[string]any{"role": "system", "content": "Today's date is 2026-09-15."}
+			case "string-unknown-system":
+				messages[1] = map[string]any{"role": "system", "content": "Unknown system context."}
 			case "multiple-systems":
 				messages = append(messages, servingShapeDate())
 			case "system-before-user":

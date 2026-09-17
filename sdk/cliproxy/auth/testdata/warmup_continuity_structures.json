@@ -1,0 +1,267 @@
+{
+  "provenance": "Two native CLI parent/child message structures; values, names and business keys replaced by shared placeholders. Known notice framing and equal-string relationships preserved; unrelated top-level fields omitted.",
+  "cases": [
+    {
+      "name": "native_notice_1",
+      "parent": {
+        "system": [
+          {
+            "type": "text",
+            "text": "Sanitized text 1."
+          },
+          {
+            "type": "text",
+            "text": "Sanitized text 2.",
+            "cache_control": {
+              "type": "ephemeral"
+            }
+          },
+          {
+            "type": "text",
+            "text": "Sanitized text 3.",
+            "cache_control": {
+              "type": "ephemeral"
+            }
+          }
+        ],
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "Sanitized text 4."
+              },
+              {
+                "type": "text",
+                "text": "Sanitized text 5."
+              }
+            ]
+          },
+          {
+            "role": "system",
+            "content": "Sanitized text 6."
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "text",
+                "text": "Sanitized text 7."
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": "Sanitized text 8."
+          },
+          {
+            "role": "system",
+            "content": [
+              {
+                "type": "text",
+                "text": "Sanitized text 9.",
+                "cache_control": {
+                  "type": "ephemeral"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "child": {
+        "system": [
+          {
+            "type": "text",
+            "text": "Sanitized text 10."
+          },
+          {
+            "type": "text",
+            "text": "Sanitized text 11.",
+            "cache_control": {
+              "type": "ephemeral"
+            }
+          },
+          {
+            "type": "text",
+            "text": "Sanitized text 12.",
+            "cache_control": {
+              "type": "ephemeral"
+            }
+          }
+        ],
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "Sanitized text 4."
+              },
+              {
+                "type": "text",
+                "text": "Sanitized text 13."
+              }
+            ]
+          },
+          {
+            "role": "system",
+            "content": [
+              {
+                "type": "text",
+                "text": "The following skills are available for use with the Skill tool:\n\n- synthetic1: Sanitized text 14.\n- synthetic2: Sanitized text 15.\nSanitized text 16.\n- synthetic3: Sanitized text 17.\nSanitized text 18.\nSanitized text 19.\n- synthetic4: Sanitized text 20.\n- synthetic5: Sanitized text 21.\n- synthetic6: Sanitized text 22.\n- synthetic7: Sanitized text 23.\n- synthetic8: Sanitized text 24.\n- synthetic9: Sanitized text 25.\n- synthetic10: Sanitized text 26.\n- synthetic11: Sanitized text 27.\nSanitized text 28.\nSanitized text 29.\n- synthetic12: Sanitized text 30.\n- synthetic13: Sanitized text 31.\nSanitized text 32.\nSanitized text 33.",
+                "cache_control": {
+                  "type": "ephemeral"
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "native_notice_2",
+      "parent": {
+        "system": [
+          {
+            "type": "text",
+            "text": "Sanitized text 34."
+          },
+          {
+            "type": "text",
+            "text": "Sanitized text 2.",
+            "cache_control": {
+              "type": "ephemeral"
+            }
+          },
+          {
+            "type": "text",
+            "text": "Sanitized text 35.",
+            "cache_control": {
+              "type": "ephemeral"
+            }
+          }
+        ],
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "Sanitized text 36."
+              },
+              {
+                "type": "text",
+                "text": "Sanitized text 37."
+              },
+              {
+                "type": "text",
+                "text": "Sanitized text 38."
+              }
+            ]
+          },
+          {
+            "role": "system",
+            "content": "Sanitized text 39."
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "thinking",
+                "thinking": "Sanitized text 40.",
+                "signature": "Sanitized text 41."
+              },
+              {
+                "type": "text",
+                "text": "Sanitized text 42."
+              },
+              {
+                "type": "tool_use",
+                "id": "Sanitized text 43.",
+                "name": "Sanitized text 44.",
+                "input": {
+                  "field1": "Sanitized text 45.",
+                  "field2": "Sanitized text 46."
+                },
+                "caller": {
+                  "type": "direct"
+                },
+                "cache_control": {
+                  "type": "ephemeral"
+                }
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "tool_use_id": "Sanitized text 43.",
+                "type": "tool_result",
+                "content": "Sanitized text 47.",
+                "is_error": false,
+                "cache_control": {
+                  "type": "ephemeral"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "child": {
+        "system": [
+          {
+            "type": "text",
+            "text": "Sanitized text 48."
+          },
+          {
+            "type": "text",
+            "text": "Sanitized text 11.",
+            "cache_control": {
+              "type": "ephemeral"
+            }
+          },
+          {
+            "type": "text",
+            "text": "Sanitized text 49.",
+            "cache_control": {
+              "type": "ephemeral"
+            }
+          }
+        ],
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "Sanitized text 36."
+              },
+              {
+                "type": "text",
+                "text": "Sanitized text 37."
+              },
+              {
+                "type": "text",
+                "text": "Sanitized text 50."
+              }
+            ]
+          },
+          {
+            "role": "system",
+            "content": [
+              {
+                "type": "text",
+                "text": "The following deferred tools are now available via ToolSearch. Their schemas are NOT loaded \u2014 calling them directly will fail with InputValidationError. Use ToolSearch with query \"select:<name>[,<name>...]\" to load tool schemas before calling them:\nsynthetic14\nsynthetic15\nsynthetic16\nsynthetic17\nsynthetic18\nsynthetic19\nsynthetic20\nsynthetic21\nsynthetic22\nsynthetic23\nsynthetic24\nsynthetic25\nsynthetic26\nsynthetic27\nsynthetic28\nsynthetic29\nsynthetic30\nsynthetic31\n\nThe following skills are available for use with the Skill tool:\n\n- synthetic32: Sanitized text 51.\n- synthetic33: Sanitized text 52.\n- synthetic34: Sanitized text 53.\n- synthetic35: Sanitized text 54.\n- synthetic36: Sanitized text 55.\n- synthetic37: Sanitized text 56.\n- synthetic38: Sanitized text 57.\n- synthetic39: Sanitized text 58.\n- synthetic40: Sanitized text 59.\n- synthetic41: Sanitized text 60.\n- synthetic42: Sanitized text 61.\n- synthetic43: Sanitized text 62.\n- synthetic44: Sanitized text 63.\n- synthetic45: Sanitized text 64.\n- synthetic46: Sanitized text 65.\n- synthetic47: Sanitized text 66.\n- synthetic48: Sanitized text 67.\n- synthetic49: Sanitized text 68.\n- synthetic50: Sanitized text 69.\n- synthetic51: Sanitized text 70.\n- synthetic52: Sanitized text 71.\n- synthetic53: Sanitized text 72.\n- synthetic54: Sanitized text 73.\n- synthetic55: Sanitized text 74.\n- synthetic56: Sanitized text 75.\n- synthetic57: Sanitized text 76.\n- synthetic58: Sanitized text 77.\n- synthetic59: Sanitized text 78.\n- synthetic60: Sanitized text 79.\n- synthetic61: Sanitized text 80.\n- synthetic62: Sanitized text 81.\n- synthetic63: Sanitized text 82.\n- synthetic64: Sanitized text 83.\n- synthetic65: Sanitized text 84.\n- synthetic66: Sanitized text 85.\n- synthetic67: Sanitized text 86.\n- synthetic68: Sanitized text 87.\n- synthetic69: Sanitized text 88.\n- synthetic70: Sanitized text 89.\n- synthetic71: Sanitized text 90.\n- synthetic72: Sanitized text 91.\n- synthetic73: Sanitized text 92.\n- synthetic74: Sanitized text 93.\n- synthetic75: Sanitized text 94.\n- synthetic76: Sanitized text 95.\n- synthetic77: Sanitized text 96.\n- synthetic78: Sanitized text 97.\n- synthetic79: Sanitized text 98.\n- synthetic80: Sanitized text 99.\n- synthetic81: Sanitized text 100.\n- synthetic82: Sanitized text 101.\n- synthetic2: Sanitized text 15.\n- synthetic83: Sanitized text 102.\n- synthetic3: Sanitized text 17.\n- synthetic84: Sanitized text 103.\n- synthetic85: Sanitized text 104.\n- synthetic86: Sanitized text 105.\n- synthetic87: Sanitized text 106.\n- synthetic88: Sanitized text 107.\n- synthetic89: Sanitized text 108.\n- synthetic90: Sanitized text 109.\n- synthetic91: Sanitized text 110.\n- synthetic92: Sanitized text 111.\n- synthetic93:synthetic94: Sanitized text 112.\n- synthetic93:synthetic95: Sanitized text 113.\n- synthetic4: Sanitized text 20.\n- synthetic96: Sanitized text 114.\n- synthetic97: Sanitized text 115.\n- synthetic5: Sanitized text 21.\n- synthetic6: Sanitized text 22.\n- synthetic7: Sanitized text 23.\n- synthetic8: Sanitized text 24.\n- synthetic9: Sanitized text 25.\n- synthetic10: Sanitized text 26.\n- synthetic11: Sanitized text 27.\nSanitized text 28.\nSanitized text 29.\n- synthetic12: Sanitized text 30.\n- synthetic13: Sanitized text 31.\n- synthetic98: Sanitized text 116.\n- synthetic99: Sanitized text 117.\n\nToday's date is 2026-09-16.",
+                "cache_control": {
+                  "type": "ephemeral"
+                }
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

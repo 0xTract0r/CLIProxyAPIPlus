@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"math"
 	"sync"
 	"time"
 )
@@ -162,8 +163,15 @@ func NewAccountRateLimiter(opts ...AccountRateLimiterOption) *AccountRateLimiter
 // clamped away; if it grows, the bucket simply refills toward the larger
 // capacity from then on.
 func (l *AccountRateLimiter) Allow(authID string, rpm float64, burst int) bool {
+	allowed, _ := l.AllowOrDelay(authID, rpm, burst)
+	return allowed
+}
+
+// AllowOrDelay atomically spends one token, or reports the next-token delay
+// without spending anything. Rejected retries never accumulate token debt.
+func (l *AccountRateLimiter) AllowOrDelay(authID string, rpm float64, burst int) (bool, time.Duration) {
 	if authID == "" || rpm <= 0 {
-		return true
+		return true, 0
 	}
 
 	capacity := float64(burst)
@@ -196,9 +204,13 @@ func (l *AccountRateLimiter) Allow(authID string, rpm float64, burst int) bool {
 
 	if b.tokens >= 1 {
 		b.tokens -= 1
-		return true
+		return true, 0
 	}
-	return false
+	nanos := math.Ceil((1 - b.tokens) / ratePerSec * float64(time.Second))
+	if math.IsInf(nanos, 1) || nanos >= float64(math.MaxInt64) {
+		return false, time.Duration(math.MaxInt64)
+	}
+	return false, time.Duration(nanos)
 }
 
 // ReclaimIdle evicts every bucket that has not been touched by an Allow call

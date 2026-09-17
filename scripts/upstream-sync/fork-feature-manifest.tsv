@@ -327,5 +327,9 @@ fork文件-反关联支撑	farm_liveness_probe.go	file	-	internal/api/handlers/m
 
 # Warm-up serving reserve: opt-in routing, guarded stickiness and bounded migration.
 scheduling-warmup-reserve	pick-entry	pattern	s\.pickWithWarmupServing\(	sdk/cliproxy/auth/adaptive_selector.go
-scheduling-warmup-reserve	guarded-keep	pattern	s\.boundServableForKeep\(boundAuth, cfg, now\)	sdk/cliproxy/auth/warmup_serving.go
+scheduling-warmup-reserve	guarded-keep	pattern	state\.protected.*s\.isMature\(boundAuth	sdk/cliproxy/auth/warmup_serving.go
 scheduling-warmup-reserve	mixed-manager-regression	symbol	^func TestWarmupServingManagerMixedClaudeRoute\(	sdk/cliproxy/auth/warmup_serving_test.go
+
+scheduling-warmup-reserve	execution-admission	pattern	m\.admitWarmupExecution\(	sdk/cliproxy/auth/conductor_execution.go
+scheduling-warmup-reserve	stream-admission	pattern	m\.admitWarmupExecution\(	sdk/cliproxy/auth/conductor_stream.go
+scheduling-warmup-reserve	cancel-budget	symbol	^func \(m \*Manager\) recordWarmupCancellation\(	sdk/cliproxy/auth/warmup_execution.go

@@ -8,43 +8,95 @@ import (
 const warmupDeferredToolsNotice = `The following deferred tools are now available via ToolSearch. Their schemas are NOT loaded — calling them directly will fail with InputValidationError. Use ToolSearch with query "select:<name>[,<name>...]" to load tool schemas before calling them:`
 const warmupSkillsNotice = "The following skills are available for use with the Skill tool:"
 
-// Recognize a bounded CLI notice grammar, not arbitrary text ending in a date.
-// Descriptions are opaque catalog data; structural recognition is not proof of
-// their provenance or meaning. The request itself is never edited or executed.
+const warmupAuxiliaryMaxBytes = 128 << 10
+
+// Complete notice units can move between text blocks or system messages.
+// A catalog header and its entries must stay in the same complete text unit.
+// Descriptions are opaque data, not evidence of semantic trust or provenance.
+func warmupAuxiliaryMessages(messages []any) bool {
+	if len(messages) == 0 || len(messages) > 8 {
+		return false
+	}
+	seen, size, blocks := uint8(0), 0, 0
+	for _, raw := range messages {
+		message, ok := raw.(map[string]any)
+		if !ok || !warmupOnlyKeys(message, "role", "content") || message["role"] != "system" || !warmupIdentityText(message["content"]) {
+			return false
+		}
+		texts := warmupTextBlocks(message["content"])
+		if len(texts) == 0 {
+			return false
+		}
+		for _, text := range texts {
+			size += len(text)
+			blocks++
+			if size > warmupAuxiliaryMaxBytes || blocks > 8 {
+				return false
+			}
+			units, ok := warmupNoticeUnits(text)
+			if !ok || seen&units != 0 {
+				return false
+			}
+			seen |= units
+		}
+	}
+	return seen != 0
+}
+
 func warmupAuxiliaryMessage(value any) bool {
-	if warmupDateMessage(value) {
-		return true
+	return warmupAuxiliaryMessages([]any{value})
+}
+
+func warmupNoticeUnits(text string) (uint8, bool) {
+	if len(text) == 0 || len(text) > warmupAuxiliaryMaxBytes {
+		return 0, false
 	}
-	message, ok := value.(map[string]any)
-	if !ok || !warmupOnlyKeys(message, "role", "content") || message["role"] != "system" {
-		return false
-	}
-	content, ok := message["content"].([]any)
-	if !ok || len(content) != 1 || !warmupIdentityText(content) {
-		return false
-	}
-	text := content[0].(map[string]any)["text"].(string)
 	sections := strings.Split(text, "\n\n")
-	if len(sections) < 2 || len(sections) > 4 {
-		return false
+	if len(sections) > 4 {
+		return 0, false
 	}
-	const dateLayout = "Today's date is 2006-01-02."
-	date := sections[len(sections)-1]
-	if len(date) != len(dateLayout) {
-		return false
+	seen := uint8(0)
+	for i := 0; i < len(sections); i++ {
+		unit := uint8(0)
+		switch {
+		case warmupToolCatalog(sections[i]):
+			unit = 1
+		case sections[i] == warmupSkillsNotice:
+			if i+1 >= len(sections) || !warmupSkillCatalog(sections[i+1]) {
+				return 0, false
+			}
+			i++
+			unit = 2
+		default:
+			const layout = "Today's date is 2006-01-02."
+			if len(sections[i]) != len(layout) {
+				return 0, false
+			}
+			if _, err := time.Parse(layout, sections[i]); err != nil {
+				return 0, false
+			}
+			unit = 4
+		}
+		if seen&unit != 0 {
+			return 0, false
+		}
+		seen |= unit
 	}
-	if _, err := time.Parse(dateLayout, date); err != nil {
-		return false
+	return seen, seen != 0
+}
+
+func warmupTextBlocks(content any) []string {
+	if text, ok := content.(string); ok {
+		return []string{text}
 	}
-	switch len(sections) {
-	case 2:
-		return warmupToolCatalog(sections[0])
-	case 3:
-		return sections[0] == warmupSkillsNotice && warmupSkillCatalog(sections[1])
-	case 4:
-		return warmupToolCatalog(sections[0]) && sections[1] == warmupSkillsNotice && warmupSkillCatalog(sections[2])
+	blocks, _ := content.([]any)
+	texts := make([]string, 0, len(blocks))
+	for _, raw := range blocks {
+		block, _ := raw.(map[string]any)
+		text, _ := block["text"].(string)
+		texts = append(texts, text)
 	}
-	return false
+	return texts
 }
 
 func warmupToolCatalog(section string) bool {

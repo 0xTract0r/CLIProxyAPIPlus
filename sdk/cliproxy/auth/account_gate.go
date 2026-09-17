@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
@@ -69,6 +70,7 @@ type AccountConcurrencyGate struct {
 	// deleted the moment its count returns to 0 (see Release), so the map is
 	// bounded by the set of accounts with active traffic, not by history.
 	inflight map[string]int
+	pending  map[string]int
 
 	// daily maps authID -> that account's rolling 24-hour REQUEST counter
 	// (harden-account-scheduling-limiter P2). It replaced the earlier single
@@ -590,9 +592,15 @@ func (m *Manager) accountSchedulingConfig() internalconfig.AccountSchedulingConf
 // concurrency-busy failover never reaches MarkResult and so records no phantom
 // count. The slot now carries ONLY the in-flight concurrency reservation.
 type accountExecutionSlot struct {
-	gate     *AccountConcurrencyGate
-	authID   string
-	released bool
+	gate        *AccountConcurrencyGate
+	authID      string
+	releaseOnce sync.Once
+	resultOnce  sync.Once
+	sent        atomic.Bool
+	target      bool
+	countOnly   bool
+	dailyBudget int
+	manager     *Manager
 }
 
 // beginAccountExecution reserves one in-flight concurrency slot for auth on the
@@ -639,11 +647,16 @@ func (m *Manager) beginAccountExecution(auth *Auth) (*accountExecutionSlot, bool
 // a leaked slot would leave the account permanently counted as busy and drop it
 // out of selection forever.
 func (s *accountExecutionSlot) release() {
-	if s == nil || s.gate == nil || s.released {
+	if s == nil || s.gate == nil {
 		return
 	}
-	s.released = true
-	s.gate.Release(s.authID)
+	s.releaseOnce.Do(func() {
+		if s.target {
+			s.gate.releaseWarmupReservation(s.authID)
+		} else {
+			s.gate.Release(s.authID)
+		}
+	})
 }
 
 // errAccountConcurrencyBusy is the retryable error the non-stream execution path
