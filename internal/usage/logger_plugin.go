@@ -44,9 +44,6 @@ func NewLoggerPlugin() *LoggerPlugin { return &LoggerPlugin{stats: defaultReques
 //   - ctx: The context for the usage record
 //   - record: The usage record to aggregate
 func (p *LoggerPlugin) HandleUsage(ctx context.Context, record coreusage.Record) {
-	if !statisticsEnabled.Load() {
-		return
-	}
 	if p == nil || p.stats == nil {
 		return
 	}
@@ -252,6 +249,8 @@ func NewRequestStatisticsWithCatalog(catalog *PricingCatalogManager) *RequestSta
 
 // Record ingests a new usage record and updates the aggregates.
 func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record) {
+	detail := normaliseDetail(record.Detail)
+	pacingHandled := coreauth.RecordAccountPacingUsage(ctx, record.Provider, strings.TrimSpace(record.AuthID), schedulerBillableTokens(detail))
 	if s == nil {
 		return
 	}
@@ -262,7 +261,6 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 	if timestamp.IsZero() {
 		timestamp = time.Now()
 	}
-	detail := normaliseDetail(record.Detail)
 	// Harden P1b/P3: feed the adaptive account scheduler off this completed request.
 	//   - real-time upstream rate-limit headers -> the per-account live headroom
 	//     overlay (selection prefers it over the slower quota snapshot);
@@ -274,7 +272,7 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 	// usage all funnel through here).
 	if scheduleAuthID := strings.TrimSpace(record.AuthID); scheduleAuthID != "" {
 		coreauth.IngestServingRateHeaders(record.Provider, scheduleAuthID, record.ResponseHeaders, timestamp)
-		if gateTokens := schedulerBillableTokens(detail); gateTokens > 0 {
+		if gateTokens := schedulerBillableTokens(detail); !pacingHandled && gateTokens > 0 {
 			coreauth.RecordAccountBillableTokens(scheduleAuthID, int(gateTokens))
 		}
 	}

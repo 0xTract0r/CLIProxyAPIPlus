@@ -9,6 +9,9 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
 var claudeProxyTransportRetryBackoffs = []time.Duration{
@@ -26,10 +29,19 @@ func doClaudeHTTPWithTransportRetry(ctx context.Context, client *http.Client, re
 	if ctx == nil {
 		ctx = req.Context()
 	}
+	gated := cliproxyexecutor.HTTPAttemptGateFromContext(ctx) != nil
+	if gated {
+		copyClient := *client
+		copyClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+		client = &copyClient
+	}
 
 	var lastErr error
 	for attempt := 0; ; attempt++ {
 		attemptReq := req
+		if gated {
+			attemptReq = req.WithContext(ctx)
+		}
 		if attempt > 0 {
 			cloned, errClone := cloneClaudeRequestForRetry(ctx, req)
 			if errClone != nil {
@@ -38,7 +50,25 @@ func doClaudeHTTPWithTransportRetry(ctx context.Context, client *http.Client, re
 			attemptReq = cloned
 		}
 
+		permit, gateErr := helps.BeginClaudeHTTPAttempt(ctx, attemptReq)
+		if gateErr != nil {
+			var detail *cliproxyexecutor.HTTPAttemptGateError
+			if errors.As(gateErr, &detail) {
+				detail.Previous = lastErr
+			}
+			if attemptReq.Body != nil {
+				_ = attemptReq.Body.Close()
+			}
+			return nil, gateErr
+		}
 		resp, err := client.Do(attemptReq)
+		if permit != nil {
+			if err != nil {
+				_ = permit.TransportFailed(err)
+			} else {
+				permit.WrapResponse(resp)
+			}
+		}
 		if err == nil {
 			return resp, nil
 		}

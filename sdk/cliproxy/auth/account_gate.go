@@ -592,15 +592,16 @@ func (m *Manager) accountSchedulingConfig() internalconfig.AccountSchedulingConf
 // concurrency-busy failover never reaches MarkResult and so records no phantom
 // count. The slot now carries ONLY the in-flight concurrency reservation.
 type accountExecutionSlot struct {
-	gate        *AccountConcurrencyGate
-	authID      string
-	releaseOnce sync.Once
-	resultOnce  sync.Once
-	sent        atomic.Bool
-	target      bool
-	countOnly   bool
-	dailyBudget int
-	manager     *Manager
+	gate           *AccountConcurrencyGate
+	authID         string
+	releaseOnce    sync.Once
+	resultOnce     sync.Once
+	sent           atomic.Bool
+	pacingRateUsed atomic.Bool
+	target         bool
+	countOnly      bool
+	dailyBudget    int
+	manager        *Manager
 }
 
 // beginAccountExecution reserves one in-flight concurrency slot for auth on the

@@ -131,8 +131,13 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 	resp, err := doClaudeHTTPWithTransportRetry(ctx, httpClient, httpReq)
 	if err != nil {
 		recordAPIResponseError(ctx, e.cfg, err)
+		if cliproxyexecutor.IsHTTPAttemptGateError(err) {
+			return cliproxyexecutor.Response{}, err
+		}
 		return cliproxyexecutor.Response{}, claudeUpstreamTransportError(err)
 	}
+	attempt := helps.ClaimClaudeAttemptResponse(resp)
+	defer attempt.Abandon()
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, resp.StatusCode, resp.Header.Clone())
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		// Decompress error responses — pass the Content-Encoding value (may be empty)
@@ -145,6 +150,7 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 			logWithRequestID(ctx).Warn(msg)
 			return cliproxyexecutor.Response{}, newClaudeStatusErr(resp.StatusCode, []byte(msg), resp.Header, time.Now())
 		}
+		errBody = attempt.ObserveDecoded(errBody)
 		b, readErr := io.ReadAll(errBody)
 		if readErr != nil {
 			helps.RecordAPIResponseError(ctx, e.cfg, readErr)
@@ -166,6 +172,7 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 		}
 		return cliproxyexecutor.Response{}, err
 	}
+	decodedBody = attempt.ObserveDecoded(decodedBody)
 	defer func() {
 		if errClose := decodedBody.Close(); errClose != nil {
 			log.Errorf("response body close error: %v", errClose)

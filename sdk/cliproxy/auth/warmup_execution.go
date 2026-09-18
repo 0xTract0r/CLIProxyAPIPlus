@@ -17,6 +17,7 @@ type warmupAdmissionReselect struct{ previous error }
 func (*warmupAdmissionReselect) Error() string { return "warming admission requires fresh selection" }
 
 func isWarmupAdmissionReselect(err error) bool {
+	err = pacingExecutionError(err)
 	var local *warmupAdmissionReselect
 	return errors.As(err, &local)
 }
@@ -60,10 +61,23 @@ func warmupSendSerial(ctx context.Context) uint64 {
 }
 
 func warmupBeforeSend(ctx context.Context, slot *accountExecutionSlot) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if cliproxyexecutor.HTTPAttemptGateFromContext(ctx) != nil {
+		return nil
+	}
+	if holder, _ := ctx.Value(pacingOwnershipKey{}).(*pacingOwnership); holder != nil && holder.manager != nil {
+		holder.manager.pacingMu.Lock()
+		holder.started = true
+		holder.manager.pacingMu.Unlock()
+	}
+	warmupMarkSent(ctx, slot)
+	return nil
+}
+
+func warmupMarkSent(ctx context.Context, slot *accountExecutionSlot) {
 	if slot != nil && slot.target {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
 		slot.sent.Store(true)
 	}
 	if state := warmupRequestFromContext(ctx); state != nil {
@@ -71,7 +85,6 @@ func warmupBeforeSend(ctx context.Context, slot *accountExecutionSlot) error {
 		state.sendSerial++
 		state.mu.Unlock()
 	}
-	return nil
 }
 
 // A successful reservation owns both counters until its final result is stored.
@@ -148,7 +161,7 @@ func (m *Manager) tryWarmupExecution(ctx context.Context, auth *Auth, model stri
 	defer m.mu.RUnlock()
 	cfgRaw, _ := m.runtimeConfig.Load().(*internalconfig.Config)
 	selector, adaptive := m.selector.(*AdaptiveSelector)
-	if !adaptive || selector == nil || cfgRaw == nil || cfgRaw.Home.Enabled || cfgRaw.AccountScheduling.WarmupServingReserve <= 0 || !strings.EqualFold(auth.Provider, "claude") {
+	if !adaptive || selector == nil || cfgRaw == nil || cfgRaw.Home.Enabled || (cfgRaw.AccountScheduling.WarmupServingReserve <= 0 && !cfgRaw.AccountScheduling.WarmupTrafficPacing.Enabled) || !strings.EqualFold(auth.Provider, "claude") {
 		return nil, false, nil
 	}
 	cfg := cfgRaw.AccountScheduling
@@ -227,6 +240,12 @@ func (slot *accountExecutionSlot) record(ctx context.Context, record func()) {
 }
 
 func (slot *accountExecutionSlot) close(ctx context.Context) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if holder, _ := ctx.Value(pacingOwnershipKey{}).(*pacingOwnership); holder != nil && holder.manager != nil {
+		defer holder.manager.finishPacingCall(ctx)
+	}
 	if slot == nil {
 		return
 	}
@@ -241,11 +260,19 @@ func (slot *accountExecutionSlot) close(ctx context.Context) {
 }
 
 func (m *Manager) recordWarmupCancellation(ctx context.Context, slot *accountExecutionSlot) {
+	defer m.finishPacingCall(ctx)
+	txn := m.beginPacingHistory(slot.authID, slot)
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if auth := m.auths[slot.authID]; auth != nil {
 		m.recordWarmupSlotBudgetLocked(auth, slot)
-		_ = m.persist(ctx, auth)
+		if txn == nil {
+			_ = m.persist(ctx, auth)
+		}
+	}
+	m.mu.Unlock()
+	m.finishPacingHistory(ctx, txn)
+	if txn != nil {
+		m.persistCurrentPacingAuth(ctx, slot.authID)
 	}
 }
 

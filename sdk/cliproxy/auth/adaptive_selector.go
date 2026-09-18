@@ -102,7 +102,9 @@ type AdaptiveSelector struct {
 	// slot and record each request. Always non-nil after construction (created
 	// here unless injected via WithAdaptiveAccountGate). It holds no background
 	// goroutine, so it needs no Stop.
-	gate *AccountConcurrencyGate
+	gate           *AccountConcurrencyGate
+	pacer          atomic.Pointer[WarmupPacer]
+	pacingInstance uint64
 
 	// cache holds session -> auth stickiness bindings. Nil when session
 	// affinity is disabled.
@@ -235,7 +237,7 @@ func WithAdaptiveSchedulingProvider(fn func() internalconfig.AccountSchedulingCo
 // replacement).
 func NewAdaptiveSelector(cfg AdaptiveSelectorConfig, opts ...AdaptiveSelectorOption) *AdaptiveSelector {
 	s := &AdaptiveSelector{
-		fallback:        cfg.Fallback,
+		pacingInstance: pacingSelectorSequence.Add(1), fallback: cfg.Fallback,
 		sessionAffinity: cfg.SessionAffinity,
 		now:             time.Now,
 		rng:             rand.Float64,
@@ -281,12 +283,12 @@ func (s *AdaptiveSelector) Pick(ctx context.Context, provider, model string, opt
 	}
 	available = preferCodexWebsocketAuths(ctx, provider, available)
 	cfg := s.scheduling()
-	countOnly := cfg.WarmupServingReserve > 0 && warmupCountPurpose(ctx) && warmupServingClaudeRoute(provider, available)
-	if cfg.WarmupServingReserve > 0 && !countOnly && warmupServingClaudeRoute(provider, available) {
+	countOnly := warmupServingEnabled(cfg) && warmupCountPurpose(ctx) && warmupServingClaudeRoute(provider, available)
+	if warmupServingEnabled(cfg) && !countOnly && warmupServingClaudeRoute(provider, available) {
 		if picked, handled, errServing := s.pickWithWarmupServing(ctx, provider, model, opts, auths, available, cfg, now); handled {
 			return picked, errServing
 		}
-	} else if cfg.WarmupServingReserve <= 0 && s.servingActive.Load() {
+	} else if !warmupServingEnabled(cfg) && s.servingActive.Load() {
 		s.clearWarmupServing()
 	}
 
@@ -353,6 +355,9 @@ func (s *AdaptiveSelector) Pick(ctx context.Context, provider, model string, opt
 	// buckets momentarily drained does NOT reach here either -- pickFromCandidates
 	// serves that as a weighted overflow above. Serve via the fallback selector
 	// rather than deny -- the token bucket smooths, it never manufactures a 429.
+	if cfg.WarmupTrafficPacing.Enabled && warmupServingClaudeRoute(provider, available) {
+		return nil, newWarmupBusyError()
+	}
 	picked, errFallback := s.fallback.Pick(ctx, provider, model, opts, auths)
 	if errFallback == nil {
 		s.logPick(ctx, "fallback-degraded", provider, model, "", picked, cfg, now)
@@ -601,6 +606,9 @@ func (s *AdaptiveSelector) selectAndBind(ctx context.Context, provider, model st
 	if gateErr := s.concurrencyHardGate(available, cfg, now); gateErr != nil {
 		return nil, "rebind-concurrency-denied", gateErr
 	}
+	if cfg.WarmupTrafficPacing.Enabled && warmupServingClaudeRoute(provider, available) {
+		return nil, "pacing-unavailable", newWarmupBusyError()
+	}
 	picked, errPick := s.fallback.Pick(ctx, provider, model, opts, auths)
 	if errPick == nil && picked != nil {
 		s.cache.Set(cacheKey, picked.ID)
@@ -694,13 +702,14 @@ func (s *AdaptiveSelector) pickFromCandidates(candidates []adaptiveCandidate, cf
 
 func (s *AdaptiveSelector) pickFromCandidatesForRequest(ctx context.Context, candidates []adaptiveCandidate, cfg internalconfig.AccountSchedulingConfig, now time.Time) (*Auth, bool) {
 	picked, ok, charged := s.pickFromCandidatesResult(ctx, candidates, cfg, now)
-	if ok && cfg.WarmupServingReserve > 0 && strings.EqualFold(picked.Provider, "claude") && !s.isMature(picked, cfg, now) {
+	if ok && warmupServingEnabled(cfg) && strings.EqualFold(picked.Provider, "claude") && !s.isMature(picked, cfg, now) {
 		warmupRecordRateCharge(ctx, picked.ID, charged)
 	}
 	return picked, ok
 }
 
 func (s *AdaptiveSelector) pickFromCandidatesResult(ctx context.Context, candidates []adaptiveCandidate, cfg internalconfig.AccountSchedulingConfig, now time.Time) (*Auth, bool, bool) {
+	candidates = s.pacingFilter(ctx, candidates, cfg, now)
 	if len(candidates) == 0 {
 		return nil, false, false
 	}

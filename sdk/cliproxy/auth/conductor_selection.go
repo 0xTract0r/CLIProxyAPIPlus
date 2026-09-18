@@ -233,9 +233,17 @@ func (m *Manager) SetSelector(selector Selector) {
 	if selector == nil {
 		selector = &RoundRobinSelector{}
 	}
+	m.pacingMu.Lock()
 	m.mu.Lock()
+	if old, ok := m.selector.(*AdaptiveSelector); ok && old != nil && (m.pacing != nil || m.accountSchedulingConfig().WarmupTrafficPacing.Enabled) {
+		if next, ok := selector.(*AdaptiveSelector); ok && next != nil {
+			next.gate = old.gate
+		}
+	}
 	m.selector = selector
 	m.mu.Unlock()
+	m.refreshWarmupPacingLocked()
+	m.pacingMu.Unlock()
 	if m.scheduler != nil {
 		m.scheduler.setSelector(selector)
 		m.syncScheduler()

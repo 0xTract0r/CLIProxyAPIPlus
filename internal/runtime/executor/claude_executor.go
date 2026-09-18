@@ -155,6 +155,8 @@ func NewClaudeExecutorWithManager(cfg *config.Config, manager *cliproxyauth.Mana
 
 func (e *ClaudeExecutor) Identifier() string { return "claude" }
 
+func (e *ClaudeExecutor) SupportsHTTPAttemptGate() bool { return true }
+
 func (e *ClaudeExecutor) upstreamRequestLogProvider() string {
 	if provider := strings.TrimSpace(e.requestLogProvider); provider != "" {
 		return provider

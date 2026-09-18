@@ -95,9 +95,12 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	}
 	auth.EnsureIndex()
 	authClone := auth.Clone()
+	m.pacingMu.Lock()
 	m.mu.Lock()
 	m.auths[auth.ID] = authClone
 	m.mu.Unlock()
+	m.refreshWarmupPacingLocked()
+	m.pacingMu.Unlock()
 	if !shouldDeferAPIKeyModelAliasRebuild(ctx) {
 		m.rebuildAPIKeyModelAliasFromRuntimeConfig()
 	}
@@ -121,10 +124,12 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	// Fork: hydrate runtime-only fields (per-account proxy_url, managed/custom
 	// headers) from metadata before merging into the live entry.
 	hydrateRuntimeFields(auth)
+	m.pacingMu.Lock()
 	m.mu.Lock()
 	existing, ok := m.auths[auth.ID]
 	if !ok || existing == nil {
 		m.mu.Unlock()
+		m.pacingMu.Unlock()
 		return nil, nil
 	}
 	if !auth.indexAssigned && auth.Index == "" {
@@ -162,6 +167,8 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	authClone := auth.Clone()
 	m.auths[auth.ID] = authClone
 	m.mu.Unlock()
+	m.refreshWarmupPacingLocked()
+	m.pacingMu.Unlock()
 	if !shouldDeferAPIKeyModelAliasRebuild(ctx) {
 		m.rebuildAPIKeyModelAliasFromRuntimeConfig()
 	}
@@ -189,10 +196,12 @@ func (m *Manager) Remove(ctx context.Context, id string) {
 	}
 	_ = ctx
 
+	m.pacingMu.Lock()
 	m.mu.Lock()
 	existing := m.auths[id]
 	if existing == nil {
 		m.mu.Unlock()
+		m.pacingMu.Unlock()
 		return
 	}
 	provider := strings.TrimSpace(existing.Provider)
@@ -210,6 +219,7 @@ func (m *Manager) Remove(ctx context.Context, id string) {
 		}
 	}
 	m.mu.Unlock()
+	m.pacingMu.Unlock()
 
 	if !shouldDeferAPIKeyModelAliasRebuild(ctx) {
 		m.rebuildAPIKeyModelAliasFromRuntimeConfig()
@@ -241,16 +251,18 @@ func (m *Manager) invalidateSessionAffinity(authID string) {
 
 // Load resets manager state from the backing store.
 func (m *Manager) Load(ctx context.Context) error {
-	m.mu.Lock()
-	if m.store == nil {
-		m.mu.Unlock()
+	m.mu.RLock()
+	store := m.store
+	m.mu.RUnlock()
+	if store == nil {
 		return nil
 	}
-	items, err := m.store.List(ctx)
+	items, err := store.List(ctx)
 	if err != nil {
-		m.mu.Unlock()
 		return err
 	}
+	m.pacingMu.Lock()
+	m.mu.Lock()
 	m.auths = make(map[string]*Auth, len(items))
 	for _, auth := range items {
 		if auth == nil || auth.ID == "" {
@@ -265,6 +277,8 @@ func (m *Manager) Load(ctx context.Context) error {
 	}
 	m.rebuildAPIKeyModelAliasLocked(cfg)
 	m.mu.Unlock()
+	m.refreshWarmupPacingLocked()
+	m.pacingMu.Unlock()
 	m.syncScheduler()
 	return nil
 }

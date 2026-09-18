@@ -114,6 +114,9 @@ type Manager struct {
 	hook                      Hook
 	mu                        sync.RWMutex
 	configCooldownMu          sync.Mutex
+	pacingMu                  sync.Mutex
+	pacing                    *managerWarmupPacing
+	pacingCalls               map[*pacingOwnership]struct{}
 	auths                     map[string]*Auth
 	scheduler                 *authScheduler
 	// pluginScheduler runs outside m.mu before falling back to native selection.

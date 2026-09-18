@@ -129,9 +129,12 @@ func (m *Manager) setConfigSnapshotLocked(cfg *internalconfig.Config) bool {
 	oldCooldownStore := m.cooldownStore
 	selector, _ := m.selector.(*AdaptiveSelector)
 	m.mu.RUnlock()
+	m.pacingMu.Lock()
 	previousScheduling := m.accountSchedulingConfig()
 	m.runtimeConfig.Store(cfg)
-	if selector != nil && previousScheduling.WarmupServingReserve > 0 && cfg.AccountScheduling.WarmupServingReserve <= 0 {
+	m.refreshWarmupPacingLocked()
+	m.pacingMu.Unlock()
+	if selector != nil && warmupServingEnabled(previousScheduling) && !warmupServingEnabled(cfg.AccountScheduling) {
 		selector.clearWarmupServing()
 	}
 	// T041 per-account proxy egress gate: re-evaluate schedulability against the
@@ -150,6 +153,7 @@ func (m *Manager) setConfigSnapshotLocked(cfg *internalconfig.Config) bool {
 	// account is a warming account with a positive token budget, so this stays inert
 	// under the default (unbounded) token config.
 	RegisterAccountBillableTokenSink(m.recordBillableTokensForAccount)
+	RegisterAccountPacingUsageSink(m.recordPacingUsage)
 	clearedCooldowns := m.clearDisabledCooldownStates(cfg)
 	if clearedCooldowns && oldCooldownStore != nil {
 		m.mu.Lock()
@@ -711,6 +715,7 @@ func cooldownReason(statusMessage string, quota QuotaState, lastErr *Error) stri
 
 // MarkResult records an execution result and notifies hooks.
 func (m *Manager) MarkResult(ctx context.Context, result Result) {
+	defer m.finishPacingResult(ctx)
 	if slot := warmupExecutionSlotFromContext(ctx); slot != nil && slot.target {
 		slot.record(ctx, func() { m.markWarmupResultOnce(context.WithoutCancel(ctx), result) })
 		return
@@ -723,6 +728,7 @@ func (m *Manager) markWarmupResultOnce(ctx context.Context, result Result) {
 		return
 	}
 
+	pacingTxn := m.beginPacingHistory(result.AuthID, warmupExecutionSlotFromContext(ctx))
 	shouldResumeModel := false
 	shouldSuspendModel := false
 	suspendReason := ""
@@ -1056,7 +1062,9 @@ func (m *Manager) markWarmupResultOnce(ctx context.Context, result Result) {
 		// the healthy steady state (see evaluateAccountHealthGate).
 		m.evaluateAccountHealthGateLocked(auth, result.Success, now)
 
-		_ = m.persist(ctx, auth)
+		if pacingTxn == nil {
+			_ = m.persist(ctx, auth)
+		}
 		authSnapshot = auth.Clone()
 		if trackCooldownState {
 			cooldownRecordsAfter := m.cooldownStateRecordsForAuthLocked(auth, now)
@@ -1064,6 +1072,10 @@ func (m *Manager) markWarmupResultOnce(ctx context.Context, result Result) {
 		}
 	}
 	m.mu.Unlock()
+	m.finishPacingHistory(ctx, pacingTxn)
+	if pacingTxn != nil {
+		m.persistCurrentPacingAuth(ctx, result.AuthID)
+	}
 	if m.scheduler != nil && authSnapshot != nil {
 		m.scheduler.upsertAuth(authSnapshot)
 	}
@@ -1172,8 +1184,15 @@ func (m *Manager) recordBillableTokensForAccount(authID string, billableTokens i
 	if authID == "" {
 		return
 	}
-	now := time.Now()
+	txn := m.beginPacingHistory(authID)
 	var snapshot *Auth
+	defer func() {
+		m.finishPacingHistory(context.Background(), txn)
+		if snapshot != nil {
+			m.persistCurrentPacingAuth(context.Background(), authID)
+		}
+	}()
+	now := time.Now()
 	m.mu.Lock()
 	gate := m.accountConcurrencyGateLocked()
 	auth := m.auths[authID]
@@ -1205,7 +1224,6 @@ func (m *Manager) recordBillableTokensForAccount(authID string, billableTokens i
 	updated := gate.RecordTokensWindow(auth.ID, billableTokens, seed)
 	setAccountSchedulingValue(auth.Metadata, accountSchedulingTokenWindowKey, dailyWindowToMetadata(updated))
 	auth.UpdatedAt = now
-	_ = m.persist(context.Background(), auth)
 	snapshot = auth.Clone()
 	m.mu.Unlock()
 
@@ -1236,6 +1254,7 @@ func (m *Manager) reportHomeResult(ctx context.Context, result Result, auth *Aut
 }
 
 func (m *Manager) recordAvailabilityNeutralResult(ctx context.Context, result Result) {
+	defer m.finishPacingResult(ctx)
 	if slot := warmupExecutionSlotFromContext(ctx); slot != nil && slot.target {
 		slot.record(ctx, func() { m.recordAvailabilityNeutralResultOnce(context.WithoutCancel(ctx), result) })
 		return

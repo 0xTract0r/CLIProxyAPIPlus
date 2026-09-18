@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"strings"
 
@@ -269,11 +270,15 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				return nil, admissionErr
 			}
 		}
-		modelCtx := withWarmupExecutionSlot(ctx, slot)
+		modelCtx := m.pacingExecutionContext(withWarmupExecutionSlot(ctx, slot), auth.ID)
+		if holder, _ := modelCtx.Value(pacingOwnershipKey{}).(*pacingOwnership); holder != nil {
+			holder.stream = true
+		}
 		transferred := false
 		cancelAttempt := func() {}
 		defer func() {
 			if !transferred {
+				m.finishPacingCall(modelCtx)
 				cancelAttempt()
 				slot.close(modelCtx)
 			}
@@ -284,10 +289,15 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				cancelAttempt()
 				sendCtx, cancelAttempt = context.WithCancel(modelCtx)
 			}
-			if err := warmupBeforeSend(modelCtx, slot); err != nil {
+			sendCtx, gateErr := m.pacingSendContext(sendCtx, executor, auth, routeModel, execOpts)
+			if gateErr != nil {
+				return nil, gateErr
+			}
+			if err := warmupBeforeSend(sendCtx, slot); err != nil {
 				return nil, err
 			}
-			return executor.ExecuteStream(sendCtx, auth, execReq, execOpts)
+			response, err := executor.ExecuteStream(sendCtx, auth, execReq, execOpts)
+			return response, pacingExecutionError(err)
 		}
 		discard := func(ch <-chan cliproxyexecutor.StreamChunk) {
 			if target {
@@ -303,9 +313,11 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			}
 			if allowRetry {
 				if refreshed, okRefresh := m.tryRefreshAfterUnauthorized(ctx, auth, errStream, didRefreshOnUnauthorized); okRefresh {
+					priorErr := errStream
 					auth = refreshed
 					didRefreshOnUnauthorized = true
 					streamResult, errStream = send()
+					errStream = pacingKeepPrevious(errStream, priorErr)
 					if errStream != nil {
 						if errCtx := ctx.Err(); errCtx != nil {
 							return nil, errCtx
@@ -313,6 +325,14 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 					}
 				}
 			}
+		}
+		if local, rejected := pacingLocalError(errStream); rejected {
+			var reselect *warmupAdmissionReselect
+			if errors.As(local, &reselect) {
+				reselect.previous = lastErr
+				warmupSetModelResume(ctx, auth.ID, execModel)
+			}
+			return nil, local
 		}
 		if errStream == nil && (streamResult == nil || streamResult.Chunks == nil) {
 			errStream = &Error{Code: "empty_stream", Message: "upstream stream has no source", Retryable: true}
@@ -345,6 +365,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 					auth = refreshed
 					didRefreshOnUnauthorized = true
 					retryStream, retryErr := send()
+					retryErr = pacingKeepPrevious(retryErr, bootstrapErr)
 					if retryErr == nil && (retryStream == nil || retryStream.Chunks == nil) {
 						retryErr = &Error{Code: "empty_stream", Message: "upstream retry stream has no source", Retryable: true}
 					}
@@ -430,10 +451,12 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			return m.wrapStreamResult(modelCtx, auth.Clone(), provider, resultModel, streamResult.Headers, buffered, remaining, aliasResult, false, func() {
 				cancelAttempt()
 				slot.close(modelCtx)
+				m.finishPacingCall(modelCtx)
 			}), nil
 		}
 		legacySlot, _ := m.beginAccountExecution(auth)
-		return m.wrapStreamResult(ctx, auth.Clone(), provider, resultModel, streamResult.Headers, buffered, remaining, aliasResult, ephemeralResult, legacySlot.release), nil
+		transferred = true
+		return m.wrapStreamResult(modelCtx, auth.Clone(), provider, resultModel, streamResult.Headers, buffered, remaining, aliasResult, ephemeralResult, func() { legacySlot.release(); m.finishPacingCall(modelCtx) }), nil
 	}
 	if lastErr == nil {
 		lastErr = &Error{Code: "auth_not_found", Message: "no upstream model available"}

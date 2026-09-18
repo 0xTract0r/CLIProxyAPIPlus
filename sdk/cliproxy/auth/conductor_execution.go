@@ -360,8 +360,9 @@ selectionLoop:
 				}
 				return cliproxyexecutor.Response{}, admissionErr
 			}
-			modelCtx := withWarmupExecutionSlot(execCtx, slot)
+			modelCtx := m.pacingExecutionContext(withWarmupExecutionSlot(execCtx, slot), auth.ID)
 			defer slot.close(modelCtx)
+			defer m.finishPacingCall(modelCtx)
 			var resp cliproxyexecutor.Response
 			var errExec, ctxErr error
 			concurrencyBusy := false
@@ -374,20 +375,16 @@ selectionLoop:
 						return
 					}
 				}
-				if ctxErr = warmupBeforeSend(modelCtx, slot); ctxErr != nil {
-					return
-				}
-				resp, errExec = executor.Execute(modelCtx, auth, execReq, execOpts)
+				resp, errExec = m.executePacingAttempt(modelCtx, executor, auth, execReq, execOpts, routeModel, false)
 				if errExec != nil {
 					if ctxErr = modelCtx.Err(); ctxErr != nil {
 						return
 					}
 					if refreshed, ok := m.tryRefreshAfterUnauthorized(modelCtx, auth, errExec, didRefreshOnUnauthorized); ok {
+						priorErr := errExec
 						auth, didRefreshOnUnauthorized = refreshed, true
-						if ctxErr = warmupBeforeSend(modelCtx, slot); ctxErr != nil {
-							return
-						}
-						resp, errExec = executor.Execute(modelCtx, auth, execReq, execOpts)
+						resp, errExec = m.executePacingAttempt(modelCtx, executor, auth, execReq, execOpts, routeModel, false)
+						errExec = pacingKeepPrevious(errExec, priorErr)
 						if errExec != nil {
 							ctxErr = modelCtx.Err()
 						}
@@ -401,8 +398,24 @@ selectionLoop:
 				return cliproxyexecutor.Response{}, ctxErr
 			}
 			if concurrencyBusy {
+				m.finishPacingCall(modelCtx)
 				lastErr = errAccountConcurrencyBusy(auth.ID)
 				break
+			}
+			if local, rejected := pacingLocalError(errExec); rejected {
+				slot.close(modelCtx)
+				if isWarmupAdmissionReselect(local) {
+					warmupSetModelResume(ctx, auth.ID, upstreamModel)
+					if authErr != nil {
+						lastErr = authErr
+					}
+					delete(tried, auth.ID)
+					if warmupSendSerial(ctx) == selectionSerial {
+						delete(attempted, auth.ID)
+					}
+					continue selectionLoop
+				}
+				return cliproxyexecutor.Response{}, local
 			}
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil}
 			if errExec != nil {
@@ -548,23 +561,20 @@ selectionLoop:
 				}
 				return cliproxyexecutor.Response{}, admissionErr
 			}
-			modelCtx := withWarmupExecutionSlot(execCtx, slot)
+			modelCtx := m.pacingExecutionContext(withWarmupExecutionSlot(execCtx, slot), auth.ID)
 			defer slot.close(modelCtx)
-			if err := warmupBeforeSend(modelCtx, slot); err != nil {
-				return cliproxyexecutor.Response{}, err
-			}
-			resp, errExec := executor.CountTokens(modelCtx, auth, execReq, execOpts)
+			defer m.finishPacingCall(modelCtx)
+			resp, errExec := m.executePacingAttempt(modelCtx, executor, auth, execReq, execOpts, routeModel, true)
 			if errExec != nil {
 				if errCtx := execCtx.Err(); errCtx != nil {
 					return cliproxyexecutor.Response{}, errCtx
 				}
 				if refreshed, okRefresh := m.tryRefreshAfterUnauthorized(execCtx, auth, errExec, didRefreshOnUnauthorized); okRefresh {
+					priorErr := errExec
 					auth = refreshed
 					didRefreshOnUnauthorized = true
-					if err := warmupBeforeSend(modelCtx, slot); err != nil {
-						return cliproxyexecutor.Response{}, err
-					}
-					resp, errExec = executor.CountTokens(modelCtx, auth, execReq, execOpts)
+					resp, errExec = m.executePacingAttempt(modelCtx, executor, auth, execReq, execOpts, routeModel, true)
+					errExec = pacingKeepPrevious(errExec, priorErr)
 					if errExec != nil {
 						if errCtx := execCtx.Err(); errCtx != nil {
 							return cliproxyexecutor.Response{}, errCtx
@@ -574,6 +584,21 @@ selectionLoop:
 			}
 			if target && modelCtx.Err() != nil {
 				return cliproxyexecutor.Response{}, modelCtx.Err()
+			}
+			if local, rejected := pacingLocalError(errExec); rejected {
+				slot.close(modelCtx)
+				if isWarmupAdmissionReselect(local) {
+					warmupSetModelResume(ctx, auth.ID, upstreamModel)
+					if authErr != nil {
+						lastErr = authErr
+					}
+					delete(tried, auth.ID)
+					if warmupSendSerial(ctx) == selectionSerial {
+						delete(attempted, auth.ID)
+					}
+					continue selectionLoop
+				}
+				return cliproxyexecutor.Response{}, local
 			}
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil}
 			if errExec != nil {

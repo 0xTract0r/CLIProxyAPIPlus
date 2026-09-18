@@ -4,7 +4,7 @@
 
 > 实现对应 `openspec/changes/add-adaptive-account-scheduling`。config 字段定义已在
 > `core/config.example.yaml` 的 `account-scheduling` 段完整覆盖，本文不重复列出，只补充
-> 管理 API 的只读字段参考、运维说明及养号服务预留扩展（`add-warmup-serving-reserve`）。
+> 管理 API 的只读字段参考、运维说明及养号预留/流量节奏扩展（`add-warmup-serving-reserve`、`add-warmup-traffic-pacing`）。
 > 字段/行为已对照 2026-09 当前代码核实。代码/符号位置
 > 统一收敛在文末[代码索引](#代码索引)，不再逐句内联在每个论断后面。
 
@@ -31,6 +31,7 @@
 
 | 参数 | 默认值 | 推荐值 | 说明 |
 | --- | --- | --- | --- |
+| `account-scheduling.warmup-traffic-pacing.enabled` | `false` | 隔离验证后明确启用 | 独立于服务预留，见[养号流量节奏](#养号流量节奏)。 |
 | `account-scheduling.warmup-serving-reserve` | `0`（关） | `0.15`（本项目生产） | 多个养号号共享新机会概率，不是总流量上限；需明确保存才能启用。见[养号服务预留](#养号服务预留)。 |
 | `account-scheduling.warmup-serving-max-binding-age-seconds` | `0` | `0`（年龄兜底关闭） | 不随续聊重置的年龄，单位秒；仅设正值不会自动启用迁移。 |
 | `account-scheduling.warmup-serving-migration-token-budget` | `0` | `0`（主动迁移关闭） | 本进程滚动1小时输入重建估算预算，与账号每日token预算分开。 |
@@ -524,9 +525,37 @@ account-scheduling:
 
 迁移预算是输入重建token的**估算**，不是账号每日token总预算；选号前原子预约滚动小时预算。媒体/不透明输入、预算不足、没有缺服务目标或来源账号在途时不迁移。无在途判断是账号瞬时观察，不是分布式会话锁。“cached assistant前缀＋uncached user尾部”也抑制迁移，以保护实测compact摘要形状；这比compact本身更宽，不能宣称识别全部compact实现。
 
-未知缓存TTL按保守1小时处理。空闲迁移要求会话绑定仍存活，绑定TTL应长于缓存TTL；绑定过期后保留最多1小时的有界标记，抑制额外预留抽签并走普通重选。缓存/标记容量上限4096，迁移费用记录同样有界，不引入新持久化存储。
+未知缓存TTL按保守1小时处理。空闲迁移要求会话绑定仍存活，绑定TTL应长于缓存TTL；绑定过期后保留最多1小时的有界标记，抑制额外预留抽签并走普通重选。缓存/标记容量上限4096，迁移费用记录同样有界，服务预留本身不引入持久化存储；独立pacing使用下节的sidecar。
 
-将预留改回0会在配置提交时清理子绑定、pin及预留/迁移状态，关闭期间没有请求也生效；普通root绑定和旧D5策略保留。删除、过期及关闭移除的服务绑定保留有界防重抽标记，反复清理不延长标记；计数或其他provider请求不误清Claude绑定。单账号/全养号池沿用普通选号，正预留下的目标养号执行仍遵守预发准入。全天配额分批释放和通用硬配速仍属于独立、未实现的traffic-pacing方案。
+将预留改回0停止预留机会；pacing仍开启时，保留其身份、组、等待及借道保护。两个开关都关闭时，才在配置提交时清理子绑定、pin及迁移状态，普通root绑定和旧D5保留。删除/过期的有界防重抽标记仍不反复续期；计数或其他provider流量不清理Claude状态。独立硬节奏保护见下节。
+
+## 养号流量节奏
+
+`account-scheduling.warmup-traffic-pacing`独立控制养号账号的发送节奏，默认关闭。它对原生Claude的adaptive链路生效（包括合格的纯Claude mixed池），不因`warmup-serving-reserve`为正而自动开启。
+
+| 参数 | 默认值 | 含义 |
+| --- | ---: | --- |
+| `enabled` | `false` | 开启新增节奏和接入约束 |
+| `request-burst` | `8` | 最多积攒8次发送额度；包含已预约未发部分，不是并发数 |
+| `min-admission-requests` | `4` | 接新独立会话时至少有4次额度 |
+| `max-active-bindings` | `1` | 每号同时接纳的近期活跃独立会话组数 |
+| `active-binding-idle-seconds` | `300` | 会话组空闲释放时长，独立于prompt缓存TTL |
+
+开启时整数须为正，接入门槛不能超过容量。首次没有账本时额度从0开始；按阶段的有效日请求预算连续补充。以200次/日为例，每7.2分钟补1次，达到接入门槛4需要约28.8分钟，空闲约57.6分钟可积攒到8。没有业务机会时不会主动生成请求，也不要求每天用满。
+
+已接入的会话优先连续使用原号，但每次真实发送仍受余额、滚动60秒、滚动24小时、并发及健康约束。短时RPM/并发不足沿用整个请求最多30秒等待；同绑定重叠请求可临时借成熟号而不改原绑定。余额、总预算或接入名额不足时交给可用成熟号；交接后不会因新号刚补回1次额度就抢回。没有可用退路时返回可重试容量错误。
+
+独立fresh child占自己的组；有可靠父关系的fork/unknown child归已知父组，每次发送仍扣账号额度。单个父/child/alias退出只释放自己的成员，不能把仍在服务的同组成员一起释放。CountTokens也计请求次数和并发，但不占用或续期会话组，不建立首投锚点；其输入估算不当作生成token消耗。
+
+内部显式HTTP重试各自计数；未发送取消返还预约，已发送的失败或断流仍计次数。正token预算包含最终请求的保守估算，只有完整终态usage才能校正退款；缓存读取不计入本项目scheduler token预算，缓存写入保留。估算器识别已知`clear_thinking_20251015`上下文编辑（默认保留、`keep: "all"`或正整数`thinking_turns`），仍按未编辑的完整正文估算；未知编辑、混入生成/压缩的编辑及未支持内容保持未知，正token预算会拒绝这些养号发送。协议见[Claude上下文编辑](https://platform.claude.com/docs/en/build-with-claude/context-editing)。0表示token保护未启用，不能据请求数推断Pro/Max订阅额度安全。
+
+状态保存在持久auth目录的独立`.pacing`文件，不依赖用量报表开关。开启前已知消费会并入总预算，旧在途请求不会让新策略提前花掉剩余额度。重启保留扣额并释放不存在的旧并发位；坏账本或发送前保存失败拒绝养号发送。发送后结算保存失败保留当前响应，告警并拒绝该号后续发送。不要通过删账本“修复”额度。
+
+旧usage没有可靠完整性标记，未知历史在正token预算下需要等待对应保守窗口到期；旧小时汇总可能保留到该小时结束后的24小时。跨文件崩溃歧义可能保守多计，不承诺恰好一次恢复。这里只提供单实例保护，同一账号不能由多个独立CPA实例各自消费一份本地额度。
+
+`reserve=0`关闭预留机会；若pacing仍开启，保留其会话身份、组、等待和借道状态。pacing关闭后恢复旧策略并保留必要账目供重开；只有两个开关都关闭才回到旧的完整关闭行为。生产启用必须明确保存配置，发布新代码本身不会开启该开关。
+
+匿名正文指纹（`msg:`及SDK派生身份）和冲突身份不能作为可复用节奏组；需要可靠会话身份或成熟号退路。自定义原生Claude SDK执行器必须实现`HTTPAttemptGateAware`并在每次发送时遵循attempt hook，否则开启pacing后拒绝养号执行。`warmup-pacing-sent`、`warmup-pacing-denied`和`warmup-pacing-settled`日志展示余额、分钟/日attempt、待结算token及估算/结算差，不记录请求正文或凭据。
 
 ## 代码索引
 
@@ -535,6 +564,10 @@ account-scheduling:
 | 机制 / 字段 | 代码位置 |
 | --- | --- |
 | 选号加权（`AccountSelectionWeight`） | `sdk/cliproxy/auth/account_weight.go` |
+| 持久节奏账、小时历史桥与sidecar | `sdk/cliproxy/auth/warmup_pacing.go`、`warmup_pacing_history.go`、`warmup_pacing_store.go` |
+| Manager唯一pacer、执行生命周期与发前准入 | `sdk/cliproxy/auth/warmup_pacing_manager.go`、`warmup_pacing_calls.go`、`warmup_pacing_execution.go` |
+| selector节奏及组成员 | `sdk/cliproxy/auth/warmup_pacing_selector.go` |
+| Claude HTTP attempt hook与终态usage观察 | `sdk/cliproxy/executor/http_attempt.go`、`internal/runtime/executor/helps/claude_attempt*.go` |
 | 养号服务预留、子代理身份与有限迁移 | `sdk/cliproxy/auth/warmup_serving.go` |
 | 辅助通知与完整任务指纹 | `sdk/cliproxy/auth/warmup_serving_auxiliary.go`、`warmup_serving_task.go` |
 | 有界等待及执行预约/结算 | `sdk/cliproxy/auth/warmup_serving_wait.go`、`warmup_execution.go` |

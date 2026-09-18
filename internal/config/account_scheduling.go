@@ -98,6 +98,10 @@ type AccountSchedulingConfig struct {
 	// This probability is neither a total traffic cap nor a guaranteed floor.
 	WarmupServingReserve float64 `yaml:"warmup-serving-reserve,omitempty" json:"warmup-serving-reserve,omitempty"`
 
+	// WarmupTrafficPacing independently gates warming accounts before each
+	// outbound attempt. It is disabled by default and does not enable reserve.
+	WarmupTrafficPacing WarmupTrafficPacingConfig `yaml:"warmup-traffic-pacing,omitempty" json:"warmup-traffic-pacing,omitempty"`
+
 	// WarmupServingMaxBindingAgeSeconds enables non-renewing binding-age
 	// reassessment. Zero disables the age fallback; natural windows still
 	// require a positive migration budget.
@@ -281,11 +285,12 @@ type CodexTierWeights struct {
 // tier-weights.claude.max-20x) without having to restate the entire section.
 func DefaultAccountSchedulingConfig() AccountSchedulingConfig {
 	return AccountSchedulingConfig{
-		WarmupCurve:  DefaultAccountWarmupCurve(),
-		MatureLimits: DefaultAccountMatureLimits(),
-		TierWeights:  DefaultAccountTierWeights(),
-		RateScale:    DefaultAccountSchedulingRateScale,
-		HealthGate:   DefaultAccountHealthGateConfig(),
+		WarmupTrafficPacing: DefaultWarmupTrafficPacingConfig(),
+		WarmupCurve:         DefaultAccountWarmupCurve(),
+		MatureLimits:        DefaultAccountMatureLimits(),
+		TierWeights:         DefaultAccountTierWeights(),
+		RateScale:           DefaultAccountSchedulingRateScale,
+		HealthGate:          DefaultAccountHealthGateConfig(),
 	}
 }
 
@@ -351,6 +356,9 @@ func DefaultAccountTierWeights() AccountTierWeightsConfig {
 // overlaps, positive limits) — it does not and cannot validate anything
 // about live account state, which is Phase 1-4's concern.
 func (c AccountSchedulingConfig) Validate() error {
+	if err := c.WarmupTrafficPacing.Validate(); err != nil {
+		return err
+	}
 	if math.IsNaN(c.WarmupServingReserve) || math.IsInf(c.WarmupServingReserve, 0) || c.WarmupServingReserve < 0 || c.WarmupServingReserve >= 1 {
 		return fmt.Errorf("account-scheduling.warmup-serving-reserve must be finite and in [0,1)")
 	}

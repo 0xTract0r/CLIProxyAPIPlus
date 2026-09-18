@@ -333,3 +333,12 @@ scheduling-warmup-reserve	mixed-manager-regression	symbol	^func TestWarmupServin
 scheduling-warmup-reserve	execution-admission	pattern	m\.admitWarmupExecution\(	sdk/cliproxy/auth/conductor_execution.go
 scheduling-warmup-reserve	stream-admission	pattern	m\.admitWarmupExecution\(	sdk/cliproxy/auth/conductor_stream.go
 scheduling-warmup-reserve	cancel-budget	symbol	^func \(m \*Manager\) recordWarmupCancellation\(	sdk/cliproxy/auth/warmup_execution.go
+
+# Independent durable warm-up traffic pacing.
+scheduling-warmup-pacing	config	pattern	WarmupTrafficPacing	internal/config/account_scheduling.go
+scheduling-warmup-pacing	ledger	symbol	^type WarmupPacer struct	sdk/cliproxy/auth/warmup_pacing.go
+scheduling-warmup-pacing	sidecar	symbol	^func NewWarmupPacingFileStore\(	sdk/cliproxy/auth/warmup_pacing_store.go
+scheduling-warmup-pacing	execute-count-hook	pattern	m\.executePacingAttempt\(	sdk/cliproxy/auth/conductor_execution.go
+scheduling-warmup-pacing	stream-hook	pattern	m\.pacingSendContext\(	sdk/cliproxy/auth/conductor_stream.go
+scheduling-warmup-pacing	safety-usage	pattern	coreauth\.RecordAccountPacingUsage\(	internal/usage/logger_plugin.go
+scheduling-warmup-pacing	actual-http-hook	pattern	helps\.BeginClaudeHTTPAttempt\(	internal/runtime/executor/claude_transport_retry.go
