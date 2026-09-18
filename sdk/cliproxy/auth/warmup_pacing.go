@@ -512,6 +512,26 @@ func (p *WarmupPacer) Peek(account string, limits WarmupPacingLimits, req Warmup
 	return p.decision(a, s, req, 0), nil
 }
 
+// PeekConfigured cannot reconfigure or initialize policy. Selectors use this
+// advisory read after the Manager publishes the latest effective limits.
+func (p *WarmupPacer) PeekConfigured(account string, req WarmupPacingRequest) (WarmupPacingDecision, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if account == "" {
+		return WarmupPacingDecision{Reason: "state-error"}, errors.New("warmup pacing account is empty")
+	}
+	a, err := p.load(pacingDigest(account))
+	if err != nil {
+		return WarmupPacingDecision{Reason: "state-error"}, err
+	}
+	if a.state.Last == 0 {
+		return WarmupPacingDecision{Reason: "state-error"}, errors.New("warmup pacing policy is not configured")
+	}
+	s := clonePacingState(a.state)
+	p.advance(a, &s, p.now().UnixNano())
+	return p.decision(a, s, req, 0), nil
+}
+
 func (p *WarmupPacer) Reconfigure(account string, limits WarmupPacingLimits) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()

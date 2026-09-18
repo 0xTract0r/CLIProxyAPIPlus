@@ -667,3 +667,27 @@ func TestWarmupPacingRejectsLeaseReuse(t *testing.T) {
 		t.Fatal("disabled nil lease changed behavior", err)
 	}
 }
+
+func TestWarmupPacingConfiguredPeekCannotRollbackPolicy(t *testing.T) {
+	p, store, now, l, r := pacingFixture(t)
+	if _, err := p.PeekConfigured("account", r); err == nil || store.saves != 0 {
+		t.Fatal("unconfigured selector initialized policy")
+	}
+	if err := p.Reconfigure("account", l); err != nil {
+		t.Fatal(err)
+	}
+	*now = now.Add(8 * time.Hour)
+	l.DailyRequests = 100
+	l.Config.RequestBurst = 4
+	if err := p.Reconfigure("account", l); err != nil {
+		t.Fatal(err)
+	}
+	saves := store.saves
+	d, err := p.PeekConfigured("account", r)
+	if err != nil || d.Balance != 4 || !d.Allowed || store.saves != saves {
+		t.Fatalf("configured peek changed current policy: %+v %v", d, err)
+	}
+	if got := p.accounts[pacingDigest("account")].state.Limits; got != l {
+		t.Fatal("selector rolled back effective limits")
+	}
+}
