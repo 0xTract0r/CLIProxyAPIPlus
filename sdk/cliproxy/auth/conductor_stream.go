@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"strings"
 
@@ -326,7 +327,8 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			}
 		}
 		if local, rejected := pacingLocalError(errStream); rejected {
-			if reselect, ok := local.(*warmupAdmissionReselect); ok {
+			var reselect *warmupAdmissionReselect
+			if errors.As(local, &reselect) {
 				reselect.previous = lastErr
 				warmupSetModelResume(ctx, auth.ID, execModel)
 			}

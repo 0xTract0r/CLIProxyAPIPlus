@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -347,12 +349,60 @@ func TestClaudeHTTPAttemptCancellationRace(t *testing.T) {
 	}
 }
 
+func claudeAttemptWithContext(edit string) string {
+	return `{"context_management":` + edit + `,` + claudeAttemptRequestJSON[1:]
+}
+
+func TestClaudeHTTPAttemptNativeChildEstimate(t *testing.T) {
+	data, err := os.ReadFile("testdata/claude_pacing_native_child_shape.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fixture struct {
+		Request json.RawMessage `json:"request"`
+	}
+	if err = json.Unmarshal(data, &fixture); err != nil {
+		t.Fatal(err)
+	}
+	gate := &claudeAttemptTestGate{}
+	ctx := cliproxyexecutor.WithHTTPAttemptGate(context.Background(), gate)
+	client := &http.Client{Transport: claudeAttemptRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		body, err := io.ReadAll(req.Body)
+		if err != nil || !bytes.Equal(body, fixture.Request) {
+			t.Error("estimate rewrote native request", err)
+		}
+		return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(claudeAttemptResponseJSON))}, nil
+	})}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://localhost/v1/messages", bytes.NewReader(fixture.Request))
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := doClaudeHTTPWithTransportRetry(ctx, client, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, response.Body)
+	_ = response.Body.Close()
+	info := gate.infos[0]
+	if !info.EstimateKnown || info.EstimatedTokens != int64(len(fixture.Request))+64000 {
+		t.Fatalf("native child omitted full unedited input/output bound: %+v", info)
+	}
+}
+
 func TestClaudeHTTPAttemptPreparedEstimate(t *testing.T) {
 	for _, tc := range []struct {
 		name, body, path string
 		known            bool
 	}{
 		{"text", claudeAttemptRequestJSON, "/v1/messages", true},
+		{"thinking-clear-all", claudeAttemptWithContext(`{"edits":[{"type":"clear_thinking_20251015","keep":"all"}]}`), "/v1/messages", true},
+		{"thinking-clear-default", claudeAttemptWithContext(`{"edits":[{"type":"clear_thinking_20251015"}]}`), "/v1/messages", true},
+		{"thinking-clear-turns", claudeAttemptWithContext(`{"edits":[{"type":"clear_thinking_20251015","keep":{"type":"thinking_turns","value":2}}]}`), "/v1/messages", true},
+		{"unknown-context-edit", claudeAttemptWithContext(`{"edits":[{"type":"future_generation_edit"}]}`), "/v1/messages", false},
+		{"mixed-context-edit", claudeAttemptWithContext(`{"edits":[{"type":"clear_thinking_20251015","keep":"all"},{"type":"compact_20260112"}]}`), "/v1/messages", false},
+		{"invalid-thinking-keep", claudeAttemptWithContext(`{"edits":[{"type":"clear_thinking_20251015","keep":{"type":"thinking_turns","value":0}}]}`), "/v1/messages", false},
+		{"unknown-thinking-option", claudeAttemptWithContext(`{"edits":[{"type":"clear_thinking_20251015","keep":"all","generate_summary":true}]}`), "/v1/messages", false},
+
 		{"media", `{"model":"claude","max_tokens":100,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","data":"synthetic"}}]}]}`, "/v1/messages", false},
 		{"tool-reference", `{"model":"claude","max_tokens":100,"messages":[{"role":"user","content":[{"type":"tool_result","content":[{"type":"tool_reference","tool_name":"inspect"}]}]}]}`, "/v1/messages", false},
 		{"unknown-top", `{"model":"claude","max_tokens":100,"mcp_servers":[],"messages":[{"role":"user","content":"Inspect concurrency"}]}`, "/v1/messages", false},

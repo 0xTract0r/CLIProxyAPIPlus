@@ -1,0 +1,267 @@
+{
+  "provenance": "Synthetic reconstruction of local native CLI batch 2 child n3. Retains observed roles, block counts, 15 custom tools, max_tokens=64000 and exact context_management policy. Text, model, tool names and schemas are synthetic; no request headers, credentials, original prompts or identifiers retained.",
+  "request": {
+    "model": "synthetic-claude",
+    "max_tokens": 64000,
+    "system": [
+      {
+        "type": "text",
+        "text": "Synthetic CLI framework."
+      },
+      {
+        "type": "text",
+        "text": "Synthetic environment notice."
+      },
+      {
+        "type": "text",
+        "text": "Synthetic project guidance.",
+        "cache_control": {
+          "type": "ephemeral"
+        }
+      }
+    ],
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Review the cancellation behavior in a Go cache."
+          },
+          {
+            "type": "text",
+            "text": "Return focused correctness findings."
+          }
+        ]
+      },
+      {
+        "role": "system",
+        "content": [
+          {
+            "type": "text",
+            "text": "Synthetic tool and skill catalog. Today's date is 2026-09-18.",
+            "cache_control": {
+              "type": "ephemeral"
+            }
+          }
+        ]
+      }
+    ],
+    "tools": [
+      {
+        "name": "synthetic_tool_00",
+        "description": "Synthetic local development tool.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": []
+        }
+      },
+      {
+        "name": "synthetic_tool_01",
+        "description": "Synthetic local development tool.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": []
+        }
+      },
+      {
+        "name": "synthetic_tool_02",
+        "description": "Synthetic local development tool.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": []
+        }
+      },
+      {
+        "name": "synthetic_tool_03",
+        "description": "Synthetic local development tool.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": []
+        }
+      },
+      {
+        "name": "synthetic_tool_04",
+        "description": "Synthetic local development tool.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": []
+        }
+      },
+      {
+        "name": "synthetic_tool_05",
+        "description": "Synthetic local development tool.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": []
+        }
+      },
+      {
+        "name": "synthetic_tool_06",
+        "description": "Synthetic local development tool.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": []
+        }
+      },
+      {
+        "name": "synthetic_tool_07",
+        "description": "Synthetic local development tool.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": []
+        }
+      },
+      {
+        "name": "synthetic_tool_08",
+        "description": "Synthetic local development tool.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": []
+        }
+      },
+      {
+        "name": "synthetic_tool_09",
+        "description": "Synthetic local development tool.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": []
+        }
+      },
+      {
+        "name": "synthetic_tool_10",
+        "description": "Synthetic local development tool.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": []
+        }
+      },
+      {
+        "name": "synthetic_tool_11",
+        "description": "Synthetic local development tool.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": []
+        }
+      },
+      {
+        "name": "synthetic_tool_12",
+        "description": "Synthetic local development tool.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": []
+        }
+      },
+      {
+        "name": "synthetic_tool_13",
+        "description": "Synthetic local development tool.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": []
+        }
+      },
+      {
+        "name": "synthetic_tool_14",
+        "description": "Synthetic local development tool.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": []
+        }
+      }
+    ],
+    "metadata": {
+      "user_id": "synthetic-session"
+    },
+    "thinking": {
+      "type": "adaptive"
+    },
+    "temperature": 1,
+    "output_config": {
+      "effort": "high"
+    },
+    "stream": true,
+    "context_management": {
+      "edits": [
+        {
+          "type": "clear_thinking_20251015",
+          "keep": "all"
+        }
+      ]
+    }
+  }
+}

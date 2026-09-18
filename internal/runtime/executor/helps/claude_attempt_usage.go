@@ -58,10 +58,13 @@ func claudeAttemptInfo(req *http.Request) cliproxyexecutor.HTTPAttemptInfo {
 func claudeAttemptTextInput(body map[string]json.RawMessage) bool {
 	for field := range body {
 		switch field {
-		case "model", "system", "messages", "tools", "max_tokens", "stream", "temperature", "top_p", "top_k", "stop_sequences", "metadata", "tool_choice", "thinking", "output_config", "service_tier":
+		case "model", "system", "messages", "tools", "max_tokens", "stream", "temperature", "top_p", "top_k", "stop_sequences", "metadata", "tool_choice", "thinking", "output_config", "service_tier", "context_management":
 		default:
 			return false
 		}
+	}
+	if editing, exists := body["context_management"]; exists && !claudeAttemptThinkingClear(editing) {
+		return false
 	}
 	if system, exists := body["system"]; exists && !claudeAttemptContent(system, true) {
 		return false
@@ -90,6 +93,45 @@ func claudeAttemptTextInput(body map[string]json.RawMessage) bool {
 			if json.Unmarshal(tool["input_schema"], &schema) != nil || schema == nil {
 				return false
 			}
+		}
+	}
+	return true
+}
+
+// Thinking clearing only keeps/removes supplied history. Counting the entire
+// unedited body remains conservative. Unknown or generation-based edits (such
+// as compaction) cannot inherit this bound and remain unknown.
+func claudeAttemptThinkingClear(raw json.RawMessage) bool {
+	var settings map[string]json.RawMessage
+	if json.Unmarshal(raw, &settings) != nil || len(settings) != 1 {
+		return false
+	}
+	var edits []map[string]json.RawMessage
+	if json.Unmarshal(settings["edits"], &edits) != nil || edits == nil || len(edits) > 1 {
+		return false
+	}
+	for _, edit := range edits {
+		var kind string
+		if json.Unmarshal(edit["type"], &kind) != nil || kind != "clear_thinking_20251015" || len(edit) > 2 {
+			return false
+		}
+		keep, exists := edit["keep"]
+		if !exists {
+			if len(edit) != 1 {
+				return false
+			}
+			continue
+		}
+		var all string
+		if json.Unmarshal(keep, &all) == nil && all == "all" {
+			continue
+		}
+		var turns map[string]json.RawMessage
+		if json.Unmarshal(keep, &turns) != nil || len(turns) != 2 || json.Unmarshal(turns["type"], &kind) != nil || kind != "thinking_turns" {
+			return false
+		}
+		if n, ok := claudeAttemptInteger(turns["value"]); !ok || n <= 0 {
+			return false
 		}
 	}
 	return true

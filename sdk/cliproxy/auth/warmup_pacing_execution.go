@@ -167,10 +167,18 @@ func (g *pacingHTTPGate) Before(ctx context.Context, info cliproxyexecutor.HTTPA
 		}
 		return nil
 	})
+	// A typed nil pointer is a non-nil interface; rejected attempts own nothing
+	// for the HTTP helper to cancel, including wait/reselect and context errors.
+	if permit == nil {
+		return nil, err
+	}
 	return permit, err
 }
 
 func (p *pacingHTTPPermit) MarkSent(ctx context.Context) error {
+	if p == nil {
+		return errors.New("missing warmup HTTP attempt permit")
+	}
 	m := p.gate.manager
 	m.pacingMu.Lock()
 	defer m.pacingMu.Unlock()
@@ -219,14 +227,14 @@ func (p *pacingHTTPPermit) MarkSent(ctx context.Context) error {
 }
 
 func (p *pacingHTTPPermit) CancelUnsent(context.Context) error {
-	if p.lease == nil {
+	if p == nil || p.lease == nil {
 		return nil
 	}
 	return p.pacer.CancelUnsent(p.lease)
 }
 
 func (p *pacingHTTPPermit) Finish(ctx context.Context, result cliproxyexecutor.HTTPAttemptResult) error {
-	if p.lease == nil {
+	if p == nil || p.lease == nil {
 		return nil
 	}
 	err := p.pacer.Finish(p.lease, result.Complete, result.SchedulerTokens)

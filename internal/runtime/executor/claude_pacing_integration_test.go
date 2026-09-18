@@ -18,7 +18,7 @@ import (
 )
 
 func TestClaudePacingManagerNativeHTTP(t *testing.T) {
-	for _, entry := range []string{"execute", "stream", "count"} {
+	for _, entry := range []string{"execute", "stream", "count", "thinking-clear", "reject-unknown-edit"} {
 		t.Run(entry, func(t *testing.T) {
 			var sends atomic.Int32
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -63,6 +63,13 @@ func TestClaudePacingManagerNativeHTTP(t *testing.T) {
 			registry.GetGlobalRegistry().RegisterClient(a.ID, "claude", []*registry.ModelInfo{{ID: model}})
 			defer registry.GetGlobalRegistry().UnregisterClient(a.ID)
 			payload := []byte(strings.ReplaceAll(claudeAttemptRequestJSON, "claude-sonnet-4-6", model))
+			if entry == "thinking-clear" || entry == "reject-unknown-edit" {
+				edit := `{"edits":[{"type":"clear_thinking_20251015","keep":"all"}]}`
+				if entry == "reject-unknown-edit" {
+					edit = `{"edits":[{"type":"future_generation_edit"}]}`
+				}
+				payload = []byte(`{"context_management":` + edit + `,` + string(payload[1:]))
+			}
 			req := cliproxyexecutor.Request{Model: model, Payload: payload}
 			opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude"), OriginalRequest: payload, Headers: http.Header{"X-Claude-Code-Session-Id": []string{"synthetic-native-root"}}}
 			invoke := func() error {
@@ -92,6 +99,16 @@ func TestClaudePacingManagerNativeHTTP(t *testing.T) {
 				t.Fatal("zero credit reached native HTTP", err)
 			}
 			clock.Add(int64(30 * time.Minute))
+			if entry == "reject-unknown-edit" {
+				if err := invoke(); err == nil || sends.Load() != 0 {
+					t.Fatal("unknown estimate must reject without panic or HTTP send", err)
+				}
+				latest, _ := manager.GetByID(a.ID)
+				if latest.Failed != 0 || latest.Success != 0 || latest.Metadata[cliproxyauth.FirstProductionAtMetadataKey] != nil {
+					t.Fatal("local refusal mutated result/anchor accounting")
+				}
+				return
+			}
 			if err := invoke(); err != nil {
 				t.Fatal(err)
 			}

@@ -765,3 +765,39 @@ func TestWarmupPacingExecutionNonAdaptiveStreamDrainsBeforeEnable(t *testing.T) 
 		t.Fatal("strategy transition retained an executor lifetime")
 	}
 }
+
+func TestWarmupPacingPermitNilReceiver(t *testing.T) {
+	var permit *pacingHTTPPermit
+	if err := permit.MarkSent(context.Background()); err == nil {
+		t.Fatal("nil permit authorized send")
+	}
+	if err := permit.CancelUnsent(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := permit.Finish(context.Background(), cliproxyexecutor.HTTPAttemptResult{}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWarmupPacingRejectedPermitIsNilInterface(t *testing.T) {
+	for _, cancelled := range []bool{false, true} {
+		t.Run(map[bool]string{false: "rejected", true: "cancelled"}[cancelled], func(t *testing.T) {
+			m, _, a, e, _, model := pacingExecutionFixture(t)
+			ctx, cancel := context.WithCancel(withWarmupRequestState(context.Background(), warmupPurposeServe))
+			defer cancel()
+			ctx = m.pacingExecutionContext(ctx, a.ID)
+			defer m.finishPacingCall(ctx)
+			ctx, err := m.pacingSendContext(ctx, e, a, model, cliproxyexecutor.Options{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cancelled {
+				cancel()
+			}
+			permit, err := cliproxyexecutor.HTTPAttemptGateFromContext(ctx).Before(ctx, cliproxyexecutor.HTTPAttemptInfo{Provider: "not-claude"})
+			if err == nil || permit != nil {
+				t.Fatalf("refusal returned an owning/typed-nil interface: permit=%#v err=%v", permit, err)
+			}
+		})
+	}
+}
