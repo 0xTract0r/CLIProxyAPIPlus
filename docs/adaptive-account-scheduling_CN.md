@@ -15,43 +15,36 @@
 
 **代码默认值、生产已保存的值、待执行的启用方案是三件不同的事。合主、部署和开启功能也要分别确认。** 以下片段只合并到原配置对应位置，不要覆盖整份配置文件；修改示例不会自动改变生产。
 
-### 生产核查快照：2026-09-18
+### 生产已启用：2026-09-19 回读
 
-只读核对了生产文件中的非敏感调度字段及 `/healthz` 版本头。生产 core 为 `28eef822`，尚未包含配速实现 `8a6a5796`。这是带日期的核查记录，不是实时运行态看板。下面是文件中显式保存的相关配置：
+生产 core 为 `951e1bba`，已部署并明确保存以下值。真实 Claude CLI 共发起48条调用，其中47条完整成功、1条成熟号进度请求被CLI取消。AC-13为3次、AC-16为6次，两个新号均保持同child并读取缓存。此处是带日期的验收快照，不是实时看板。完整证据见 umbrella 的 `docs/operations/verification/warmup-traffic-pacing-2026-09-18.md`。
 
 ```yaml
 routing:
   strategy: adaptive
-  session-affinity: true
+  session-affinity: true # 保留父会话、同child及fork的缓存亲和
 account-scheduling:
-  warmup-serving-reserve: 0.15 # 已开启；15%的合格新机会参加养号预留抽签
-  warmup-serving-max-binding-age-seconds: 0 # 关闭绑定年龄兜底迁移
-  warmup-serving-migration-token-budget: 0 # 关闭已有会话的全部主动迁移
-```
-
-生产文件中没有 `warmup-traffic-pacing`，且运行版本尚不支持，因此未开启。也没有 `anti-streak-limit`，按当前版本默认 `0`，反连击关闭；此前文档写“生产3”不准确。`rate-scale`、权重、养号曲线和成熟号限额未显式覆盖，使用程序默认值。
-
-未配置的 token 日预算默认 `0`，表示该项保护关闭，不代表没有消耗或订阅额度充足。以上是全局配置核查，不等于已读取每个账号的覆盖值及有效限额。
-
-### 本轮生产启用方案：需要发布并明确保存
-
-下方是候选启用配置，**不是已经生效的生产值**。用户已授权生产测试与调优；初值经过分批验证后，最终值及回读结果记录到验收报告。程序通用默认仍保持兼容，生产启用由显式环境配置承担。
-
-```yaml
-routing:
-  strategy: adaptive # 本策略使用adaptive
-  session-affinity: true # 保留会话粘性
-account-scheduling:
-  warmup-serving-reserve: 0.15 # 程序默认0；生产当前0.15。按合格新机会统计，不按全部请求占比
-  warmup-serving-max-binding-age-seconds: 0 # 明确保留关闭，不是漏配
-  warmup-serving-migration-token-budget: 0 # 明确保留主动迁移关闭；单位为滚动1小时重建token估算预算
+  warmup-serving-reserve: 0.50 # 已保存；50%的合格新机会参加预留，不是50%的全部请求
+  warmup-serving-max-binding-age-seconds: 0 # 保留关闭：不为养号强制轮换长主会话
+  warmup-serving-migration-token-budget: 0 # 保留主动迁移关闭，避免重建已有缓存
   warmup-traffic-pacing:
-    enabled: true # 候选生产开启值；程序默认false，不会随预留0.15自动开启
+    enabled: true # 生产已开启；程序通用默认仍为false
     request-burst: 8 # 最多积攒8次额度，含未发预约；不是并发8
     min-admission-requests: 4 # 接新独立会话前至少剩4次额度
     max-active-bindings: 1 # 每号近期活跃独立会话组上限
-    active-binding-idle-seconds: 300 # 空闲300秒释放组名额；不是prompt缓存TTL
+    active-binding-idle-seconds: 300 # 空闲300秒释放组名额，不是prompt缓存TTL
+debug: false # 验收临时开启后已恢复
+request-retry: 3 # 沿用生产原值
+max-retry-interval: 30 # 验收临时设0后已恢复
+# max-retry-credentials 未显式设置，有效值为2
+# anti-streak-limit 未显式设置，有效值为0（关闭）
 ```
+
+选择 `0.50` 是为了给每天仅少量新任务/独立子代理更多接入机会；防止短时集中消耗由配速、RPM、并发和日预算承担。`0.30`下3次明确fresh机会有1次入新号，`0.50`下1次入新号；样本不足以证明哪档概率全局最优，也不承诺每个新号每天必有流量。mock对比支持保留容量8/门槛4：门槛2可能不足三轮，容量12会扩大短时突发。本轮没有提高账号原有曲线或速率乘子。
+
+全局速率、权重、曲线和成熟号限额仍采用默认值；账号覆盖另行生效：APUS-01 `rate_scale=3`，有效135 RPM/并发12；AC-13为w1（200/日、3 RPM、并发1），AC-16自然升至w2（500/日、5 RPM、并发1），二者 `rate_scale=1`。升档效果不计为概率调优收益。
+
+反连击保留0，因为已有预留和配速承担本轮目标，没有证据支持再加一层改选；两项迁移参数保持0以保护既有缓存。各阶段token日预算仍为0（关闭），本轮样本不足以校准全天token预算；请求数保护已开启，不代表token消耗为0或账号不会风控。新建实例仍需显式配置，普通升级必须保留以上生产值。
 
 ### 其它常用参数：默认值和关闭含义
 
@@ -61,7 +54,7 @@ account-scheduling:
 max-retry-credentials: 2 # 顶层参数；缺省/0的有效值为2，-1才是遍历全池
 account-scheduling:
   rate-scale: 1.0 # 必须>0；默认不缩放，单账号rate_scale覆盖优先
-  anti-streak-limit: 0 # 默认关闭；3是此前建议的候选值，不是已核实的生产值
+  anti-streak-limit: 0 # 默认关闭；生产明确保留0
   tier-weights:
     claude:
       max-20x: 20 # YAML键用连字符；账号档位名max_20x用下划线
@@ -191,7 +184,7 @@ weight = tier 基础容量权重 x (1 - 额度利用率) x 新鲜度系数
 | **非 Claude 账号**（本调度器不打分的 provider） | 不做分级，行为等同现有 session-affinity。 |
 | **成熟且未打到软上限**（token bucket 仍允许放行） | 保持粘性，维持 prompt cache 连续性。 |
 | **成熟但已打到软上限**（视为接近风控硬阈值） | 打破粘性，在全池重新加权选择。 |
-| **仍在养号期、且池子里存在可用的成熟账号** | 打破粘性，改路由到成熟账号并重新绑定（后续轮次跟随该成熟账号）。 |
+| **仍在养号期、未受服务预留保护，且有可用成熟账号** | 打破粘性，改路由到成熟账号并重新绑定（后续轮次跟随该成熟账号）。 |
 | **仍在养号期、且池子里没有任何成熟账号可选** | 只要该养号账号本身仍可服务（未打满日预算/并发/token bucket），就保持粘性——避免在全养号池里无意义换号、白白丢 prompt cache。账号本身已不可服务时才跨全池重选。 |
 
 ### 降级行为
@@ -553,14 +546,14 @@ cpamp 账号页直接渲染 §2.5 的投影字段；运维这样读：
 
 ```yaml
 account-scheduling:
-  warmup-serving-reserve: 0 # 默认关；概率须0<=值<1，生产核查为0.15
+  warmup-serving-reserve: 0 # 默认关；概率须0<=值<1，生产已保存0.50
   warmup-serving-max-binding-age-seconds: 0 # 秒；不随续聊重置的年龄阈值，也控制缺服务观察周期；0关闭年龄兜底
   warmup-serving-migration-token-budget: 0 # 滚动1小时的输入缓存重建估算预算，非日预算；0关闭全部主动迁移
 ```
 
 正的年龄阈值还要求预留开启、迁移预算为正及安全资格满足，不能单独启用迁移。
 
-**防漏配**：复制通用`config.example.yaml`仍默认关闭；新建/恢复生产配置时必须核对三项的目标生产值及adaptive/会话粘性。已经保存的0.15不会仅因正常重启而丢失；部署也应保留原运行态配置，不能用模板里的0覆盖它。验收要读取实际配置，而不能仅凭示例文件或功能已部署判断启用。
+**防漏配**：复制通用`config.example.yaml`仍默认关闭；新建/恢复生产配置时必须核对三项的目标生产值及adaptive/会话粘性。已经保存的0.50不会仅因正常重启而丢失；部署也应保留原运行态配置，不能用模板里的0覆盖它。验收要读取实际配置，而不能仅凭示例文件或功能已部署判断启用。
 
 正的预留概率给合格的新会话和独立Claude子代理增加养号机会。养号号共享这份概率；它不是请求/token份额，也不保证小样本最低命中次数。有成熟退路的合格新机会，无论通过预留还是普通加权选中新号，都会获得连续服务保护。日志区分`reserve`、`weighted`、`migration`、`inherited`，普通加权不算预留命中。
 
@@ -627,7 +620,7 @@ account-scheduling:
 
 `reserve=0`关闭预留机会；若pacing仍开启，保留其会话身份、组、等待和借道状态。pacing关闭后恢复旧策略并保留必要账目供重开；只有两个开关都关闭才回到旧的完整关闭行为。生产启用必须明确保存配置，发布新代码本身不会开启该开关。
 
-匿名正文指纹（`msg:`及SDK派生身份）和冲突身份不能作为可复用节奏组；需要可靠会话身份或成熟号退路。自定义原生Claude SDK执行器必须实现`HTTPAttemptGateAware`并在每次发送时遵循attempt hook，否则开启pacing后拒绝养号执行。`warmup-pacing-sent`、`warmup-pacing-denied`和`warmup-pacing-settled`日志展示余额、分钟/日attempt、待结算token及估算/结算差，不记录请求正文或凭据。
+匿名正文指纹（`msg:`及SDK派生身份）和冲突身份不能作为可复用节奏组；需要可靠会话身份或成熟号退路。自定义原生Claude SDK执行器必须实现`HTTPAttemptGateAware`并在每次发送时遵循attempt hook，否则开启pacing后拒绝养号执行。`warmup-pacing-sent`、`warmup-pacing-denied`和`warmup-pacing-settled`记录发送/拒绝/结算事件，不记录请求正文或凭据。余额、分钟/日attempt及token字段是否显示取决于日志格式；本轮生产用sent事件与持久账本交叉核对，不能把未显示字段当零。
 
 ## 代码索引
 
