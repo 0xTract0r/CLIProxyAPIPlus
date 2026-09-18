@@ -2,53 +2,133 @@
 
 [English](adaptive-account-scheduling.md)
 
-> 实现对应 `openspec/changes/add-adaptive-account-scheduling`。config 字段定义已在
-> `core/config.example.yaml` 的 `account-scheduling` 段完整覆盖，本文不重复列出，只补充
-> 管理 API 的只读字段参考、运维说明及养号预留/流量节奏扩展（`add-warmup-serving-reserve`、`add-warmup-traffic-pacing`）。
-> 字段/行为已对照 2026-09 当前代码核实。代码/符号位置
-> 统一收敛在文末[代码索引](#代码索引)，不再逐句内联在每个论断后面。
+> 本文集中说明配置层级、默认值、生产核查状态、启用方式及管理 API 字段。旧的自适应调度、养号服务预留和新的流量配速都在这里；完整字段另见 `config.example.yaml`。代码入口收敛在文末[代码索引](#代码索引)。
 
 ## 运维速查
 
-常见运维任务与对应入口：
-
-| 我想… | 用什么 | 在哪 |
-| --- | --- | --- |
-| 启用自适应调度 | `routing.strategy: "adaptive"` | §1 |
-| 启用养号机会并核对生产值 | `warmup-serving-reserve`及迁移参数 | [养号服务预留](#养号服务预留) |
-| 读某号的订阅档 / 额度 / 养号态 | `GET /v0/management/auth-files` 的 `account_scheduling` 投影 | §2 |
-| 给某号钉死订阅档 | `tier_override`（端点或 auth JSON） | §3.1 / §3.5 |
-| 迁移老号 / 回填养号锚点 | `first_production_at`（端点回填） | §3.2 / §3.5 |
-| 慢速安全测试某号 | `rate_scale`（`< 1` 限速） | §3.4 / §3.5 |
-| 查某号为啥被减速 | `in_distress` / `warmup_health_stage_cap` / `warmup_last_distress_at`；对比 `warmup.stage` vs `warmup.age_days` | §3.6 / §3.7 |
-| 改运维覆盖（档位 / 速率 / 锚点） | `PATCH /v0/management/auth-files/account-scheduling` | §3.5 |
+- 修改配置：先看[推荐取值速查](#推荐取值速查)的完整层级。
+- 新会话机会：[养号服务预留](#养号服务预留)。
+- 请求节奏和接入余量：[养号流量节奏](#养号流量节奏)。
+- 订阅档、额度、养号态：§2；单账号覆盖：§3.1–§3.5；健康减速：§3.6–§3.7。
 
 ## 推荐取值速查
 
-> 这些推荐值原本埋在运维部署文档里，读参数时看不到；本节把它们提炼到参数专题，方便读参数
-> 时直接看到该配多少。**部署时配置的权威真源仍是 `docs/operations/deploy/remote-core-maintenance.md`**
-> （在 umbrella `cliproxy-stack` 仓库），本表只是速查，任何出入以那份文档为准。
+**代码默认值、生产已保存的值、待执行的启用方案是三件不同的事。合主、部署和开启功能也要分别确认。** 以下片段只合并到原配置对应位置，不要覆盖整份配置文件；修改示例不会自动改变生产。
 
-| 参数 | 默认值 | 推荐值 | 说明 |
-| --- | --- | --- | --- |
-| `account-scheduling.warmup-traffic-pacing.enabled` | `false` | 隔离验证后明确启用 | 独立于服务预留，见[养号流量节奏](#养号流量节奏)。 |
-| `account-scheduling.warmup-serving-reserve` | `0`（关） | `0.15`（本项目生产） | 多个养号号共享新机会概率，不是总流量上限；需明确保存才能启用。见[养号服务预留](#养号服务预留)。 |
-| `account-scheduling.warmup-serving-max-binding-age-seconds` | `0` | `0`（年龄兜底关闭） | 不随续聊重置的年龄，单位秒；仅设正值不会自动启用迁移。 |
-| `account-scheduling.warmup-serving-migration-token-budget` | `0` | `0`（主动迁移关闭） | 本进程滚动1小时输入重建估算预算，与账号每日token预算分开。 |
-| `account-scheduling.rate-scale` / per-account `rate_scale`（§3.4） | `1.0` | `1.0`（不缩放） | 有效限流乘子（缩放 rpm/burst/并发/日预算）。**没有"老号该设多少 / 新号该设多少"的场景化数字**——默认就是 `1.0`，只在对某个具体号做低风险慢速测时才把该号设 `< 1`，按需微调，别照抄一个固定数。必须 `> 0`。 |
-| `account-scheduling.anti-streak-limit`（反连击） | `0`（关） | **`3`**（生产） | 同一**养号号**连续被选 ≤ 该值即强制轮换到其它可用号。只作用于养号号（成熟号豁免）、缓存安全（不改长期 20:5:1 份额）；当池子里只有单个成熟号扛全部流量时基本空转（没有可轮换的养号号）。 |
-| `account-scheduling.warmup-curve[*].token-daily-budget`（养号号 token 日预算） | `0`（无界） | **`0` —— 待真流量校准** | 养号号 rolling-24h billable-token 硬闸。**具体正值尚未标定**：要先跑真流量灰度看清 burn 曲线再设，**不要直接拍一个数字**。成熟号的 `mature-limits.token-daily-budget` 恒 `0`（无界）。 |
-| `account-scheduling.tier-weights.claude` | `max_20x:20 / max_5x:5 / pro:1 / unknown:1` | 同默认（20:5:1） | 按 Claude 订阅档加权选号。 |
-| `max-retry-credentials`（顶层，非 `account-scheduling` 内） | `2` | `2` | 单个失败请求最多跨几个号 failover。`-1` = 逃生口（遍历全池，慎用）。 |
-| warmup 曲线（`warmup-curve` 各档 rpm / 并发 / 日预算） | 见档位表 | 见档位表 | 各养号档（cold / w1 / w2 / w3-4 / w5-6 / w7-8 / mature）的 rpm / 并发 / 日预算，见 §1「新号养号期渐进放量」引用的默认曲线，或 `docs/operations/deploy/remote-core-maintenance.md` 的 warmup 档位表——此处不重复数字。 |
+### 生产核查快照：2026-09-18
 
-诚实附注：
+只读核对了生产文件中的非敏感调度字段及 `/healthz` 版本头。生产 core 为 `28eef822`，尚未包含配速实现 `8a6a5796`。这是带日期的核查记录，不是实时运行态看板。下面是文件中显式保存的相关配置：
 
-- 上表都是**全局 config 文件旋钮**（远端 `config.yaml` 的 `account-scheduling` 段 + 顶层
-  `max-retry-credentials`），**设置页 UI 不可编辑**。设置页 UI 只暴露 per-account 的三项：
-  `tier`（订阅档，§3.1）、`rate_scale`（速率乘子，§3.4）、首投锚点 `first_production_at`（§3.2）。
-- **部署时配置的权威真源是 `docs/operations/deploy/remote-core-maintenance.md`**（在 umbrella
-  `cliproxy-stack` 仓库），本表是速查，取值以那份文档为准。
+```yaml
+routing:
+  strategy: adaptive
+  session-affinity: true
+account-scheduling:
+  warmup-serving-reserve: 0.15 # 已开启；15%的合格新机会参加养号预留抽签
+  warmup-serving-max-binding-age-seconds: 0 # 关闭绑定年龄兜底迁移
+  warmup-serving-migration-token-budget: 0 # 关闭已有会话的全部主动迁移
+```
+
+生产文件中没有 `warmup-traffic-pacing`，且运行版本尚不支持，因此未开启。也没有 `anti-streak-limit`，按当前版本默认 `0`，反连击关闭；此前文档写“生产3”不准确。`rate-scale`、权重、养号曲线和成熟号限额未显式覆盖，使用程序默认值。
+
+未配置的 token 日预算默认 `0`，表示该项保护关闭，不代表没有消耗或订阅额度充足。以上是全局配置核查，不等于已读取每个账号的覆盖值及有效限额。
+
+### 本轮生产启用方案：需要发布并明确保存
+
+下方是候选启用配置，**不是已经生效的生产值**。用户已授权生产测试与调优；初值经过分批验证后，最终值及回读结果记录到验收报告。程序通用默认仍保持兼容，生产启用由显式环境配置承担。
+
+```yaml
+routing:
+  strategy: adaptive # 本策略使用adaptive
+  session-affinity: true # 保留会话粘性
+account-scheduling:
+  warmup-serving-reserve: 0.15 # 程序默认0；生产当前0.15。按合格新机会统计，不按全部请求占比
+  warmup-serving-max-binding-age-seconds: 0 # 明确保留关闭，不是漏配
+  warmup-serving-migration-token-budget: 0 # 明确保留主动迁移关闭；单位为滚动1小时重建token估算预算
+  warmup-traffic-pacing:
+    enabled: true # 候选生产开启值；程序默认false，不会随预留0.15自动开启
+    request-burst: 8 # 最多积攒8次额度，含未发预约；不是并发8
+    min-admission-requests: 4 # 接新独立会话前至少剩4次额度
+    max-active-bindings: 1 # 每号近期活跃独立会话组上限
+    active-binding-idle-seconds: 300 # 空闲300秒释放组名额；不是prompt缓存TTL
+```
+
+### 其它常用参数：默认值和关闭含义
+
+这些参数与旧预留、新配速属于同一份配置。省略时使用默认值，但交付时仍要说明实际采用了什么；推荐值不能写成已生效值。
+
+```yaml
+max-retry-credentials: 2 # 顶层参数；缺省/0的有效值为2，-1才是遍历全池
+account-scheduling:
+  rate-scale: 1.0 # 必须>0；默认不缩放，单账号rate_scale覆盖优先
+  anti-streak-limit: 0 # 默认关闭；3是此前建议的候选值，不是已核实的生产值
+  tier-weights:
+    claude:
+      max-20x: 20 # YAML键用连字符；账号档位名max_20x用下划线
+      max-5x: 5
+      pro: 1
+      unknown: 1
+  health-gate:
+    enabled: true # 健康降档默认开启
+    failure-cluster-threshold: 3 # 观察窗口内失败阈值；0关闭该信号
+    backoff-level-threshold: 1 # 429退避层级阈值；0关闭该信号
+    observation-window-minutes: 30 # 失败观察窗口，单位分钟
+    demote-step: 1 # 每次降低的养号档位数
+    promote-cooldown-minutes: 30 # 恢复升档冷静期，单位分钟
+  mature-limits:
+    rpm-limit: 45
+    burst: 10
+    concurrency-limit: 4
+    token-daily-budget: 0 # 成熟号默认不设固定token日预算
+```
+
+养号号的 `token-daily-budget` 放在每个阶段下面。以下是**完整默认曲线**；只要配置 `warmup-curve` 列表，就会整体替换默认列表，不逐阶段合并。生产本次没有覆盖该列表。账号有效限额还受健康门控、档位和速率乘子影响。
+
+```yaml
+account-scheduling:
+  warmup-curve:
+  - name: w1
+    min-age-days: 0
+    max-age-days: 7
+    daily-budget: 200
+    rpm-limit: 3
+    concurrency-limit: 1
+    token-daily-budget: 0 # 0关闭token日预算；正值需按真实用量校准
+  - name: w2
+    min-age-days: 7
+    max-age-days: 14
+    daily-budget: 500
+    rpm-limit: 5
+    concurrency-limit: 1
+    token-daily-budget: 0 # 0关闭token日预算；正值需按真实用量校准
+  - name: w3-4
+    min-age-days: 14
+    max-age-days: 30
+    daily-budget: 2000
+    rpm-limit: 12
+    concurrency-limit: 2
+    token-daily-budget: 0 # 0关闭token日预算；正值需按真实用量校准
+  - name: w5-6
+    min-age-days: 30
+    max-age-days: 45
+    daily-budget: 4500
+    rpm-limit: 20
+    concurrency-limit: 2
+    token-daily-budget: 0 # 0关闭token日预算；正值需按真实用量校准
+  - name: w7-8
+    min-age-days: 45
+    max-age-days: 60
+    daily-budget: 6500
+    rpm-limit: 30
+    concurrency-limit: 3
+    token-daily-budget: 0 # 0关闭token日预算；正值需按真实用量校准
+```
+
+这些是全局 `config.yaml` 参数，设置页不能编辑。页面里的单账号 `tier`、`rate_scale`、`first_production_at` 属于另一层，见§3.5；全局 `rate-scale` 不等于账号 metadata 的 `account_scheduling.rate_scale`。运行态路径和发布操作见 umbrella 的 `docs/operations/deploy/remote-core-maintenance.md`。
+
+### 开启状态必须成为交付结果
+
+交付时报告生产版本、持久化配置和可验证的生效结果。对关闭或未设置项，逐项说明保留关闭的原因或启用安排，并在收尾前取得用户处置决定。已有启用/调优授权时按授权执行，不重复卡确认；没有答复不能当作同意。升级保留已确认的环境值，不能把模板的关闭值覆盖回生产。
 
 ## 1. 概述
 
@@ -469,28 +549,18 @@ cpamp 账号页直接渲染 §2.5 的投影字段；运维这样读：
 
 ## 养号服务预留
 
-
-三个参数都位于`account-scheduling`，代码默认值均为0。默认关闭是为了让未配置的新安装和已有部署升级时保持原调度；**缺省不等于自动采用生产推荐值**。
-
-| 参数 | 中文含义 | 默认值 | 本项目生产启用值 |
-| --- | --- | ---: | ---: |
-| `warmup-serving-reserve` | 新独立服务机会的养号预留概率，合法范围`0 <= 值 < 1` | 0（关闭） | 0.15 |
-| `warmup-serving-max-binding-age-seconds` | 不随续聊重置的绑定年龄阈值，单位秒；兼作持续缺服务观察周期 | 0（关闭年龄兜底） | 0 |
-| `warmup-serving-migration-token-budget` | 本进程滚动1小时内，已有会话迁移的输入缓存重建token估算预算 | 0（关闭全部主动迁移） | 0 |
-
-生产启用值是2026-09-15明确保存的环境配置，不是程序内置默认值。需要在新环境启用相同策略时，将下面字段合并到原配置对应段，不能用这一小段覆盖整个配置文件：
+三个参数均位于 `account-scheduling`。完整启用示例和生产核查见[推荐取值速查](#推荐取值速查)；以下是程序默认值及含义。
 
 ```yaml
-routing:
-  strategy: adaptive
-  session-affinity: true
 account-scheduling:
-  warmup-serving-reserve: 0.15                    # 开启15%新机会预留
-  warmup-serving-max-binding-age-seconds: 0      # 不启用年龄兜底迁移
-  warmup-serving-migration-token-budget: 0       # 不主动迁移已有长会话
+  warmup-serving-reserve: 0 # 默认关；概率须0<=值<1，生产核查为0.15
+  warmup-serving-max-binding-age-seconds: 0 # 秒；不随续聊重置的年龄阈值，也控制缺服务观察周期；0关闭年龄兜底
+  warmup-serving-migration-token-budget: 0 # 滚动1小时的输入缓存重建估算预算，非日预算；0关闭全部主动迁移
 ```
 
-**防漏配**：复制通用`config.example.yaml`仍默认关闭；新建/恢复生产配置时必须核对上面三项及adaptive/会话粘性。已经保存的0.15不会仅因正常重启而丢失；部署也应保留原运行态配置，不能用模板里的0覆盖它。验收要读取实际配置，而不能仅凭示例文件或功能已部署判断启用。
+正的年龄阈值还要求预留开启、迁移预算为正及安全资格满足，不能单独启用迁移。
+
+**防漏配**：复制通用`config.example.yaml`仍默认关闭；新建/恢复生产配置时必须核对三项的目标生产值及adaptive/会话粘性。已经保存的0.15不会仅因正常重启而丢失；部署也应保留原运行态配置，不能用模板里的0覆盖它。验收要读取实际配置，而不能仅凭示例文件或功能已部署判断启用。
 
 正的预留概率给合格的新会话和独立Claude子代理增加养号机会。养号号共享这份概率；它不是请求/token份额，也不保证小样本最低命中次数。有成熟退路的合格新机会，无论通过预留还是普通加权选中新号，都会获得连续服务保护。日志区分`reserve`、`weighted`、`migration`、`inherited`，普通加权不算预留命中。
 
@@ -533,13 +603,15 @@ account-scheduling:
 
 `account-scheduling.warmup-traffic-pacing`独立控制养号账号的发送节奏，默认关闭。它对原生Claude的adaptive链路生效（包括合格的纯Claude mixed池），不因`warmup-serving-reserve`为正而自动开启。
 
-| 参数 | 默认值 | 含义 |
-| --- | ---: | --- |
-| `enabled` | `false` | 开启新增节奏和接入约束 |
-| `request-burst` | `8` | 最多积攒8次发送额度；包含已预约未发部分，不是并发数 |
-| `min-admission-requests` | `4` | 接新独立会话时至少有4次额度 |
-| `max-active-bindings` | `1` | 每号同时接纳的近期活跃独立会话组数 |
-| `active-binding-idle-seconds` | `300` | 会话组空闲释放时长，独立于prompt缓存TTL |
+```yaml
+account-scheduling:
+  warmup-traffic-pacing:
+    enabled: false # 程序默认关闭；获准生产方案显式设为true
+    request-burst: 8 # 额度容量，包含已预约未发部分
+    min-admission-requests: 4 # 新独立会话的接入余量
+    max-active-bindings: 1 # 每号近期活跃独立会话组上限
+    active-binding-idle-seconds: 300 # 组空闲释放秒数，独立于缓存TTL
+```
 
 开启时整数须为正，接入门槛不能超过容量。首次没有账本时额度从0开始；按阶段的有效日请求预算连续补充。以200次/日为例，每7.2分钟补1次，达到接入门槛4需要约28.8分钟，空闲约57.6分钟可积攒到8。没有业务机会时不会主动生成请求，也不要求每天用满。
 
