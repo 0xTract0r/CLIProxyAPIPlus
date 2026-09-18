@@ -20,6 +20,7 @@ type SessionCache struct {
 	stopCh  chan struct{}
 	// Opt-in expiry markers prevent an expired binding from becoming an extra reserve draw.
 	servingExpired map[string]time.Time
+	onServingExit  func(string, sessionEntry)
 }
 
 // NewSessionCache creates a cache with the specified TTL.
@@ -93,6 +94,9 @@ func (c *SessionCache) Set(sessionID, authID string) {
 		return
 	}
 	c.mu.Lock()
+	if previous, exists := c.entries[sessionID]; exists && c.onServingExit != nil {
+		c.onServingExit(sessionID, previous)
+	}
 	c.entries[sessionID] = sessionEntry{
 		authID:    authID,
 		expiresAt: time.Now().Add(c.ttl),

@@ -24,6 +24,9 @@ type HTTPAttemptResult struct {
 
 // HTTPAttemptGate is optional and carries no auth-package dependency. Before
 // must return a fresh permit for each application-level HTTP attempt.
+// HTTPAttemptGateAware identifies executors that gate every actual HTTP attempt.
+type HTTPAttemptGateAware interface{ SupportsHTTPAttemptGate() bool }
+
 type HTTPAttemptGate interface {
 	Before(context.Context, HTTPAttemptInfo) (HTTPAttemptPermit, error)
 }

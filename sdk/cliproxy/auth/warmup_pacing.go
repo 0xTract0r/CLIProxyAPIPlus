@@ -76,14 +76,15 @@ type pacingRecord struct {
 }
 
 type pacingState struct {
-	Schema  int                         `json:"schema"`
-	Key     string                      `json:"key"`
-	Last    int64                       `json:"last"`
-	Balance float64                     `json:"balance"`
-	Limits  WarmupPacingLimits          `json:"limits"`
-	Next    uint64                      `json:"next"`
-	Records map[uint64]pacingRecord     `json:"records"`
-	Groups  map[string]map[string]int64 `json:"groups"`
+	Schema  int                          `json:"schema"`
+	Key     string                       `json:"key"`
+	Last    int64                        `json:"last"`
+	Balance float64                      `json:"balance"`
+	Limits  WarmupPacingLimits           `json:"limits"`
+	Next    uint64                       `json:"next"`
+	Records map[uint64]pacingRecord      `json:"records"`
+	Groups  map[string]map[string]int64  `json:"groups"`
+	Legacy  map[int64]pacingLegacyBucket `json:"legacy,omitempty"`
 }
 
 type pacingAccount struct {
@@ -138,6 +139,10 @@ func (l WarmupPacingLimits) validate() error {
 
 func clonePacingState(s pacingState) pacingState {
 	c := s
+	c.Legacy = make(map[int64]pacingLegacyBucket, len(s.Legacy))
+	for hour, bucket := range s.Legacy {
+		c.Legacy[hour] = bucket
+	}
 	c.Records = make(map[uint64]pacingRecord, len(s.Records))
 	for k, v := range s.Records {
 		c.Records[k] = v
@@ -198,6 +203,9 @@ func validatePacingState(s pacingState, key string) error {
 	if s.Schema != warmupPacingSchema || s.Key != key || s.Last <= 0 || math.IsNaN(s.Balance) || math.IsInf(s.Balance, 0) || s.Balance < 0 || s.Records == nil || s.Groups == nil || len(s.Records) > warmupPacingMaxAttempts || len(s.Groups) > warmupPacingMaxBindings {
 		return errors.New("invalid warmup pacing schema or state bounds")
 	}
+	if err := validatePacingLegacy(s); err != nil {
+		return err
+	}
 	storedLimits := s.Limits
 	storedLimits.Config.Enabled = true
 	if err := storedLimits.validate(); err != nil {
@@ -256,6 +264,11 @@ func (p *WarmupPacer) advance(a *pacingAccount, s *pacingState, at int64) {
 		s.Balance = math.Min(pacingAvailableCapacity(a, s, 0), s.Balance+float64(at-s.Last)/float64(time.Second)*float64(s.Limits.DailyRequests)/86400)
 	}
 	s.Last = at
+	for hour := range s.Legacy {
+		if pacingLegacyExpiry(hour) <= at {
+			delete(s.Legacy, hour)
+		}
+	}
 	for id, r := range s.Records {
 		if a.live[id] == nil && r.At <= at-int64(24*time.Hour) {
 			delete(s.Records, id)
@@ -420,6 +433,18 @@ func (p *WarmupPacer) decision(a *pacingAccount, s pacingState, req WarmupPacing
 			if minuteExpiry == 0 || r.At < minuteExpiry {
 				minuteExpiry = r.At
 			}
+		}
+	}
+	for hour, bucket := range s.Legacy {
+		if pacingLegacyExpiry(hour) <= s.Last {
+			continue
+		}
+		d.DayRequests = int(pacingAdd(int64(d.DayRequests), bucket.Requests))
+		d.Tokens = pacingAdd(d.Tokens, bucket.Tokens)
+		unknownHistory = unknownHistory || bucket.UnknownTokens
+		at := pacingLegacyExpiry(hour) - int64(24*time.Hour)
+		if bucket.Requests > 0 && (dayExpiry == 0 || at < dayExpiry) {
+			dayExpiry = at
 		}
 	}
 	d.ActiveGroups = len(groups)

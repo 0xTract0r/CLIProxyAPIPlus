@@ -349,6 +349,14 @@ routing:
 #   # Zero disables all proactive migration, including idle and context-reset windows.
 #   # 默认0=关闭所有已有会话主动迁移，包括空闲和上下文重建窗口。
 #   warmup-serving-migration-token-budget: 0
+#   # Independent pacing: defaults off; 200/day refills 4 admission credits in 28.8 minutes.
+#   # 独立养号配速，默认关闭；200次/日时首次积攒4次接入额度约需28.8分钟。
+#   warmup-traffic-pacing:
+#     enabled: false
+#     request-burst: 8
+#     min-admission-requests: 4
+#     max-active-bindings: 1
+#     active-binding-idle-seconds: 300
 #   # Health-gated warm-up ramp (ANCHOR-Q4, design.md §10). Warm-up promotion
 #   # depends on account health, not calendar age alone: an account showing an
 #   # early risk-control signal (a recent failure cluster, or an escalated 429

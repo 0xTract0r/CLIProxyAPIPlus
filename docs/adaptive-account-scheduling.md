@@ -6,7 +6,7 @@
 > are already fully covered in the `account-scheduling` section of
 > `core/config.example.yaml` and are not repeated here; this document only adds the
 > management API read-only field reference, operational notes and the serving-reserve
-> extension (`add-warmup-serving-reserve`). Fields/behavior have
+> extensions (`add-warmup-serving-reserve`, `add-warmup-traffic-pacing`). Fields/behavior have
 > been verified against the current code as of 2026-09. Code/symbol locations are
 > consolidated in the [Code index](#code-index) at the end, not inlined after each claim.
 
@@ -17,6 +17,7 @@ Common operator tasks and where each one lives:
 | I want to… | Use | Where |
 | --- | --- | --- |
 | Turn adaptive scheduling on | `routing.strategy: "adaptive"` | §1 |
+| Bound warming send bursts and admission | `warmup-traffic-pacing` | [Traffic pacing](#warm-up-traffic-pacing) |
 | Enable warming opportunities and check production values | `warmup-serving-reserve` and migration controls | [Serving reserve](#opt-in-warm-up-serving-reserve) |
 | Read an account's tier / quota / warm-up state | `GET /v0/management/auth-files` → the `account_scheduling` projection | §2 |
 | Pin a subscription tier on one account | `tier_override` (endpoint or auth JSON) | §3.1 / §3.5 |
@@ -36,6 +37,7 @@ Common operator tasks and where each one lives:
 
 | Parameter | Default | Recommended | Notes |
 | --- | --- | --- | --- |
+| `account-scheduling.warmup-traffic-pacing.enabled` | `false` | Explicit opt-in after isolated validation | Independent of serving reserve; see [Traffic pacing](#warm-up-traffic-pacing). |
 | `account-scheduling.warmup-serving-reserve` | `0` (off) | `0.15` (this production profile) | Shared new-opportunity probability, not a total traffic cap; explicitly persist it to enable. See [Serving reserve](#opt-in-warm-up-serving-reserve). |
 | `account-scheduling.warmup-serving-max-binding-age-seconds` | `0` | `0` (age fallback off) | Non-renewing age in seconds; a positive value alone does not enable migration. |
 | `account-scheduling.warmup-serving-migration-token-budget` | `0` | `0` (proactive migration off) | Per-process rolling-hour estimated input reconstruction budget, separate from daily account tokens. |
@@ -599,9 +601,37 @@ With reserve enabled and a positive migration budget, **existing bindings** can 
 
 The migration budget is an **estimate** of input reconstruction tokens, not an account's daily token budget; rolling-hour credit is reserved atomically before selection. Opaque/media input, insufficient budget, no underserved target or an in-flight source suppresses migration. The source check is an instantaneous account-level observation, not a distributed session lock. A cached assistant prefix followed by an uncached user task also suppresses migration to protect the observed compaction request shape; this is deliberately broader than compaction and does not identify every implementation.
 
-Unknown cache TTLs conservatively use one hour. Idle reassessment needs a surviving session binding, so the affinity TTL should exceed the cache TTL. Expired bindings retain a bounded one-hour marker that suppresses an additional reserve lottery and uses ordinary reselection. Cache entries/markers are capped at 4096, migration charges are likewise bounded, and no new persistence store is introduced.
+Unknown cache TTLs conservatively use one hour. Idle reassessment needs a surviving session binding, so the affinity TTL should exceed the cache TTL. Expired bindings retain a bounded one-hour marker that suppresses an additional reserve lottery and uses ordinary reselection. Cache entries/markers are capped at 4096, migration charges are likewise bounded, and serving reserve alone introduces no persistence store; independent pacing uses the sidecar described below.
 
-Setting reserve to zero clears child bindings, pins and reserve/migration state when configuration is committed, even if no request arrives during the disabled interval. Ordinary root bindings and legacy D5 remain. Invalidated, expired and disabled child segments retain bounded no-redraw markers; repeated clearing does not renew them. Count or other-provider traffic does not clear Claude bindings. Single-account/all-warming pools retain ordinary selection, with opt-in warming executions still subject to pre-send admission. All-day budget distribution and general hard traffic pacing remain a separate, unimplemented change.
+Setting reserve to zero stops reserve opportunities. When pacing remains enabled, keep its identities, groups, waiting and overlap protection. Turning both controls off clears child bindings, pins and migration state on config commit; ordinary root bindings and legacy D5 remain. Invalidation/expiry markers still suppress extra reserve draws without renewal. Count and other-provider traffic do not clear Claude state. Independent hard traffic pacing is described below.
+
+## Warm-up traffic pacing
+
+`account-scheduling.warmup-traffic-pacing` independently controls warming-account send cadence and defaults to disabled. It applies to the native adaptive Claude path, including eligible Claude-only mixed pools. A positive serving reserve does not enable pacing.
+
+| Field | Default | Meaning |
+| --- | ---: | --- |
+| `enabled` | `false` | Enable the additional pacing and admission constraints |
+| `request-burst` | `8` | Maximum stored send credits, including unsent reservations; not concurrency |
+| `min-admission-requests` | `4` | Minimum credits to admit a new independent conversation |
+| `max-active-bindings` | `1` | Maximum recently active independent conversation groups per account |
+| `active-binding-idle-seconds` | `300` | Group inactivity expiry, independent of prompt-cache TTL |
+
+When enabled, integer limits must be positive and the admission minimum cannot exceed capacity. A new ledger starts at zero. Credits refill continuously at the effective daily request budget divided by 86400 seconds. At 200 requests/day, one credit takes 7.2 minutes, admission at four takes about 28.8 minutes, and eight idle credits take about 57.6 minutes. The service does not generate traffic to fill a quota.
+
+Admitted conversations prefer their current account, but every send still observes credit, rolling-60-second and rolling-24-hour budgets, concurrency and health. Temporary RPM/concurrency pressure uses the existing request-total 30-second wait. Overlap can borrow a mature account without replacing the primary binding. Long-term credit/budget/admission exhaustion uses a stable mature handoff; recovering one credit does not reclaim that conversation. Without an eligible fallback, return retryable capacity pressure.
+
+Fresh children use independent groups; reliable parent-affine fork/unknown children share the known parent group while still spending per-account allowance. Releasing one parent/child/alias membership does not free another active member. CountTokens consumes request/concurrency allowance without creating or renewing groups or stamping first production; input estimation is not generation usage.
+
+Each explicit HTTP retry is separately admitted. Unsent cancellation refunds its reservation; sent failures and disconnected streams remain counted. Positive token budgets include a conservative estimate of the final request, and only complete terminal usage permits reconciliation refunds. Scheduler accounting excludes cache reads and retains cache writes. A zero token budget leaves that protection disabled and provides no subscription-quota safety guarantee.
+
+Independent `.pacing` files live in the durable auth directory and do not depend on usage-reporting enablement. Known previous consumption is combined with new attempts; earlier in-flight work cannot let the new policy spend the same remaining allowance. Restart preserves debits while releasing dead-process concurrency. Corrupt state or pre-send save failure blocks warming sends. A post-send settlement failure preserves the current response, emits a diagnostic and blocks later sends for that account. Deleting the ledger is not a quota-recovery procedure.
+
+Legacy usage lacks a trustworthy completeness marker. Unknown history can block a positive token budget until its conservative window expires; legacy hourly aggregates may remain until 24 hours after that hour ends. Ambiguous cross-file crash recovery can overcount conservatively and is not exactly-once accounting. Protection is per instance; independent instances cannot safely spend separate local allowances for the same account.
+
+Setting reserve to zero stops reserve opportunities. While pacing remains enabled, retain the identities, groups, waiting and overlap state it needs. Disabling pacing restores the legacy policy while retaining accounting for re-enable; disabling both controls restores the complete legacy-off behavior. Persist an explicit enabled configuration when rolling out: deploying code alone does not enable pacing.
+
+Anonymous content fingerprints (`msg:` / SDK-derived identities) and conflicting identities are not reusable pacing groups; use a reliable session identity or a mature fallback. Custom native-Claude SDK executors must implement `HTTPAttemptGateAware` and honor the attempt hook on every send; otherwise warming execution fails closed when pacing is enabled. Logs `warmup-pacing-sent`, `warmup-pacing-denied` and `warmup-pacing-settled` expose balances, minute/day attempts, pending tokens and estimate/settlement differences without request bodies or credentials.
 
 ## Code index
 
@@ -610,6 +640,10 @@ of 2026-09):
 
 | Mechanism / field | Code location |
 | --- | --- |
+| Durable pacing, hourly history bridge and sidecar | `sdk/cliproxy/auth/warmup_pacing.go`, `warmup_pacing_history.go`, `warmup_pacing_store.go` |
+| Manager-owned pacing, executor lifecycle and final send admission | `sdk/cliproxy/auth/warmup_pacing_manager.go`, `warmup_pacing_calls.go`, `warmup_pacing_execution.go` |
+| Selector pacing and group membership | `sdk/cliproxy/auth/warmup_pacing_selector.go` |
+| Claude HTTP attempt hook / terminal usage observer | `sdk/cliproxy/executor/http_attempt.go`, `internal/runtime/executor/helps/claude_attempt*.go` |
 | Selection weighting (`AccountSelectionWeight`) | `sdk/cliproxy/auth/account_weight.go` |
 | Opt-in service reserve, child identity and migration | `sdk/cliproxy/auth/warmup_serving.go` |
 | Auxiliary notices and full-task fingerprints | `sdk/cliproxy/auth/warmup_serving_auxiliary.go`, `warmup_serving_task.go` |
