@@ -35,7 +35,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 
 	reporter := helps.NewExecutorUsageReporter(ctx, e, baseModel, auth)
 	reporter.UseDecodedContentTelemetry()
-	defer reporter.TrackFailure(ctx, &err)
+	defer helps.TrackClaudeAttemptFailure(ctx, reporter, &err)
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("claude")
 	originalPayloadSource := req.Payload
@@ -161,8 +161,18 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	httpResp, err := doClaudeHTTPWithTransportRetry(ctx, httpClient, httpReq)
 	if err != nil {
 		recordAPIResponseError(ctx, e.cfg, err)
+		if cliproxyexecutor.IsHTTPAttemptGateError(err) {
+			return nil, err
+		}
 		return nil, claudeUpstreamTransportError(err)
 	}
+	attempt := helps.ClaimClaudeAttemptResponse(httpResp)
+	transferred := false
+	defer func() {
+		if !transferred {
+			attempt.Abandon()
+		}
+	}()
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		// Decompress error responses — pass the Content-Encoding value (may be empty)
@@ -175,6 +185,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			logWithRequestID(ctx).Warn(msg)
 			return nil, newClaudeStatusErr(httpResp.StatusCode, []byte(msg), httpResp.Header, time.Now())
 		}
+		errBody = attempt.ObserveDecoded(errBody)
 		b, readErr := io.ReadAll(errBody)
 		if readErr != nil {
 			helps.RecordAPIResponseError(ctx, e.cfg, readErr)
@@ -198,6 +209,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		}
 		return nil, err
 	}
+	decodedBody = attempt.ObserveDecoded(decodedBody)
 	out := make(chan cliproxyexecutor.StreamChunk)
 	go func() {
 		defer close(out)
@@ -333,6 +345,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			}
 		}
 	}()
+	transferred = true
 	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
 }
 

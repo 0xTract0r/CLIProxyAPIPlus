@@ -31,7 +31,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	}
 
 	reporter := helps.NewExecutorUsageReporter(ctx, e, baseModel, auth)
-	defer reporter.TrackFailure(ctx, &err)
+	defer helps.TrackClaudeAttemptFailure(ctx, reporter, &err)
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("claude")
 	// Use streaming translation to preserve function calling, except for claude.
@@ -166,8 +166,13 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	httpResp, err := doClaudeHTTPWithTransportRetry(ctx, httpClient, httpReq)
 	if err != nil {
 		recordAPIResponseError(ctx, e.cfg, err)
+		if cliproxyexecutor.IsHTTPAttemptGateError(err) {
+			return resp, err
+		}
 		return resp, claudeUpstreamTransportError(err)
 	}
+	attempt := helps.ClaimClaudeAttemptResponse(httpResp)
+	defer attempt.Abandon()
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		// Decompress error responses — pass the Content-Encoding value (may be empty)
@@ -180,6 +185,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 			logWithRequestID(ctx).Warn(msg)
 			return resp, newClaudeStatusErr(httpResp.StatusCode, []byte(msg), httpResp.Header, time.Now())
 		}
+		errBody = attempt.ObserveDecoded(errBody)
 		b, readErr := io.ReadAll(errBody)
 		if readErr != nil {
 			helps.RecordAPIResponseError(ctx, e.cfg, readErr)
@@ -203,6 +209,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		}
 		return resp, err
 	}
+	decodedBody = attempt.ObserveDecoded(decodedBody)
 	defer func() {
 		if errClose := decodedBody.Close(); errClose != nil {
 			log.Errorf("response body close error: %v", errClose)
