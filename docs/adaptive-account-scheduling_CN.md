@@ -17,7 +17,7 @@
 
 ### 生产已启用：2026-09-19 回读
 
-生产 core 为 `951e1bba`，已部署并明确保存以下值。真实 Claude CLI 完成48条调用，AC-13为3次、AC-16为6次，两个新号均保持同child并读取缓存；另有1条成熟号进度请求被CLI取消，未计作成功。此处是带日期的验收快照，不是实时看板。完整证据见 umbrella 的 `docs/operations/verification/warmup-traffic-pacing-2026-09-18.md`。
+生产 core 为 `951e1bba`，已部署并明确保存以下值。真实 Claude CLI 共发起48条调用，其中47条完整成功、1条成熟号进度请求被CLI取消。AC-13为3次、AC-16为6次，两个新号均保持同child并读取缓存。此处是带日期的验收快照，不是实时看板。完整证据见 umbrella 的 `docs/operations/verification/warmup-traffic-pacing-2026-09-18.md`。
 
 ```yaml
 routing:
