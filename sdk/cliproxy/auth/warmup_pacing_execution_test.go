@@ -581,6 +581,16 @@ func TestWarmupPacingExecutionStreamLifetimes(t *testing.T) {
 			}
 			for i := 0; i < 2; i++ {
 				release := make(chan struct{})
+				settlementReady := make(chan struct{})
+				allowSettlement := make(chan struct{})
+				settlementDone := make(chan struct{})
+				executorStarted := make(chan struct{})
+				var settlementErr error
+				var allowOnce sync.Once
+				allowFinish := func() { allowOnce.Do(func() { close(allowSettlement) }) }
+				if mode != "cancel" {
+					allowFinish()
+				}
 				e.stream = func(ctx context.Context, _ *Auth, r cliproxyexecutor.Request, _ cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
 					var permit cliproxyexecutor.HTTPAttemptPermit
 					if gate := cliproxyexecutor.HTTPAttemptGateFromContext(ctx); gate != nil {
@@ -595,6 +605,7 @@ func TestWarmupPacingExecutionStreamLifetimes(t *testing.T) {
 						}
 					}
 					e.sends.Add(1)
+					close(executorStarted)
 					ch := make(chan cliproxyexecutor.StreamChunk, 1)
 					ch <- cliproxyexecutor.StreamChunk{Payload: []byte("data: synthetic\n\n")}
 					go func() {
@@ -604,15 +615,32 @@ func TestWarmupPacingExecutionStreamLifetimes(t *testing.T) {
 						case <-ctx.Done():
 							complete = false
 						}
+						close(settlementReady)
+						<-allowSettlement
 						if permit != nil {
-							_ = permit.Finish(ctx, cliproxyexecutor.HTTPAttemptResult{Complete: complete})
+							settlementErr = permit.Finish(ctx, cliproxyexecutor.HTTPAttemptResult{Complete: complete})
 						}
 						close(ch)
+						close(settlementDone)
 					}()
 					return &cliproxyexecutor.StreamResult{Chunks: ch}, nil
 				}
 				opts := servingOptions("stream-lifetime-root", "", "system", "Review a streaming implementation.")
+				var stream *cliproxyexecutor.StreamResult
 				ctx, cancel := context.WithCancel(context.Background())
+				defer func() {
+					cancel()
+					allowFinish()
+					if stream != nil {
+						for range stream.Chunks {
+						}
+					}
+					select {
+					case <-executorStarted:
+						<-settlementDone
+					default:
+					}
+				}()
 				stream, err := m.ExecuteStream(ctx, []string{"claude"}, cliproxyexecutor.Request{Model: model, Payload: opts.OriginalRequest}, opts)
 				if err != nil {
 					cancel()
@@ -639,6 +667,21 @@ func TestWarmupPacingExecutionStreamLifetimes(t *testing.T) {
 				m.pacingMu.Unlock()
 				if active != 0 || s.gate.InFlight(a.ID) != 0 {
 					t.Fatalf("completed stream retained lifetime: calls=%d gate=%d", active, s.gate.InFlight(a.ID))
+				}
+				// Client cancellation closes the forwarding stream independently of
+				// the executor's asynchronous durable settlement. Hold that
+				// settlement to verify admission remains closed in the gap.
+				if mode == "cancel" {
+					<-settlementReady
+					pending, pendingErr := m.pacing.pacer.PeekConfigured(a.ID, WarmupPacingRequest{CountOnly: true, EstimateKnown: true})
+					if pendingErr != nil || pending.InFlight != 1 || pending.Allowed {
+						t.Fatal("unsettled cancellation prematurely released admission", pending, pendingErr)
+					}
+				}
+				allowFinish()
+				<-settlementDone
+				if settlementErr != nil {
+					t.Fatal("executor settlement failed", settlementErr)
 				}
 				d, err := m.pacing.pacer.PeekConfigured(a.ID, WarmupPacingRequest{CountOnly: true, EstimateKnown: true})
 				if err != nil || d.InFlight != 0 {
