@@ -44,3 +44,27 @@ func TestCodexFastContextAttributionAndVisibleEvents(t *testing.T) {
 		t.Fatalf("telemetry=%+v", result.Telemetry)
 	}
 }
+
+func TestCodexVisibleCoverageCustomRefusalAndUnknownOutput(t *testing.T) {
+	for _, kind := range []string{"response.custom_tool_call_input.delta", "response.refusal.delta"} {
+		r := NewUsageReporter(context.Background(), "codex", "main", nil)
+		r.SetCodexFastContext([]byte(`{}`), []byte(`{}`), false)
+		r.ObserveContentEvent([]byte(`{"type":"response.output_text.delta","delta":"text"}`))
+		r.ObserveContentEvent([]byte(`{"type":"` + kind + `","delta":"tool-or-refusal"}`))
+		if *r.telemetry.VisibleContentEvents != 2 || !r.telemetry.VisibleContentObserved {
+			t.Fatalf("coverage=%+v", r.telemetry)
+		}
+		auxiliary := r.buildRecordForModel("image-tool", usage.Detail{}, false, usage.Failure{}).Telemetry
+		if auxiliary.FastContext != nil || auxiliary.VisibleContentObserved || auxiliary.FirstVisibleContentMS != nil {
+			t.Fatal("auxiliary model borrowed main timing")
+		}
+	}
+	for _, payload := range []string{`{"type":"response.unknown.delta","delta":"unclassified"}`, `{"type":"response.completed","response":{"output":[{"type":"image_generation_call"}]}}`, `{"type":"response.completed","response":{"output":[{"type":"message","content":[{"type":"audio"}]}]}}`} {
+		r := NewUsageReporter(context.Background(), "codex", "main", nil)
+		r.SetCodexFastContext([]byte(`{}`), []byte(`{}`), false)
+		r.ObserveContentEvent([]byte(payload))
+		if r.telemetry.VisibleContentObserved {
+			t.Fatal("unknown output reported complete visibility")
+		}
+	}
+}

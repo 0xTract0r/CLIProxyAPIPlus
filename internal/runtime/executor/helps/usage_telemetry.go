@@ -162,6 +162,7 @@ func (r *UsageReporter) ObserveContentEvent(payload []byte) {
 	content := false
 	visible := false
 	subset := false
+	unsupportedVisible := false
 	recognized := done
 	finish := ""
 	if !done {
@@ -170,6 +171,13 @@ func (r *UsageReporter) ObserveContentEvent(payload []byte) {
 		}
 		root := gjson.ParseBytes(payload)
 		kind := root.Get("type").String()
+		switch kind {
+		case "response.custom_tool_call_input.delta", "response.refusal.delta":
+			visible = root.Get("delta").String() != ""
+		case "response.output_text.delta", "response.function_call_arguments.delta", "response.reasoning_text.delta", "response.reasoning_summary_text.delta":
+		default:
+			unsupportedVisible = strings.HasSuffix(kind, ".delta")
+		}
 		switch kind {
 		case "response.output_text.delta", "response.reasoning_text.delta", "response.reasoning_summary_text.delta", "response.function_call_arguments.delta":
 			recognized = true
@@ -186,6 +194,19 @@ func (r *UsageReporter) ObserveContentEvent(payload []byte) {
 			finish = "completed"
 			output, reasoning := root.Get("response.usage.output_tokens"), root.Get("response.usage.output_tokens_details.reasoning_tokens")
 			subset = output.Type == gjson.Number && reasoning.Type == gjson.Number && reasoning.Int() >= 0 && output.Int() >= reasoning.Int()
+			for _, item := range root.Get("response.output").Array() {
+				switch item.Get("type").String() {
+				case "reasoning", "function_call", "custom_tool_call":
+				case "message":
+					for _, part := range item.Get("content").Array() {
+						if typ := part.Get("type").String(); typ != "output_text" && typ != "refusal" {
+							unsupportedVisible = true
+						}
+					}
+				default:
+					unsupportedVisible = true
+				}
+			}
 		case "response.failed":
 			finish = "failed"
 		case "response.incomplete":
@@ -211,6 +232,12 @@ func (r *UsageReporter) ObserveContentEvent(payload []byte) {
 	defer r.telemetryMu.Unlock()
 	t := &r.telemetry
 	if t.Version >= 2 {
+		if unsupportedVisible {
+			t.VisibleContentObserved = false
+		}
+		if visible {
+			recognized = true
+		}
 		if subset {
 			t.OutputReasoningSubset = true
 		}
