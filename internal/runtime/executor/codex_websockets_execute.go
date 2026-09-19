@@ -193,10 +193,16 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		}()
 	}
 
+	mainResponseCompleted := false
 	var readCh chan codexWebsocketRead
 	if sess != nil {
 		readCh = sess.activate(conn)
 		defer func() {
+			// An unread main response can outlive cancellation. Do not let the
+			// next fast prewarm consume its tail as its own completion.
+			if fastEnabled && !mainResponseCompleted {
+				e.invalidateUpstreamConn(sess, conn, "fast_turn_incomplete", err)
+			}
 			sess.clearActive(conn, readCh)
 		}()
 	}
@@ -354,6 +360,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		case "response.output_item.done":
 			collectCodexOutputItemDone(payload, outputItemsByIndex, &outputItemsFallback)
 		case "response.completed":
+			mainResponseCompleted = true
 			payload = patchCodexCompletedOutput(payload, outputItemsByIndex, outputItemsFallback)
 			cacheCodexReasoningReplayFromCompleted(replayScope, payload)
 			if detail, ok := helps.ParseCodexUsage(payload); ok {

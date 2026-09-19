@@ -306,10 +306,16 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	go func() {
 		terminateReason := "completed"
 		var terminateErr error
+		mainResponseCompleted := false
 
 		defer close(out)
 		defer func() {
 			if sess != nil {
+				// Clearing the consumer alone leaves upstream generation running.
+				// Discard that connection before another turn can activate it.
+				if fastEnabled && !mainResponseCompleted {
+					e.invalidateUpstreamConn(sess, conn, "fast_turn_incomplete", terminateErr)
+				}
 				sess.clearActive(conn, readCh)
 				unlockStreamSession()
 				return
@@ -431,6 +437,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			}
 			completedPayload := payload
 			if eventType == "response.completed" || eventType == "response.done" {
+				mainResponseCompleted = true
 				completedPayload = normalizeCodexWebsocketCompletion(completedPayload)
 				completedPayload = patchCodexCompletedOutput(completedPayload, outputItemsByIndex, outputItemsFallback)
 				cacheCodexReasoningReplayFromCompleted(replayScope, completedPayload)
