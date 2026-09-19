@@ -926,3 +926,14 @@ func waitForUsageFile(t *testing.T, path string) {
 
 	t.Fatalf("timed out waiting for persisted usage snapshot at %s", path)
 }
+
+func TestFastImpactHistoricalTelemetryContract(t *testing.T) {
+	stats := NewRequestStatistics()
+	enabled := true
+	first := int64(1200)
+	stats.Record(context.Background(), coreusage.Record{APIKey: "test", Model: "gpt-test", ServiceTier: "default", ReasoningEffort: "high", TTFT: 300 * time.Millisecond, Telemetry: &coreusage.Telemetry{Version: 2, AttemptID: "attempt-fast", FastContext: &coreusage.FastContext{SchemaVersion: 1, UpstreamRequestServiceTier: "priority", ServerFastEnabled: &enabled, TierSource: "account", RequestKind: "serving"}, FirstVisibleContentMS: &first}, Detail: coreusage.Detail{InputTokens: 20, OutputTokens: 200, TotalTokens: 220}})
+	detail := stats.Snapshot().APIs["test"].Models["gpt-test"].Details[0]
+	if detail.ServiceTier != "default" || detail.ReasoningEffort != "high" || detail.TTFTMs != 300 || detail.Telemetry.Version != 2 || detail.Telemetry.FastContext.UpstreamRequestServiceTier != "priority" || *detail.Telemetry.FirstVisibleContentMS != 1200 {
+		t.Fatalf("historical provenance=%+v", detail)
+	}
+}

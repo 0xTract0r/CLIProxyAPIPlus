@@ -105,6 +105,9 @@ func (r *UsageReporter) bodyObserver(resp *http.Response) func([]byte) {
 		return nil
 	}
 	if !strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
+		r.telemetryMu.Lock()
+		r.telemetry.VisibleContentObserved = false
+		r.telemetryMu.Unlock()
 		return nil
 	}
 	r.telemetryMu.Lock()
@@ -130,6 +133,7 @@ func (r *UsageReporter) bodyObserver(resp *http.Response) func([]byte) {
 				line = nil
 				r.telemetryMu.Lock()
 				r.telemetry.ObservationKind = "content_observation_truncated"
+				r.telemetry.VisibleContentObserved = false
 				r.telemetryMu.Unlock()
 				return
 			}
@@ -156,6 +160,8 @@ func (r *UsageReporter) ObserveContentEvent(payload []byte) {
 	r.observeFirstBody()
 	done := bytes.Equal(payload, []byte("[DONE]"))
 	content := false
+	visible := false
+	subset := false
 	recognized := done
 	finish := ""
 	if !done {
@@ -168,6 +174,7 @@ func (r *UsageReporter) ObserveContentEvent(payload []byte) {
 		case "response.output_text.delta", "response.reasoning_text.delta", "response.reasoning_summary_text.delta", "response.function_call_arguments.delta":
 			recognized = true
 			content = root.Get("delta").String() != ""
+			visible = content && (kind == "response.output_text.delta" || kind == "response.function_call_arguments.delta")
 		case "content_block_delta":
 			recognized = true
 			for _, p := range []string{"delta.text", "delta.thinking", "delta.partial_json"} {
@@ -177,6 +184,8 @@ func (r *UsageReporter) ObserveContentEvent(payload []byte) {
 			recognized = true
 			done = true
 			finish = "completed"
+			output, reasoning := root.Get("response.usage.output_tokens"), root.Get("response.usage.output_tokens_details.reasoning_tokens")
+			subset = output.Type == gjson.Number && reasoning.Type == gjson.Number && reasoning.Int() >= 0 && output.Int() >= reasoning.Int()
 		case "response.failed":
 			finish = "failed"
 		case "response.incomplete":
@@ -201,6 +210,20 @@ func (r *UsageReporter) ObserveContentEvent(payload []byte) {
 	r.telemetryMu.Lock()
 	defer r.telemetryMu.Unlock()
 	t := &r.telemetry
+	if t.Version >= 2 {
+		if subset {
+			t.OutputReasoningSubset = true
+		}
+		if visible {
+			now := r.offset()
+			if t.FirstVisibleContentMS == nil {
+				t.FirstVisibleContentMS = intPtr(now)
+				t.VisibleContentEvents = intPtr(0)
+			}
+			*t.VisibleContentEvents++
+			t.LastVisibleContentMS = intPtr(now)
+		}
+	}
 	if recognized && t.ObservationKind != "content_observation_truncated" {
 		t.ObservationKind = "protocol_content_events"
 	}
@@ -262,6 +285,9 @@ func (r *UsageReporter) telemetrySnapshot(failed bool, fail usage.Failure) *usag
 	r.telemetryMu.Lock()
 	defer r.telemetryMu.Unlock()
 	t := r.telemetry
+	if t.VisibleContentEvents != nil {
+		t.VisibleContentEvents = intPtr(*t.VisibleContentEvents)
+	}
 	t.EndedAtMS = time.Now().UnixMilli()
 	t.ObservedStages = append([]string(nil), t.ObservedStages...)
 	// JSON round trips are unnecessary: numeric pointers are copied below so later
