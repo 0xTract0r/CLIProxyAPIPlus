@@ -87,6 +87,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		// frame and the main turn derive from upstreamBody, so both carry it.
 		upstreamBody = applyCodexServiceTierPriority(upstreamBody)
 	}
+	reporter.SetCodexFastContext(originalPayloadSource, upstreamBody, fastEnabled)
 	reporter.SetTranslatedReasoningEffort(clientBody, to.String())
 	wsHeaders = applyCodexWebsocketHeaders(ctx, wsHeaders, auth, apiKey, e.cfg)
 	// codex 版本高水位持久化（真实 serving 路径：WS ExecuteStream 出站）。见 WS Execute 注释。

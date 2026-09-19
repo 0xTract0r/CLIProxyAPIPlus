@@ -22,3 +22,20 @@ func TestTelemetryUsageEventOptionalContract(t *testing.T) {
 		requireMissingField(t, nested, "first_content_ms")
 	})
 }
+
+func TestFastImpactRealtimeTelemetryContract(t *testing.T) {
+	withEnabledQueue(t, func() {
+		enabled := true
+		p := &usageQueuePlugin{}
+		p.HandleUsage(context.Background(), coreusage.Record{Model: "gpt-test", ServiceTier: "default", Telemetry: &coreusage.Telemetry{Version: 2, AttemptID: "attempt-fast", FastContext: &coreusage.FastContext{SchemaVersion: 1, UpstreamRequestServiceTier: "priority", ServerFastEnabled: &enabled, TierSource: "account", RequestKind: "serving"}}})
+		v := popSinglePayload(t)
+		var telemetry coreusage.Telemetry
+		if err := json.Unmarshal(v["telemetry"], &telemetry); err != nil {
+			t.Fatal(err)
+		}
+		requireStringField(t, v, "service_tier", "default")
+		if telemetry.Version != 2 || telemetry.FastContext == nil || telemetry.FastContext.UpstreamRequestServiceTier != "priority" || !*telemetry.FastContext.ServerFastEnabled {
+			t.Fatalf("realtime=%+v", telemetry)
+		}
+	})
+}

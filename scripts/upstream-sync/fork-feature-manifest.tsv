@@ -342,3 +342,9 @@ scheduling-warmup-pacing	execute-count-hook	pattern	m\.executePacingAttempt\(	sd
 scheduling-warmup-pacing	stream-hook	pattern	m\.pacingSendContext\(	sdk/cliproxy/auth/conductor_stream.go
 scheduling-warmup-pacing	safety-usage	pattern	coreauth\.RecordAccountPacingUsage\(	internal/usage/logger_plugin.go
 scheduling-warmup-pacing	actual-http-hook	pattern	helps\.BeginClaudeHTTPAttempt\(	internal/runtime/executor/claude_transport_retry.go
+极速模型收益	fast-context-sdk	symbol	FastContext	sdk/cliproxy/usage/telemetry.go
+极速模型收益	fast-visible-telemetry	symbol	FirstVisibleContentMS	internal/runtime/executor/helps/usage_telemetry.go
+极速模型收益	fast-ws-stream-provenance	pattern	SetCodexFastContext\(	internal/runtime/executor/codex_websockets_stream.go
+极速模型收益	fast-ws-execute-provenance	pattern	SetCodexFastContext\(	internal/runtime/executor/codex_websockets_execute.go
+极速模型收益	fast-http-stream-provenance	pattern	SetCodexFastContext\(	internal/runtime/executor/codex_executor_stream.go
+极速模型收益	fast-http-execute-provenance	pattern	SetCodexFastContext\(	internal/runtime/executor/codex_executor_execute.go

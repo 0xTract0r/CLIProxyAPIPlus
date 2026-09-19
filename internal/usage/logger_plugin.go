@@ -111,6 +111,10 @@ type modelStats struct {
 
 // RequestDetail stores the timestamp, latency, and token usage for a single request.
 type RequestDetail struct {
+	ServiceTier     string `json:"service_tier,omitempty"`
+	ReasoningEffort string `json:"reasoning_effort,omitempty"`
+	TTFTMs          int64  `json:"ttft_ms,omitempty"`
+
 	RequestedModel string               `json:"requested_model,omitempty"`
 	ResolvedModel  string               `json:"resolved_model,omitempty"`
 	Telemetry      *coreusage.Telemetry `json:"telemetry,omitempty"`
@@ -307,18 +311,21 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 		sessionID = coreauth.SessionIDFromContext(ctx)
 	}
 	requestDetail := RequestDetail{
-		RequestedModel: strings.TrimSpace(record.Alias),
-		ResolvedModel:  strings.TrimSpace(record.Model),
-		Telemetry:      record.Telemetry,
-		Timestamp:      timestamp,
-		LatencyMs:      normaliseLatency(record.Latency),
-		Source:         record.Source,
-		AuthIndex:      record.AuthIndex,
-		RequestID:      strings.TrimSpace(internallogging.GetRequestID(ctx)),
-		SessionID:      sessionID,
-		Tokens:         detail,
-		Failed:         failed,
-		CostUSD:        microsToUSD(pricing.CostMicros),
+		ServiceTier:     record.ServiceTier,
+		ReasoningEffort: record.ReasoningEffort,
+		TTFTMs:          record.TTFT.Milliseconds(),
+		RequestedModel:  strings.TrimSpace(record.Alias),
+		ResolvedModel:   strings.TrimSpace(record.Model),
+		Telemetry:       record.Telemetry,
+		Timestamp:       timestamp,
+		LatencyMs:       normaliseLatency(record.Latency),
+		Source:          record.Source,
+		AuthIndex:       record.AuthIndex,
+		RequestID:       strings.TrimSpace(internallogging.GetRequestID(ctx)),
+		SessionID:       sessionID,
+		Tokens:          detail,
+		Failed:          failed,
+		CostUSD:         microsToUSD(pricing.CostMicros),
 	}
 	if pricing.State != pricingStatePriced {
 		requestDetail.PricingStatus = string(pricing.State)

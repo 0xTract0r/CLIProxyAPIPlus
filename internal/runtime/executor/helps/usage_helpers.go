@@ -270,8 +270,18 @@ func (r *UsageReporter) buildRecordForModel(model string, detail usage.Detail, f
 	if r == nil {
 		return usage.Record{Model: model, Detail: detail, Failed: failed, Fail: fail, Generate: usage.GenerateFlag(true)}
 	}
+	telemetry := r.telemetrySnapshot(failed, fail)
+	// Auxiliary model usage (e.g. image tools) did not observe its own content stream.
+	if model != r.model {
+		telemetry.FastContext = nil
+		telemetry.VisibleContentObserved = false
+		telemetry.OutputReasoningSubset = false
+		telemetry.FirstVisibleContentMS = nil
+		telemetry.LastVisibleContentMS = nil
+		telemetry.VisibleContentEvents = nil
+	}
 	return usage.Record{
-		Telemetry:           r.telemetrySnapshot(failed, fail),
+		Telemetry:           telemetry,
 		Provider:            r.provider,
 		ExecutorType:        r.executorType,
 		Model:               model,
