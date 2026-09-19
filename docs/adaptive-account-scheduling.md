@@ -2,62 +2,126 @@
 
 [简体中文](adaptive-account-scheduling_CN.md)
 
-> Implements `openspec/changes/add-adaptive-account-scheduling`. Config field definitions
-> are already fully covered in the `account-scheduling` section of
-> `core/config.example.yaml` and are not repeated here; this document only adds the
-> management API read-only field reference, operational notes and the serving-reserve
-> extensions (`add-warmup-serving-reserve`, `add-warmup-traffic-pacing`). Fields/behavior have
-> been verified against the current code as of 2026-09. Code/symbol locations are
-> consolidated in the [Code index](#code-index) at the end, not inlined after each claim.
+> This reference brings configuration hierarchy, defaults, production observations, enablement and management API fields together. It covers existing adaptive scheduling, serving reserve and traffic pacing. See `config.example.yaml` for every field and the [Code index](#code-index) for implementation entry points.
 
 ## Operator quick reference
 
-Common operator tasks and where each one lives:
-
-| I want to… | Use | Where |
-| --- | --- | --- |
-| Turn adaptive scheduling on | `routing.strategy: "adaptive"` | §1 |
-| Bound warming send bursts and admission | `warmup-traffic-pacing` | [Traffic pacing](#warm-up-traffic-pacing) |
-| Enable warming opportunities and check production values | `warmup-serving-reserve` and migration controls | [Serving reserve](#opt-in-warm-up-serving-reserve) |
-| Read an account's tier / quota / warm-up state | `GET /v0/management/auth-files` → the `account_scheduling` projection | §2 |
-| Pin a subscription tier on one account | `tier_override` (endpoint or auth JSON) | §3.1 / §3.5 |
-| Migrate an old account / backfill its warm-up anchor | `first_production_at` (endpoint backfill) | §3.2 / §3.5 |
-| Slow-speed safety-test one account | `rate_scale` (`< 1` throttles) | §3.4 / §3.5 |
-| See why one account was decelerated | `in_distress` / `warmup_health_stage_cap` / `warmup_last_distress_at`; compare `warmup.stage` vs `warmup.age_days` | §3.6 / §3.7 |
-| Change an operator override (tier / rate / anchor) | `PATCH /v0/management/auth-files/account-scheduling` | §3.5 |
+- Change configuration: start with [Recommended values quick reference](#recommended-values-quick-reference).
+- New opportunities: [Serving reserve](#opt-in-warm-up-serving-reserve).
+- Cadence and admission: [Traffic pacing](#warm-up-traffic-pacing).
+- Tier/quota/warm-up state: §2; per-account overrides: §3.1–§3.5; health deceleration: §3.6–§3.7.
 
 ## Recommended values quick reference
 
-> These recommended values used to be buried in the ops deployment doc, out of sight when
-> reading the parameters; this section lifts them into the parameter reference so you can
-> see what to set right here. **The authoritative source for deployment-time configuration
-> remains `docs/operations/deploy/remote-core-maintenance.md`** (in the umbrella
-> `cliproxy-stack` repo); this table is only a quick reference and that doc wins on any
-> discrepancy.
+**Code defaults, persisted production values and an enablement plan are different things. Confirm merging, deployment and activation separately.** Merge snippets into the matching existing sections; do not replace the complete file. Editing an example does not change production.
 
-| Parameter | Default | Recommended | Notes |
-| --- | --- | --- | --- |
-| `account-scheduling.warmup-traffic-pacing.enabled` | `false` | Explicit opt-in after isolated validation | Independent of serving reserve; see [Traffic pacing](#warm-up-traffic-pacing). |
-| `account-scheduling.warmup-serving-reserve` | `0` (off) | `0.15` (this production profile) | Shared new-opportunity probability, not a total traffic cap; explicitly persist it to enable. See [Serving reserve](#opt-in-warm-up-serving-reserve). |
-| `account-scheduling.warmup-serving-max-binding-age-seconds` | `0` | `0` (age fallback off) | Non-renewing age in seconds; a positive value alone does not enable migration. |
-| `account-scheduling.warmup-serving-migration-token-budget` | `0` | `0` (proactive migration off) | Per-process rolling-hour estimated input reconstruction budget, separate from daily account tokens. |
-| `account-scheduling.rate-scale` / per-account `rate_scale` (§3.4) | `1.0` | `1.0` (no scaling) | Effective rate-limit multiplier (scales rpm/burst/concurrency/daily-budget). **There is no "set X for old accounts / Y for new accounts" scenario number** — the default is simply `1.0`; only set a specific account `< 1` for a low-risk slow test, tuning as needed. Do not copy a fixed number. Must be `> 0`. |
-| `account-scheduling.anti-streak-limit` (anti-streak) | `0` (off) | **`3`** (production) | Force-rotate a **warm-up account** away once it has been picked ≤ this many times in a row. Applies only to warm-up accounts (mature accounts are exempt) and is cache-safe (does not change the long-term 20:5:1 share); largely idle when a single mature account carries all traffic (no warm-up accounts to rotate to). |
-| `account-scheduling.warmup-curve[*].token-daily-budget` (warm-up account token daily budget) | `0` (unbounded) | **`0` — pending real-traffic calibration** | Rolling-24h billable-token hard gate for warm-up accounts. **No concrete positive value has been calibrated yet**: run a real-traffic gray release to see the burn curve first, then set it — **do not just pick a number**. Mature accounts' `mature-limits.token-daily-budget` stays `0` (unbounded). |
-| `account-scheduling.tier-weights.claude` | `max_20x:20 / max_5x:5 / pro:1 / unknown:1` | Same as default (20:5:1) | Weighted selection by Claude subscription tier. |
-| `max-retry-credentials` (top-level, not inside `account-scheduling`) | `2` | `2` | How many accounts a single failed request may fail over across. `-1` = escape hatch (traverse the whole pool; use with care). |
-| warm-up curve (`warmup-curve` per-stage rpm / concurrency / daily-budget) | see stage table | see stage table | The rpm / concurrency / daily-budget of each warm-up stage (cold / w1 / w2 / w3-4 / w5-6 / w7-8 / mature) live in the default curve referenced by §1 "Progressive ramp-up during a new account's warm-up period", or the warm-up stage table in `docs/operations/deploy/remote-core-maintenance.md` — not repeated here. |
+### Production enabled: verified 2026-09-19
 
-Honest caveats:
+Production core `951e1bba` is deployed with the following persisted values. Genuine Claude CLI produced 48 calls, including 3 on AC-13 and 6 on AC-16; both warming accounts retained the same child and read cached tokens. One mature-account progress call was cancelled by CLI and is not counted as a complete success. This is a dated verification snapshot, not a live dashboard. Evidence is in the umbrella's `docs/operations/verification/warmup-traffic-pacing-2026-09-18.md`.
 
-- Everything above is a **global config-file knob** (the `account-scheduling` section of the
-  remote `config.yaml` plus the top-level `max-retry-credentials`) and is **not editable from
-  the settings-page UI**. The settings-page UI only exposes three per-account controls:
-  `tier` (subscription tier, §3.1), `rate_scale` (rate multiplier, §3.4), and the
-  first-production anchor `first_production_at` (§3.2).
-- **The authoritative source for deployment-time configuration is
-  `docs/operations/deploy/remote-core-maintenance.md`** (in the umbrella `cliproxy-stack`
-  repo); this table is a quick reference and that doc is the source of truth.
+```yaml
+routing:
+  strategy: adaptive
+  session-affinity: true # Preserve parent, same-child and fork cache affinity
+account-scheduling:
+  warmup-serving-reserve: 0.50 # Persisted: 50% of eligible new opportunities, not all requests
+  warmup-serving-max-binding-age-seconds: 0 # Keep long parent conversations on their account
+  warmup-serving-migration-token-budget: 0 # Proactive migration remains off to preserve existing caches
+  warmup-traffic-pacing:
+    enabled: true # Enabled in production; generic code default remains false
+    request-burst: 8 # Stored credits including unsent reservations, not concurrency 8
+    min-admission-requests: 4 # Credit required for a new independent conversation
+    max-active-bindings: 1 # Recently active independent groups per account
+    active-binding-idle-seconds: 300 # Idle group expiry, not prompt-cache TTL
+debug: false # Restored after temporary verification logging
+request-retry: 3 # Existing production value
+max-retry-interval: 30 # Restored after temporarily using 0 during verification
+# max-retry-credentials is omitted; effective value is 2
+# anti-streak-limit is omitted; effective value is 0 (off)
+```
+
+`0.50` is chosen for workloads with few new tasks/independent children per day. Pacing, RPM, concurrency and daily budgets bound concentrated use. At `0.30`, one of three explicit fresh opportunities reached a warming account; at `0.50`, one of one did. This sample cannot establish a globally optimal probability or guarantee daily traffic for every new account. The mock grid supports retaining burst8/admission4: admission2 may not cover three turns, while burst12 permits a larger short burst. No account curve or rate multiplier was increased.
+
+Global rate, weights, curve and mature limits retain defaults; account overrides still apply. APUS-01 has `rate_scale=3`, effective135 RPM/concurrency12. AC-13 is w1 (200/day,3 RPM,concurrency1); AC-16 naturally entered w2 (500/day,5 RPM,concurrency1); both have `rate_scale=1`. Natural promotion is not attributed to probability tuning.
+
+Anti-streak stays0 because reserve and pacing cover this objective without evidence for another reselection control. Both migration controls stay0 to protect existing caches. Stage token budgets remain0 (off): this sample cannot calibrate an all-day token budget. Request protection is active, but does not imply zero token consumption or ban safety. New instances still require explicit configuration; upgrades must preserve these production values.
+
+### Other common settings: defaults and disabled protections
+
+These settings belong to the same configuration as reserve and pacing. Omission uses defaults, but delivery must identify actual values; a recommendation is not proof of activation.
+
+```yaml
+max-retry-credentials: 2 # Top-level; omitted/0 becomes 2 at runtime; -1 explicitly tries the full pool
+account-scheduling:
+  rate-scale: 1.0 # Must be >0; no scaling by default. Per-account rate_scale takes precedence
+  anti-streak-limit: 0 # Default off; production intentionally retains 0
+  tier-weights:
+    claude:
+      max-20x: 20 # YAML keys use hyphens; account tier identifiers use max_20x
+      max-5x: 5
+      pro: 1
+      unknown: 1
+  health-gate:
+    enabled: true # Health-based demotion is on by default
+    failure-cluster-threshold: 3 # Failures within the window; 0 disables this signal
+    backoff-level-threshold: 1 # 429 backoff level; 0 disables this signal
+    observation-window-minutes: 30 # Failure observation window in minutes
+    demote-step: 1 # Warm-up stages removed per distress hit
+    promote-cooldown-minutes: 30 # Recovery cooldown in minutes
+  mature-limits:
+    rpm-limit: 45
+    burst: 10
+    concurrency-limit: 4
+    token-daily-budget: 0 # No fixed daily token budget for mature accounts
+```
+
+The warming token budget belongs under each stage. This is the **complete default curve**: supplying a `warmup-curve` list replaces all defaults rather than merging stages. Production did not override the list in this check; effective account limits also depend on health, tier and rate scaling.
+
+```yaml
+account-scheduling:
+  warmup-curve:
+  - name: w1
+    min-age-days: 0
+    max-age-days: 7
+    daily-budget: 200
+    rpm-limit: 3
+    concurrency-limit: 1
+    token-daily-budget: 0 # 0 disables token budgeting; calibrate a positive value from real usage
+  - name: w2
+    min-age-days: 7
+    max-age-days: 14
+    daily-budget: 500
+    rpm-limit: 5
+    concurrency-limit: 1
+    token-daily-budget: 0 # 0 disables token budgeting; calibrate a positive value from real usage
+  - name: w3-4
+    min-age-days: 14
+    max-age-days: 30
+    daily-budget: 2000
+    rpm-limit: 12
+    concurrency-limit: 2
+    token-daily-budget: 0 # 0 disables token budgeting; calibrate a positive value from real usage
+  - name: w5-6
+    min-age-days: 30
+    max-age-days: 45
+    daily-budget: 4500
+    rpm-limit: 20
+    concurrency-limit: 2
+    token-daily-budget: 0 # 0 disables token budgeting; calibrate a positive value from real usage
+  - name: w7-8
+    min-age-days: 45
+    max-age-days: 60
+    daily-budget: 6500
+    rpm-limit: 30
+    concurrency-limit: 3
+    token-daily-budget: 0 # 0 disables token budgeting; calibrate a positive value from real usage
+```
+
+These are global `config.yaml` settings, not settings-page controls. The UI exposes per-account `tier`, `rate_scale` and `first_production_at` (§3.5); global `rate-scale` differs from auth metadata `account_scheduling.rate_scale`. Deployment paths and procedures live in the umbrella's `docs/operations/deploy/remote-core-maintenance.md`.
+
+### Enablement is part of delivery
+
+Report the production version, persisted configuration and verified active behavior. Identify each disabled/omitted setting as intentionally off with a reason or pending activation, and obtain the user's disposition before closing. Execute existing activation/tuning authorization without asking again; silence is not approval. Preserve approved environment values during upgrades instead of overwriting them with template defaults.
 
 ## 1. Overview
 
@@ -132,7 +196,7 @@ which simply returns immediately on a cache hit and never consults the inner sel
 | **Non-Claude account** (a provider this scheduler does not score) | No tiering; behavior is identical to existing session-affinity. |
 | **Mature, soft ceiling not hit** (token bucket still permits it) | Stickiness kept, preserving prompt-cache continuity. |
 | **Mature, soft ceiling already hit** (treated as approaching the hard risk-control threshold) | Stickiness broken; a fresh weighted selection is made across the whole pool. |
-| **Still warming up, a usable mature account exists** | Stickiness broken; routed to a mature account, with rebinding (subsequent rounds follow that mature account). |
+| **Still warming up, without serving-reserve protection, a usable mature account exists** | Stickiness broken; routed to a mature account, with rebinding (subsequent rounds follow that mature account). |
 | **Still warming up, no mature account available** | As long as the warming account can still serve (daily budget / concurrency / token bucket not maxed), stickiness is kept — avoids pointless churn and prompt-cache loss in an all-warm-up pool. A pool-wide reselection happens only once the account itself can no longer serve. |
 
 ### Fallback behavior
@@ -546,27 +610,18 @@ How the cpamp account page renders the §2.5 projection fields for operators:
 
 ## Opt-in warm-up serving reserve
 
-All three fields belong to `account-scheduling` and default to zero. The disabled default preserves existing routing for unconfigured installations and upgrades; **omitting a field does not automatically select the production recommendation**.
-
-| Parameter | Meaning | Default | This production profile |
-| --- | --- | ---: | ---: |
-| `warmup-serving-reserve` | Probability of reserving a new independent service opportunity for warming accounts; finite `0 <= value < 1` | 0 (disabled) | 0.15 |
-| `warmup-serving-max-binding-age-seconds` | Non-renewing binding-age threshold in seconds; also controls the underserved observation period | 0 (age fallback disabled) | 0 |
-| `warmup-serving-migration-token-budget` | Per-process rolling-hour estimate budget for input-cache reconstruction when migrating existing bindings | 0 (all proactive migration disabled) | 0 |
-
-The production values were explicitly persisted on 2026-09-15; they are environment configuration, not built-in defaults. To enable the same policy in a new environment, merge these fields into the corresponding sections of the existing configuration rather than replacing the entire file:
+All three fields belong to `account-scheduling`. See [Recommended values quick reference](#recommended-values-quick-reference) for the combined enablement example and production observation; these are code defaults and meanings.
 
 ```yaml
-routing:
-  strategy: adaptive
-  session-affinity: true
 account-scheduling:
-  warmup-serving-reserve: 0.15                    # Enable the 15% new-opportunity reserve
-  warmup-serving-max-binding-age-seconds: 0      # Keep age fallback disabled
-  warmup-serving-migration-token-budget: 0       # Keep proactive migration disabled
+  warmup-serving-reserve: 0 # Default off; finite 0<=value<1. Persisted production value 0.50
+  warmup-serving-max-binding-age-seconds: 0 # Seconds; non-renewing age and underserved observation period. Zero disables age fallback
+  warmup-serving-migration-token-budget: 0 # Rolling-hour input reconstruction estimate, not daily tokens; zero disables all proactive migration
 ```
 
-**Avoid missing configuration:** the generic `config.example.yaml` remains disabled by default. When creating or restoring a production configuration, check these three fields plus adaptive routing and session affinity. A persisted 0.15 survives a normal restart; deployment must preserve the existing runtime configuration instead of overwriting it with template zeros. Verify the actual configuration, not merely the example file or deployed feature version.
+A positive binding age still requires reserve, a positive migration budget and safety eligibility; it does not enable migration by itself.
+
+**Avoid missing configuration:** the generic `config.example.yaml` remains disabled by default. When creating or restoring a production configuration, check these three fields plus adaptive routing and session affinity. A persisted 0.50 survives a normal restart; deployment must preserve the existing runtime configuration instead of overwriting it with template zeros. Verify the actual configuration, not merely the example file or deployed feature version.
 
 A positive reserve adds opportunities for eligible new Claude sessions and reliably independent children. Warming accounts share the probability; it is not a request/token share or a finite-sample minimum. A qualified fresh selection with a mature fallback receives continuity protection whether it came from the reserve draw or ordinary weighting. Logs distinguish `reserve`, `weighted`, `migration`, and `inherited`; weighted selection is not counted as a reserve win.
 
@@ -609,13 +664,15 @@ Setting reserve to zero stops reserve opportunities. When pacing remains enabled
 
 `account-scheduling.warmup-traffic-pacing` independently controls warming-account send cadence and defaults to disabled. It applies to the native adaptive Claude path, including eligible Claude-only mixed pools. A positive serving reserve does not enable pacing.
 
-| Field | Default | Meaning |
-| --- | ---: | --- |
-| `enabled` | `false` | Enable the additional pacing and admission constraints |
-| `request-burst` | `8` | Maximum stored send credits, including unsent reservations; not concurrency |
-| `min-admission-requests` | `4` | Minimum credits to admit a new independent conversation |
-| `max-active-bindings` | `1` | Maximum recently active independent conversation groups per account |
-| `active-binding-idle-seconds` | `300` | Group inactivity expiry, independent of prompt-cache TTL |
+```yaml
+account-scheduling:
+  warmup-traffic-pacing:
+    enabled: false # Code default off; an authorized production plan explicitly sets true
+    request-burst: 8 # Credit capacity including unsent reservations
+    min-admission-requests: 4 # New independent conversation admission headroom
+    max-active-bindings: 1 # Recently active independent groups per account
+    active-binding-idle-seconds: 300 # Idle expiry in seconds, separate from prompt-cache TTL
+```
 
 When enabled, integer limits must be positive and the admission minimum cannot exceed capacity. A new ledger starts at zero. Credits refill continuously at the effective daily request budget divided by 86400 seconds. At 200 requests/day, one credit takes 7.2 minutes, admission at four takes about 28.8 minutes, and eight idle credits take about 57.6 minutes. The service does not generate traffic to fill a quota.
 
@@ -631,7 +688,7 @@ Legacy usage lacks a trustworthy completeness marker. Unknown history can block 
 
 Setting reserve to zero stops reserve opportunities. While pacing remains enabled, retain the identities, groups, waiting and overlap state it needs. Disabling pacing restores the legacy policy while retaining accounting for re-enable; disabling both controls restores the complete legacy-off behavior. Persist an explicit enabled configuration when rolling out: deploying code alone does not enable pacing.
 
-Anonymous content fingerprints (`msg:` / SDK-derived identities) and conflicting identities are not reusable pacing groups; use a reliable session identity or a mature fallback. Custom native-Claude SDK executors must implement `HTTPAttemptGateAware` and honor the attempt hook on every send; otherwise warming execution fails closed when pacing is enabled. Logs `warmup-pacing-sent`, `warmup-pacing-denied` and `warmup-pacing-settled` expose balances, minute/day attempts, pending tokens and estimate/settlement differences without request bodies or credentials.
+Anonymous content fingerprints (`msg:` / SDK-derived identities) and conflicting identities are not reusable pacing groups; use a reliable session identity or a mature fallback. Custom native-Claude SDK executors must implement `HTTPAttemptGateAware` and honor the attempt hook on every send; otherwise warming execution fails closed when pacing is enabled. Logs `warmup-pacing-sent`, `warmup-pacing-denied` and `warmup-pacing-settled` record send/denial/settlement events without request bodies or credentials. Visible balance, minute/day-attempt and token fields depend on the log formatter; this production verification cross-checked sent events against durable accounting and did not treat absent fields as zero.
 
 ## Code index
 

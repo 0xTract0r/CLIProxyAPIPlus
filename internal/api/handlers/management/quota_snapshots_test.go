@@ -399,15 +399,8 @@ func TestQuotaSnapshotsClaudeUnauthorizedRequiresReauth(t *testing.T) {
 			if entry.Error != claudeQuotaCredentialUnauthorizedMessage {
 				t.Fatalf("entry error = %q, want sanitized reauth message", entry.Error)
 			}
-			for _, forbidden := range []string{"401", "403"} {
-				if strings.Contains(entry.Error, forbidden) {
-					t.Fatalf("reauth error leaked %q: entry=%#v body=%s", forbidden, entry, rec.Body.String())
-				}
-			}
-			for _, forbidden := range []string{"provider body", "invalid token", "forbidden"} {
-				if strings.Contains(rec.Body.String(), forbidden) || strings.Contains(entry.Error, forbidden) {
-					t.Fatalf("reauth response leaked %q: entry=%#v body=%s", forbidden, entry, rec.Body.String())
-				}
+			if leaked := quotaSnapshotErrorLeak(entry.Error, rec.Body.String(), "provider body", "invalid token", "forbidden"); leaked != "" {
+				t.Fatalf("reauth response leaked %q: entry=%#v body=%s", leaked, entry, rec.Body.String())
 			}
 
 			updated, ok := manager.GetByID("claude-oauth")
@@ -884,10 +877,8 @@ func TestQuotaSnapshotsLegacyUnauthorizedErrorMapsToReauthAndRetriesExplicitly(t
 	if legacyEntry.Error != claudeQuotaCredentialUnauthorizedMessage {
 		t.Fatalf("legacy entry error = %q, want sanitized reauth message", legacyEntry.Error)
 	}
-	for _, forbidden := range []string{"401", "authentication_error", "Invalid authentication credentials", "provider_body", "legacy raw auth failure"} {
-		if strings.Contains(snapshotRec.Body.String(), forbidden) || strings.Contains(legacyEntry.Error, forbidden) {
-			t.Fatalf("legacy snapshot leaked %q: entry=%#v body=%s", forbidden, legacyEntry, snapshotRec.Body.String())
-		}
+	if leaked := quotaSnapshotErrorLeak(legacyEntry.Error, snapshotRec.Body.String(), "authentication_error", "Invalid authentication credentials", "provider_body", "legacy raw auth failure"); leaked != "" {
+		t.Fatalf("legacy snapshot leaked %q: entry=%#v body=%s", leaked, legacyEntry, snapshotRec.Body.String())
 	}
 
 	handler.refreshDueQuotaSnapshots(context.Background(), defaultQuotaSnapshotTestPolicy(), false)
@@ -1542,5 +1533,48 @@ func TestQuotaSnapshotLegacyUnsupportedProviderErrorIsStaleAndRetried(t *testing
 	}
 	if got := metadataString(updated.Metadata, quotaRefreshStatusMetadataKey); got != quotaRefreshStatusOK {
 		t.Fatalf("status after retry = %q, want ok", got)
+	}
+}
+
+// 时间戳和标识符可能包含状态码数字，因此只在错误字段检查 HTTP 状态码。
+// 调用方明确禁止出现在整个响应中的上游正文标记仍检查完整 JSON。
+func quotaSnapshotErrorLeak(errorText, responseBody string, providerMarkers ...string) string {
+	for _, code := range []string{"401", "403"} {
+		if strings.Contains(errorText, code) {
+			return code
+		}
+	}
+	for _, marker := range providerMarkers {
+		if strings.Contains(errorText, marker) || strings.Contains(responseBody, marker) {
+			return marker
+		}
+	}
+	return ""
+}
+
+func TestQuotaSnapshotErrorLeakScope(t *testing.T) {
+	const safeError = "Credential unauthorized; reauthenticate this credential."
+	generatedAt := time.Date(2026, time.September, 18, 14, 52, 48, 401403018, time.UTC).Format(time.RFC3339Nano)
+	for _, tc := range []struct{ name, errorText, otherField, want string }{
+		{"status digits only in timestamp", safeError, "", ""},
+		{"status digits in identifier", safeError, "account-401403", ""},
+		{"401 in error", "HTTP 401 unauthorized", "", "401"},
+		{"403 in error", "HTTP 403 forbidden", "", "403"},
+		{"provider marker outside error", safeError, "provider_body", "provider_body"},
+		{"provider marker in error", "authentication_error", "", "authentication_error"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			response, err := json.Marshal(map[string]string{"generated_at": generatedAt, "error": tc.errorText, "other": tc.otherField})
+			if err != nil {
+				t.Fatal(err)
+			}
+			body := string(response)
+			if !strings.Contains(body, "401") || !strings.Contains(body, "403") {
+				t.Fatal("fixture lost controlled timestamp digits")
+			}
+			if got := quotaSnapshotErrorLeak(tc.errorText, body, "provider_body", "authentication_error"); got != tc.want {
+				t.Fatalf("leak=%q, want %q body=%s", got, tc.want, body)
+			}
+		})
 	}
 }
