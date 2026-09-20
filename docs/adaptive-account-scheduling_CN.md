@@ -201,6 +201,8 @@ weight = tier 基础容量权重 x (1 - 额度利用率) x 新鲜度系数
 
 - 只读取账号记录上已经持久化的数据——`Metadata.quota_snapshot` /
   `Metadata.first_production_at`、`Attributes.plan_type`——加上启动时加载的养号曲线配置。
+  Claude 的 `warmup_traffic_pacing` 还读取 Manager 持有的账本和在途预约，
+  只在副本上估算补额和窗口过期，不改缓存、余额、绑定、策略或 sidecar 文件。
 - 不会铸造（mint）`first_production_at` 锚点，不会写回 auth 记录，也不会触发任何上游请求。
 
 未知状态一律显式表达、绝不悄悄猜成一个具体值：
@@ -523,6 +525,21 @@ cpamp 账号页直接渲染 §2.5 的投影字段；运维这样读：
   `rate_limit_tier`（如 `default_claude_ai`）时显示 `未知` 是预期、不是 bug——若该账号应
   参与按档加权选号，用 `tier_override`（§3.1 / §3.5）钉死一个档位。
 - **养号徽标**：`warmup.stage`（有效/被压低后的档位）配 `warmup.age_days`。
+- **配速徽标与只读详情**（凭证 → 认证文件 → Claude）：仅养号账号显示入口，成熟号隐藏。
+  数据来自 `account_scheduling.warmup_traffic_pacing`；余额颜色按 1 次请求及账本实际
+  `min_admission_requests` 门槛区分，不代表完整准入。`status` 为 `active`（开启）、
+  `disabled`（已关闭）、`uninitialized`（未初始化）、`error`（不可读取）或
+  `not_applicable`（不适用）；非开启状态的动态值为 JSON `null`，未知不是零。
+  旧后端可能缺少整块字段。`observed_at` 随列表刷新更新，浏览器不做本地补额倒计时。
+  详情显示余额/容量、接入门槛、每小时补额、余额 ETA、滚动 24 小时/60 秒请求及上限、
+  独立活跃组及空闲期限、在途及并发上限。`pending_requests` 是尚未发送的预约，已计入
+  请求总数。限额来自账本实际策略，不套用尚未生效的新配置。
+  `admission_balance_eta_seconds` 仅估算余额恢复；未发送预约占用容量、单靠等待无法
+  达到门槛，或时钟回拨暂停补额且余额不足时为 `null`。
+  `blocking_reasons` 仅列已知的 `request_balance`、`daily_budget`、
+  `rpm`、`active_groups`、`concurrency`、`unknown_token_history` 或 `token_budget` 阻挡；
+  活跃组及接入门槛针对新的独立会话，空列表不保证请求 token、健康状态和上游额度均满足。
+  `reason` 仅含机器码，不返回内部错误、路径或身份信息。
 - **"手动"标**：`tier_source = "override"`。
 - **会话数**：`sessions_total` / `sessions_active` / `sessions_closed`。
 - **减速态**：`in_distress = true`（配合 `warmup_health_stage_cap` /

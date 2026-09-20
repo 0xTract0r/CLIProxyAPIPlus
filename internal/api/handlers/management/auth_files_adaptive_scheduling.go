@@ -160,6 +160,21 @@ func (h *Handler) buildAccountSchedulingView(auth *coreauth.Auth) gin.H {
 		warmupView["age_days"] = nil
 	}
 	view["warmup"] = warmupView
+	if providerKey(auth) == "claude" {
+		if h != nil && h.authManager != nil {
+			view["warmup_traffic_pacing"] = h.authManager.WarmupTrafficPacingSnapshot(auth.ID)
+		} else {
+			// A disk-only handler has no authoritative live ledger or leases.
+			pacing := coreauth.WarmupTrafficPacingSnapshot{
+				Status: "uninitialized", Reason: "manager_unavailable",
+				ObservedAt: now.UTC().Format(time.RFC3339), BlockingReasons: []string{},
+			}
+			if h != nil && h.cfg != nil && !h.cfg.AccountScheduling.WarmupTrafficPacing.Enabled {
+				pacing.Status, pacing.Reason = "disabled", "config_disabled"
+			}
+			view["warmup_traffic_pacing"] = pacing
+		}
+	}
 
 	// Effective (post-rate_scale) outbound ceilings the adaptive selector actually
 	// enforces for this account. The warmup block above carries the PRE-scale stage

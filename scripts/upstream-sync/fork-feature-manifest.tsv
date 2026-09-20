@@ -342,6 +342,10 @@ scheduling-warmup-pacing	execute-count-hook	pattern	m\.executePacingAttempt\(	sd
 scheduling-warmup-pacing	stream-hook	pattern	m\.pacingSendContext\(	sdk/cliproxy/auth/conductor_stream.go
 scheduling-warmup-pacing	safety-usage	pattern	coreauth\.RecordAccountPacingUsage\(	internal/usage/logger_plugin.go
 scheduling-warmup-pacing	actual-http-hook	pattern	helps\.BeginClaudeHTTPAttempt\(	internal/runtime/executor/claude_transport_retry.go
+scheduling-warmup-pacing	read-only-snapshot	symbol	^func \(p \*WarmupPacer\) Snapshot\(	sdk/cliproxy/auth/warmup_pacing_snapshot.go
+scheduling-warmup-pacing	manager-snapshot	symbol	^func \(m \*Manager\) WarmupTrafficPacingSnapshot\(	sdk/cliproxy/auth/warmup_pacing_snapshot.go
+scheduling-warmup-pacing	management-snapshot	pattern	view\["warmup_traffic_pacing"\] = h\.authManager\.WarmupTrafficPacingSnapshot	internal/api/handlers/management/auth_files_adaptive_scheduling.go
+scheduling-warmup-pacing	read-only-regression	symbol	^func TestWarmupPacingManagerSnapshotReadOnly\(	sdk/cliproxy/auth/warmup_pacing_snapshot_test.go
 极速模型收益	fast-context-sdk	symbol	FastContext	sdk/cliproxy/usage/telemetry.go
 极速模型收益	fast-visible-telemetry	symbol	FirstVisibleContentMS	internal/runtime/executor/helps/usage_telemetry.go
 极速模型收益	fast-ws-stream-provenance	pattern	SetCodexFastContext\(	internal/runtime/executor/codex_websockets_stream.go
