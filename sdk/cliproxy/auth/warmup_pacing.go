@@ -26,6 +26,8 @@ const (
 
 // WarmupPacingStore must durably replace one account's complete sidecar before
 // returning nil. Keys are SHA-256 digests, never credential or session text.
+// Load must be read-only: management snapshots may call it without initializing
+// the account, repairing storage, or changing the pacer's cache.
 type WarmupPacingStore interface {
 	Load(key string) ([]byte, error)
 	Save(key string, data []byte) error

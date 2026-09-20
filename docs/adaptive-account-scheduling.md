@@ -215,7 +215,9 @@ This is a **read-only projection**:
 
 - It reads only data already persisted on the account record — `Metadata.quota_snapshot`
   / `Metadata.first_production_at` and `Attributes.plan_type` — plus the warm-up curve
-  config loaded at startup.
+  config loaded at startup. The Claude `warmup_traffic_pacing` block also reads
+  the manager-owned ledger and live reservations, projecting refill/expiry on a
+  copy without changing the cache, balance, bindings, policy, or sidecar.
 - It does not mint the `first_production_at` anchor, does not write anything back to the
   auth record, and does not trigger any upstream request.
 
@@ -587,6 +589,27 @@ How the cpamp account page renders the §2.5 projection fields for operators:
   (e.g. `default_claude_ai`) — pin a tier via `tier_override` (§3.1 / §3.5) if the account
   should participate in tier-weighted selection.
 - **Warm-up badge**: `warmup.stage` (effective/capped stage) with `warmup.age_days`.
+- **Pacing badge and read-only details** (Credentials → Auth Files → Claude):
+  warming accounts expose `account_scheduling.warmup_traffic_pacing`; mature
+  accounts hide the entry. Balance colors compare `request_balance` with one
+  credit and the ledger's `min_admission_requests`, rather than promising full
+  admission. `status` is `active`, `disabled`, `uninitialized`, `error`, or
+  `not_applicable`; inactive dynamic values are JSON `null`, never a guessed zero.
+  Older servers may omit the whole block. `observed_at` is the list-refresh
+  snapshot time; the browser does not run a local refill countdown.
+  Details show balance/capacity, admission threshold, refill/hour and balance ETA,
+  rolling 24-hour/60-second requests and limits, active independent groups/idle
+  expiry, and in-flight/concurrency. `pending_requests` counts unsent reservations
+  already included in the request totals. Limits come from the actual ledger
+  policy, not a newly configured curve that has not yet been applied.
+  `admission_balance_eta_seconds` estimates only balance recovery; it is null
+  when unsent reservations prevent reaching the threshold by waiting alone,
+  or a clock rollback has suspended refill while the balance is insufficient.
+  `blocking_reasons` lists known `request_balance`, `daily_budget`, `rpm`,
+  `active_groups`, `concurrency`, `unknown_token_history`, or `token_budget`
+  pressure. Group/admission pressure refers to a new independent conversation;
+  an empty list does not guarantee request-token, health or upstream admission.
+  `reason` contains only a machine code, never raw storage errors or identities.
 - **"Manual" marker**: `tier_source = "override"`.
 - **Session counts**: `sessions_total` / `sessions_active` / `sessions_closed`.
 - **Decelerated state**: `in_distress = true` (with `warmup_health_stage_cap` /
