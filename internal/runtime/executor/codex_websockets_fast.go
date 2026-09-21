@@ -98,15 +98,26 @@ func codexFastSessionFallbackID(opts cliproxyexecutor.Options, req cliproxyexecu
 	return ""
 }
 
-// applyCodexServiceTierPriority injects service_tier=priority into the outbound
-// upstream request body. Both the prewarm frame and the main turn derive from the
-// same upstream body, so this propagates to both. It is applied to the upstream body
-// only (never the client-facing body) and only when fast is enabled.
-func applyCodexServiceTierPriority(body []byte) []byte {
+// applyCodexServiceTierPolicy makes the account setting authoritative for Codex Fast.
+// An enabled account always sends priority. A disabled account downgrades an explicit
+// client fast/priority request to default so a local /fast setting cannot bypass the
+// CPA account policy and consume premium credits. Other explicit tiers (notably flex)
+// keep their existing pass-through behavior.
+func applyCodexServiceTierPolicy(body []byte, fastEnabled bool) []byte {
 	if len(body) == 0 {
 		return body
 	}
-	updated, err := sjson.SetBytes(body, "service_tier", "priority")
+	tier := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "service_tier").String()))
+	target := ""
+	if fastEnabled {
+		target = "priority"
+	} else if tier == "fast" || tier == "priority" {
+		target = "default"
+	}
+	if target == "" || tier == target {
+		return body
+	}
+	updated, err := sjson.SetBytes(body, "service_tier", target)
 	if err != nil || len(updated) == 0 {
 		return body
 	}

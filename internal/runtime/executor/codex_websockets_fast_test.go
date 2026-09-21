@@ -3,6 +3,7 @@ package executor
 import (
 	"bytes"
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -63,15 +64,86 @@ func TestCodexBaseModelNameStripsSuffix(t *testing.T) {
 	}
 }
 
-// TestApplyCodexServiceTierPriority is a small unit guard on the priority injection.
-func TestApplyCodexServiceTierPriority(t *testing.T) {
+func TestApplyCodexServiceTierPolicy(t *testing.T) {
 	t.Parallel()
-	out := applyCodexServiceTierPriority([]byte(`{"model":"gpt-5.6"}`))
-	if got := gjson.GetBytes(out, "service_tier").String(); got != "priority" {
-		t.Fatalf("service_tier = %q, want priority", got)
+	for _, tc := range []struct {
+		name, input, want string
+		enabled           bool
+	}{
+		{"account enables missing tier", `{}`, "priority", true},
+		{"account overrides flex", `{"service_tier":"flex"}`, "priority", true},
+		{"disabled blocks priority", `{"service_tier":"priority"}`, "default", false},
+		{"disabled blocks fast alias", `{"service_tier":"fast"}`, "default", false},
+		{"disabled preserves flex", `{"service_tier":"flex"}`, "flex", false},
+		{"disabled preserves auto", `{"service_tier":"auto"}`, "auto", false},
+		{"disabled preserves missing", `{}`, "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out := applyCodexServiceTierPolicy([]byte(tc.input), tc.enabled)
+			if got := gjson.GetBytes(out, "service_tier").String(); got != tc.want {
+				t.Fatalf("service_tier = %q, want %q; payload=%s", got, tc.want, out)
+			}
+		})
 	}
-	if applyCodexServiceTierPriority(nil) != nil {
+	if applyCodexServiceTierPolicy(nil, true) != nil {
 		t.Fatal("nil body should stay nil")
+	}
+}
+
+func TestCodexHTTPExecutorBlocksClientFastWhenAccountFastDisabled(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		name := "execute"
+		if stream {
+			name = "stream"
+		}
+		t.Run(name, func(t *testing.T) {
+			captured := make(chan []byte, 1)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, err := io.ReadAll(r.Body)
+				if err != nil {
+					t.Errorf("read request body: %v", err)
+					return
+				}
+				captured <- body
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = w.Write([]byte(`data: {"type":"response.completed","response":{"id":"resp_1","object":"response","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}` + "\n\n"))
+			}))
+			defer server.Close()
+
+			exec := NewCodexExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
+			auth := &cliproxyauth.Auth{
+				ID:       "codex-fast-disabled",
+				Provider: "codex",
+				ProxyURL: "direct",
+				Attributes: map[string]string{
+					"api_key":  "sk-test",
+					"base_url": server.URL,
+				},
+			}
+			req := cliproxyexecutor.Request{
+				Model:   "gpt-5.6",
+				Payload: []byte(`{"model":"gpt-5.6","service_tier":"fast","input":"hello"}`),
+			}
+			opts := cliproxyexecutor.Options{
+				SourceFormat:   sdktranslator.FromString("codex"),
+				ResponseFormat: sdktranslator.FromString("codex"),
+			}
+			if stream {
+				result, err := exec.ExecuteStream(context.Background(), auth, req, opts)
+				if err != nil {
+					t.Fatalf("ExecuteStream() error = %v", err)
+				}
+				for range result.Chunks {
+				}
+			} else if _, err := exec.Execute(context.Background(), auth, req, opts); err != nil {
+				t.Fatalf("Execute() error = %v", err)
+			}
+
+			outbound := receiveFrame(t, captured, "HTTP request")
+			if got := gjson.GetBytes(outbound, "service_tier").String(); got != "default" {
+				t.Fatalf("outbound service_tier = %q, want default; payload=%s", got, outbound)
+			}
+		})
 	}
 }
 

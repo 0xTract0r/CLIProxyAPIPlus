@@ -85,11 +85,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	clientBody := body
 	var identityState codexIdentityConfuseState
 	upstreamBody, identityState := applyCodexIdentityConfuseBody(e.cfg, auth, originalPayloadSource, body)
-	if fastEnabled {
-		// Inject service_tier=priority into the upstream body only. Both the prewarm
-		// frame and the main turn derive from upstreamBody, so both carry it.
-		upstreamBody = applyCodexServiceTierPriority(upstreamBody)
-	}
+	upstreamBody = applyCodexServiceTierPolicy(upstreamBody, fastEnabled)
 	reporter.SetCodexFastContext(originalPayloadSource, upstreamBody, fastEnabled)
 	reporter.SetTranslatedReasoningEffort(clientBody, to.String())
 	wsHeaders = applyCodexWebsocketHeaders(ctx, wsHeaders, auth, apiKey, e.cfg)
