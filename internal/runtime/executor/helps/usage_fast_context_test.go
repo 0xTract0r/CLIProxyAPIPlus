@@ -16,6 +16,7 @@ func TestCodexFastContextAttributionAndVisibleEvents(t *testing.T) {
 	}{
 		{`{}`, `{}`, false, "auto", "default", "serving"},
 		{`{"service_tier":"priority"}`, `{"service_tier":"priority"}`, false, "priority", "client", "serving"},
+		{`{"service_tier":"fast"}`, `{"service_tier":"default"}`, false, "default", "default", "serving"},
 		{`{}`, `{"service_tier":"priority"}`, true, "priority", "account", "serving"},
 		{`{"service_tier":"priority"}`, `{"service_tier":"priority"}`, true, "priority", "both", "serving"},
 		{`{"service_tier":"flex"}`, `{"service_tier":"flex"}`, false, "flex", "client", "serving"},

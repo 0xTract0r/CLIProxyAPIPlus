@@ -13,8 +13,8 @@ func (r *UsageReporter) SetCodexFastContext(client, outbound []byte, enabled boo
 	if r == nil {
 		return
 	}
-	clientTier := strings.ToLower(strings.TrimSpace(gjson.GetBytes(client, "service_tier").String()))
-	upstreamTier := strings.ToLower(strings.TrimSpace(gjson.GetBytes(outbound, "service_tier").String()))
+	clientTier := normalizeCodexServiceTier(gjson.GetBytes(client, "service_tier").String())
+	upstreamTier := normalizeCodexServiceTier(gjson.GetBytes(outbound, "service_tier").String())
 	if upstreamTier == "" {
 		upstreamTier = "auto"
 	}
@@ -44,4 +44,12 @@ func (r *UsageReporter) SetCodexFastContext(client, outbound []byte, enabled boo
 	r.telemetry.Version = 2
 	r.telemetry.VisibleContentObserved = true
 	r.telemetry.FastContext = &usage.FastContext{SchemaVersion: 1, ClientServiceTier: clientTier, UpstreamRequestServiceTier: upstreamTier, ServerFastEnabled: &enabled, TierSource: source, RequestKind: kind}
+}
+
+func normalizeCodexServiceTier(value string) string {
+	tier := strings.ToLower(strings.TrimSpace(value))
+	if tier == "fast" {
+		return "priority"
+	}
+	return tier
 }
