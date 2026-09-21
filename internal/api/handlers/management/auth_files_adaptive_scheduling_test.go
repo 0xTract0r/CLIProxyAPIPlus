@@ -686,3 +686,128 @@ func TestBuildAuthFileEntry_AdaptiveScheduling_AnchorCandidates(t *testing.T) {
 		}
 	})
 }
+
+// TestBuildAuthFileEntry_AdaptiveScheduling_AccountCreatedAt covers
+// openspec/changes/fix-account-origin-anchors: account_created_at is a
+// read-only display field projected at the account_scheduling view root, read
+// through coreauth.AccountCreatedAt from the persisted quota_snapshot.profile
+// -- preferring profile.account.created_at and falling back to
+// profile.organization.subscription_created_at only when the former is
+// absent. It is deliberately kept OUT of anchor_candidates: anchor_candidates
+// is the one-click pick set for the first_production_at warm-up anchor, and
+// seeding that anchor with the account's true (often much older) creation
+// time would inflate its apparent maturity, skip the deliberate warm-up ramp,
+// and raise ban risk. Neither first_production_at nor RuntimeIdentityState is
+// ever consulted for this field, and it is omitted (never synthesized) when
+// neither quota-snapshot source is present.
+func TestBuildAuthFileEntry_AdaptiveScheduling_AccountCreatedAt(t *testing.T) {
+	h := &Handler{cfg: &config.Config{AccountScheduling: config.DefaultAccountSchedulingConfig()}}
+	now := time.Now().UTC()
+
+	t.Run("profile.account.created_at present is projected verbatim at the view root, not in anchor_candidates", func(t *testing.T) {
+		accountCreated := now.Add(-400 * 24 * time.Hour).UTC().Format(time.RFC3339)
+		subscriptionCreated := now.Add(-30 * 24 * time.Hour).UTC().Format(time.RFC3339)
+		auth := &coreauth.Auth{
+			ID:         "claude-account-created-at-both",
+			Provider:   "claude",
+			Status:     coreauth.StatusActive,
+			UpdatedAt:  now,
+			Attributes: map[string]string{"runtime_only": "true"},
+			Metadata: map[string]any{
+				"quota_snapshot": map[string]any{
+					"profile": map[string]any{
+						"account": map[string]any{
+							"created_at": accountCreated,
+						},
+						"organization": map[string]any{
+							"subscription_created_at": subscriptionCreated,
+						},
+					},
+				},
+			},
+		}
+
+		entry := h.buildAuthFileEntry(auth)
+		view, ok := entry["account_scheduling"].(gin.H)
+		if !ok {
+			t.Fatalf("entry[\"account_scheduling\"] = %#v, want gin.H", entry["account_scheduling"])
+		}
+		if got := view["account_created_at"]; got != accountCreated {
+			t.Fatalf("account_scheduling.account_created_at = %#v, want %q (profile.account.created_at, not the subscription fallback)", got, accountCreated)
+		}
+		if candidates, present := view["anchor_candidates"].(gin.H); present {
+			if _, inCandidates := candidates["account_created_at"]; inCandidates {
+				t.Fatalf("anchor_candidates unexpectedly contains account_created_at = %#v; it must be display-only, never a fillable anchor candidate", candidates["account_created_at"])
+			}
+		}
+	})
+
+	t.Run("missing account.created_at falls back to organization.subscription_created_at", func(t *testing.T) {
+		subscriptionCreated := now.Add(-60 * 24 * time.Hour).UTC().Format(time.RFC3339)
+		auth := &coreauth.Auth{
+			ID:         "claude-account-created-at-fallback",
+			Provider:   "claude",
+			Status:     coreauth.StatusActive,
+			UpdatedAt:  now,
+			Attributes: map[string]string{"runtime_only": "true"},
+			Metadata: map[string]any{
+				"quota_snapshot": map[string]any{
+					"profile": map[string]any{
+						"organization": map[string]any{
+							"subscription_created_at": subscriptionCreated,
+						},
+					},
+				},
+			},
+		}
+
+		entry := h.buildAuthFileEntry(auth)
+		view := entry["account_scheduling"].(gin.H)
+		if got := view["account_created_at"]; got != subscriptionCreated {
+			t.Fatalf("account_scheduling.account_created_at = %#v, want %q (organization.subscription_created_at fallback)", got, subscriptionCreated)
+		}
+		if candidates, present := view["anchor_candidates"].(gin.H); present {
+			if _, inCandidates := candidates["account_created_at"]; inCandidates {
+				t.Fatalf("anchor_candidates unexpectedly contains account_created_at = %#v; it must be display-only, never a fillable anchor candidate", candidates["account_created_at"])
+			}
+		}
+	})
+
+	t.Run("neither quota-snapshot source present omits the field, never synthesized", func(t *testing.T) {
+		firstAuth := now.Add(-15 * 24 * time.Hour).UTC().Format(time.RFC3339)
+		auth := &coreauth.Auth{
+			ID:         "claude-account-created-at-none",
+			Provider:   "claude",
+			Status:     coreauth.StatusActive,
+			UpdatedAt:  now,
+			Attributes: map[string]string{"runtime_only": "true"},
+			Metadata: map[string]any{
+				// first_auth_at IS present here on purpose: account_created_at must
+				// stay omitted rather than falling back to it or to any other
+				// non-quota-snapshot source.
+				"account_settings": map[string]any{
+					"runtime_identity_state": map[string]any{
+						"current": map[string]any{
+							"created_at": firstAuth,
+						},
+					},
+				},
+			},
+		}
+
+		entry := h.buildAuthFileEntry(auth)
+		view := entry["account_scheduling"].(gin.H)
+		if _, present := view["account_created_at"]; present {
+			t.Fatalf("account_scheduling.account_created_at present = %#v, want omitted when no quota_snapshot.profile source exists", view["account_created_at"])
+		}
+		// first_auth_at IS expected in anchor_candidates here (it's a real anchor
+		// candidate); account_created_at must still be absent from it.
+		candidates, ok := view["anchor_candidates"].(gin.H)
+		if !ok {
+			t.Fatalf("anchor_candidates = %#v, want gin.H (first_auth_at should still be present)", view["anchor_candidates"])
+		}
+		if _, inCandidates := candidates["account_created_at"]; inCandidates {
+			t.Fatalf("anchor_candidates.account_created_at present = %#v, want it to never appear in anchor_candidates", candidates["account_created_at"])
+		}
+	})
+}
