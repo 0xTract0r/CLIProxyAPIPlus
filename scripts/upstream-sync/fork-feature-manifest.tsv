@@ -352,6 +352,9 @@ scheduling-warmup-pacing	management-snapshot	pattern	view\["warmup_traffic_pacin
 scheduling-warmup-pacing	read-only-regression	symbol	^func TestWarmupPacingManagerSnapshotReadOnly\(	sdk/cliproxy/auth/warmup_pacing_snapshot_test.go
 极速模型收益	fast-context-sdk	symbol	FastContext	sdk/cliproxy/usage/telemetry.go
 极速模型收益	fast-visible-telemetry	symbol	FirstVisibleContentMS	internal/runtime/executor/helps/usage_telemetry.go
+极速模型收益	fast-http-sse-observer	symbol	^func \(r \*UsageReporter\) ContentEventObserver\(	internal/runtime/executor/helps/usage_telemetry.go
+极速模型收益	fast-http-execute-visible-events	pattern	reporter\.ContentEventObserver\(\)	internal/runtime/executor/codex_executor_execute.go
+极速模型收益	fast-http-stream-visible-events	pattern	reporter\.ContentEventObserver\(\)	internal/runtime/executor/codex_executor_stream.go
 极速模型收益	fast-ws-stream-provenance	pattern	SetCodexFastContext\(	internal/runtime/executor/codex_websockets_stream.go
 极速模型收益	fast-ws-execute-provenance	pattern	SetCodexFastContext\(	internal/runtime/executor/codex_websockets_execute.go
 极速模型收益	fast-http-stream-provenance	pattern	SetCodexFastContext\(	internal/runtime/executor/codex_executor_stream.go
