@@ -111,6 +111,17 @@ func TestContentEventObserverHandlesKnownSSEWithNonSSEHeaders(t *testing.T) {
 	}
 }
 
+func TestDecodedContentTelemetryKeepsUnsupportedVisibleEventsIncomplete(t *testing.T) {
+	r := NewUsageReporter(context.Background(), "codex", "test", nil)
+	r.SetCodexFastContext([]byte(`{}`), []byte(`{}`), false)
+	r.UseDecodedContentTelemetry()
+	r.ObserveContentEvent([]byte(`{"type":"response.unknown_visible.delta","delta":"future"}`))
+	r.ObserveContentEvent([]byte(`{"type":"response.output_text.delta","delta":"known"}`))
+	if r.telemetry.VisibleContentObserved {
+		t.Fatal("later known delta restored completeness after an unsupported visible event")
+	}
+}
+
 func TestTelemetryFailureAndOptionalFields(t *testing.T) {
 	r := NewUsageReporter(context.Background(), "test", "test", nil)
 	r.observeFailure(context.DeadlineExceeded)

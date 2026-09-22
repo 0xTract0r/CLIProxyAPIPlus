@@ -258,9 +258,10 @@ func (r *UsageReporter) ObserveContentEvent(payload []byte) {
 	t := &r.telemetry
 	if t.Version >= 2 {
 		if unsupportedVisible {
+			r.visibleContentIncomplete = true
 			t.VisibleContentObserved = false
 		}
-		if visible {
+		if visible && !r.visibleContentIncomplete {
 			recognized = true
 			t.VisibleContentObserved = true
 		}
