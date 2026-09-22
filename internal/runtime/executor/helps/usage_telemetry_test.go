@@ -84,6 +84,33 @@ func TestTelemetrySSEBoundedAndUnsupported(t *testing.T) {
 	}
 }
 
+func TestContentEventObserverHandlesKnownSSEWithNonSSEHeaders(t *testing.T) {
+	r := NewUsageReporter(context.Background(), "codex", "test", nil)
+	r.SetCodexFastContext([]byte(`{}`), []byte(`{}`), false)
+	r.UseDecodedContentTelemetry()
+	observer := r.ContentEventObserver()
+	first := `data: {"type":"response.output_text.delta","delta":"hello"}` + "\n"
+	second := `data: {"type":"response.function_call_arguments.delta","delta":"{}"}` + "\n"
+	done := `data: {"type":"response.completed","response":{"usage":{"output_tokens":20,"output_tokens_details":{"reasoning_tokens":2}}}}` + "\n\n"
+	if _, err := observer.Write([]byte(first[:19])); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := observer.Write([]byte(first[19:])); err != nil {
+		t.Fatal(err)
+	}
+	r.requestedAt = r.requestedAt.Add(-2 * time.Second)
+	if _, err := observer.Write([]byte(second + done)); err != nil {
+		t.Fatal(err)
+	}
+	v := r.telemetrySnapshot(false, usage.Failure{})
+	if !v.VisibleContentObserved || v.VisibleContentEvents == nil || *v.VisibleContentEvents != 2 || v.FirstVisibleContentMS == nil || v.LastVisibleContentMS == nil || *v.LastVisibleContentMS-*v.FirstVisibleContentMS < 1000 {
+		t.Fatalf("missing visible span: %+v", v)
+	}
+	if v.StreamCompleted == nil || !*v.StreamCompleted || !v.OutputReasoningSubset || v.ObservationKind != "protocol_content_events" {
+		t.Fatalf("missing terminal metadata: %+v", v)
+	}
+}
+
 func TestTelemetryFailureAndOptionalFields(t *testing.T) {
 	r := NewUsageReporter(context.Background(), "test", "test", nil)
 	r.observeFailure(context.DeadlineExceeded)

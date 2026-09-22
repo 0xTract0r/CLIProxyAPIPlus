@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptrace"
@@ -97,7 +98,12 @@ func (r *UsageReporter) UseDecodedContentTelemetry() {
 	if r == nil {
 		return
 	}
+	r.telemetryMu.Lock()
 	r.decodedContentTelemetry = true
+	if r.telemetry.Version >= 2 {
+		r.telemetry.VisibleContentObserved = false
+	}
+	r.telemetryMu.Unlock()
 }
 
 func (r *UsageReporter) bodyObserver(resp *http.Response) func([]byte) {
@@ -113,42 +119,61 @@ func (r *UsageReporter) bodyObserver(resp *http.Response) func([]byte) {
 	r.telemetryMu.Lock()
 	r.telemetry.ObservationKind = "http_sse_unclassified"
 	r.telemetryMu.Unlock()
+	observer := r.ContentEventObserver()
+	return func(p []byte) {
+		_, _ = observer.Write(p)
+	}
+}
+
+// ContentEventObserver returns an io.Writer that observes SSE data lines while
+// preserving the caller's byte stream. Codex sometimes returns an SSE body with a
+// non-SSE Content-Type, so executors that already know the protocol use this writer
+// explicitly instead of relying on HTTP header classification.
+func (r *UsageReporter) ContentEventObserver() io.Writer {
+	return &usageSSEContentObserver{reporter: r}
+}
+
+type usageSSEContentObserver struct {
+	reporter *UsageReporter
+	line     []byte
+	disabled bool
+}
+
+func (o *usageSSEContentObserver) Write(p []byte) (int, error) {
+	written := len(p)
+	if o == nil || o.reporter == nil || o.disabled {
+		return written, nil
+	}
 	// Never retain more than 64 KiB of a line. Oversized events disable content
 	// observations so partial samples cannot masquerade as complete coverage.
 	const limit = 64 * 1024
-	var line []byte
-	disabled := false
-	return func(p []byte) {
-		if disabled {
-			return
+	for len(p) > 0 {
+		i := bytes.IndexByte(p, '\n')
+		part := p
+		if i >= 0 {
+			part = p[:i]
 		}
-		for len(p) > 0 {
-			i := bytes.IndexByte(p, '\n')
-			part := p
-			if i >= 0 {
-				part = p[:i]
-			}
-			if len(line)+len(part) > limit {
-				disabled = true
-				line = nil
-				r.telemetryMu.Lock()
-				r.telemetry.ObservationKind = "content_observation_truncated"
-				r.telemetry.VisibleContentObserved = false
-				r.telemetryMu.Unlock()
-				return
-			}
-			line = append(line, part...)
-			if i < 0 {
-				return
-			}
-			event := bytes.TrimSpace(line)
-			if bytes.HasPrefix(event, []byte("data:")) {
-				r.ObserveContentEvent(bytes.TrimSpace(event[5:]))
-			}
-			line = line[:0]
-			p = p[i+1:]
+		if len(o.line)+len(part) > limit {
+			o.disabled = true
+			o.line = nil
+			o.reporter.telemetryMu.Lock()
+			o.reporter.telemetry.ObservationKind = "content_observation_truncated"
+			o.reporter.telemetry.VisibleContentObserved = false
+			o.reporter.telemetryMu.Unlock()
+			return written, nil
 		}
+		o.line = append(o.line, part...)
+		if i < 0 {
+			return written, nil
+		}
+		event := bytes.TrimSpace(o.line)
+		if bytes.HasPrefix(event, []byte("data:")) {
+			o.reporter.ObserveContentEvent(bytes.TrimSpace(event[5:]))
+		}
+		o.line = o.line[:0]
+		p = p[i+1:]
 	}
+	return written, nil
 }
 
 // ObserveContentEvent inspects a protocol event without retaining its payload.
@@ -237,6 +262,7 @@ func (r *UsageReporter) ObserveContentEvent(payload []byte) {
 		}
 		if visible {
 			recognized = true
+			t.VisibleContentObserved = true
 		}
 		if subset {
 			t.OutputReasoningSubset = true

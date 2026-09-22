@@ -104,6 +104,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 
 	httpClient := helps.NewUtlsHTTPClient(ctx, e.cfg, auth, 0)
 	reporter.SetCodexFastContext(originalPayloadSource, upstreamBody, codexFastEnabled(auth, baseModel))
+	reporter.UseDecodedContentTelemetry()
 	httpClient = reporter.TrackHTTPClient(httpClient)
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
@@ -137,7 +138,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 				log.Errorf("codex executor: close response body error: %v", errClose)
 			}
 		}()
-		scanner := bufio.NewScanner(httpResp.Body)
+		scanner := bufio.NewScanner(io.TeeReader(httpResp.Body, reporter.ContentEventObserver()))
 		scanner.Buffer(nil, 52_428_800) // 50MB
 		claudeInputTokens := helps.NewClaudeInputTokenState(from, to, responseFormat, originalPayload)
 		var param any
