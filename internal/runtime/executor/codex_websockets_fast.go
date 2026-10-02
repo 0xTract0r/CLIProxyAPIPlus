@@ -25,9 +25,8 @@ const codexFastPrewarmWarmupText = "<session warmup>"
 // codexFastEnabled reports whether the Codex priority/fast Responses websocket flow
 // is enabled for this credential AND this specific model. It is the per-account &
 // per-model gate that parallels codexWebsocketsEnabled: fast is opt-in, never on by
-// default, and implies the websocket transport (fast only works over the responses
-// websocket, so a fast-enabled request is routed to the ws upstream even when the
-// downstream is plain HTTP/SSE).
+// default. It selects the priority service tier independently of transport; the
+// auto executor prefers WS with a size guard for complete HTTP/SSE requests.
 //
 // The allowlist is sourced from auth.Attributes["fast_models"] (a normalized
 // comma-separated list written by the config synthesizer) with a Metadata fallback for
