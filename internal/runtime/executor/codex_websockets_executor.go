@@ -21,7 +21,8 @@ import (
 type CodexWebsocketsExecutor struct {
 	*CodexExecutor
 
-	store *codexWebsocketSessionStore
+	store        *codexWebsocketSessionStore
+	httpFallback *CodexExecutor
 }
 
 func NewCodexWebsocketsExecutor(cfg *config.Config) *CodexWebsocketsExecutor {
@@ -31,20 +32,21 @@ func NewCodexWebsocketsExecutor(cfg *config.Config) *CodexWebsocketsExecutor {
 	}
 }
 
-// CodexAutoExecutor routes Codex requests to the websocket transport only when:
-//  1. The downstream transport is websocket, and
-//  2. The selected auth enables websockets.
-//
-// For non-websocket downstream requests, it always uses the legacy HTTP implementation.
+// CodexAutoExecutor preserves downstream WS routing and prefers WS for Fast.
+// Complete HTTP/SSE requests may stay on HTTP when the serialized WS request
+// exceeds the local transport budget. Fast service-tier policy applies to both.
 type CodexAutoExecutor struct {
 	httpExec *CodexExecutor
 	wsExec   *CodexWebsocketsExecutor
 }
 
 func NewCodexAutoExecutor(cfg *config.Config) *CodexAutoExecutor {
+	httpExec := NewCodexExecutor(cfg)
+	wsExec := NewCodexWebsocketsExecutor(cfg)
+	wsExec.httpFallback = httpExec
 	return &CodexAutoExecutor{
-		httpExec: NewCodexExecutor(cfg),
-		wsExec:   NewCodexWebsocketsExecutor(cfg),
+		httpExec: httpExec,
+		wsExec:   wsExec,
 	}
 }
 
@@ -53,9 +55,12 @@ func NewCodexAutoExecutor(cfg *config.Config) *CodexAutoExecutor {
 // detection, so it intentionally stays on the no-manager constructor; do not
 // claim symmetry until WS frames are parsed for cyber_policy events.
 func NewCodexAutoExecutorWithManager(cfg *config.Config, manager *cliproxyauth.Manager) *CodexAutoExecutor {
+	httpExec := NewCodexExecutorWithManager(cfg, manager)
+	wsExec := NewCodexWebsocketsExecutor(cfg)
+	wsExec.httpFallback = httpExec
 	return &CodexAutoExecutor{
-		httpExec: NewCodexExecutorWithManager(cfg, manager),
-		wsExec:   NewCodexWebsocketsExecutor(cfg),
+		httpExec: httpExec,
+		wsExec:   wsExec,
 	}
 }
 
@@ -133,11 +138,9 @@ func (e *CodexAutoExecutor) UpstreamDisconnectChan(sessionID string) <-chan erro
 // responses websocket upstream. Two independent conditions route to ws:
 //  1. The existing rule: the downstream transport is websocket AND the credential
 //     enables websockets.
-//  2. Fast implies ws: the credential enables fast for this model. Codex priority
-//     only applies over the responses websocket transport, so a fast-enabled request
-//     is routed to the ws upstream even when the downstream is plain HTTP/SSE. The ws
-//     executor already translates the ws event stream back to SSE / non-stream for a
-//     non-websocket downstream.
+//  2. Fast prefers WS for the selected model. The WS executor checks the fully
+//     serialized request before dialing and routes eligible oversized HTTP/SSE
+//     requests to HTTP while retaining account priority policy.
 func codexAutoRouteToWebsocket(ctx context.Context, auth *cliproxyauth.Auth, model string) bool {
 	if cliproxyexecutor.DownstreamWebsocket(ctx) && codexWebsocketsEnabled(auth) {
 		return true

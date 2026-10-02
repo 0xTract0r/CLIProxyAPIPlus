@@ -18,7 +18,7 @@ import (
 	"github.com/tidwall/gjson"
 )
 
-func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
+func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (result *cliproxyexecutor.StreamResult, err error) {
 	log.Debugf("Executing Codex Websockets stream request with auth ID: %s, model: %s", auth.ID, req.Model)
 	if ctx == nil {
 		ctx = context.Background()
@@ -36,7 +36,20 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 
 	reporter := helps.NewExecutorUsageReporter(ctx, e, baseModel, auth)
 	reporter.SetWebsocketTelemetry()
-	defer reporter.TrackFailure(ctx, &err)
+	httpFallbackAllowed, httpFallbackStarted := false, false
+	wsBudget, wsMessageBytes, wsPhase := codexFastWebsocketMessageBytes(), 0, "prepare"
+	defer func() {
+		if !httpFallbackStarted {
+			reporter.TrackFailure(ctx, &err)
+		}
+	}()
+	defer func() {
+		if httpFallbackAllowed && ctx.Err() == nil && isCodexWebsocketMessageTooBig(err) {
+			httpFallbackStarted = true
+			logCodexFastTransport(ctx, wsPhase, "http_upstream_1009", wsMessageBytes, wsBudget)
+			result, err = e.executeHTTPFallbackStream(ctx, auth, req, opts, true)
+		}
+	}()
 
 	from := opts.SourceFormat
 	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
@@ -90,6 +103,18 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	e.persistCodexDeviceHighWater(ctx, auth)
 	applyModelHeaderOverrides(wsHeaders, baseModel)
 	applyCodexIdentityConfuseHeaders(wsHeaders, &identityState)
+	httpFallbackAllowed = fastEnabled && codexHTTPFallbackAllowed(ctx, req, opts, upstreamBody)
+	if httpFallbackAllowed {
+		mainBody := buildCodexWebsocketFastMainBody(upstreamBody, "")
+		prewarmBody := buildCodexWebsocketPrewarmBody(upstreamBody)
+		if len(prewarmBody) > len(mainBody) {
+			mainBody = prewarmBody
+		}
+		if codexFastWebsocketSizeGate(ctx, mainBody, wsBudget, "prepare") {
+			httpFallbackStarted = true
+			return e.executeHTTPFallbackStream(ctx, auth, req, opts, false)
+		}
+	}
 
 	var authID, authLabel, authType, authValue string
 	authID = auth.ID
@@ -194,13 +219,27 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	if sess != nil {
 		readCh = sess.activate(conn)
 	}
+	var stopFallbackCancel func() bool
+	streamOwnsConnection := false
+	if httpFallbackAllowed {
+		recoveryCloser := closer
+		stopFallbackCancel = context.AfterFunc(ctx, func() { _ = recoveryCloser.Close() })
+	}
+	defer func() {
+		if !streamOwnsConnection && stopFallbackCancel != nil {
+			stopFallbackCancel()
+		}
+	}()
 
 	// Codex fast: run the generate:false prewarm -> main turn link on this same
-	// connection before the main send (necessary condition for upstream priority).
-	// Fail-closed: a prewarm error tears down the connection and aborts the turn.
+	// connection before the main send. Priority policy also applies over HTTP.
 	if fastEnabled {
+		wsPhase, wsMessageBytes = "prewarm", len(buildCodexWebsocketPrewarmBody(upstreamBody))
 		prewarmID, errPrewarm := e.runCodexFastPrewarm(ctx, sess, conn, readCh, upstreamBody, identityState)
 		if errPrewarm != nil {
+			if ctx.Err() != nil {
+				errPrewarm = ctx.Err()
+			}
 			helps.RecordAPIWebsocketError(ctx, e.cfg, "fast_prewarm", errPrewarm)
 			if sess != nil {
 				e.invalidateUpstreamConn(sess, conn, "fast_prewarm_error", errPrewarm)
@@ -215,6 +254,17 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			return nil, errPrewarm
 		}
 		wsReqBody = buildCodexWebsocketFastMainBody(upstreamBody, prewarmID)
+		if httpFallbackAllowed && codexFastWebsocketSizeGate(ctx, wsReqBody, wsBudget, "main") {
+			httpFallbackStarted = true
+			if sess != nil {
+				e.invalidateUpstreamConn(sess, conn, "http_size_gate", nil)
+				sess.clearActive(conn, readCh)
+				unlockStreamSession()
+			} else {
+				_ = closer.Close()
+			}
+			return e.executeHTTPFallbackStream(ctx, auth, req, opts, false)
+		}
 		helps.RecordAPIWebsocketRequest(ctx, e.cfg, helps.UpstreamRequestLog{
 			URL:       wsURL,
 			Method:    "WEBSOCKET",
@@ -228,6 +278,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		})
 	}
 
+	wsPhase, wsMessageBytes = "main", len(wsReqBody)
 	if errSend := writeCodexWebsocketMessage(sess, conn, wsReqBody); errSend != nil {
 		errSend = mapCodexWebsocketWriteError(sess, conn, errSend)
 		helps.RecordAPIWebsocketError(ctx, e.cfg, "send", errSend)
@@ -299,7 +350,29 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		}
 	}
 
+	var firstRead *codexWebsocketRead
+	if httpFallbackAllowed {
+		msgType, payload, errRead := readCodexWebsocketMessage(ctx, sess, conn, readCh)
+		if errRead != nil {
+			mappedErr := mapCodexWebsocketReadError(errRead)
+			if ctx.Err() != nil {
+				mappedErr = ctx.Err()
+			}
+			helps.RecordAPIWebsocketError(ctx, e.cfg, "read", mappedErr)
+			if sess != nil {
+				e.invalidateUpstreamConn(sess, conn, "read_error", mappedErr)
+				sess.clearActive(conn, readCh)
+				unlockStreamSession()
+			} else {
+				_ = closer.Close()
+			}
+			return nil, mappedErr
+		}
+		firstRead = &codexWebsocketRead{msgType: msgType, payload: payload}
+		httpFallbackAllowed = false
+	}
 	out := make(chan cliproxyexecutor.StreamChunk)
+	streamOwnsConnection = true
 	go func() {
 		terminateReason := "completed"
 		var terminateErr error
@@ -307,6 +380,9 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 
 		defer close(out)
 		defer func() {
+			if stopFallbackCancel != nil {
+				stopFallbackCancel()
+			}
 			if sess != nil {
 				// Clearing the consumer alone leaves upstream generation running.
 				// Discard that connection before another turn can activate it.
@@ -347,9 +423,17 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				_ = send(cliproxyexecutor.StreamChunk{Err: ctx.Err()})
 				return
 			}
-			msgType, payload, errRead := readCodexWebsocketMessage(ctx, sess, conn, readCh)
+			var msgType int
+			var payload []byte
+			var errRead error
+			if firstRead != nil {
+				msgType, payload = firstRead.msgType, firstRead.payload
+				firstRead = nil
+			} else {
+				msgType, payload, errRead = readCodexWebsocketMessage(ctx, sess, conn, readCh)
+			}
 			if errRead != nil {
-				if sess != nil && ctx != nil && ctx.Err() != nil {
+				if ctx != nil && ctx.Err() != nil {
 					terminateReason = "context_done"
 					terminateErr = ctx.Err()
 					_ = send(cliproxyexecutor.StreamChunk{Err: ctx.Err()})

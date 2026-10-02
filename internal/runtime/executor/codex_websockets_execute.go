@@ -36,7 +36,22 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 
 	reporter := helps.NewExecutorUsageReporter(ctx, e, baseModel, auth)
 	reporter.SetWebsocketTelemetry()
-	defer reporter.TrackFailure(ctx, &err)
+	httpFallbackAllowed, httpFallbackStarted, receivedMainResponse := false, false, false
+	wsBudget, wsMessageBytes, wsPhase := codexFastWebsocketMessageBytes(), 0, "prepare"
+	defer func() {
+		if !httpFallbackStarted {
+			reporter.TrackFailure(ctx, &err)
+		}
+	}()
+	// Connection cleanup/unlock executes before HTTP; only HTTP owns its outcome.
+	defer func() {
+		if httpFallbackAllowed && !receivedMainResponse && ctx.Err() == nil && isCodexWebsocketMessageTooBig(err) {
+			httpFallbackStarted = true
+			logCodexFastTransport(ctx, wsPhase, "http_upstream_1009", wsMessageBytes, wsBudget)
+			resp, err = e.httpFallbackExecutor().Execute(ctx, auth, req, opts)
+			err = scopedCodexHTTPFallbackError(err)
+		}
+	}()
 
 	from := opts.SourceFormat
 	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
@@ -95,6 +110,18 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	e.persistCodexDeviceHighWater(ctx, auth)
 	applyModelHeaderOverrides(wsHeaders, baseModel)
 	applyCodexIdentityConfuseHeaders(wsHeaders, &identityState)
+	httpFallbackAllowed = fastEnabled && codexHTTPFallbackAllowed(ctx, req, opts, upstreamBody)
+	if httpFallbackAllowed {
+		mainBody := buildCodexWebsocketFastMainBody(upstreamBody, "")
+		prewarmBody := buildCodexWebsocketPrewarmBody(upstreamBody)
+		if len(prewarmBody) > len(mainBody) {
+			mainBody = prewarmBody
+		}
+		if codexFastWebsocketSizeGate(ctx, mainBody, wsBudget, "prepare") {
+			httpFallbackStarted = true
+			return e.httpFallbackExecutor().Execute(ctx, auth, req, opts)
+		}
+	}
 
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
@@ -204,13 +231,19 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		}()
 	}
 
-	// Codex fast: run the generate:false prewarm -> main turn link on this same
-	// connection (the necessary condition for upstream priority). Fail-closed: a
-	// prewarm error aborts the turn (the deferred close/unlock/clearActive above and
-	// the sess==nil close defer handle teardown).
+	if httpFallbackAllowed {
+		recoveryCloser := closer
+		stopCancel := context.AfterFunc(ctx, func() { _ = recoveryCloser.Close() })
+		defer stopCancel()
+	}
+	// Preserve the preferred Fast WS prewarm/turn link for eligible small requests.
 	if fastEnabled {
+		wsPhase, wsMessageBytes = "prewarm", len(buildCodexWebsocketPrewarmBody(upstreamBody))
 		prewarmID, errPrewarm := e.runCodexFastPrewarm(ctx, sess, conn, readCh, upstreamBody, identityState)
 		if errPrewarm != nil {
+			if ctx.Err() != nil {
+				errPrewarm = ctx.Err()
+			}
 			if sess != nil {
 				e.invalidateUpstreamConn(sess, conn, "fast_prewarm_error", errPrewarm)
 			}
@@ -218,6 +251,17 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 			return resp, errPrewarm
 		}
 		wsReqBody = buildCodexWebsocketFastMainBody(upstreamBody, prewarmID)
+		if httpFallbackAllowed && codexFastWebsocketSizeGate(ctx, wsReqBody, wsBudget, "main") {
+			httpFallbackStarted = true
+			if sess != nil {
+				e.invalidateUpstreamConn(sess, conn, "http_size_gate", nil)
+				sess.clearActive(conn, readCh)
+			} else {
+				_ = closer.Close()
+			}
+			unlockSession()
+			return e.httpFallbackExecutor().Execute(ctx, auth, req, opts)
+		}
 		helps.RecordAPIWebsocketRequest(ctx, e.cfg, helps.UpstreamRequestLog{
 			URL:       wsURL,
 			Method:    "WEBSOCKET",
@@ -231,6 +275,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		})
 	}
 
+	wsPhase, wsMessageBytes = "main", len(wsReqBody)
 	if errSend := writeCodexWebsocketMessage(sess, conn, wsReqBody); errSend != nil {
 		errSend = mapCodexWebsocketWriteError(sess, conn, errSend)
 		if sess != nil {
@@ -304,10 +349,14 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		}
 		msgType, payload, errRead := readCodexWebsocketMessage(ctx, sess, conn, readCh)
 		if errRead != nil {
+			if ctx.Err() != nil {
+				errRead = ctx.Err()
+			}
 			mappedErr := mapCodexWebsocketReadError(errRead)
 			helps.RecordAPIWebsocketError(ctx, e.cfg, "read", mappedErr)
 			return resp, mappedErr
 		}
+		receivedMainResponse = true
 		if msgType != websocket.TextMessage {
 			if msgType == websocket.BinaryMessage {
 				err = fmt.Errorf("codex websockets executor: unexpected binary message")
