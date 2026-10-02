@@ -52,7 +52,8 @@ func codexFastWebsocketSizeGate(ctx context.Context, body []byte, budget int, ph
 }
 
 func logCodexFastTransport(ctx context.Context, phase, decision string, messageBytes, budget int) {
-	helps.LogWithRequestID(ctx).WithFields(log.Fields{"phase": phase, "message_bytes": messageBytes, "budget_bytes": budget, "decision": decision}).Info("codex fast transport")
+	// 文本格式化器只输出白名单字段；消息中也保留匿名决策，保证落盘可验收。
+	helps.LogWithRequestID(ctx).WithFields(log.Fields{"phase": phase, "message_bytes": messageBytes, "budget_bytes": budget, "decision": decision}).Infof("codex fast transport phase=%s decision=%s message_bytes=%d budget_bytes=%d", phase, decision, messageBytes, budget)
 }
 
 func (e *CodexWebsocketsExecutor) httpFallbackExecutor() *CodexExecutor {

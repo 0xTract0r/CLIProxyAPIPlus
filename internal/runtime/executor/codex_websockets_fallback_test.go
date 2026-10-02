@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -15,13 +16,36 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
+	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
+
+func TestCodexFastTransportLogSurvivesProductionFormatter(t *testing.T) {
+	logger := log.StandardLogger()
+	previousFormatter, previousOutput, previousLevel := logger.Formatter, logger.Out, logger.Level
+	t.Cleanup(func() {
+		logger.SetFormatter(previousFormatter)
+		logger.SetOutput(previousOutput)
+		logger.SetLevel(previousLevel)
+	})
+	var output bytes.Buffer
+	logger.SetFormatter(&logging.LogFormatter{})
+	logger.SetOutput(&output)
+	logger.SetLevel(log.InfoLevel)
+	ctx := logging.WithRequestID(context.Background(), "probe001")
+	logCodexFastTransport(ctx, "main", "http_size_gate", 17322596, 16711680)
+	for _, expected := range []string{"probe001", "phase=main", "decision=http_size_gate", "message_bytes=17322596", "budget_bytes=16711680"} {
+		if !strings.Contains(output.String(), expected) {
+			t.Errorf("production log missing %q: %s", expected, output.String())
+		}
+	}
+}
 
 type captureCodexFallbackUsage struct {
 	model   string
