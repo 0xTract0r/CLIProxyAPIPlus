@@ -73,44 +73,163 @@ func (l *codexWebsocketSessionLease) release() {
 }
 
 func codexFastIndependentRequest(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, body []byte, fast bool) bool {
-	if !fast || executionSessionIDFromOptions(opts) != "" || !codexHTTPFallbackAllowed(ctx, req, opts, body) {
-		return false
+	independent, reason := codexFastIndependentRequestEligibility(ctx, req, opts, body, fast)
+	helps.LogWithRequestID(ctx).Infof("codex websocket lease eligibility independent=%t reason=%s", independent, reason)
+	return independent
+}
+
+func codexFastIndependentRequestEligibility(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, body []byte, fast bool) (bool, string) {
+	if !fast {
+		return false, "fast_disabled"
+	}
+	if executionSessionIDFromOptions(opts) != "" {
+		return false, "execution_session"
+	}
+	if !codexHTTPFallbackAllowed(ctx, req, opts, body) {
+		return false, "bound_or_incremental_request"
+	}
+	for _, payload := range [][]byte{req.Payload, opts.OriginalRequest, body} {
+		if gjson.GetBytes(payload, "multi_agent.enabled").Bool() {
+			return false, "active_multi_agent"
+		}
+		for _, key := range []string{"conversation", "conversation_id", "response_id", "stream_id"} {
+			if gjson.GetBytes(payload, key).Exists() {
+				return false, "connection_anchor"
+			}
+		}
 	}
 	input := gjson.GetBytes(body, "input")
 	if input.Type == gjson.String {
-		return strings.TrimSpace(input.String()) != ""
+		if strings.TrimSpace(input.String()) != "" {
+			return true, "complete_input"
+		}
+		return false, "input_shape"
 	}
 	if !input.IsArray() || len(input.Array()) == 0 {
-		return false
+		return false, "input_shape"
 	}
 	pending := make(map[string]bool)
 	for _, item := range input.Array() {
 		switch item.Get("type").String() {
 		case "item_reference":
-			return false
+			return false, "input_reference"
 		case "function_call", "custom_tool_call":
 			id := item.Get("call_id").String()
 			if id == "" || pending[id] {
-				return false
+				return false, "tool_dependency"
 			}
 			pending[id] = true
 		case "function_call_output", "custom_tool_call_output":
 			id := item.Get("call_id").String()
 			if !pending[id] {
-				return false
+				return false, "tool_dependency"
 			}
 			delete(pending, id)
 		case "message", "reasoning":
+		case "compaction":
+			if !codexHistoryNonemptyString(item.Get("encrypted_content")) {
+				return false, "compaction_shape"
+			}
+		case "agent_message":
+			if !codexIndependentAgentMessage(item) {
+				return false, "agent_message_shape"
+			}
+		case "additional_tools":
+			if item.Get("role").String() != "developer" || item.Get("role").Type != gjson.String || !codexIndependentToolDeclarations(item.Get("tools")) {
+				return false, "additional_tools_shape"
+			}
 		case "":
 			if !item.IsObject() || !item.Get("role").Exists() || !item.Get("content").Exists() {
-				return false
+				return false, "input_shape"
 			}
 		default:
 			// Unverified tool/approval items may depend on state held by the base socket.
+			return false, "unknown_input_item"
+		}
+	}
+	if len(pending) != 0 {
+		return false, "tool_dependency"
+	}
+	return true, "complete_input"
+}
+
+func codexHistoryNonemptyString(value gjson.Result) bool {
+	return value.Type == gjson.String && strings.TrimSpace(value.String()) != ""
+}
+
+func codexIndependentAgentMessage(item gjson.Result) bool {
+	if !codexHistoryNonemptyString(item.Get("author")) || !codexHistoryNonemptyString(item.Get("recipient")) {
+		return false
+	}
+	content := item.Get("content")
+	if !content.IsArray() || len(content.Array()) == 0 {
+		return false
+	}
+	for _, part := range content.Array() {
+		switch part.Get("type").String() {
+		case "input_text":
+			if part.Get("text").Type != gjson.String {
+				return false
+			}
+		case "encrypted_content":
+			if !codexHistoryNonemptyString(part.Get("encrypted_content")) {
+				return false
+			}
+		default:
 			return false
 		}
 	}
-	return len(pending) == 0
+	return true
+}
+
+func codexIndependentToolDeclarations(tools gjson.Result) bool {
+	if !tools.IsArray() || len(tools.Array()) == 0 {
+		return false
+	}
+	for _, tool := range tools.Array() {
+		if !codexHistoryNonemptyString(tool.Get("name")) {
+			return false
+		}
+		if description := tool.Get("description"); description.Exists() && description.Type != gjson.String {
+			return false
+		}
+		if tool.Get("type").String() == "namespace" {
+			children := tool.Get("tools")
+			if !children.IsArray() || len(children.Array()) == 0 {
+				return false
+			}
+			for _, child := range children.Array() {
+				if !codexIndependentLeafToolDeclaration(child) {
+					return false
+				}
+			}
+		} else if !codexIndependentLeafToolDeclaration(tool) {
+			return false
+		}
+	}
+	return true
+}
+
+func codexIndependentLeafToolDeclaration(tool gjson.Result) bool {
+	if !codexHistoryNonemptyString(tool.Get("name")) {
+		return false
+	}
+	if description := tool.Get("description"); description.Exists() && description.Type != gjson.String {
+		return false
+	}
+	switch tool.Get("type").String() {
+	case "function":
+		return tool.Get("parameters").IsObject()
+	case "custom":
+		format := tool.Get("format")
+		switch format.Get("type").String() {
+		case "text":
+			return true
+		case "grammar":
+			return codexHistoryNonemptyString(format.Get("definition")) && (format.Get("syntax").String() == "lark" || format.Get("syntax").String() == "regex")
+		}
+	}
+	return false
 }
 
 func (e *CodexWebsocketsExecutor) acquireSessionLease(ctx context.Context, sessionID string, auth *cliproxyauth.Auth, wsURL string, independent bool) (*codexWebsocketSessionLease, error) {
