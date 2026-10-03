@@ -138,20 +138,16 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		// per-conversation id. Scoped to the fast path only.
 		executionSessionID = codexFastSessionFallbackID(opts, req)
 	}
+	lease, errLease := e.acquireSessionLease(ctx, executionSessionID, auth, wsURL, codexFastIndependentRequest(ctx, req, opts, upstreamBody, fastEnabled))
+	if errLease != nil {
+		return resp, errLease
+	}
 	var sess *codexWebsocketSession
-	sessionLocked := false
-	unlockSession := func() {
-		if sess != nil && sessionLocked {
-			sess.reqMu.Unlock()
-			sessionLocked = false
-		}
+	if lease != nil {
+		sess = lease.session
 	}
-	if executionSessionID != "" {
-		sess = e.getOrCreateSession(executionSessionID, auth, wsURL)
-		sess.reqMu.Lock()
-		sessionLocked = true
-		defer unlockSession()
-	}
+	unlockSession := func() { lease.release() }
+	defer unlockSession()
 
 	wsReqBody := buildCodexWebsocketRequestBody(upstreamBody)
 	wsReqLog := helps.UpstreamRequestLog{
@@ -188,6 +184,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 			if opts.ExecutionLifecycle != nil || cliproxyexecutor.DownstreamWebsocket(ctx) {
 				return resp, statusErr{code: respHS.StatusCode, msg: string(bodyErr)}
 			}
+			unlockSession()
 			return e.CodexExecutor.Execute(ctx, auth, req, opts)
 		}
 		if respHS != nil && respHS.StatusCode > 0 {
@@ -197,8 +194,8 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		return resp, errDial
 	}
 	if errBind := sess.bindExecutionLifecycle(opts, conn, closer, req.Model); errBind != nil {
-		unlockSession()
 		closeWebsocketAfterBindFailure(sess, conn, closer)
+		unlockSession()
 		return resp, errBind
 	}
 	recordAPIWebsocketHandshake(ctx, e.cfg, respHS)
@@ -303,8 +300,8 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 				closer = closerRetry
 				if errBind := sess.bindExecutionLifecycle(opts, conn, closer, req.Model); errBind != nil {
 					clearRetryActiveState(sess, previousConn, previousReadCh)
-					unlockSession()
 					closeWebsocketAfterBindFailure(sess, conn, closer)
+					unlockSession()
 					return resp, errBind
 				}
 				readCh = sess.activate(conn)
@@ -391,8 +388,8 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		}
 		if streamErr, terminalBody, ok := codexTerminalFailureErr(payload); ok {
 			if sess != nil {
-				unlockSession()
 				e.invalidateUpstreamConn(sess, conn, "terminal_failure", streamErr)
+				unlockSession()
 			}
 			if errClearReplay := clearCodexReasoningReplayOnInvalidSignature(ctx, replayScope, streamErr.StatusCode(), terminalBody); errClearReplay != nil {
 				return resp, errClearReplay
