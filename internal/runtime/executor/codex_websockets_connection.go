@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -41,7 +42,55 @@ func (e *CodexWebsocketsExecutor) dialCodexWebsocket(ctx context.Context, auth *
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	// Gorilla does not interrupt the HTTP upgrade read on cancellation after
+	// dialing TCP. Keep ownership of that socket only until the handshake ends.
+	var dialMu sync.Mutex
+	var handshakeConn net.Conn
+	handshakeFinished := false
+	wrapDial := func(dial func(context.Context, string, string) (net.Conn, error)) func(context.Context, string, string) (net.Conn, error) {
+		return func(dialCtx context.Context, network, address string) (net.Conn, error) {
+			rawConn, errDial := dial(dialCtx, network, address)
+			if errDial != nil {
+				return nil, errDial
+			}
+			dialMu.Lock()
+			if ctx.Err() != nil {
+				dialMu.Unlock()
+				_ = rawConn.Close()
+				return nil, ctx.Err()
+			}
+			handshakeConn = rawConn
+			dialMu.Unlock()
+			return rawConn, nil
+		}
+	}
+	netDial := dialer.NetDialContext
+	if netDial == nil {
+		netDial = (&net.Dialer{}).DialContext
+	}
+	dialer.NetDialContext = wrapDial(netDial)
+	if dialer.NetDialTLSContext != nil {
+		dialer.NetDialTLSContext = wrapDial(dialer.NetDialTLSContext)
+	}
+	stopCancel := context.AfterFunc(ctx, func() {
+		dialMu.Lock()
+		defer dialMu.Unlock()
+		if !handshakeFinished && handshakeConn != nil {
+			_ = handshakeConn.Close()
+		}
+	})
 	conn, resp, err := dialer.DialContext(ctx, wsURL, headers)
+	stopCancel()
+	dialMu.Lock()
+	handshakeFinished = true
+	dialMu.Unlock()
+	if ctx.Err() != nil {
+		if conn != nil {
+			_ = conn.Close()
+			conn = nil
+		}
+		return nil, nil, resp, ctx.Err()
+	}
 	closer := newWebsocketConnectionCloser(conn)
 	if conn != nil {
 		// Avoid gorilla/websocket flate tail validation issues on some upstreams/Go versions.
