@@ -14,11 +14,13 @@ import (
 	"io"
 	"net/http"
 	"sort"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	. "github.com/router-for-me/CLIProxyAPI/v7/internal/constant"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -485,6 +487,8 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 	// New core execution path
 	modelName := gjson.GetBytes(rawJSON, "model").String()
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
+	cliCtx, stages := helps.BeginCodexStreamStages(cliCtx, c)
+	defer stages.HandlerDone()
 	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "")
 
 	setSSEHeaders := func() {
@@ -508,7 +512,11 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 				continue
 			}
 			// Upstream failed immediately. Return proper error status and JSON.
+			writeStarted := time.Now()
 			h.WriteErrorResponse(c, errMsg)
+			if stages.Active() {
+				stages.ObserveWrite(writeStarted)
+			}
 			if errMsg != nil {
 				cliCancel(errMsg.Error)
 			} else {
@@ -520,8 +528,16 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 				// Stream closed without data? Send headers and done.
 				setSSEHeaders()
 				handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+				writeStarted := time.Now()
 				_, _ = c.Writer.Write([]byte("\n"))
+				if stages.Active() {
+					stages.ObserveWrite(writeStarted)
+				}
+				flushStarted := time.Now()
 				flusher.Flush()
+				if stages.Active() {
+					stages.ObserveFlush(flushStarted)
+				}
 				cliCancel(nil)
 				return
 			}
@@ -531,8 +547,16 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 			handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
 
 			// Write first chunk logic (matching forwardResponsesStream)
+			writeStarted := time.Now()
 			framer.WriteChunk(c.Writer, chunk)
+			if stages.Active() {
+				stages.ObserveWrite(writeStarted)
+			}
+			flushStarted := time.Now()
 			flusher.Flush()
+			if stages.Active() {
+				stages.ObserveFlush(flushStarted)
+			}
 
 			// Continue
 			h.forwardResponsesStream(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan, framer)

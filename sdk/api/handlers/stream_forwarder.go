@@ -6,6 +6,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 )
 
 type StreamForwardOptions struct {
@@ -35,6 +36,28 @@ func (h *BaseAPIHandler) ForwardStream(c *gin.Context, flusher http.Flusher, can
 	}
 	if cancel == nil {
 		return
+	}
+	stages := helps.CodexStreamStagesFromGin(c)
+	if !stages.HandlerManaged() {
+		stages = nil
+	}
+	write := func(callback func()) {
+		if stages == nil || !stages.Active() {
+			callback()
+			return
+		}
+		started := time.Now()
+		callback()
+		stages.ObserveWrite(started)
+	}
+	flush := func() {
+		if stages == nil || !stages.Active() {
+			flusher.Flush()
+			return
+		}
+		started := time.Now()
+		flusher.Flush()
+		stages.ObserveFlush(started)
 	}
 
 	writeChunk := opts.WriteChunk
@@ -81,21 +104,21 @@ func (h *BaseAPIHandler) ForwardStream(c *gin.Context, flusher http.Flusher, can
 				}
 				if terminalErr != nil {
 					if opts.WriteTerminalError != nil {
-						opts.WriteTerminalError(terminalErr)
+						write(func() { opts.WriteTerminalError(terminalErr) })
 					}
-					flusher.Flush()
+					flush()
 					cancel(terminalErr.Error)
 					return
 				}
 				if opts.WriteDone != nil {
-					opts.WriteDone()
+					write(opts.WriteDone)
 				}
-				flusher.Flush()
+				flush()
 				cancel(nil)
 				return
 			}
-			writeChunk(chunk)
-			flusher.Flush()
+			write(func() { writeChunk(chunk) })
+			flush()
 		case errMsg, ok := <-errs:
 			if !ok {
 				continue
@@ -103,8 +126,8 @@ func (h *BaseAPIHandler) ForwardStream(c *gin.Context, flusher http.Flusher, can
 			if errMsg != nil {
 				terminalErr = errMsg
 				if opts.WriteTerminalError != nil {
-					opts.WriteTerminalError(errMsg)
-					flusher.Flush()
+					write(func() { opts.WriteTerminalError(errMsg) })
+					flush()
 				}
 			}
 			var execErr error
@@ -114,8 +137,8 @@ func (h *BaseAPIHandler) ForwardStream(c *gin.Context, flusher http.Flusher, can
 			cancel(execErr)
 			return
 		case <-keepAliveC:
-			writeKeepAlive()
-			flusher.Flush()
+			write(writeKeepAlive)
+			flush()
 		}
 	}
 }

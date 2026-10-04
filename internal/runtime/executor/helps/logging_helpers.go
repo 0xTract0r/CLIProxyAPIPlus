@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -28,6 +29,28 @@ const (
 	creditsUsedKey                 = "__antigravity_credits_used__"
 	maxDeferredAPIRequestBodyBytes = 32 << 20 // 32 MiB
 )
+
+var websocketTimelineInitMu sync.Mutex
+
+const websocketTimelineLockKey = "__api_websocket_timeline_lock__"
+
+func websocketTimelineLock(c *gin.Context) *sync.Mutex {
+	if value, ok := c.Get(websocketTimelineLockKey); ok {
+		if mu, ok := value.(*sync.Mutex); ok {
+			return mu
+		}
+	}
+	websocketTimelineInitMu.Lock()
+	defer websocketTimelineInitMu.Unlock()
+	if value, ok := c.Get(websocketTimelineLockKey); ok {
+		if mu, ok := value.(*sync.Mutex); ok {
+			return mu
+		}
+	}
+	mu := &sync.Mutex{}
+	c.Set(websocketTimelineLockKey, mu)
+	return mu
+}
 
 // UpstreamRequestLog captures the outbound upstream request details for logging.
 type UpstreamRequestLog struct {
@@ -555,21 +578,45 @@ func appendAPIWebsocketTimeline(ginCtx *gin.Context, chunk []byte) {
 	if ginCtx == nil {
 		return
 	}
+	if stages := CodexStreamStagesFromGin(ginCtx); stages != nil && stages.Active() {
+		started := time.Now()
+		defer stages.ObserveTimeline(started)
+	}
+	mu := websocketTimelineLock(ginCtx)
+	mu.Lock()
+	defer mu.Unlock()
 	data := bytes.TrimSpace(chunk)
 	if len(data) == 0 {
 		return
 	}
 	if source, ok := apiWebsocketTimelineSource(ginCtx); ok {
-		if errAppend := source.AppendPart(data); errAppend == nil {
+		if errAppend := source.AppendTimelinePart(data); errAppend == nil {
+			if stages := CodexStreamStagesFromGin(ginCtx); stages != nil {
+				stages.SetTimelineStorage("file")
+			}
 			return
 		} else {
 			log.WithError(errAppend).Warn("failed to append api websocket timeline log part")
+			// Never mix a recovered disk suffix with memory events after an error.
+			// Keep any readable prefix, and explicitly report unavailable bytes.
+			var prefix bytes.Buffer
+			if errRead := source.WriteTo(&prefix); errRead != nil {
+				log.WithError(errRead).Warn("api websocket timeline coverage=partial_memory: unreadable prefix unavailable")
+			}
+			ginCtx.Set(apiWebsocketTimelineKey, prefix.Bytes())
+			ginCtx.Set(logging.APIWebsocketTimelineSourceContextKey, nil)
+			if errCleanup := source.Cleanup(); errCleanup != nil {
+				log.WithError(errCleanup).Warn("failed to clean up api websocket timeline source")
+			}
 		}
 	}
 	if existing, exists := ginCtx.Get(apiWebsocketTimelineKey); exists {
+		if stages := CodexStreamStagesFromGin(ginCtx); stages != nil {
+			stages.SetTimelineStorage("memory")
+		}
 		if existingBytes, ok := existing.([]byte); ok && len(existingBytes) > 0 {
-			combined := make([]byte, 0, len(existingBytes)+len(data)+2)
-			combined = append(combined, existingBytes...)
+			// Existing snapshots keep their immutable prefix; append owns only the tail.
+			combined := existingBytes
 			if !bytes.HasSuffix(existingBytes, []byte("\n")) {
 				combined = append(combined, '\n')
 			}

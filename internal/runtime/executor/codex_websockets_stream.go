@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
@@ -348,13 +349,33 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		}
 	}
 
+	stages := helps.StartCodexMainStream(ctx, time.Now(), e.cfg)
+	defer func() {
+		if !streamOwnsConnection {
+			reason := "read_error"
+			if ctx.Err() != nil {
+				reason = "context_done"
+			}
+			stages.ExecutorDone(reason)
+		}
+	}()
+	readMain := func() codexWebsocketRead {
+		started := time.Now()
+		event := readCodexWebsocketEvent(ctx, sess, conn, readCh)
+		stages.ObserveRead(started, event.arrival, event.readDuration, event.err != nil)
+		return event
+	}
 	var firstRead *codexWebsocketRead
 	if httpFallbackAllowed {
-		msgType, payload, errRead := readCodexWebsocketMessage(ctx, sess, conn, readCh)
+		event := readMain()
+		errRead := event.err
 		if errRead != nil {
 			mappedErr := mapCodexWebsocketReadError(errRead)
 			if ctx.Err() != nil {
 				mappedErr = ctx.Err()
+			}
+			if ctx.Err() == nil && isCodexWebsocketMessageTooBig(mappedErr) {
+				stages.SuppressHTTPRecovery()
 			}
 			helps.RecordAPIWebsocketError(ctx, e.cfg, "read", mappedErr)
 			if sess != nil {
@@ -366,7 +387,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			}
 			return nil, mappedErr
 		}
-		firstRead = &codexWebsocketRead{msgType: msgType, payload: payload}
+		firstRead = &event
 		httpFallbackAllowed = false
 	}
 	out := make(chan cliproxyexecutor.StreamChunk)
@@ -377,6 +398,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		mainResponseCompleted := false
 
 		defer close(out)
+		defer func() { stages.ExecutorDone(terminateReason) }()
 		defer func() {
 			if stopFallbackCancel != nil {
 				stopFallbackCancel()
@@ -398,6 +420,8 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		}()
 
 		send := func(chunk cliproxyexecutor.StreamChunk) bool {
+			started := time.Now()
+			defer stages.ObserveSend(started)
 			if ctx == nil {
 				out <- chunk
 				return true
@@ -428,7 +452,8 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				msgType, payload = firstRead.msgType, firstRead.payload
 				firstRead = nil
 			} else {
-				msgType, payload, errRead = readCodexWebsocketMessage(ctx, sess, conn, readCh)
+				event := readMain()
+				msgType, payload, errRead = event.msgType, event.payload, event.err
 			}
 			if errRead != nil {
 				if ctx != nil && ctx.Err() != nil {

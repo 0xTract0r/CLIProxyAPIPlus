@@ -368,10 +368,12 @@ func newCodexWebsocketSession(sessionID, authID, wsURL string) *codexWebsocketSe
 }
 
 type codexWebsocketRead struct {
-	conn    *websocket.Conn
-	msgType int
-	payload []byte
-	err     error
+	conn         *websocket.Conn
+	msgType      int
+	payload      []byte
+	err          error
+	arrival      time.Time
+	readDuration time.Duration
 }
 
 func (s *codexWebsocketSession) setActive(conn *websocket.Conn, ch chan codexWebsocketRead) {
@@ -858,7 +860,10 @@ func (e *CodexWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession, 
 	}
 	for {
 		_ = conn.SetReadDeadline(time.Now().Add(codexResponsesWebsocketIdleTimeout))
+		readStarted := time.Now()
 		msgType, payload, errRead := conn.ReadMessage()
+		arrival := time.Now()
+		readDuration := arrival.Sub(readStarted)
 		if errRead != nil {
 			invalidate := func() {
 				e.invalidateUpstreamConn(sess, conn, "upstream_disconnected", errRead)
@@ -866,7 +871,7 @@ func (e *CodexWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession, 
 			invalidated := false
 			ch, done := sess.activeForConn(conn)
 			if ch != nil {
-				invalidated = sendTerminalWebsocketRead(ch, done, codexWebsocketRead{conn: conn, err: errRead}, invalidate)
+				invalidated = sendTerminalWebsocketRead(ch, done, codexWebsocketRead{conn: conn, err: errRead, arrival: arrival, readDuration: readDuration}, invalidate)
 				if sess.clearActive(conn, ch) {
 					close(ch)
 				}
@@ -886,7 +891,7 @@ func (e *CodexWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession, 
 				invalidated := false
 				ch, done := sess.activeForConn(conn)
 				if ch != nil {
-					invalidated = sendTerminalWebsocketRead(ch, done, codexWebsocketRead{conn: conn, err: errBinary}, invalidate)
+					invalidated = sendTerminalWebsocketRead(ch, done, codexWebsocketRead{conn: conn, err: errBinary, arrival: arrival, readDuration: readDuration}, invalidate)
 					if sess.clearActive(conn, ch) {
 						close(ch)
 					}
@@ -904,7 +909,7 @@ func (e *CodexWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession, 
 			continue
 		}
 		select {
-		case ch <- codexWebsocketRead{conn: conn, msgType: msgType, payload: payload}:
+		case ch <- codexWebsocketRead{conn: conn, msgType: msgType, payload: payload, arrival: arrival, readDuration: readDuration}:
 		case <-done:
 		}
 	}
