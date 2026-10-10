@@ -24,7 +24,7 @@ import (
 
 func TestCodexStreamStagesRealWebsocket(t *testing.T) {
 	for _, session := range []bool{false, true} {
-		for _, mode := range []string{"completed", "read_error", "cancel"} {
+		for _, mode := range []string{"completed", "read_error", "cancel", "cancel_before_consume"} {
 			t.Run(fmt.Sprintf("session=%t/%s", session, mode), func(t *testing.T) {
 				mainReceived := make(chan struct{})
 				allowFirst := make(chan struct{})
@@ -132,6 +132,19 @@ func TestCodexStreamStagesRealWebsocket(t *testing.T) {
 				var output strings.Builder
 				var streamErr error
 				if mode == "cancel" {
+					// A received chunk proves synchronous timeline logging finished before send.
+					select {
+					case chunk, ok := <-stream.Chunks:
+						if !ok || chunk.Err != nil || len(chunk.Payload) == 0 {
+							t.Fatal("cancel fixture did not receive a logged payload chunk")
+						}
+						output.Write(chunk.Payload)
+					case <-ctx.Done():
+						t.Fatal("cancel fixture did not reach consumer acknowledgement")
+					}
+					cancel()
+				} else if mode == "cancel_before_consume" {
+					// Server send completion does not imply executor consumption/logging.
 					cancel()
 				}
 				for chunk := range stream.Chunks {
@@ -143,8 +156,15 @@ func TestCodexStreamStagesRealWebsocket(t *testing.T) {
 				stages.HandlerDone()
 				release()
 				v := stages.Snapshot()
-				if !v.Active || v.MainAttempts != 1 || v.WireRead.Count == 0 || v.ConsumerWait.Count == 0 || v.Send.Count == 0 || v.Timeline.Count == 0 || v.TimelineStorage != "file" {
+				if !v.Active || v.MainAttempts != 1 || v.WireRead.Count == 0 || v.ConsumerWait.Count == 0 || v.Send.Count == 0 || v.TimelineStorage != "file" {
 					t.Fatalf("missing actual stage counters: %+v", v)
+				}
+				if mode == "cancel_before_consume" {
+					if v.Outcome != "context_done" || v.Timeline.Count > v.Frames {
+						t.Fatalf("pre-consumption cancellation counters inconsistent: %+v", v)
+					}
+				} else if v.Timeline.Count == 0 {
+					t.Fatalf("acknowledged stream omitted timeline logging: %+v", v)
 				}
 				if mode == "completed" {
 					if streamErr != nil || !strings.Contains(output.String(), "visible") || v.Frames != 67 || v.Timeline.Count != 67 {
@@ -156,6 +176,9 @@ func TestCodexStreamStagesRealWebsocket(t *testing.T) {
 					}
 				} else if streamErr != nil && !errors.Is(streamErr, context.Canceled) {
 					t.Fatal(streamErr)
+				}
+				if (mode == "cancel" || mode == "cancel_before_consume") && v.Outcome != "context_done" {
+					t.Fatalf("cancelled stream completed normally: %+v", v)
 				}
 				bytes, err := source.Bytes()
 				if err != nil {
