@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 )
 
 var accountWarmupTestAnchor = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)

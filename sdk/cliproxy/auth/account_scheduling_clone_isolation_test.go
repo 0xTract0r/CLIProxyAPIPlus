@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 )
 
 // TestClone_AccountSchedulingMapIsDeepCopied is the fast, deterministic unit guard

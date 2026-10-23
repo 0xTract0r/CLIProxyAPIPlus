@@ -4,7 +4,7 @@ import (
 	"math"
 	"time"
 
-	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 )
 
 // EffectiveLimits is the read-only projection of an account's ACTUAL outbound

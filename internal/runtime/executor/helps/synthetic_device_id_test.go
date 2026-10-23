@@ -7,7 +7,7 @@ import (
 
 	"github.com/tidwall/gjson"
 
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
 var hex64 = regexp.MustCompile(`^[0-9a-f]{64}$`)

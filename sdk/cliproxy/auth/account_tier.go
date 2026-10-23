@@ -4,7 +4,7 @@ import (
 	"sort"
 	"strings"
 
-	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 )
 
 // This file implements the "unfolded" subscription-tier read path required by
