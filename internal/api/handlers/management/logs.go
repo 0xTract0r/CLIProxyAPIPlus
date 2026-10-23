@@ -303,17 +303,37 @@ func (h *Handler) GetRequestLogByID(c *gin.Context) {
 	suffixGz := "-" + requestID + ".log.gz"
 	var matchedFile string
 	var matchedGz string
+	shortSuffix := "-" + logging.ShortRequestID(requestID) + ".log"
+	var latestModTime, latestGzModTime time.Time
 	for _, entry := range entries {
 		if entry.IsDir() {
 			continue
 		}
 		name := entry.Name()
-		if strings.HasSuffix(name, suffix) {
-			matchedFile = name
-			break
+		if strings.HasSuffix(name, suffix) || strings.HasSuffix(name, shortSuffix) {
+			info, errInfo := entry.Info()
+			if errInfo != nil {
+				if matchedFile == "" {
+					matchedFile = name
+				}
+				continue
+			}
+			if matchedFile == "" || logFileIsNewer(name, info.ModTime(), matchedFile, latestModTime) {
+				matchedFile = name
+				latestModTime = info.ModTime()
+			}
 		}
-		if matchedGz == "" && strings.HasSuffix(name, suffixGz) {
-			matchedGz = name
+		if strings.HasSuffix(name, suffixGz) || strings.HasSuffix(name, shortSuffix+".gz") {
+			info, errInfo := entry.Info()
+			if errInfo != nil {
+				if matchedGz == "" {
+					matchedGz = name
+				}
+				continue
+			}
+			if matchedGz == "" || logFileIsNewer(name, info.ModTime(), matchedGz, latestGzModTime) {
+				matchedGz, latestGzModTime = name, info.ModTime()
+			}
 		}
 	}
 
@@ -399,6 +419,78 @@ func (h *Handler) serveGzipRequestLog(c *gin.Context, fullPath, gzName string) {
 		// Response headers/status are already flushed; only log the failure.
 		log.Errorf("failed to stream decompressed request log %s: %v", fullPath, errCopy)
 	}
+}
+
+type logFileMeta struct {
+	prefix  string
+	time    time.Time
+	seq     int
+	hasTime bool
+}
+
+func parseLogMetadata(filename string) logFileMeta {
+	ext := filepath.Ext(filename)
+	base := strings.TrimSuffix(filename, ext)
+	lastHyphen := strings.LastIndex(base, "-")
+	if lastHyphen <= 0 {
+		return logFileMeta{prefix: base}
+	}
+	beforeID := base[:lastHyphen]
+
+	seq := 0
+	beforeSeq := beforeID
+	if lastUnderscore := strings.LastIndex(beforeID, "_"); lastUnderscore >= 0 {
+		if parsedSeq, errConv := strconv.Atoi(beforeID[lastUnderscore+1:]); errConv == nil {
+			seq = parsedSeq
+			beforeSeq = beforeID[:lastUnderscore]
+		}
+	}
+
+	const tsLen = 17 // len("2006-01-02T150405")
+	if len(beforeSeq) >= tsLen {
+		tsStr := beforeSeq[len(beforeSeq)-tsLen:]
+		if t, errTime := time.Parse("2006-01-02T150405", tsStr); errTime == nil {
+			prefix := beforeSeq
+			if len(beforeSeq) > tsLen && beforeSeq[len(beforeSeq)-tsLen-1] == '-' {
+				prefix = beforeSeq[:len(beforeSeq)-tsLen-1]
+			}
+			return logFileMeta{
+				prefix:  prefix,
+				time:    t,
+				seq:     seq,
+				hasTime: true,
+			}
+		}
+	}
+
+	return logFileMeta{
+		prefix: beforeSeq,
+		seq:    seq,
+	}
+}
+
+// logFileIsNewer determines whether candidate should take precedence over current.
+// It compares file modification times, and on ties, compares the embedded timestamp
+// and collision sequence for matching prefixes.
+func logFileIsNewer(candidateName string, candidateMod time.Time, currentName string, currentMod time.Time) bool {
+	if candidateMod.After(currentMod) {
+		return true
+	}
+	if candidateMod.Before(currentMod) {
+		return false
+	}
+	candMeta := parseLogMetadata(candidateName)
+	currMeta := parseLogMetadata(currentName)
+
+	if candMeta.hasTime && currMeta.hasTime {
+		if !candMeta.time.Equal(currMeta.time) {
+			return candMeta.time.After(currMeta.time)
+		}
+		if candMeta.prefix == currMeta.prefix && candMeta.seq != currMeta.seq {
+			return candMeta.seq > currMeta.seq
+		}
+	}
+	return candidateName > currentName
 }
 
 // DownloadRequestErrorLog downloads a specific error request log file by name.

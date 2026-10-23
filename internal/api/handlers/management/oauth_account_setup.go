@@ -126,13 +126,14 @@ func (h *Handler) configForOAuthSetup(setup *oauthAccountSetup) *config.Config {
 		}
 		return nil
 	}
+	cfg := h.configSnapshot()
 	if setup == nil || strings.TrimSpace(setup.ProxyURL) == "" {
-		return h.cfg
+		return cfg
 	}
-	if h.cfg == nil {
+	if cfg == nil {
 		return &config.Config{SDKConfig: config.SDKConfig{ProxyURL: setup.ProxyURL}}
 	}
-	cfgCopy := *h.cfg
+	cfgCopy := *cfg
 	cfgCopy.SDKConfig.ProxyURL = setup.ProxyURL
 	return &cfgCopy
 }
@@ -182,7 +183,7 @@ func (h *Handler) oauthIdentityHTTPClient(ctx context.Context, host string, auth
 	if host != "" {
 		transportCtx = runtimehelps.WithRuntimeTransportHost(transportCtx, host)
 	}
-	client := runtimehelps.NewProxyAwareHTTPClient(transportCtx, h.cfg, auth, timeout)
+	client := runtimehelps.NewProxyAwareHTTPClient(transportCtx, h.configSnapshot(), auth, timeout)
 	headers := coreauth.ExtractCustomHeadersFromMetadata(auth.Metadata)
 	if len(headers) == 0 {
 		headers = map[string]string{}
@@ -232,20 +233,21 @@ func (h *Handler) applyOAuthAccountSetupToRecord(record *coreauth.Auth, setup *o
 			record.Attributes["note"] = setup.Note
 		}
 	}
+	cfg := h.configSnapshot()
 	ensureManagedHeaderSeed(record)
 
-	stored := readAccountSettingsMetadata(record, h.cfg)
+	stored := readAccountSettingsMetadata(record, cfg)
 	stored.SchemaVersion = accountSettingsSchemaVersion
 	stored.ManagedHeaderSeedHash = accountManagedHeaderSeedHash(record)
-	projection := managedHeaderProjectionForAuth(record, h.cfg)
+	projection := managedHeaderProjectionForAuth(record, cfg)
 	if len(projection.SummaryHeaders) > 0 || len(projection.VersionedCapabilities) > 0 || len(projection.StableIdentity) > 0 || len(projection.RuntimeFingerprint) > 0 {
 		stored.ManagedHeaderState = mergeManagedHeaderState(stored.ManagedHeaderState, projection, providerKey(record))
 	}
 	profile := runtimehelps.ResolveRuntimeTransportProfile(record)
-	stored.RuntimeIdentityState = mergeRuntimeIdentityState(stored.RuntimeIdentityState, record, h.cfg, profile)
+	stored.RuntimeIdentityState = mergeRuntimeIdentityState(stored.RuntimeIdentityState, record, cfg, profile)
 	record.Metadata["account_settings"] = stored
 
-	managedHeaders := managedHeadersForAuth(record, h.cfg)
+	managedHeaders := managedHeadersForAuth(record, cfg)
 	extraHeaders := normalizeHeaderMap(stored.ExtraHeaders)
 	runtimeHeaders := mergeAccountHeaders(managedHeaders, extraHeaders)
 	if len(runtimeHeaders) > 0 {

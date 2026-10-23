@@ -11,7 +11,9 @@ func init() {
 	translator.Register(
 		Claude,
 		Kiro,
-		ConvertClaudeRequestToKiro,
+		func(model string, payload []byte, stream bool) ([]byte, error) {
+			return ConvertClaudeRequestToKiro(model, payload, stream), nil
+		},
 		interfaces.TranslateResponse{
 			Stream:    ConvertKiroStreamToClaude,
 			NonStream: ConvertKiroNonStreamToClaude,

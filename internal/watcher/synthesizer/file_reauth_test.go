@@ -46,7 +46,10 @@ func TestSynthesizeFileAuths_RestoresReauthRequiredStateOnColdLoad(t *testing.T)
 		IDGenerator: NewStableIDGenerator(),
 	}
 
-	auths := SynthesizeAuthFile(ctx, fullPath, data)
+	auths, errSynthesize := SynthesizeAuthFile(ctx, fullPath, data)
+	if errSynthesize != nil {
+		t.Fatalf("SynthesizeAuthFile: %v", errSynthesize)
+	}
 	if len(auths) != 1 {
 		t.Fatalf("SynthesizeAuthFile() len = %d, want 1", len(auths))
 	}
@@ -92,7 +95,10 @@ func TestSynthesizeFileAuths_DisabledTakesPriorityOverReauthRequiredStatus(t *te
 		IDGenerator: NewStableIDGenerator(),
 	}
 
-	auths := SynthesizeAuthFile(ctx, fullPath, data)
+	auths, errSynthesize := SynthesizeAuthFile(ctx, fullPath, data)
+	if errSynthesize != nil {
+		t.Fatalf("SynthesizeAuthFile: %v", errSynthesize)
+	}
 	if len(auths) != 1 {
 		t.Fatalf("SynthesizeAuthFile() len = %d, want 1", len(auths))
 	}
@@ -131,7 +137,10 @@ func TestSynthesizeFileAuths_HealthyRecordStaysActive(t *testing.T) {
 		IDGenerator: NewStableIDGenerator(),
 	}
 
-	auths := SynthesizeAuthFile(ctx, fullPath, data)
+	auths, errSynthesize := SynthesizeAuthFile(ctx, fullPath, data)
+	if errSynthesize != nil {
+		t.Fatalf("SynthesizeAuthFile: %v", errSynthesize)
+	}
 	if len(auths) != 1 {
 		t.Fatalf("SynthesizeAuthFile() len = %d, want 1", len(auths))
 	}

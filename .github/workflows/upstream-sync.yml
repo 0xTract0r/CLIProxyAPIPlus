@@ -108,13 +108,17 @@ jobs:
           go-version-file: go.mod
           cache-dependency-path: go.sum
 
+      - name: Download test dependencies
+        if: steps.merge.outputs.merged == 'true'
+        run: GOTOOLCHAIN=auto go mod download
+
       - name: go test
         id: gotest
         if: steps.merge.outputs.merged == 'true'
         continue-on-error: true
         run: |
           set +e
-          GOTOOLCHAIN=auto go test -timeout 600s ./... 2>&1 | tee "${RUNNER_TEMP}/gotest.log"
+          bash scripts/ci/run-loopback-only.sh env GOPROXY=off GOTOOLCHAIN=local go test -timeout 600s ./... 2>&1 | tee "${RUNNER_TEMP}/gotest.log"
           rc=${PIPESTATUS[0]}
           echo "gotest_exit=${rc}" >> "$GITHUB_OUTPUT"
           set -e

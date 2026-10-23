@@ -129,6 +129,11 @@ func isTerminalAuthQuarantineResultError(err *Error) bool {
 	if err == nil {
 		return false
 	}
+	// Request policies do not prove credential revocation. A force-cooldown
+	// action owns a bounded recovery window and must not become quarantine.
+	if err.Code == ErrorCodeForceCooldown || shouldSkipCredentialCooldown(err) {
+		return false
+	}
 	// These failure classes already have their own dedicated recovery paths
 	// and must never be double-counted as a permission revocation, even
 	// though some of them can (rarely) surface alongside a 401-shaped error.

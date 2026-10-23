@@ -3181,15 +3181,16 @@ func claudeReauthHighWaterUserAgent(cfg *config.Config, target *coreauth.Auth) s
 }
 
 func (h *Handler) newClaudeOAuthAuth(ctx context.Context, target *coreauth.Auth) *claude.ClaudeAuth {
+	cfg := h.configSnapshot()
 	if target == nil {
-		return claude.NewClaudeAuth(h.cfg)
+		return claude.NewClaudeAuth(cfg)
 	}
 	client := h.oauthIdentityHTTPClient(ctx, "api.anthropic.com", target, anthropicOAuthExchangeTimeout)
 	// Raise the reauth User-Agent to this account's persisted device-profile
 	// high-water mark (when present) so the OAuth exchange/refresh presents
 	// the same claude-cli identity this account's serving requests use,
 	// instead of falling back to the generic claudeOAuthUserAgent floor.
-	return claude.NewClaudeAuthWithHTTPClient(client).WithUserAgent(claudeReauthHighWaterUserAgent(h.cfg, target))
+	return claude.NewClaudeAuthWithHTTPClient(client).WithUserAgent(claudeReauthHighWaterUserAgent(cfg, target))
 }
 
 func (h *Handler) newClaudeOAuthAccountProxyFallbackAuth(target *coreauth.Auth) *claude.ClaudeAuth {

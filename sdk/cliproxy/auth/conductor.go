@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"math"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -10,6 +11,7 @@ import (
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
+	"golang.org/x/sync/semaphore"
 )
 
 // ProviderExecutor defines the contract required by Manager to execute provider calls.
@@ -30,6 +32,12 @@ type ProviderExecutor interface {
 	HttpRequest(ctx context.Context, auth *Auth, req *http.Request) (*http.Response, error)
 }
 
+// APIKeyConfigExecutor provides an execution-local view without OAuth-only
+// configuration. The registered executor and its shared session state stay intact.
+type APIKeyConfigExecutor interface {
+	ForAPIKey() ProviderExecutor
+}
+
 // RequestAuthPreparer lets an executor update missing auth metadata immediately
 // before a request. Manager serializes and persists returned updates.
 type RequestAuthPreparer interface {
@@ -42,6 +50,18 @@ type ExecutionSessionCloser interface {
 	CloseExecutionSession(sessionID string)
 }
 
+// ExecutionSessionSharer reports whether a replaced executor shares its execution
+// session store with the replacement executor so active sessions stay open.
+type ExecutionSessionSharer interface {
+	SharesExecutionSessionsWith(other ProviderExecutor) bool
+}
+
+// AuthExecutionSessionCloser allows executors to release execution sessions
+// associated with a removed credential without tearing down other credentials' sessions.
+type AuthExecutionSessionCloser interface {
+	CloseAuthExecutionSessions(authID string)
+}
+
 // Result captures execution outcome used to adjust auth state.
 type Result struct {
 	// AuthID references the auth that produced this result.
@@ -50,6 +70,8 @@ type Result struct {
 	Provider string
 	// Model is the upstream model identifier used for the request.
 	Model string
+	// RouteModel is the requested logical route model before alias resolution.
+	RouteModel string
 	// Success marks whether the execution succeeded.
 	Success bool
 	// RetryAfter carries a provider supplied retry hint (e.g. 429 retryDelay).
@@ -58,8 +80,28 @@ type Result struct {
 	// indicate the selected auth should cool down before the next request (fork
 	// codex proactive quota cooldown; see quotaRetryAfterFromHeaders).
 	QuotaExceeded bool
+	// CredentialScope indicates that the failure affects the whole credential across models (e.g. Anthropic 5h/7d unified limits).
+	CredentialScope bool
 	// Error describes the failure when Success is false.
 	Error *Error
+	// Options carries execution request options (headers, metadata, etc.) for result tracking.
+	Options cliproxyexecutor.Options
+	// SkipQuotaObservation reports that this result must not replace the last
+	// observed watermark. Count-tokens requests reuse the credential but are not
+	// generation traffic; their response headers are not a generation snapshot.
+	SkipQuotaObservation bool
+	// AccessToken captures the active access token under which the request was executed.
+	AccessToken string
+	// CredentialVersion captures the credential version under which the request was executed.
+	CredentialVersion uint64
+	// RegistrationEpoch captures the registration epoch under which the request was executed.
+	RegistrationEpoch uint64
+	// ExecutionSeq is the manager-local monotonic sequence assigned when the
+	// execution was dispatched upstream. It orders in-flight executions so a
+	// success dispatched before a cooldown was recorded cannot clear that
+	// cooldown. Zero means unknown (direct MarkResult callers) and is exempt
+	// from the ordering guard.
+	ExecutionSeq uint64
 }
 
 // Selector chooses an auth candidate for execution.
@@ -69,6 +111,12 @@ type Selector interface {
 
 type PluginScheduler interface {
 	PickAuth(context.Context, pluginapi.SchedulerPickRequest) (pluginapi.SchedulerPickResponse, bool, error)
+}
+
+// PluginSchedulerAcrossPriorities is an optional interface implemented by schedulers
+// that opt into receiving candidates across all priority tiers.
+type PluginSchedulerAcrossPriorities interface {
+	SchedulerWantsAcrossPriorities() bool
 }
 
 type pluginSchedulerState interface {
@@ -104,6 +152,25 @@ func (NoopHook) OnAuthUpdated(context.Context, *Auth) {}
 // OnResult implements Hook.
 func (NoopHook) OnResult(context.Context, Result) {}
 
+// ResultPolicy allows inspecting and mutating an execution result before in-memory quota mutations,
+// cooldown persistence, and scheduler/registry publishing.
+// Implementations of ResultPolicy must be safe for concurrent use by multiple goroutines.
+type ResultPolicy interface {
+	ApplyResultPolicy(ctx context.Context, result Result) Result
+}
+
+// ResultPolicyFunc enables using a plain function as a ResultPolicy.
+type ResultPolicyFunc func(ctx context.Context, result Result) Result
+
+// ApplyResultPolicy calls f(ctx, result).
+func (f ResultPolicyFunc) ApplyResultPolicy(ctx context.Context, result Result) Result {
+	return f(ctx, result)
+}
+
+type resultPolicyHolder struct {
+	policy ResultPolicy
+}
+
 // Manager orchestrates auth lifecycle, selection, execution, and persistence.
 type Manager struct {
 	store                     Store
@@ -112,13 +179,23 @@ type Manager struct {
 	executors                 map[string]ProviderExecutor
 	selector                  Selector
 	hook                      Hook
+	resultPolicy              atomic.Pointer[resultPolicyHolder]
 	mu                        sync.RWMutex
+	selectorMu                sync.Mutex
 	configCooldownMu          sync.Mutex
 	pacingMu                  sync.Mutex
 	pacing                    *managerWarmupPacing
 	pacingCalls               map[*pacingOwnership]struct{}
-	auths                     map[string]*Auth
-	scheduler                 *authScheduler
+	syncSchedulerMu           sync.Mutex
+	// executionSeq stamps upstream dispatches with a monotonic sequence used
+	// to reject cooldown clears from executions dispatched before the cooldown.
+	executionSeq       atomic.Uint64
+	structuralEpoch    atomic.Uint64
+	syncedVersion      atomic.Uint64
+	auths              map[string]*Auth
+	authEpochs         map[string]uint64
+	authChangeWatchers map[string]map[chan struct{}]struct{}
+	scheduler          *authScheduler
 	// pluginScheduler runs outside m.mu before falling back to native selection.
 	pluginScheduler PluginScheduler
 	// homeRuntimeAuths retains legacy session auth lookups for non-execution callers.
@@ -128,6 +205,7 @@ type Manager struct {
 	// homeSessionSelections owns retained Home selections for websocket sessions.
 	homeSessionSelections map[string]map[homeSessionSelectionKey]*HomeDispatchSelection
 	homeSessionLocks      sync.Map
+	homeSessionAliases    homeSessionAliasCache
 	// providerOffsets tracks per-model provider rotation state for multi-provider routing.
 	providerOffsets             map[string]int
 	homeDispatchBundle          atomic.Pointer[HomeDispatchBundle]
@@ -141,9 +219,8 @@ type Manager struct {
 	// oauthModelAlias stores global OAuth model alias mappings (alias -> upstream name) keyed by channel.
 	oauthModelAlias atomic.Value
 
-	// apiKeyModelAlias caches resolved model alias mappings for API-key auths.
-	// Keyed by auth.ID, value is alias(lower) -> upstream model (including suffix).
-	apiKeyModelAlias atomic.Value
+	// apiKeyModelRouting atomically publishes per-auth aliases and configured capabilities.
+	apiKeyModelRouting atomic.Value
 
 	// modelPoolOffsets tracks per-auth alias pool rotation state.
 	modelPoolOffsets map[string]int
@@ -158,11 +235,22 @@ type Manager struct {
 	// Auto refresh state
 	refreshCancel context.CancelFunc
 	refreshLoop   *authAutoRefreshLoop
+	// refreshJobs retains queued and running jobs across loop restarts under m.mu.
+	refreshJobs map[string]*authRefreshJob
 
 	requestPrepareLocks sync.Map
 	// refreshLocks serializes credential refresh per auth ID so concurrent
 	// 401 recoveries and auto-refresh workers do not race the same refresh_token.
 	refreshLocks sync.Map
+	// persistLocks serializes disk persistence per auth ID and guards against out-of-order writes.
+	persistLocks sync.Map
+	// authMutationLocks coordinate credential mutations without blocking unrelated readers.
+	authMutationLocks      sync.Map
+	metadataPersistCancels sync.Map
+	metadataSaveGate       sync.Map
+	// authLoadGate allows concurrent credential transactions, but excludes whole-store reloads.
+	// Mutations acquire one permit; Load acquires all permits before reading the store.
+	authLoadGate *semaphore.Weighted
 }
 
 // NewManager constructs a manager with optional custom selector and hook.
@@ -175,10 +263,12 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 	}
 	manager := &Manager{
 		store:                 store,
+		authLoadGate:          semaphore.NewWeighted(math.MaxInt64),
 		executors:             make(map[string]ProviderExecutor),
 		selector:              selector,
 		hook:                  hook,
 		auths:                 make(map[string]*Auth),
+		authEpochs:            make(map[string]uint64),
 		homeRuntimeAuths:      make(map[string]map[string]*Auth),
 		homeRuntimeAuthOwners: make(map[string]map[string]*HomeDispatchSelection),
 		homeSessionSelections: make(map[string]map[homeSessionSelectionKey]*HomeDispatchSelection),
@@ -187,11 +277,35 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 	}
 	// atomic.Value requires non-nil initial value.
 	manager.runtimeConfig.Store(&internalconfig.Config{})
-	manager.apiKeyModelAlias.Store(apiKeyModelAliasTable(nil))
+	manager.apiKeyModelRouting.Store(&apiKeyModelRoutingSnapshot{config: &internalconfig.Config{}})
 	defaultInFlightConfig, errInFlightConfig := HomeInFlightPublisherConfigFromConfig(internalconfig.DefaultCredentialInFlightConfig())
 	if errInFlightConfig == nil {
 		manager.ApplyHomeInFlightPublisherConfig(defaultInFlightConfig)
 	}
 	manager.scheduler = newAuthScheduler(selector)
 	return manager
+}
+
+// SetResultPolicy sets an execution result policy invoked before in-memory quota mutations and persistence.
+func (m *Manager) SetResultPolicy(policy ResultPolicy) {
+	if m == nil {
+		return
+	}
+	if policy == nil {
+		m.resultPolicy.Store(nil)
+		return
+	}
+	m.resultPolicy.Store(&resultPolicyHolder{policy: policy})
+}
+
+// ResultPolicy returns the current execution result policy, or nil if none is configured.
+func (m *Manager) ResultPolicy() ResultPolicy {
+	if m == nil {
+		return nil
+	}
+	holder := m.resultPolicy.Load()
+	if holder == nil {
+		return nil
+	}
+	return holder.policy
 }

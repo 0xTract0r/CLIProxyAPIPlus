@@ -243,10 +243,11 @@ func (s *FileBodySource) Paths() []string {
 }
 
 // WriteTo merges all ordered parts into w.
-func (s *FileBodySource) WriteTo(w io.Writer) error {
+func (s *FileBodySource) WriteTo(w io.Writer) (int64, error) {
 	if s == nil || w == nil {
-		return nil
+		return 0, nil
 	}
+	var totalWritten int64
 	s.mu.Lock()
 	paths := append([]string(nil), s.paths...)
 	limits := make(map[string]int64, len(s.failedTimelineLimits))
@@ -261,21 +262,24 @@ func (s *FileBodySource) WriteTo(w io.Writer) error {
 			if os.IsNotExist(errOpen) {
 				continue
 			}
-			return errOpen
+			return totalWritten, errOpen
 		}
 		if wrote {
-			if _, errWrite := io.WriteString(w, "\n"); errWrite != nil {
+			n, errWrite := io.WriteString(w, "\n")
+			totalWritten += int64(n)
+			if errWrite != nil {
 				if errClose := file.Close(); errClose != nil {
 					log.WithError(errClose).Warn("failed to close log part file")
 				}
-				return errWrite
+				return totalWritten, errWrite
 			}
 		}
 		var reader io.Reader = file
 		if limit, exists := limits[path]; exists {
 			reader = io.LimitReader(file, limit)
 		}
-		_, errCopy := io.Copy(w, reader)
+		n, errCopy := io.Copy(w, reader)
+		totalWritten += n
 		if errClose := file.Close(); errClose != nil {
 			log.WithError(errClose).Warn("failed to close log part file")
 			if errCopy == nil {
@@ -283,17 +287,17 @@ func (s *FileBodySource) WriteTo(w io.Writer) error {
 			}
 		}
 		if errCopy != nil {
-			return errCopy
+			return totalWritten, errCopy
 		}
 		wrote = true
 	}
-	return nil
+	return totalWritten, nil
 }
 
 // Bytes merges all ordered parts into memory.
 func (s *FileBodySource) Bytes() ([]byte, error) {
 	var buf bytes.Buffer
-	if errWrite := s.WriteTo(&buf); errWrite != nil {
+	if _, errWrite := s.WriteTo(&buf); errWrite != nil {
 		return nil, errWrite
 	}
 	return buf.Bytes(), nil

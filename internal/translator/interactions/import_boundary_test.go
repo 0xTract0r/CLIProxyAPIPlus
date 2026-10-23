@@ -16,7 +16,16 @@ func TestInteractionsTranslatorsDoNotImportGeminiTranslators(t *testing.T) {
 		"internal/translator/codex/interactions",
 		"internal/translator/antigravity/interactions",
 	}
-	forbidden := regexp.MustCompile(`"github\.com/router-for-me/CLIProxyAPI/v7/internal/translator/[^"]*/gemini[^"]*"`)
+	forbidden := regexp.MustCompile(`"github\.com/router-for-me/CLIProxyAPI/v[78]/internal/translator/[^"]*/gemini[^"]*"`)
+	for _, version := range []string{"v7", "v8"} {
+		sample := `"github.com/router-for-me/CLIProxyAPI/` + version + `/internal/translator/openai/gemini"`
+		if !forbidden.MatchString(sample) {
+			t.Fatalf("boundary detector missed %s", version)
+		}
+	}
+	if forbidden.MatchString(`"github.com/router-for-me/CLIProxyAPI/v8/internal/translator/openai/interactions"`) {
+		t.Fatal("boundary detector rejected an allowed Interactions import")
+	}
 	var violations []string
 	for _, scanDir := range scanDirs {
 		root := filepath.Join(repoRoot, scanDir)

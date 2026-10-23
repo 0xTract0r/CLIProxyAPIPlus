@@ -112,9 +112,10 @@ fork路由-管理端点	logs-compress-after-days	route	/logs-compress-after-days
 反关联-内建OAuth代理接线	claude绑账号代理	pattern	prepareOAuthSetupRuntimeAuth\("claude"	internal/api/handlers/management/auth_files_provider_oauth.go
 反关联-内建OAuth代理接线	codex合成账号身份	pattern	prepareOAuthSetupRuntimeAuth\("codex"	internal/api/handlers/management/auth_files_provider_oauth.go
 反关联-内建OAuth代理接线	codex交换走账号代理	pattern	oauthIdentityHTTPClient\(ctx, "auth\.openai\.com"	internal/api/handlers/management/auth_files_provider_oauth.go
-反关联-内建OAuth代理接线	antigravity绑账号代理	pattern	NewAntigravityAuth\(h\.configForOAuthSetup\(setup\)	internal/api/handlers/management/auth_files_provider_oauth.go
+反关联-内建OAuth代理接线	antigravity绑账号代理	pattern	NewAntigravityAuth\(cfg, nil\)	internal/api/handlers/management/auth_files_provider_oauth.go
+反关联-内建OAuth代理接线	antigravity账号代理快照来源	pattern	cfg := h\.configForOAuthSetup\(setup\)	internal/api/handlers/management/auth_files_provider_oauth.go
 反关联-内建OAuth代理接线	xai绑账号代理	pattern	NewXAIAuth\(h\.configForOAuthSetup\(setup\)	internal/api/handlers/management/auth_files_provider_oauth.go
-反关联-内建OAuth代理接线	kimi绑账号代理	pattern	NewKimiAuth\(h\.configForOAuthSetup\(setup\)	internal/api/handlers/management/auth_files_provider_oauth.go
+反关联-内建OAuth代理接线	kimi绑账号代理	pattern	NewKimiAuthWithDomain\(h\.configForOAuthSetup\(setup\), domain\)	internal/api/handlers/management/auth_files_provider_oauth.go
 反关联-内建OAuth代理接线	proxy写落库record	pattern	applyOAuthAccountSetupToRecord\(record, setup\)	internal/api/handlers/management/auth_files_provider_oauth.go
 
 # === fork 自定义模块/反关联支撑文件存在性(19) ===
@@ -164,10 +165,10 @@ fork文件-反关联支撑	disable_image_generation_mode.go	file	-	internal/conf
 反关联-Codex fast门控	codexFastEnabled	symbol	^func codexFastEnabled\(	internal/runtime/executor/codex_websockets_fast.go
 反关联-Codex fast路由接线	codexAutoRouteToWebsocket@auto_executor	pattern	codexAutoRouteToWebsocket\(ctx, auth, req\.Model\)	internal/runtime/executor/codex_websockets_executor.go
 反关联-Codex fast service_tier账号策略	applyCodexServiceTierPolicy	symbol	^func applyCodexServiceTierPolicy\(	internal/runtime/executor/codex_websockets_fast.go
-反关联-Codex fast service_tier策略@ws_execute	applyCodexServiceTierPolicy@ws_execute	pattern	applyCodexServiceTierPolicy\(upstreamBody, fastEnabled\)	internal/runtime/executor/codex_websockets_execute.go
-反关联-Codex fast service_tier策略@ws_stream	applyCodexServiceTierPolicy@ws_stream	pattern	applyCodexServiceTierPolicy\(upstreamBody, fastEnabled\)	internal/runtime/executor/codex_websockets_stream.go
-反关联-Codex fast service_tier策略@http_execute	applyCodexServiceTierPolicy@http_execute	pattern	applyCodexServiceTierPolicy\(body, codexFastEnabled\(auth, baseModel\)\)	internal/runtime/executor/codex_executor_execute.go
-反关联-Codex fast service_tier策略@http_stream	applyCodexServiceTierPolicy@http_stream	pattern	applyCodexServiceTierPolicy\(body, codexFastEnabled\(auth, baseModel\)\)	internal/runtime/executor/codex_executor_stream.go
+反关联-Codex fast service_tier策略@ws_execute	applyCodexServiceTierPolicy@ws_execute	pattern	applyCodexServiceTierPolicy\(finalizePayload\(upstreamBody\), fastEnabled\)	internal/runtime/executor/codex_websockets_execute.go
+反关联-Codex fast service_tier策略@ws_stream	applyCodexServiceTierPolicy@ws_stream	pattern	applyCodexServiceTierPolicy\(finalizePayload\(body\), codexFastEnabled\(auth, baseModel\)\)	internal/runtime/executor/codex_websockets_stream.go
+反关联-Codex fast service_tier策略@http_execute	applyCodexServiceTierPolicy@http_execute	pattern	applyCodexServiceTierPolicy\(payloadFinalizer\(payload\), codexFastEnabled\(auth, baseModel\)\)	internal/runtime/executor/codex_executor_execute.go
+反关联-Codex fast service_tier策略@http_stream	applyCodexServiceTierPolicy@http_stream	pattern	applyCodexServiceTierPolicy\(payloadFinalizer\(payload\), codexFastEnabled\(auth, baseModel\)\)	internal/runtime/executor/codex_executor_stream.go
 反关联-Codex fast管理面视图	accountSettingsFastEnabled	symbol	^func accountSettingsFastEnabled\(	internal/api/handlers/management/auth_files_anticorr.go
 反关联-Codex fast管理面写入	applyAuthFastModelsMetadata	symbol	^func applyAuthFastModelsMetadata\(	internal/api/handlers/management/auth_files_anticorr.go
 
@@ -213,7 +214,7 @@ H4-farm自动纳管开关	farm-auto-enroll路由PUT	route	mgmt\.PUT\("/farm-auto
 H4-farm自动纳管开关	GetFarmAutoEnroll handler	symbol	^func \(h \*Handler\) GetFarmAutoEnroll\(	internal/api/handlers/management/config_basic.go
 H4-farm自动纳管开关	PutFarmAutoEnroll handler	symbol	^func \(h \*Handler\) PutFarmAutoEnroll\(	internal/api/handlers/management/config_basic.go
 H4-farm自动纳管开关	FarmAutoEnrollEnabled gate符号	symbol	^func FarmAutoEnrollEnabled\(	internal/config/config_normalization.go
-H4-farm自动纳管开关	gate包住applyAuthFarmEnrolledMetadata	pattern	config\.FarmAutoEnrollEnabled\(h\.cfg\)	internal/api/handlers/management/auth_files_fields.go
+H4-farm自动纳管开关	gate包住applyAuthFarmEnrolledMetadata	pattern	config\.FarmAutoEnrollEnabled\(h\.configSnapshot\(\)\)	internal/api/handlers/management/auth_files_fields.go
 
 # === 一期: 自适应账号调度(adaptive account scheduling)fork 新增守护(11) ===
 # 补硬:一期"自适应账号调度"是纯 core 后端(无 serving/出站指纹改动)新增的三类 fork 能力,

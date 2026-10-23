@@ -199,14 +199,16 @@ func TestClaudeExecutor_ExecuteStream_PersistsDeviceHighWaterFromServingPath(t *
 // count_tokens serving flow, which also passes through applyClaudeHeaders and so
 // must trigger the same monotonic high-water write-back.
 func TestClaudeExecutor_CountTokens_PersistsDeviceHighWaterFromServingPath(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	if !claudeCountSandboxChild(t) {
+		return
+	}
+	proxyURL := newClaudeCountLifecycleSink(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.ReadAll(r.Body)
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"input_tokens":42}`))
 	}))
-	defer server.Close()
-
-	executor, auth, store, mgr := newServingHighWaterFixture(t, server.URL)
+	executor, auth, store, mgr := newServingHighWaterFixture(t, "https://api.anthropic.com")
+	auth.ProxyURL = proxyURL
 
 	payload := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
 	if _, err := executor.CountTokens(context.Background(), auth, cliproxyexecutor.Request{

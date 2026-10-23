@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -452,7 +453,7 @@ func TestWarmupExecutionPoolReacquiresSlot(t *testing.T) {
 		close(ch)
 		return &cliproxyexecutor.StreamResult{Chunks: ch}, nil
 	}
-	result, err := f.m.executeStreamWithModelPool(f.ctx, f.e, f.a, "claude", req, opts, f.model, "", []string{"pool-first", "pool-second"}, true, OAuthModelAliasResult{}, true, false)
+	result, err := f.m.executeStreamWithModelPool(f.ctx, f.e, f.a, "claude", req, opts, f.model, "", []string{"pool-first", "pool-second"}, true, OAuthModelAliasResult{}, nil, true, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -488,7 +489,7 @@ func TestWarmupExecutionLocalBusyDoesNotSpendCredentialRetry(t *testing.T) {
 		sentTo = a.ID
 		return cliproxyexecutor.Response{}, nil
 	}
-	_, err := f.m.executeMixedOnce(f.ctx, []string{"claude"}, req, opts, 1)
+	_, err := f.m.executeMixedOnce(f.ctx, []string{"claude"}, req, opts, 1, 0, 0)
 	if err != nil || calls != 1 || sentTo != mature.ID || f.state.waited != 100*time.Millisecond || f.s.gate.DailyCount(f.a.ID) != 0 {
 		t.Fatalf("busy spent retry or sent: err=%v calls=%d sent=%s waited=%v", err, calls, sentTo, f.state.waited)
 	}
@@ -527,7 +528,7 @@ func TestWarmupExecutionMatureAndHomeStayLegacy(t *testing.T) {
 			if name == "mature" {
 				result, err = f.m.ExecuteStream(f.ctx, []string{"claude"}, req, opts)
 			} else {
-				result, err = f.m.executeStreamWithModelPool(f.ctx, f.e, f.a, "claude", req, opts, f.model, "", []string{f.model}, false, OAuthModelAliasResult{}, false, true)
+				result, err = f.m.executeStreamWithModelPool(f.ctx, f.e, f.a, "claude", req, opts, f.model, "", []string{f.model}, false, OAuthModelAliasResult{}, nil, false, true)
 			}
 			if err != nil {
 				t.Fatal(err)
@@ -747,7 +748,7 @@ func TestWarmupExecutionSDKCompatPoolContinuation(t *testing.T) {
 		close(ch)
 		return &cliproxyexecutor.StreamResult{Chunks: ch}, nil
 	}
-	result, err := f.m.executeStreamMixedOnce(f.ctx, []string{provider}, req, opts, 1)
+	result, err := f.m.executeStreamMixedOnce(f.ctx, []string{provider}, req, opts, 1, nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -784,7 +785,7 @@ func TestWarmupExecutionCountPreservesProtectedRootAndChild(t *testing.T) {
 		t.Fatal("Count cleared protected entries")
 	}
 	for key, entry := range before {
-		if f.s.cache.entries[key] != entry {
+		if !reflect.DeepEqual(f.s.cache.entries[key], entry) {
 			t.Fatal("Count changed a protected binding")
 		}
 	}

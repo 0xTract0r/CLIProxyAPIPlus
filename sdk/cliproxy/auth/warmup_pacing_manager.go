@@ -247,10 +247,12 @@ func (m *Manager) persistCurrentPacingAuth(ctx context.Context, id string) {
 	}
 	// Preserve the old save ordering and save the current authoritative object,
 	// never the snapshot that predates a concurrent refresh/first-use update.
+	releaseMutation := m.lockAuthMutation(id)
+	defer releaseMutation()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if a := m.auths[id]; a != nil {
-		_ = m.persist(context.WithoutCancel(ctx), a)
+		_ = m.persistLocked(context.WithoutCancel(ctx), a)
 	}
 }
 

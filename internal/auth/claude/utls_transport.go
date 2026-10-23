@@ -1,36 +1,177 @@
-// Package claude provides authentication functionality for Anthropic's Claude API.
-// This file implements a custom HTTP transport using utls to bypass TLS fingerprinting.
 package claude
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	tls "github.com/refraction-networking/utls"
+	internalcache "github.com/router-for-me/CLIProxyAPI/v8/internal/cache"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/httpwire"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/proxyutil"
 	log "github.com/sirupsen/logrus"
-	"golang.org/x/net/http2"
 	"golang.org/x/net/proxy"
 )
 
-// utlsRoundTripper implements http.RoundTripper using utls with Chrome fingerprint
-// to bypass Cloudflare's TLS fingerprinting on Anthropic domains.
+type claudeRefreshHandshakeTimeoutContextKey struct{}
+
+var claudeOAuthRefreshHeaderOrder = []string{
+	"Accept",
+	"Content-Type",
+	"User-Agent",
+	"Content-Length",
+	"Accept-Encoding",
+	"Host",
+	"Connection",
+}
+
+// claudeOAuthInspectHeaderOrder is the order the native client emits for the
+// authenticated Axios GET lookups on the OAuth control plane, covering both the
+// account profile and the claude_cli roles companion request.
+var claudeOAuthInspectHeaderOrder = []string{
+	"Accept",
+	"Content-Type",
+	"Authorization",
+	"Cache-Control",
+	"User-Agent",
+	"Accept-Encoding",
+	"Host",
+	"Connection",
+}
+
+// claudeOAuthInspectTargets are the authenticated control-plane GET paths that
+// use claudeOAuthInspectHeaderOrder.
+var claudeOAuthInspectTargets = []string{
+	"/api/oauth/profile",
+	"/api/oauth/claude_cli/roles",
+}
+
+func claudeOAuthRequestHeaderOrder(method, requestTarget string) []string {
+	if method == http.MethodGet {
+		for _, target := range claudeOAuthInspectTargets {
+			if strings.HasPrefix(requestTarget, target) {
+				return claudeOAuthInspectHeaderOrder
+			}
+		}
+	}
+	return claudeOAuthRefreshHeaderOrder
+}
+
+// claudeOAuthSessionCacheCapacity bounds one proxy's TLS session cache. The
+// OAuth control plane only talks to platform.claude.com and api.anthropic.com,
+// so a small cache covers every reachable server.
+const (
+	claudeOAuthSessionCacheCapacity      = 8
+	claudeOAuthProxySessionCacheCapacity = 64
+)
+
+// claudeOAuthSessionCaches keys one session cache per effective proxy URL.
+//
+// ClaudeAuth is constructed per operation (every refresh and every executor
+// profile check builds a new one), so a cache owned by the round tripper would
+// always start empty and never resume. Keying on the proxy instead matches the
+// inference plane, where the whole round tripper is cached per proxy, and keeps
+// resumption from crossing proxy boundaries. TLS sessions are scoped to a
+// server rather than a credential, and connections are already pooled per proxy
+// on the inference plane, so this adds no new cross-credential linkage.
+
+var claudeOAuthSessionCaches = internalcache.NewBoundedLRU[string, tls.ClientSessionCache](
+	claudeOAuthProxySessionCacheCapacity,
+	nil,
+)
+
+func claudeOAuthSessionCache(proxyURL string) tls.ClientSessionCache {
+	return claudeOAuthSessionCaches.GetOrAdd(proxyURL, func() tls.ClientSessionCache {
+		return tls.NewLRUClientSessionCache(claudeOAuthSessionCacheCapacity)
+	})
+}
+
+// newClaudeOAuthTLSConfig builds the uTLS config for one control-plane dial.
+//
+// OmitEmptyPsk keeps the pre_shared_key extension silent until a session is
+// actually cached, so the first ClientHello is byte-identical to the captured
+// native handshake. PreferSkipResumptionOnNilExtension is defense in depth: for
+// HelloCustom specs uTLS panics when it wants to resume but the spec lacks the
+// matching extension, and this degrades that into a skipped resumption.
+func newClaudeOAuthTLSConfig(host string, sessionCache tls.ClientSessionCache) *tls.Config {
+	return &tls.Config{
+		ServerName:                         host,
+		ClientSessionCache:                 sessionCache,
+		OmitEmptyPsk:                       true,
+		PreferSkipResumptionOnNilExtension: true,
+	}
+}
+
+// claudeOAuthTLSClientHelloSpec reproduces the compact Node/OpenSSL profile
+// Claude Code 2.1.220 uses for Axios OAuth control-plane requests. Unlike the
+// inference profile, it advertises no ALPN extension and therefore uses
+// HTTP/1.1 without negotiating a protocol.
+func claudeOAuthTLSClientHelloSpec() *tls.ClientHelloSpec {
+	return &tls.ClientHelloSpec{
+		TLSVersMin:         tls.VersionTLS12,
+		TLSVersMax:         tls.VersionTLS13,
+		CompressionMethods: []uint8{0},
+		CipherSuites: []uint16{
+			tls.TLS_AES_128_GCM_SHA256,
+			tls.TLS_AES_256_GCM_SHA384,
+			tls.TLS_CHACHA20_POLY1305_SHA256,
+			tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+			tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+			tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+			tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+			tls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA,
+			tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
+			tls.TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA,
+			tls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
+			tls.TLS_RSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_RSA_WITH_AES_256_GCM_SHA384,
+			tls.TLS_RSA_WITH_AES_128_CBC_SHA,
+			tls.TLS_RSA_WITH_AES_256_CBC_SHA,
+		},
+		Extensions: []tls.TLSExtension{
+			&tls.SNIExtension{},
+			&tls.ExtendedMasterSecretExtension{},
+			&tls.RenegotiationInfoExtension{Renegotiation: tls.RenegotiateOnceAsClient},
+			&tls.SupportedCurvesExtension{Curves: []tls.CurveID{tls.X25519, tls.CurveP256, tls.CurveP384}},
+			&tls.SupportedPointsExtension{SupportedPoints: []byte{0}},
+			&tls.SessionTicketExtension{},
+			&tls.SignatureAlgorithmsExtension{SupportedSignatureAlgorithms: []tls.SignatureScheme{
+				tls.ECDSAWithP256AndSHA256,
+				tls.PSSWithSHA256,
+				tls.PKCS1WithSHA256,
+				tls.ECDSAWithP384AndSHA384,
+				tls.PSSWithSHA384,
+				tls.PKCS1WithSHA384,
+				tls.PSSWithSHA512,
+				tls.PKCS1WithSHA512,
+				tls.PKCS1WithSHA1,
+			}},
+			&tls.KeyShareExtension{KeyShares: []tls.KeyShare{{Group: tls.X25519}}},
+			&tls.PSKKeyExchangeModesExtension{Modes: []uint8{tls.PskModeDHE}},
+			&tls.SupportedVersionsExtension{Versions: []uint16{tls.VersionTLS13, tls.VersionTLS12}},
+			// pre_shared_key MUST be the final extension (RFC 8446 4.2.11). It
+			// contributes zero bytes until a cached session exists.
+			&tls.UtlsPreSharedKeyExtension{},
+		},
+	}
+}
+
+// utlsRoundTripper uses Claude Code's OAuth control-plane TLS and HTTP/1.1
+// profile while retaining net/http proxy, cancellation, response parsing and
+// connection lifecycle semantics.
 type utlsRoundTripper struct {
-	// mu protects the connections map and pending map
-	mu sync.Mutex
-	// connections caches HTTP/2 client connections per host
-	connections map[string]*http2.ClientConn
-	// pending tracks hosts that are currently being connected to (prevents race condition)
-	pending map[string]*sync.Cond
-	// dialer is used to create network connections, supporting proxies
 	dialer proxy.Dialer
+	// sessionCache is shared by every transport built for the same proxy, so
+	// short-lived ClaudeAuth instances can still resume, while resumption never
+	// crosses proxy boundaries.
+	sessionCache tls.ClientSessionCache
+	transport    *http.Transport
 }
 
 const anthropicHTTPClientTimeout = 60 * time.Second
@@ -38,7 +179,9 @@ const anthropicHTTPClientTimeout = 60 * time.Second
 // newUtlsRoundTripper creates a new utls-based round tripper with optional proxy support
 func newUtlsRoundTripper(cfg *config.SDKConfig) *utlsRoundTripper {
 	var dialer proxy.Dialer = proxy.Direct
+	var proxyURL string
 	if cfg != nil {
+		proxyURL = cfg.ProxyURL
 		proxyDialer, mode, errBuild := proxyutil.BuildDialer(cfg.ProxyURL)
 		if errBuild != nil {
 			// Fail-closed on an invalid proxy_url: never silently fall back to a
@@ -51,241 +194,95 @@ func newUtlsRoundTripper(cfg *config.SDKConfig) *utlsRoundTripper {
 		}
 	}
 
-	return &utlsRoundTripper{
-		connections: make(map[string]*http2.ClientConn),
-		pending:     make(map[string]*sync.Cond),
-		dialer:      dialer,
+	roundTripper := &utlsRoundTripper{
+		dialer:       dialer,
+		sessionCache: claudeOAuthSessionCache(proxyURL),
 	}
+	roundTripper.transport = &http.Transport{
+		ForceAttemptHTTP2:     false,
+		DialContext:           roundTripper.dialWithContext,
+		DialTLSContext:        roundTripper.dialTLSContext,
+		ResponseHeaderTimeout: 45 * time.Second,
+		ExpectContinueTimeout: time.Second,
+	}
+	return roundTripper
 }
 
-func (t *utlsRoundTripper) waitForPendingConnection(ctx context.Context, host string, cond *sync.Cond) (*http2.ClientConn, error) {
-	wakeOnCancelDone := make(chan struct{})
-	go func() {
-		select {
-		case <-ctx.Done():
-			t.mu.Lock()
-			cond.Broadcast()
-			t.mu.Unlock()
-		case <-wakeOnCancelDone:
-		}
-	}()
-	defer close(wakeOnCancelDone)
-
-	for {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		cond.Wait()
-		if h2Conn, ok := t.connections[host]; ok && h2Conn.CanTakeNewRequest() {
-			return h2Conn, nil
-		}
-		if _, stillPending := t.pending[host]; !stillPending {
-			return nil, nil
-		}
-	}
-}
-
-// getOrCreateConnection gets an existing connection or creates a new one.
-// It uses a per-host locking mechanism to prevent multiple goroutines from
-// creating connections to the same host simultaneously.
-func (t *utlsRoundTripper) getOrCreateConnection(ctx context.Context, host, addr string) (*http2.ClientConn, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-
-	t.mu.Lock()
-
-	// Check if connection exists and is usable
-	if h2Conn, ok := t.connections[host]; ok && h2Conn.CanTakeNewRequest() {
-		t.mu.Unlock()
-		return h2Conn, nil
-	}
-
-	// Check if another goroutine is already creating a connection
-	if cond, ok := t.pending[host]; ok {
-		// Wait for the other goroutine to finish
-		h2Conn, err := t.waitForPendingConnection(ctx, host, cond)
-		if err != nil {
-			t.mu.Unlock()
-			return nil, err
-		}
-		if h2Conn != nil {
-			t.mu.Unlock()
-			return h2Conn, nil
-		}
-		// Connection still not available, we'll create one
-	}
-
-	// Mark this host as pending
-	cond := sync.NewCond(&t.mu)
-	t.pending[host] = cond
-	t.mu.Unlock()
-
-	// Create connection outside the lock
-	h2Conn, err := t.createConnection(ctx, host, addr)
-
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	// Remove pending marker and wake up waiting goroutines
-	delete(t.pending, host)
-	cond.Broadcast()
-
+func (t *utlsRoundTripper) dialTLSContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	conn, err := t.dialWithContext(ctx, network, addr)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("claude oauth tls: dial upstream: %w", err)
 	}
 
-	// Store the new connection
-	t.connections[host] = h2Conn
-	return h2Conn, nil
+	host, _, errSplit := net.SplitHostPort(addr)
+	if errSplit != nil {
+		if errClose := conn.Close(); errClose != nil {
+			log.Debugf("claude oauth tls: close failed connection: %v", errClose)
+		}
+		return nil, fmt.Errorf("claude oauth tls: split upstream address: %w", errSplit)
+	}
+	tlsConn := tls.UClient(conn, newClaudeOAuthTLSConfig(host, t.sessionCache), tls.HelloCustom)
+	if errPreset := tlsConn.ApplyPreset(claudeOAuthTLSClientHelloSpec()); errPreset != nil {
+		if errClose := tlsConn.Close(); errClose != nil {
+			log.Debugf("claude oauth tls: close connection after preset failure: %v", errClose)
+		}
+		return nil, fmt.Errorf("claude oauth tls: apply ClientHello: %w", errPreset)
+	}
+	handshakeTimeout, _ := ctx.Value(claudeRefreshHandshakeTimeoutContextKey{}).(time.Duration)
+	if handshakeTimeout <= 0 {
+		handshakeTimeout = 15 * time.Second
+	}
+	handshakeCtx, cancelHandshake := context.WithTimeout(ctx, handshakeTimeout)
+	defer cancelHandshake()
+	if errHandshake := tlsConn.HandshakeContext(handshakeCtx); errHandshake != nil {
+		if errClose := tlsConn.Close(); errClose != nil {
+			log.Debugf("claude oauth tls: close connection after handshake failure: %v", errClose)
+		}
+		return nil, fmt.Errorf("claude oauth tls: handshake upstream: %w", errHandshake)
+	}
+	return httpwire.NewOrderedRequestConn(tlsConn, claudeOAuthRequestHeaderOrder), nil
 }
 
+func (t *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	return t.transport.RoundTrip(req)
+}
+
+func (t *utlsRoundTripper) CloseIdleConnections() {
+	t.transport.CloseIdleConnections()
+}
+
+func NewAnthropicHttpClient(cfg *config.SDKConfig) *http.Client {
+	return &http.Client{Transport: newUtlsRoundTripper(cfg), Timeout: anthropicHTTPClientTimeout}
+}
+
+// dialWithContext preserves cancellation even for a proxy dialer without context
+// support. A connection arriving after cancellation is closed by its owner.
 func (t *utlsRoundTripper) dialWithContext(ctx context.Context, network, addr string) (net.Conn, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-
+	if dialer, ok := t.dialer.(proxy.ContextDialer); ok {
+		return dialer.DialContext(ctx, network, addr)
+	}
 	type dialResult struct {
 		conn net.Conn
 		err  error
 	}
-	resultCh := make(chan dialResult, 1)
+	resultCh := make(chan dialResult)
 	go func() {
 		conn, err := t.dialer.Dial(network, addr)
-		resultCh <- dialResult{conn: conn, err: err}
+		select {
+		case resultCh <- dialResult{conn, err}:
+		case <-ctx.Done():
+			if conn != nil {
+				_ = conn.Close()
+			}
+		}
 	}()
-
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	case result := <-resultCh:
 		return result.conn, result.err
-	}
-}
-
-func closeConnectionOnCancel(ctx context.Context, conn net.Conn) func() {
-	cancelWatchDone := make(chan struct{})
-	go func() {
-		select {
-		case <-ctx.Done():
-			_ = conn.Close()
-		case <-cancelWatchDone:
-		}
-	}()
-	return func() { close(cancelWatchDone) }
-}
-
-// createConnection creates a new HTTP/2 connection with Chrome TLS fingerprint.
-// Chrome's TLS fingerprint is closer to Node.js/OpenSSL (which real Claude Code uses)
-// than Firefox, reducing the mismatch between TLS layer and HTTP headers.
-func (t *utlsRoundTripper) createConnection(ctx context.Context, host, addr string) (*http2.ClientConn, error) {
-	conn, err := t.dialWithContext(ctx, "tcp", addr)
-	if err != nil {
-		return nil, err
-	}
-	defer func() {
-		if err := conn.SetDeadline(time.Time{}); err != nil && !errors.Is(err, net.ErrClosed) {
-			log.Debugf("failed to clear utls connection deadline for %s: %v", host, err)
-		}
-	}()
-	if deadline, ok := ctx.Deadline(); ok {
-		if errDeadline := conn.SetDeadline(deadline); errDeadline != nil {
-			_ = conn.Close()
-			return nil, fmt.Errorf("failed to set connection deadline: %w", errDeadline)
-		}
-	}
-	stopCancelWatcher := closeConnectionOnCancel(ctx, conn)
-	defer stopCancelWatcher()
-
-	tlsConfig := &tls.Config{ServerName: host}
-	tlsConn := tls.UClient(conn, tlsConfig, tls.HelloChrome_Auto)
-
-	if err := tlsConn.Handshake(); err != nil {
-		conn.Close()
-		return nil, err
-	}
-
-	tr := &http2.Transport{}
-	h2Conn, err := tr.NewClientConn(tlsConn)
-	if err != nil {
-		tlsConn.Close()
-		return nil, err
-	}
-
-	return h2Conn, nil
-}
-
-// RoundTrip implements http.RoundTripper
-func (t *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	ctx := req.Context()
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-
-	host := req.URL.Host
-	addr := host
-	if !strings.Contains(addr, ":") {
-		addr += ":443"
-	}
-
-	// Get hostname without port for TLS ServerName
-	hostname := req.URL.Hostname()
-
-	h2Conn, err := t.getOrCreateConnection(ctx, hostname, addr)
-	if err != nil {
-		return nil, err
-	}
-
-	resp, err := h2Conn.RoundTrip(req)
-	if err != nil {
-		// Connection failed, remove it from cache
-		t.mu.Lock()
-		if cached, ok := t.connections[hostname]; ok && cached == h2Conn {
-			delete(t.connections, hostname)
-		}
-		t.mu.Unlock()
-		return nil, err
-	}
-
-	return resp, nil
-}
-
-// NewAnthropicHttpClient creates the OAuth control-plane HTTP client. Runtime
-// Claude requests may use account transport profiles, but OAuth token exchange
-// must avoid the legacy uTLS-only HTTP/2 path because a proxy/TLS mismatch can
-// leave remote Management Center re-auth stuck after callback submission.
-// It accepts optional SDK configuration for proxy settings.
-func NewAnthropicHttpClient(cfg *config.SDKConfig) *http.Client {
-	proxyURL := ""
-	if cfg != nil {
-		proxyURL = strings.TrimSpace(cfg.ProxyURL)
-	}
-	transport, mode, errBuild := proxyutil.BuildHTTPTransport(proxyURL)
-	if errBuild != nil || mode == proxyutil.ModeInvalid {
-		// Fail-closed: a present-but-invalid proxy_url must NOT fall back to the
-		// default (direct) transport, which would expose the real server IP under
-		// the account's OAuth identity. Return a client whose transport always
-		// errors before any dial. Empty (ModeInherit) and explicit direct
-		// (ModeDirect) keep the normal path below.
-		log.Errorf("claude oauth: egress_blocked reason=invalid_proxy_url proxy=%s: %v", proxyutil.Redact(proxyURL), errBuild)
-		return &http.Client{Transport: proxyutil.BlockingRoundTripper(), Timeout: anthropicHTTPClientTimeout}
-	}
-	if transport == nil {
-		if mode == proxyutil.ModeDirect {
-			transport = proxyutil.NewDirectTransport()
-		} else if defaultTransport, ok := http.DefaultTransport.(*http.Transport); ok && defaultTransport != nil {
-			transport = defaultTransport.Clone()
-		} else {
-			transport = &http.Transport{}
-		}
-	}
-	transport.TLSHandshakeTimeout = 15 * time.Second
-	transport.ResponseHeaderTimeout = 45 * time.Second
-	transport.ExpectContinueTimeout = 1 * time.Second
-	transport.ForceAttemptHTTP2 = true
-
-	return &http.Client{
-		Transport: transport,
-		Timeout:   anthropicHTTPClientTimeout,
 	}
 }

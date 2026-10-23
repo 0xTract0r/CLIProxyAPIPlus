@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -26,6 +27,7 @@ type responsesWebsocketPinnedAuthState struct {
 }
 
 type websocketTimelineLog struct {
+	mu      sync.Mutex
 	enabled bool
 	source  *requestlogging.FileBodySource
 	builder *strings.Builder
@@ -73,6 +75,12 @@ func (l *websocketTimelineLog) BeginRequest() {
 	if l == nil || !l.enabled || l.source == nil {
 		return
 	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.beginRequestLocked()
+}
+
+func (l *websocketTimelineLog) beginRequestLocked() {
 	l.closeCurrentPart()
 	part, errCreate := l.source.CreatePart("request")
 	if errCreate != nil {
@@ -87,13 +95,15 @@ func (l *websocketTimelineLog) Append(eventType string, payload []byte, timestam
 	if l == nil || !l.enabled {
 		return
 	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	data := formatWebsocketTimelineEvent(eventType, payload, timestamp)
 	if len(data) == 0 {
 		return
 	}
 	if l.source != nil {
 		if l.currentPart == nil {
-			l.BeginRequest()
+			l.beginRequestLocked()
 		}
 		if l.currentPart == nil {
 			return
@@ -114,6 +124,8 @@ func (l *websocketTimelineLog) SetContext(c *gin.Context) {
 	if l == nil || !l.enabled {
 		return
 	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	l.closeCurrentPart()
 	if l.source != nil {
 		if l.source.HasPayload() {
@@ -133,6 +145,8 @@ func (l *websocketTimelineLog) String() string {
 	if l == nil || !l.enabled {
 		return ""
 	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	l.closeCurrentPart()
 	if l.source != nil {
 		data, errRead := l.source.Bytes()
@@ -221,6 +235,25 @@ func isResponsesWebsocketCompletionEvent(eventType string) bool {
 	return eventType == wsEventTypeCompleted || eventType == wsEventTypeDone
 }
 
+type responsesWebsocketPayloadError struct {
+	status  int
+	payload []byte
+}
+
+func (e *responsesWebsocketPayloadError) Error() string {
+	if e == nil {
+		return ""
+	}
+	return string(e.payload)
+}
+
+func (e *responsesWebsocketPayloadError) StatusCode() int {
+	if e == nil {
+		return 0
+	}
+	return e.status
+}
+
 func responsesWebsocketErrorMessageFromPayload(payload []byte) *interfaces.ErrorMessage {
 	status := int(gjson.GetBytes(payload, "status").Int())
 	if status <= 0 {
@@ -230,17 +263,17 @@ func responsesWebsocketErrorMessageFromPayload(payload []byte) *interfaces.Error
 		status = http.StatusInternalServerError
 	}
 
-	errText := strings.TrimSpace(gjson.GetBytes(payload, "error.message").String())
-	if errText == "" {
-		errText = strings.TrimSpace(gjson.GetBytes(payload, "message").String())
+	trimmedPayload := bytes.TrimSpace(payload)
+	if len(trimmedPayload) > 0 {
+		return &interfaces.ErrorMessage{
+			StatusCode: status,
+			Error: &responsesWebsocketPayloadError{
+				status:  status,
+				payload: bytes.Clone(trimmedPayload),
+			},
+		}
 	}
-	if errText == "" {
-		errText = strings.TrimSpace(string(payload))
-	}
-	if errText == "" {
-		errText = http.StatusText(status)
-	}
-	return &interfaces.ErrorMessage{StatusCode: status, Error: fmt.Errorf("%s", errText)}
+	return &interfaces.ErrorMessage{StatusCode: status, Error: fmt.Errorf("%s", http.StatusText(status))}
 }
 
 func setWebsocketTimelineBody(c *gin.Context, body string) {

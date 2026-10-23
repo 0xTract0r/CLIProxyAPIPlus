@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"context"
 	"net"
 	"net/http"
 	"testing"
@@ -46,7 +47,7 @@ func TestApplyCodexRustlsWebsocketTLSForcesUTLSAndNilProxy(t *testing.T) {
 func TestSharedWebsocketDialerDoesNotApplyUTLS(t *testing.T) {
 	t.Parallel()
 
-	dialer := newProxyAwareWebsocketDialer(
+	dialer := newProxyAwareWebsocketDialer(context.Background(),
 		&config.Config{SDKConfig: sdkconfig.SDKConfig{ProxyURL: "socks5h://global.example.com:1080"}},
 		&cliproxyauth.Auth{ProxyURL: "socks5h://account.example.com:1080"},
 	)

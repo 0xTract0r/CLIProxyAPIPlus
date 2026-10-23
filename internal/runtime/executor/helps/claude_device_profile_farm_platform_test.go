@@ -169,7 +169,7 @@ func TestResolveClaudeDeviceProfile_FarmBoundVersionRaiseKeepsLinux(t *testing.T
 // the CI host GOOS/GOARCH.
 func TestApplyClaudeLegacyDeviceHeaders_FarmAgnostic(t *testing.T) {
 	r := httptest.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", nil)
-	ApplyClaudeLegacyDeviceHeaders(r, nil, &config.Config{})
+	ApplyClaudeLegacyDeviceHeaders(r, nil, &config.Config{}, false)
 
 	if got, want := r.Header.Get("X-Stainless-Os"), MapStainlessOS(); got != want {
 		t.Fatalf("legacy X-Stainless-Os = %q, want runtime-derived %q (must ignore farm binding)", got, want)

@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -290,7 +291,7 @@ func TestWarmupServingCountDoesNotTouchAffinity(t *testing.T) {
 		t.Fatal("count/non-Claude cleared Claude protection")
 	}
 	for key, before := range beforeEntries {
-		if after := s.cache.entries[key]; after != before {
+		if after := s.cache.entries[key]; !reflect.DeepEqual(after, before) {
 			t.Fatal("count/non-Claude changed a binding")
 		}
 	}

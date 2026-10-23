@@ -54,12 +54,18 @@ func TestApplyClaudeHeaders_DangerousDirect_OAuthGatedByReplayFlag(t *testing.T)
 		{"oauth + flag on => present", oauthAuth(), "tok", newCfg(&tru), true},
 		{"apikey + flag nil => present (unchanged)", apiKeyAuth(), "key-x", newCfg(nil), true},
 		{"apikey + flag on => present", apiKeyAuth(), "key-x", newCfg(&tru), true},
+		{"apikey + flag false => present", apiKeyAuth(), "key-x", newCfg(&fal), true},
+		{"oauth prefix + flag nil => absent", oauthAuth(), "sk-ant-oat-synthetic", newCfg(nil), false},
+		{"oauth prefix + flag false => absent", oauthAuth(), "sk-ant-oat-synthetic", newCfg(&fal), false},
+		{"oauth prefix + flag on => present", oauthAuth(), "sk-ant-oat-synthetic", newCfg(&tru), true},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			req := newClaudeHeaderTestRequest(t, http.Header{})
-			applyClaudeHeaders(req, tc.auth, tc.key, false, nil, tc.cfg)
+			if err := applyClaudeHeaders(req, tc.auth, tc.key, false, nil, nil, tc.cfg, nil, false); err != nil {
+				t.Fatal(err)
+			}
 			got := req.Header.Get(dangerousDirectHeaderName) == "true"
 			if got != tc.want {
 				t.Fatalf("dangerous-direct present = %v, want %v (headers: %v)",

@@ -12,6 +12,7 @@ import (
 
 	xxHash64 "github.com/pierrec/xxHash/xxHash64"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
@@ -96,7 +97,7 @@ func billingBodyWithVersion(t *testing.T, version, build, cch string) []byte {
 
 // recomputeExpectedCCH independently reproduces signAnthropicMessagesBody's hash
 // step (normalize the billing-header cch to 00000, then xxHash64 the whole body
-// with the shared seed) so a test can prove the emitted cch corresponds to the
+// with the fixed legacy fork seed) so a test can prove the emitted cch corresponds to the
 // exact bytes of the rewritten body under the real algorithm — not merely that
 // re-calling the signer is self-consistent.
 func recomputeExpectedCCH(t *testing.T, body []byte) string {
@@ -107,7 +108,7 @@ func recomputeExpectedCCH(t *testing.T, body []byte) string {
 	if err != nil {
 		t.Fatalf("zero cch: %v", err)
 	}
-	return fmt.Sprintf("%05x", xxHash64.Checksum(zeroedBody, claudeCCHSeed)&0xFFFFF)
+	return fmt.Sprintf("%05x", xxHash64.Checksum(zeroedBody, 0x6E52736AC806831E)&0xFFFFF)
 }
 
 func ccVersionSegment(t *testing.T, body []byte) string {
@@ -207,7 +208,7 @@ func TestAlignRealPathBillingVersion_ReSignCoversRewrittenBodyExactlyOnce(t *tes
 		t.Fatal("expected changed=true")
 	}
 	// Mirror the executor: exactly one re-sign after the alignment.
-	signed := signAnthropicMessagesBody(aligned)
+	signed := mustSignClaudeMessagesForIntegration(t, aligned)
 
 	emitted := cchFromBody(t, signed)
 	if wantOverRewritten := recomputeExpectedCCH(t, signed); emitted != wantOverRewritten {
@@ -219,7 +220,7 @@ func TestAlignRealPathBillingVersion_ReSignCoversRewrittenBodyExactlyOnce(t *tes
 		t.Fatalf("emitted cch %q matches the un-floored body hash %q; cch is not bound to the rewritten version", emitted, overOriginal)
 	}
 	// Exactly-once: re-signing the already-signed body is idempotent.
-	if reSigned := cchFromBody(t, signAnthropicMessagesBody(signed)); reSigned != emitted {
+	if reSigned := cchFromBody(t, mustSignClaudeMessagesForIntegration(t, signed)); reSigned != emitted {
 		t.Fatalf("signing not idempotent: %q -> %q", emitted, reSigned)
 	}
 }
@@ -331,7 +332,7 @@ func runRealPathExecuteCapture(t *testing.T, align *bool, apiKey string, payload
 
 	cfg := &config.Config{Claude: config.ClaudeConfig{AlignRealPathBillingVersion: align}}
 	executor := NewClaudeExecutor(cfg)
-	auth := &cliproxyauth.Auth{ProxyURL: "direct", ID: "align-real-path-exec", Attributes: map[string]string{
+	auth := &cliproxyauth.Auth{Metadata: claudeOAuthTestMetadata(), ProxyURL: "direct", ID: "align-real-path-exec", Attributes: map[string]string{
 		"api_key":  apiKey,
 		"base_url": server.URL,
 	}}
@@ -424,7 +425,7 @@ func TestClaudeExecutorExecuteStream_RealPathFloorsBodyBillingVersionWhenEnabled
 
 	cfg := &config.Config{Claude: config.ClaudeConfig{AlignRealPathBillingVersion: &enabled}}
 	executor := NewClaudeExecutor(cfg)
-	auth := &cliproxyauth.Auth{ProxyURL: "direct", ID: "align-real-path-stream", Attributes: map[string]string{
+	auth := &cliproxyauth.Auth{Metadata: claudeOAuthTestMetadata(), ProxyURL: "direct", ID: "align-real-path-stream", Attributes: map[string]string{
 		"api_key":  "sk-ant-oat-real-path-stream",
 		"base_url": server.URL,
 	}}
@@ -473,7 +474,10 @@ func TestApplyCloaking_CloakedPathStillInjectsAndFloors(t *testing.T) {
 	payload := []byte(`{"system":"third party system","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
 	ctx := ctxWithUserAgent("some-third-party-agent/1.0")
 
-	out := applyCloaking(ctx, cfg, auth, payload, "claude-3-5-sonnet-20241022", "key-cloak", realPathHighWater)
+	out, _, errCloak := applyCloaking(ctx, cfg, auth, helps.SetStringIfDifferent(payload, "model", "claude-3-5-sonnet-20241022"), "key-cloak", false, false)
+	if errCloak != nil {
+		t.Fatal(errCloak)
+	}
 
 	system := gjson.GetBytes(out, "system")
 	if !system.IsArray() {
@@ -490,3 +494,6 @@ func TestApplyCloaking_CloakedPathStillInjectsAndFloors(t *testing.T) {
 		t.Fatalf("cloaked path must inject the Claude Code agent block at system[1], got %q", got)
 	}
 }
+
+// Independent fixture matcher retained from the fork signing guard.
+var claudeBillingHeaderCCHPattern = regexp.MustCompile(`\bcch=([0-9a-f]{5});`)

@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"sort"
 	"time"
 
@@ -22,19 +23,28 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
+	"strings"
+
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/client/codex/optimize-multi-agent-v2"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/httpwire"
+	sdkaccess "github.com/router-for-me/CLIProxyAPI/v8/sdk/access"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
 
-func writeResponsesSSEChunk(w io.Writer, chunk []byte) {
+func writeResponsesSSEChunk(w io.Writer, chunk []byte) error {
 	if w == nil || len(chunk) == 0 {
-		return
+		return nil
 	}
-	if _, err := w.Write(chunk); err != nil {
-		return
+	if n, errWrite := w.Write(chunk); errWrite != nil {
+		return errWrite
+	} else if n != len(chunk) {
+		return io.ErrShortWrite
 	}
 	if bytes.HasSuffix(chunk, []byte("\n\n")) || bytes.HasSuffix(chunk, []byte("\r\n\r\n")) {
-		return
+		return nil
 	}
 	suffix := []byte("\n\n")
 	if bytes.HasSuffix(chunk, []byte("\r\n")) {
@@ -42,9 +52,17 @@ func writeResponsesSSEChunk(w io.Writer, chunk []byte) {
 	} else if bytes.HasSuffix(chunk, []byte("\n")) {
 		suffix = []byte("\n")
 	}
-	if _, err := w.Write(suffix); err != nil {
-		return
+	if n, errWrite := w.Write(suffix); errWrite != nil {
+		return errWrite
+	} else if n != len(suffix) {
+		return io.ErrShortWrite
 	}
+	return nil
+}
+
+// flushResponsesSSE preserves middleware behavior and transport flush errors.
+func flushResponsesSSE(w http.ResponseWriter) error {
+	return httpwire.FlushResponse(w)
 }
 
 type responsesSSEFramer struct {
@@ -52,11 +70,26 @@ type responsesSSEFramer struct {
 	outputItems          map[int][]byte
 	outputOrder          []int
 	unindexedOutputItems [][]byte
+	lastEvent            string
+	terminalEvent        string
+	terminalError        *interfaces.ErrorMessage
+	failureEvent         string
+	isCodexClient        bool
+	dataFrames           int
+	writeErr             error
+	canComplete          func() bool
 }
 
 func (f *responsesSSEFramer) WriteChunk(w io.Writer, chunk []byte) {
-	if len(chunk) == 0 {
+	if len(chunk) == 0 || f.terminalEvent != "" {
 		return
+	}
+	if responsesSSEStartsNewDataFrame(f.pending, chunk) {
+		f.writeFrame(w, f.pending)
+		f.pending = f.pending[:0]
+		if f.terminalEvent != "" {
+			return
+		}
 	}
 	if responsesSSENeedsLineBreak(f.pending, chunk) {
 		f.pending = append(f.pending, '\n')
@@ -70,6 +103,10 @@ func (f *responsesSSEFramer) WriteChunk(w io.Writer, chunk []byte) {
 		f.writeFrame(w, f.pending[:frameLen])
 		copy(f.pending, f.pending[frameLen:])
 		f.pending = f.pending[:len(f.pending)-frameLen]
+		if f.terminalEvent != "" {
+			f.pending = f.pending[:0]
+			return
+		}
 	}
 	if len(bytes.TrimSpace(f.pending)) == 0 {
 		f.pending = f.pending[:0]
@@ -83,14 +120,14 @@ func (f *responsesSSEFramer) WriteChunk(w io.Writer, chunk []byte) {
 }
 
 func (f *responsesSSEFramer) Flush(w io.Writer) {
-	if len(f.pending) == 0 {
+	if len(f.pending) == 0 || f.terminalEvent != "" {
 		return
 	}
 	if len(bytes.TrimSpace(f.pending)) == 0 {
 		f.pending = f.pending[:0]
 		return
 	}
-	if !responsesSSECanEmitWithoutDelimiter(f.pending) {
+	if !responsesSSECanFlushWithoutDelimiter(f.pending) {
 		f.pending = f.pending[:0]
 		return
 	}
@@ -99,16 +136,92 @@ func (f *responsesSSEFramer) Flush(w io.Writer) {
 }
 
 func (f *responsesSSEFramer) writeFrame(w io.Writer, frame []byte) {
-	writeResponsesSSEChunk(w, f.repairFrame(frame))
+	if f.writeErr == nil {
+		f.writeErr = writeResponsesSSEChunk(w, f.repairFrame(frame))
+	}
+}
+
+func (f *responsesSSEFramer) shouldFilterPrivateEvent(streamEvent, payloadType string) bool {
+	check := func(name string) bool {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			return false
+		}
+		if responsesSSEErrorEvent(name) {
+			return false
+		}
+
+		// Always filter internal WebSocket timing telemetry and Meta subscription usage from SSE streams.
+		if strings.HasPrefix(name, "responsesapi.") || name == "response.subscription_usage" {
+			return true
+		}
+
+		// If official Codex client, preserve codex.response.metadata but filter rate limits.
+		if f != nil && f.isCodexClient {
+			if name == "codex.rate_limits" {
+				return true
+			}
+			return false
+		}
+
+		// For standard Responses API clients: filter any codex.* private events.
+		if strings.HasPrefix(name, "codex.") {
+			return true
+		}
+
+		return false
+	}
+
+	return check(streamEvent) || check(payloadType)
 }
 
 func (f *responsesSSEFramer) repairFrame(frame []byte) []byte {
 	payload, ok := responsesSSEDataPayload(frame)
-	if !ok || len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) || !json.Valid(payload) {
+	streamEvent := responsesSSEEventName(frame)
+	if streamEvent != "" && f.shouldFilterPrivateEvent(streamEvent, "") {
+		return nil
+	}
+	if !ok || len(payload) == 0 {
+		return frame
+	}
+	if bytes.Equal(payload, []byte("[DONE]")) {
+		f.dataFrames++
+		return frame
+	}
+	if !json.Valid(payload) {
 		return frame
 	}
 
-	switch gjson.GetBytes(payload, "type").String() {
+	payloadType := gjson.GetBytes(payload, "type").String()
+	if f.shouldFilterPrivateEvent(streamEvent, payloadType) {
+		return nil
+	}
+
+	f.dataFrames++
+
+	if responsesSSEErrorEvent(payloadType) || responsesSSEPayloadHasError(payload) {
+		if payloadType != "" {
+			f.lastEvent = sanitizeResponsesStreamEventName(payloadType)
+		}
+		return f.repairErrorPayload(payload)
+	}
+	eventType := payloadType
+	if responsesSSETerminalEvent(streamEvent) {
+		eventType = streamEvent
+	} else if eventType == "" {
+		eventType = streamEvent
+	}
+	if eventType != "" {
+		f.lastEvent = sanitizeResponsesStreamEventName(eventType)
+	}
+	if responsesSSEErrorEvent(eventType) {
+		return f.repairErrorPayload(payload)
+	}
+	if responsesSSETerminalEvent(eventType) {
+		f.terminalEvent = eventType
+	}
+
+	switch eventType {
 	case "response.output_item.done":
 		f.recordOutputItem(payload)
 	case "response.completed":
@@ -118,6 +231,88 @@ func (f *responsesSSEFramer) repairFrame(frame []byte) []byte {
 		}
 	}
 	return frame
+}
+
+func responsesSSEPayloadErrorMessage(payload []byte) *interfaces.ErrorMessage {
+	status := http.StatusBadGateway
+	for _, path := range []string{"status", "status_code", "error.status", "error.status_code", "response.error.status", "response.error.status_code"} {
+		candidate := int(gjson.GetBytes(payload, path).Int())
+		if candidate >= http.StatusBadRequest && candidate <= 599 {
+			status = candidate
+			break
+		}
+	}
+	return sanitizeResponsesStreamErrorMessage(&interfaces.ErrorMessage{StatusCode: status, Error: fmt.Errorf("%s", payload)})
+}
+
+func (f *responsesSSEFramer) repairErrorPayload(payload []byte) []byte {
+	errMsg := responsesSSEPayloadErrorMessage(payload)
+	status := errMsg.StatusCode
+	f.terminalError = errMsg
+	isResponseFailedPayload := gjson.GetBytes(payload, "type").String() == "response.failed"
+	failureEvent := f.failureEvent
+	if isResponseFailedPayload || failureEvent == "response.failed" {
+		failureEvent = "response.failed"
+	} else {
+		failureEvent = "error"
+	}
+	f.terminalEvent = failureEvent
+	errText := responsesStreamErrorText(errMsg, status)
+	seq := 0
+	if s := gjson.GetBytes(payload, "sequence_number"); s.Exists() {
+		seq = int(s.Int())
+	} else if origSeq := gjson.Get(errText, "sequence_number"); origSeq.Exists() {
+		seq = int(origSeq.Int())
+	} else if f != nil && f.dataFrames > 0 {
+		seq = f.dataFrames - 1
+	}
+	if failureEvent == "response.failed" {
+		chunk := handlers.BuildOpenAIResponsesStreamFailedChunk(status, errText, seq)
+		if isResponseFailedPayload && gjson.GetBytes(payload, "response").IsObject() {
+			repaired := f.repairCompletedPayload(payload)
+			respRaw := []byte(gjson.GetBytes(repaired, "response").Raw)
+			respRaw, _ = sjson.SetBytes(respRaw, "status", "failed")
+			if sanitizedErr := gjson.GetBytes(chunk, "response.error"); sanitizedErr.Exists() {
+				respRaw, _ = sjson.SetRawBytes(respRaw, "error", []byte(sanitizedErr.Raw))
+			}
+			env := []byte(`{"type":"response.failed","sequence_number":0,"response":{}}`)
+			env, _ = sjson.SetBytes(env, "sequence_number", seq)
+			if updated, errSet := sjson.SetRawBytes(env, "response", respRaw); errSet == nil {
+				chunk = updated
+			}
+		}
+		return []byte(fmt.Sprintf("event: response.failed\ndata: %s\n\n", chunk))
+	}
+	chunk := handlers.BuildOpenAIResponsesStreamErrorChunk(status, errText, seq)
+	return []byte(fmt.Sprintf("event: error\ndata: %s\n\n", chunk))
+}
+
+func responsesSSEErrorEvent(eventType string) bool {
+	switch eventType {
+	case "response.failed", "response.error", "error":
+		return true
+	default:
+		return false
+	}
+}
+
+func responsesSSETerminalEvent(eventType string) bool {
+	switch eventType {
+	case "response.completed", "response.incomplete", "response.failed", "response.done", "response.error", "error":
+		return true
+	default:
+		return false
+	}
+}
+
+func responsesSSEPayloadHasError(payload []byte) bool {
+	for _, path := range []string{"error", "response.error"} {
+		result := gjson.GetBytes(payload, path)
+		if result.Exists() && result.Type != gjson.Null {
+			return true
+		}
+	}
+	return gjson.GetBytes(payload, "code").Exists() && gjson.GetBytes(payload, "message").Exists()
 }
 
 func responsesSSEDataPayload(frame []byte) ([]byte, bool) {
@@ -270,35 +465,45 @@ func responsesSSEHasField(chunk []byte, prefix []byte) bool {
 
 func responsesSSECanEmitWithoutDelimiter(chunk []byte) bool {
 	trimmed := bytes.TrimSpace(chunk)
-	if len(trimmed) == 0 || responsesSSENeedsMoreData(trimmed) || !responsesSSEHasField(trimmed, []byte("data:")) {
+	if len(trimmed) == 0 || responsesSSENeedsMoreData(trimmed) ||
+		!responsesSSEHasField(trimmed, []byte("event:")) || !responsesSSEHasField(trimmed, []byte("data:")) {
 		return false
 	}
 	return responsesSSEDataLinesValid(trimmed)
 }
 
-func responsesSSEDataLinesValid(chunk []byte) bool {
-	s := chunk
-	for len(s) > 0 {
-		line := s
-		if i := bytes.IndexByte(s, '\n'); i >= 0 {
-			line = s[:i]
-			s = s[i+1:]
-		} else {
-			s = nil
-		}
-		line = bytes.TrimSpace(line)
-		if len(line) == 0 || !bytes.HasPrefix(line, []byte("data:")) {
-			continue
-		}
-		data := bytes.TrimSpace(line[len("data:"):])
-		if len(data) == 0 || bytes.Equal(data, []byte("[DONE]")) {
-			continue
-		}
-		if !json.Valid(data) {
-			return false
+func responsesSSECanFlushWithoutDelimiter(chunk []byte) bool {
+	trimmed := bytes.TrimSpace(chunk)
+	return len(trimmed) > 0 && responsesSSEHasField(trimmed, []byte("data:")) && responsesSSEDataLinesValid(trimmed)
+}
+
+func responsesSSEStartsNewDataFrame(pending, chunk []byte) bool {
+	trimmedPending := bytes.TrimSpace(pending)
+	if len(trimmedPending) == 0 || responsesSSEHasField(trimmedPending, []byte("event:")) ||
+		!responsesSSEHasField(trimmedPending, []byte("data:")) || !responsesSSEDataLinesValid(trimmedPending) {
+		return false
+	}
+	trimmedChunk := bytes.TrimLeft(chunk, " \t\r\n")
+	return bytes.HasPrefix(trimmedChunk, []byte("data:"))
+}
+
+func responsesSSEEventName(frame []byte) string {
+	for _, line := range bytes.Split(frame, []byte("\n")) {
+		trimmed := bytes.TrimSpace(bytes.TrimRight(line, "\r"))
+		if bytes.HasPrefix(trimmed, []byte("event:")) {
+			return strings.TrimSpace(string(trimmed[len("event:"):]))
 		}
 	}
-	return true
+	return ""
+}
+
+func responsesSSEDataLinesValid(chunk []byte) bool {
+	payload, found := responsesSSEDataPayload(chunk)
+	if !found {
+		return true
+	}
+	payload = bytes.TrimSpace(payload)
+	return len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) || json.Valid(payload)
 }
 
 func responsesSSENeedsLineBreak(pending, chunk []byte) bool {
@@ -327,6 +532,7 @@ func responsesSSENeedsLineBreak(pending, chunk []byte) bool {
 // It holds a pool of clients to interact with the backend service.
 type OpenAIResponsesAPIHandler struct {
 	*handlers.BaseAPIHandler
+	AccessManager *sdkaccess.Manager
 }
 
 // NewOpenAIResponsesAPIHandler creates a new OpenAIResponses API handlers instance.
@@ -365,6 +571,57 @@ func (h *OpenAIResponsesAPIHandler) OpenAIResponsesModels(c *gin.Context) {
 	})
 }
 
+func (h *OpenAIResponsesAPIHandler) prepareCodexMultiAgentV2Tools(c *gin.Context, payload []byte) []byte {
+	if h == nil {
+		return payload
+	}
+	cfg := h.CurrentConfig()
+	if cfg == nil {
+		return payload
+	}
+
+	requestCtx := context.Background()
+	if c != nil && c.Request != nil {
+		requestCtx = c.Request.Context()
+	}
+	requestCtx = context.WithValue(requestCtx, "gin", c)
+
+	var requestHeaders http.Header
+	if c != nil && c.Request != nil {
+		requestHeaders = c.Request.Header
+	}
+	homeEnabled := h.AuthManager != nil && h.AuthManager.HomeEnabled()
+	updated, prepared := multiagentv2.PrepareCodexMultiAgentV2Tools(
+		requestCtx,
+		requestHeaders,
+		payload,
+		cfg.Client.Codex.OptimizeMultiAgentV2,
+		homeEnabled,
+	)
+	if prepared && c != nil {
+		c.Set(multiagentv2.CodexMultiAgentV2ToolsPreparedContextKey, true)
+	}
+	return updated
+}
+
+func (h *OpenAIResponsesAPIHandler) prepareCodexOrphanDelegation(c *gin.Context, payload []byte) []byte {
+	if h == nil {
+		return payload
+	}
+	cfg := h.CurrentConfig()
+	if cfg == nil || !cfg.CodexOrphanDelegationCompatibility {
+		return payload
+	}
+	requestCtx := context.Background()
+	var requestHeaders http.Header
+	if c != nil && c.Request != nil {
+		requestCtx = c.Request.Context()
+		requestHeaders = c.Request.Header
+	}
+	requestCtx = context.WithValue(requestCtx, "gin", c)
+	return multiagentv2.RewriteCodexOrphanDelegationInput(requestCtx, requestHeaders, payload, true)
+}
+
 // Responses handles the /v1/responses endpoint.
 // It determines whether the request is for a streaming or non-streaming response
 // and calls the appropriate handler based on the model provider.
@@ -375,7 +632,7 @@ func (h *OpenAIResponsesAPIHandler) Responses(c *gin.Context) {
 	rawJSON, err := handlers.ReadRequestBody(c)
 	// If data retrieval fails, return a 400 Bad Request error.
 	if err != nil {
-		c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
+		c.JSON(clienterror.HTTPStatusFromErrorOr(err, http.StatusBadRequest), handlers.ErrorResponse{
 			Error: handlers.ErrorDetail{
 				Message: fmt.Sprintf("Invalid request: %v", err),
 				Type:    "invalid_request_error",
@@ -383,6 +640,9 @@ func (h *OpenAIResponsesAPIHandler) Responses(c *gin.Context) {
 		})
 		return
 	}
+
+	rawJSON = h.prepareCodexMultiAgentV2Tools(c, rawJSON)
+	rawJSON = h.prepareCodexOrphanDelegation(c, rawJSON)
 
 	// Check if the client requested a streaming response.
 	streamResult := gjson.GetBytes(rawJSON, "stream")
@@ -397,7 +657,7 @@ func (h *OpenAIResponsesAPIHandler) Responses(c *gin.Context) {
 func (h *OpenAIResponsesAPIHandler) Compact(c *gin.Context) {
 	rawJSON, err := handlers.ReadRequestBody(c)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
+		c.JSON(clienterror.HTTPStatusFromErrorOr(err, http.StatusBadRequest), handlers.ErrorResponse{
 			Error: handlers.ErrorDetail{
 				Message: fmt.Sprintf("Invalid request: %v", err),
 				Type:    "invalid_request_error",
@@ -405,6 +665,8 @@ func (h *OpenAIResponsesAPIHandler) Compact(c *gin.Context) {
 		})
 		return
 	}
+
+	rawJSON = h.prepareCodexOrphanDelegation(c, rawJSON)
 
 	streamResult := gjson.GetBytes(rawJSON, "stream")
 	if streamResult.Type == gjson.True {
@@ -486,20 +748,78 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 
 	// New core execution path
 	modelName := gjson.GetBytes(rawJSON, "model").String()
-	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
+	deliveryCtx, finishDelivery := usage.WithStreamDelivery(context.Background())
+	defer finishDelivery(context.Canceled)
+	cliCtx, cancelExecution := h.GetContextWithCancel(h, c, deliveryCtx)
+	cliCancel := func(err error) {
+		finishDelivery(err)
+		cancelExecution(err)
+	}
 	cliCtx, stages := helps.BeginCodexStreamStages(cliCtx, c)
 	defer stages.HandlerDone()
-	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "")
-
+	writeMeasured := func(payload []byte) error {
+		started := time.Now()
+		defer stages.ObserveWrite(started)
+		return writeResponsesSSEChunk(c.Writer, payload)
+	}
+	flushMeasured := func() error {
+		started := time.Now()
+		defer stages.ObserveFlush(started)
+		return flushResponsesSSE(c.Writer)
+	}
+	writeErrorMeasured := func(errMsg *interfaces.ErrorMessage) {
+		started := time.Now()
+		defer stages.ObserveWrite(started)
+		h.WriteErrorResponse(c, errMsg)
+	}
 	setSSEHeaders := func() {
 		c.Header("Content-Type", "text/event-stream")
 		c.Header("Cache-Control", "no-cache")
 		c.Header("Connection", "keep-alive")
 		c.Header("Access-Control-Allow-Origin", "*")
 	}
-	framer := &responsesSSEFramer{}
+	var upstreamHeaders http.Header
+	committed := false
+	commitSSE := func() {
+		if committed {
+			return
+		}
+		setSSEHeaders()
+		handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+		committed = true
+	}
+	writeKeepAlive := func() bool {
+		commitSSE()
+		if errWrite := writeMeasured([]byte(": keep-alive\n\n")); errWrite != nil {
+			cliCancel(errWrite)
+			return false
+		}
+		if errFlush := flushMeasured(); errFlush != nil {
+			cliCancel(errFlush)
+			return false
+		}
+		return true
+	}
+	keepAliveC, stopKeepAlive := handlers.NewPreFirstTokenKeepAliveTicker(h.CurrentConfig())
+	defer stopKeepAlive()
 
-	// Peek at the first chunk
+	dataChan, resolvedHeaders, errChan, okBootstrap := h.ExecuteStreamWithPreFTKeepAlive(
+		c, cliCtx, cliCancel, h.HandlerType(), modelName, rawJSON, "", keepAliveC, writeKeepAlive,
+	)
+	if !okBootstrap {
+		return
+	}
+	upstreamHeaders = resolvedHeaders
+
+	isCodexClient := isCodexResponsesClientRequest(c)
+	failureEvent := "error"
+	if isCodexClient {
+		failureEvent = "response.failed"
+	}
+	framer := &responsesSSEFramer{failureEvent: failureEvent, isCodexClient: isCodexClient, canComplete: func() bool { return usage.StreamDeliverySupported(cliCtx) }}
+	var initialOutput bytes.Buffer
+
+	// Peek at the first complete SSE data frame.
 	for {
 		select {
 		case <-c.Request.Context().Done():
@@ -511,83 +831,400 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 				errChan = nil
 				continue
 			}
-			// Upstream failed immediately. Return proper error status and JSON.
-			writeStarted := time.Now()
-			h.WriteErrorResponse(c, errMsg)
-			if stages.Active() {
-				stages.ObserveWrite(writeStarted)
+			framer.Flush(&initialOutput)
+			if committed || framer.dataFrames > 0 {
+				stopKeepAlive()
+				safeErrMsg := sanitizeResponsesStreamErrorMessage(errMsg)
+				commitSSE()
+				if initialOutput.Len() > 0 {
+					if errWrite := writeMeasured(initialOutput.Bytes()); errWrite != nil {
+						cliCancel(errWrite)
+						return
+					}
+					if errFlush := flushMeasured(); errFlush != nil {
+						cliCancel(errFlush)
+						return
+					}
+				}
+				if safeErrMsg == nil {
+					cliCancel(nil)
+					return
+				}
+				pendingErrors := make(chan *interfaces.ErrorMessage, 1)
+				pendingErrors <- safeErrMsg
+				close(pendingErrors)
+				h.forwardResponsesStream(c, flusher, func(err error) { cliCancel(err) }, make(chan []byte), pendingErrors, framer)
+				return
 			}
-			if errMsg != nil {
-				cliCancel(errMsg.Error)
+			// Upstream failed before SSE was committed. Return JSON with HTTP status.
+			safeErrMsg := sanitizeResponsesInitialErrorMessage(errMsg)
+			h.LoggingAPIResponseError(context.WithValue(context.Background(), "gin", c), safeErrMsg)
+			writeErrorMeasured(safeErrMsg)
+			if safeErrMsg != nil {
+				cliCancel(safeErrMsg.Error)
 			} else {
 				cliCancel(nil)
 			}
 			return
 		case chunk, ok := <-dataChan:
 			if !ok {
-				// Stream closed without data? Send headers and done.
-				setSSEHeaders()
-				handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
-				writeStarted := time.Now()
-				_, _ = c.Writer.Write([]byte("\n"))
-				if stages.Active() {
-					stages.ObserveWrite(writeStarted)
+				framer.Flush(&initialOutput)
+				errMsg, hasPendingError := handlers.PendingStreamError(errChan)
+				if !hasPendingError && framer.terminalEvent == "" {
+					message := "upstream stream closed before first payload"
+					if framer.dataFrames > 0 {
+						message = "upstream stream closed before a terminal event"
+					}
+					errMsg = &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: fmt.Errorf("%s", message)}
 				}
-				flushStarted := time.Now()
-				flusher.Flush()
-				if stages.Active() {
-					stages.ObserveFlush(flushStarted)
+				if committed || framer.dataFrames > 0 {
+					errMsg = sanitizeResponsesStreamErrorMessage(errMsg)
+				} else {
+					errMsg = sanitizeResponsesInitialErrorMessage(errMsg)
 				}
-				cliCancel(nil)
+
+				if committed || framer.dataFrames > 0 {
+					stopKeepAlive()
+					commitSSE()
+					if initialOutput.Len() > 0 {
+						if errWrite := writeMeasured(initialOutput.Bytes()); errWrite != nil {
+							cliCancel(errWrite)
+							return
+						}
+						if errFlush := flushMeasured(); errFlush != nil {
+							cliCancel(errFlush)
+							return
+						}
+					}
+					if framer.terminalError != nil {
+						h.logResponsesStreamError(c, framer, framer.terminalError)
+						cliCancel(framer.terminalError.Error)
+						return
+					}
+					if errMsg == nil {
+						cliCancel(nil)
+						return
+					}
+					pendingErrors := make(chan *interfaces.ErrorMessage, 1)
+					pendingErrors <- errMsg
+					close(pendingErrors)
+					h.forwardResponsesStream(c, flusher, func(err error) { cliCancel(err) }, make(chan []byte), pendingErrors, framer)
+					return
+				}
+
+				h.LoggingAPIResponseError(context.WithValue(context.Background(), "gin", c), errMsg)
+				writeErrorMeasured(errMsg)
+				if errMsg != nil {
+					cliCancel(errMsg.Error)
+				} else {
+					cliCancel(nil)
+				}
 				return
 			}
 
-			// Success! Set headers.
-			setSSEHeaders()
-			handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
-
-			// Write first chunk logic (matching forwardResponsesStream)
-			writeStarted := time.Now()
-			framer.WriteChunk(c.Writer, chunk)
-			if stages.Active() {
-				stages.ObserveWrite(writeStarted)
-			}
-			flushStarted := time.Now()
-			flusher.Flush()
-			if stages.Active() {
-				stages.ObserveFlush(flushStarted)
+			framer.WriteChunk(&initialOutput, chunk)
+			if framer.dataFrames == 0 {
+				continue
 			}
 
-			// Continue
+			stopKeepAlive()
+			commitSSE()
+			if errWrite := writeMeasured(initialOutput.Bytes()); errWrite != nil {
+				cliCancel(errWrite)
+				return
+			}
+			if errFlush := flushMeasured(); errFlush != nil {
+				cliCancel(errFlush)
+				return
+			}
+			if framer.terminalError != nil {
+				h.logResponsesStreamError(c, framer, framer.terminalError)
+				cliCancel(framer.terminalError.Error)
+				return
+			}
+
 			h.forwardResponsesStream(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan, framer)
 			return
+		case <-keepAliveC:
+			if !writeKeepAlive() {
+				return
+			}
 		}
 	}
+}
+
+// isCodexResponsesClientRequest limits the alternate terminal event to official Codex clients.
+func isCodexResponsesClientRequest(c *gin.Context) bool {
+	if c == nil || c.Request == nil {
+		return false
+	}
+	if multiagentv2.IsCodexClientUserAgent(c.GetHeader("User-Agent")) {
+		return true
+	}
+
+	switch originator := strings.ToLower(strings.TrimSpace(c.GetHeader("Originator"))); originator {
+	case "codex desktop", "codex-tui", "codex_cli_rs":
+		return true
+	default:
+		return strings.HasPrefix(originator, "codex desktop/") || strings.HasPrefix(originator, "codex-tui/") || strings.HasPrefix(originator, "codex_cli_rs/")
+	}
+}
+
+const (
+	responsesStreamErrorMessageLimit = 2048
+	responsesStreamErrorFieldLimit   = 256
+)
+
+var (
+	responsesStreamSensitiveValuePattern = regexp.MustCompile(`(?i)((?:"?(?:api[_-]?key|access[_-]?token|token|authorization|secret)"?)\s*[=:]\s*"?)([^\s"&,;}]+)`)
+	responsesStreamBearerPattern         = regexp.MustCompile(`(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+`)
+)
+
+func truncateResponsesStreamErrorText(text string, limit int) string {
+	runes := []rune(text)
+	if len(runes) <= limit {
+		return text
+	}
+	return string(runes[:limit]) + "…"
+}
+
+func redactResponsesStreamErrorText(text string) string {
+	text = responsesStreamSensitiveValuePattern.ReplaceAllString(text, `${1}[REDACTED]`)
+	return responsesStreamBearerPattern.ReplaceAllString(text, "Bearer [REDACTED]")
+}
+
+func sanitizeResponsesStreamEventName(eventName string) string {
+	return truncateResponsesStreamErrorText(redactResponsesStreamErrorText(strings.TrimSpace(eventName)), responsesStreamErrorFieldLimit)
+}
+
+func isResponsesStreamSensitiveKey(key string) bool {
+	k := strings.ToLower(strings.TrimSpace(key))
+	k = strings.ReplaceAll(k, "-", "_")
+	if strings.Contains(k, "tokens") || strings.Contains(k, "token_count") || strings.Contains(k, "token_limit") || strings.Contains(k, "token_usage") {
+		return false
+	}
+	switch k {
+	case "authorization", "secret", "password", "passwd", "api_key", "apikey", "token", "access_token", "refresh_token", "id_token", "auth_token", "session_token", "api_token", "client_secret", "client_key":
+		return true
+	}
+	return strings.HasSuffix(k, "_secret") ||
+		strings.HasSuffix(k, "_password") ||
+		strings.HasSuffix(k, "_api_key") ||
+		strings.HasSuffix(k, "_token")
+}
+
+func sanitizeResponsesStreamErrorNode(val any) any {
+	switch v := val.(type) {
+	case string:
+		return truncateResponsesStreamErrorText(redactResponsesStreamErrorText(v), responsesStreamErrorMessageLimit)
+	case map[string]any:
+		cleaned := make(map[string]any, len(v))
+		for k, item := range v {
+			if isResponsesStreamSensitiveKey(k) {
+				cleaned[k] = "[REDACTED]"
+				continue
+			}
+			cleaned[k] = sanitizeResponsesStreamErrorNode(item)
+		}
+		return cleaned
+	case []any:
+		cleaned := make([]any, len(v))
+		for i, item := range v {
+			cleaned[i] = sanitizeResponsesStreamErrorNode(item)
+		}
+		return cleaned
+	default:
+		return val
+	}
+}
+
+func responsesStreamErrorText(errMsg *interfaces.ErrorMessage, status int) string {
+	text := http.StatusText(status)
+	if errMsg != nil && errMsg.Error != nil && strings.TrimSpace(errMsg.Error.Error()) != "" {
+		text = strings.TrimSpace(errMsg.Error.Error())
+	}
+	trimmed := strings.TrimSpace(text)
+	if !json.Valid([]byte(trimmed)) {
+		return truncateResponsesStreamErrorText(redactResponsesStreamErrorText(trimmed), responsesStreamErrorMessageLimit)
+	}
+
+	var root map[string]any
+	dec := json.NewDecoder(bytes.NewReader([]byte(trimmed)))
+	dec.UseNumber()
+	if errUnmarshal := dec.Decode(&root); errUnmarshal != nil {
+		return truncateResponsesStreamErrorText(redactResponsesStreamErrorText(trimmed), responsesStreamErrorMessageLimit)
+	}
+
+	errorNode, hasError := root["error"].(map[string]any)
+	if !hasError {
+		if resp, ok := root["response"].(map[string]any); ok {
+			errorNode, hasError = resp["error"].(map[string]any)
+		}
+	}
+
+	if hasError {
+		cleanedError := sanitizeResponsesStreamErrorNode(errorNode)
+		out := map[string]any{
+			"error": cleanedError,
+		}
+		if seq, ok := root["sequence_number"]; ok {
+			out["sequence_number"] = seq
+		}
+		data, errMarshal := json.Marshal(out)
+		if errMarshal == nil {
+			return string(data)
+		}
+	}
+
+	cleanedRoot := sanitizeResponsesStreamErrorNode(root)
+	data, errMarshal := json.Marshal(cleanedRoot)
+	if errMarshal == nil {
+		return string(data)
+	}
+	return http.StatusText(status)
+}
+
+type responsesStreamSanitizedError struct {
+	message string
+	cause   error
+}
+
+func (e *responsesStreamSanitizedError) Error() string { return e.message }
+func (e *responsesStreamSanitizedError) Unwrap() error { return e.cause }
+
+func sanitizeResponsesInitialErrorMessage(errMsg *interfaces.ErrorMessage) *interfaces.ErrorMessage {
+	if errMsg != nil && errMsg.DirectResponse {
+		return errMsg
+	}
+	return sanitizeResponsesStreamErrorMessage(errMsg)
+}
+
+func sanitizeResponsesStreamErrorMessage(errMsg *interfaces.ErrorMessage) *interfaces.ErrorMessage {
+	if errMsg == nil {
+		return nil
+	}
+	status := errMsg.StatusCode
+	if status < http.StatusBadRequest || status > 599 {
+		status = http.StatusInternalServerError
+	}
+	safe := *errMsg
+	safe.StatusCode = status
+	safe.Error = &responsesStreamSanitizedError{message: responsesStreamErrorText(errMsg, status), cause: errMsg.Error}
+	safe.DirectResponse = false
+	safe.Body = nil
+	return &safe
+}
+
+func (h *OpenAIResponsesAPIHandler) logResponsesStreamError(c *gin.Context, framer *responsesSSEFramer, errMsg *interfaces.ErrorMessage) {
+	if errMsg == nil {
+		return
+	}
+	status := errMsg.StatusCode
+	if status < http.StatusBadRequest || status > 599 {
+		status = http.StatusInternalServerError
+	}
+	lastEvent := "none"
+	if framer != nil && framer.lastEvent != "" {
+		lastEvent = framer.lastEvent
+	}
+	errText := responsesStreamErrorText(errMsg, status)
+	h.LoggingAPIResponseError(context.WithValue(context.Background(), "gin", c), &interfaces.ErrorMessage{
+		StatusCode: status,
+		Error:      fmt.Errorf("responses stream terminated after %s: %s", lastEvent, errText),
+	})
 }
 
 func (h *OpenAIResponsesAPIHandler) forwardResponsesStream(c *gin.Context, flusher http.Flusher, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage, framer *responsesSSEFramer) {
 	if framer == nil {
 		framer = &responsesSSEFramer{}
 	}
+	if isCodexResponsesClientRequest(c) {
+		framer.failureEvent = "response.failed"
+		framer.isCodexClient = true
+	} else {
+		framer.failureEvent = "error"
+		framer.isCodexClient = false
+	}
+	// Initial frames have already been written and flushed by the caller.
+	if framer.writeErr != nil {
+		cancel(framer.writeErr)
+		return
+	}
+	if framer.canComplete != nil && framer.canComplete() && framer.terminalEvent == "response.completed" && framer.terminalError == nil {
+		if errMsg, pending := handlers.PendingStreamError(errs); pending {
+			h.logResponsesStreamError(c, framer, sanitizeResponsesStreamErrorMessage(errMsg))
+		}
+		cancel(nil)
+		return
+	}
+	writeTerminalError := func(errMsg *interfaces.ErrorMessage) {
+		framer.Flush(c.Writer)
+		if errMsg == nil {
+			return
+		}
+		status := http.StatusInternalServerError
+		if errMsg.StatusCode > 0 {
+			status = errMsg.StatusCode
+		}
+		errText := responsesStreamErrorText(errMsg, status)
+		h.logResponsesStreamError(c, framer, errMsg)
+		if framer.terminalEvent != "" {
+			return
+		}
+		seq := 0
+		if framer != nil {
+			seq = framer.dataFrames
+		}
+		if origSeq := gjson.Get(errText, "sequence_number"); origSeq.Exists() {
+			seq = int(origSeq.Int())
+		}
+		if isCodexResponsesClientRequest(c) {
+			chunk := handlers.BuildOpenAIResponsesStreamFailedChunk(status, errText, seq)
+			_, _ = fmt.Fprintf(c.Writer, "\nevent: response.failed\ndata: %s\n\n", string(chunk))
+			return
+		}
+		chunk := handlers.BuildOpenAIResponsesStreamErrorChunk(status, errText, seq)
+		_, _ = fmt.Fprintf(c.Writer, "\nevent: error\ndata: %s\n\n", string(chunk))
+	}
+
 	h.ForwardStream(c, flusher, cancel, data, errs, handlers.StreamForwardOptions{
+		NormalizeTerminalError: sanitizeResponsesStreamErrorMessage,
+		Flush:                  func() error { return flushResponsesSSE(c.Writer) },
 		WriteChunk: func(chunk []byte) {
 			framer.WriteChunk(c.Writer, chunk)
 		},
-		WriteTerminalError: func(errMsg *interfaces.ErrorMessage) {
+		ChunkDone: func() bool {
+			return framer.canComplete != nil && framer.canComplete() && framer.terminalEvent == "response.completed" && framer.writeErr == nil
+		},
+		ChunkError: func() *interfaces.ErrorMessage {
+			if framer.writeErr != nil {
+				return &interfaces.ErrorMessage{Error: framer.writeErr}
+			}
+			if framer.terminalError != nil {
+				h.logResponsesStreamError(c, framer, framer.terminalError)
+			}
+			return framer.terminalError
+		},
+		WriteTerminalError: writeTerminalError,
+		CloseError: func() *interfaces.ErrorMessage {
 			framer.Flush(c.Writer)
-			if errMsg == nil {
-				return
+			if framer.writeErr != nil {
+				return &interfaces.ErrorMessage{Error: framer.writeErr}
 			}
-			status := http.StatusInternalServerError
-			if errMsg.StatusCode > 0 {
-				status = errMsg.StatusCode
+			if framer.terminalError != nil {
+				return framer.terminalError
 			}
-			errText := http.StatusText(status)
-			if errMsg.Error != nil && errMsg.Error.Error() != "" {
-				errText = errMsg.Error.Error()
+			if framer.terminalEvent != "" {
+				return nil
 			}
-			chunk := handlers.BuildOpenAIResponsesStreamErrorChunk(status, errText, 0)
-			_, _ = fmt.Fprintf(c.Writer, "\nevent: error\ndata: %s\n\n", string(chunk))
+			lastEvent := framer.lastEvent
+			if lastEvent == "" {
+				lastEvent = "none"
+			}
+			return &interfaces.ErrorMessage{
+				StatusCode: http.StatusBadGateway,
+				Error:      fmt.Errorf("upstream stream closed before a terminal event (last event: %s)", lastEvent),
+			}
 		},
 		WriteDone: func() {
 			framer.Flush(c.Writer)

@@ -8,6 +8,72 @@ import (
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
 )
 
+func TestBuildConfigChangeDetailsClientCodexEnableApplyPatch(t *testing.T) {
+	oldCfg, newCfg := &config.Config{}, &config.Config{}
+	newCfg.Client.Codex.EnableApplyPatch = true
+	for _, tc := range []struct {
+		old, new *config.Config
+		want     string
+	}{
+		{oldCfg, newCfg, "client.codex.enable-apply-patch: false -> true"},
+		{newCfg, oldCfg, "client.codex.enable-apply-patch: true -> false"},
+	} {
+		changes := BuildConfigChangeDetails(tc.old, tc.new)
+		if len(changes) != 1 || changes[0] != tc.want {
+			t.Fatalf("changes = %v, want [%s]", changes, tc.want)
+		}
+	}
+	if changes := BuildConfigChangeDetails(newCfg, newCfg); len(changes) != 0 {
+		t.Fatalf("unchanged client setting produced changes: %v", changes)
+	}
+}
+
+func TestBuildConfigChangeDetailsClientCodexOptimizeMultiAgentV2(t *testing.T) {
+	oldCfg, newCfg := &config.Config{}, &config.Config{}
+	newCfg.Client.Codex.OptimizeMultiAgentV2 = true
+	for _, tc := range []struct {
+		old, new *config.Config
+		want     string
+	}{
+		{oldCfg, newCfg, "client.codex.optimize-multi-agent-v2: false -> true"},
+		{newCfg, oldCfg, "client.codex.optimize-multi-agent-v2: true -> false"},
+	} {
+		changes := BuildConfigChangeDetails(tc.old, tc.new)
+		if len(changes) != 1 || changes[0] != tc.want {
+			t.Fatalf("changes = %v, want [%s]", changes, tc.want)
+		}
+	}
+	if changes := BuildConfigChangeDetails(newCfg, newCfg); len(changes) != 0 {
+		t.Fatalf("unchanged client setting produced changes: %v", changes)
+	}
+}
+
+func TestBuildConfigChangeDetailsClientCodexWebSearchResultCache(t *testing.T) {
+	oldCfg, newCfg := &config.Config{}, &config.Config{}
+	newCfg.Client.Codex.WebSearchResultCache = config.CodexWebSearchResultCacheConfig{
+		Enabled: true,
+		TTL:     "30m",
+		Limit:   256,
+	}
+	changes := BuildConfigChangeDetails(oldCfg, newCfg)
+	want := []string{
+		"client.codex.web-search-result-cache.enabled: false -> true",
+		"client.codex.web-search-result-cache.ttl:  -> 30m",
+		"client.codex.web-search-result-cache.limit: 0 -> 256",
+	}
+	if len(changes) != len(want) {
+		t.Fatalf("changes = %v, want %v", changes, want)
+	}
+	for i := range want {
+		if changes[i] != want[i] {
+			t.Fatalf("changes[%d] = %q, want %q", i, changes[i], want[i])
+		}
+	}
+	if unchanged := BuildConfigChangeDetails(newCfg, newCfg); len(unchanged) != 0 {
+		t.Fatalf("unchanged web-search-result-cache produced changes: %v", unchanged)
+	}
+}
+
 func TestBuildConfigChangeDetails(t *testing.T) {
 	oldCfg := &config.Config{
 		Port:    8080,
@@ -39,6 +105,7 @@ func TestBuildConfigChangeDetails(t *testing.T) {
 	newCfg := &config.Config{
 		Port:    9090,
 		AuthDir: "/tmp/auth-new",
+		Codex:   config.CodexConfig{DisableCodexCloaking: true},
 		GeminiKey: []config.GeminiKey{
 			{APIKey: "old", BaseURL: "http://old", ExcludedModels: []string{"old-model", "extra"}},
 		},
@@ -78,6 +145,7 @@ func TestBuildConfigChangeDetails(t *testing.T) {
 	expectContains(t, details, "remote-management.allow-remote: false -> true")
 	expectContains(t, details, "remote-management.disable-auto-update-panel: false -> true")
 	expectContains(t, details, "remote-management.secret-key: updated")
+	expectContains(t, details, "codex.disable-codex-cloaking: false -> true")
 	expectContains(t, details, "oauth-excluded-models[providera]: updated (1 -> 2 entries)")
 	expectContains(t, details, "oauth-excluded-models[providerb]: added (1 entries)")
 	expectContains(t, details, "openai-compatibility:")
@@ -194,7 +262,36 @@ func TestBuildConfigChangeDetails_ModelPrefixes(t *testing.T) {
 	expectContains(t, changes, "vertex[0].prefix: old-v -> new-v")
 }
 
+func TestBuildConfigChangeDetails_CodexAlphaSearch(t *testing.T) {
+	oldCfg := &config.Config{CodexKey: []config.CodexKey{{APIKey: "key", BaseURL: "https://codex.example.com"}}}
+	newCfg := &config.Config{CodexKey: []config.CodexKey{{APIKey: "key", BaseURL: "https://codex.example.com", AlphaSearch: true}}}
+
+	changes := BuildConfigChangeDetails(oldCfg, newCfg)
+	expectContains(t, changes, "codex[0].alpha-search: false -> true")
+}
+
+func TestBuildConfigChangeDetails_CodexKey_DisableCodexCloaking(t *testing.T) {
+	disabled := true
+	oldCfg := &config.Config{CodexKey: []config.CodexKey{{APIKey: "key", BaseURL: "https://codex.example.com"}}}
+	newCfg := &config.Config{CodexKey: []config.CodexKey{{APIKey: "key", BaseURL: "https://codex.example.com", DisableCodexCloaking: &disabled}}}
+
+	changes := BuildConfigChangeDetails(oldCfg, newCfg)
+	expectContains(t, changes, "codex[0].disable-codex-cloaking: inherit -> true")
+}
+
+func TestBuildConfigChangeDetails_CodexOrphanDelegationCompatibility(t *testing.T) {
+	oldCfg := &config.Config{Codex: config.CodexConfig{OrphanDelegationCompatibility: false}}
+	newCfg := &config.Config{Codex: config.CodexConfig{OrphanDelegationCompatibility: true}}
+
+	changes := BuildConfigChangeDetails(oldCfg, newCfg)
+	expectContains(t, changes, "codex.orphan-delegation-compatibility: false -> true")
+}
+
 func TestBuildConfigChangeDetails_XAIKeys(t *testing.T) {
+	oldRetry := 1
+	newRetry := 0
+	oldDisableCooling := false
+	newDisableCooling := true
 	oldCfg := &config.Config{XAIKey: []config.XAIKey{{
 		APIKey:         "old-key",
 		Priority:       1,
@@ -202,7 +299,8 @@ func TestBuildConfigChangeDetails_XAIKeys(t *testing.T) {
 		BaseURL:        "https://old.example.com/v1",
 		ProxyURL:       "http://old-proxy",
 		Websockets:     false,
-		DisableCooling: false,
+		DisableCooling: &oldDisableCooling,
+		RequestRetry:   &oldRetry,
 		Headers:        map[string]string{"X-Test": "old"},
 		Models:         []config.XAIModel{{Name: "grok-old", Alias: "grok"}},
 		ExcludedModels: []string{"grok-hidden"},
@@ -214,7 +312,8 @@ func TestBuildConfigChangeDetails_XAIKeys(t *testing.T) {
 		BaseURL:        "https://new.example.com/v1",
 		ProxyURL:       "http://new-proxy",
 		Websockets:     true,
-		DisableCooling: true,
+		DisableCooling: &newDisableCooling,
+		RequestRetry:   &newRetry,
 		Headers:        map[string]string{"X-Test": "new"},
 		Models:         []config.XAIModel{{Name: "grok-new", Alias: "grok"}},
 		ExcludedModels: []string{"grok-other"},
@@ -227,6 +326,7 @@ func TestBuildConfigChangeDetails_XAIKeys(t *testing.T) {
 	expectContains(t, changes, "xai[0].priority: 1 -> 2")
 	expectContains(t, changes, "xai[0].websockets: false -> true")
 	expectContains(t, changes, "xai[0].disable-cooling: false -> true")
+	expectContains(t, changes, "xai[0].request-retry: 1 -> 0")
 	expectContains(t, changes, "xai[0].api-key: updated")
 	expectContains(t, changes, "xai[0].headers: updated")
 	expectContains(t, changes, "xai[0].models: updated (1 -> 1 entries)")
@@ -313,6 +413,8 @@ func TestBuildConfigChangeDetails_RedactsEndpointURLs(t *testing.T) {
 }
 
 func TestBuildConfigChangeDetails_FlagsAndKeys(t *testing.T) {
+	oldPoolEnabled := false
+	newPoolEnabled := true
 	oldCfg := &config.Config{
 		Port:                          1000,
 		AuthDir:                       "/old",
@@ -327,9 +429,16 @@ func TestBuildConfigChangeDetails_FlagsAndKeys(t *testing.T) {
 		MaxRetryInterval:              1,
 		WebsocketAuth:                 false,
 		QuotaExceeded:                 config.QuotaExceeded{SwitchProject: false, SwitchPreviewModel: false, AntigravityCredits: false},
-		ClaudeKey:                     []config.ClaudeKey{{APIKey: "c1"}},
-		CodexKey:                      []config.CodexKey{{APIKey: "x1"}},
-		RemoteManagement:              config.RemoteManagement{DisableControlPanel: false, PanelGitHubRepository: "old/repo", SecretKey: "keep"},
+		Antigravity: config.AntigravityConfig{
+			SensitiveWords: []string{"old-word"},
+			ConnectionPool: config.AntigravityConnectionPoolConfig{
+				Enabled:         &oldPoolEnabled,
+				IdleConnTimeout: "30s",
+			},
+		},
+		ClaudeKey:        []config.ClaudeKey{{APIKey: "c1"}},
+		CodexKey:         []config.CodexKey{{APIKey: "x1"}},
+		RemoteManagement: config.RemoteManagement{DisableControlPanel: false, PanelGitHubRepository: "old/repo", SecretKey: "keep"},
 		SDKConfig: sdkconfig.SDKConfig{
 			RequestLog:                 false,
 			ProxyURL:                   "http://old-proxy",
@@ -352,6 +461,15 @@ func TestBuildConfigChangeDetails_FlagsAndKeys(t *testing.T) {
 		MaxRetryInterval:              3,
 		WebsocketAuth:                 true,
 		QuotaExceeded:                 config.QuotaExceeded{SwitchProject: true, SwitchPreviewModel: true, AntigravityCredits: true},
+		Antigravity: config.AntigravityConfig{
+			SensitiveWords: []string{"new-word-1", "new-word-2"},
+			ConnectionPool: config.AntigravityConnectionPoolConfig{
+				Enabled:         &newPoolEnabled,
+				IdleConnTimeout: "10s",
+			},
+		},
+		XAI:    config.XAIConfig{InjectXSearch: true},
+		Claude: config.ClaudeConfig{ToolSearch: true},
 		ClaudeKey: []config.ClaudeKey{
 			{APIKey: "c1", BaseURL: "http://new", ProxyURL: "http://p", Headers: map[string]string{"H": "1"}, ExcludedModels: []string{"a"}},
 			{APIKey: "c2"},
@@ -373,6 +491,9 @@ func TestBuildConfigChangeDetails_FlagsAndKeys(t *testing.T) {
 			ForceModelPrefix:           true,
 			NonStreamKeepAliveInterval: 5,
 			DisableImageGeneration:     config.DisableImageGenerationAll,
+			ClaudeCode: sdkconfig.ClaudeCodeConfig{
+				DisableCloakingModelList: true,
+			},
 		},
 	}
 
@@ -384,6 +505,7 @@ func TestBuildConfigChangeDetails_FlagsAndKeys(t *testing.T) {
 	expectContains(t, details, "save-cooldown-status: false -> true")
 	expectContains(t, details, "transient-error-cooldown-seconds: 0 -> -1")
 	expectContains(t, details, "disable-image-generation: false -> true")
+	expectContains(t, details, "claude-code.disable-cloaking-model-list: false -> true")
 	expectContains(t, details, "request-log: false -> true")
 	expectContains(t, details, "request-retry: 1 -> 2")
 	expectContains(t, details, "max-retry-credentials: 1 -> 3")
@@ -395,6 +517,11 @@ func TestBuildConfigChangeDetails_FlagsAndKeys(t *testing.T) {
 	expectContains(t, details, "quota-exceeded.switch-project: false -> true")
 	expectContains(t, details, "quota-exceeded.switch-preview-model: false -> true")
 	expectContains(t, details, "quota-exceeded.antigravity-credits: false -> true")
+	expectContains(t, details, "antigravity.sensitive-words: 1 -> 2")
+	expectContains(t, details, "antigravity.connection-pool.enabled: false -> true")
+	expectContains(t, details, `antigravity.connection-pool.idle-conn-timeout: "30s" -> "10s"`)
+	expectContains(t, details, "xai.inject-x-search: false -> true")
+	expectContains(t, details, "claude.tool-search: false -> true")
 	expectContains(t, details, "api-keys count: 1 -> 2")
 	expectContains(t, details, "claude-api-key count: 1 -> 2")
 	expectContains(t, details, "codex-api-key count: 1 -> 2")
@@ -583,31 +710,6 @@ func TestFormatProxyURL(t *testing.T) {
 	}
 }
 
-func TestBuildConfigChangeDetails_ErrorLogAlertWebhookRedacted(t *testing.T) {
-	oldCfg := &config.Config{}
-	newCfg := &config.Config{
-		ErrorLogAlert: config.ErrorLogAlertConfig{
-			FeishuWebhookURL: "https://open.feishu.cn/open-apis/bot/v2/hook/secret-hook",
-		},
-	}
-
-	changes := BuildConfigChangeDetails(oldCfg, newCfg)
-	expectContains(t, changes, "error-log-alert.feishu-webhook-url: unset -> set")
-	for _, change := range changes {
-		if change == "https://open.feishu.cn/open-apis/bot/v2/hook/secret-hook" || strings.Contains(change, "secret-hook") {
-			t.Fatalf("webhook secret leaked in config diff: %v", changes)
-		}
-	}
-
-	updatedCfg := &config.Config{
-		ErrorLogAlert: config.ErrorLogAlertConfig{
-			FeishuWebhookURL: "https://open.feishu.cn/open-apis/bot/v2/hook/another-secret",
-		},
-	}
-	changes = BuildConfigChangeDetails(newCfg, updatedCfg)
-	expectContains(t, changes, "error-log-alert.feishu-webhook-url: updated")
-}
-
 func TestBuildConfigChangeDetails_RemoteManagementSecretUpdated(t *testing.T) {
 	oldCfg := &config.Config{
 		RemoteManagement: config.RemoteManagement{
@@ -622,6 +724,22 @@ func TestBuildConfigChangeDetails_RemoteManagementSecretUpdated(t *testing.T) {
 
 	changes := BuildConfigChangeDetails(oldCfg, newCfg)
 	expectContains(t, changes, "remote-management.secret-key: updated")
+}
+
+func TestBuildConfigChangeDetails_RemoteManagementBaseURL(t *testing.T) {
+	oldCfg := &config.Config{
+		RemoteManagement: config.RemoteManagement{
+			BaseURL: "https://old.example.com",
+		},
+	}
+	newCfg := &config.Config{
+		RemoteManagement: config.RemoteManagement{
+			BaseURL: "https://new.example.com",
+		},
+	}
+
+	changes := BuildConfigChangeDetails(oldCfg, newCfg)
+	expectContains(t, changes, "remote-management.base-url: https://old.example.com -> https://new.example.com")
 }
 
 func TestBuildConfigChangeDetails_CountBranches(t *testing.T) {
@@ -651,8 +769,12 @@ func TestTrimStrings(t *testing.T) {
 	}
 }
 
-// TestBuildConfigChangeDetails_AmpCode guards the fork's AmpCode diff detection so a
-// future upstream sync cannot silently drop it again (see restored ampcode diff block).
+func TestBuildConfigChangeDetails_ClaudeNativeToolSearch(t *testing.T) {
+	oldCfg := &config.Config{ClaudeKey: []config.ClaudeKey{{APIKey: "key", BaseURL: "https://gateway.example.com"}}}
+	newCfg := &config.Config{ClaudeKey: []config.ClaudeKey{{APIKey: "key", BaseURL: "https://gateway.example.com", NativeToolSearch: true}}}
+	expectContains(t, BuildConfigChangeDetails(oldCfg, newCfg), "claude[0].native-tool-search: false -> true")
+}
+
 func TestBuildConfigChangeDetails_AmpCode(t *testing.T) {
 	oldCfg := &config.Config{
 		AmpCode: config.AmpCode{
@@ -692,4 +814,29 @@ func TestBuildConfigChangeDetails_AmpCode(t *testing.T) {
 	expectContains(t, details, "ampcode.model-mappings: updated (1 -> 2 entries)")
 	expectContains(t, details, "ampcode.force-model-mappings: false -> true")
 	expectContains(t, details, "ampcode.upstream-api-keys: updated (1 -> 1 entries)")
+}
+
+func TestBuildConfigChangeDetails_ErrorLogAlertWebhookRedacted(t *testing.T) {
+	oldCfg := &config.Config{}
+	newCfg := &config.Config{
+		ErrorLogAlert: config.ErrorLogAlertConfig{
+			FeishuWebhookURL: "https://open.feishu.cn/open-apis/bot/v2/hook/secret-hook",
+		},
+	}
+
+	changes := BuildConfigChangeDetails(oldCfg, newCfg)
+	expectContains(t, changes, "error-log-alert.feishu-webhook-url: unset -> set")
+	for _, change := range changes {
+		if change == "https://open.feishu.cn/open-apis/bot/v2/hook/secret-hook" || strings.Contains(change, "secret-hook") {
+			t.Fatalf("webhook secret leaked in config diff: %v", changes)
+		}
+	}
+
+	updatedCfg := &config.Config{
+		ErrorLogAlert: config.ErrorLogAlertConfig{
+			FeishuWebhookURL: "https://open.feishu.cn/open-apis/bot/v2/hook/another-secret",
+		},
+	}
+	changes = BuildConfigChangeDetails(newCfg, updatedCfg)
+	expectContains(t, changes, "error-log-alert.feishu-webhook-url: updated")
 }

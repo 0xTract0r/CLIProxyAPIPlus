@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"runtime"
 	"strconv"
 	"strings"
 
@@ -24,23 +25,38 @@ import (
 )
 
 const (
-	codexUserAgent             = "codex-tui/0.135.0 (Mac OS 26.5.0; arm64) iTerm.app/3.6.10 (codex-tui; 0.135.0)"
+	codexUserAgent             = "codex-tui/0.154.0 (Mac OS 26.5.2; arm64) iTerm.app/3.6.11 (codex-tui; 0.154.0)"
 	codexOriginator            = "codex-tui"
 	codexDefaultImageToolModel = "gpt-image-2"
-	codexResponsesLiteHeader   = "X-OpenAI-Internal-Codex-Responses-Lite"
 	codexResponsesLiteMetadata = "client_metadata.ws_request_header_x_openai_internal_codex_responses_lite"
+	codexResponsesLiteHeader   = "X-OpenAI-Internal-Codex-Responses-Lite"
 )
 
 var dataTag = []byte("data:")
 
-func translateCodexRequestPair(from, to sdktranslator.Format, model string, originalPayload, payload []byte, stream bool) ([]byte, []byte) {
-	if bytes.Equal(originalPayload, payload) {
-		body := sdktranslator.TranslateRequest(from, to, model, payload, stream)
-		return body, body
+func translateCodexRequestPair(from, to sdktranslator.Format, model string, originalPayload, payload []byte, stream bool, preserveEmptyThinkingBlocks ...bool) ([]byte, []byte) {
+	original, body, _, _ := translateCodexRequestPairWithUpdateIntent(from, to, model, originalPayload, payload, stream, preserveEmptyThinkingBlocks...)
+	return original, body
+}
+
+func translateCodexRequestPairWithUpdateIntent(from, to sdktranslator.Format, model string, originalPayload, payload []byte, stream bool, preserveEmptyThinkingBlocks ...bool) ([]byte, []byte, bool, error) {
+	isCompat := len(preserveEmptyThinkingBlocks) > 0 && preserveEmptyThinkingBlocks[0]
+	ctx := context.Background()
+	translate := func(raw []byte) ([]byte, bool, error) {
+		if isCompat && from == sdktranslator.FormatClaude && to == sdktranslator.FormatCodex {
+			body, err := helps.TranslateRequestReturningError(ctx, nil, nil, from, to, model, raw, stream, true)
+			return body, false, err
+		}
+		translated := sdktranslator.TranslateRequestEnvelope(ctx, from, to, sdktranslator.RequestEnvelope{Format: from, Model: model, Stream: stream, Body: raw})
+		return translated.Body, translated.ConfigurationUpdatesChanged, translated.Err
 	}
-	originalTranslated := sdktranslator.TranslateRequest(from, to, model, originalPayload, stream)
-	body := sdktranslator.TranslateRequest(from, to, model, payload, stream)
-	return originalTranslated, body
+	if bytes.Equal(originalPayload, payload) {
+		body, changed, err := translate(payload)
+		return body, body, changed, err
+	}
+	originalTranslated, _, _ := translate(originalPayload)
+	body, changed, err := translate(payload)
+	return originalTranslated, body, changed, err
 }
 
 // PrepareRequest injects Codex credentials into the outgoing HTTP request.
@@ -48,9 +64,21 @@ func (e *CodexExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Aut
 	if req == nil {
 		return nil
 	}
-	apiKey, _ := codexCreds(auth)
+	apiKey, _ := codexCredsForRequest(req.Context(), auth, req.Header)
+	if codexUseSIWCForRequest(req.Context(), auth, req.Header) && req.URL != nil && req.URL.Scheme == "https" &&
+		req.URL.Host == "chatgpt.com" && req.URL.Path == "/backend-api/codex/alpha/search" {
+		// ChatGPT Alpha Search requires the original OAuth partition, not SIWC.
+		apiKey, _ = auth.Metadata["access_token"].(string)
+		if strings.TrimSpace(apiKey) == "" {
+			return statusErr{code: http.StatusUnauthorized, msg: "codex executor: original OAuth access_token is required for ChatGPT Alpha Search"}
+		}
+	} else if errSIWC := ensureCodexSIWCCredentialsForRequest(req.Context(), auth, apiKey, req.Header); errSIWC != nil {
+		return errSIWC
+	}
 	if strings.TrimSpace(apiKey) != "" {
 		req.Header.Set("Authorization", "Bearer "+apiKey)
+	} else {
+		req.Header.Del("Authorization")
 	}
 	var attrs map[string]string
 	if auth != nil {
@@ -74,30 +102,6 @@ func (e *CodexExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth
 	}
 	httpClient := helps.NewUtlsHTTPClient(ctx, e.cfg, auth, 0)
 	return httpClient.Do(httpReq)
-}
-
-type codexIdentityConfuseState struct {
-	// enabled 表示 identity-confuse 开关分支生效（受 codexIdentityConfuseEnabled
-	// 门控），仅驱动 prompt_cache_key / window_id 这两个字段的混淆。
-	enabled bool
-	// identityNormalize 表示真机身份字段（installation_id / turn_id /
-	// session_id / thread_id）的无条件归一生效。它与 enabled 解耦：只要 authID
-	// 有效就为 true，无论 identity-confuse 开关如何，都对这 4 个字段做归一，
-	// 避免生产关掉 identity-confuse 时裸泄漏真机指纹（anticorr 方案A）。
-	identityNormalize      bool
-	authID                 string
-	originalPromptCacheKey string
-	promptCacheKey         string
-	// installationID 是本请求派生出的混淆 installation_id（与 body
-	// client_metadata.x-codex-installation-id 同一个派生值）。turn-metadata
-	// header/body 副本里的 installation_id 都用它改写，保证处处一致、且不泄漏真机值。
-	installationID string
-	turnIDs        []codexIdentityReplacement
-}
-
-type codexIdentityReplacement struct {
-	original string
-	confused string
 }
 
 func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Format, url string, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, userPayload []byte, rawJSON []byte, headerSets ...http.Header) (*http.Request, []byte, codexIdentityConfuseState, error) {
@@ -150,6 +154,13 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Form
 	if identityState.promptCacheKey != "" {
 		cache.ID = identityState.promptCacheKey
 	}
+	// Identity normalization is a built-in transformation. User payload rules
+	// remain the last semantic barrier, including an explicit cache-key override.
+	rawJSON = helps.FinalizePayload(ctx, rawJSON)
+	cache.ID = gjson.GetBytes(rawJSON, "prompt_cache_key").String()
+	if identityState.enabled {
+		identityState.promptCacheKey = cache.ID
+	}
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(rawJSON))
 	if err != nil {
 		return nil, nil, codexIdentityConfuseState{}, err
@@ -160,6 +171,554 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Form
 		setHeaderCasePreserved(httpReq.Header, "session-id", cache.ID)
 	}
 	return httpReq, rawJSON, identityState, nil
+}
+
+func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool, cfg *config.Config, clientHeaders ...http.Header) {
+	var ginHeaders http.Header
+	if len(clientHeaders) > 0 && clientHeaders[0] != nil {
+		ginHeaders = clientHeaders[0]
+	} else if ginCtx, ok := r.Context().Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
+		ginHeaders = ginCtx.Request.Header
+	}
+	applyCodexHeadersWithSIWC(r, auth, codexUseSIWCForRequest(r.Context(), auth, ginHeaders), token, stream, cfg, ginHeaders)
+}
+
+// applyModelHeaderOverrides forces models.json config.override_header onto upstream headers.
+func applyModelHeaderOverrides(headers http.Header, modelName string) {
+	if headers == nil {
+		return
+	}
+	overrides := registry.ModelOverrideHeaders(modelName)
+	if len(overrides) == 0 {
+		return
+	}
+	for key, value := range overrides {
+		headers.Set(key, value)
+	}
+	if strings.Contains(headers.Get("User-Agent"), "Mac OS") && codexSessionHeaderValue(headers) == "" {
+		headers.Set("Session_id", uuid.NewString())
+	}
+}
+
+// applyCodexDirectImageHeaders sets Codex upstream headers for direct /images/* calls.
+// Downstream client User-Agent values are not forwarded to reduce Cloudflare 1010 blocks.
+func applyCodexDirectImageHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool, cfg *config.Config, clientHeaders ...http.Header) {
+	useSIWC := codexUseSIWCForRequest(r.Context(), auth, clientHeaders...)
+	var ginHeaders http.Header
+	if len(clientHeaders) > 0 && clientHeaders[0] != nil {
+		ginHeaders = clientHeaders[0].Clone()
+		ginHeaders.Del("User-Agent")
+	} else if ginCtx, ok := r.Context().Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
+		ginHeaders = ginCtx.Request.Header.Clone()
+		ginHeaders.Del("User-Agent")
+	}
+	applyCodexHeadersWithSIWC(r, auth, useSIWC, token, stream, cfg, ginHeaders)
+}
+
+func codexSIWCUserAgent(cfg *config.Config) string {
+	agentName := config.DefaultSignInWithChatGPTIdentifier
+	if cfg != nil {
+		agentName = cfg.Codex.EffectiveSignInWithChatGPTIdentifier()
+	}
+	return fmt.Sprintf("%s (%s; %s)", agentName, runtime.GOOS, runtime.GOARCH)
+}
+
+func applyCodexSIWCRequestBodyRules(body []byte, hasExplicitInstructions bool, opts ...cliproxyexecutor.Options) []byte {
+	body = helps.SetBoolIfDifferent(body, "store", false)
+	body = helps.SetBoolIfDifferent(body, "stream", true)
+	return stripCodexSIWCUnsupportedFields(body, hasExplicitInstructions, opts...)
+}
+
+func applyCodexSIWCWebsocketBodyRules(body []byte, hasExplicitInstructions bool, opts ...cliproxyexecutor.Options) []byte {
+	body = helps.SetBoolIfDifferent(body, "store", false)
+	body, _ = sjson.DeleteBytes(body, "stream")
+	body, _ = sjson.DeleteBytes(body, "background")
+	return stripCodexSIWCUnsupportedFields(body, hasExplicitInstructions, opts...)
+}
+
+func applyCodexSIWCCompactBodyRules(body []byte, hasExplicitInstructions bool, opts ...cliproxyexecutor.Options) []byte {
+	body, _ = sjson.DeleteBytes(body, "stream")
+	body, _ = sjson.DeleteBytes(body, "store")
+	return stripCodexSIWCUnsupportedFields(body, hasExplicitInstructions, opts...)
+}
+
+func stripCodexSIWCUnsupportedFields(body []byte, hasExplicitInstructions bool, opts ...cliproxyexecutor.Options) []byte {
+	// SIWC subscriptions reject configuration_update input items, so degrade
+	// them to the classic top-level reasoning.effort and accept the cache loss.
+	// An explicit model thinking suffix is an operator override: the thinking
+	// layer has already resolved it into the top-level effort, so only the
+	// unsupported items are removed in that case.
+	body = thinking.CollapseConfigurationUpdates(body, len(opts) > 0 && opts[0].KeepTopLevelEffort)
+	body, _ = sjson.DeleteBytes(body, "prompt_cache_retention")
+	body, _ = sjson.DeleteBytes(body, "prompt_cache_options")
+	body, _ = sjson.DeleteBytes(body, "max_output_tokens")
+	body, _ = sjson.DeleteBytes(body, "max_completion_tokens")
+	body, _ = sjson.DeleteBytes(body, "temperature")
+	if !hasExplicitInstructions {
+		if inst := gjson.GetBytes(body, "instructions"); inst.Exists() && strings.TrimSpace(inst.String()) == "" {
+			body, _ = sjson.DeleteBytes(body, "instructions")
+		}
+	}
+	return body
+}
+
+func applyCodexHeadersFromSources(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool, cfg *config.Config, ginHeaders http.Header) {
+	applyCodexHeadersWithSIWC(r, auth, codexUseSIWCForRequest(r.Context(), auth, ginHeaders), token, stream, cfg, ginHeaders)
+}
+
+func applyCodexHeadersWithSIWC(r *http.Request, auth *cliproxyauth.Auth, useSIWC bool, token string, stream bool, cfg *config.Config, ginHeaders http.Header) {
+	r.Header.Set("Content-Type", "application/json")
+	if strings.TrimSpace(token) != "" {
+		r.Header.Set("Authorization", "Bearer "+token)
+	} else {
+		r.Header.Del("Authorization")
+	}
+
+	if useSIWC {
+		if sessionID := strings.TrimSpace(r.Header.Get("Session-Id")); sessionID != "" {
+			r.Header.Del("Session-Id")
+			setHeaderCasePreserved(r.Header, "session_id", sessionID)
+			r.Header.Set("X-Client-Request-Id", sessionID)
+		}
+		r.Header.Set("User-Agent", codexSIWCUserAgent(cfg))
+		if stream {
+			r.Header.Set("Accept", "text/event-stream")
+		} else {
+			r.Header.Set("Accept", "application/json")
+		}
+		r.Header.Set("Connection", "Keep-Alive")
+		var attrs map[string]string
+		if auth != nil {
+			attrs = auth.Attributes
+		}
+		util.ApplyCustomHeadersFromAttrs(r, attrs, ginHeaders)
+		return
+	}
+
+	// Explicit upstream opt-out retains caller-owned headers. The default path
+	// keeps the fork's account profile, originator allowlist and wire spelling.
+	if isCodexCloakingDisabled(cfg, auth) {
+
+		if ginHeaders != nil && ginHeaders.Get("X-Codex-Beta-Features") != "" {
+			r.Header.Set("X-Codex-Beta-Features", ginHeaders.Get("X-Codex-Beta-Features"))
+		}
+		misc.EnsureHeader(r.Header, ginHeaders, "Version", "")
+		misc.EnsureHeader(r.Header, ginHeaders, "X-Codex-Turn-Metadata", "")
+		misc.EnsureHeader(r.Header, ginHeaders, "X-Codex-Turn-State", "")
+		misc.EnsureHeader(r.Header, ginHeaders, "X-Client-Request-Id", "")
+		misc.EnsureHeader(r.Header, ginHeaders, "X-Codex-Window-Id", "")
+		misc.EnsureHeader(r.Header, ginHeaders, "Thread-Id", "")
+		misc.EnsureHeader(r.Header, ginHeaders, "Session-Id", "")
+		misc.EnsureHeader(r.Header, ginHeaders, "X-Openai-Internal-Codex-Responses-Lite", "")
+
+		cfgUserAgent, _ := codexHeaderDefaults(cfg, auth)
+		ensureHeaderWithConfigPrecedence(r.Header, ginHeaders, "User-Agent", cfgUserAgent, codexUserAgent)
+
+		if stream {
+			r.Header.Set("Accept", "text/event-stream")
+		} else {
+			r.Header.Set("Accept", "application/json")
+		}
+		r.Header.Set("Connection", "Keep-Alive")
+
+		isAPIKey := codexAuthUsesAPIKey(auth)
+		if originator := strings.TrimSpace(ginHeaders.Get("Originator")); originator != "" {
+			r.Header.Set("Originator", originator)
+		} else if !isAPIKey {
+			r.Header.Set("Originator", codexOriginator)
+		}
+		if !isAPIKey {
+			if auth != nil && auth.Metadata != nil {
+				if accountID, ok := auth.Metadata["account_id"].(string); ok {
+					r.Header.Set("Chatgpt-Account-Id", accountID)
+				}
+			}
+		}
+		var attrs map[string]string
+		if auth != nil {
+			attrs = auth.Attributes
+		}
+		util.ApplyCustomHeadersFromAttrs(r, attrs, ginHeaders)
+		applyCodexCloakingHeaders(r.Header, cfg, auth)
+		return
+	}
+
+	if ginHeaders.Get("X-Codex-Beta-Features") != "" {
+		r.Header.Set("X-Codex-Beta-Features", ginHeaders.Get("X-Codex-Beta-Features"))
+	}
+	// fork: codex client device-profile / fingerprint 稳定化（反风控）。
+	var profile helps.CodexClientProfile
+	if auth != nil {
+		profile = helps.ResolveCodexClientProfile(auth, ginHeaders, cfg)
+	}
+	misc.EnsureHeader(r.Header, ginHeaders, "X-Codex-Turn-Metadata", "")
+	misc.EnsureHeader(r.Header, ginHeaders, "X-Codex-Turn-State", "")
+	misc.EnsureHeader(r.Header, ginHeaders, "Thread-Id", "")
+	misc.EnsureHeader(r.Header, ginHeaders, "X-Openai-Internal-Codex-Responses-Lite", "")
+	misc.EnsureHeader(r.Header, ginHeaders, "X-Client-Request-Id", "")
+	// fork(anticorr): 真实 codex 出站没有独立 Version 头，版本只体现在 UA 里。
+	// 旧实现会从客户端或 device-profile 注入 Version，是 CPA 独有指纹，删除（含
+	// 客户端透传值），不再回写。
+	deleteHeaderCaseInsensitive(r.Header, "Version")
+	if auth != nil && strings.TrimSpace(profile.UserAgent) != "" {
+		userAgent := strings.TrimSpace(profile.UserAgent)
+		r.Header.Set("User-Agent", userAgent)
+	} else {
+		cfgUserAgent, _ := codexHeaderDefaults(cfg, auth)
+		ensureHeaderWithConfigPrecedence(r.Header, ginHeaders, "User-Agent", cfgUserAgent, helps.DefaultCodexManagedUserAgent())
+	}
+	applyCodexCommunityDesktopHeaders(r.Header, profile)
+
+	if strings.Contains(r.Header.Get("User-Agent"), "Mac OS") {
+		// fork(anticorr): 出站 session 头名对齐真实 codex 的 session-id（小写连字符）。
+		// 缺失时优先沿用客户端值，否则生成 uuid。已有任意大小写变体则不覆盖。
+		ensureCodexOutboundLowerSessionHeader(r.Header, ginHeaders, uuid.NewString())
+	}
+
+	if stream {
+		r.Header.Set("Accept", "text/event-stream")
+	} else {
+		r.Header.Set("Accept", "application/json")
+	}
+	// fork(anticorr): 真实 codex 出站不带 Connection 头（由 Go transport 自行管理
+	// keep-alive），旧实现写死 Connection: Keep-Alive 是 CPA 独有指纹，删除。
+
+	isAPIKey := codexAuthUsesAPIKey(auth)
+	// fork(anticorr A-1): managed（非 api-key）codex 账号的 Originator 钉死。
+	// 旧逻辑无条件第一优先透传客户端 Originator，客户端可任意覆盖出站身份（伪造污染）。
+	// 现在对 managed 账号只接受白名单内的 first-party Originator（codex-tui /
+	// codex_cli_rs / codex_vscode / codex_exec / "Codex " 前缀），其余一律钉死为
+	// profile.Originator（无则 DefaultCodexManagedOriginator），不可被下游覆盖。
+	// api-key 账号沿用旧行为（透传客户端 Originator），不在本次加固范围内。
+	clientOriginator := strings.TrimSpace(ginHeaders.Get("Originator"))
+	if isAPIKey {
+		if clientOriginator != "" {
+			r.Header.Set("Originator", clientOriginator)
+		}
+	} else {
+		pinnedOriginator := strings.TrimSpace(profile.Originator)
+		if pinnedOriginator == "" {
+			pinnedOriginator = helps.DefaultCodexManagedOriginator()
+		}
+		// 只接受白名单内的客户端值；其余覆盖为 managed 钉死值。
+		if clientOriginator != "" && helps.IsFirstPartyCodexOriginator(clientOriginator) {
+			pinnedOriginator = clientOriginator
+		}
+		r.Header.Set("Originator", pinnedOriginator)
+	}
+	if !isAPIKey {
+		if auth != nil && auth.Metadata != nil {
+			if accountID, ok := auth.Metadata["account_id"].(string); ok {
+				r.Header.Set("Chatgpt-Account-Id", accountID)
+			}
+		}
+	}
+	managedHeaderSnapshot := captureManagedHeaderSnapshot(r.Header, []string{
+		"User-Agent",
+		"Version",
+		"Originator",
+		"X-Codex-Beta-Features",
+		"sec-ch-ua",
+		"sec-ch-ua-mobile",
+		"sec-ch-ua-platform",
+		"Accept-Encoding",
+		"Accept-Language",
+		"sec-fetch-site",
+		"sec-fetch-mode",
+		"sec-fetch-dest",
+	})
+	var attrs map[string]string
+	if auth != nil {
+		attrs = auth.Attributes
+	}
+	util.ApplyCustomHeadersFromAttrs(r, attrs, ginHeaders)
+	if cliproxyauth.HasStructuredAccountSettingsMetadata(auth) {
+		applyManagedHeaderSnapshot(r.Header, managedHeaderSnapshot)
+	}
+	// fork(anticorr Wave10-D 要点4)：CLI 画像下兜底剥离 Desktop 专属指纹头。
+	// 账号 metadata.headers / header:* 属性里可能残留历史 Desktop bundle 的
+	// sec-ch-ua / sec-ch-ua-* （真实 codex-rs CLI 不发这些）。ApplyCustomHeadersFromAttrs
+	// 会把这些残留 set 回 r.Header，而 managed snapshot 只恢复 snapshot 内已有的名字
+	// （CLI snapshot 不含 sec-ch-ua），无法挡住。这里在 CLI 画像（profile 非 Desktop）下
+	// 显式删除，确保出站不带 sec-ch-ua 系列，与 CLI body/TLS 自洽。
+	stripCodexDesktopOnlyHeadersForCLIProfile(r.Header, profile)
+	// fork(anticorr): 兜底再删一次 Version —— 真实 codex 出站无独立 Version 头。
+	// 上面的自定义 header（header:Version 属性）可能在 snapshot 恢复后又写回 Version，
+	// 这里最终统一剥离，确保出站任何来源的 Version 都不上线。
+	deleteHeaderCaseInsensitive(r.Header, "Version")
+}
+
+const codexRoutingHintHeader = "X-Codex-Routing-Hint"
+
+// applyCodexRoutingHint sends the routing hint native Codex attaches to every
+// ChatGPT-backend Responses request: "model=<slug>" plus ";tier=<service_tier>"
+// when the body requests a tier (openai/codex rust-v0.155.0,
+// codex-rs/core/src/client.rs build_routing_hint_header). Without it, a
+// translated request carries service_tier=priority only in the body. Whether
+// the backend needs the header to grant priority is undocumented.
+//
+// The model is the resolved model written to the upstream body, while the tier
+// is read from the final body so payload rules cannot make the hint stale. A
+// hint forwarded by a native client names its original model and is replaced.
+// Operator configuration keeps precedence: when an auth "header:" rule for the
+// hint resolves to a value (static, or a "$Header" reference the request
+// carries), that value is sent, and callers apply models.json override_header
+// afterwards. A rule that resolves to nothing falls back to the derived hint.
+// API-key requests are not touched, matching native Codex, which sends no hint
+// to API-key providers.
+func applyCodexRoutingHint(ctx context.Context, headers http.Header, auth *cliproxyauth.Auth, baseModel string, upstreamBody []byte, clientHeaders http.Header) {
+	if codexAuthUsesAPIKey(auth) || codexUseSIWCForRequest(ctx, auth, clientHeaders) {
+		return
+	}
+	deleteHeaderCaseInsensitive(headers, codexRoutingHintHeader)
+	if operatorHint := codexOperatorHeaderValue(ctx, auth, clientHeaders, codexRoutingHintHeader); operatorHint != "" {
+		headers.Set(codexRoutingHintHeader, operatorHint)
+		return
+	}
+	model := strings.TrimSpace(baseModel)
+	if model == "" {
+		return
+	}
+	hint := "model=" + model
+	if tier := gjson.GetBytes(upstreamBody, "service_tier"); tier.Type == gjson.String {
+		if value := strings.TrimSpace(tier.String()); value != "" {
+			hint += ";tier=" + value
+		}
+	}
+	headers.Set(codexRoutingHintHeader, hint)
+}
+
+// codexOperatorHeaderValue returns the value the auth's "header:" rules
+// resolve to for name, using the same resolver that applied them to the
+// request, so dynamic references that resolve to nothing report "".
+func codexOperatorHeaderValue(ctx context.Context, auth *cliproxyauth.Auth, clientHeaders http.Header, name string) string {
+	if auth == nil || len(auth.Attributes) == 0 {
+		return ""
+	}
+	resolved := (&http.Request{Header: http.Header{}}).WithContext(ctx)
+	util.ApplyCustomHeadersFromAttrs(resolved, auth.Attributes, clientHeaders)
+	return strings.TrimSpace(resolved.Header.Get(name))
+}
+
+func isCodexCloakingDisabled(cfg *config.Config, auth *cliproxyauth.Auth) bool {
+	if auth != nil && auth.AuthKind() == cliproxyauth.AuthKindAPIKey {
+		cfg = cfg.ForAPIKey()
+	}
+	if auth != nil && len(auth.Attributes) > 0 {
+		if val, ok := auth.Attributes[cliproxyauth.AttributeCodexDisableCloaking]; ok {
+			if parsed, errParse := strconv.ParseBool(strings.TrimSpace(val)); errParse == nil {
+				return parsed
+			}
+		}
+	}
+	if entry := resolveCodexKeyConfig(cfg, auth); entry != nil && entry.DisableCodexCloaking != nil {
+		return *entry.DisableCodexCloaking
+	}
+	if cfg != nil && cfg.Codex.DisableCodexCloaking {
+		return true
+	}
+	return false
+}
+
+func applyCodexCloakingHeaders(headers http.Header, cfg *config.Config, auth *cliproxyauth.Auth) {
+	if headers == nil || cfg == nil || isCodexCloakingDisabled(cfg, auth) {
+		return
+	}
+	headers.Set("User-Agent", codexUserAgent)
+	headers.Set("Originator", codexOriginator)
+}
+
+func normalizeCodexInstructions(body []byte, nativeRequest ...bool) []byte {
+	if len(nativeRequest) > 0 && nativeRequest[0] {
+		return body
+	}
+	instructions := gjson.GetBytes(body, "instructions")
+	if !instructions.Exists() || instructions.Type == gjson.Null {
+		body, _ = sjson.SetBytes(body, "instructions", "")
+	}
+	return body
+}
+
+var imageGenToolJSON = []byte(`{"type":"image_generation","output_format":"png"}`)
+var imageGenToolArrayJSON = []byte(`[{"type":"image_generation","output_format":"png"}]`)
+var webSearchToolJSON = []byte(`{"type":"web_search"}`)
+var webSearchToolArrayJSON = []byte(`[{"type":"web_search"}]`)
+
+func isCodexWebSearchToolType(toolType string) bool {
+	switch strings.TrimSpace(toolType) {
+	case "web_search", "web_search_preview", "web_search_preview_2025_03_11":
+		return true
+	default:
+		return false
+	}
+}
+
+// ensureWebSearchToolForHistory reconciles replayed web_search_call input items
+// with the request's tool declarations so upstream Codex does not fail with
+// "response protection is unavailable". Standard Responses requests receive a
+// {"type":"web_search"} tool declaration when missing, while Responses Lite
+// requests (which omit top-level hosted tools) strip the replayed search items.
+func ensureWebSearchToolForHistory(body []byte, headers http.Header) []byte {
+	if !bytes.Contains(body, []byte("web_search_call")) {
+		return body
+	}
+	input := util.GetGJSONBytesNoCopy(body, "input")
+	if !input.IsArray() {
+		return body
+	}
+	hasWebSearchCall := false
+	input.ForEach(func(_, item gjson.Result) bool {
+		if strings.TrimSpace(item.Get("type").String()) == "web_search_call" {
+			hasWebSearchCall = true
+			return false
+		}
+		return true
+	})
+	if !hasWebSearchCall {
+		return body
+	}
+
+	tools := util.GetGJSONBytesNoCopy(body, "tools")
+	if tools.IsArray() {
+		for _, t := range tools.Array() {
+			if isCodexWebSearchToolType(t.Get("type").String()) {
+				return body
+			}
+		}
+	}
+
+	if util.IsCodexResponsesLiteRequest(body, headers) {
+		items := input.Array()
+		rebuilt := make([]string, 0, len(items))
+		for _, item := range items {
+			if strings.TrimSpace(item.Get("type").String()) == "web_search_call" {
+				continue
+			}
+			rebuilt = append(rebuilt, item.Raw)
+		}
+		updated, errSet := sjson.SetRawBytes(body, "input", []byte("["+strings.Join(rebuilt, ",")+"]"))
+		if errSet != nil {
+			return body
+		}
+		return updated
+	}
+
+	if !tools.Exists() || !tools.IsArray() {
+		updated, errSet := sjson.SetRawBytes(body, "tools", webSearchToolArrayJSON)
+		if errSet != nil {
+			return body
+		}
+		return updated
+	}
+	updated, errSet := sjson.SetRawBytes(body, "tools.-1", webSearchToolJSON)
+	if errSet != nil {
+		return body
+	}
+	return updated
+}
+
+func isCodexFreePlanAuth(auth *cliproxyauth.Auth) bool {
+	if auth == nil || auth.Attributes == nil {
+		return false
+	}
+	if !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(auth.Attributes["plan_type"]), "free")
+}
+
+func isImageGenerationFunctionTool(tool gjson.Result) bool {
+	switch tool.Get("type").String() {
+	case "function":
+		return tool.Get("name").String() == "image_gen.imagegen"
+	case "namespace":
+		if tool.Get("name").String() != "image_gen" {
+			return false
+		}
+		tools := tool.Get("tools")
+		if !tools.IsArray() {
+			return false
+		}
+		for _, nestedTool := range tools.Array() {
+			if nestedTool.Get("type").String() == "function" && nestedTool.Get("name").String() == "imagegen" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func ensureImageGenerationTool(body []byte, baseModel string, auth *cliproxyauth.Auth, headers http.Header) []byte {
+	if util.IsCodexResponsesLiteRequest(body, headers) {
+		return body
+	}
+	if strings.HasSuffix(baseModel, "spark") {
+		return body
+	}
+	if isCodexFreePlanAuth(auth) {
+		return body
+	}
+
+	tools := gjson.GetBytes(body, "tools")
+	if !tools.Exists() || !tools.IsArray() {
+		body, _ = sjson.SetRawBytes(body, "tools", imageGenToolArrayJSON)
+		return body
+	}
+	for _, t := range tools.Array() {
+		if t.Get("type").String() == "image_generation" || isImageGenerationFunctionTool(t) {
+			return body
+		}
+	}
+	body, _ = sjson.SetRawBytes(body, "tools.-1", imageGenToolJSON)
+	return body
+}
+
+func normalizeCodexParallelToolCalls(body []byte, headers http.Header) []byte {
+	if util.IsCodexResponsesLiteRequest(body, headers) {
+		body = helps.SetBoolIfDifferent(body, "parallel_tool_calls", false)
+		return body
+	}
+	return normalizeCodexParallelToolCallsForTools(body)
+}
+
+func normalizeCodexParallelToolCallsForTools(body []byte) []byte {
+	if !gjson.GetBytes(body, "parallel_tool_calls").Exists() {
+		return body
+	}
+
+	tools := gjson.GetBytes(body, "tools")
+	hasTools := tools.Exists() && tools.IsArray() && len(tools.Array()) > 0
+	if hasTools {
+		return body
+	}
+
+	body, _ = sjson.DeleteBytes(body, "parallel_tool_calls")
+	return body
+}
+
+func publishCodexImageToolUsage(ctx context.Context, reporter *helps.UsageReporter, body []byte, completedData []byte) {
+	detail, ok := helps.ParseCodexImageToolUsage(completedData)
+	if !ok {
+		return
+	}
+	reporter.EnsurePublished(ctx)
+	reporter.PublishAdditionalModel(ctx, codexImageGenerationToolModel(body), detail)
+}
+
+func codexImageGenerationToolModel(body []byte) string {
+	tools := gjson.GetBytes(body, "tools")
+	if tools.IsArray() {
+		for _, tool := range tools.Array() {
+			if tool.Get("type").String() != "image_generation" {
+				continue
+			}
+			if model := strings.TrimSpace(tool.Get("model").String()); model != "" {
+				return model
+			}
+			break
+		}
+	}
+	return codexDefaultImageToolModel
 }
 
 func applyCodexIdentityConfuseBody(cfg *config.Config, auth *cliproxyauth.Auth, userPayload []byte, rawJSON []byte) ([]byte, codexIdentityConfuseState) {
@@ -246,11 +805,6 @@ func applyCodexIdentityConfuseHeaders(headers http.Header, state *codexIdentityC
 	headers.Set("X-Codex-Window-Id", state.promptCacheKey+":0")
 }
 
-// setCodexOutboundLowerSessionHeader forces the codex session header onto the
-// real-codex lowercase-hyphen "session-id" form, deleting any Session_id /
-// Session-Id case variants first (http.Header.Set would canonicalize to Session-Id).
-// This is the fork anti-corr equivalent of the codex-websocket setCodexLowerSessionHeader,
-// defined locally so this executor family does not depend on the WS executor file.
 func setCodexOutboundLowerSessionHeader(headers http.Header, value string) {
 	if headers == nil {
 		return
@@ -267,10 +821,6 @@ func setCodexOutboundLowerSessionHeader(headers http.Header, value string) {
 	headers["session-id"] = []string{value}
 }
 
-// ensureCodexOutboundLowerSessionHeader injects a lowercase-hyphen "session-id"
-// when the outbound request carries no session header variant yet (source-first,
-// else fallback), and collapses any existing variant onto "session-id" without
-// changing its value. Fork anti-corr equivalent of the WS ensureCodexLowerSessionHeader.
 func ensureCodexOutboundLowerSessionHeader(target http.Header, source http.Header, fallbackValue string) {
 	if target == nil {
 		return
@@ -351,22 +901,6 @@ func applyCodexIdentityExposeResponsePayload(payload []byte, state codexIdentity
 	return payload
 }
 
-func (state *codexIdentityConfuseState) confuseTurnID(turnID string) string {
-	turnID = strings.TrimSpace(turnID)
-	// turn_id 归一与 identity-confuse 开关解耦：identityNormalize 生效即处理（anticorr 方案A）。
-	if state == nil || !state.identityNormalize || strings.TrimSpace(state.authID) == "" || turnID == "" {
-		return turnID
-	}
-	for _, replacement := range state.turnIDs {
-		if replacement.original == turnID || replacement.confused == turnID {
-			return replacement.confused
-		}
-	}
-	confusedTurnID := codexIdentityConfuseUUID(state.authID, "turn", turnID)
-	state.turnIDs = append(state.turnIDs, codexIdentityReplacement{original: turnID, confused: confusedTurnID})
-	return confusedTurnID
-}
-
 func replaceCodexIdentityResponsePayload(payload []byte, from string, to string) []byte {
 	from = strings.TrimSpace(from)
 	to = strings.TrimSpace(to)
@@ -389,124 +923,6 @@ func codexIdentityConfuseUUID(authID string, kind string, value string) string {
 	return uuid.NewSHA1(uuid.NameSpaceOID, []byte(name)).String()
 }
 
-func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool, cfg *config.Config) {
-	r.Header.Set("Content-Type", "application/json")
-	r.Header.Set("Authorization", "Bearer "+token)
-
-	var ginHeaders http.Header
-	if ginCtx, ok := r.Context().Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
-		ginHeaders = ginCtx.Request.Header
-	}
-
-	if ginHeaders.Get("X-Codex-Beta-Features") != "" {
-		r.Header.Set("X-Codex-Beta-Features", ginHeaders.Get("X-Codex-Beta-Features"))
-	}
-	// fork: codex client device-profile / fingerprint 稳定化（反风控）。
-	var profile helps.CodexClientProfile
-	if auth != nil {
-		profile = helps.ResolveCodexClientProfile(auth, ginHeaders, cfg)
-	}
-	misc.EnsureHeader(r.Header, ginHeaders, "X-Codex-Turn-Metadata", "")
-	misc.EnsureHeader(r.Header, ginHeaders, "X-Client-Request-Id", "")
-	// fork(anticorr): 真实 codex 出站没有独立 Version 头，版本只体现在 UA 里。
-	// 旧实现会从客户端或 device-profile 注入 Version，是 CPA 独有指纹，删除（含
-	// 客户端透传值），不再回写。
-	deleteHeaderCaseInsensitive(r.Header, "Version")
-	if auth != nil && strings.TrimSpace(profile.UserAgent) != "" {
-		userAgent := strings.TrimSpace(profile.UserAgent)
-		r.Header.Set("User-Agent", userAgent)
-	} else {
-		cfgUserAgent, _ := codexHeaderDefaults(cfg, auth)
-		ensureHeaderWithConfigPrecedence(r.Header, ginHeaders, "User-Agent", cfgUserAgent, helps.DefaultCodexManagedUserAgent())
-	}
-	applyCodexCommunityDesktopHeaders(r.Header, profile)
-
-	if strings.Contains(r.Header.Get("User-Agent"), "Mac OS") {
-		// fork(anticorr): 出站 session 头名对齐真实 codex 的 session-id（小写连字符）。
-		// 缺失时优先沿用客户端值，否则生成 uuid。已有任意大小写变体则不覆盖。
-		ensureCodexOutboundLowerSessionHeader(r.Header, ginHeaders, uuid.NewString())
-	}
-
-	if stream {
-		r.Header.Set("Accept", "text/event-stream")
-	} else {
-		r.Header.Set("Accept", "application/json")
-	}
-	// fork(anticorr): 真实 codex 出站不带 Connection 头（由 Go transport 自行管理
-	// keep-alive），旧实现写死 Connection: Keep-Alive 是 CPA 独有指纹，删除。
-
-	isAPIKey := false
-	if auth != nil && auth.Attributes != nil {
-		if v := strings.TrimSpace(auth.Attributes["api_key"]); v != "" {
-			isAPIKey = true
-		}
-	}
-	// fork(anticorr A-1): managed（非 api-key）codex 账号的 Originator 钉死。
-	// 旧逻辑无条件第一优先透传客户端 Originator，客户端可任意覆盖出站身份（伪造污染）。
-	// 现在对 managed 账号只接受白名单内的 first-party Originator（codex-tui /
-	// codex_cli_rs / codex_vscode / codex_exec / "Codex " 前缀），其余一律钉死为
-	// profile.Originator（无则 DefaultCodexManagedOriginator），不可被下游覆盖。
-	// api-key 账号沿用旧行为（透传客户端 Originator），不在本次加固范围内。
-	clientOriginator := strings.TrimSpace(ginHeaders.Get("Originator"))
-	if isAPIKey {
-		if clientOriginator != "" {
-			r.Header.Set("Originator", clientOriginator)
-		}
-	} else {
-		pinnedOriginator := strings.TrimSpace(profile.Originator)
-		if pinnedOriginator == "" {
-			pinnedOriginator = helps.DefaultCodexManagedOriginator()
-		}
-		// 只接受白名单内的客户端值；其余覆盖为 managed 钉死值。
-		if clientOriginator != "" && helps.IsFirstPartyCodexOriginator(clientOriginator) {
-			pinnedOriginator = clientOriginator
-		}
-		r.Header.Set("Originator", pinnedOriginator)
-	}
-	if !isAPIKey {
-		if auth != nil && auth.Metadata != nil {
-			if accountID, ok := auth.Metadata["account_id"].(string); ok {
-				r.Header.Set("Chatgpt-Account-Id", accountID)
-			}
-		}
-	}
-	managedHeaderSnapshot := captureManagedHeaderSnapshot(r.Header, []string{
-		"User-Agent",
-		"Version",
-		"Originator",
-		"X-Codex-Beta-Features",
-		"sec-ch-ua",
-		"sec-ch-ua-mobile",
-		"sec-ch-ua-platform",
-		"Accept-Encoding",
-		"Accept-Language",
-		"sec-fetch-site",
-		"sec-fetch-mode",
-		"sec-fetch-dest",
-	})
-	var attrs map[string]string
-	if auth != nil {
-		attrs = auth.Attributes
-	}
-	util.ApplyCustomHeadersFromAttrs(r, attrs)
-	if cliproxyauth.HasStructuredAccountSettingsMetadata(auth) {
-		applyManagedHeaderSnapshot(r.Header, managedHeaderSnapshot)
-	}
-	// fork(anticorr Wave10-D 要点4)：CLI 画像下兜底剥离 Desktop 专属指纹头。
-	// 账号 metadata.headers / header:* 属性里可能残留历史 Desktop bundle 的
-	// sec-ch-ua / sec-ch-ua-* （真实 codex-rs CLI 不发这些）。ApplyCustomHeadersFromAttrs
-	// 会把这些残留 set 回 r.Header，而 managed snapshot 只恢复 snapshot 内已有的名字
-	// （CLI snapshot 不含 sec-ch-ua），无法挡住。这里在 CLI 画像（profile 非 Desktop）下
-	// 显式删除，确保出站不带 sec-ch-ua 系列，与 CLI body/TLS 自洽。
-	stripCodexDesktopOnlyHeadersForCLIProfile(r.Header, profile)
-	// fork(anticorr): 兜底再删一次 Version —— 真实 codex 出站无独立 Version 头。
-	// 上面的自定义 header（header:Version 属性）可能在 snapshot 恢复后又写回 Version，
-	// 这里最终统一剥离，确保出站任何来源的 Version 都不上线。
-	deleteHeaderCaseInsensitive(r.Header, "Version")
-}
-
-// stripCodexDesktopOnlyHeadersForCLIProfile 在 CLI 画像下删除 Desktop 专属指纹头。
-// 仅当 profile 非 Desktop 家族（即 CLI 画像）时生效；Desktop 画像不受影响，保持兼容。
 func stripCodexDesktopOnlyHeadersForCLIProfile(headers http.Header, profile helps.CodexClientProfile) {
 	if headers == nil || helps.IsCodexDesktopProfile(profile) {
 		return
@@ -543,125 +959,6 @@ func applyCodexCommunityDesktopHeaders(headers http.Header, profile helps.CodexC
 	}
 }
 
-// applyModelHeaderOverrides forces models.json config.override_header onto upstream headers.
-func applyModelHeaderOverrides(headers http.Header, modelName string) {
-	if headers == nil {
-		return
-	}
-	overrides := registry.ModelOverrideHeaders(modelName)
-	if len(overrides) == 0 {
-		return
-	}
-	for key, value := range overrides {
-		headers.Set(key, value)
-	}
-	if strings.Contains(headers.Get("User-Agent"), "Mac OS") && codexSessionHeaderValue(headers) == "" {
-		headers.Set("Session_id", uuid.NewString())
-	}
-}
-
-// applyCodexDirectImageHeaders sets Codex upstream headers for direct /images/* calls.
-// Downstream client User-Agent values are not forwarded to reduce Cloudflare 1010 blocks.
-func applyCodexDirectImageHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool, cfg *config.Config) {
-	var ginHeaders http.Header
-	if ginCtx, ok := r.Context().Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
-		ginHeaders = ginCtx.Request.Header.Clone()
-		ginHeaders.Del("User-Agent")
-	}
-	applyCodexHeadersFromSources(r, auth, token, stream, cfg, ginHeaders)
-}
-
-func applyCodexHeadersFromSources(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool, cfg *config.Config, ginHeaders http.Header) {
-	r.Header.Set("Content-Type", "application/json")
-	r.Header.Set("Authorization", "Bearer "+token)
-
-	if ginHeaders != nil && ginHeaders.Get("X-Codex-Beta-Features") != "" {
-		r.Header.Set("X-Codex-Beta-Features", ginHeaders.Get("X-Codex-Beta-Features"))
-	}
-	misc.EnsureHeader(r.Header, ginHeaders, "Version", "")
-	misc.EnsureHeader(r.Header, ginHeaders, "X-Codex-Turn-Metadata", "")
-	misc.EnsureHeader(r.Header, ginHeaders, "X-Client-Request-Id", "")
-	cfgUserAgent, _ := codexHeaderDefaults(cfg, auth)
-	ensureHeaderWithConfigPrecedence(r.Header, ginHeaders, "User-Agent", cfgUserAgent, codexUserAgent)
-
-	if strings.Contains(r.Header.Get("User-Agent"), "Mac OS") {
-		misc.EnsureHeader(r.Header, ginHeaders, "Session_id", uuid.NewString())
-	}
-
-	if stream {
-		r.Header.Set("Accept", "text/event-stream")
-	} else {
-		r.Header.Set("Accept", "application/json")
-	}
-	r.Header.Set("Connection", "Keep-Alive")
-
-	isAPIKey := false
-	if auth != nil && auth.Attributes != nil {
-		if v := strings.TrimSpace(auth.Attributes["api_key"]); v != "" {
-			isAPIKey = true
-		}
-	}
-	if originator := strings.TrimSpace(ginHeaders.Get("Originator")); originator != "" {
-		r.Header.Set("Originator", originator)
-	} else if !isAPIKey {
-		r.Header.Set("Originator", codexOriginator)
-	}
-	if !isAPIKey {
-		if auth != nil && auth.Metadata != nil {
-			if accountID, ok := auth.Metadata["account_id"].(string); ok {
-				r.Header.Set("Chatgpt-Account-Id", accountID)
-			}
-		}
-	}
-	var attrs map[string]string
-	if auth != nil {
-		attrs = auth.Attributes
-	}
-	util.ApplyCustomHeadersFromAttrs(r, attrs)
-}
-
-func normalizeCodexInstructions(body []byte) []byte {
-	instructions := gjson.GetBytes(body, "instructions")
-	if !instructions.Exists() || instructions.Type == gjson.Null {
-		body, _ = sjson.SetBytes(body, "instructions", "")
-	}
-	return body
-}
-
-var imageGenToolJSON = []byte(`{"type":"image_generation","output_format":"png"}`)
-var imageGenToolArrayJSON = []byte(`[{"type":"image_generation","output_format":"png"}]`)
-
-func isCodexFreePlanAuth(auth *cliproxyauth.Auth) bool {
-	if auth == nil || auth.Attributes == nil {
-		return false
-	}
-	if !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
-		return false
-	}
-	return strings.EqualFold(strings.TrimSpace(auth.Attributes["plan_type"]), "free")
-}
-
-func isImageGenerationFunctionTool(tool gjson.Result) bool {
-	switch tool.Get("type").String() {
-	case "function":
-		return tool.Get("name").String() == "image_gen.imagegen"
-	case "namespace":
-		if tool.Get("name").String() != "image_gen" {
-			return false
-		}
-		tools := tool.Get("tools")
-		if !tools.IsArray() {
-			return false
-		}
-		for _, nestedTool := range tools.Array() {
-			if nestedTool.Get("type").String() == "function" && nestedTool.Get("name").String() == "imagegen" {
-				return true
-			}
-		}
-	}
-	return false
-}
-
 func isCodexResponsesLiteRequest(body []byte, headers http.Header) bool {
 	if strings.EqualFold(strings.TrimSpace(headers.Get(codexResponsesLiteHeader)), "true") {
 		return true
@@ -674,35 +971,6 @@ func isCodexResponsesLiteRequest(body []byte, headers http.Header) bool {
 	return value.Type == gjson.True || value.Type == gjson.String && strings.EqualFold(strings.TrimSpace(value.String()), "true")
 }
 
-func ensureImageGenerationTool(body []byte, baseModel string, auth *cliproxyauth.Auth, headers http.Header) []byte {
-	if isCodexResponsesLiteRequest(body, headers) {
-		return body
-	}
-	if strings.HasSuffix(baseModel, "spark") {
-		return body
-	}
-	if isCodexFreePlanAuth(auth) {
-		return body
-	}
-
-	tools := gjson.GetBytes(body, "tools")
-	if !tools.Exists() || !tools.IsArray() {
-		body, _ = sjson.SetRawBytes(body, "tools", imageGenToolArrayJSON)
-		return body
-	}
-	for _, t := range tools.Array() {
-		if t.Get("type").String() == "image_generation" || isImageGenerationFunctionTool(t) {
-			return body
-		}
-	}
-	body, _ = sjson.SetRawBytes(body, "tools.-1", imageGenToolJSON)
-	return body
-}
-
-// stripImageGenerationTool 从请求体 tools 数组里移除所有 type==image_generation
-// 的工具（包括 Codex 客户端自带的完整 gpt-image-2 定义）。若移除后 tools 变为空
-// 数组，则删除整个 tools 字段，避免空 tools + tool_choice 触发上游报错。无 tools
-// 字段时原样返回。
 func stripImageGenerationTool(body []byte) []byte {
 	tools := gjson.GetBytes(body, "tools")
 	if !tools.Exists() || !tools.IsArray() {
@@ -722,16 +990,6 @@ func stripImageGenerationTool(body []byte) []byte {
 	return body
 }
 
-// applyImageGenerationPolicy decides how to handle the Codex image_generation tool
-// based on the tri-state config (DisableImageGenerationMode):
-//
-//	DisableImageGenerationOff  (config "false") → inject the tool via
-//	    ensureImageGenerationTool, which still skips free-plan / spark / responses-lite.
-//	DisableImageGenerationAll  (config "true")  → strip the tool.
-//	DisableImageGenerationChat (config "chat")  → strip on this Codex (chat-style) path.
-//
-// The loaded config default is Off, so by default the Codex image_generation tool is
-// injected on this chat-style path (matching upstream). nil cfg strips, defensively.
 func applyImageGenerationPolicy(cfg *config.Config, body []byte, baseModel string, auth *cliproxyauth.Auth, headers http.Header) []byte {
 	if cfg != nil && cfg.DisableImageGeneration == config.DisableImageGenerationOff {
 		return ensureImageGenerationTool(body, baseModel, auth, headers)
@@ -739,50 +997,42 @@ func applyImageGenerationPolicy(cfg *config.Config, body []byte, baseModel strin
 	return stripImageGenerationTool(body)
 }
 
-func normalizeCodexParallelToolCalls(body []byte, headers http.Header) []byte {
-	if isCodexResponsesLiteRequest(body, headers) {
-		body = helps.SetBoolIfDifferent(body, "parallel_tool_calls", false)
-		return body
-	}
-	return normalizeCodexParallelToolCallsForTools(body)
+type codexIdentityConfuseState struct {
+	// enabled 表示 identity-confuse 开关分支生效（受 codexIdentityConfuseEnabled
+	// 门控），仅驱动 prompt_cache_key / window_id 这两个字段的混淆。
+	enabled bool
+	// identityNormalize 表示真机身份字段（installation_id / turn_id /
+	// session_id / thread_id）的无条件归一生效。它与 enabled 解耦：只要 authID
+	// 有效就为 true，无论 identity-confuse 开关如何，都对这 4 个字段做归一，
+	// 避免生产关掉 identity-confuse 时裸泄漏真机指纹（anticorr 方案A）。
+	identityNormalize      bool
+	authID                 string
+	originalPromptCacheKey string
+	promptCacheKey         string
+	// installationID 是本请求派生出的混淆 installation_id（与 body
+	// client_metadata.x-codex-installation-id 同一个派生值）。turn-metadata
+	// header/body 副本里的 installation_id 都用它改写，保证处处一致、且不泄漏真机值。
+	installationID string
+	turnIDs        []codexIdentityReplacement
 }
 
-func normalizeCodexParallelToolCallsForTools(body []byte) []byte {
-	if !gjson.GetBytes(body, "parallel_tool_calls").Exists() {
-		return body
-	}
-
-	tools := gjson.GetBytes(body, "tools")
-	hasTools := tools.Exists() && tools.IsArray() && len(tools.Array()) > 0
-	if hasTools {
-		return body
-	}
-
-	body, _ = sjson.DeleteBytes(body, "parallel_tool_calls")
-	return body
+type codexIdentityReplacement struct {
+	original string
+	confused string
 }
 
-func publishCodexImageToolUsage(ctx context.Context, reporter *helps.UsageReporter, body []byte, completedData []byte) {
-	detail, ok := helps.ParseCodexImageToolUsage(completedData)
-	if !ok {
-		return
+func (state *codexIdentityConfuseState) confuseTurnID(turnID string) string {
+	turnID = strings.TrimSpace(turnID)
+	// turn_id 归一与 identity-confuse 开关解耦：identityNormalize 生效即处理（anticorr 方案A）。
+	if state == nil || !state.identityNormalize || strings.TrimSpace(state.authID) == "" || turnID == "" {
+		return turnID
 	}
-	reporter.EnsurePublished(ctx)
-	reporter.PublishAdditionalModel(ctx, codexImageGenerationToolModel(body), detail)
-}
-
-func codexImageGenerationToolModel(body []byte) string {
-	tools := gjson.GetBytes(body, "tools")
-	if tools.IsArray() {
-		for _, tool := range tools.Array() {
-			if tool.Get("type").String() != "image_generation" {
-				continue
-			}
-			if model := strings.TrimSpace(tool.Get("model").String()); model != "" {
-				return model
-			}
-			break
+	for _, replacement := range state.turnIDs {
+		if replacement.original == turnID || replacement.confused == turnID {
+			return replacement.confused
 		}
 	}
-	return codexDefaultImageToolModel
+	confusedTurnID := codexIdentityConfuseUUID(state.authID, "turn", turnID)
+	state.turnIDs = append(state.turnIDs, codexIdentityReplacement{original: turnID, confused: confusedTurnID})
+	return confusedTurnID
 }

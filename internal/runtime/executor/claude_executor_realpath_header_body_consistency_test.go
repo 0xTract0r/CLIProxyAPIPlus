@@ -66,7 +66,7 @@ func runRealPathServingCapture(t *testing.T, stabilize, align bool, inboundUA, a
 		Claude:               config.ClaudeConfig{AlignRealPathBillingVersion: &align},
 	}
 	executor := NewClaudeExecutor(cfg)
-	auth := &cliproxyauth.Auth{ProxyURL: "direct", ID: "realpath-consistency", Attributes: map[string]string{
+	auth := &cliproxyauth.Auth{Metadata: claudeOAuthTestMetadata(), ProxyURL: "direct", ID: "realpath-consistency", Attributes: map[string]string{
 		"api_key":  apiKey,
 		"base_url": server.URL,
 	}}

@@ -454,7 +454,7 @@ func TestClaudeHTTPAttemptRealExecutorEntries(t *testing.T) {
 			var preparedBytes atomic.Int64
 			invalidCompression := strings.HasSuffix(kind, "decode-failure")
 			entry := strings.Split(kind, "-")[0]
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				sends.Add(1)
 				body, readErr := io.ReadAll(r.Body)
 				if readErr != nil {
@@ -480,12 +480,22 @@ func TestClaudeHTTPAttemptRealExecutorEntries(t *testing.T) {
 					return
 				}
 				_, _ = io.WriteString(w, claudeAttemptResponseJSON)
-			}))
-			defer server.Close()
+			})
+			baseURL, proxyURL := "https://api.anthropic.com", "direct"
+			if entry == "count" {
+				if !claudeCountSandboxChild(t) {
+					return
+				}
+				proxyURL = newClaudeCountLifecycleSink(t, handler)
+			} else {
+				server := httptest.NewServer(handler)
+				t.Cleanup(server.Close)
+				baseURL = server.URL
+			}
 			gate := &claudeAttemptTestGate{}
 			ctx := cliproxyexecutor.WithHTTPAttemptGate(context.Background(), gate)
 			exec := NewClaudeExecutor(&config.Config{})
-			auth := &cliproxyauth.Auth{ID: "synthetic-http-attempt", Provider: "claude", ProxyURL: "direct", Attributes: map[string]string{"api_key": "key-123", "base_url": server.URL}}
+			auth := &cliproxyauth.Auth{ID: "synthetic-http-attempt", Provider: "claude", ProxyURL: proxyURL, Attributes: map[string]string{"api_key": "key-123", "base_url": baseURL}}
 			req := cliproxyexecutor.Request{Model: "claude-3-5-sonnet-20241022", Payload: []byte(claudeAttemptRequestJSON)}
 			opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")}
 			var err error
@@ -526,6 +536,32 @@ func TestClaudeHTTPAttemptRealExecutorEntries(t *testing.T) {
 				t.Fatalf("entry lifecycle: %d %+v", finished, result)
 			}
 		})
+	}
+}
+
+func TestClaudeHTTPAttemptCustomGatewayCountStaysLocal(t *testing.T) {
+	var sends atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sends.Add(1)
+		w.Header().Set("Content-Encoding", "gzip")
+		_, _ = io.WriteString(w, "invalid-compressed-body")
+	}))
+	defer server.Close()
+	gate := &claudeAttemptTestGate{}
+	ctx := cliproxyexecutor.WithHTTPAttemptGate(context.Background(), gate)
+	auth := &cliproxyauth.Auth{ID: "synthetic-local-count", Provider: "claude", ProxyURL: "direct", Attributes: map[string]string{"api_key": "key-123", "base_url": server.URL}}
+	result, err := NewClaudeExecutor(&config.Config{}).CountTokens(ctx, auth, cliproxyexecutor.Request{Model: "claude-3-5-sonnet-20241022", Payload: []byte(claudeAttemptRequestJSON)}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatClaude})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var count struct {
+		InputTokens int64 `json:"input_tokens"`
+	}
+	if err := json.Unmarshal(result.Payload, &count); err != nil || count.InputTokens <= 0 {
+		t.Fatalf("local count missing: %s err=%v", result.Payload, err)
+	}
+	if sends.Load() != 0 || len(gate.infos) != 0 || len(gate.permits) != 0 {
+		t.Fatalf("local Count entered HTTP admission: sends=%d infos=%d permits=%d", sends.Load(), len(gate.infos), len(gate.permits))
 	}
 }
 

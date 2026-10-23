@@ -37,7 +37,7 @@ func TestNewAnthropicHttpClientFailsClosedOnInvalidProxy(t *testing.T) {
 
 // TestNewAnthropicHttpClientAllowsValidDirectAndEmpty is the negative control: a
 // valid proxy, the explicit "direct" sentinel, and an empty proxy all keep the
-// normal *http.Transport path (never fail-closed blocked).
+// native OAuth uTLS path, including direct mode, without a Go TLS fallback.
 func TestNewAnthropicHttpClientAllowsValidDirectAndEmpty(t *testing.T) {
 	t.Parallel()
 
@@ -51,8 +51,8 @@ func TestNewAnthropicHttpClientAllowsValidDirectAndEmpty(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			client := NewAnthropicHttpClient(&config.SDKConfig{ProxyURL: proxyURL})
-			if _, ok := client.Transport.(*http.Transport); !ok {
-				t.Fatalf("%s proxy transport = %T, want *http.Transport (not blocked)", name, client.Transport)
+			if transport, ok := client.Transport.(*utlsRoundTripper); !ok || transport.transport == nil || transport.transport.DialTLSContext == nil {
+				t.Fatalf("%s proxy transport = %T, want native OAuth uTLS dialer", name, client.Transport)
 			}
 		})
 	}

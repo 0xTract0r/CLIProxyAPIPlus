@@ -18,6 +18,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/claude"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/kimi"
+	metaauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/meta"
 	xaiauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/xai"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginhost"
@@ -62,6 +63,7 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 		return
 	}
 
+	cfg := h.configSnapshot()
 	// Initialize Claude auth service. 新账号 setup 先合成一份临时账号身份，OAuth token
 	// 交换就绑定这台账号自己的代理/运行时画像，不会静默回退到核心全局代理；setup 为空时
 	// exchangeAuth 为 nil，newClaudeOAuthAuth 退回 claude.NewClaudeAuth(h.cfg)，行为不变。
@@ -101,7 +103,7 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 		}
 
 		// Helper: wait for callback file
-		waitFile := filepath.Join(h.cfg.AuthDir, fmt.Sprintf(".oauth-anthropic-%s.oauth", state))
+		waitFile := filepath.Join(cfg.AuthDir, fmt.Sprintf(".oauth-anthropic-%s.oauth", state))
 		waitForFile := func(path string, timeout time.Duration) (map[string]string, error) {
 			deadline := time.Now().Add(timeout)
 			for {
@@ -162,12 +164,26 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 
 		// Create token storage
 		tokenStorage := anthropicAuth.CreateTokenStorage(bundle)
+		metadata := map[string]any{"email": tokenStorage.Email}
+		if tokenStorage.AccountUUID != "" {
+			metadata["account_uuid"] = tokenStorage.AccountUUID
+		}
+		if tokenStorage.OrganizationUUID != "" {
+			metadata["organization_uuid"] = tokenStorage.OrganizationUUID
+		}
+		if tokenStorage.OrganizationName != "" {
+			metadata["organization_name"] = tokenStorage.OrganizationName
+		}
+		if len(tokenStorage.DeviceIDs) > 0 {
+			metadata[claude.ClaudeDeviceIDsMetadataKey] = append([]string(nil), tokenStorage.DeviceIDs...)
+		}
+		fileName := claude.CredentialFileName(tokenStorage.Email, tokenStorage.OrganizationUUID, tokenStorage.AccountUUID)
 		record := &coreauth.Auth{
-			ID:       fmt.Sprintf("claude-%s.json", tokenStorage.Email),
+			ID:       fileName,
 			Provider: "claude",
-			FileName: fmt.Sprintf("claude-%s.json", tokenStorage.Email),
+			FileName: fileName,
 			Storage:  tokenStorage,
-			Metadata: map[string]any{"email": tokenStorage.Email},
+			Metadata: metadata,
 		}
 		// 把 setup 的托管头种子和 proxy_url 等字段写进落库 record，保证新账号 proxy_url 不为空。
 		copyOAuthSetupSeed(record, exchangeAuth)
@@ -222,10 +238,11 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 		return
 	}
 
+	cfg := h.configSnapshot()
 	// Initialize Codex auth service. 新账号 setup 先合成一份临时账号身份，token 交换就走
 	// 账号自己的代理 + 托管头 + 运行时画像；setup 为空时退回核心全局 codex 服务，行为不变。
 	setupAuth := h.prepareOAuthSetupRuntimeAuth("codex", setup)
-	openaiAuth := newCodexOAuthService(h.cfg)
+	openaiAuth := newCodexOAuthService(cfg)
 	if setupAuth != nil {
 		openaiAuth = codex.NewCodexAuthWithHTTPClient(h.oauthIdentityHTTPClient(ctx, "auth.openai.com", setupAuth, anthropicOAuthExchangeTimeout))
 	}
@@ -263,7 +280,7 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 		}
 
 		// Wait for callback file
-		waitFile := filepath.Join(h.cfg.AuthDir, fmt.Sprintf(".oauth-codex-%s.oauth", state))
+		waitFile := filepath.Join(cfg.AuthDir, fmt.Sprintf(".oauth-codex-%s.oauth", state))
 		deadline := time.Now().Add(5 * time.Minute)
 		var code string
 		for {
@@ -311,17 +328,26 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 		// Extract additional info for filename generation
 		claims, _ := codex.ParseJWTToken(bundle.TokenData.IDToken)
 		planType := ""
+		if bundle != nil && strings.TrimSpace(bundle.TokenData.PlanType) != "" {
+			planType = strings.TrimSpace(bundle.TokenData.PlanType)
+		}
 		hashAccountID := ""
 		if claims != nil {
-			planType = strings.TrimSpace(claims.CodexAuthInfo.ChatgptPlanType)
+			if pt := strings.TrimSpace(claims.CodexAuthInfo.ChatgptPlanType); pt != "" {
+				planType = pt
+			}
 			if accountID := claims.GetAccountID(); accountID != "" {
 				digest := sha256.Sum256([]byte(accountID))
 				hashAccountID = hex.EncodeToString(digest[:])[:8]
 			}
 		}
+		if planType == "" {
+			planType = codex.DefaultPlanType
+		}
 
 		// Create token storage and persist
 		tokenStorage := openaiAuth.CreateTokenStorage(bundle)
+		tokenStorage.PlanType = planType
 		fileName := codex.CredentialFileName(tokenStorage.Email, planType, hashAccountID, true)
 		record := &coreauth.Auth{
 			ID:       fileName,
@@ -331,6 +357,10 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 			Metadata: map[string]any{
 				"email":      tokenStorage.Email,
 				"account_id": tokenStorage.AccountID,
+				"plan_type":  planType,
+			},
+			Attributes: map[string]string{
+				"plan_type": planType,
 			},
 		}
 		// 把 setup 的托管头种子和 proxy_url 等字段写进落库 record，保证新账号 proxy_url 不为空。
@@ -371,7 +401,8 @@ func (h *Handler) RequestAntigravityToken(c *gin.Context) {
 
 	// token 交换 / 用户信息拉取的出站 HTTP 走账号自己的代理（configForOAuthSetup 用账号
 	// proxy 覆盖全局代理），不回退核心全局代理；setup 无 proxy 时等价于 h.cfg，行为不变。
-	authSvc := antigravity.NewAntigravityAuth(h.configForOAuthSetup(setup), nil)
+	cfg := h.configForOAuthSetup(setup)
+	authSvc := antigravity.NewAntigravityAuth(cfg, nil)
 
 	state, errState := misc.GenerateRandomState()
 	if errState != nil {
@@ -407,7 +438,7 @@ func (h *Handler) RequestAntigravityToken(c *gin.Context) {
 			defer stopCallbackForwarderInstance(antigravity.CallbackPort, forwarder)
 		}
 
-		waitFile := filepath.Join(h.cfg.AuthDir, fmt.Sprintf(".oauth-antigravity-%s.oauth", state))
+		waitFile := filepath.Join(cfg.AuthDir, fmt.Sprintf(".oauth-antigravity-%s.oauth", state))
 		deadline := time.Now().Add(5 * time.Minute)
 		var authCode string
 		for {
@@ -658,24 +689,197 @@ func (h *Handler) RequestXAIToken(c *gin.Context) {
 	c.JSON(200, response)
 }
 
-func (h *Handler) RequestKimiToken(c *gin.Context) {
+func (h *Handler) RequestMetaToken(c *gin.Context) {
 	ctx := context.Background()
 	ctx = PopulateAuthContext(ctx, c)
 
-	fmt.Println("Initializing Kimi authentication...")
+	fmt.Println("Initializing Meta authentication...")
 
-	// 解析可选的账号级 setup（note / proxy_url）；proxy_url 非法直接 400。
 	setup, errSetup := parseOAuthAccountSetupFromRequest(c)
 	if errSetup != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": errSetup.Error()})
 		return
 	}
+	state := fmt.Sprintf("meta-%d", time.Now().UnixNano())
+	authSvc := metaauth.NewMetaAuth(h.configForOAuthSetup(setup))
 
-	state := fmt.Sprintf("kmi-%d", time.Now().UnixNano())
-	// Initialize Kimi auth service. device flow 的 token 交换出站 HTTP 走账号自己的代理
-	// （configForOAuthSetup 用账号 proxy 覆盖全局代理），不回退核心全局代理；setup 无 proxy
-	// 时等价于 h.cfg，行为不变。
-	kimiAuth := kimi.NewKimiAuth(h.configForOAuthSetup(setup))
+	deviceFlow, errStartDeviceFlow := authSvc.StartDeviceFlow(ctx)
+	if errStartDeviceFlow != nil {
+		log.Errorf("Failed to start Meta device flow: %v", errStartDeviceFlow)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to start device authorization flow"})
+		return
+	}
+	authURL := strings.TrimSpace(deviceFlow.VerificationURIComplete)
+	if authURL == "" {
+		authURL = strings.TrimSpace(deviceFlow.VerificationURI)
+	}
+
+	RegisterOAuthSession(state, "meta")
+
+	go func() {
+		pollCtx, cancelPoll := context.WithCancel(ctx)
+		defer cancelPoll()
+		go watchOAuthSessionCancel(pollCtx, cancelPoll, state, "meta")
+
+		fmt.Println("Waiting for Meta authentication...")
+		bundle, errWaitForAuthorization := authSvc.WaitForAuthorization(pollCtx, deviceFlow)
+		if errWaitForAuthorization != nil {
+			if !IsOAuthSessionPending(state, "meta") {
+				return
+			}
+			log.Errorf("Meta authentication failed: %v", errWaitForAuthorization)
+			SetOAuthSessionError(state, oauthSessionErrorWithCause("Authentication failed", errWaitForAuthorization))
+			return
+		}
+		if !IsOAuthSessionPending(state, "meta") {
+			return
+		}
+
+		tokenStorage := authSvc.CreateTokenStorage(bundle)
+		if tokenStorage == nil || strings.TrimSpace(tokenStorage.AccessToken) == "" {
+			log.Error("Meta token exchange returned empty access token")
+			SetOAuthSessionError(state, "Failed to exchange token")
+			return
+		}
+
+		record := buildMetaAuthRecord(bundle, tokenStorage)
+		h.applyOAuthAccountSetupToRecord(record, setup)
+		if errGuard := guardOAuthSessionPendingForSave(state, "meta"); errGuard != nil {
+			return
+		}
+		savedPath, errSave := h.saveTokenRecord(ctx, record)
+		if errSave != nil {
+			log.Errorf("Failed to save Meta token to file: %v", errSave)
+			SetOAuthSessionError(state, "Failed to save token to file")
+			return
+		}
+
+		CompleteOAuthSessionWithRecord(state, savedPath, record)
+		fmt.Printf("Authentication successful! Token saved to %s\n", savedPath)
+		fmt.Println("You can now use Meta services through this CLI")
+	}()
+
+	response := gin.H{"status": "ok", "url": authURL, "state": state, "flow": "device"}
+	if userCode := strings.TrimSpace(deviceFlow.UserCode); userCode != "" {
+		response["user_code"] = userCode
+	}
+	if deviceFlow.ExpiresIn > 0 {
+		response["expires_in"] = deviceFlow.ExpiresIn
+	} else {
+		response["expires_in"] = int(metaauth.MaxPollDuration / time.Second)
+	}
+	c.JSON(200, response)
+}
+
+func buildMetaAuthRecord(bundle *metaauth.MetaAuthBundle, tokenStorage *metaauth.MetaTokenStorage) *coreauth.Auth {
+	fileName := metaauth.CredentialFileName(tokenStorage.Email, tokenStorage.DCAToken)
+	label := strings.TrimSpace(tokenStorage.Email)
+	if label == "" {
+		label = "Meta"
+	}
+
+	metadata := map[string]any{
+		"type":         "meta",
+		"access_token": tokenStorage.AccessToken,
+		"token_type":   tokenStorage.TokenType,
+		"expires_in":   tokenStorage.ExpiresIn,
+		"expired":      tokenStorage.Expired,
+		"last_refresh": tokenStorage.LastRefresh,
+		"base_url":     tokenStorage.BaseURL,
+		"auth_kind":    "oauth",
+	}
+	if tokenStorage.DCAExpired != "" {
+		metadata["dca_expired"] = tokenStorage.DCAExpired
+	}
+	if tokenStorage.DCAExpiresAt > 0 {
+		metadata["dca_expires_at"] = tokenStorage.DCAExpiresAt
+	}
+	if tokenStorage.APIKey != "" {
+		metadata["api_key"] = tokenStorage.APIKey
+	}
+	if tokenStorage.DCAToken != "" {
+		metadata["dca_token"] = tokenStorage.DCAToken
+	}
+	if tokenStorage.Email != "" {
+		metadata["email"] = tokenStorage.Email
+	}
+	if tokenStorage.Name != "" {
+		metadata["name"] = tokenStorage.Name
+	}
+	if bundle != nil && bundle.MintedKey != nil {
+		metadata["subs_tier_name"] = bundle.MintedKey.SubsTierName
+		metadata["subs_tier_id"] = bundle.MintedKey.SubsTierID
+		metadata["is_subs_active"] = bundle.MintedKey.IsSubsActive
+		metadata["has_payment_method"] = bundle.MintedKey.HasPaymentMethod
+	}
+
+	attrs := map[string]string{
+		"auth_kind": "oauth",
+		"base_url":  tokenStorage.BaseURL,
+	}
+	if tokenStorage.APIKey != "" {
+		attrs["api_key"] = tokenStorage.APIKey
+	}
+	if tokenStorage.DCAToken != "" {
+		attrs["dca_token"] = tokenStorage.DCAToken
+	}
+	if tokenStorage.Email != "" {
+		attrs["email"] = tokenStorage.Email
+	}
+
+	return &coreauth.Auth{
+		ID:         fileName,
+		Provider:   "meta",
+		FileName:   fileName,
+		Label:      label,
+		Storage:    tokenStorage,
+		Metadata:   metadata,
+		Attributes: attrs,
+	}
+}
+
+func (h *Handler) RequestKimiToken(c *gin.Context) {
+	domain := kimi.KimiDefaultDomain
+	if qDomain := strings.TrimSpace(c.Query("domain")); qDomain != "" {
+		domain = qDomain
+	} else if qChan := strings.TrimSpace(c.Query("channel")); qChan != "" {
+		domain = qChan
+	}
+	h.requestKimiTokenWithDomain(c, domain)
+}
+
+func (h *Handler) RequestKimiAIToken(c *gin.Context) {
+	h.requestKimiTokenWithDomain(c, kimi.KimiAIDomain)
+}
+
+func (h *Handler) requestKimiTokenWithDomain(c *gin.Context, domain string) {
+	ctx := context.Background()
+	ctx = PopulateAuthContext(ctx, c)
+
+	isAI := kimi.IsKimiAIDomain(domain)
+	displayName := "Kimi"
+	providerName := "kimi"
+	filePrefix := "kimi"
+	statePrefix := "kmi"
+	baseURL := kimi.KimiAPIBaseURL
+	if isAI {
+		displayName = "Kimi.ai"
+		providerName = "kimi-ai"
+		filePrefix = "kimi-ai"
+		statePrefix = "kmi-ai"
+		baseURL = kimi.KimiAIAPIBaseURL
+	}
+
+	fmt.Printf("Initializing %s authentication...\n", displayName)
+
+	setup, errSetup := parseOAuthAccountSetupFromRequest(c)
+	if errSetup != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errSetup.Error()})
+		return
+	}
+	state := fmt.Sprintf("%s-%d", statePrefix, time.Now().UnixNano())
+	// Initialize Kimi auth service
+	kimiAuth := kimi.NewKimiAuthWithDomain(h.configForOAuthSetup(setup), domain)
 
 	// Generate authorization URL
 	deviceFlow, errStartDeviceFlow := kimiAuth.StartDeviceFlow(ctx)
@@ -689,37 +893,42 @@ func (h *Handler) RequestKimiToken(c *gin.Context) {
 		authURL = deviceFlow.VerificationURI
 	}
 
-	RegisterOAuthSession(state, "kimi")
+	RegisterOAuthSession(state, providerName)
 
 	go func() {
 		pollCtx, cancelPoll := context.WithCancel(ctx)
 		defer cancelPoll()
-		go watchOAuthSessionCancel(pollCtx, cancelPoll, state, "kimi")
+		go watchOAuthSessionCancel(pollCtx, cancelPoll, state, providerName)
 
-		fmt.Println("Waiting for authentication...")
+		fmt.Printf("Waiting for %s authentication...\n", displayName)
 		authBundle, errWaitForAuthorization := kimiAuth.WaitForAuthorization(pollCtx, deviceFlow)
 		if errWaitForAuthorization != nil {
-			if !IsOAuthSessionPending(state, "kimi") {
+			if !IsOAuthSessionPending(state, providerName) {
 				return
 			}
 			SetOAuthSessionError(state, oauthSessionErrorWithCause("Authentication failed", errWaitForAuthorization))
-			fmt.Printf("Authentication failed: %v\n", errWaitForAuthorization)
+			fmt.Printf("%s authentication failed: %v\n", displayName, errWaitForAuthorization)
 			return
 		}
-		if !IsOAuthSessionPending(state, "kimi") {
+		if !IsOAuthSessionPending(state, providerName) {
 			return
 		}
 
 		// Create token storage
 		tokenStorage := kimiAuth.CreateTokenStorage(authBundle)
+		if isAI {
+			tokenStorage.Type = providerName
+		}
 
 		metadata := map[string]any{
-			"type":          "kimi",
+			"type":          providerName,
 			"access_token":  authBundle.TokenData.AccessToken,
 			"refresh_token": authBundle.TokenData.RefreshToken,
 			"token_type":    authBundle.TokenData.TokenType,
 			"scope":         authBundle.TokenData.Scope,
 			"timestamp":     time.Now().UnixMilli(),
+			"domain":        domain,
+			"base_url":      baseURL,
 		}
 		if authBundle.TokenData.ExpiresAt > 0 {
 			expired := time.Unix(authBundle.TokenData.ExpiresAt, 0).UTC().Format(time.RFC3339)
@@ -729,18 +938,22 @@ func (h *Handler) RequestKimiToken(c *gin.Context) {
 			metadata["device_id"] = strings.TrimSpace(authBundle.DeviceID)
 		}
 
-		fileName := fmt.Sprintf("kimi-%d.json", time.Now().UnixMilli())
+		fileName := fmt.Sprintf("%s-%d.json", filePrefix, time.Now().UnixMilli())
 		record := &coreauth.Auth{
 			ID:       fileName,
-			Provider: "kimi",
+			Provider: providerName,
 			FileName: fileName,
-			Label:    "Kimi User",
+			Label:    fmt.Sprintf("%s User", displayName),
 			Storage:  tokenStorage,
 			Metadata: metadata,
+			Attributes: map[string]string{
+				"base_url": baseURL,
+				"domain":   domain,
+			},
 		}
 		// 把 setup 的 proxy_url 等字段写进落库 record，保证新账号 proxy_url 不为空。
 		h.applyOAuthAccountSetupToRecord(record, setup)
-		if errGuard := guardOAuthSessionPendingForSave(state, "kimi"); errGuard != nil {
+		if errGuard := guardOAuthSessionPendingForSave(state, providerName); errGuard != nil {
 			return
 		}
 		savedPath, errSave := h.saveTokenRecord(ctx, record)
@@ -751,7 +964,7 @@ func (h *Handler) RequestKimiToken(c *gin.Context) {
 		}
 
 		fmt.Printf("Authentication successful! Token saved to %s\n", savedPath)
-		fmt.Println("You can now use Kimi services through this CLI")
+		fmt.Printf("You can now use %s services through this CLI\n", displayName)
 		CompleteOAuthSessionWithRecord(state, savedPath, record)
 	}()
 

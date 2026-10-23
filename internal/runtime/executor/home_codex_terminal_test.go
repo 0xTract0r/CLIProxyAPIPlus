@@ -55,7 +55,7 @@ func TestHomeCodexTerminalStreamFailureUsesFreshDispatchOnNextRequest(t *testing
 	}))
 	defer server.Close()
 
-	dispatcher := &terminalCodexHomeDispatcher{auth: cliproxyauth.Auth{
+	dispatcher := &terminalCodexHomeDispatcher{auth: cliproxyauth.Auth{ProxyURL: "direct",
 		ID:       "home-codex",
 		Provider: "codex",
 		Status:   cliproxyauth.StatusActive,

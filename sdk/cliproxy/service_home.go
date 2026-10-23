@@ -11,7 +11,6 @@ import (
 
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/home"
-	"github.com/router-for-me/CLIProxyAPI/v8/internal/homeplugins"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/redisqueue"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
@@ -101,6 +100,23 @@ func (q *homeConfigWorkQueue) dequeue(ctx context.Context) ([]byte, bool) {
 	}
 }
 
+func (q *homeConfigWorkQueue) tryDequeueLatest() ([]byte, bool) {
+	if q == nil {
+		return nil, false
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if len(q.items) == 0 {
+		return nil, false
+	}
+	item := q.items[len(q.items)-1]
+	for index := range q.items {
+		q.items[index] = nil
+	}
+	q.items = nil
+	return item, true
+}
+
 type homeLogForwarder interface {
 	Bind(*home.Client)
 	Deactivate(*home.Client)
@@ -180,16 +196,15 @@ func (s *Service) stageHomeOverlayWithClient(ctx context.Context, remoteCfg *con
 	if errContext := ctx.Err(); errContext != nil {
 		return nil, errContext
 	}
-	if didSync {
-		if errLoad := homeplugins.MarkLoadResults(&report, s.pluginHost); errLoad != nil {
-			return nil, fmt.Errorf("load home plugins: %w", errLoad)
-		}
-	}
 	if strings.TrimSpace(report.Task) != "" {
 		work.syncKey = syncKey
 		work.markSynced = true
 		if strings.TrimSpace(merged.Home.NodeID) != "" {
-			work.statusWork = append(work.statusWork, homePluginStatusWork{cfg: &merged, report: report})
+			work.statusWork = append(work.statusWork, homePluginStatusWork{
+				cfg:              &merged,
+				report:           report,
+				needsLoadMarking: didSync,
+			})
 		}
 	}
 	taskWork, errTasks := s.stageHomePluginTasksWithClient(ctx, &merged, client)
@@ -241,8 +256,6 @@ func (s *Service) homeLifetimeActive(homeCtx, lifetimeCtx context.Context, gener
 }
 
 func (s *Service) finalizeHomePluginWorkUntilDone(ctx, homeCtx context.Context, generation uint64, client *home.Client, work *homePluginFinalization, publish func() bool) error {
-	stopClose := closeHomeClientOnCancellation(ctx, client)
-	defer stopClose()
 	for {
 		if errContext := ctx.Err(); errContext != nil {
 			return errContext
@@ -272,21 +285,6 @@ func (s *Service) finalizeHomePluginWorkUntilDone(ctx, homeCtx context.Context, 
 		case <-timer.C:
 		}
 	}
-}
-
-func closeHomeClientOnCancellation(ctx context.Context, client *home.Client) func() {
-	if ctx == nil || client == nil {
-		return func() {}
-	}
-	stop := make(chan struct{})
-	go func() {
-		select {
-		case <-ctx.Done():
-			client.Close()
-		case <-stop:
-		}
-	}()
-	return func() { close(stop) }
 }
 
 func logHomeConfigChanges(oldCfg, newCfg *config.Config) {
@@ -492,6 +490,25 @@ func (s *Service) runHomeSubscriber(homeCtx context.Context, parentCtx context.C
 	}()
 
 	var previousClient *home.Client
+	registry := executionregistry.New()
+	cancelBound := atomic.Int64{}
+	cancelBound.Store(int64(internalconfig.CredentialConcurrencyConfig{}.WithDefaults().CPACancelBound))
+	releaseFlusher := home.NewReleaseFlusher(nil, nil)
+	registry.SetReleaseSink(releaseFlusher.MarkDirty)
+	defer func() {
+		registry.SetReleaseSink(nil)
+		drainBound := time.Duration(cancelBound.Load())
+		if drainBound <= 0 {
+			drainBound = internalconfig.CredentialConcurrencyConfig{}.WithDefaults().CPACancelBound
+		}
+		drainCtx, cancelDrain := context.WithTimeout(context.WithoutCancel(parentCtx), drainBound)
+		errDrain := registry.Drain(drainCtx)
+		cancelDrain()
+		if errDrain != nil && !errors.Is(errDrain, executionregistry.ErrRegistryClosed) && parentCtx.Err() == nil {
+			log.WithError(errDrain).Error("failed to drain detached Home execution registry")
+			s.cancelServiceRun()
+		}
+	}()
 	for homeCtx.Err() == nil {
 		supervisor.setPublisherCompletion(nil)
 		client := previousClient
@@ -501,18 +518,15 @@ func (s *Service) runHomeSubscriber(homeCtx context.Context, parentCtx context.C
 			client = client.NewLifetime()
 		}
 		client.SetManagedLifetime(true)
-		registry := executionregistry.New()
 		releaseCtx, releaseCancel := context.WithCancel(context.WithoutCancel(homeCtx))
-		releaseFlusher := home.NewReleaseFlusher(client.LimiterConfig, client.PushConcurrencyRelease)
-		registry.SetReleaseSink(releaseFlusher.MarkDirty)
+		releaseFlusher.SetConfigProvider(client.LimiterConfig)
+		releaseFlusher.SetSender(client.PushConcurrencyRelease)
 		releaseDone := make(chan struct{})
 		go func() {
 			defer close(releaseDone)
 			releaseFlusher.Run(releaseCtx)
 		}()
 		lifetimeCtx, lifetimeCancel := context.WithCancel(homeCtx)
-		cancelBound := atomic.Int64{}
-		cancelBound.Store(int64(internalconfig.CredentialConcurrencyConfig{}.WithDefaults().CPACancelBound))
 		queue := newHomeConfigWorkQueue()
 		ready := make(chan struct{})
 		var readyOnce sync.Once
@@ -545,6 +559,16 @@ func (s *Service) runHomeSubscriber(homeCtx context.Context, parentCtx context.C
 		}, func() {
 			readyOnce.Do(func() { close(ready) })
 		})
+		plannedRebalance := errors.Is(errRun, home.ErrRebalanceRequested)
+		settleBound := time.Duration(cancelBound.Load())
+		var errPending error
+		if plannedRebalance {
+			// Settle issued dispatches before deciding between target takeover and source drain/flush.
+			client.FenceDispatch()
+			settleCtx, cancelSettle := context.WithTimeout(context.WithoutCancel(parentCtx), settleBound)
+			errPending = registry.WaitPending(settleCtx)
+			cancelSettle()
+		}
 		lifetimeCancel()
 		<-workerDone
 		if publisherDone := supervisor.publisherCompletion(); publisherDone != nil {
@@ -552,6 +576,52 @@ func (s *Service) runHomeSubscriber(homeCtx context.Context, parentCtx context.C
 		}
 
 		s.detachHomeSubscriberLifetime(client, registry)
+		retry := errRun != nil && homeCtx.Err() == nil
+		if retry {
+			releaseCancel()
+			<-releaseDone
+			client.Close()
+			if !plannedRebalance {
+				settleCtx, cancelSettle := context.WithTimeout(context.WithoutCancel(parentCtx), settleBound)
+				errPending = registry.WaitPending(settleCtx)
+				cancelSettle()
+			}
+			if errPending != nil {
+				log.WithError(errPending).Error("failed to settle pending Home dispatches before subscriber replacement")
+				s.cancelServiceRun()
+				return
+			}
+			legacyProtocol := home.IsLegacyMembershipProtocolError(errRun)
+			if legacyProtocol {
+				client.EnableLegacyMembership()
+			}
+			if client.AmbiguousDispatch() || home.IsMembershipTakeoverUnavailableError(errRun) || legacyProtocol || client.LegacyMembership() {
+				registry.SetReleaseSink(nil)
+				drainCtx, cancelDrain := context.WithTimeout(context.WithoutCancel(parentCtx), settleBound)
+				errDrain := registry.Drain(drainCtx)
+				cancelDrain()
+				if errDrain != nil {
+					log.WithError(errDrain).Error("failed to drain Home executions after unsafe subscriber replacement")
+					s.cancelServiceRun()
+					return
+				}
+				client.SuppressTakeover()
+				registry = executionregistry.New()
+				releaseFlusher = home.NewReleaseFlusher(nil, nil)
+				registry.SetReleaseSink(releaseFlusher.MarkDirty)
+			}
+			if errors.Is(errRun, home.ErrRebalanceRequested) {
+				log.Info("home config subscription reconnecting for load balance")
+			} else {
+				log.WithError(errRun).Warn("home config subscription lifetime ended")
+			}
+			if !published.Load() && !waitForHomeSubscriberRetry(homeCtx, homeSubscriberPreAckRetryBackoff) {
+				return
+			}
+			previousClient = client
+			continue
+		}
+
 		drainBound := time.Duration(cancelBound.Load())
 		drainCtx, cancelDrain := context.WithTimeout(context.WithoutCancel(parentCtx), drainBound)
 		errDrain := registry.Drain(drainCtx)
@@ -577,13 +647,7 @@ func (s *Service) runHomeSubscriber(homeCtx context.Context, parentCtx context.C
 			}
 			return
 		}
-		if errRun != nil && homeCtx.Err() == nil {
-			log.WithError(errRun).Warn("home config subscription lifetime ended")
-		}
-		if !published.Load() && errRun != nil && !waitForHomeSubscriberRetry(homeCtx, homeSubscriberPreAckRetryBackoff) {
-			return
-		}
-		previousClient = client
+		return
 	}
 }
 
@@ -628,6 +692,9 @@ func (s *Service) runHomeConfigWorkerWithSupervisor(lifetimeCtx, homeCtx context
 			log.WithError(errParse).Warn("failed to stage home config; retrying")
 			if !waitForHomeSubscriberRetry(lifetimeCtx, homeSubscriberPreAckRetryBackoff) {
 				return
+			}
+			if latest, okLatest := queue.tryDequeueLatest(); okLatest {
+				raw = latest
 			}
 		}
 

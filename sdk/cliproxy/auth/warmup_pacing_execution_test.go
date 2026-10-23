@@ -514,7 +514,7 @@ func TestWarmupPacingExecutionPoolGateReselectKeepsContinuation(t *testing.T) {
 		*now = now.Add(21 * time.Second)
 		return nil, firstErr
 	}
-	_, err := m.executeStreamWithModelPool(ctx, e, a, "claude", cliproxyexecutor.Request{Model: model, Payload: opts.OriginalRequest}, opts, model, "", []string{"up-a", "up-b"}, true, OAuthModelAliasResult{}, true, false)
+	_, err := m.executeStreamWithModelPool(ctx, e, a, "claude", cliproxyexecutor.Request{Model: model, Payload: opts.OriginalRequest}, opts, model, "", []string{"up-a", "up-b"}, true, OAuthModelAliasResult{}, nil, true, false)
 	var local *warmupAdmissionReselect
 	if !errors.As(err, &local) || local.previous != firstErr || len(calls) != 2 || calls[0] != "up-a" || calls[1] != "up-b" {
 		t.Fatalf("pool local reselect lost history: calls=%v err=%v", calls, err)

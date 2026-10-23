@@ -110,7 +110,7 @@ func TestCodexHTTPExecutorBlocksClientFastWhenAccountFastDisabled(t *testing.T) 
 			}))
 			defer server.Close()
 
-			exec := NewCodexExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
+			exec := NewCodexExecutor(codexFastFinalizerGuardConfig("priority"))
 			auth := &cliproxyauth.Auth{
 				ID:       "codex-fast-disabled",
 				Provider: "codex",
@@ -238,10 +238,11 @@ func TestCodexAutoExecutorFastRoutesHTTPDownstreamAndRunsPrewarm(t *testing.T) {
 	server := fastPrewarmUpstream(t, "resp_prewarm_1", "resp_main_1", capturePrewarm, captureMain)
 	defer server.Close()
 
-	exec := NewCodexAutoExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
+	exec := NewCodexAutoExecutor(codexFastFinalizerGuardConfig("flex"))
 	auth := &cliproxyauth.Auth{
 		ID:       "codex-fast-route",
 		Provider: "codex",
+		ProxyURL: "direct",
 		Attributes: map[string]string{
 			"api_key":     "sk-test",
 			"base_url":    server.URL,
@@ -306,10 +307,11 @@ func TestCodexAutoExecutorFastStreamRunsPrewarmThenMain(t *testing.T) {
 	server := fastPrewarmUpstream(t, "resp_prewarm_s", "resp_main_s", capturePrewarm, captureMain)
 	defer server.Close()
 
-	exec := NewCodexAutoExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
+	exec := NewCodexAutoExecutor(codexFastFinalizerGuardConfig("flex"))
 	auth := &cliproxyauth.Auth{
 		ID:       "codex-fast-stream",
 		Provider: "codex",
+		ProxyURL: "direct",
 		Attributes: map[string]string{
 			"api_key":     "sk-test",
 			"base_url":    server.URL,
@@ -385,7 +387,7 @@ func TestCodexWebsocketsFastPrewarmFailsClosed(t *testing.T) {
 	defer server.Close()
 
 	exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID:       "codex-fast-failclosed",
 		Provider: "codex",
 		Attributes: map[string]string{
@@ -457,4 +459,10 @@ func TestBuildCodexWebsocketFastMainBody(t *testing.T) {
 	if got := gjson.GetBytes(out, "input.0.content.0.text").String(); got != "real prompt" {
 		t.Fatalf("main input text = %q, want the real prompt", got)
 	}
+}
+
+// Each transport guard supplies the opposite payload override. Account Fast
+// policy must remain authoritative after the final user payload barrier.
+func codexFastFinalizerGuardConfig(tier string) *config.Config {
+	return &config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}, Payload: config.PayloadConfig{Override: []config.PayloadRule{{Models: []config.PayloadModelRule{{Name: "gpt-*", Protocol: "codex"}, {Name: "gpt-*", Protocol: "codex-websockets"}}, Params: map[string]any{"service_tier": tier}}}}}
 }

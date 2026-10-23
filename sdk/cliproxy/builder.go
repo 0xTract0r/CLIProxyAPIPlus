@@ -48,11 +48,17 @@ type Builder struct {
 	// coreManager handles core authentication and execution.
 	coreManager *coreauth.Manager
 
+	// cooldownStateStore overrides runtime cooldown persistence.
+	cooldownStateStore coreauth.CooldownStateStore
+
 	// pluginHost owns dynamic plugin lifecycle and adapters.
 	pluginHost *pluginhost.Host
 
 	// postAuthHook is called after auth record creation and before persistence.
 	postAuthHook coreauth.PostAuthHook
+
+	// resultPolicy intercepts execution results before quota mutation and persistence.
+	resultPolicy coreauth.ResultPolicy
 
 	// serverOptions contains additional server configuration options.
 	serverOptions []api.ServerOption
@@ -146,6 +152,12 @@ func (b *Builder) WithCoreAuthManager(mgr *coreauth.Manager) *Builder {
 	return b
 }
 
+// WithCooldownStateStore overrides the store used for runtime cooldown persistence.
+func (b *Builder) WithCooldownStateStore(store coreauth.CooldownStateStore) *Builder {
+	b.cooldownStateStore = store
+	return b
+}
+
 // WithPluginHost overrides the dynamic plugin host used by the service.
 func (b *Builder) WithPluginHost(host *pluginhost.Host) *Builder {
 	b.pluginHost = host
@@ -177,6 +189,12 @@ func (b *Builder) WithPostAuthHook(hook coreauth.PostAuthHook) *Builder {
 	return b
 }
 
+// WithResultPolicy sets an execution result policy invoked before in-memory quota mutations and persistence.
+func (b *Builder) WithResultPolicy(policy coreauth.ResultPolicy) *Builder {
+	b.resultPolicy = policy
+	return b
+}
+
 // Build validates inputs, applies defaults, and returns a ready-to-run service.
 func (b *Builder) Build() (*Service, error) {
 	if b.cfg == nil {
@@ -184,6 +202,9 @@ func (b *Builder) Build() (*Service, error) {
 	}
 	if b.configPath == "" {
 		return nil, fmt.Errorf("cliproxy: configuration path is required")
+	}
+	if errValidate := b.cfg.ValidateCredentialWeights(); errValidate != nil {
+		return nil, fmt.Errorf("cliproxy: validate credential weights: %w", errValidate)
 	}
 	b.cfg.NormalizePluginsConfig()
 	if errResolvePluginsDir := b.cfg.ResolvePluginsDir(); errResolvePluginsDir != nil && b.cfg.Plugins.Enabled {
@@ -227,11 +248,17 @@ func (b *Builder) Build() (*Service, error) {
 	accessManager.SetProviders(sdkaccess.RegisteredProviders())
 
 	coreManager := b.coreManager
+	cooldownStateStore := b.cooldownStateStore
 	var appliedRoutingState *routingRuntimeState
 	if coreManager == nil {
 		tokenStore := sdkAuth.GetTokenStore()
 		if dirSetter, ok := tokenStore.(interface{ SetBaseDir(string) }); ok && b.cfg != nil {
 			dirSetter.SetBaseDir(b.cfg.AuthDir)
+		}
+		if cooldownStateStore == nil {
+			if provider, ok := tokenStore.(coreauth.CooldownStateStoreProvider); ok {
+				cooldownStateStore = provider.CooldownStateStore()
+			}
 		}
 
 		// Adopt upstream routing-runtime abstraction. The legacy
@@ -258,9 +285,12 @@ func (b *Builder) Build() (*Service, error) {
 	if pluginHost != nil {
 		coreManager.SetPluginScheduler(pluginHost)
 	}
+	if b.resultPolicy != nil {
+		coreManager.SetResultPolicy(b.resultPolicy)
+	}
 
 	service := &Service{
-		cfg:                 b.cfg,
+		cfg:                 b.cfg.CloneForRuntime(),
 		configPath:          b.configPath,
 		tokenProvider:       tokenProvider,
 		apiKeyProvider:      apiKeyProvider,
@@ -269,7 +299,9 @@ func (b *Builder) Build() (*Service, error) {
 		authManager:         authManager,
 		accessManager:       accessManager,
 		coreManager:         coreManager,
+		cooldownStateStore:  cooldownStateStore,
 		pluginHost:          pluginHost,
+		discoveryManager:    newDiscoveryAdvertiserManager(),
 		appliedRoutingState: appliedRoutingState,
 		serverOptions:       append([]api.ServerOption(nil), b.serverOptions...),
 	}
@@ -325,10 +357,17 @@ func (s *Service) runtimeAuthSyncHook() coreauth.PostAuthHook {
 			ID:     auth.ID,
 			Auth:   auth,
 		}
-		if s.watcher != nil && s.watcher.DispatchPersistedAuthUpdate(update) {
-			return nil
+		if watcher := s.currentWatcher(); watcher != nil {
+			_, rev := watcher.DispatchPersistedAuthUpdateWithRevision(&update)
+			if rev > 0 {
+				update.SetRevision(rev)
+			}
 		}
-		s.handleAuthUpdate(coreauth.WithSkipPersist(ctx), update)
+		// Detach from request cancellation so runtime model registration always completes
+		// once the credential has been persisted to disk. If the watcher consumer already
+		// claimed this revision, handleAuthUpdate waits for that registration to finish.
+		syncCtx := coreauth.WithSkipPersist(context.Background())
+		s.handleAuthUpdate(syncCtx, update)
 		return nil
 	}
 }

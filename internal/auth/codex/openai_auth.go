@@ -40,6 +40,7 @@ const (
 	// identity. Kept as a local copy because that constant is unexported and
 	// importing the executor package here would create an import cycle.
 	codexOAuthUserAgent = "codex-tui/0.135.0 (Mac OS 26.5.0; arm64) iTerm.app/3.6.10 (codex-tui; 0.135.0)"
+	codexRefreshTimeout = 30 * time.Second
 )
 
 // CodexAuth handles the OpenAI OAuth2 authentication flow.
@@ -52,7 +53,8 @@ type CodexAuth struct {
 	// background token refresh presents the serving identity; the management-bound
 	// client (NewCodexAuthWithHTTPClient) leaves it empty and relies on its own
 	// managed-header transport.
-	userAgent string
+	userAgent         string
+	siwcAgentNameHint string
 }
 
 var codexRefreshGroup singleflight.Group
@@ -67,14 +69,13 @@ func NewCodexAuth(cfg *config.Config) *CodexAuth {
 // proxyURL takes precedence over cfg.ProxyURL when non-empty.
 func NewCodexAuthWithProxyURL(cfg *config.Config, proxyURL string) *CodexAuth {
 	effectiveProxyURL := strings.TrimSpace(proxyURL)
-	var sdkCfg config.SDKConfig
+	agentNameHint := SIWCAgentNameHint
 	if cfg != nil {
-		sdkCfg = cfg.SDKConfig
 		if effectiveProxyURL == "" {
 			effectiveProxyURL = strings.TrimSpace(cfg.ProxyURL)
 		}
+		agentNameHint = cfg.Codex.EffectiveSignInWithChatGPTIdentifier()
 	}
-	sdkCfg.ProxyURL = effectiveProxyURL
 	// Anti-correlation (leak 03117a8e): OAuth token exchange/refresh must present
 	// the SAME replicated codex-rs (Rust/rustls) ClientHello that serving uses for
 	// the codex outbound path, not a Go-default TLS fingerprint. util.SetProxy is
@@ -84,8 +85,9 @@ func NewCodexAuthWithProxyURL(cfg *config.Config, proxyURL string) *CodexAuth {
 	// per-account proxy. timeout=0 preserves the prior context-governed behavior
 	// (the bare client had no http.Client.Timeout).
 	return &CodexAuth{
-		httpClient: helps.NewOAuthRefreshUtlsHTTPClient(effectiveProxyURL, helps.CodexRustlsClientHelloProfileID, 0),
-		userAgent:  codexOAuthUserAgent,
+		httpClient:        helps.NewOAuthRefreshUtlsHTTPClient(effectiveProxyURL, helps.CodexRustlsClientHelloProfileID, 0),
+		userAgent:         codexOAuthUserAgent,
+		siwcAgentNameHint: agentNameHint,
 	}
 }
 
@@ -201,9 +203,11 @@ func (o *CodexAuth) ExchangeCodeForTokensWithRedirect(ctx context.Context, code,
 
 	accountID := ""
 	email := ""
+	planType := DefaultPlanType
 	if claims != nil {
 		accountID = claims.GetAccountID()
 		email = claims.GetUserEmail()
+		planType = claims.GetPlanType()
 	}
 
 	// Create token data
@@ -213,6 +217,7 @@ func (o *CodexAuth) ExchangeCodeForTokensWithRedirect(ctx context.Context, code,
 		RefreshToken: tokenResp.RefreshToken,
 		AccountID:    accountID,
 		Email:        email,
+		PlanType:     planType,
 		Expire:       time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second).Format(time.RFC3339),
 	}
 
@@ -237,7 +242,9 @@ func (o *CodexAuth) RefreshTokens(ctx context.Context, refreshToken string) (*Co
 	}
 
 	result, err, _ := codexRefreshGroup.Do(refreshToken, func() (interface{}, error) {
-		return o.refreshTokensSingleFlight(context.WithoutCancel(ctx), refreshToken)
+		refreshCtx, cancelRefresh := context.WithTimeout(context.WithoutCancel(ctx), codexRefreshTimeout)
+		defer cancelRefresh()
+		return o.refreshTokensSingleFlight(refreshCtx, refreshToken)
 	})
 	if err != nil {
 		return nil, err
@@ -307,9 +314,11 @@ func (o *CodexAuth) refreshTokensSingleFlight(ctx context.Context, refreshToken 
 
 	accountID := ""
 	email := ""
+	planType := DefaultPlanType
 	if claims != nil {
 		accountID = claims.GetAccountID()
 		email = claims.Email
+		planType = claims.GetPlanType()
 	}
 
 	return &CodexTokenData{
@@ -318,6 +327,7 @@ func (o *CodexAuth) refreshTokensSingleFlight(ctx context.Context, refreshToken 
 		RefreshToken: tokenResp.RefreshToken,
 		AccountID:    accountID,
 		Email:        email,
+		PlanType:     planType,
 		Expire:       time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second).Format(time.RFC3339),
 	}, nil
 }
@@ -325,6 +335,10 @@ func (o *CodexAuth) refreshTokensSingleFlight(ctx context.Context, refreshToken 
 // CreateTokenStorage creates a new CodexTokenStorage from a CodexAuthBundle.
 // It populates the storage struct with token data, user information, and timestamps.
 func (o *CodexAuth) CreateTokenStorage(bundle *CodexAuthBundle) *CodexTokenStorage {
+	planType := DefaultPlanType
+	if bundle != nil && strings.TrimSpace(bundle.TokenData.PlanType) != "" {
+		planType = strings.TrimSpace(bundle.TokenData.PlanType)
+	}
 	storage := &CodexTokenStorage{
 		IDToken:      bundle.TokenData.IDToken,
 		AccessToken:  bundle.TokenData.AccessToken,
@@ -333,6 +347,7 @@ func (o *CodexAuth) CreateTokenStorage(bundle *CodexAuthBundle) *CodexTokenStora
 		LastRefresh:  bundle.LastRefresh,
 		Email:        bundle.TokenData.Email,
 		Expire:       bundle.TokenData.Expire,
+		PlanType:     planType,
 	}
 
 	return storage
@@ -495,6 +510,9 @@ func decodeTokenResponseBody(body []byte, encoding string) ([]byte, error) {
 // UpdateTokenStorage updates an existing CodexTokenStorage with new token data.
 // This is typically called after a successful token refresh to persist the new credentials.
 func (o *CodexAuth) UpdateTokenStorage(storage *CodexTokenStorage, tokenData *CodexTokenData) {
+	if storage == nil || tokenData == nil {
+		return
+	}
 	storage.IDToken = tokenData.IDToken
 	storage.AccessToken = tokenData.AccessToken
 	storage.RefreshToken = tokenData.RefreshToken
@@ -502,4 +520,9 @@ func (o *CodexAuth) UpdateTokenStorage(storage *CodexTokenStorage, tokenData *Co
 	storage.LastRefresh = time.Now().Format(time.RFC3339)
 	storage.Email = tokenData.Email
 	storage.Expire = tokenData.Expire
+	planType := DefaultPlanType
+	if strings.TrimSpace(tokenData.PlanType) != "" {
+		planType = strings.TrimSpace(tokenData.PlanType)
+	}
+	storage.PlanType = planType
 }
