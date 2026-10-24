@@ -9,6 +9,7 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -72,7 +73,7 @@ func TestClaudeGatewayCountKeepsModeAndNativeProfileBoundaries(t *testing.T) {
 	}{
 		{name: "oauth_auto", wantCCH: true},
 		{name: "oauth_never", mode: "never"},
-		{name: "native_auto", native: true},
+		{name: "native_auto", native: true, wantCCH: true},
 		{name: "native_always", native: true, mode: "always", wantCCH: true},
 		{name: "explicit_native_profile", profile: true},
 		{name: "explicit_key_native_profile", profile: true, apiKey: true},
@@ -95,13 +96,26 @@ func TestClaudeGatewayCountKeepsModeAndNativeProfileBoundaries(t *testing.T) {
 			if tc.native {
 				headers = http.Header{"User-Agent": []string{"claude-cli/2.1.211 (external, cli)"}}
 			}
-			body, ua := captureGatewayCountContract(t, cfg, auth, []byte(`{"model":"claude-3-5-sonnet-20241022","system":"PRIVATE_CALLER_RULE","messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}]}`), headers)
+			payload := []byte(`{"model":"claude-3-5-sonnet-20241022","system":"PRIVATE_CALLER_RULE","messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}]}`)
+			if tc.name == "native_auto" {
+				payload, _ = sjson.SetRawBytes(payload, "tools", []byte(`[{"name":"caller_tool","input_schema":{"type":"object"}}]`))
+			}
+			body, ua := captureGatewayCountContract(t, cfg, auth, payload, headers)
 			_, hasCCH := claudeBillingCCHDigitsOffset(body)
 			if hasCCH != tc.wantCCH {
 				t.Fatalf("CCH=%t want %t", hasCCH, tc.wantCCH)
 			}
 			if tc.wantCCH {
-				if bytes.Contains(body, []byte("PRIVATE_CALLER_RULE")) || !bytes.Contains(body, []byte("Use the available tools when needed")) {
+				if tc.name == "native_auto" {
+					for _, field := range []string{"messages", "tools"} {
+						if gjson.GetBytes(body, field).Raw != gjson.GetBytes(payload, field).Raw {
+							t.Fatalf("native auto %s changed", field)
+						}
+					}
+					if !bytes.Contains(body, []byte("PRIVATE_CALLER_RULE")) || bytes.Contains(body, []byte("Use the available tools when needed")) {
+						t.Fatal("native auto whole cloak changed caller body")
+					}
+				} else if bytes.Contains(body, []byte("PRIVATE_CALLER_RULE")) || !bytes.Contains(body, []byte("Use the available tools when needed")) {
 					t.Fatal("OAuth effective neutralization lost")
 				}
 				request, _ := http.NewRequest(http.MethodPost, "http://127.0.0.1", bytes.NewReader(body))

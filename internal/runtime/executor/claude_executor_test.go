@@ -14506,3 +14506,147 @@ func TestPrependToFirstUserMessage_PrependsWhenNoLeadingToolResult(t *testing.T)
 		t.Fatalf("original block should follow, got %q: %s", got, out)
 	}
 }
+
+// Custom Count keeps the fork's billing maintenance independently of body
+// cloaking. Every caller field below has a literal oracle, not a cloak helper.
+func TestClaudeExecutorCountTokens_NativeAutoBillingOwnership(t *testing.T) {
+	cases := []struct {
+		name, provider, baseURL, mode, profile, key string
+		billing                                     bool
+	}{
+		{"custom-auto", "claude", "https://gateway.invalid", "auto", "", "sk-ant-oat-count210", true},
+		{"custom-empty-provider", "", "https://gateway.invalid", "", "", "sk-ant-oat-count210", true},
+		{"custom-api-key", "claude", "https://gateway.invalid", "auto", "", "key-count210", true},
+		{"official-auto", "claude", "https://api.anthropic.com", "auto", "", "sk-ant-oat-count210", false},
+		{"custom-cli-profile", "claude", "https://gateway.invalid", "auto", "claude-code-cli", "sk-ant-oat-count210", false},
+		{"custom-never", "claude", "https://gateway.invalid", "never", "", "sk-ant-oat-count210", false},
+		{"custom-uncloak", "claude", "https://gateway.invalid", "uncloak", "", "sk-ant-oat-count210", false},
+		{"kimi-provider", "kimi", "https://gateway.invalid", "auto", "", "sk-ant-oat-count210", false},
+		{"other-provider", "other", "https://gateway.invalid", "auto", "", "sk-ant-oat-count210", false},
+		{"kimi-origin-empty-provider", "", "https://api.kimi.com", "auto", "", "sk-ant-oat-count210", false},
+	}
+	for _, tc := range cases {
+		for _, stale := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/stale=%v", tc.name, stale), func(t *testing.T) {
+				resetClaudeDeviceProfileCache()
+				t.Cleanup(resetClaudeDeviceProfileCache)
+				var seen []byte
+				var ua string
+				var sinkHits int
+				if tc.name == "official-auto" && !claudeCountSandboxChild(t) {
+					return
+				}
+				transport := roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+					seen, _ = io.ReadAll(r.Body)
+					ua = r.Header.Get("User-Agent")
+					if r.URL.Path != "/v1/messages/count_tokens" {
+						t.Errorf("path=%s", r.URL.Path)
+					}
+					if r.ContentLength != int64(len(seen)) {
+						t.Errorf("ContentLength=%d body=%d", r.ContentLength, len(seen))
+					}
+					if r.GetBody != nil {
+						replay, err := r.GetBody()
+						if err != nil {
+							t.Fatal(err)
+						}
+						again, _ := io.ReadAll(replay)
+						_ = replay.Close()
+						if !bytes.Equal(seen, again) {
+							t.Error("retry body differs from wire body")
+						}
+					}
+					return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(`{"input_tokens":9}`)), Request: r}, nil
+				})
+				var server *httptest.Server
+				if tc.provider == "claude" && tc.name != "official-auto" {
+					server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						if r.Method != "POST" || r.URL.Path != "/v1/messages/count_tokens" {
+							t.Errorf("216 request %s %s", r.Method, r.URL.Path)
+						}
+						seen, _ = io.ReadAll(r.Body)
+						ua = r.Header.Get("User-Agent")
+						sinkHits++
+						if r.ContentLength != int64(len(seen)) {
+							t.Error("wire length mismatch")
+						}
+						if !bytes.Contains(seen, []byte(t.Name())) {
+							t.Error("216 nonce missing")
+						}
+						t.Logf("216 sink request=%d path=%s nonce=%s", sinkHits, r.URL.Path, t.Name())
+						w.Header().Set("Content-Type", "application/json")
+						_, _ = io.WriteString(w, `{"input_tokens":9}`)
+					}))
+					defer server.Close()
+				}
+				ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", http.RoundTripper(transport))
+				stabilize := true
+				cfg := &config.Config{ClaudeHeaderDefaults: config.ClaudeHeaderDefaults{UserAgent: "claude-cli/2.1.70 (external, cli)", PackageVersion: "0.80.0", RuntimeVersion: "v24.5.0", StabilizeDeviceProfile: &stabilize}}
+				auth := &cliproxyauth.Auth{ID: t.Name(), Provider: tc.provider, Attributes: map[string]string{"api_key": tc.key, "base_url": tc.baseURL, "cloak_mode": tc.mode, "fingerprint_profile": tc.profile}, Metadata: claudeOAuthTestMetadata()}
+				if server != nil {
+					auth.ProxyURL = "direct"
+					auth.Attributes["base_url"] = server.URL
+				}
+				payload := []byte(`{"model":"claude-sonnet-4-6","system":[{"type":"text","text":"CALLER guidance stays top-level"}],"messages":[{"role":"user","content":[{"type":"text","text":"CALLER message stays literal"}]}],"tools":[{"name":"search_web","description":"CALLER tool","input_schema":{"type":"object"}}]}`)
+				payload, _ = sjson.SetBytes(payload, "messages.0.content.0.text", "CALLER message stays literal|"+t.Name())
+				if stale {
+					payload, _ = sjson.SetRawBytes(payload, "system", []byte(`[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.63.abc; cc_entrypoint=cli; cch=12345; cc_prompt_id=caller-tag;"},{"type":"text","text":"CALLER guidance stays top-level"}]`))
+				}
+				headers := http.Header{"User-Agent": []string{"claude-cli/2.1.85 (external, cli)"}, "X-Stainless-Package-Version": []string{"0.81.0"}, "X-Stainless-Runtime-Version": []string{"v24.6.0"}}
+				var err error
+				if tc.name == "official-auto" {
+					seen, ua = countReview216Official(t, payload, cfg, auth, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatClaude, Headers: headers})
+				} else {
+					_, err = NewClaudeExecutor(cfg).CountTokens(ctx, auth, cliproxyexecutor.Request{Model: "claude-sonnet-4-6", Payload: payload}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatClaude, Headers: headers})
+				}
+
+				if err != nil {
+					t.Fatal(err)
+				}
+				if server != nil && sinkHits != 1 {
+					t.Fatalf("216 sink hits=%d want1", sinkHits)
+				}
+				for _, field := range []string{"messages", "tools"} {
+					if got, want := gjson.GetBytes(seen, field).Raw, gjson.GetBytes(payload, field).Raw; got != want {
+						t.Fatalf("%s moved/rewritten: got %s want %s", field, got, want)
+					}
+				}
+				if strings.Count(string(seen), "CALLER guidance stays top-level") != 1 {
+					t.Fatalf("caller system lost/duplicated: %s", seen)
+				}
+				if !strings.Contains(gjson.GetBytes(seen, "system").Raw, "CALLER guidance stays top-level") {
+					t.Fatalf("caller system relocated: %s", seen)
+				}
+				if bytes.Contains(seen, []byte("You are Claude Code")) || bytes.Contains(seen, []byte("currentDate")) {
+					t.Fatalf("full cloak leaked: %s", seen)
+				}
+				billing := gjson.GetBytes(seen, "system.0.text").String()
+				if tc.billing {
+					if ua != "claude-cli/2.1.85 (external, cli)" {
+						t.Fatalf("UA=%q", ua)
+					}
+					if got := billingVersionFromBody(t, seen); got != "2.1.85" {
+						t.Fatalf("billing=%q want 2.1.85", got)
+					}
+					if stale && !strings.Contains(billing, "cc_prompt_id=caller-tag;") {
+						t.Fatalf("caller billing tag lost: %s", billing)
+					}
+					if tc.key == "sk-ant-oat-count210" {
+						cch := cchFromBody(t, seen)
+						unsigned := bytes.Replace(seen, []byte("cch="+cch+";"), []byte("cch=00000;"), 1)
+						want := fmt.Sprintf("%05x", xxHash64.Checksum(unsigned, 0x6E52736AC806831E)&0xFFFFF)
+						if cch != want || cch == "00000" {
+							t.Fatalf("final-byte CCH=%s want=%s", cch, want)
+						}
+					}
+				} else if stale && (tc.name == "custom-never" || tc.name == "custom-uncloak" || tc.name == "kimi-origin-empty-provider") {
+					if got := billingVersionFromBody(t, seen); got != "2.1.63" {
+						t.Fatalf("excluded mode/origin billing=%q want original 2.1.63", got)
+					}
+				} else if strings.HasPrefix(billing, "x-anthropic-billing-header:") {
+					t.Fatalf("excluded native shape gained billing: %s", seen)
+				}
+			})
+		}
+	}
+}

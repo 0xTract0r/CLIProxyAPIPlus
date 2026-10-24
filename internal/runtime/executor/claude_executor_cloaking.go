@@ -1633,6 +1633,7 @@ type claudeWirePolicy struct {
 	Cloak                bool
 	Uncloak              bool
 	ExplicitNever        bool
+	AutoMode             bool // resolved mode, independent of native body passthrough
 }
 
 type claudeCloakSettings struct {
@@ -1782,6 +1783,7 @@ func resolveClaudeWirePolicy(cfg *config.Config, auth *cliproxyauth.Auth, apiKey
 		Cloak:                helps.ShouldCloak(trimmedMode, userAgent),
 		Uncloak:              uncloak,
 		ExplicitNever:        trimmedMode == "never",
+		AutoMode:             trimmedMode == "auto" || trimmedMode == "",
 	}
 	if trimmedMode == "uncloak" {
 		policy.Cloak = false

@@ -213,6 +213,11 @@ func (e *ClaudeExecutor) countTokensUpstream(ctx context.Context, auth *cliproxy
 		claudeFingerprintProfileFromConfig(e.cfg, auth) == claudeFingerprintProfileDefault
 	policy, settings := resolveClaudeWirePolicy(e.cfg, auth, apiKey, confirmedClaudeCode, helps.HeaderValueCaseInsensitive(incomingHeaders, "User-Agent"))
 	cloaked := policy.Cloak
+	// F custom Count maintained billing even when auto skipped body cloaking.
+	// Preserve the native shape on first-party/delegated/profile paths and keep
+	// explicit never/uncloak independent of the caller's native UA.
+	maintainNativeCountBilling := customClaudeCount && !isKimiAPIEndpoint(baseURL) &&
+		policy.AutoMode && !cloaked && !strings.HasPrefix(baseModel, "claude-3-5-haiku")
 	explicitCacheMode := isExplicitPromptCacheMode(originalPayload, req.Payload, body)
 	useCCHSigning := customClaudeCount && (policy.OAuth || experimentalCCHSigningEnabled(e.cfg, auth))
 	if customClaudeCount {
@@ -307,6 +312,37 @@ func (e *ClaudeExecutor) countTokensUpstream(ctx context.Context, auth *cliproxy
 	}
 	if errHeaders := applyClaudeHeaders(httpReq, auth, apiKey, false, extraBetas, body, e.cfg, incomingHeaders, confirmedClaudeCode && !cloaked, claudeSessionID); errHeaders != nil {
 		return cliproxyexecutor.Response{}, errHeaders
+	}
+	if maintainNativeCountBilling {
+		// Identity and payload rules have already run. Billing follows the actual
+		// outgoing UA; the compatibility SHA sees the body before this insertion.
+		version, ok := helps.ClaudeVersionFromUserAgent(httpReq.Header.Get("User-Agent"))
+		if !ok {
+			version = resolveClaudeBillingVersion(ctx, e.cfg, auth, apiKey)
+		}
+		legacyCCH := ""
+		if !useCCHSigning {
+			legacyCCH = claudeLegacyCountPayloadCCH(body, settings.strictMode)
+		}
+		fallback := claudeCCHFallbackBillingHeader(ctx, e.cfg, body, parseEntrypointFromUA(e.cfg, httpReq.Header.Get("User-Agent")), version)
+		body, err = ensureClaudeBillingHeaderCCHPlaceholder(body, fallback)
+		if err != nil {
+			return cliproxyexecutor.Response{}, fmt.Errorf("maintain Claude count billing: %w", err)
+		}
+		body = alignClaudeCloakedBillingBuild(body, version)
+		if legacyCCH != "" {
+			if offset, found := claudeBillingCCHDigitsOffset(body); found {
+				body = bytes.Clone(body)
+				copy(body[offset:offset+5], legacyCCH)
+			}
+		}
+		_ = httpReq.Body.Close()
+		httpReq.Body = io.NopCloser(bytes.NewReader(body))
+		httpReq.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(body)), nil }
+		httpReq.ContentLength = int64(len(body))
+		if httpReq.Header.Get("Content-Length") != "" {
+			httpReq.Header.Set("Content-Length", fmt.Sprint(len(body)))
+		}
 	}
 	// 最后payload规则与出站UA确定后签名；request Body/GetBody/长度及日志共用最终字节。
 	if useCCHSigning {
