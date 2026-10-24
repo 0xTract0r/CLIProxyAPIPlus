@@ -76,7 +76,7 @@ func TestCodexDuplexInitialFailure(t *testing.T) {
 				exec := NewCodexWebsocketsExecutor(cfg)
 				exec.store = &codexWebsocketSessionStore{sessions: make(map[string]*codexWebsocketSession)}
 				model := "duplex-initial-failure-model"
-				bad := &auth.Auth{ID: "duplex-initial-bad", Provider: "codex", Status: auth.StatusActive, Attributes: map[string]string{
+				bad := &auth.Auth{ProxyURL: "direct", ID: "duplex-initial-bad", Provider: "codex", Status: auth.StatusActive, Attributes: map[string]string{
 					"api_key": "bad-key", "base_url": upstream.URL, "websockets": "true", "priority": "4",
 				}}
 				req := core.Request{Model: model, Payload: []byte(`{"model":"duplex-initial-failure-model","input":[]}`)}
@@ -127,7 +127,7 @@ func TestCodexDuplexInitialFailure(t *testing.T) {
 					manager.SetConfig(cfg)
 					manager.SetRetryConfig(3, 30*time.Second, 0)
 					manager.RegisterExecutor(exec)
-					good := &auth.Auth{ID: "duplex-initial-good", Provider: "codex", Status: auth.StatusActive, Attributes: map[string]string{
+					good := &auth.Auth{ProxyURL: "direct", ID: "duplex-initial-good", Provider: "codex", Status: auth.StatusActive, Attributes: map[string]string{
 						"api_key": "good-key", "base_url": upstream.URL, "websockets": "true", "priority": "3",
 					}}
 					for _, candidate := range []*auth.Auth{bad, good} {

@@ -66,20 +66,21 @@ func TestCodexExecutorRoutingHintCarriesRequestedTier(t *testing.T) {
 	const aliasedClaude = `{"model":"client-alias","max_tokens":64,"speed":"fast","messages":[{"role":"user","content":"hi"}]}`
 
 	cases := []struct {
-		name     string
-		apiKey   bool
-		stream   bool
-		model    string
-		payload  string
-		wantHint string
-		wantTier string
+		name        string
+		fastEnabled bool
+		apiKey      bool
+		stream      bool
+		model       string
+		payload     string
+		wantHint    string
+		wantTier    string
 	}{
-		{name: "oauth stream fast", stream: true, payload: fastClaude, wantHint: "model=gpt-5.5;tier=priority", wantTier: "priority"},
-		{name: "oauth non-stream fast", stream: false, payload: fastClaude, wantHint: "model=gpt-5.5;tier=priority", wantTier: "priority"},
-		{name: "oauth stream alias and thinking suffix", stream: true, model: "gpt-5.5(low)", payload: aliasedClaude, wantHint: "model=gpt-5.5;tier=priority", wantTier: "priority"},
-		{name: "oauth non-stream alias and thinking suffix", model: "gpt-5.5(low)", payload: aliasedClaude, wantHint: "model=gpt-5.5;tier=priority", wantTier: "priority"},
+		{fastEnabled: true, name: "oauth stream fast", stream: true, payload: fastClaude, wantHint: "model=gpt-5.5;tier=priority", wantTier: "priority"},
+		{fastEnabled: true, name: "oauth non-stream fast", stream: false, payload: fastClaude, wantHint: "model=gpt-5.5;tier=priority", wantTier: "priority"},
+		{fastEnabled: true, name: "oauth stream alias and thinking suffix", stream: true, model: "gpt-5.5(low)", payload: aliasedClaude, wantHint: "model=gpt-5.5;tier=priority", wantTier: "priority"},
+		{fastEnabled: true, name: "oauth non-stream alias and thinking suffix", model: "gpt-5.5(low)", payload: aliasedClaude, wantHint: "model=gpt-5.5;tier=priority", wantTier: "priority"},
 		{name: "oauth stream standard", stream: true, payload: plainClaude, wantHint: "model=gpt-5.5"},
-		{name: "api key keeps body tier without hint", apiKey: true, stream: true, payload: fastClaude, wantTier: "priority"},
+		{fastEnabled: true, name: "api key keeps body tier without hint", apiKey: true, stream: true, payload: fastClaude, wantTier: "priority"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -90,6 +91,11 @@ func TestCodexExecutorRoutingHintCarriesRequestedTier(t *testing.T) {
 			auth := codexOAuthTestAuth(server.URL)
 			if tc.apiKey {
 				auth = codexAPIKeyTestAuth(server.URL)
+			}
+			auth.ProxyURL = "direct"
+			// Fork Fast按账号/模型显式启用；standard用例保持默认关闭。
+			if tc.fastEnabled {
+				auth.Attributes["fast_models"] = "gpt-5.5"
 			}
 			executor := NewCodexExecutor(&config.Config{})
 			model := tc.model
@@ -140,7 +146,9 @@ func TestCodexExecutorCompactRoutingHintCarriesRequestedTier(t *testing.T) {
 	defer server.Close()
 
 	executor := NewCodexExecutor(&config.Config{})
-	_, err := executor.Execute(context.Background(), codexOAuthTestAuth(server.URL), cliproxyexecutor.Request{
+	auth := codexOAuthTestAuth(server.URL)
+	auth.ProxyURL = "direct"
+	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
 		Model:   "gpt-5.5(low)",
 		Payload: []byte(`{"model":"client-alias","service_tier":"priority","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}`),
 	}, cliproxyexecutor.Options{
@@ -170,6 +178,7 @@ func TestCodexExecutorOperatorRoutingHintRuleWins(t *testing.T) {
 	defer server.Close()
 
 	auth := codexOAuthTestAuth(server.URL)
+	auth.ProxyURL = "direct"
 	auth.Attributes["header:X-Codex-Routing-Hint"] = "model=operator-pinned"
 	clientHeaders := http.Header{}
 	clientHeaders.Set(codexRoutingHintHeader, "model=gpt-5.4-client")
@@ -250,4 +259,23 @@ func TestApplyCodexRoutingHint(t *testing.T) {
 			t.Fatalf("routing hint = %q, want %q", got, "model=gpt-5.5")
 		}
 	})
+}
+
+// 固定F的gate/policy实现与当前函数逐字相同；此fixture守护默认关和显式开。
+func TestRoutingHintFixtureForkFastOracle(t *testing.T) {
+	auth := codexOAuthTestAuth("")
+	if codexFastEnabled(auth, "gpt-5.5") {
+		t.Fatal("fork Fast default must remain off")
+	}
+	body := []byte(`{"service_tier":"priority"}`)
+	if got := gjson.GetBytes(applyCodexServiceTierPolicy(body, codexFastEnabled(auth, "gpt-5.5")), "service_tier").String(); got != "default" {
+		t.Fatalf("disabled tier=%q", got)
+	}
+	auth.Attributes["fast_models"] = "gpt-5.5"
+	if !codexFastEnabled(auth, "gpt-5.5") || codexFastEnabled(auth, "gpt-other") {
+		t.Fatal("explicit per-model gate changed")
+	}
+	if got := gjson.GetBytes(applyCodexServiceTierPolicy(body, codexFastEnabled(auth, "gpt-5.5")), "service_tier").String(); got != "priority" {
+		t.Fatalf("enabled tier=%q", got)
+	}
 }

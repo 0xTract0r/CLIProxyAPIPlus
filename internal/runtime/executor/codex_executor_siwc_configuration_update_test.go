@@ -185,7 +185,9 @@ func TestCodexExecutorUseSIWCStripsConfigurationUpdatesBeforePayloadFinalizer(t 
 			defer server.Close()
 
 			executor := NewCodexExecutor(tc.cfg)
-			_, err := executor.Execute(context.Background(), codexSIWCAuthForUpdateTest(server.URL), cliproxyexecutor.Request{
+			auth := codexSIWCAuthForUpdateTest(server.URL)
+			auth.ProxyURL = "direct"
+			_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
 				Model:   "gpt-6-astra",
 				Payload: []byte(codexSIWCUpdatePayload),
 			}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai-response")})
@@ -208,7 +210,9 @@ func TestCodexExecutorCompactUseSIWCStripsConfigurationUpdates(t *testing.T) {
 	defer server.Close()
 
 	executor := NewCodexExecutor(&config.Config{})
-	_, err := executor.Execute(context.Background(), codexSIWCAuthForUpdateTest(server.URL), cliproxyexecutor.Request{
+	auth := codexSIWCAuthForUpdateTest(server.URL)
+	auth.ProxyURL = "direct"
+	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
 		Model:   "gpt-6-astra",
 		Payload: []byte(codexSIWCUpdatePayload),
 	}, cliproxyexecutor.Options{
@@ -245,7 +249,9 @@ func TestCodexWebsocketsExecuteUseSIWCStripsConfigurationUpdates(t *testing.T) {
 	defer server.Close()
 
 	executor := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
-	_, err := executor.Execute(context.Background(), codexSIWCAuthForUpdateTest(server.URL), cliproxyexecutor.Request{
+	auth := codexSIWCAuthForUpdateTest(server.URL)
+	auth.ProxyURL = "direct"
+	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
 		Model:   "gpt-6-astra",
 		Payload: []byte(codexSIWCUpdatePayload),
 	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai-response")})
@@ -278,7 +284,9 @@ func TestCodexExecutorUseSIWCKeepsSuffixEffortOverConfigurationUpdate(t *testing
 	// override into the top-level effort. The SIWC strip must keep that
 	// suffix intent instead of resurrecting the last configuration_update.
 	executor := NewCodexExecutor(&config.Config{})
-	_, err := executor.Execute(context.Background(), codexSIWCAuthForUpdateTest(server.URL), cliproxyexecutor.Request{
+	auth := codexSIWCAuthForUpdateTest(server.URL)
+	auth.ProxyURL = "direct"
+	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
 		Model:   "gpt-6-astra(xhigh)",
 		Payload: []byte(codexSIWCUpdatePayload),
 	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai-response")})
@@ -299,7 +307,9 @@ func TestCodexExecutorExecuteStreamUseSIWCStripsConfigurationUpdates(t *testing.
 	defer server.Close()
 
 	executor := NewCodexExecutor(&config.Config{})
-	result, err := executor.ExecuteStream(context.Background(), codexSIWCAuthForUpdateTest(server.URL), cliproxyexecutor.Request{
+	auth := codexSIWCAuthForUpdateTest(server.URL)
+	auth.ProxyURL = "direct"
+	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
 		Model:   "gpt-6-astra",
 		Payload: []byte(codexSIWCUpdatePayload),
 	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai-response")})
@@ -337,7 +347,9 @@ func TestCodexExecutorUseSIWCInvalidSuffixPromotesConfigurationUpdate(t *testing
 	defer server.Close()
 
 	executor := NewCodexExecutor(&config.Config{})
-	_, err := executor.Execute(context.Background(), codexSIWCAuthForUpdateTest(server.URL), cliproxyexecutor.Request{
+	auth := codexSIWCAuthForUpdateTest(server.URL)
+	auth.ProxyURL = "direct"
+	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
 		Model:   "gpt-6-astra(invalid)",
 		Payload: []byte(codexSIWCUpdatePayload),
 	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai-response")})
@@ -358,7 +370,9 @@ func TestCodexExecutorWithoutSIWCKeepsConfigurationUpdates(t *testing.T) {
 	defer server.Close()
 
 	executor := NewCodexExecutor(&config.Config{})
-	_, err := executor.Execute(context.Background(), codexOAuthTestAuth(server.URL), cliproxyexecutor.Request{
+	auth := codexOAuthTestAuth(server.URL)
+	auth.ProxyURL = "direct"
+	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
 		Model:   "gpt-6-astra",
 		Payload: []byte(codexSIWCUpdatePayload),
 	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai-response")})
