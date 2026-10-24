@@ -33,6 +33,12 @@ func TestClientDecoratorsPreserveProtectedAndProxyTransports(t *testing.T) {
 					return &observingTransport{RoundTripper: next}
 				})
 				auth := &coreauth.Auth{ProxyURL: proxy}
+				if proxy == "" {
+					auth.ProxyURL = "direct"
+					if factory == "plain" {
+						auth = nil
+					}
+				}
 				cfg := &config.Config{}
 
 				var c *http.Client
@@ -42,12 +48,30 @@ func TestClientDecoratorsPreserveProtectedAndProxyTransports(t *testing.T) {
 					c = NewUtlsHTTPClient(ctx, cfg, auth, 0)
 					plain = NewUtlsHTTPClient(context.Background(), cfg, auth, 0)
 					rt, ok := selected.(*fallbackRoundTripper)
-					if !ok || rt.anthropic == nil || rt.chrome == nil || rt.fallback == nil {
+					if !ok || rt.anthropic == nil || rt.utls == nil || rt.fallback == nil {
 						t.Fatalf("lost TLS profiles: %#v", selected)
 					}
 					plainRT, ok := plain.Transport.(*fallbackRoundTripper)
 					if !ok || plainRT.anthropic != rt.anthropic {
 						t.Fatal("Anthropic cached transport identity changed under decoration")
+					}
+					// 路由探针只替换局部副本，不触及缓存或真实网络。
+					routes := *rt
+					for _, target := range []struct {
+						url  string
+						want string
+					}{{"https://api.anthropic.com/v1/messages", "anthropic"}, {"https://chatgpt.com/backend-api/codex/responses", "utls"}, {"https://unprotected.invalid/v1", "fallback"}} {
+						hit := ""
+						routes.anthropic = decoratorRoutingProbe{hit: &hit, name: "anthropic"}
+						routes.utls = decoratorRoutingProbe{hit: &hit, name: "utls"}
+						routes.fallback = decoratorRoutingProbe{hit: &hit, name: "fallback"}
+						request, _ := http.NewRequest(http.MethodGet, target.url, nil)
+						probeClient := &http.Client{Transport: &observingTransport{RoundTripper: &routes}}
+						response, err := probeClient.Do(request)
+						if err != nil || response.StatusCode != http.StatusNoContent || hit != target.want {
+							t.Fatal("decorator changed selected protected/fallback route")
+						}
+						response.Body.Close()
 					}
 				case "devin":
 					c = NewDevinHTTPClient(ctx, cfg, auth, 0)
@@ -87,6 +111,33 @@ func TestClientDecoratorsPreserveProtectedAndProxyTransports(t *testing.T) {
 		}
 	}
 
+	t.Run("explicit_direct_account_and_empty_account_guard", func(t *testing.T) {
+		var selected http.RoundTripper
+		ctx := httptransport.WithDecorator(context.Background(), func(next http.RoundTripper) http.RoundTripper {
+			selected = next
+			return &observingTransport{RoundTripper: next}
+		})
+		direct := NewProxyAwareHTTPClient(ctx, &config.Config{}, &coreauth.Auth{ProxyURL: "direct"}, 0)
+		tr, ok := selected.(*http.Transport)
+		if !ok || selected == http.DefaultTransport {
+			t.Fatal("explicit direct account must select its own transport")
+		}
+		req, _ := http.NewRequest(http.MethodGet, "http://example.invalid/", nil)
+		if tr.Proxy != nil {
+			proxy, err := tr.Proxy(req)
+			if err != nil || proxy != nil {
+				t.Fatal("explicit direct account unexpectedly uses proxy")
+			}
+		}
+		wrapped, ok := direct.Transport.(*observingTransport)
+		if !ok || wrapped.RoundTripper != selected {
+			t.Fatal("direct decorator replaced selected transport")
+		}
+		blocked := NewProxyAwareHTTPClient(context.Background(), &config.Config{}, &coreauth.Auth{}, 0)
+		if _, ok := blocked.Transport.(blockingRoundTripper); !ok {
+			t.Fatalf("empty account proxy must fail closed, got %T", blocked.Transport)
+		}
+	})
 	t.Run("request_proxy_override_with_decorator", func(t *testing.T) {
 		var selected http.RoundTripper
 		ctx := coreexecutor.WithRequestProxyURL(context.Background(), "http://127.0.0.1:18081")
@@ -210,4 +261,14 @@ func TestClientDecoratorContextIsolationAndStreamLifecycle(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+type decoratorRoutingProbe struct {
+	hit  *string
+	name string
+}
+
+func (p decoratorRoutingProbe) RoundTrip(r *http.Request) (*http.Response, error) {
+	*p.hit = p.name
+	return &http.Response{StatusCode: http.StatusNoContent, Body: http.NoBody, Header: make(http.Header), Request: r}, nil
 }

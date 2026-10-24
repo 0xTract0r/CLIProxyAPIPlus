@@ -399,6 +399,8 @@ func TestDetectClaudeCodeRequestRejectsNearMissHaikuHelpers(t *testing.T) {
 }
 
 func TestDetectClaudeCodeRequestRejectsMalformedNativeSignals(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.ClaudeHeaderDefaults.UserAgent = "claude-cli/2.1.280 (external, cli)"
 	tests := []struct {
 		name    string
 		headers http.Header
@@ -416,7 +418,7 @@ func TestDetectClaudeCodeRequestRejectsMalformedNativeSignals(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if detection := DetectClaudeCodeRequest(test.headers, claudeCodeDetectionPayload(test.userID), false); detection.Confirmed {
+			if detection := DetectClaudeCodeRequest(test.headers, claudeCodeDetectionPayload(test.userID), false, cfg); detection.Confirmed {
 				t.Fatalf("detection = %#v, want malformed signal to use local profile", detection)
 			}
 		})
