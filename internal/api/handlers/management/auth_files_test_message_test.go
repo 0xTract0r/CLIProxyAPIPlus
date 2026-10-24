@@ -145,8 +145,9 @@ func TestTestAuthFileMessageUsesProviderDefaultModelWhenNoRegisteredModel(t *tes
 	if executor.authID != "codex-no-model.json" {
 		t.Fatalf("executor authID = %q, want codex-no-model.json", executor.authID)
 	}
-	if executor.model != "gpt-5.4-mini" {
-		t.Fatalf("executor model = %q, want gpt-5.4-mini", executor.model)
+	// 上游31ec4362已从固定目录移除5.4/mini；本例继续严格核现有provider默认。
+	if executor.model != "gpt-5.2" {
+		t.Fatalf("executor model = %q, want gpt-5.2", executor.model)
 	}
 }
 
