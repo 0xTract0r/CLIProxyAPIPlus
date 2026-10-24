@@ -1603,7 +1603,7 @@ func TestEndToEndAuthFileReplacement_RestoresModelsInV1ModelsWithoutRestart(t *t
 
 	// Synthetic JWT containing CodexAuthInfo claims with chatgpt_plan_type: team
 	teamIDToken := "eyJhbGciOiJub25lIn0.eyJlbWFpbCI6ICJ1c2VyQGV4YW1wbGUuY29tIiwgImh0dHBzOi8vYXBpLm9wZW5haS5jb20vYXV0aCI6IHsiY2hhdGdwdF9wbGFuX3R5cGUiOiAidGVhbSIsICJjaGF0Z3B0X2FjY291bnRfaWQiOiAiYWNjLTEyMyJ9fQ.sig"
-	initialContent := fmt.Sprintf(`{"type":"codex","email":"user@example.com","access_token":"token-old","id_token":%q}`, teamIDToken)
+	initialContent := fmt.Sprintf(`{"type":"codex","proxy_url":"direct","email":"user@example.com","access_token":"token-old","refresh_token":"refresh-old","id_token":%q}`, teamIDToken)
 	if errWrite := os.WriteFile(filePath, []byte(initialContent), 0o600); errWrite != nil {
 		t.Fatalf("write auth file: %v", errWrite)
 	}
@@ -1637,6 +1637,11 @@ func TestEndToEndAuthFileReplacement_RestoresModelsInV1ModelsWithoutRestart(t *t
 		t.Fatalf("Build() failed: %v", errBuild)
 	}
 
+	t.Cleanup(func() {
+		service.coreManager.Remove(context.Background(), authID)
+		reg.UnregisterClient(authID)
+	})
+
 	server := api.NewServer(service.cfg, service.coreManager, service.accessManager, service.configPath, service.serverOptions...)
 	if server == nil {
 		t.Fatal("NewServer() returned nil")
@@ -1645,15 +1650,18 @@ func TestEndToEndAuthFileReplacement_RestoresModelsInV1ModelsWithoutRestart(t *t
 	service.coreManager.RegisterExecutor(&syncTestExecutor{})
 
 	auth := &coreauth.Auth{
+		ProxyURL: "direct",
 		ID:       authID,
 		FileName: fileName,
 		Provider: "codex",
 		Status:   coreauth.StatusActive,
 		Metadata: map[string]any{
-			"type":         "codex",
-			"email":        "user@example.com",
-			"access_token": "token-old",
-			"id_token":     teamIDToken,
+			"type":          "codex",
+			"email":         "user@example.com",
+			"access_token":  "token-old",
+			"refresh_token": "refresh-old",
+			"proxy_url":     "direct",
+			"id_token":      teamIDToken,
 		},
 		Attributes: map[string]string{
 			"plan_type": "team",
@@ -1729,8 +1737,10 @@ func TestEndToEndAuthFileReplacement_RestoresModelsInV1ModelsWithoutRestart(t *t
 		}
 	}
 
+	beforeUpload, _ := service.coreManager.GetByID(authID)
+
 	// 3. Replace credential via management upload (POST /v0/management/auth-files)
-	newContent := fmt.Sprintf(`{"type":"codex","email":"user@example.com","access_token":"token-new","id_token":%q}`, teamIDToken)
+	newContent := fmt.Sprintf(`{"type":"codex","proxy_url":"direct","email":"user@example.com","access_token":"token-new","refresh_token":"refresh-new","id_token":%q}`, teamIDToken)
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
 	part, err := writer.CreateFormFile("file", fileName)
@@ -1751,6 +1761,22 @@ func TestEndToEndAuthFileReplacement_RestoresModelsInV1ModelsWithoutRestart(t *t
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("upload failed: status=%d, body=%s", rec.Code, rec.Body.String())
+	}
+
+	live, _ := service.coreManager.GetByID(authID)
+	if live == nil || live.AutoQuarantined || live.Unavailable || live.RegistrationEpoch <= beforeUpload.RegistrationEpoch || live.CredentialVersion <= beforeUpload.CredentialVersion || live.Index != beforeUpload.Index || !live.CreatedAt.Equal(beforeUpload.CreatedAt) {
+		t.Fatal("full upload did not publish a fresh registration preserving account identity")
+	}
+	persisted, errRead := os.ReadFile(filePath)
+	if errRead != nil {
+		t.Fatal(errRead)
+	}
+	var disk map[string]any
+	if errDecode := json.Unmarshal(persisted, &disk); errDecode != nil {
+		t.Fatal(errDecode)
+	}
+	if disk["access_token"] != "token-new" || disk["refresh_token"] != "refresh-new" || live.Metadata["access_token"] != disk["access_token"] {
+		t.Fatal("full upload disk/runtime credential mismatch")
 	}
 
 	// 4. Verify that GET /v1/models immediately includes all team models without restart
@@ -1776,12 +1802,20 @@ func TestEndToEndAuthFileReplacement_RestoresModelsInV1ModelsWithoutRestart(t *t
 }
 
 func TestEndToEndAuthFilePatch_RestoresModelsInV1ModelsWithoutRestart(t *testing.T) {
+	testEndToEndAuthFilePatchRecovery(t, true)
+}
+
+func TestEndToEndAuthFilePartialPatchPreservesQuarantine(t *testing.T) {
+	testEndToEndAuthFilePatchRecovery(t, false)
+}
+
+func testEndToEndAuthFilePatchRecovery(t *testing.T, expectRecovery bool) {
 	authDir := t.TempDir()
 	fileName := "codex-patch.json"
 	filePath := filepath.Join(authDir, fileName)
 
 	teamIDToken := "eyJhbGciOiJub25lIn0.eyJlbWFpbCI6ICJ1c2VyQGV4YW1wbGUuY29tIiwgImh0dHBzOi8vYXBpLm9wZW5haS5jb20vYXV0aCI6IHsiY2hhdGdwdF9wbGFuX3R5cGUiOiAidGVhbSIsICJjaGF0Z3B0X2FjY291bnRfaWQiOiAiYWNjLTEyMyJ9fQ.sig"
-	initialContent := fmt.Sprintf(`{"type":"codex","email":"user@example.com","access_token":"token-old","id_token":%q}`, teamIDToken)
+	initialContent := fmt.Sprintf(`{"type":"codex","proxy_url":"direct","email":"user@example.com","access_token":"token-old","refresh_token":"refresh-old","id_token":%q}`, teamIDToken)
 	if errWrite := os.WriteFile(filePath, []byte(initialContent), 0o600); errWrite != nil {
 		t.Fatalf("write auth file: %v", errWrite)
 	}
@@ -1815,6 +1849,11 @@ func TestEndToEndAuthFilePatch_RestoresModelsInV1ModelsWithoutRestart(t *testing
 		t.Fatalf("Build() failed: %v", errBuild)
 	}
 
+	t.Cleanup(func() {
+		service.coreManager.Remove(context.Background(), authID)
+		reg.UnregisterClient(authID)
+	})
+
 	server := api.NewServer(service.cfg, service.coreManager, service.accessManager, service.configPath, service.serverOptions...)
 	if server == nil {
 		t.Fatal("NewServer() returned nil")
@@ -1823,15 +1862,18 @@ func TestEndToEndAuthFilePatch_RestoresModelsInV1ModelsWithoutRestart(t *testing
 	service.coreManager.RegisterExecutor(&syncTestExecutor{})
 
 	auth := &coreauth.Auth{
+		ProxyURL: "direct",
 		ID:       authID,
 		FileName: fileName,
 		Provider: "codex",
 		Status:   coreauth.StatusActive,
 		Metadata: map[string]any{
-			"type":         "codex",
-			"email":        "user@example.com",
-			"access_token": "token-old",
-			"id_token":     teamIDToken,
+			"type":          "codex",
+			"email":         "user@example.com",
+			"access_token":  "token-old",
+			"refresh_token": "refresh-old",
+			"proxy_url":     "direct",
+			"id_token":      teamIDToken,
 		},
 		Attributes: map[string]string{
 			"plan_type": "team",
@@ -1889,6 +1931,8 @@ func TestEndToEndAuthFilePatch_RestoresModelsInV1ModelsWithoutRestart(t *testing
 		}
 	}
 
+	beforePatch, _ := service.coreManager.GetByID(authID)
+
 	// 2. Patch auth file fields with fresh access token
 	patchBody := fmt.Sprintf(`{"name":%q,"access_token":"token-fresh","id_token":%q}`, fileName, teamIDToken)
 	rec = httptest.NewRecorder()
@@ -1898,6 +1942,45 @@ func TestEndToEndAuthFilePatch_RestoresModelsInV1ModelsWithoutRestart(t *testing
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("PATCH fields failed: status=%d, body=%s", rec.Code, rec.Body.String())
+	}
+
+	if !expectRecovery {
+		live, _ := service.coreManager.GetByID(authID)
+		if live == nil || !live.AutoQuarantined || !live.Unavailable || live.Status == coreauth.StatusActive || live.RegistrationEpoch != beforePatch.RegistrationEpoch {
+			t.Fatal("partial credential patch released recovery state")
+		}
+		persisted, errRead := os.ReadFile(filePath)
+		if errRead != nil {
+			t.Fatal(errRead)
+		}
+		var disk map[string]any
+		if errDecode := json.Unmarshal(persisted, &disk); errDecode != nil {
+			t.Fatal(errDecode)
+		}
+		for _, key := range []string{"access_token", "refresh_token", "id_token"} {
+			if disk[key] != live.Metadata[key] || disk[key] != beforePatch.Metadata[key] {
+				t.Fatalf("partial patch changed protected credential field %s", key)
+			}
+		}
+		if quarantined, _ := disk["auto_quarantined"].(bool); !quarantined {
+			t.Fatal("partial patch lost persisted quarantine")
+		}
+		rec = httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+		modelsResp.Data = nil
+		if errDecode := json.Unmarshal(rec.Body.Bytes(), &modelsResp); errDecode != nil {
+			t.Fatal(errDecode)
+		}
+		for _, m := range teamModels {
+			if hasModel(m) {
+				t.Fatalf("partial patch advertised quarantined model %q", m)
+			}
+		}
+		service.coreManager.RegisterExecutor(&syncTestExecutor{})
+		if _, errExecute := service.coreManager.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: "gpt-6-astra"}, cliproxyexecutor.Options{}); errExecute == nil {
+			t.Fatal("partial patch executed quarantined credential")
+		}
+		return
 	}
 
 	// 3. Confirm all team models are restored in /v1/models

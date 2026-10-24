@@ -297,6 +297,20 @@ func (h *Handler) writeAuthFile(ctx context.Context, name string, data []byte) e
 	}
 	release := h.beginSIWCFileMutation(ctx, dst)
 	defer release()
+	if coreauth.IsCodexAuthRecord(auth) {
+		if existing, ok := h.authManager.GetByID(auth.ID); ok {
+			accessToken, _ := auth.Metadata["access_token"].(string)
+			idToken, _ := auth.Metadata["id_token"].(string)
+			if strings.TrimSpace(accessToken) != "" && strings.TrimSpace(idToken) != "" && coreauth.LoginReplacesOAuthCredentials(auth.Metadata, existing.Metadata) {
+				if !uploadedCodexRecoveryIdentityMatches(existing, auth) {
+					return fmt.Errorf("%w: uploaded credentials do not establish the same account identity", errInvalidAuthFile)
+				}
+				// 完整上传沿已验证的重认证链先保存、再切换代际；普通字段更新不放开恢复锁。
+				_, errSave := h.saveTokenRecord(ctx, auth)
+				return errSave
+			}
+		}
+	}
 	if errWrite := h.writeAuthFileBytes(dst, data, auth); errWrite != nil {
 		return fmt.Errorf("failed to write file: %w", errWrite)
 	}
@@ -309,6 +323,52 @@ func (h *Handler) writeAuthFile(ctx context.Context, name string, data []byte) e
 		}
 	}
 	return nil
+}
+
+// uploadedCodexRecoveryIdentityMatches checks identity before the upload inherits
+// any old account fields. JWT parsing only extracts claims; it does not validate
+// a signature or authenticate credentials with the provider.
+func uploadedCodexRecoveryIdentityMatches(existing, incoming *coreauth.Auth) bool {
+	if existing == nil || incoming == nil || existing.ID != incoming.ID || !strings.EqualFold(existing.Provider, incoming.Provider) {
+		return false
+	}
+	identity := func(metadata map[string]any) (accountID, email string, valid bool) {
+		text := func(key string) string {
+			value, _ := metadata[key].(string)
+			return strings.TrimSpace(value)
+		}
+		accountID, email = text("account_id"), text("email")
+		if alias := text("chatgpt_account_id"); alias != "" {
+			if accountID != "" && accountID != alias {
+				return "", "", false
+			}
+			accountID = alias
+		}
+		if claims, err := codex.ParseJWTToken(text("id_token")); err == nil && claims != nil {
+			if claimedID := strings.TrimSpace(claims.GetAccountID()); claimedID != "" {
+				if accountID != "" && accountID != claimedID {
+					return "", "", false
+				}
+				accountID = claimedID
+			}
+			if claimedEmail := strings.TrimSpace(claims.GetUserEmail()); claimedEmail != "" {
+				if email != "" && !strings.EqualFold(email, claimedEmail) {
+					return "", "", false
+				}
+				email = claimedEmail
+			}
+		}
+		return accountID, email, true
+	}
+	beforeID, beforeEmail, beforeValid := identity(existing.Metadata)
+	afterID, afterEmail, afterValid := identity(incoming.Metadata)
+	if !beforeValid || !afterValid {
+		return false
+	}
+	if beforeID != "" || afterID != "" {
+		return beforeID != "" && beforeID == afterID
+	}
+	return beforeEmail != "" && afterEmail != "" && strings.EqualFold(beforeEmail, afterEmail)
 }
 
 func (h *Handler) writeAuthFileBytes(dst string, data []byte, auth *coreauth.Auth) error {

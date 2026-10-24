@@ -462,6 +462,13 @@ func (m *Manager) updateInternalLocked(ctx context.Context, base, auth *Auth, mo
 	} else {
 		auth.CredentialVersion = existingVersion
 	}
+	// Guard against a stale write-back silently rolling back the automatic
+	// terminal-auth quarantine lock: a caller that cloned this auth before a
+	// concurrent MarkResult quarantined it would otherwise wholesale-overwrite
+	// the live entry with its unaware zero-value quarantine fields.
+	if preserveQuarantineFieldsOnStaleWriteback(auth, existing) {
+		logEntryWithRequestID(ctx).WithField("auth_id", auth.ID).Warn("auth update carried stale auto-quarantine fields; preserved live quarantine state")
+	}
 	cooldownStateChanged := false
 	if !existing.Disabled && existing.Status != StatusDisabled && !auth.Disabled && auth.Status != StatusDisabled {
 		if isFileSnapshot {
@@ -492,7 +499,7 @@ func (m *Manager) updateInternalLocked(ctx context.Context, base, auth *Auth, mo
 		}
 		if credChanged || mode == updateModeRefresh {
 			applyPreservedRejectedTokens(existing, auth, mode == updateModeRefresh)
-			if auth.RejectedAccessToken == "" || authAccessToken(auth) != auth.RejectedAccessToken {
+			if !auth.AutoQuarantined && (auth.RejectedAccessToken == "" || authAccessToken(auth) != auth.RejectedAccessToken) {
 				if hasUnauthorizedAuthFailure(existing) || (auth.LastError != nil && isUnauthorizedError(auth.LastError)) {
 					auth.Unavailable = false
 					auth.NextRetryAfter = time.Time{}
@@ -536,13 +543,6 @@ func (m *Manager) updateInternalLocked(ctx context.Context, base, auth *Auth, mo
 	// non-token metadata changes.
 	if preserveNewerTokenOwnedFields(auth, existing) {
 		logEntryWithRequestID(ctx).WithField("auth_id", auth.ID).Warn("auth update carried stale token-owned fields; preserved newer stored token state")
-	}
-	// Guard against a stale write-back silently rolling back the automatic
-	// terminal-auth quarantine lock: a caller that cloned this auth before a
-	// concurrent MarkResult quarantined it would otherwise wholesale-overwrite
-	// the live entry with its unaware zero-value quarantine fields.
-	if preserveQuarantineFieldsOnStaleWriteback(auth, existing) {
-		logEntryWithRequestID(ctx).WithField("auth_id", auth.ID).Warn("auth update carried stale auto-quarantine fields; preserved live quarantine state")
 	}
 	now := time.Now()
 	auth.UpdatedAt = now
