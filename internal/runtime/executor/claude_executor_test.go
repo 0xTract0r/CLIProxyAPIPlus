@@ -817,7 +817,7 @@ func TestClaudeExecutor_NonClaudeRequestUsesClaudeCode220CLIFingerprint(t *testi
 	}))
 	defer server.Close()
 
-	executor := NewClaudeExecutor(&config.Config{})
+	executor := NewClaudeExecutor(claudeBeta280Config375())
 	auth := &cliproxyauth.Auth{ProxyURL: "direct", Attributes: map[string]string{
 		"api_key":    "key-sdk-fingerprint",
 		"base_url":   server.URL,
@@ -874,8 +874,14 @@ func TestClaudeExecutor_NonClaudeRequestUsesClaudeCode220CLIFingerprint(t *testi
 	if !helps.IsValidUserID(userID) {
 		t.Fatalf("metadata.user_id = %q, want Claude Code JSON shape", userID)
 	}
-	if got, want := gjson.Get(userID, "session_id").String(), seenHeaders.Get("X-Claude-Code-Session-Id"); got != want {
-		t.Fatalf("metadata session_id = %q, header session ID = %q", got, want)
+	// F synthetic_device_id.go:256 fabricates a body session independently;
+	// F request.go:499–501 uses the API-key cache for this legacy header.
+	// Explicit CLI-profile/OAuth identity alignment has separate coverage.
+	if _, err := uuid.Parse(gjson.Get(userID, "session_id").String()); err != nil {
+		t.Fatalf("metadata session_id is not a UUID: %v", err)
+	}
+	if got, want := seenHeaders.Get("X-Claude-Code-Session-Id"), helps.CachedSessionID("key-sdk-fingerprint"); got != want {
+		t.Fatalf("legacy header session = %q, want API-key cached %q", got, want)
 	}
 }
 
