@@ -16,6 +16,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -494,7 +495,7 @@ func TestCodexExecutorRefresh_EmptyAttributesSnapshotIsolation(t *testing.T) {
 func startDualCodexAndSIWCMockOAuthServer(t *testing.T, idToken string, failSIWC *bool) (proxyURL string, outerCount *int, siwcCount *int, teardown func()) {
 	t.Helper()
 	var oCount, sCount int
-	mockAuthServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	mockAuthServer := startCodexRefreshStrictTLSServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = r.ParseForm()
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
@@ -527,7 +528,7 @@ func startDualCodexAndSIWCMockOAuthServer(t *testing.T, idToken string, failSIWC
 	}))
 
 	mockProxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodConnect {
+		if r.Method == http.MethodConnect && r.Host == "auth.openai.com:443" {
 			destConn, errDial := net.Dial("tcp", mockAuthServer.Listener.Addr().String())
 			if errDial != nil {
 				http.Error(w, errDial.Error(), http.StatusServiceUnavailable)
@@ -556,15 +557,24 @@ func startDualCodexAndSIWCMockOAuthServer(t *testing.T, idToken string, failSIWC
 			}()
 			return
 		}
-		http.Error(w, "proxy only supports CONNECT", http.StatusBadRequest)
+		http.Error(w, "fixture proxy target denied", http.StatusForbidden)
 	}))
 
-	origTransport := http.DefaultTransport
-	http.DefaultTransport = &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	proxy, err := url.Parse(mockProxy.URL)
+	if err != nil {
+		t.Fatal(err)
 	}
+	probeTransport := &http.Transport{Proxy: http.ProxyURL(proxy)}
+	defer probeTransport.CloseIdleConnections()
+	probe := &http.Client{Transport: probeTransport, Timeout: time.Second}
+	if resp, err := probe.Get("https://unknown-codex-refresh.invalid/"); err == nil {
+		_ = resp.Body.Close()
+		t.Fatal("unknown refresh proxy target accepted")
+	} else if !strings.Contains(err.Error(), "Forbidden") {
+		t.Fatalf("unknown refresh proxy target was not explicitly denied: %v", err)
+	}
+	t.Log("unknown refresh proxy target explicitly denied before TLS sink")
 	teardown = func() {
-		http.DefaultTransport = origTransport
 		mockProxy.Close()
 		mockAuthServer.Close()
 	}
@@ -572,6 +582,9 @@ func startDualCodexAndSIWCMockOAuthServer(t *testing.T, idToken string, failSIWC
 }
 
 func TestCodexExecutorRefreshSelectiveAndDual(t *testing.T) {
+	if !codexRefreshSandboxChild(t) {
+		return
+	}
 	idToken := makeTestCodexRefreshJWT("plus", "acc-dual-1")
 	failSIWC := false
 	proxyURL, outerCount, siwcCount, teardown := startDualCodexAndSIWCMockOAuthServer(t, idToken, &failSIWC)
@@ -1268,6 +1281,9 @@ func TestCodexExecutorUseSIWCImageRequestsRouteThroughResponsesSSE(t *testing.T)
 }
 
 func TestCodexExecutorRefreshHomeModeRefreshesSIWCWhenOnlySIWCDue(t *testing.T) {
+	if !codexRefreshSandboxChild(t) {
+		return
+	}
 	idToken := makeTestCodexRefreshJWT("plus", "acc-home-1")
 	failSIWC := false
 	proxyURL, outerCount, siwcCount, teardown := startDualCodexAndSIWCMockOAuthServer(t, idToken, &failSIWC)
@@ -1347,6 +1363,9 @@ func TestCodexExecutorRefreshHomeModeRefreshesSIWCWhenOnlySIWCDue(t *testing.T) 
 }
 
 func TestCodexExecutorRefreshSerializesUnderFileLockAndSkipsAlreadyRotatedToken(t *testing.T) {
+	if !codexRefreshSandboxChild(t) {
+		return
+	}
 	idToken := makeTestCodexRefreshJWT("plus", "acc-lock-1")
 	failSIWC := false
 	proxyURL, outerCount, siwcCount, teardown := startDualCodexAndSIWCMockOAuthServer(t, idToken, &failSIWC)
