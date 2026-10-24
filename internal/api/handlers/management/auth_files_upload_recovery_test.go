@@ -84,8 +84,8 @@ func TestUploadAuthFileCompleteReauthenticationPublishesAfterSave(t *testing.T) 
 				case "claims same account":
 					fresh["id_token"] = jwt("account-a", "synthetic@example.invalid")
 				case "claims different account":
+					// 372：完整外部上传可用自洽的新账号 claims 替换原账号。
 					fresh["id_token"] = jwt("account-b", "synthetic@example.invalid")
-					rejectIdentity = true
 				}
 			case "claims conflict with metadata":
 				fresh["id_token"] = jwt("account-b", "synthetic@example.invalid")
@@ -113,6 +113,58 @@ func TestUploadAuthFileCompleteReauthenticationPublishesAfterSave(t *testing.T) 
 			afterBytes, readErr := os.ReadFile(path)
 			if readErr != nil {
 				t.Fatal(readErr)
+			}
+			if name == "claims different account" {
+				// 提交没有 account_id/email 字段，JWT 唯一账号声明为 account-b；
+				// 不适用旧的同账号恢复合同（保留计数、operator controls）。
+				if _, ok := fresh["account_id"]; ok {
+					t.Fatal("replacement fixture unexpectedly supplied account metadata")
+				}
+				if _, ok := fresh["email"]; ok || fresh["id_token"] != jwt("account-b", "synthetic@example.invalid") {
+					t.Fatal("replacement fixture must contain only self-consistent new identity claims")
+				}
+				if err != nil || store.saves != 1 || hooks != 1 || live == nil {
+					t.Fatalf("complete operator replacement not published after one save: err=%v saves=%d hooks=%d", err, store.saves, hooks)
+				}
+				if live.ID != before.ID || live.FileName != before.FileName || live.Provider != "codex" || live.RegistrationEpoch <= before.RegistrationEpoch || live.CredentialVersion <= before.CredentialVersion {
+					t.Fatal("operator replacement lost file identity or failed to retire prior generation")
+				}
+				if live.Status != coreauth.StatusActive || live.AutoQuarantined || live.Unavailable || live.Disabled || live.Runtime != nil || live.Storage != nil || live.LastError != nil || len(live.ModelStates) != 0 || live.Success != 0 || live.Failed != 0 || live.CreatedAt.Equal(before.CreatedAt) {
+					t.Fatal("operator replacement inherited retired principal runtime/history")
+				}
+				var disk map[string]any
+				if errDecode := json.Unmarshal(afterBytes, &disk); errDecode != nil {
+					t.Fatal(errDecode)
+				}
+				for _, metadata := range []map[string]any{live.Metadata, disk} {
+					for _, key := range []string{"access_token", "refresh_token", "id_token"} {
+						if metadata[key] != fresh[key] {
+							t.Fatalf("replacement did not retain submitted %s", key)
+						}
+					}
+					if account, ok := metadata["account_id"]; ok && account != "account-b" {
+						t.Fatal("replacement inherited old account identity")
+					}
+					siwc, ok := metadata["siwc"].(map[string]any)
+					if !ok || siwc["access_token"] != "new-siwc-access" || siwc["refresh_token"] != "new-siwc-refresh" {
+						t.Fatal("replacement inherited old SIWC partition")
+					}
+					for _, key := range []string{"note", "priority", "account_settings", "auto_quarantined", "quarantine_reason", "quarantined_at", "refresh_disabled", "refresh_disabled_reason", "reauth_required"} {
+						if _, ok := metadata[key]; ok {
+							t.Fatalf("replacement inherited old %s", key)
+						}
+					}
+				}
+				if live.Attributes["priority"] != "" || live.RefreshDisabled() {
+					t.Fatal("replacement inherited old operator controls")
+				}
+				manager.MarkResult(ctx, coreauth.Result{AuthID: old.ID, Provider: "codex", RegistrationEpoch: before.RegistrationEpoch, CredentialVersion: before.CredentialVersion, AccessToken: "old-access", Error: &coreauth.Error{HTTPStatus: 401, Message: "old callback"}})
+				after, _ := manager.GetByID(old.ID)
+				finalBytes, errRead := os.ReadFile(path)
+				if errRead != nil || !bytes.Equal(finalBytes, afterBytes) || after.RegistrationEpoch != live.RegistrationEpoch || after.AutoQuarantined || after.Failed != 0 || after.Metadata["access_token"] != "new-access" {
+					t.Fatal("retired generation poisoned operator replacement")
+				}
+				return
 			}
 			if store.fail || rejectIdentity {
 				if err == nil || hooks != 0 || live.RegistrationEpoch != before.RegistrationEpoch || live.CredentialVersion != before.CredentialVersion || !live.AutoQuarantined || !bytes.Equal(beforeBytes, afterBytes) {
