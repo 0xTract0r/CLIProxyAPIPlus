@@ -1125,6 +1125,13 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 			return "", fmt.Errorf("reauthenticate auth %s: account identity changed", record.ID)
 		}
 	}
+	// 只保留调用者本次明确给出的quota结果，区分后续通用合并补入的旧观测。
+	incomingQuotaRuntime := make(map[string]any)
+	for key, value := range record.Metadata {
+		if isReauthRuntimeMetadataKey(key) {
+			incomingQuotaRuntime[key] = value
+		}
+	}
 	existingMetadata := h.mergeExistingAuthFileMetadata(record)
 	store := h.tokenStoreWithBaseDir()
 	if store == nil {
@@ -1189,6 +1196,16 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 	}
 	canClearRecovery := !coreauth.IsCodexAuthRecord(record) || coreauth.LoginReplacesOAuthCredentials(record.Metadata, recoveryBase)
 	if canClearRecovery {
+		// 通用metadata合并可能已带回旧quota错误；仅完整恢复边界清理，
+		// Codex单分区更新继续保留旧观测/硬锁，operator设置不在此集合中。
+		for key := range record.Metadata {
+			if isReauthRuntimeMetadataKey(key) {
+				delete(record.Metadata, key)
+			}
+		}
+		for key, value := range incomingQuotaRuntime {
+			record.Metadata[key] = value
+		}
 		clearStaleReauthLockOnSave(record)
 	}
 

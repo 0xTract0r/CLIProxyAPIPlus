@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -34,6 +35,7 @@ func TestSaveTokenRecordCredentialRecoveryPersistsAndFences(t *testing.T) {
 		oldSIWC, recover, operatorOff bool
 	}{
 		{"codex full reauthentication", "codex", "new-outer", "new-siwc", true, true, false},
+		{"codex explicit fresh quota result", "codex", "new-outer", "new-siwc", true, true, false},
 		{"codex outer only stays locked", "codex", "new-outer", "old-siwc", true, false, false},
 		{"codex SIWC only stays locked", "codex", "old-outer", "new-siwc", true, false, false},
 		{"codex access-only stays locked", "codex", "old-outer", "old-siwc", true, false, false},
@@ -56,6 +58,16 @@ func TestSaveTokenRecordCredentialRecoveryPersistsAndFences(t *testing.T) {
 				"type": tc.provider, "email": "synthetic@example.invalid", "account_id": "synthetic-account", "access_token": "old-access", "refresh_token": "old-outer", "proxy_url": "direct", "note": "keep-operator-note", "auto_quarantined": true, "quarantine_reason": "terminal_auth_failure", "quarantined_at": time.Now().Format(time.RFC3339Nano),
 				"reauth_required": true, "refresh_status": "reauth_required", "refresh_error_code": "invalid_grant", "refresh_disabled": true, "refresh_disabled_reason": "reauth_required", "refresh_disabled_at": "2026-01-01T00:00:00Z", "last_refresh_error": "synthetic invalid_grant",
 			}}
+			staleQuota := map[string]any{
+				quotaRefreshStatusMetadataKey:     quotaRefreshStatusReauthRequired,
+				quotaRefreshErrorMetadataKey:      "old quota credential failure",
+				quotaNextRefreshMetadataKey:       "2026-01-01T00:00:00Z",
+				quotaRefreshHTTPStatusMetadataKey: 401,
+				quotaRefreshRetryAfterMetadataKey: 60,
+			}
+			for key, value := range staleQuota {
+				previous.Metadata[key] = value
+			}
 			previous.CreatedAt = time.Date(2025, 1, 2, 3, 4, 5, 0, time.UTC)
 			previous.Success, previous.Failed = 7, 9
 			previous.Metadata["priority"] = 23
@@ -95,6 +107,9 @@ func TestSaveTokenRecordCredentialRecoveryPersistsAndFences(t *testing.T) {
 				incoming.Metadata["access_token"] = "old-access"
 				incoming.Metadata["siwc"].(map[string]any)["access_token"] = "old-siwc-access"
 				incoming.Metadata["note"] = "config-note"
+			}
+			if tc.name == "codex explicit fresh quota result" {
+				incoming.Metadata[quotaRefreshStatusMetadataKey] = "ok"
 			}
 			beforeRaw, err := os.ReadFile(path)
 			if err != nil {
@@ -170,6 +185,22 @@ func TestSaveTokenRecordCredentialRecoveryPersistsAndFences(t *testing.T) {
 			}
 			if disk["note"] != wantNote || live.ProxyURL != "direct" {
 				t.Fatal("operator fields lost")
+			}
+			for location, metadata := range map[string]map[string]any{"incoming": incoming.Metadata, "disk": disk, "runtime": live.Metadata} {
+				for key, oldValue := range staleQuota {
+					value, present := metadata[key]
+					if !tc.recover {
+						if !present || fmt.Sprint(value) != fmt.Sprint(oldValue) {
+							t.Fatalf("%s partial recovery changed %s", location, key)
+						}
+					} else if tc.name == "codex explicit fresh quota result" && key == quotaRefreshStatusMetadataKey {
+						if value != "ok" {
+							t.Fatalf("%s lost explicit fresh quota status: %v", location, value)
+						}
+					} else if present {
+						t.Fatalf("%s retained stale quota field %s", location, key)
+					}
+				}
 			}
 			if live.RefreshDisabled() != (!tc.recover || tc.operatorOff) {
 				t.Fatalf("refresh disabled=%v", live.RefreshDisabled())
