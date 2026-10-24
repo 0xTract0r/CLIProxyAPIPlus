@@ -758,6 +758,10 @@ func (t *utlsRoundTripper) createConnection(ctx context.Context, host, addr stri
 	defer cancelHandshake()
 	if errHandshake := tlsConn.HandshakeContext(handshakeCtx); errHandshake != nil {
 		errHandshake = classifyHandshakeError(ctx, handshakeCtx, errHandshake)
+		// HandshakeContext 在取消时已关闭底层连接；其它握手错误仍由本层释放。
+		if errors.Is(errHandshake, context.Canceled) || errors.Is(errHandshake, context.DeadlineExceeded) {
+			return nil, fmt.Errorf("utls: TLS handshake: %w", errHandshake)
+		}
 		if errClose := conn.Close(); errClose != nil {
 			return nil, fmt.Errorf("utls: TLS handshake: %w; close connection: %v", errHandshake, errClose)
 		}

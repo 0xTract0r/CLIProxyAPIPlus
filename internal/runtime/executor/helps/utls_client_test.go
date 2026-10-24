@@ -639,3 +639,52 @@ func summarizeClaudeCodeClientHelloSpec(t *testing.T, spec *tls.ClientHelloSpec)
 	summary.JA3MD5 = hex.EncodeToString(digest[:])
 	return summary
 }
+
+func TestUtlsRoundTripperHandshakeDeadlineClosesConnectionOnce(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+	tracked := &trackedNetConn{Conn: clientConn}
+	roundTripper := &utlsRoundTripper{dialer: contextDialerFunc(func(context.Context, string, string) (net.Conn, error) { return tracked, nil })}
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer cancel()
+	conn, err := roundTripper.createConnection(ctx, "chatgpt.com", "chatgpt.com:443")
+	if conn != nil {
+		_ = conn.Close()
+		t.Fatal("expired handshake returned a connection")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("handshake error = %v, want deadline exceeded", err)
+	}
+	if got := tracked.closeCount.Load(); got != 1 {
+		t.Fatalf("connection close count = %d, want 1", got)
+	}
+}
+
+func TestUtlsRoundTripperHandshakeFailureClosesConnectionAndAllowsRedial(t *testing.T) {
+	var connections []*trackedNetConn
+	roundTripper := &utlsRoundTripper{dialer: contextDialerFunc(func(context.Context, string, string) (net.Conn, error) {
+		clientConn, serverConn := net.Pipe()
+		_ = serverConn.Close()
+		tracked := &trackedNetConn{Conn: clientConn}
+		connections = append(connections, tracked)
+		t.Cleanup(func() { _ = clientConn.Close() })
+		return tracked, nil
+	})}
+	for attempt := 0; attempt < 2; attempt++ {
+		conn, err := roundTripper.createConnection(t.Context(), "chatgpt.com", "chatgpt.com:443")
+		if conn != nil {
+			_ = conn.Close()
+			t.Fatal("failed handshake returned a connection")
+		}
+		if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("unexpected handshake error: %v", err)
+		}
+		if len(connections) != attempt+1 {
+			t.Fatalf("failed connection prevented redial: %d dials", len(connections))
+		}
+		if got := connections[attempt].closeCount.Load(); got != 1 {
+			t.Fatalf("failed handshake close count = %d, want 1", got)
+		}
+	}
+}
