@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
@@ -15,6 +17,7 @@ import (
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/httptransport"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 	"github.com/tidwall/gjson"
 )
@@ -139,7 +142,7 @@ func TestGeminiVertexExecutorClaudeMalformedFunctionCallReturnsRetryableError(t 
 			ctx := context.Background()
 			auth := &cliproxyauth.Auth{ID: t.Name(), Provider: "vertex"}
 			if authMode == "api_key" {
-			auth.ProxyURL = "direct"
+				auth.ProxyURL = "direct"
 				auth.Attributes = map[string]string{"api_key": "test-key", "base_url": server.URL}
 			} else {
 				var serviceAccount map[string]any
@@ -218,16 +221,45 @@ func TestGeminiVertexExecutorClaudeMalformedFunctionCallReturnsRetryableError(t 
 	}
 }
 
+// 调度前提负控：缺少显式proxy不能绕过scheduler进入本地fake wire。
+func TestGeminiVertex376MissingProxyCannotReachStream(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	wireCalls := 0
+	ctx = context.WithValue(ctx, "cliproxy.roundtripper", kimiRoundTripperFunc(func(*http.Request) (*http.Response, error) {
+		wireCalls++
+		return &http.Response{StatusCode: http.StatusBadGateway, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("synthetic local wire must not be reached"))}, nil
+	}))
+	auth := &cliproxyauth.Auth{ID: t.Name(), Provider: "vertex", Status: cliproxyauth.StatusActive,
+		Attributes: map[string]string{"api_key": "synthetic-key", "base_url": "http://127.0.0.1:1"}}
+	manager := cliproxyauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(NewGeminiVertexExecutor(&config.Config{}))
+	if _, err := manager.Register(ctx, auth); err != nil {
+		t.Fatal(err)
+	}
+	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: "gemini-4-argon"}})
+	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(auth.ID) })
+	_, err := manager.ExecuteStream(ctx, []string{"vertex"}, cliproxyexecutor.Request{Model: "gemini-4-argon",
+		Payload: []byte(`{"model":"gemini-4-argon","max_tokens":1024,"messages":[{"role":"user","content":"hi"}]}`)},
+		cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatClaude, ResponseFormat: sdktranslator.FormatClaude, Stream: true})
+	if err == nil || !strings.Contains(err.Error(), "auth_not_found") || wireCalls != 0 {
+		t.Fatalf("missing proxy bypassed scheduler: err=%v wireCalls=%d", err, wireCalls)
+	}
+}
+
 func TestGeminiVertexExecutorClaudeMalformedFunctionCallCancelAfterErrorRecordsFailure(t *testing.T) {
 	malformedBody := `{"candidates":[{"content":{"role":"model","parts":[]},"finishReason":"MALFORMED_FUNCTION_CALL"}],"usageMetadata":{"promptTokenCount":120,"candidatesTokenCount":10,"thoughtsTokenCount":313,"totalTokenCount":443},"modelVersion":"gemini-4-argon"}`
 	for _, authMode := range []string{"api_key", "service_account"} {
 		t.Run(authMode, func(t *testing.T) {
+			var tokenCalls, modelCalls atomic.Int32
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.URL.Path == "/token" {
+					tokenCalls.Add(1)
 					w.Header().Set("Content-Type", "application/json")
 					_, _ = io.WriteString(w, `{"access_token":"local-token","token_type":"Bearer","expires_in":3600}`)
 					return
 				}
+				modelCalls.Add(1)
 				w.Header().Set("Content-Type", "text/event-stream")
 				_, _ = io.WriteString(w, "data: "+malformedBody+"\n\n")
 				if flusher, okFlush := w.(http.Flusher); okFlush {
@@ -238,7 +270,7 @@ func TestGeminiVertexExecutorClaudeMalformedFunctionCallCancelAfterErrorRecordsF
 			defer server.Close()
 
 			ctx := context.Background()
-			auth := &cliproxyauth.Auth{ID: t.Name(), Provider: "vertex", Status: cliproxyauth.StatusActive}
+			auth := &cliproxyauth.Auth{ID: t.Name(), Provider: "vertex", Status: cliproxyauth.StatusActive, ProxyURL: "direct"}
 			if authMode == "api_key" {
 				auth.Attributes = map[string]string{"api_key": "test-key", "base_url": server.URL}
 			} else {
@@ -251,15 +283,26 @@ func TestGeminiVertexExecutorClaudeMalformedFunctionCallCancelAfterErrorRecordsF
 					"location":        "global",
 					"service_account": serviceAccount,
 				}
-				target, errParse := parseTestURL(t, server.URL)
-				if errParse != nil {
-					t.Fatal(errParse)
-				}
-				transport := http.DefaultTransport.(*http.Transport).Clone()
-				transport.Proxy = nil
-				t.Cleanup(transport.CloseIdleConnections)
-				ctx = context.WithValue(ctx, "cliproxy.roundtripper", issue6258RedirectTransport{target: target, base: transport})
+
 			}
+
+			target, errParse := parseTestURL(t, server.URL)
+			if errParse != nil {
+				t.Fatal(errParse)
+			}
+			// direct 优先于旧 ctx RoundTripper；在最终选定 transport 之后装本地 fixture。
+			// 保留 next 的 direct 语义，拒绝一切非预期地址，禁止 DNS / 真实上游回退。
+			ctx = httptransport.WithDecorator(ctx, func(next http.RoundTripper) http.RoundTripper {
+				return kimiRoundTripperFunc(func(request *http.Request) (*http.Response, error) {
+					if request.URL.Host == target.Host && request.URL.Scheme == target.Scheme {
+						return next.RoundTrip(request)
+					}
+					if authMode == "service_account" && request.URL.Scheme == "https" && request.URL.Host == "aiplatform.googleapis.com" && strings.HasSuffix(request.URL.Path, ":streamGenerateContent") {
+						return (issue6258RedirectTransport{target: target, base: next}).RoundTrip(request)
+					}
+					return nil, fmt.Errorf("local-only fixture rejected URL: %s", request.URL.Redacted())
+				})
+			})
 
 			capture := &malformedFunctionCallUsageCapture{authID: auth.ID, records: make(chan usage.Record, 1)}
 			usage.RegisterNamedPlugin(t.Name(), capture)
@@ -299,6 +342,14 @@ func TestGeminiVertexExecutorClaudeMalformedFunctionCallCancelAfterErrorRecordsF
 					cancel()
 				}
 			}
+			wantTokenCalls := int32(0)
+			if authMode == "service_account" {
+				wantTokenCalls = 1
+			}
+			if modelCalls.Load() != 1 || tokenCalls.Load() != wantTokenCalls {
+				t.Fatalf("local wire counts: model=%d token=%d, want model=1 token=%d", modelCalls.Load(), tokenCalls.Load(), wantTokenCalls)
+			}
+			t.Logf("local-only wire: model=%d token=%d; all delegated destinations are loopback, no provider DNS attempt", modelCalls.Load(), tokenCalls.Load())
 			assertMalformedFunctionCallFailedUsage(t, capture.records)
 			updated, okAuth := manager.GetByID(auth.ID)
 			if !okAuth || updated.ModelStates["gemini-4-argon"] == nil || updated.ModelStates["gemini-4-argon"].LastError == nil {
