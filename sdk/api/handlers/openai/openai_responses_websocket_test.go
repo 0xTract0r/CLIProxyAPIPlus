@@ -628,7 +628,7 @@ func (e *websocketPrewarmRetryExecutor) ExecuteStream(ctx context.Context, auth 
 		e.streamCalls++
 		e.payloads = append(e.payloads, bytes.Clone(req.Payload))
 		chunks := make(chan coreexecutor.StreamChunk, 1)
-		chunks <- coreexecutor.StreamChunk{Err: websocketPinnedFailoverStatusError{status: http.StatusBadRequest, msg: "retry diagnostic"}}
+		chunks <- coreexecutor.StreamChunk{Err: websocketPinnedFailoverStatusError{status: http.StatusBadRequest, msg: `{"error":{"type":"invalid_request_error","message":"retry diagnostic"}}`}}
 		close(chunks)
 		return &coreexecutor.StreamResult{Chunks: chunks}, nil
 	}
@@ -4548,6 +4548,12 @@ func TestResponsesWebsocketPrewarmPreservesCompactedFollowup(t *testing.T) {
 			if tc.failFirst {
 				if gjson.GetBytes(result, "type").String() != "error" {
 					t.Fatalf("expected first failure: %s", result)
+				}
+				if gjson.GetBytes(result, "status").Int() != http.StatusBadRequest || gjson.GetBytes(result, "error.message").String() != "retry diagnostic" {
+					t.Fatalf("request-scoped error changed: %s", result)
+				}
+				if state, _ := manager.GetByID(auth.ID); state.Unavailable {
+					t.Fatal("request-scoped diagnostic cooled the credential")
 				}
 				// Terminal upstream errors close the connection. Codex reconnects
 				// and establishes a new warm-up before retrying the full request.

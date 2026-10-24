@@ -271,8 +271,9 @@ func (e *homeInterruptExecutor) InterruptExecutionSession(ctx context.Context, s
 }
 
 type blockingHTTPInterruptExecutor struct {
-	calls    atomic.Int32
-	canceled atomic.Bool
+	calls          atomic.Int32
+	canceled       atomic.Bool
+	cancelObserved chan struct{}
 }
 
 func (*blockingHTTPInterruptExecutor) Identifier() string { return "codex" }
@@ -294,6 +295,9 @@ func (e *blockingHTTPInterruptExecutor) ExecuteStream(ctx context.Context, _ *co
 		chunks <- coreexecutor.StreamChunk{Payload: []byte(`{"type":"response.created","response":{"id":"r-http"}}`)}
 		<-ctx.Done()
 		e.canceled.Store(true)
+		if e.cancelObserved != nil {
+			close(e.cancelObserved)
+		}
 	}()
 	return &coreexecutor.StreamResult{Chunks: chunks}, nil
 }
@@ -318,7 +322,7 @@ func (*blockingHTTPInterruptExecutor) InterruptExecutionSession(context.Context,
 // cancels an HTTP upstream turn and lets the same socket continue.
 func TestResponsesInterruptStopsHTTPUpstream(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	executor := &blockingHTTPInterruptExecutor{}
+	executor := &blockingHTTPInterruptExecutor{cancelObserved: make(chan struct{})}
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.SetConfig(&config.Config{})
 	manager.RegisterExecutor(executor)
@@ -347,7 +351,8 @@ func TestResponsesInterruptStopsHTTPUpstream(t *testing.T) {
 		t.Fatal(errDial)
 	}
 	defer func() { _ = client.Close() }()
-	_ = client.SetReadDeadline(time.Now().Add(5 * time.Second))
+	deadline := time.Now().Add(5 * time.Second)
+	_ = client.SetReadDeadline(deadline)
 	if errSend := client.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf(`{"type":"response.create","model":%q,"input":[]}`, model))); errSend != nil {
 		t.Fatal(errSend)
 	}
@@ -373,6 +378,12 @@ func TestResponsesInterruptStopsHTTPUpstream(t *testing.T) {
 	}
 	if got := gjson.GetBytes(interrupted, "response.incomplete_details.reason").String(); got != "interrupted" {
 		t.Fatalf("interrupt reason = %q, payload %s", got, interrupted)
+	}
+	// 上游worker观察ctx取消是异步事件；仍沿原5s总deadline，不增加等待预算。
+	select {
+	case <-executor.cancelObserved:
+	case <-time.After(time.Until(deadline)):
+		t.Fatal("http upstream did not observe cancellation within original deadline")
 	}
 	if !executor.canceled.Load() {
 		t.Fatal("http upstream was not canceled")
@@ -479,5 +490,72 @@ func TestResponsesInterruptUsesHomeSessionAuth(t *testing.T) {
 	}
 	if got := gjson.GetBytes(followDone, "type").String(); got != "response.completed" {
 		t.Fatalf("expected follow-up response.completed, got %s", followDone)
+	}
+}
+
+func TestResponsesLocalInterruptCancelsBeforeBlockedACK(t *testing.T) {
+	for _, failWrite := range []bool{false, true} {
+		t.Run(fmt.Sprintf("write_failure_%t", failWrite), func(t *testing.T) {
+			serverResult := make(chan error, 1)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				conn, err := responsesWebsocketUpgrader.Upgrade(w, r, nil)
+				if err != nil {
+					serverResult <- err
+					return
+				}
+				defer conn.Close()
+				writer := newResponsesWebsocketWriter(conn)
+				upstreamCtx, cancel := context.WithCancel(r.Context())
+				defer cancel()
+				writer.writeMu.Lock()
+				done := make(chan error, 1)
+				go func() {
+					_, _, _, _, err := completeResponsesWebsocketLocalInterrupt(writer, nil, func(...interface{}) { cancel() }, []byte(`{"type":"response.interrupt","response_id":"blocked-ack"}`), nil, nil, nil)
+					done <- err
+				}()
+				var orderingError error
+				select {
+				case <-upstreamCtx.Done():
+				case <-time.After(time.Second):
+					orderingError = errors.New("upstream cancellation waited behind ACK write")
+				}
+				if failWrite {
+					_ = conn.Close()
+				}
+				writer.writeMu.Unlock()
+				select {
+				case err := <-done:
+					if orderingError != nil {
+						serverResult <- orderingError
+						return
+					}
+					if (err != nil) != failWrite {
+						serverResult <- fmt.Errorf("ACK write error = %v, want failure %v", err, failWrite)
+						return
+					}
+					serverResult <- nil
+				case <-time.After(time.Second):
+					serverResult <- errors.New("interrupt did not finish after releasing ACK writer")
+				}
+			}))
+			defer server.Close()
+			conn, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http"), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+			_, ack, err := conn.ReadMessage()
+			if failWrite {
+				if err == nil {
+					t.Fatal("closed ACK writer unexpectedly succeeded")
+				}
+			} else if err != nil || gjson.GetBytes(ack, "type").String() != "response.incomplete" {
+				t.Fatalf("ACK = %s, error=%v", ack, err)
+			}
+			if err := <-serverResult; err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
