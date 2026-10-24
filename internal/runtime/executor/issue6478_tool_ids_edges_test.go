@@ -40,7 +40,7 @@ func TestIssue6478_DevinReservedPrefixStatelessFragmentedRoundTrip(t *testing.T)
 		}
 	}))
 	defer server.Close()
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "test", "base_url": server.URL}}
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", Attributes: map[string]string{"api_key": "test", "base_url": server.URL}}
 	var idsByMode [][]string
 	for _, stream := range []bool{false, true} {
 		name := "Execute"

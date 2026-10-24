@@ -75,6 +75,7 @@ func TestOpenAICompatExecutor_ImageStreamChunkBoundaryObservability(t *testing.T
 				}},
 			})
 			auth := &cliproxyauth.Auth{
+				ProxyURL: "direct",
 				Provider: "openai-compatibility",
 				Attributes: map[string]string{
 					"base_url":     server.URL,

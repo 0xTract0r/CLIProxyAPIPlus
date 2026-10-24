@@ -1898,7 +1898,7 @@ func TestKimiApplyPatchSSEFramingAndIncompleteEOF(t *testing.T) {
 			}))
 			defer server.Close()
 			exec := NewKimiExecutor(&config.Config{})
-			result, errExecute := exec.ExecuteStream(t.Context(), &cliproxyauth.Auth{Provider: "kimi", Attributes: map[string]string{"api_key": "test", "base_url": server.URL}}, cliproxyexecutor.Request{Model: "kimi-k2.5", Payload: []byte(`{"input":[],"tools":[{"type":"custom","name":"apply_patch"}]}`)}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse})
+			result, errExecute := exec.ExecuteStream(t.Context(), &cliproxyauth.Auth{ProxyURL: "direct", Provider: "kimi", Attributes: map[string]string{"api_key": "test", "base_url": server.URL}}, cliproxyexecutor.Request{Model: "kimi-k2.5", Payload: []byte(`{"input":[],"tools":[{"type":"custom","name":"apply_patch"}]}`)}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse})
 			if errExecute != nil {
 				t.Fatal(errExecute)
 			}

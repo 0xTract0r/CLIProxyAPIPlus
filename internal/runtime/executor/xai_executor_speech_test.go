@@ -265,6 +265,7 @@ func newXAISpeechScopeManager(t *testing.T, baseURL string, count int) (*cliprox
 	authIDs := make([]string, 0, count)
 	for i := 0; i < count; i++ {
 		auth := &cliproxyauth.Auth{
+			ProxyURL: "direct",
 			ID:       uuid.NewString() + "-xai-speech-scope",
 			Provider: "xai",
 			Attributes: map[string]string{

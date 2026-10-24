@@ -505,6 +505,7 @@ func TestGeminiVertexOpenAPI_APIKey_ValidationAndThirdPartyRelay(t *testing.T) {
 
 	// 2. Third-party compatible gateway with custom base_url routes non-google publisher model to endpoints/openapi/chat/completions
 	customGatewayAuth := &cliproxyauth.Auth{
+		ProxyURL: "direct",
 		ID:       "vertex-apikey-custom-gateway",
 		Provider: "vertex",
 		Attributes: map[string]string{
