@@ -24,6 +24,115 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+func TestCodexAutoRouteWebsocketAccountPolicy(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		downstream bool
+		attributes map[string]string
+		metadata   map[string]any
+		want       bool
+	}{
+		{"disabled HTTP", false, nil, nil, false},
+		{"disabled WS", true, nil, nil, false},
+		{"enabled HTTP", false, map[string]string{"websockets": "true"}, nil, true},
+		{"enabled WS", true, map[string]string{"websockets": "true"}, nil, true},
+		{"metadata HTTP", false, nil, map[string]any{"websockets": true}, true},
+		{"metadata string HTTP", false, nil, map[string]any{"websockets": "true"}, true},
+		{"attribute overrides metadata", false, map[string]string{"websockets": "false"}, map[string]any{"websockets": true}, false},
+		{"fast remains independent", false, map[string]string{"websockets": "false", "fast_models": "*"}, nil, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			if tc.downstream {
+				ctx = cliproxyexecutor.WithDownstreamWebsocket(ctx)
+			}
+			auth := &cliproxyauth.Auth{Attributes: tc.attributes, Metadata: tc.metadata}
+			if got := codexAutoRouteToWebsocket(ctx, auth, "gpt-5-codex"); got != tc.want {
+				t.Fatalf("websocket route = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestCodexAutoExecutorWebsocketsWithoutFast(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		for _, tier := range []string{"priority", "fast"} {
+			mode := "execute/" + tier
+			if stream {
+				mode = "stream/" + tier
+			}
+			t.Run(mode, func(t *testing.T) {
+				captured := make(chan []byte, 1)
+				var httpRequests, frames atomic.Int32
+				upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if !websocket.IsWebSocketUpgrade(r) {
+						httpRequests.Add(1)
+						http.Error(w, "websocket required", http.StatusBadRequest)
+						return
+					}
+					conn, err := upgrader.Upgrade(w, r, nil)
+					if err != nil {
+						t.Errorf("upgrade: %v", err)
+						return
+					}
+					defer func() { _ = conn.Close() }()
+					for {
+						_, payload, errRead := conn.ReadMessage()
+						if errRead != nil {
+							return
+						}
+						if frames.Add(1) == 1 {
+							captured <- bytes.Clone(payload)
+						}
+						if errWrite := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp-normal-ws","output":[],"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}}`)); errWrite != nil {
+							return
+						}
+					}
+				}))
+				defer server.Close()
+				exec := NewCodexAutoExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
+				auth := &cliproxyauth.Auth{
+					ID: t.Name(), Provider: "codex", ProxyURL: "direct",
+					Attributes: map[string]string{"api_key": "sk-test", "base_url": server.URL, "fast_models": ""},
+					Metadata:   map[string]any{"websockets": true},
+				}
+				req := cliproxyexecutor.Request{Model: "gpt-5-codex", Payload: []byte(`{"model":"gpt-5-codex","input":[{"role":"user","content":"hi"}],"service_tier":"` + tier + `","prompt_cache_key":"normal-ws"}`)}
+				opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("codex")}
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				// A plain HTTP/SSE caller must honor the account's WebSocket switch.
+				if stream {
+					result, err := exec.ExecuteStream(ctx, auth, req, opts)
+					if err != nil {
+						t.Fatalf("ExecuteStream: %v", err)
+					}
+					for chunk := range result.Chunks {
+						if chunk.Err != nil {
+							t.Fatalf("stream chunk: %v", chunk.Err)
+						}
+					}
+				} else if _, err := exec.Execute(ctx, auth, req, opts); err != nil {
+					t.Fatalf("Execute: %v", err)
+				}
+				payload := receiveFrame(t, captured, "normal websocket request")
+				if got := gjson.GetBytes(payload, "service_tier").String(); got != "default" {
+					t.Fatalf("service_tier = %q, want default", got)
+				}
+				if got := gjson.GetBytes(payload, "type").String(); got != "response.create" {
+					t.Fatalf("type = %q, want response.create", got)
+				}
+				if gjson.GetBytes(payload, "generate").Exists() || gjson.GetBytes(payload, "previous_response_id").Exists() || frames.Load() != 1 {
+					t.Fatal("non-fast WebSocket must send one main request without prewarm")
+				}
+				if got := gjson.GetBytes(payload, "prompt_cache_key").String(); got != "normal-ws" || httpRequests.Load() != 0 {
+					t.Fatalf("cache key = %q, HTTP requests = %d", got, httpRequests.Load())
+				}
+			})
+		}
+	}
+}
+
 func TestBuildCodexWebsocketRequestBodyPreservesPreviousResponseID(t *testing.T) {
 	body := []byte(`{"model":"gpt-5-codex","previous_response_id":"resp-1","input":[{"type":"message","id":"msg-1"}]}`)
 
