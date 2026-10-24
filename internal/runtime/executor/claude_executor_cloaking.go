@@ -427,6 +427,21 @@ func checkSystemInstructionsWithSigningModeAt(
 	prevReq, promptID string,
 	keepCallerSystemTopLevel bool,
 	turnOrigin ...string,
+) []byte {
+	return checkSystemInstructionsWithDatePolicy(payload, strictMode, cchSigning, version, entrypoint, workload, currentDate, isSubagent, prevReq, promptID, keepCallerSystemTopLevel, true, turnOrigin...)
+}
+
+func checkSystemInstructionsWithDatePolicy(
+	payload []byte,
+	strictMode bool,
+	cchSigning bool,
+	version, entrypoint, workload string,
+	currentDate string,
+	isSubagent bool,
+	prevReq, promptID string,
+	keepCallerSystemTopLevel bool,
+	injectDate bool,
+	turnOrigin ...string,
 ) (result []byte) {
 	if strings.TrimSpace(version) == "" {
 		version = "2.1.211"
@@ -439,6 +454,12 @@ func checkSystemInstructionsWithSigningModeAt(
 	billingBlock := buildTextBlock(billingText, nil)
 
 	isExplicit := (len(turnOrigin) > 1 && turnOrigin[1] == "explicit_cache_mode") || isExplicitPromptCacheMode(payload)
+	finishDate := func(body []byte) []byte {
+		if !injectDate {
+			return body
+		}
+		return injectClaudeCodeCurrentDateInternal(body, currentDate, isExplicit)
+	}
 	var agentCC *claudeCacheControl = &claudeCodeCacheControl
 	if isExplicit {
 		agentCC = nil
@@ -452,19 +473,19 @@ func checkSystemInstructionsWithSigningModeAt(
 	}
 	payload, _ = sjson.SetRawBytes(payload, "system", []byte("["+strings.Join(systemBlocks, ",")+"]"))
 	if strictMode {
-		return injectClaudeCodeCurrentDateInternal(payload, currentDate, isExplicit)
+		return finishDate(payload)
 	}
 
 	forwardedSystemBlocks := collectForwardedClaudeSystemPromptBlocksWithCache(system)
 	if len(forwardedSystemBlocks) == 0 {
-		return injectClaudeCodeCurrentDateInternal(payload, currentDate, isExplicit)
+		return finishDate(payload)
 	}
 	if claudeHistoryHasAdvisorCallOrResult(payload) {
 		for _, block := range forwardedSystemBlocks {
 			systemBlocks = append(systemBlocks, buildForwardedSystemBlock(block.Text, block, isExplicit))
 		}
 		payload, _ = sjson.SetRawBytes(payload, "system", []byte("["+strings.Join(systemBlocks, ",")+"]"))
-		return injectClaudeCodeCurrentDateInternal(payload, currentDate, isExplicit)
+		return finishDate(payload)
 	}
 	if claudeUsesLegacySystemReminder(payload) {
 		payload = prependClaudeSystemReminderBlocksToFirstUserMessage(payload, forwardedSystemBlocks, isExplicit)
@@ -476,7 +497,7 @@ func checkSystemInstructionsWithSigningModeAt(
 	} else {
 		payload = insertClaudeMidConversationSystemBlocks(payload, forwardedSystemBlocks, isExplicit)
 	}
-	return injectClaudeCodeCurrentDateInternal(payload, currentDate, isExplicit)
+	return finishDate(payload)
 }
 
 // relocateClaudeSystemPromptForCountTokens keeps a cloaked count_tokens request
@@ -1803,6 +1824,12 @@ func applyCloakingInternal(
 		}
 		return payload, false, nil
 	}
+	// Fork 的 legacy custom Claude API-key 请求不自动向 user 正文插入日期。
+	// 真实 OAuth、其他 provider、官方端点和显式新版指纹继续使用上游日期策略。
+	_, configuredBaseURL := claudeCreds(auth)
+	claudeProvider := auth == nil || strings.TrimSpace(auth.Provider) == "" || strings.EqualFold(strings.TrimSpace(auth.Provider), "claude")
+	legacyCustomBody := claudeProvider && !policy.OAuth && claudeLegacyFingerprintCompatibility(cfg, auth) &&
+		strings.TrimSpace(configuredBaseURL) != "" && !isAnthropicUpstreamBase(configuredBaseURL)
 	isExplicit := (len(explicitCacheMode) > 0 && explicitCacheMode[0]) || isExplicitPromptCacheModeContext(ctx)
 	// Strict mode drops caller system prompts entirely, so nothing needs a
 	// destination and an unusable block cannot lose information.
@@ -1845,7 +1872,7 @@ func applyCloakingInternal(
 	if pinnedDate == "" {
 		pinnedDate = claudeCodeLocalDate(claudeCodeCurrentTime(cfg, auth))
 	}
-	if !isProbeOrHelper && claudeSessionDatePinRetention(cfg) > 0 {
+	if !legacyCustomBody && !isProbeOrHelper && claudeSessionDatePinRetention(cfg) > 0 {
 		// Strip a string-form caller reminder before the pipeline turns the
 		// content into blocks, so user text is never dropped with it.
 		payload = stripFirstUserClaudeCodeCurrentDateReminder(payload)
@@ -1865,7 +1892,7 @@ func applyCloakingInternal(
 			payload = applyClaudeLegacyStrictSystemInstructions(payload, billingText)
 			payload = alignClaudeCloakedBillingBuild(payload, billingVersion)
 		} else {
-			payload = checkSystemInstructionsWithSigningModeAt(
+			payload = checkSystemInstructionsWithDatePolicy(
 				payload,
 				settings.strictMode,
 				cchSigning,
@@ -1877,6 +1904,7 @@ func applyCloakingInternal(
 				prevReq,
 				promptID,
 				!policy.OAuth, // OAuth top-level caller prompts trigger Anthropic's third-party classifier (#6432).
+				!legacyCustomBody,
 				turnOriginArgs...,
 			)
 		}
