@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
@@ -46,7 +47,7 @@ func newClaudeWireProbeRequest(t *testing.T, rawURL string) *http.Request {
 	req := httptest.NewRequest(http.MethodPost, rawURL, strings.NewReader("{}"))
 	req.Header = http.Header{}
 	body := []byte(`{"model":"claude-opus-5","messages":[{"role":"user","content":"hi"}]}`)
-	if err := applyClaudeHeaders(req, auth, "sk-ant-oat01-wire", false, nil, body, nil, nil, false); err != nil {
+	if err := applyClaudeHeaders(req, auth, "sk-ant-oat01-wire", false, nil, body, wireReplayFixture235(), nil, false); err != nil {
 		t.Fatalf("applyClaudeHeaders: %v", err)
 	}
 	// Mirror the production sequence: the casing pass runs at the send boundary,
@@ -63,7 +64,7 @@ func TestApplyClaudeHeaders_LeavesHeadersCanonicalForThePipeline(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages?beta=true", strings.NewReader("{}"))
 	req.Header = http.Header{}
 	body := []byte(`{"model":"claude-opus-5","messages":[{"role":"user","content":"hi"}]}`)
-	if err := applyClaudeHeaders(req, auth, "sk-ant-oat01-wire", false, nil, body, nil, nil, false); err != nil {
+	if err := applyClaudeHeaders(req, auth, "sk-ant-oat01-wire", false, nil, body, wireReplayFixture235(), nil, false); err != nil {
 		t.Fatalf("applyClaudeHeaders: %v", err)
 	}
 	for canonical := range claudeWireHeaderCasing {
@@ -216,4 +217,10 @@ func TestClaudeExecutorHasSingleUpstreamSendBoundary(t *testing.T) {
 			t.Errorf("%s does not route through doClaudeUpstreamRequest", name)
 		}
 	}
+}
+
+// 捕获的完整wire合同显式开启replay；默认OAuth负控单独保留。
+func wireReplayFixture235() *config.Config {
+	enabled := true
+	return &config.Config{ClaudeHeaderDefaults: config.ClaudeHeaderDefaults{ReplayWireHeaderOrder: &enabled}}
 }
