@@ -1684,16 +1684,17 @@ func applyClaudeHeadersWithNativeProfile(
 	// and non-streaming requests. Claude Code 2.1.258 Haiku helpers offer the same
 	// full compression set as the main thread (2.1.220's minimal probe offered gzip
 	// only). Confirmed helpers preserve the incoming native values.
+	// 默认 fork streaming 保持 SSE/identity；明确 native/pin/profile 继续新版协商。
+	legacyStreamTransport := !confirmedClaudeCode && !hd.PinSoftwareBaseline &&
+		claudeFingerprintProfileFromConfig(cfg, auth) == claudeFingerprintProfileDefault
 	applyTransportNegotiation := func() {
 		if helperProfile {
 			identityHeader("Accept", "application/json")
 			identityHeader("Accept-Encoding", "gzip, deflate, br, zstd")
 			return
 		}
-		if stream && !isAnthropicBase {
-			// Other Anthropic-compatible upstreams (Kimi, custom gateways) may select
-			// SSE from Accept and need not compress predictably, so they keep the
-			// conservative contract.
+		if stream && (!isAnthropicBase || legacyStreamTransport) {
+			// legacy 默认流与自定义兼容端点保留原 SSE/无压缩合同。
 			r.Header.Set("Accept", "text/event-stream")
 			r.Header.Set("Accept-Encoding", "identity")
 			return
