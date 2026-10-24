@@ -62,7 +62,7 @@ func runOpenAIStreamErrorTest(t *testing.T, endpoint string, body string) {
 			manager := coreauth.NewManager(nil, nil, nil)
 			manager.RegisterExecutor(executor)
 			authID := fmt.Sprintf("initial-failure-auth-%s-%d", strings.ReplaceAll(endpoint, "/", "-"), idx)
-			auth := &coreauth.Auth{ID: authID, Provider: executor.Identifier(), Status: coreauth.StatusActive}
+			auth := &coreauth.Auth{ProxyURL: "direct", ID: authID, Provider: executor.Identifier(), Status: coreauth.StatusActive}
 			if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
 				t.Errorf("register auth %d: %v", idx, errRegister)
 				return
@@ -139,7 +139,7 @@ func TestChatCompletionsHandlerSendKeepAliveBeforeFTWritesSSEErrorOnFailure(t *t
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
 	model := "pre-ft-keepalive-chat-model"
-	auth := &coreauth.Auth{ID: "pre-ft-keepalive-chat-auth", Provider: executor.Identifier(), Status: coreauth.StatusActive}
+	auth := &coreauth.Auth{ProxyURL: "direct", ID: "pre-ft-keepalive-chat-auth", Provider: executor.Identifier(), Status: coreauth.StatusActive}
 	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
 		t.Fatalf("register auth: %v", errRegister)
 	}
@@ -200,7 +200,7 @@ func TestCompletionsHandlerSendKeepAliveBeforeFTWritesSSEErrorOnFailure(t *testi
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
 	model := "pre-ft-keepalive-completions-model"
-	auth := &coreauth.Auth{ID: "pre-ft-keepalive-completions-auth", Provider: executor.Identifier(), Status: coreauth.StatusActive}
+	auth := &coreauth.Auth{ProxyURL: "direct", ID: "pre-ft-keepalive-completions-auth", Provider: executor.Identifier(), Status: coreauth.StatusActive}
 	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
 		t.Fatalf("register auth: %v", errRegister)
 	}

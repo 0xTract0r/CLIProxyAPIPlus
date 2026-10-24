@@ -961,6 +961,7 @@ func newVideoAuthTestHandler(t *testing.T, executor *videoAuthCaptureExecutor, a
 	manager := coreauth.NewManager(nil, &coreauth.RoundRobinSelector{}, nil)
 	manager.RegisterExecutor(executor)
 	auth := &coreauth.Auth{
+		ProxyURL: "direct",
 		ID:       authID,
 		Provider: "xai",
 		Status:   coreauth.StatusActive,
