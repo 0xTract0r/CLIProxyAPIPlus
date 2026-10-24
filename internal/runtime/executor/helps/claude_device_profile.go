@@ -1568,6 +1568,37 @@ func ApplyClaudeDefaultDeviceProfileHeaders(r *http.Request, cfg *config.Config)
 	ApplyClaudeDeviceProfileHeaders(r, defaultClaudeDeviceProfile(cfg))
 }
 
+// ApplyClaudeLegacyCompatibilityHeaders 保留 fork 未启用稳定化时的调用方软件字段。
+// 仅由无显式 pin/profile 的 legacy 路径调用；账号自定义头仍在调用方最后覆盖。
+func ApplyClaudeLegacyCompatibilityHeaders(r *http.Request, ginHeaders http.Header, cfg *config.Config) {
+	if r == nil {
+		return
+	}
+	profile := defaultClaudeDeviceProfile(cfg)
+	miscEnsure := func(name, fallback string) {
+		if strings.TrimSpace(r.Header.Get(name)) != "" {
+			return
+		}
+		if incoming := strings.TrimSpace(ginHeaders.Get(name)); incoming != "" {
+			r.Header.Set(name, incoming)
+			return
+		}
+		r.Header.Set(name, fallback)
+	}
+	miscEnsure("X-Stainless-Runtime-Version", profile.RuntimeVersion)
+	miscEnsure("X-Stainless-Package-Version", profile.PackageVersion)
+	miscEnsure("X-Stainless-Os", mapStainlessOS())
+	miscEnsure("X-Stainless-Arch", mapStainlessArch())
+	if strings.TrimSpace(r.Header.Get("User-Agent")) != "" {
+		return
+	}
+	if clientUA := strings.TrimSpace(ginHeaders.Get("User-Agent")); isClaudeCodeClient(clientUA) {
+		r.Header.Set("User-Agent", clientUA)
+		return
+	}
+	r.Header.Set("User-Agent", profile.UserAgent)
+}
+
 func ApplyClaudeLegacyDeviceHeaders(r *http.Request, ginHeaders http.Header, cfg *config.Config, confirmedClaudeCode bool, keepNewerVersions ...bool) {
 	if r == nil {
 		return

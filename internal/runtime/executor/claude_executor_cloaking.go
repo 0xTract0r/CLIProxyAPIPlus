@@ -399,6 +399,24 @@ func collectForwardedClaudeSystemPromptBlocksWithCache(system gjson.Result) []fo
 	return blocks
 }
 
+// 明确 strict + legacy 时复用 fork 原模板；普通及显式原生策略仍走新版最小模板。
+func applyClaudeLegacyStrictSystemInstructions(payload []byte, billingText string) []byte {
+	staticPrompt := strings.Join([]string{
+		helps.ClaudeCodeIntro,
+		helps.ClaudeCodeSystem,
+		helps.ClaudeCodeDoingTasks,
+		helps.ClaudeCodeToneAndStyle,
+		helps.ClaudeCodeOutputEfficiency,
+	}, "\n\n")
+	blocks := []string{
+		buildTextBlock(billingText, nil),
+		buildTextBlock(claudeCodeCLIIdentity, nil),
+		buildTextBlock(staticPrompt, nil),
+	}
+	payload, _ = sjson.SetRawBytes(payload, "system", []byte("["+strings.Join(blocks, ",")+"]"))
+	return payload
+}
+
 func checkSystemInstructionsWithSigningModeAt(
 	payload []byte,
 	strictMode bool,
@@ -1842,20 +1860,26 @@ func applyCloakingInternal(
 		turnOriginArgs = append(turnOriginArgs, "explicit_cache_mode")
 	}
 	if !strings.HasPrefix(gjson.GetBytes(payload, "model").String(), "claude-3-5-haiku") {
-		payload = checkSystemInstructionsWithSigningModeAt(
-			payload,
-			settings.strictMode,
-			cchSigning,
-			billingVersion,
-			entrypoint,
-			workload,
-			pinnedDate,
-			isSubagent,
-			prevReq,
-			promptID,
-			!policy.OAuth, // OAuth top-level caller prompts trigger Anthropic's third-party classifier (#6432).
-			turnOriginArgs...,
-		)
+		if settings.strictMode && claudeLegacyFingerprintCompatibility(cfg, auth) {
+			billingText := generateBillingHeader(cchSigning, billingVersion, claudeBillingFingerprintMessageText(payload), entrypoint, workload, isSubagent, prevReq, promptID, turnOriginArgs...)
+			payload = applyClaudeLegacyStrictSystemInstructions(payload, billingText)
+			payload = alignClaudeCloakedBillingBuild(payload, billingVersion)
+		} else {
+			payload = checkSystemInstructionsWithSigningModeAt(
+				payload,
+				settings.strictMode,
+				cchSigning,
+				billingVersion,
+				entrypoint,
+				workload,
+				pinnedDate,
+				isSubagent,
+				prevReq,
+				promptID,
+				!policy.OAuth, // OAuth top-level caller prompts trigger Anthropic's third-party classifier (#6432).
+				turnOriginArgs...,
+			)
+		}
 	}
 
 	// In native Claude Code 2.1.258, claude-fable-5-1 requests carry:

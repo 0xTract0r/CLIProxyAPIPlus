@@ -1231,6 +1231,13 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 	)
 }
 
+// 显式 pin/profile 沿用新版原生策略；关闭稳定化的默认路径保留 fork legacy 合同。
+func claudeLegacyFingerprintCompatibility(cfg *config.Config, auth *cliproxyauth.Auth) bool {
+	return !helps.ClaudeDeviceProfileStabilizationEnabled(cfg) &&
+		(cfg == nil || !cfg.ClaudeHeaderDefaults.PinSoftwareBaseline) &&
+		claudeFingerprintProfileFromConfig(cfg, auth) == claudeFingerprintProfileDefault
+}
+
 func applyClaudeHeadersWithNativeProfile(
 	r *http.Request,
 	auth *cliproxyauth.Auth,
@@ -1700,6 +1707,8 @@ func applyClaudeHeadersWithNativeProfile(
 	if stabilizeDeviceProfile {
 		helps.ApplyClaudeDeviceProfileHeaders(r, deviceProfile)
 		helps.AlignClaudeDeviceProfileUserAgentSuffix(cfg, r, helps.HeaderValueCaseInsensitive(incomingHeaders, "User-Agent"))
+	} else if claudeLegacyFingerprintCompatibility(cfg, auth) {
+		helps.ApplyClaudeLegacyCompatibilityHeaders(r, incomingHeaders, cfg)
 	} else {
 		helps.ApplyClaudeLegacyDeviceHeaders(r, incomingHeaders, cfg, confirmedClaudeCode)
 	}
