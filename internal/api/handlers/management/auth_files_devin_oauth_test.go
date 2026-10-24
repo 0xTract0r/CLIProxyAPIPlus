@@ -223,8 +223,9 @@ func TestCompleteDevinOAuthFailures(t *testing.T) {
 			h.completeDevinOAuth(context.Background(), authDir, state, "verifier", service)
 			_, status, ok := GetOAuthSession(state)
 			if test.cancelDuringCreate {
-				if ok {
-					t.Fatal("cancelled session was recreated")
+				// Fork keeps a visible cancellation tombstone; it must never become pending again.
+				if !ok || status != oauthSessionStatusCancelled || IsOAuthSessionPending(state, "devin") {
+					t.Fatalf("cancelled session resumed or lost its tombstone: status=%q exists=%v", status, ok)
 				}
 			} else if !ok || status != test.want {
 				t.Fatalf("status = %q, exists = %v; want %q", status, ok, test.want)

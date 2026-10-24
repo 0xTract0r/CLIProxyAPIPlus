@@ -267,6 +267,15 @@ func TestSIWCBindRejectsInvalidCallbacksWithoutExchange(t *testing.T) {
 
 func TestSIWCBindDuplicateAndCancellation(t *testing.T) {
 	f := setupSIWCFlow(t, true)
+	before, _ := f.manager.GetByID(f.auth.ID)
+	beforeMetadata, errMarshal := json.Marshal(before.Metadata)
+	if errMarshal != nil {
+		t.Fatal(errMarshal)
+	}
+	beforeDisk, errRead := os.ReadFile(f.path)
+	if errRead != nil {
+		t.Fatal(errRead)
+	}
 	state, flow := f.start(t)
 	duplicate := siwcRequest(t, f.router, http.MethodPost, "/bind", map[string]any{"name": f.auth.FileName})
 	if duplicate.Code != http.StatusConflict {
@@ -292,8 +301,23 @@ func TestSIWCBindDuplicateAndCancellation(t *testing.T) {
 	if got.Metadata["use_siwc"] == true || f.service.calls.Load() != 1 {
 		t.Fatal("cancelled or duplicate exchange committed")
 	}
-	if w := siwcRequest(t, f.router, http.MethodPost, "/callback", body); w.Code != http.StatusNotFound {
-		t.Fatal("cancelled callback accepted")
+	if w := siwcRequest(t, f.router, http.MethodPost, "/callback", body); w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), "no longer accepting callbacks") {
+		t.Fatalf("cancelled callback was not rejected: %d %s", w.Code, w.Body.String())
+	}
+	if _, status, ok := GetOAuthSession(state); !ok || status != oauthSessionStatusCancelled || IsOAuthSessionPending(state, "codex") {
+		t.Fatalf("cancelled tombstone changed: status=%q exists=%v", status, ok)
+	}
+	after, _ := f.manager.GetByID(f.auth.ID)
+	afterMetadata, errMarshal := json.Marshal(after.Metadata)
+	if errMarshal != nil {
+		t.Fatal(errMarshal)
+	}
+	afterDisk, errRead := os.ReadFile(f.path)
+	if errRead != nil {
+		t.Fatal(errRead)
+	}
+	if f.service.calls.Load() != 1 || string(beforeMetadata) != string(afterMetadata) || string(beforeDisk) != string(afterDisk) || after.RegistrationEpoch != before.RegistrationEpoch || after.CredentialVersion != before.CredentialVersion {
+		t.Fatal("cancelled callback changed credentials, disk, epoch, or exchange count")
 	}
 }
 
@@ -668,6 +692,12 @@ func TestSIWCBindLegacyUploadDuringCommitWindow(t *testing.T) {
 	}
 	if got.Metadata["note"] != "uploaded-during-commit" || got.Metadata["access_token"] != "uploaded-outer" {
 		t.Fatalf("unexpected in-memory metadata after upload: %#v", got.Metadata)
+	}
+	if disk["refresh_token"] != "uploaded-refresh" || got.Metadata["refresh_token"] != "uploaded-refresh" {
+		t.Fatal("uploaded outer refresh token was rolled back")
+	}
+	if got.RegistrationEpoch != f.auth.RegistrationEpoch || got.Index != f.auth.Index || !got.CreatedAt.Equal(f.auth.CreatedAt) || got.CredentialVersion <= f.auth.CredentialVersion {
+		t.Fatal("upload changed logical identity or failed to advance credential version")
 	}
 	if disk["use_siwc"] != got.Metadata["use_siwc"] {
 		t.Fatalf("disk and memory disagree on use_siwc: disk=%v memory=%v", disk["use_siwc"], got.Metadata["use_siwc"])

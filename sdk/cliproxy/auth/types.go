@@ -1447,7 +1447,8 @@ func tokenOwnedFreshness(a *Auth) time.Time {
 		return time.Time{}
 	}
 	latest := a.LastRefreshedAt
-	if exp, ok := a.ExpirationTime(); ok && exp.After(latest) {
+	// This guard owns outer token fields; active SIWC expiration is independent.
+	if exp, ok := a.OuterExpirationTime(); ok && exp.After(latest) {
 		latest = exp
 	}
 	if a.Metadata != nil {
