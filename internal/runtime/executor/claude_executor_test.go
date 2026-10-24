@@ -2868,39 +2868,23 @@ func TestClaudeExecutor_CountTokensCloakStrictModeDropsCallerSystem(t *testing.T
 }
 
 func TestClaudeExecutor_CountTokensConfirmedNativePreservesMeasuredOAuthBody(t *testing.T) {
-	var upstreamBody []byte
-	var upstreamHeaders http.Header
-	transport := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
-		var errRead error
-		upstreamBody, errRead = io.ReadAll(req.Body)
-		if errRead != nil {
-			t.Fatal(errRead)
-		}
-		upstreamHeaders = req.Header.Clone()
-		return &http.Response{
-			StatusCode: http.StatusOK,
-			Header:     http.Header{"Content-Type": []string{"application/json"}},
-			Body:       io.NopCloser(strings.NewReader(`{"input_tokens":34}`)),
-			Request:    req,
-		}, nil
-	})
-	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", http.RoundTripper(transport))
-	executor := NewClaudeExecutor(&config.Config{})
+	if !codexRefreshSandboxChild(t) {
+		return
+	}
 	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "sk-ant-oat-native-count-shape"}}
 	payload := []byte(`{"model":"claude-opus-5","messages":[{"role":"user","content":[{"type":"text","text":"x"}]}],"tools":[]}`)
 	incomingBetas := "claude-code-20250219,interleaved-thinking-2025-05-14,context-management-2025-06-27,token-counting-2024-11-01"
 	wantBetas := "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,token-counting-2024-11-01"
-	_, errCount := executor.countTokensUpstream(ctx, auth, cliproxyexecutor.Request{Model: "claude-opus-5", Payload: payload}, cliproxyexecutor.Options{
+	opts := cliproxyexecutor.Options{
 		SourceFormat: sdktranslator.FormatClaude,
 		Headers: http.Header{
 			"User-Agent":     {"claude-cli/2.1.280 (external, cli)"},
 			"X-App":          {"cli"},
 			"Anthropic-Beta": {incomingBetas},
 		},
-	})
-	if errCount != nil {
-		t.Fatalf("countTokensUpstream() error = %v", errCount)
 	}
+	upstreamBody, upstreamHeaders := countGo243Official(t, payload, &config.Config{}, auth, opts)
+	t.Logf("AFTER_GO_TLS beta_fields=%v", upstreamHeaders.Values("Anthropic-Beta"))
 	if !bytes.Equal(upstreamBody, payload) {
 		t.Fatalf("confirmed native count body changed\n got: %s\nwant: %s", upstreamBody, payload)
 	}
@@ -2909,7 +2893,11 @@ func TestClaudeExecutor_CountTokensConfirmedNativePreservesMeasuredOAuthBody(t *
 			t.Fatalf("confirmed native count body %s = %s, want absent", field, got.Raw)
 		}
 	}
-	if got := strings.Join(upstreamHeaders["anthropic-beta"], ","); got != wantBetas {
+	beta, betaErr := uniqueCountHeader243(upstreamHeaders, "Anthropic-Beta")
+	if betaErr != nil {
+		t.Fatal(betaErr)
+	}
+	if got := beta; got != wantBetas {
 		t.Fatalf("confirmed native count beta = %q, want %q", got, wantBetas)
 	}
 	if got := upstreamHeaders.Get("X-Stainless-Timeout"); got != "" {
