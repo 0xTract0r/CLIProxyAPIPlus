@@ -3,6 +3,7 @@ package executor
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"io"
 	"net/http"
@@ -127,6 +128,31 @@ func validateClaudeTokenCountRequest(body []byte) error {
 	return nil
 }
 
+// claudeLegacyCountPayloadCCH复现F非OAuth摘要的preimage：caller system转发后、
+// 注入billing/system模板前的payload。仅供custom Count旧SHA兼容，不是最终正文签名。
+func claudeLegacyCountPayloadCCH(payload []byte, strictMode bool) string {
+	if !strictMode {
+		var parts []string
+		system := gjson.GetBytes(payload, "system")
+		if system.IsArray() {
+			for _, part := range system.Array() {
+				if part.Get("type").String() == "text" {
+					if text := strings.TrimSpace(part.Get("text").String()); text != "" {
+						parts = append(parts, text)
+					}
+				}
+			}
+		} else if system.Type == gjson.String && strings.TrimSpace(system.String()) != "" {
+			parts = append(parts, strings.TrimSpace(system.String()))
+		}
+		if len(parts) > 0 {
+			payload = prependToFirstUserMessage(payload, strings.Join(parts, "\n\n"))
+		}
+	}
+	sum := sha256.Sum256(payload)
+	return fmt.Sprintf("%x", sum[:])[:5]
+}
+
 func shouldUseClaudeUpstreamTokenCount(apiKey, baseURL string) bool {
 	return strings.TrimSpace(apiKey) != "" && isAnthropicUpstreamBase(baseURL)
 }
@@ -182,33 +208,51 @@ func (e *ClaudeExecutor) countTokensUpstream(ctx context.Context, auth *cliproxy
 	}
 
 	directAnthropic := isAnthropicUpstreamBase(baseURL)
-	// Claude Code's count_tokens carries only model, messages and tools, so the
-	// full Messages cloaking must not run here for any origin. Apply the parts
-	// that still have to hold: relocate the caller's system prompt into messages
-	// so its tokens stay counted, and obfuscate sensitive words exactly like the
-	// Messages path. Kimi opt-in uses the same contract.
+	// 官方/显式原生profile与其他provider沿用native Count形状；普通Claude gateway保fork职责。
+	customClaudeCount := !directAnthropic && (auth == nil || strings.TrimSpace(auth.Provider) == "" || strings.EqualFold(strings.TrimSpace(auth.Provider), "claude")) &&
+		claudeFingerprintProfileFromConfig(e.cfg, auth) == claudeFingerprintProfileDefault
 	policy, settings := resolveClaudeWirePolicy(e.cfg, auth, apiKey, confirmedClaudeCode, helps.HeaderValueCaseInsensitive(incomingHeaders, "User-Agent"))
 	cloaked := policy.Cloak
 	explicitCacheMode := isExplicitPromptCacheMode(originalPayload, req.Payload, body)
-	if cloaked {
-		if !settings.strictMode {
-			if errSystem := validateClaudeCallerSystemBlocks(gjson.GetBytes(body, "system")); errSystem != nil {
-				return cliproxyexecutor.Response{}, errSystem
+	useCCHSigning := customClaudeCount && (policy.OAuth || experimentalCCHSigningEnabled(e.cfg, auth))
+	if customClaudeCount {
+		legacyCCH := ""
+		var legacyCCHOutput *string
+		if cloaked && !useCCHSigning && !strings.HasPrefix(baseModel, "claude-3-5-haiku") {
+			legacyCCHOutput = &legacyCCH
+		}
+		ctx = helps.WithIncomingHeaders(ctx, incomingHeaders)
+		body, cloaked, err = applyCloakingWithDeviceIdentityPolicy(ctx, e.cfg, auth, body, apiKey, confirmedClaudeCode, useCCHSigning, true, false, legacyCCHOutput, explicitCacheMode)
+		if err != nil {
+			return cliproxyexecutor.Response{}, err
+		}
+		if legacyCCH != "" {
+			billing := gjson.GetBytes(body, "system.0.text").String()
+			if strings.HasPrefix(billing, "x-anthropic-billing-header:") {
+				billing = claudeBillingHeaderEntrypointPattern.ReplaceAllStringFunc(billing, func(entrypoint string) string { return entrypoint + " cch=" + legacyCCH + ";" })
+				body, _ = sjson.SetBytes(body, "system.0.text", billing)
 			}
 		}
-		if !strings.HasPrefix(baseModel, "claude-3-5-haiku") {
-			if policy.OAuth && !settings.strictMode {
-				body = neutralizeClaudeOAuthCallerSystem(body)
+	} else {
+		if cloaked {
+			if !settings.strictMode {
+				if errSystem := validateClaudeCallerSystemBlocks(gjson.GetBytes(body, "system")); errSystem != nil {
+					return cliproxyexecutor.Response{}, errSystem
+				}
 			}
-			body = relocateClaudeSystemPromptForCountTokensWithPolicy(body, settings.strictMode, explicitCacheMode, !policy.OAuth)
+			if !strings.HasPrefix(baseModel, "claude-3-5-haiku") {
+				if policy.OAuth && !settings.strictMode {
+					body = neutralizeClaudeOAuthCallerSystem(body)
+				}
+				body = relocateClaudeSystemPromptForCountTokensWithPolicy(body, settings.strictMode, explicitCacheMode, !policy.OAuth)
+			}
+			if len(settings.sensitiveWords) > 0 {
+				body = helps.ObfuscateSensitiveWords(body, helps.BuildSensitiveWordMatcher(settings.sensitiveWords))
+			}
+		} else if policy.Uncloak {
+			body = uncloakClaudeCodePayload(body, confirmedClaudeCode)
 		}
-		if len(settings.sensitiveWords) > 0 {
-			body = helps.ObfuscateSensitiveWords(body, helps.BuildSensitiveWordMatcher(settings.sensitiveWords))
-		}
-	} else if policy.Uncloak {
-		body = uncloakClaudeCodePayload(body, confirmedClaudeCode)
 	}
-
 	// Keep count_tokens requests compatible with Anthropic cache-control constraints too.
 	body = enforceCacheControlLimit(body, 4)
 	if !explicitCacheMode {
@@ -240,7 +284,7 @@ func (e *ClaudeExecutor) countTokensUpstream(ctx context.Context, auth *cliproxy
 	// Only an explicit claude-code-cli profile aligns the shape, and then it aligns
 	// to the measured one: Claude Code 2.1.220 count_tokens carries exactly model,
 	// messages and tools, never a system block.
-	alignCLICountTokensShape := fp.ProfileClaudeCodeCLI
+	alignCLICountTokensShape := fp.ProfileClaudeCodeCLI && !customClaudeCount
 	if directAnthropic || alignCLICountTokensShape {
 		body, _ = sjson.DeleteBytes(body, "metadata")
 		body, _ = sjson.DeleteBytes(body, "context_management")
@@ -263,6 +307,13 @@ func (e *ClaudeExecutor) countTokensUpstream(ctx context.Context, auth *cliproxy
 	}
 	if errHeaders := applyClaudeHeaders(httpReq, auth, apiKey, false, extraBetas, body, e.cfg, incomingHeaders, confirmedClaudeCode && !cloaked, claudeSessionID); errHeaders != nil {
 		return cliproxyexecutor.Response{}, errHeaders
+	}
+	// 最后payload规则与出站UA确定后签名；request Body/GetBody/长度及日志共用最终字节。
+	if useCCHSigning {
+		body, err = signClaudeHTTPRequestCCH(httpReq, body)
+		if err != nil {
+			return cliproxyexecutor.Response{}, fmt.Errorf("sign Claude count CCH: %w", err)
+		}
 	}
 	e.persistClaudeDeviceHighWater(auth, apiKey)
 	var authID, authLabel, authType, authValue string

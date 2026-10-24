@@ -1815,6 +1815,22 @@ func applyCloakingInternal(
 	obfuscateSensitiveWords bool,
 	explicitCacheMode ...bool,
 ) ([]byte, bool, error) {
+	return applyCloakingWithDeviceIdentityPolicy(ctx, cfg, auth, payload, apiKey, confirmedClaudeCode, cchSigning, obfuscateSensitiveWords, true, nil, explicitCacheMode...)
+}
+
+func applyCloakingWithDeviceIdentityPolicy(
+	ctx context.Context,
+	cfg *config.Config,
+	auth *cliproxyauth.Auth,
+	payload []byte,
+	apiKey string,
+	confirmedClaudeCode bool,
+	cchSigning bool,
+	obfuscateSensitiveWords bool,
+	fabricateDeviceIdentity bool,
+	legacyCountCCH *string,
+	explicitCacheMode ...bool,
+) ([]byte, bool, error) {
 	policy, settings := resolveClaudeWirePolicy(cfg, auth, apiKey, confirmedClaudeCode, getClientUserAgent(ctx))
 	// The account-bound device ID also applies to confirmed native clients and
 	// cloak=never; it must run before the broader-cloaking early return.
@@ -1822,12 +1838,17 @@ func applyCloakingInternal(
 	if cfg != nil {
 		authDir = cfg.AuthDir
 	}
-	payload = helps.InjectAccountDeviceID(payload, authDir, auth, apiKey)
+	payload = helps.InjectAccountDeviceIDWithOptions(payload, authDir, auth, apiKey, fabricateDeviceIdentity)
 	if !policy.Cloak {
 		if policy.Uncloak {
 			payload = uncloakClaudeCodePayload(payload, confirmedClaudeCode)
 		}
 		return payload, false, nil
+	}
+	// Count 的旧 SHA 在真实账号身份改写后、billing/system 注入前取 preimage。
+	// Messages 和 OAuth Count 不请求此兼容摘要。
+	if legacyCountCCH != nil {
+		*legacyCountCCH = claudeLegacyCountPayloadCCH(payload, settings.strictMode)
 	}
 	// Fork 的 legacy custom Claude API-key 请求不自动向 user 正文插入日期。
 	// 真实 OAuth、其他 provider、官方端点和显式新版指纹继续使用上游日期策略。
