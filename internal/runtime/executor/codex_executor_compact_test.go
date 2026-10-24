@@ -105,6 +105,7 @@ func TestCodexExecutorCompactUseSIWCAppliesSIWCRulesBeforePayloadFinalizer(t *te
 	}
 	executor := NewCodexExecutor(cfg)
 	auth := &cliproxyauth.Auth{
+		ProxyURL: "direct",
 		ID:       "codex-siwc-compact",
 		Provider: "codex",
 		Attributes: map[string]string{

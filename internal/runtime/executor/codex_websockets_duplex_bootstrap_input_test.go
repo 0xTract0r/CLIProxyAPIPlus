@@ -92,7 +92,7 @@ func TestCodexDuplexBootstrapPreservesFollowup(t *testing.T) {
 			manager.RegisterExecutor(executor)
 			model := "duplex-bootstrap-followup-model"
 			for i, key := range []string{"bad-key", "good-key"} {
-				candidate := &auth.Auth{ID: fmt.Sprintf("%s-%d", t.Name(), i), Provider: "codex", Status: auth.StatusActive, Attributes: map[string]string{
+				candidate := &auth.Auth{ProxyURL: "direct", ID: fmt.Sprintf("%s-%d", t.Name(), i), Provider: "codex", Status: auth.StatusActive, Attributes: map[string]string{
 					"api_key": key, "base_url": upstream.URL, "websockets": "true", "priority": fmt.Sprint(4 - i),
 				}}
 				registry.GetGlobalRegistry().RegisterClient(candidate.ID, "codex", []*registry.ModelInfo{{ID: model}})
