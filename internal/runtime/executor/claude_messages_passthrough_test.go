@@ -14,6 +14,7 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 func directClaudeMessagesContext() context.Context {
@@ -34,6 +35,7 @@ func TestApplyClaudeCloak_DirectMessagesPreservesCallerBody(t *testing.T) {
 
 	authNever := directClaudeOAuthAuth()
 	authNever.Attributes["cloak_mode"] = "never"
+	authNever.Attributes[cliproxyauth.ClaudeDeviceIDAttributeKey] = strings.Repeat("a", 64)
 	got, cloaked, err := applyCloaking(directClaudeMessagesContext(), &config.Config{}, authNever, payload, "sk-ant-oat-direct-messages-test", false, true)
 	if err != nil {
 		t.Fatalf("applyCloaking() error = %v", err)
@@ -41,8 +43,14 @@ func TestApplyClaudeCloak_DirectMessagesPreservesCallerBody(t *testing.T) {
 	if cloaked {
 		t.Fatal("applyCloaking() cloaked = true, want direct Messages passthrough when cloak_mode is never")
 	}
-	if !bytes.Equal(got, payload) {
-		t.Fatalf("direct Messages body changed: got %s, want %s", got, payload)
+	// SD15: never bypasses broad cloaking, but OAuth still binds account device identity.
+	identity := gjson.GetBytes(got, "metadata.user_id").String()
+	if len(gjson.GetBytes(got, "metadata").Map()) != 1 || !helps.IsValidUserID(identity) || gjson.Get(identity, "device_id").String() != strings.Repeat("a", 64) {
+		t.Fatal("never bypassed saved account device identity")
+	}
+	withoutIdentity, errDelete := sjson.DeleteBytes(got, "metadata")
+	if errDelete != nil || !bytes.Equal(withoutIdentity, payload) {
+		t.Fatalf("direct Messages business body changed: got %s, want %s", withoutIdentity, payload)
 	}
 }
 
