@@ -1772,6 +1772,12 @@ func (h *Handler) TestAuthFileMessage(c *gin.Context) {
 			selectedAuthID = strings.TrimSpace(authID)
 		},
 	}
+	if provider == "claude" {
+		// Management probes have no client session. Reuse an account-scoped
+		// internal identity so repeated probes share one fully metered binding.
+		sessionHash := sha256.Sum256([]byte(auth.ID))
+		metadata[cliproxyexecutor.ExecutionSessionMetadataKey] = fmt.Sprintf("management-test:%x", sessionHash[:16])
+	}
 	execReq := cliproxyexecutor.Request{
 		Model:    model,
 		Payload:  payload,
