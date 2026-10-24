@@ -194,7 +194,7 @@ func TestClaudeExecutor_NativeToolSearchFallbackMatchesDev(t *testing.T) {
 			}
 			got := captureNativeToolSearchBody(t, &config.Config{}, tc.send, tc.auth, tc.model, payload, original)
 			want := captureNativeToolSearchBody(t, &config.Config{}, tc.send, tc.auth, tc.model, stripped, strippedOriginal)
-			if !bytes.Equal(got, want) {
+			if !bytes.Equal(normalizeToolSearchSession451(t, got), normalizeToolSearchSession451(t, want)) {
 				t.Fatalf("fallback body differs from the pre-tool-search translation:\n got: %s\nwant: %s", got, want)
 			}
 			assertDevToolSearchBody(t, got)

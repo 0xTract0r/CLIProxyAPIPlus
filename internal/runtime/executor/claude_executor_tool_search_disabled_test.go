@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strings"
 	"testing"
@@ -120,7 +121,19 @@ func TestClaudeExecutor_ToolSearchDisabledMatchesDevGolden(t *testing.T) {
 		t.Fatalf("rendered %d bodies, golden has %d", len(got), len(want))
 	}
 	for name, body := range got {
-		if body != want[name] {
+		expected := want[name]
+		if name == "gateway/count_tokens" {
+			// 固定F对自定义网关也发count_tokens；dev空golden记录的是U本地估算，不是空任务合同。
+			if expected != "" {
+				t.Fatal("unexpected nonempty legacy gateway golden")
+			}
+			value, err := sjson.Set(want["official/count_tokens"], "metadata", map[string]any{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			expected = value
+		}
+		if !toolSearchGoldenContractEqual451(body, expected) {
 			t.Errorf("%s differs from dev\n got: %s\nwant: %s", name, body, want[name])
 		}
 	}
@@ -272,6 +285,123 @@ func TestClaudeExecutor_ToolSearchFallbackPinsTranslation(t *testing.T) {
 				if got := gjson.GetBytes(body, `tools.#(name=="`+name+`")`).Exists(); got != want {
 					t.Errorf("tool %s declared = %v, want %v: %s", name, got, want, gjson.GetBytes(body, "tools").Raw)
 				}
+			}
+		})
+	}
+}
+
+// 仅排除独立profile版本维度；任务、工具schema、引用及全部其它字段仍完整比较。
+func toolSearchGoldenContractEqual451(a, b string) bool {
+	var av, bv any
+	if json.Unmarshal([]byte(a), &av) != nil || json.Unmarshal([]byte(b), &bv) != nil {
+		return false
+	}
+	// 仅识别本fixture由executor生成的system[0]独立billing行。
+	// 整行语法识别后，只替换版本capture；caller字段、其它system块和header其余token逐值比较。
+	billing := regexp.MustCompile(`^x-anthropic-billing-header: cc_version=([0-9]+\.[0-9]+\.[0-9]+\.[0-9a-f]{3}); cc_entrypoint=(?:cli|sdk-cli); cch=[0-9a-f]+; cc_prompt_id=[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}; cc_turn_origin=(?:human|agent);$`)
+	normalizeBilling := func(value any) bool {
+		root, ok := value.(map[string]any)
+		if !ok {
+			return false
+		}
+		system, ok := root["system"].([]any)
+		if !ok || len(system) == 0 {
+			return false
+		}
+		block, ok := system[0].(map[string]any)
+		if !ok || block["type"] != "text" {
+			return false
+		}
+		text, ok := block["text"].(string)
+		if !ok {
+			return false
+		}
+		match := billing.FindStringSubmatchIndex(text)
+		if len(match) != 4 {
+			return false
+		}
+		block["text"] = text[:match[2]] + "PROFILE" + text[match[3]:]
+		return true
+	}
+	if normalizeBilling(av) != normalizeBilling(bv) {
+		return false
+	}
+	return reflect.DeepEqual(av, bv)
+}
+
+// 两次独立请求可有不同session；保留device/account和全部消息、工具字节。
+func normalizeToolSearchSession451(t *testing.T, body []byte) []byte {
+	t.Helper()
+	user := gjson.GetBytes(body, "metadata.user_id")
+	if !user.Exists() {
+		return body
+	}
+	session := gjson.Get(user.String(), "session_id").String()
+	if !regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`).MatchString(session) {
+		t.Fatalf("invalid independent session: %q", session)
+	}
+	value, err := sjson.Set(user.String(), "session_id", "independent-request-session")
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := sjson.SetBytes(body, "metadata.user_id", value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return result
+}
+
+func TestToolSearchContract451NegativeControls(t *testing.T) {
+	body := `{"messages":[{"role":"user","content":"create a calendar event"}],"tools":[{"name":"lookup_order","input_schema":{"type":"object","required":["id"]}}]}`
+	for _, path := range []string{"messages", "tools", "tools.0.input_schema.required"} {
+		changed, err := sjson.Delete(body, path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if toolSearchGoldenContractEqual451(body, changed) {
+			t.Fatalf("lost %s accepted", path)
+		}
+	}
+}
+
+func TestToolSearchBillingScope458(t *testing.T) {
+	const headerA = "x-anthropic-billing-header: cc_version=2.1.211.40b; cc_entrypoint=cli; cch=0; cc_prompt_id=ebb599d3-6b98-4fcc-bc9c-99d7dcbd62b9; cc_turn_origin=human;"
+	const headerB = "x-anthropic-billing-header: cc_version=2.1.280.283; cc_entrypoint=cli; cch=0; cc_prompt_id=ebb599d3-6b98-4fcc-bc9c-99d7dcbd62b9; cc_turn_origin=human;"
+	base := `{"system":[{"type":"text","text":""},{"type":"text","text":"caller cc_version=task-A;"}],"messages":[{"role":"user","content":"caller cc_version=task-A;"}],"tools":[{"name":"lookup_order","input_schema":{"type":"object","description":"caller cc_version=task-A;","required":["id"]}}],"metadata":{"notes":"caller cc_version=task-A;"}}`
+	set := func(body, path string, value any) string {
+		t.Helper()
+		out, err := sjson.Set(body, path, value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+	a := set(base, "system.0.text", headerA)
+	b := set(base, "system.0.text", headerB)
+	if !toolSearchGoldenContractEqual451(a, b) {
+		t.Fatal("generated billing version-only difference rejected")
+	}
+	for _, path := range []string{"messages.0.content", "tools.0.input_schema.description", "metadata.notes", "system.1.text"} {
+		t.Run(path, func(t *testing.T) {
+			if toolSearchGoldenContractEqual451(a, set(b, path, "caller cc_version=task-B;")) {
+				t.Fatal("caller version-like task mutation accepted")
+			}
+			// 即便caller值是完整header文本，也不能递归正规化。
+			if toolSearchGoldenContractEqual451(set(a, path, headerA), set(b, path, headerB)) {
+				t.Fatal("caller header-looking mutation accepted")
+			}
+		})
+	}
+	for _, tc := range []struct{ name, a, b string }{
+		{"plain-first-system", "caller cc_version=task-A;", "caller cc_version=task-B;"},
+		{"billing-with-caller-suffix", headerA + " keep task-A", headerB + " keep task-A"},
+		{"billing-entrypoint", headerA, strings.Replace(headerB, "cc_entrypoint=cli;", "cc_entrypoint=sdk-cli;", 1)},
+		{"billing-placeholder", headerA, strings.Replace(headerB, "2.1.280.283", "PROFILE", 1)},
+		{"billing-prompt-id", headerA, strings.Replace(headerB, "ebb599d3", "abb599d3", 1)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if toolSearchGoldenContractEqual451(set(a, "system.0.text", tc.a), set(b, "system.0.text", tc.b)) {
+				t.Fatal("non-version system mutation accepted")
 			}
 		})
 	}

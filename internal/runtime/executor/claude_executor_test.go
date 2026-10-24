@@ -11365,11 +11365,26 @@ func TestClaudeWireHeaderOrderReplayEnabled_DefaultFalse(t *testing.T) {
 }
 
 func TestApplyClaudeToolPrefix_NestedToolReference(t *testing.T) {
-	input := []byte(`{"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_123","content":[{"type":"tool_reference","tool_name":"mcp__nia__manage_resource"}]}]}]}`)
-	out := applyClaudeToolPrefix(input, "proxy_")
-	got := gjson.GetBytes(out, "messages.0.content.0.content.0.tool_name").String()
-	if got != "proxy_mcp__nia__manage_resource" {
-		t.Fatalf("nested tool_reference tool_name = %q, want %q", got, "proxy_mcp__nia__manage_resource")
+	for _, name := range []string{"mcp__nia__manage_resource", "lookup_order"} {
+		t.Run(name, func(t *testing.T) {
+			input := []byte(`{"tools":[{"name":"` + name + `","input_schema":{"type":"object","required":["id"],"properties":{"id":{"type":"string"}}}}],"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_123","content":[{"type":"tool_reference","tool_name":"` + name + `"}]}]}]}`)
+			out := applyClaudeToolPrefix(input, "proxy_")
+			want := name
+			if name == "lookup_order" {
+				want = "proxy_" + name
+			}
+			if got := gjson.GetBytes(out, "messages.0.content.0.content.0.tool_name").String(); got != want {
+				t.Fatalf("reference = %q, want %q", got, want)
+			}
+			if gjson.GetBytes(out, "tools.0.name").String() != want || gjson.GetBytes(out, "tools.0.input_schema").Raw != gjson.GetBytes(input, "tools.0.input_schema").Raw {
+				t.Fatal("declaration/schema changed inconsistently")
+			}
+			response := []byte(`{"content":[{"type":"tool_result","tool_use_id":"toolu_123","content":[{"type":"tool_reference","tool_name":"` + want + `"}]}]}`)
+			restored := stripClaudeToolPrefixFromResponse(response, "proxy_")
+			if gjson.GetBytes(restored, "content.0.content.0.tool_name").String() != name {
+				t.Fatal("nested reference reverse failed")
+			}
+		})
 	}
 }
 
