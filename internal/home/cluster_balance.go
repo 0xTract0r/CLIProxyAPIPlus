@@ -8,6 +8,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/redis/go-redis/v9"
 	log "github.com/sirupsen/logrus"
@@ -42,6 +43,52 @@ func (c *Client) canExecuteRebalanceLocked() bool {
 		recoveryState(c.recoveryState.Load()) == recoveryStateStable && !c.balance.moving
 }
 
+// rebalanceContextDialer 直接关闭本次独占连接，避免池 Close 的健康检查等待正在读的 fd。
+// 不包装 net.Conn，保留原 TCP/TLS 连接及其 syscall 能力；cleanup 注销或等待已触发的回调。
+func rebalanceContextDialer(ctx context.Context, dial func(context.Context, string, string) (net.Conn, error)) (func(context.Context, string, string) (net.Conn, error), func()) {
+	var mu sync.Mutex
+	retired := false
+	var callbacks []func()
+	wrapped := func(dialCtx context.Context, network, address string) (net.Conn, error) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		conn, err := dial(dialCtx, network, address)
+		if err != nil {
+			return nil, err
+		}
+		mu.Lock()
+		if retired || ctx.Err() != nil {
+			mu.Unlock()
+			_ = conn.Close()
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			return nil, context.Canceled
+		}
+		done := make(chan struct{})
+		stop := context.AfterFunc(ctx, func() { defer close(done); _ = conn.Close() })
+		callbacks = append(callbacks, func() {
+			if !stop() {
+				<-done
+			}
+		})
+		mu.Unlock()
+		return conn, nil
+	}
+	cleanup := func() {
+		mu.Lock()
+		retired = true
+		pending := callbacks
+		callbacks = nil
+		mu.Unlock()
+		for _, stop := range pending {
+			stop()
+		}
+	}
+	return wrapped, cleanup
+}
+
 // rebalanceCommand owns a cancellable transport independent of issued dispatches.
 func (c *Client) rebalanceCommand(ctx context.Context, address string, args ...any) (string, error) {
 	if errContext := ctx.Err(); errContext != nil {
@@ -58,16 +105,18 @@ func (c *Client) rebalanceCommand(ctx context.Context, address string, args ...a
 	}
 	options.ReadTimeout = -1
 	options.WriteTimeout = -1
-	options.Dialer = redis.NewDialer(options)
+	commandCtx, cancelCommand := context.WithCancel(ctx)
+	var stopDialCallbacks func()
+	options.Dialer, stopDialCallbacks = rebalanceContextDialer(commandCtx, redis.NewDialer(options))
 	command := redis.NewClient(options)
-	stopCancel := context.AfterFunc(ctx, func() { _ = command.Close() })
 	defer func() {
-		stopCancel()
+		stopDialCallbacks()
+		cancelCommand()
 		if errClose := command.Close(); errClose != nil && ctx.Err() == nil {
 			log.Debugf("Home rebalance transport close failed: %v", errClose)
 		}
 	}()
-	raw, errCommand := command.Do(ctx, args...).Text()
+	raw, errCommand := command.Do(commandCtx, args...).Text()
 	if errCommand != nil {
 		return "", fmt.Errorf("Home rebalance %v: %w", args[0], errCommand)
 	}
