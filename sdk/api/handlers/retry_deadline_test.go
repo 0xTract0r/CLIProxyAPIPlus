@@ -19,7 +19,7 @@ func TestLocalRecoveryHintsSurviveDefaultHeaderPolicyAndEnrichment(t *testing.T)
 	for _, quota := range []bool{false, true} {
 		next := time.Now().Add(time.Minute)
 		_, err := (&coreauth.RoundRobinSelector{}).Pick(context.Background(), "codex", "gpt-5.6-luna", coreexecutor.Options{}, []*coreauth.Auth{{
-			ID: "synthetic", Provider: "codex", Unavailable: true, NextRetryAfter: next,
+			ID: "synthetic", Provider: "codex", ProxyURL: "direct", Unavailable: true, NextRetryAfter: next,
 			Quota: coreauth.QuotaState{Exceeded: quota},
 		}})
 		if err == nil {

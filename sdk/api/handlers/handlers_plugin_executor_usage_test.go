@@ -627,6 +627,7 @@ func TestHandlerPluginExecutorSkipsOuterUsageWhenPluginCallsHostModelExecute(t *
 	manager.RegisterExecutor(innerExecutor)
 	auth := &coreauth.Auth{
 		ID:       "auth-" + innerModel,
+		ProxyURL: "direct",
 		Provider: innerExecutor.Identifier(),
 		Status:   coreauth.StatusActive,
 	}

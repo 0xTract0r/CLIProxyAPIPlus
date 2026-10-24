@@ -887,18 +887,21 @@ func TestExecuteModelPinsExactAuthAcrossPrioritiesWithoutFallback(t *testing.T) 
 	manager.RegisterExecutor(executor)
 
 	highAuth := &coreauth.Auth{
+		ProxyURL:   "direct",
 		ID:         "auth-high-priority",
 		Provider:   "pinned-provider",
 		Status:     coreauth.StatusActive,
 		Attributes: map[string]string{"priority": "100"},
 	}
 	lowAuth := &coreauth.Auth{
+		ProxyURL:   "direct",
 		ID:         "auth-low-priority",
 		Provider:   "pinned-provider",
 		Status:     coreauth.StatusActive,
 		Attributes: map[string]string{"priority": "0"},
 	}
 	disabledAuth := &coreauth.Auth{
+		ProxyURL:   "direct",
 		ID:         "auth-disabled",
 		Provider:   "pinned-provider",
 		Status:     coreauth.StatusActive,

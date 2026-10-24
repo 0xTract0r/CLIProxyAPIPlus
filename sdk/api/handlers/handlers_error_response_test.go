@@ -403,6 +403,7 @@ func TestEnrichAuthSelectionError_DoesNotModifyModelCooldownError(t *testing.T) 
 	next := time.Now().Add(time.Minute)
 	auth := &coreauth.Auth{
 		ID:          "auth-cool",
+		ProxyURL:    "direct",
 		Provider:    "codex",
 		Unavailable: true,
 		Quota: coreauth.QuotaState{
