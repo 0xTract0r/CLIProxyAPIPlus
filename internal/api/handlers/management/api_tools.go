@@ -1105,6 +1105,10 @@ func (h *Handler) apiCallUtlsRoundTripper(auth *coreauth.Auth, requestProxyURLs 
 		return nil, false
 	}
 	proxyURL := h.apiCallResolvedProxyURL(auth, requestProxyURLs...)
+	if _, err := proxyutil.Parse(proxyURL); err != nil {
+		// 非provider URL可能走helper的标准fallback；在此之前统一拒绝无效代理。
+		return proxyutil.BlockingRoundTripper(), true
+	}
 	rt := helps.NewUtlsRoundTripperForProfile(proxyURL, profileID)
 	if rt == nil {
 		return nil, false
@@ -1112,11 +1116,10 @@ func (h *Handler) apiCallUtlsRoundTripper(auth *coreauth.Auth, requestProxyURLs 
 	return rt, true
 }
 
-// apiCallResolvedProxyURL computes the same proxy-candidate priority chain used by
-// apiCallTransportWithDialer and returns the first non-empty candidate (empty means
-// direct egress, preserving api-call's documented "Direct connect" priority-3
-// behavior). Factored out so the uTLS and standard-library paths resolve identical
-// proxies.
+// apiCallResolvedProxyURL shares one candidate policy between uTLS and stdlib.
+// An explicit request override is authoritative, including an invalid one. After
+// an invalid inherited candidate, only a valid non-direct proxy may be selected;
+// returning the invalid value keeps both transport constructors fail-closed.
 func (h *Handler) apiCallResolvedProxyURL(auth *coreauth.Auth, requestProxyURLs ...string) string {
 	if len(requestProxyURLs) > 0 {
 		if value := strings.TrimSpace(requestProxyURLs[0]); value != "" {
@@ -1127,20 +1130,30 @@ func (h *Handler) apiCallResolvedProxyURL(auth *coreauth.Auth, requestProxyURLs 
 	if h != nil {
 		cfg = h.configSnapshot()
 	}
+	var candidates []string
 	if auth != nil {
-		if value := strings.TrimSpace(auth.ProxyURL); value != "" {
-			return value
-		}
+		candidates = append(candidates, auth.ProxyURL)
 		if cfg != nil {
-			if value := strings.TrimSpace(proxyURLFromAPIKeyConfig(cfg, auth)); value != "" {
-				return value
-			}
+			candidates = append(candidates, proxyURLFromAPIKeyConfig(cfg, auth))
 		}
 	}
 	if cfg != nil {
-		return strings.TrimSpace(cfg.ProxyURL)
+		candidates = append(candidates, cfg.ProxyURL)
 	}
-	return ""
+	invalid := ""
+	for _, candidate := range candidates {
+		setting, err := proxyutil.Parse(candidate)
+		if err != nil {
+			if invalid == "" {
+				invalid = strings.TrimSpace(candidate)
+			}
+			continue
+		}
+		if setting.Mode == proxyutil.ModeProxy || (setting.Mode == proxyutil.ModeDirect && invalid == "") {
+			return setting.Raw
+		}
+	}
+	return invalid
 }
 
 // apiCallTransportWithDialer returns the configured outbound transport along
