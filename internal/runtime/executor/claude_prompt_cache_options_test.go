@@ -211,7 +211,7 @@ func TestClaudeExecutor_PromptCacheOptionsMode_ImplicitOrMissing_PreservesAutoCa
 			defer server.Close()
 
 			executor := NewClaudeExecutor(&config.Config{})
-			auth := &cliproxyauth.Auth{Attributes: map[string]string{
+			auth := &cliproxyauth.Auth{ProxyURL: "direct", Attributes: map[string]string{
 				"api_key":  "key-123",
 				"base_url": server.URL,
 			}}
@@ -228,8 +228,30 @@ func TestClaudeExecutor_PromptCacheOptionsMode_ImplicitOrMissing_PreservesAutoCa
 			}
 
 			// In normal mode without client markers, system and message should receive auto-injected cache_control.
-			if !gjson.GetBytes(seenBody, "system.0.cache_control").Exists() {
-				t.Fatalf("expected system cache_control in implicit mode: %s", string(seenBody))
+			// F 的 billing 块不缓存；按角色检查，避免把新增 attribution 当成 caller。
+			foundBilling, foundIdentity, foundCaller := false, false, false
+			for _, block := range gjson.GetBytes(seenBody, "system").Array() {
+				text := block.Get("text").String()
+				switch {
+				case strings.HasPrefix(text, "x-anthropic-billing-header:"):
+					foundBilling = true
+					if block.Get("cache_control").Exists() {
+						t.Fatal("billing must not carry cache_control")
+					}
+				case text == "You are Claude Code, Anthropic's official CLI for Claude.":
+					foundIdentity = true
+					if !block.Get("cache_control").Exists() {
+						t.Fatal("identity lost automatic cache_control")
+					}
+				case text == "You are helpful.":
+					foundCaller = true
+					if !block.Get("cache_control").Exists() {
+						t.Fatal("caller lost automatic cache_control")
+					}
+				}
+			}
+			if !foundBilling || !foundIdentity || !foundCaller {
+				t.Fatal("missing billing, identity or caller system role")
 			}
 			if !gjson.GetBytes(seenBody, "messages.0.content.0.cache_control").Exists() {
 				t.Fatalf("expected message cache_control in implicit mode: %s", string(seenBody))
@@ -796,13 +818,14 @@ func TestClaudeExecutor_PromptCacheOptionsMode_Explicit_Cloaked_LegacyModelPrese
 	}
 	executor := NewClaudeExecutor(cfg)
 	auth := &cliproxyauth.Auth{ProxyURL: "direct", Attributes: map[string]string{
-		"api_key":  "key-123",
-		"base_url": server.URL,
+		"api_key":    "key-123",
+		"cloak_mode": "always",
+		"base_url":   server.URL,
 	}}
 
-	// claude-3-5-haiku-20241022 is in claudeLegacySystemReminderModels, so it uses legacy system reminders
+	// claude-3-7-sonnet-20250219 is in claudeLegacySystemReminderModels, so it uses legacy system reminders
 	originalReq := []byte(`{
-		"model": "claude-3-5-haiku-20241022",
+		"model": "claude-3-7-sonnet-20250219",
 		"prompt_cache_options": {
 			"mode": "explicit"
 		},
@@ -820,7 +843,7 @@ func TestClaudeExecutor_PromptCacheOptionsMode_Explicit_Cloaked_LegacyModelPrese
 	}`)
 
 	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
-		Model:   "claude-3-5-haiku-20241022",
+		Model:   "claude-3-7-sonnet-20250219",
 		Payload: originalReq,
 	}, cliproxyexecutor.Options{
 		SourceFormat:    sdktranslator.FromString("openai"),
@@ -879,12 +902,13 @@ func TestClaudeExecutor_CountTokensUpstream_Cloaked_LegacyModel_ExplicitPreserve
 	}
 	executor := NewClaudeExecutor(cfg)
 	auth := &cliproxyauth.Auth{ProxyURL: "direct", Attributes: map[string]string{
-		"api_key":  "key-123",
-		"base_url": server.URL,
+		"api_key":    "key-123",
+		"cloak_mode": "always",
+		"base_url":   server.URL,
 	}}
 
 	originalReq := []byte(`{
-		"model": "claude-3-5-haiku-20241022",
+		"model": "claude-3-7-sonnet-20250219",
 		"prompt_cache_options": {
 			"mode": "explicit"
 		},
@@ -902,7 +926,7 @@ func TestClaudeExecutor_CountTokensUpstream_Cloaked_LegacyModel_ExplicitPreserve
 	}`)
 
 	upstreamResp, errUpstream := executor.countTokensUpstream(context.Background(), auth, cliproxyexecutor.Request{
-		Model:   "claude-3-5-haiku-20241022",
+		Model:   "claude-3-7-sonnet-20250219",
 		Payload: originalReq,
 	}, cliproxyexecutor.Options{
 		SourceFormat:    sdktranslator.FromString("openai"),
@@ -1142,5 +1166,44 @@ func TestClaudeWirePolicyPreservesForkDefaultModePrecedence(t *testing.T) {
 				})
 			}
 		}
+	}
+}
+
+// F 的 Haiku 3.5 跳过 system 注入；always 也不能取消此模型边界。
+func TestClaudePromptCacheHaikuKeepsSystemWithoutReminder338(t *testing.T) {
+	for _, count := range []bool{false, true} {
+		t.Run(fmt.Sprintf("count=%t", count), func(t *testing.T) {
+			var seen []byte
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				seen, _ = io.ReadAll(r.Body)
+				if count {
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = w.Write([]byte(`{"input_tokens":20}`))
+				} else {
+					writeClaudeSSEMockResponse(w)
+				}
+			}))
+			defer server.Close()
+			auth := &cliproxyauth.Auth{ProxyURL: "direct", Attributes: map[string]string{"api_key": "key-haiku-338", "base_url": server.URL, "cloak_mode": "always"}}
+			payload := []byte(`{"model":"claude-3-5-haiku-20241022","prompt_cache_options":{"mode":"explicit"},"system":[{"type":"text","text":"haiku caller guidance","cache_control":{"type":"ephemeral","scope":"global"}}],"messages":[{"role":"user","content":"question"}]}`)
+			req := cliproxyexecutor.Request{Model: "claude-3-5-haiku-20241022", Payload: payload}
+			opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatClaude, OriginalRequest: payload}
+			ex := NewClaudeExecutor(&config.Config{})
+			var err error
+			if count {
+				_, err = ex.countTokensUpstream(context.Background(), auth, req, opts)
+			} else {
+				_, err = ex.Execute(context.Background(), auth, req, opts)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if gjson.GetBytes(seen, "system.#").Int() != 1 || gjson.GetBytes(seen, "system.0.text").String() != "haiku caller guidance" || gjson.GetBytes(seen, "system.0.cache_control.scope").String() != "global" {
+				t.Fatal("Haiku lost its unchanged caller system/cache boundary")
+			}
+			if bytes.Contains(seen, []byte("x-anthropic-billing-header:")) || bytes.Contains(seen, []byte("<system-reminder>")) || countCacheControls(seen) != 1 {
+				t.Fatal("Haiku unexpectedly acquired cloak system/reminder/cache blocks")
+			}
+		})
 	}
 }
