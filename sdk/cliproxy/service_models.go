@@ -156,6 +156,16 @@ func (s *Service) registerModelsForAuthWithConfigAndCache(ctx context.Context, c
 		models = registry.FilterClaudeModelsForPlan(models, claudePlanType, claudeUsageCredits)
 		models = applyExcludedModels(models, excluded)
 	case "codex":
+		// API keys use their matched configuration catalog, not OAuth plan entitlements.
+		// Missing/stale credentials must remove any previous registration.
+		if authKind == "apikey" {
+			if entry := resolveConfigCodexKeyForConfig(cfg, a); entry != nil {
+				models = buildCodexConfigModels(entry)
+				excluded = append(excluded, entry.ExcludedModels...)
+			}
+			models = applyExcludedModels(models, excluded)
+			break
+		}
 		// fork(anticorr): normalize the plan and gate Codex-tier models (e.g. Spark)
 		// by subscription plan; the fork gate treats unknown/empty plans as base.
 		codexPlanType := authCodexSubscriptionPlanType(a)
