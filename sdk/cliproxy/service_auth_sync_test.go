@@ -40,6 +40,7 @@ func TestRuntimeAuthSyncHook_SynchronousModelAndSchedulerRestoration(t *testing.
 		ID:       authID,
 		Provider: "codex",
 		Status:   coreauth.StatusActive,
+		ProxyURL: "direct",
 		Attributes: map[string]string{
 			"plan_type": "pro",
 			"path":      "/path/to/codex-sync.json",
@@ -1253,6 +1254,7 @@ func TestRuntimeAuthSync_StaleAsyncEventDoesNotOverwriteSynchronousEnable(t *tes
 		ID:       authID,
 		Provider: "codex",
 		Status:   coreauth.StatusActive,
+		ProxyURL: "direct",
 		Attributes: map[string]string{
 			"plan_type": "pro",
 		},
@@ -1374,6 +1376,7 @@ func TestRuntimeAuthSync_StaleWatcherUnversionedEventDoesNotOverwriteSynchronous
 		ID:       authID,
 		Provider: "codex",
 		Status:   coreauth.StatusActive,
+		ProxyURL: "direct",
 		Attributes: map[string]string{
 			"plan_type": "pro",
 		},
@@ -1558,6 +1561,7 @@ func TestRuntimeAuthSyncHook_ContextCancellationDoesNotAbortSync(t *testing.T) {
 		ID:       authID,
 		Provider: "codex",
 		Status:   coreauth.StatusActive,
+		ProxyURL: "direct",
 		Attributes: map[string]string{
 			"plan_type": "pro",
 		},
