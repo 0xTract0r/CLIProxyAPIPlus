@@ -236,7 +236,7 @@ func TestApplyClaudeHeaders_ClaudeCodeCLIProfileUsesOAuthBetasWithoutPretendingT
 		t.Fatalf("NewRequest() error = %v", errReq)
 	}
 	payload := []byte(`{"model":"claude-sonnet-5"}`)
-	if errHeaders := applyClaudeHeaders(req, auth, "key-third-party", false, nil, payload, &config.Config{}, nil, false, "11111111-2222-4333-8444-555555555555"); errHeaders != nil {
+	if errHeaders := applyClaudeHeaders(req, auth, "key-third-party", false, nil, payload, &config.Config{ClaudeHeaderDefaults: config.ClaudeHeaderDefaults{PinSoftwareBaseline: true, UserAgent: "claude-cli/2.1.280 (external, cli)"}}, nil, false, "11111111-2222-4333-8444-555555555555"); errHeaders != nil {
 		t.Fatalf("applyClaudeHeaders() error = %v", errHeaders)
 	}
 	if got := req.Header.Get("Authorization"); got != "Bearer key-third-party" {
@@ -296,7 +296,7 @@ func TestApplyClaudeHeaders_OfficialAPIKeyClaudeCodeCLIProfileUsesOAuthBetas(t *
 	if errReq != nil {
 		t.Fatalf("NewRequest() error = %v", errReq)
 	}
-	if errHeaders := applyClaudeHeaders(req, auth, "key-official-fp", false, nil, []byte(`{"model":"claude-sonnet-5"}`), &config.Config{}, nil, false, "11111111-2222-4333-8444-555555555555"); errHeaders != nil {
+	if errHeaders := applyClaudeHeaders(req, auth, "key-official-fp", false, nil, []byte(`{"model":"claude-sonnet-5"}`), &config.Config{ClaudeHeaderDefaults: config.ClaudeHeaderDefaults{PinSoftwareBaseline: true, UserAgent: "claude-cli/2.1.280 (external, cli)"}}, nil, false, "11111111-2222-4333-8444-555555555555"); errHeaders != nil {
 		t.Fatalf("applyClaudeHeaders() error = %v", errHeaders)
 	}
 	if got := req.Header.Get("Authorization"); got != "" {
