@@ -113,6 +113,31 @@ func TestSameIDIncompleteCodexRecovery230(t *testing.T) {
 				if readErr != nil {
 					t.Fatal(readErr)
 				}
+				// F 1228bf9 accepts this external full-file provider replacement;
+				// the internal save/provider rejection below remains unchanged.
+				if entry == "upload" && missing == "provider" {
+					if err != nil || store.saves != 1 || hooks != 1 || live.Provider != "other" || live.RegistrationEpoch <= before.RegistrationEpoch || live.CredentialVersion <= before.CredentialVersion {
+						t.Fatalf("generic upload replacement: %v", err)
+					}
+					if live.Runtime != nil || live.Storage != nil || live.CodexRefreshPatch != nil || live.AutoQuarantined || live.RejectedAccessToken != "" {
+						t.Fatal("inherited old principal")
+					}
+					var disk map[string]any
+					if err := json.Unmarshal(after, &disk); err != nil {
+						t.Fatal(err)
+					}
+					for _, metadata := range []map[string]any{live.Metadata, disk} {
+						if metadata["type"] != "other" || metadata["access_token"] != "new-access" || metadata["refresh_token"] != "new-refresh" || metadata["siwc"].(map[string]any)["access_token"] != "new-siwc-access" || metadata["siwc"].(map[string]any)["refresh_token"] != "new-siwc-refresh" {
+							t.Fatal("submitted credential not persisted")
+						}
+						for _, key := range []string{"account_settings", "headers", "auto_quarantined"} {
+							if _, ok := metadata[key]; ok {
+								t.Fatalf("inherited old %s", key)
+							}
+						}
+					}
+					return
+				}
 				if completeWithoutID {
 					if err != nil || store.saves != 1 || hooks != 1 {
 						t.Fatalf("complete no-id save err=%v saves=%d hooks=%d", err, store.saves, hooks)

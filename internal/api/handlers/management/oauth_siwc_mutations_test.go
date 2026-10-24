@@ -160,6 +160,30 @@ func TestSIWCPending315RejectedUploadContinues(t *testing.T) {
 			after, _ := os.ReadFile(f.path)
 			live, _ := f.manager.GetByID(f.auth.ID)
 			session, exists := f.store.Get(state)
+			// F 1228bf9 crud:494–533,559–565 accepts generic provider replacement.
+			if mode == "provider" {
+				if w.Code != 200 || live.Provider != "other" || live.RegistrationEpoch <= old.RegistrationEpoch || live.CredentialVersion <= old.CredentialVersion || flow.ctx.Err() == nil || f.store.IsPending(state, "codex") {
+					t.Fatal("generic provider replacement did not retire old registration")
+				}
+				if live.Runtime != nil || live.Storage != nil || live.CodexRefreshPatch != nil || live.Metadata["access_token"] != payload["access_token"] || live.Metadata["refresh_token"] != payload["refresh_token"] {
+					t.Fatal("replacement inherited old credential state")
+				}
+				var disk map[string]any
+				if err := json.Unmarshal(after, &disk); err != nil {
+					t.Fatal(err)
+				}
+				for _, metadata := range []map[string]any{live.Metadata, disk} {
+					for _, key := range []string{"account_settings", "headers", "siwc"} {
+						if _, ok := metadata[key]; ok {
+							t.Fatalf("inherited old %s", key)
+						}
+					}
+					if metadata["note"] != payload["note"] {
+						t.Fatal("submitted note not preserved")
+					}
+				}
+				return
+			}
 			if w.Code < 400 {
 				t.Fatalf("reject returned %d", w.Code)
 			}

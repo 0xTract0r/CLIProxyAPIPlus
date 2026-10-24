@@ -298,6 +298,9 @@ func (h *Handler) writeAuthFile(ctx context.Context, name string, data []byte) e
 	ctx, release := h.beginSIWCUploadMutation(ctx, dst)
 	defer release()
 	if h.authManager != nil {
+		if existing, ok := h.authManager.GetByID(auth.ID); ok && !strings.EqualFold(existing.Provider, auth.Provider) {
+			return h.replaceOperatorProviderAuth(ctx, dst, existing, auth)
+		}
 		if existing, ok := h.authManager.GetByID(auth.ID); ok && (coreauth.IsCodexAuthRecord(existing) || coreauth.IsCodexAuthRecord(auth)) {
 			// Replacing an existing file is not a metadata PATCH. Reject partial
 			// credentials before any disk write; complete saves revalidate in-gate.
@@ -335,6 +338,60 @@ func (h *Handler) writeAuthFile(ctx context.Context, name string, data []byte) e
 		if errHook := h.postAuthPersistHook(ctx, auth); errHook != nil {
 			return fmt.Errorf("post-auth persist hook failed: %w", errHook)
 		}
+	}
+	return nil
+}
+
+// replaceOperatorProviderAuth preserves the generic upload storage contract:
+// parsed files may replace a different provider even without a registered executor.
+// It grants no Codex recovery and carries no state from the retired principal.
+func (h *Handler) replaceOperatorProviderAuth(ctx context.Context, path string, expected, incoming *coreauth.Auth) error {
+	if ctx == nil || ctx.Value(siwcFileMutationKey{}) != true {
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		ctx = context.WithValue(ctx, siwcFileMutationKey{}, true)
+		var release func()
+		ctx, release = h.beginSIWCUploadMutation(ctx, path)
+		defer release()
+	}
+	request := incoming.Clone()
+	if h.postAuthHook != nil {
+		if err := h.postAuthHook(ctx, request); err != nil {
+			return err
+		}
+	}
+	registered, err := h.authManager.CommitOperatorReplacement(ctx, expected.ID, expected.RegistrationEpoch, func(current *coreauth.Auth) (*coreauth.Auth, error) {
+		kind, _ := request.Metadata["type"].(string)
+		originalKind, _ := incoming.Metadata["type"].(string)
+		if strings.EqualFold(current.Provider, request.Provider) || request.Provider != incoming.Provider || kind != originalKind {
+			return nil, fmt.Errorf("%w: replacement provider changed", errInvalidAuthFile)
+		}
+		access, _ := request.Metadata["access_token"].(string)
+		refresh, _ := request.Metadata["refresh_token"].(string)
+		if coreauth.IsCodexAuthRecord(request) && (strings.TrimSpace(access) == "" || strings.TrimSpace(refresh) == "" || !operatorCodexReplacementIdentity(request)) {
+			return nil, fmt.Errorf("%w: incomplete operator Codex replacement", errInvalidAuthFile)
+		}
+		next := request.Clone()
+		next.ID, next.FileName = current.ID, current.FileName
+		if err := validateStoredAuthProxyURL(next); err != nil {
+			return nil, err
+		}
+		return next, nil
+	}, func(saveCtx context.Context, next *coreauth.Auth) error {
+		store := h.tokenStoreWithBaseDir()
+		if store == nil {
+			return fmt.Errorf("token store unavailable")
+		}
+		_, err := store.Save(coreauth.WithAuthCreationIntent(saveCtx), next)
+		return err
+	})
+	if err != nil {
+		return err
+	}
+	commitSIWCUploadMutation(ctx)
+	if h.postAuthPersistHook != nil {
+		return h.postAuthPersistHook(ctx, registered.Clone())
 	}
 	return nil
 }
@@ -719,7 +776,8 @@ func (h *Handler) buildAuthFromFileData(path string, data []byte) (*coreauth.Aut
 		auth.LastRefreshedAt = lastRefresh
 	}
 	if h != nil && h.authManager != nil {
-		if existing, ok := h.authManager.GetByID(authID); ok {
+		// A different provider is a new principal, never a runtime reload.
+		if existing, ok := h.authManager.GetByID(authID); ok && strings.EqualFold(existing.Provider, auth.Provider) {
 			auth.CreatedAt = existing.CreatedAt
 			if !hasLastRefresh {
 				auth.LastRefreshedAt = existing.LastRefreshedAt
