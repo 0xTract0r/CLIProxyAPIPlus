@@ -552,8 +552,9 @@ func TestClaudeExecutor_AuthManager_OrdinaryModel429DoesNotBlockSiblingModels(t 
 		ID:       baseID + "-ordinary-429",
 		Provider: "claude",
 		Attributes: map[string]string{
-			"api_key":  "test-key",
-			"base_url": server.URL,
+			"plan_type": "max",
+			"api_key":   "test-key",
+			"base_url":  server.URL,
 		},
 	}
 

@@ -69,15 +69,29 @@ func TestMultiSourceSecret_CacheBehavior(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s := NewMultiSourceSecretWithPath("", p, 50*time.Millisecond)
+	const cacheTTL = time.Hour
+	s := NewMultiSourceSecretWithPath("", p, cacheTTL)
 
 	// First read - should return v1
+	beforeRead := time.Now()
 	got1, err := s.Get(ctx)
+	afterRead := time.Now()
 	if err != nil {
 		t.Fatalf("Get failed: %v", err)
 	}
 	if got1 != "v1" {
 		t.Fatalf("expected v1, got %s", got1)
+	}
+
+	s.mu.RLock()
+	if s.cache == nil {
+		s.mu.RUnlock()
+		t.Fatal("expected cached secret")
+	}
+	expiresAt := s.cache.expiresAt
+	s.mu.RUnlock()
+	if expiresAt.Before(beforeRead.Add(cacheTTL)) || expiresAt.After(afterRead.Add(cacheTTL)) {
+		t.Fatal("cache expiry does not honor the configured TTL")
 	}
 
 	// Change file; within TTL we should still see v1 (cached)
@@ -90,7 +104,9 @@ func TestMultiSourceSecret_CacheBehavior(t *testing.T) {
 	}
 
 	// After TTL expires, should see v2
-	time.Sleep(60 * time.Millisecond)
+	s.mu.Lock()
+	s.cache.expiresAt = time.Now().Add(-time.Second)
+	s.mu.Unlock()
 	got3, _ := s.Get(ctx)
 	if got3 != "v2" {
 		t.Fatalf("cache miss expected v2, got %s", got3)

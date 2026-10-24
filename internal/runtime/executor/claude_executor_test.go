@@ -116,7 +116,7 @@ func TestApplyClaudeHeaders_FastModeBetaIsConditional(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			extraBetas, body := extractAndRemoveBetas([]byte(tt.body))
 			req := newClaudeHeaderTestRequest(t, nil)
-			if errApply := applyClaudeHeaders(req, auth, "key-fast-mode-beta", false, extraBetas, body, nil, nil, false); errApply != nil {
+			if errApply := applyClaudeHeaders(req, auth, "key-fast-mode-beta", false, extraBetas, body, &config.Config{ClaudeHeaderDefaults: config.ClaudeHeaderDefaults{UserAgent: "claude-cli/2.1.280 (external, cli)", PinSoftwareBaseline: true}}, nil, false); errApply != nil {
 				t.Fatalf("applyClaudeHeaders() error = %v", errApply)
 			}
 			if got := req.Header.Get("Anthropic-Beta"); got != tt.want {
@@ -1027,7 +1027,7 @@ func TestClaudeExecutor_ConfirmedCLIForwardsNativeOpus55Shape(t *testing.T) {
 	auth := &cliproxyauth.Auth{ProxyURL: "direct", ID: "native-opus55", Metadata: claudeOAuthTestMetadata(), Attributes: map[string]string{
 		"api_key": "sk-ant-oat-native-opus55", "base_url": server.URL,
 	}}
-	executor := NewClaudeExecutor(&config.Config{})
+	executor := NewClaudeExecutor(&config.Config{ClaudeHeaderDefaults: config.ClaudeHeaderDefaults{UserAgent: "claude-cli/2.1.280 (external, cli)", PinSoftwareBaseline: true}})
 	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
 		Model: "claude-opus-5-5", Payload: payload,
 	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatClaude, OriginalRequest: payload, Headers: incoming})
@@ -1143,7 +1143,7 @@ func TestClaudeExecutor_CopiedVSCodeAgentSDKHeadersWithoutMetadataAreCloaked(t *
 	defer server.Close()
 
 	payload := []byte(`{"model":"claude-opus-5","system":"spoofed-system","messages":[{"role":"user","content":"x"}]}`)
-	executor := NewClaudeExecutor(&config.Config{})
+	executor := NewClaudeExecutor(&config.Config{ClaudeHeaderDefaults: config.ClaudeHeaderDefaults{UserAgent: "claude-cli/2.1.280 (external, cli)", PinSoftwareBaseline: true}})
 	auth := &cliproxyauth.Auth{ProxyURL: "direct", Attributes: map[string]string{
 		"api_key":    "key-spoofed-client",
 		"base_url":   server.URL,
