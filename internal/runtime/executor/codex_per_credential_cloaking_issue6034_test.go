@@ -115,12 +115,15 @@ func TestCodexPerCredentialDisableCloaking_HTTP_ExplicitFalseOverridesGlobalTrue
 
 	applyCodexHeadersFromSources(req, auth, "test-token", false, cfg, nil)
 
-	// Since disable-codex-cloaking is explicitly false on the credential, cloaking should be enforced.
-	if got := req.Header.Get("User-Agent"); got != codexUserAgent {
-		t.Errorf("User-Agent = %q, want %q", got, codexUserAgent)
+	// F1228 默认路径仍保留显式 legacy header:*；策略 false 与强制覆盖 wire identity 是两份合同。
+	if got := req.Header.Get("User-Agent"); got != "CustomAgent/1.0" {
+		t.Errorf("User-Agent = %q, want %q", got, "CustomAgent/1.0")
 	}
-	if got := req.Header.Get("Originator"); got != codexOriginator {
-		t.Errorf("Originator = %q, want %q", got, codexOriginator)
+	if got := req.Header.Get("Originator"); got != "CustomOriginator" {
+		t.Errorf("Originator = %q, want %q", got, "CustomOriginator")
+	}
+	if isCodexCloakingDisabled(cfg, auth) {
+		t.Fatal("explicit false must override global true")
 	}
 }
 
@@ -175,8 +178,12 @@ func TestCodexPerCredentialDisableCloaking_HTTP_FallbackToGlobal(t *testing.T) {
 		t.Fatalf("http.NewRequest failed: %v", err)
 	}
 	applyCodexHeadersFromSources(req2, authNil, "test-token", false, cfgGlobalFalse, nil)
-	if got := req2.Header.Get("User-Agent"); got != codexUserAgent {
-		t.Errorf("Global false fallback User-Agent = %q, want %q", got, codexUserAgent)
+	if got := req2.Header.Get("User-Agent"); got != "CustomAgent/1.0" {
+		t.Errorf("Global false fallback User-Agent = %q, want %q", got, "CustomAgent/1.0")
+	}
+	// 两种开关都可保留 legacy identity，仍独立断言 config fallback 策略。
+	if !isCodexCloakingDisabled(cfgGlobalTrue, authNil) || isCodexCloakingDisabled(cfgGlobalFalse, authNil) {
+		t.Fatal("credential nil must follow global cloaking policy")
 	}
 }
 
@@ -228,11 +235,14 @@ func TestCodexPerCredentialDisableCloaking_WebSocket_ExplicitFalseOverridesGloba
 
 	headers := applyCodexWebsocketHeaders(context.Background(), nil, auth, "test-token", cfg, true)
 
-	if got := headers.Get("User-Agent"); got != codexUserAgent {
-		t.Errorf("WebSocket User-Agent = %q, want %q", got, codexUserAgent)
+	if got := headers.Get("User-Agent"); got != "CustomWSAgent/1.0" {
+		t.Errorf("WebSocket User-Agent = %q, want %q", got, "CustomWSAgent/1.0")
 	}
-	if got := headers.Get("Originator"); got != codexOriginator {
-		t.Errorf("WebSocket Originator = %q, want %q", got, codexOriginator)
+	if got := headers.Get("Originator"); got != "CustomWSOriginator" {
+		t.Errorf("WebSocket Originator = %q, want %q", got, "CustomWSOriginator")
+	}
+	if isCodexCloakingDisabled(cfg, auth) {
+		t.Fatal("explicit false must override global true")
 	}
 }
 
@@ -268,12 +278,15 @@ func TestCodexPerCredentialDisableCloaking_OAuthUnaffectedByAPIKeyOverride(t *te
 
 	applyCodexHeadersFromSources(req, oauthAuth, "oauth-token", false, cfg, nil)
 
-	// OAuth credential must remain cloaked with official Codex identity
-	if got := req.Header.Get("User-Agent"); got != codexUserAgent {
-		t.Errorf("OAuth User-Agent = %q, want %q", got, codexUserAgent)
+	// F1228 的 OAuth 默认身份是受管 CLI 画像；API-key override 不得切换 OAuth 策略。
+	if got := req.Header.Get("User-Agent"); got != "codex_cli_rs/0.140.0 (Mac OS 15.7.4; arm64) iTerm.app/3.6.8 (codex_cli_rs; 0.140.0)" {
+		t.Errorf("OAuth User-Agent = %q, want %q", got, "codex_cli_rs/0.140.0 (Mac OS 15.7.4; arm64) iTerm.app/3.6.8 (codex_cli_rs; 0.140.0)")
 	}
-	if got := req.Header.Get("Originator"); got != codexOriginator {
-		t.Errorf("OAuth Originator = %q, want %q", got, codexOriginator)
+	if got := req.Header.Get("Originator"); got != "codex_cli_rs" {
+		t.Errorf("OAuth Originator = %q, want %q", got, "codex_cli_rs")
+	}
+	if isCodexCloakingDisabled(cfg, oauthAuth) {
+		t.Fatal("API-key override must not disable OAuth cloaking")
 	}
 }
 

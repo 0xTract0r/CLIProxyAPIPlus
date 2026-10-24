@@ -1027,12 +1027,13 @@ func TestCodexWebsocketsExecutorUseSIWCExecuteAndStream(t *testing.T) {
 	}))
 	defer wsServer.Close()
 
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID:       "codex-siwc-ws",
 		Provider: "codex",
 		Attributes: map[string]string{
-			"base_url":   wsServer.URL + "/v1",
-			"websockets": "true",
+			"base_url":    wsServer.URL + "/v1",
+			"websockets":  "true",
+			"fast_models": "gpt-5.4",
 		},
 		Metadata: map[string]any{
 			"type":         "codex",

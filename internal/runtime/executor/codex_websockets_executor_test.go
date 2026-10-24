@@ -1275,11 +1275,11 @@ func TestApplyCodexWebsocketHeadersDefaultsToCodexCloaking(t *testing.T) {
 
 			headers = applyCodexWebsocketHeaders(ctx, headers, tt.auth, tt.token, cfg, false)
 
-			if got := headers.Get("User-Agent"); got != codexUserAgent {
-				t.Fatalf("User-Agent = %q, want %q", got, codexUserAgent)
+			if got := headers.Get("User-Agent"); got != "custom-ua" {
+				t.Fatalf("User-Agent = %q, want %q", got, "custom-ua")
 			}
-			if got := headers.Get("Originator"); got != codexOriginator {
-				t.Fatalf("Originator = %q, want %q", got, codexOriginator)
+			if got := headers.Get("Originator"); got != "custom-origin" {
+				t.Fatalf("Originator = %q, want %q", got, "custom-origin")
 			}
 		})
 	}
@@ -1960,11 +1960,11 @@ func TestApplyCodexHeadersDefaultsToCodexCloaking(t *testing.T) {
 
 	applyCodexHeadersFromSources(req, auth, "api-key", false, cfg, ginHeaders)
 
-	if got := req.Header.Get("User-Agent"); got != codexUserAgent {
-		t.Fatalf("User-Agent = %q, want %q", got, codexUserAgent)
+	if got := req.Header.Get("User-Agent"); got != "custom-ua" {
+		t.Fatalf("User-Agent = %q, want %q", got, "custom-ua")
 	}
-	if got := req.Header.Get("Originator"); got != codexOriginator {
-		t.Fatalf("Originator = %q, want %q", got, codexOriginator)
+	if got := req.Header.Get("Originator"); got != "custom-origin" {
+		t.Fatalf("Originator = %q, want %q", got, "custom-origin")
 	}
 }
 
@@ -2133,9 +2133,9 @@ func TestApplyCodexHeadersPassesThroughClientIdentityHeaders(t *testing.T) {
 	if got := req.Header.Get("Originator"); got != "Codex Desktop" {
 		t.Fatalf("Originator = %s, want %s", got, "Codex Desktop")
 	}
-	// fork(anticorr): 真实 codex 出站无独立 Version 头，客户端透传的 Version 被删除。
-	if got := req.Header.Get("Version"); got != "" {
-		t.Fatalf("Version = %q, want empty (出站不带 Version 头)", got)
+	// 显式 disable-cloaking 走上游 opt-out 分支，保留客户端 Version；默认模式另有剥离负控。
+	if got := req.Header.Get("Version"); got != "0.115.0-alpha.27" {
+		t.Fatalf("Version = %q, want 0.115.0-alpha.27 (explicit opt-out)", got)
 	}
 	if got := req.Header.Get("X-Codex-Turn-Metadata"); got != `{"turn_id":"turn-1"}` {
 		t.Fatalf("X-Codex-Turn-Metadata = %s, want %s", got, `{"turn_id":"turn-1"}`)
