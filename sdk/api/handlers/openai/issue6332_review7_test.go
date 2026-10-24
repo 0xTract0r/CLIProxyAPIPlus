@@ -21,6 +21,7 @@ import (
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/httptransport"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 	"github.com/tidwall/sjson"
 )
@@ -129,42 +130,60 @@ func TestIssue6332Review7ConcurrentTerminalInterceptors(t *testing.T) {
 }
 
 type issue6332GatedBody struct {
-	io.Reader
-	release <-chan struct{}
-	closed  chan struct{}
+	io.ReadCloser
+	release    <-chan struct{}
+	eofReached chan struct{}
+	closed     chan struct{}
+	eofOnce    sync.Once
+	closeOnce  sync.Once
 }
 
 func (b *issue6332GatedBody) Read(p []byte) (int, error) {
-	n, errRead := b.Reader.Read(p)
-	if errRead == io.EOF {
+	n, err := b.ReadCloser.Read(p)
+	// net/http may return the last frame together with EOF. Deliver those bytes
+	// before gating the subsequent zero-byte EOF, as strings.Reader did.
+	if n > 0 && err == io.EOF {
+		return n, nil
+	}
+	if err == io.EOF {
+		b.eofOnce.Do(func() { close(b.eofReached) })
 		<-b.release
 	}
-	return n, errRead
+	return n, err
 }
-func (b *issue6332GatedBody) Close() error { close(b.closed); return nil }
+func (b *issue6332GatedBody) Close() error {
+	err := b.ReadCloser.Close()
+	b.closeOnce.Do(func() { close(b.closed) })
+	return err
+}
 
 type issue6332LifecycleTransport struct {
 	calls      atomic.Int32
 	release    <-chan struct{}
+	eofReached chan struct{}
 	closed     chan struct{}
 	requests   chan []byte
 	firstFrame string
 }
 
-func (rt *issue6332LifecycleTransport) RoundTripperFor(*cliproxyauth.Auth) http.RoundTripper {
-	return rt
+type issue6332LifecycleObservedTransport struct {
+	next     http.RoundTripper
+	observer *issue6332LifecycleTransport
 }
-func (rt *issue6332LifecycleTransport) RoundTrip(r *http.Request) (*http.Response, error) {
-	body, errRead := io.ReadAll(r.Body)
-	if errRead != nil {
-		return nil, errRead
+
+func (rt *issue6332LifecycleTransport) decorate(next http.RoundTripper) http.RoundTripper {
+	return &issue6332LifecycleObservedTransport{next: next, observer: rt}
+}
+func (rt *issue6332LifecycleObservedTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	// Delegate the exact transport chosen for this credential/direct route.
+	response, err := rt.next.RoundTrip(r)
+	if err != nil {
+		return response, err
 	}
-	rt.requests <- body
-	var response io.ReadCloser = io.NopCloser(strings.NewReader(issue6332ToolFrame()))
-	if rt.calls.Add(1) == 1 {
-		response = &issue6332GatedBody{Reader: strings.NewReader(rt.firstFrame), release: rt.release, closed: rt.closed}
+	if rt.observer.calls.Add(1) == 1 {
+		response.Body = &issue6332GatedBody{ReadCloser: response.Body, release: rt.observer.release, eofReached: rt.observer.eofReached, closed: rt.observer.closed}
 	}
-	return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"text/event-stream"}}, Body: response, Request: r}, nil
+	return response, nil
 }
 
 type issue6332CallbackHost struct {
@@ -199,12 +218,11 @@ func TestIssue6332Review7LifecycleNextTurn(t *testing.T) {
 }
 
 func testIssue6332LifecycleNextTurn(t *testing.T, split bool) {
-	base, manager := issue6332ReviewBase(t, "http://upstream.invalid")
 	release := make(chan struct{})
 	var once sync.Once
 	unblock := func() { once.Do(func() { close(release) }) }
 	defer unblock()
-	rt := &issue6332LifecycleTransport{release: release, closed: make(chan struct{}), requests: make(chan []byte, 2)}
+	rt := &issue6332LifecycleTransport{release: release, eofReached: make(chan struct{}), closed: make(chan struct{}), requests: make(chan []byte, 2)}
 	rt.firstFrame = issue6332ToolFrame()
 	if split {
 		// A finishReason alone is not the replay boundary: signature and usage follow.
@@ -212,7 +230,26 @@ func testIssue6332LifecycleNextTurn(t *testing.T, split bool) {
 			`data: {"response":{"candidates":[{"content":{"parts":[{"text":"","thoughtSignature":"` + strings.Repeat("s", 128) + `"}]}}]}}` + "\n\n" +
 			`data: {"response":{"usageMetadata":{"promptTokenCount":11,"candidatesTokenCount":22,"totalTokenCount":33}}}` + "\n\n"
 	}
-	manager.SetRoundTripperProvider(rt)
+	var peerCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read peer request: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		rt.requests <- body
+		frame := issue6332ToolFrame()
+		if peerCalls.Add(1) == 1 {
+			frame = rt.firstFrame
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		if _, err := io.WriteString(w, frame); err != nil {
+			t.Errorf("write peer stream: %v", err)
+		}
+	}))
+	defer server.Close()
+	base, _ := issue6332ReviewBase(t, server.URL)
 	body := issue6332ReviewBody(t)
 	second, _ := sjson.SetBytes(body, "input.-1", map[string]any{"type": "function_call", "call_id": "native-call", "name": "lookup", "arguments": `{"key":"value"}`})
 	second, _ = sjson.SetBytes(second, "input.-1", map[string]any{"type": "function_call_output", "call_id": "native-call", "output": "found"})
@@ -224,7 +261,9 @@ func testIssue6332LifecycleNextTurn(t *testing.T, split bool) {
 	router := gin.New()
 	router.POST("/v1/responses", NewOpenAIResponsesAPIHandler(base).Responses)
 	writer := httptest.NewRecorder()
-	router.ServeHTTP(writer, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(string(body))))
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(string(body)))
+	request = request.WithContext(httptransport.WithDecorator(request.Context(), rt.decorate))
+	router.ServeHTTP(writer, request)
 	select {
 	case errNested := <-host.result:
 		if errNested != nil {
@@ -238,11 +277,35 @@ func testIssue6332LifecycleNextTurn(t *testing.T, split bool) {
 	if !strings.Contains(string(secondRequest), strings.Repeat("s", 128)) {
 		t.Errorf("lifecycle next turn read stale replay ledger: %s", secondRequest)
 	}
+	select {
+	case <-rt.eofReached:
+	case <-time.After(time.Second):
+		t.Fatal("outer producer did not reach gated EOF")
+	}
+	select {
+	case <-rt.closed:
+		t.Fatal("upstream cleanup completed before next turn assertion")
+	default:
+	}
+	if peerCalls.Load() != 2 || rt.calls.Load() != 2 {
+		t.Fatalf("real peer/delegated calls=%d/%d, want 2/2", peerCalls.Load(), rt.calls.Load())
+	}
 	unblock()
-	<-rt.closed
+	select {
+	case <-rt.closed:
+	case <-time.After(time.Second):
+		t.Fatal("underlying body Close did not complete")
+	}
 	// Join both producers only after the next-turn assertion.
 	for range 2 {
-		<-capture.records
+		select {
+		case record := <-capture.records:
+			if record.Failed || record.Detail.InputTokens != 11 || record.Detail.OutputTokens != 22 || record.Detail.TotalTokens != 33 {
+				t.Errorf("usage producer=%+v, want success 11/22/33", record)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("usage producers did not join")
+		}
 	}
 	cache.ClearAntigravityReasoningReplayCache()
 }
