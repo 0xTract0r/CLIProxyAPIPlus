@@ -550,7 +550,9 @@ func TestClaudeHTTPAttemptCustomGatewayCountStaysLocal(t *testing.T) {
 	gate := &claudeAttemptTestGate{}
 	ctx := cliproxyexecutor.WithHTTPAttemptGate(context.Background(), gate)
 	auth := &cliproxyauth.Auth{ID: "synthetic-local-count", Provider: "claude", ProxyURL: "direct", Attributes: map[string]string{"api_key": "key-123", "base_url": server.URL}}
-	result, err := NewClaudeExecutor(&config.Config{}).CountTokens(ctx, auth, cliproxyexecutor.Request{Model: "claude-3-5-sonnet-20241022", Payload: []byte(claudeAttemptRequestJSON)}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatClaude})
+	cfg := &config.Config{}
+	cfg.Claude.LocalTokenCount = true
+	result, err := NewClaudeExecutor(cfg).CountTokens(ctx, auth, cliproxyexecutor.Request{Model: "claude-3-5-sonnet-20241022", Payload: []byte(claudeAttemptRequestJSON)}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatClaude})
 	if err != nil {
 		t.Fatal(err)
 	}
