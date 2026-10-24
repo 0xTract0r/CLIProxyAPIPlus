@@ -22,13 +22,10 @@ import (
 func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
 	ctx = contextWithClaudeInboundHeaders(ctx, opts.Headers)
 	apiKey, baseURL := claudeCreds(auth)
-	if baseURL == "" {
-		baseURL = "https://api.anthropic.com"
-	}
-	// Only Anthropic's first-party origin has the measured native count_tokens
-	// contract. Every custom/third-party base URL keeps local estimation,
-	// regardless of whether the credential is OAuth or an API key.
-	if shouldUseClaudeUpstreamTokenCount(apiKey, baseURL) {
+	// A configured upstream keeps the fork's count endpoint behavior. Local
+	// estimation is explicit; unauthenticated SDK calls may still count locally.
+	localCount := e.cfg != nil && e.cfg.Claude.LocalTokenCount
+	if !localCount && (strings.TrimSpace(apiKey) != "" || strings.TrimSpace(baseURL) != "") {
 		return e.countTokensUpstream(ctx, auth, req, opts)
 	}
 
@@ -140,6 +137,7 @@ func (e *ClaudeExecutor) countTokensUpstream(ctx context.Context, auth *cliproxy
 	upstreamModel := e.upstreamModel(baseModel)
 
 	apiKey, baseURL := claudeCreds(auth)
+	baseURL = strings.TrimSpace(baseURL)
 	if baseURL == "" {
 		baseURL = "https://api.anthropic.com"
 	}

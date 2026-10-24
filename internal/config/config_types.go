@@ -113,6 +113,8 @@ func defaultPluginInstanceConfigNode() *yaml.Node {
 
 // ClaudeConfig configures provider-wide Claude request behavior.
 type ClaudeConfig struct {
+	// LocalTokenCount uses the local estimator instead of calling the configured count endpoint.
+	LocalTokenCount bool `yaml:"local-token-count" json:"local-token-count"`
 	// ModelLevelCooling scopes Claude quota cooldowns to the requested model
 	// rather than cooling down the entire credential across all sibling models.
 	ModelLevelCooling bool `yaml:"model-level-cooling" json:"model-level-cooling"`

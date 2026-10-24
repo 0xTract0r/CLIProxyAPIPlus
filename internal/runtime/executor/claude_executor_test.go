@@ -2555,7 +2555,7 @@ func TestClaudeExecutor_LegacySystemReminderAcrossMessagesAndStream(t *testing.T
 	}))
 	defer server.Close()
 
-	executor := NewClaudeExecutor(&config.Config{})
+	executor := NewClaudeExecutor(&config.Config{Claude: config.ClaudeConfig{LocalTokenCount: true}})
 	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID: "oauth-legacy-reminder-paths",
 		Attributes: map[string]string{
@@ -2938,7 +2938,7 @@ func TestClaudeExecutor_CountTokensCountsLocallyWithoutUpstreamRequest(t *testin
 			}))
 			defer server.Close()
 
-			executor := NewClaudeExecutor(&config.Config{})
+			executor := NewClaudeExecutor(&config.Config{Claude: config.ClaudeConfig{LocalTokenCount: true}})
 			auth := &cliproxyauth.Auth{Attributes: map[string]string{
 				"api_key":  testCase.apiKey,
 				"base_url": server.URL,
@@ -2956,7 +2956,7 @@ func TestClaudeExecutor_CountTokensCountsLocallyWithoutUpstreamRequest(t *testin
 		})
 	}
 
-	executor := NewClaudeExecutor(&config.Config{})
+	executor := NewClaudeExecutor(&config.Config{Claude: config.ClaudeConfig{LocalTokenCount: true}})
 	resp, err := executor.CountTokens(context.Background(), nil, cliproxyexecutor.Request{
 		Model:   "claude-sonnet-4-5",
 		Payload: payload,
