@@ -237,3 +237,69 @@ func TestSaveTokenRecordCredentialRecoveryPersistsAndFences(t *testing.T) {
 		})
 	}
 }
+
+func TestSaveNonRecoveryConsumer281(t *testing.T) {
+	for _, mode := range []string{"partial-success", "failed-save", "claims-conflict", "stale-epoch"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx := context.Background()
+			store := &recoveryCountingFileStore{FileTokenStore: fileauth.NewFileTokenStore()}
+			store.SetBaseDir(t.TempDir())
+			m := coreauth.NewManager(store, nil, nil)
+			old, err := m.Register(coreauth.WithAuthCreationIntent(ctx), &coreauth.Auth{ID: "consumer281.json", FileName: "consumer281.json", Provider: "codex", ProxyURL: "direct", Status: coreauth.StatusQuarantined, AutoQuarantined: true, Unavailable: true, Metadata: map[string]any{"type": "codex", "account_id": "same", "email": "same@example.invalid", "access_token": "old-access", "refresh_token": "old-refresh", "siwc": map[string]any{"access_token": "old-siwc", "refresh_token": "old-siwc-refresh"}, "reauth_required": true, "note": "before", "quota_refresh_status": "reauth_required"}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			path := old.Attributes[coreauth.AttributePath]
+			rawBefore, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: filepath.Dir(path)}, m)
+			h.tokenStore = store
+			hooks := 0
+			h.SetPostAuthPersistHook(func(c context.Context, a *coreauth.Auth) error {
+				hooks++
+				sentinel := errors.New("gate-release-probe")
+				entered := false
+				_, _, e := m.Modify(c, a.ID, a.RegistrationEpoch, func(*coreauth.Auth) error { entered = true; return sentinel })
+				if !entered || !errors.Is(e, sentinel) {
+					return errors.New("consumer hook retained auth gate")
+				}
+				return nil
+			})
+			incoming := &coreauth.Auth{ID: old.ID, FileName: old.FileName, Provider: "codex", Metadata: map[string]any{"type": "codex", "account_id": "same", "email": "same@example.invalid", "access_token": "new-access", "note": "after"}}
+			if mode == "claims-conflict" {
+				incoming.Metadata["id_token"] = "eyJhbGciOiJub25lIn0.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoib3RoZXIifX0."
+			}
+			expected := old
+			if mode == "stale-epoch" {
+				h.postAuthHook = func(c context.Context, _ *coreauth.Auth) error {
+					var e error
+					expected, e = m.Register(coreauth.WithSkipPersist(c), old.Clone())
+					return e
+				}
+			}
+			store.saves = 0
+			store.fail = mode == "failed-save"
+			_, err = h.saveTokenRecord(ctx, incoming)
+			live, _ := m.GetByID(old.ID)
+			rawAfter, _ := os.ReadFile(path)
+			if mode != "partial-success" {
+				wantSaves := 0
+				if mode == "failed-save" {
+					wantSaves = 1
+				}
+				if err == nil || store.saves != wantSaves || hooks != 0 || string(rawBefore) != string(rawAfter) || live.RegistrationEpoch != expected.RegistrationEpoch || live.CredentialVersion != expected.CredentialVersion || live.Metadata["note"] != expected.Metadata["note"] || !live.AutoQuarantined {
+					t.Fatalf("negative %s err=%v saves=%d hooks=%d epoch=%d version=%d note=%v", mode, err, store.saves, hooks, live.RegistrationEpoch, live.CredentialVersion, live.Metadata["note"])
+				}
+				return
+			}
+			if err != nil || store.saves != 1 || hooks != 1 || string(rawBefore) == string(rawAfter) || live.RegistrationEpoch != old.RegistrationEpoch || live.CredentialVersion <= old.CredentialVersion || !live.AutoQuarantined || !coreauth.IsReauthRequiredMetadata(live.Metadata) || live.Metadata["note"] != "after" {
+				t.Fatalf("partial err=%v saves=%d hooks=%d epoch=%d version=%d live=%#v", err, store.saves, hooks, live.RegistrationEpoch, live.CredentialVersion, live.Metadata)
+			}
+			if live.Metadata["refresh_token"] != "old-refresh" || live.Metadata["siwc"].(map[string]any)["refresh_token"] != "old-siwc-refresh" {
+				t.Fatal("missing refresh partitions lost")
+			}
+		})
+	}
+}

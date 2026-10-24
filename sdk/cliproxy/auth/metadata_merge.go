@@ -470,3 +470,39 @@ func mergeAuthContent(base, current, updated *Auth) *Auth {
 func LoginReplacesOAuthCredentials(incoming, existing map[string]any) bool {
 	return loginReplacesOAuthCredentials(incoming, existing)
 }
+
+// A non-recovery save cannot reinterpret a partial token/configuration update as
+// evidence that a terminal refresh lock, quota observation or operator disable
+// has recovered. Explicit recovery continues through CommitReauthenticated.
+func preserveNonRecoveryMetadata(next, current *Auth) {
+	if next.Metadata == nil {
+		next.Metadata = make(map[string]any)
+	}
+	for key, value := range current.Metadata {
+		canonical := strings.ToLower(strings.TrimSpace(key))
+		if isRefreshLockMetadataKey(canonical) || strings.HasPrefix(canonical, "quota_") || canonical == "auto_quarantined" || canonical == "quarantine_reason" || canonical == "quarantined_at" || canonical == "disabled" {
+			next.Metadata[key] = value
+		}
+	}
+	if current.Disabled {
+		next.Metadata["disabled"] = true
+	}
+	if current.AutoQuarantined {
+		next.Metadata["auto_quarantined"] = true
+		next.Metadata["quarantine_reason"] = current.QuarantineReason
+		if !current.QuarantinedAt.IsZero() {
+			next.Metadata["quarantined_at"] = current.QuarantinedAt.Format(time.RFC3339Nano)
+		}
+	}
+	oldSettings, _ := current.Metadata["account_settings"].(map[string]any)
+	if enabled, ok := oldSettings["refresh_enabled"].(bool); ok && !enabled {
+		settings := make(map[string]any)
+		if incoming, ok := next.Metadata["account_settings"].(map[string]any); ok {
+			for key, value := range incoming {
+				settings[key] = value
+			}
+		}
+		settings["refresh_enabled"] = false
+		next.Metadata["account_settings"] = settings
+	}
+}

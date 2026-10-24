@@ -277,6 +277,135 @@ func (m *Manager) CommitReauthenticated(ctx context.Context, id string, expected
 	return m.registerLocked(WithSkipPersist(ctx), next, true, releaseMutation)
 }
 
+// CommitNonRecoveryUpdate strictly persists an ordinary same-account edit without
+// opening a new registration or releasing terminal/operator/quota protections.
+// prepare receives the latest snapshot under the credential gate and must validate
+// all submitted credential identity claims before merging them. persist must make
+// an atomic save; neither callback may mutate this manager or invoke its hooks.
+// A nonzero expected credential version fences stale partial credential edits.
+func (m *Manager) CommitNonRecoveryUpdate(ctx context.Context, id string, expectedEpoch, expectedCredentialVersion uint64, prepare func(*Auth) (*Auth, error), persist func(context.Context, *Auth) error) (*Auth, error) {
+	if m == nil || strings.TrimSpace(id) == "" || prepare == nil || persist == nil {
+		return nil, fmt.Errorf("non-recovery update: incomplete transaction")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	releaseMutation, err := m.lockAuthMutationContext(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseMutation()
+	m.mu.RLock()
+	var current *Auth
+	if stored := m.auths[id]; stored != nil {
+		current = cloneNonRecoveryAuth(stored)
+	}
+	m.mu.RUnlock()
+	if current == nil || (expectedEpoch != 0 && current.RegistrationEpoch != expectedEpoch) || (expectedCredentialVersion != 0 && current.CredentialVersion != expectedCredentialVersion) {
+		return nil, fmt.Errorf("non-recovery update auth %s: missing or stale credential", id)
+	}
+	prepared, err := prepare(cloneNonRecoveryAuth(current))
+	if err != nil {
+		return nil, err
+	}
+	if prepared == nil || !ReauthenticationIdentityMatches(current, prepared) {
+		return nil, fmt.Errorf("non-recovery update auth %s: account identity changed", id)
+	}
+	// This content merge starts from current, retaining runtime status, quota,
+	// model errors, counters, rejected tokens, registration and stable identity.
+	next := MergePreparedAuth(current, current, prepared)
+	NormalizeCredentialMetadata(next.Metadata)
+	preserveNonRecoveryMetadata(next, current)
+	if err := ValidateAuthWeight(next); err != nil {
+		return nil, err
+	}
+	next.CredentialVersion = current.CredentialVersion
+	if CredentialsChanged(current, next) {
+		next.CredentialVersion++
+	}
+	next.Generation = current.Generation + 1
+	next.UpdatedAt = time.Now()
+	releaseSave, err := m.beginForegroundStoreSave(ctx)
+	if err != nil {
+		return nil, err
+	}
+	saved := cloneNonRecoveryAuth(next)
+	err = persist(ctx, saved)
+	releaseSave()
+	if err != nil {
+		return nil, err
+	}
+	// Store callbacks may backfill content, but cannot own manager identity,
+	// revisions, history, terminal status or quota. Isolate their delta exactly
+	// as persistLocked does, then retain only the ordinary content projection.
+	storeResult := cloneNonRecoveryAuth(next)
+	mergeAuthSaveDelta(storeResult, next, saved, true)
+	// Verify known claims after storage backfill, before publication.
+	if !nonRecoveryStoredIdentityMatches(next, storeResult) {
+		return nil, fmt.Errorf("non-recovery update auth %s: store changed account identity", id)
+	}
+	next = MergePreparedAuth(next, next, storeResult)
+	preserveNonRecoveryMetadata(next, current)
+	next.CredentialVersion = current.CredentialVersion
+	if CredentialsChanged(current, next) {
+		next.CredentialVersion++
+	}
+	// Store I/O holds only the per-account gate. Runtime observations that use
+	// m.mu directly remain live and their intervening delta wins publication.
+	m.pacingMu.Lock()
+	m.mu.Lock()
+	latest := m.auths[id]
+	if latest == nil || latest.RegistrationEpoch != current.RegistrationEpoch || latest.CredentialVersion != current.CredentialVersion {
+		m.mu.Unlock()
+		m.pacingMu.Unlock()
+		return nil, fmt.Errorf("non-recovery update auth %s: credential changed during persistence", id)
+	}
+	mergeAuthSaveDelta(next, current, latest, false)
+	if latest.Generation >= next.Generation {
+		next.Generation = latest.Generation + 1
+	}
+	next.ClearFileSnapshot()
+	m.auths[id] = cloneNonRecoveryAuth(next)
+	m.notifyAuthChangeLocked(id)
+	committed := cloneNonRecoveryAuth(next)
+	m.mu.Unlock()
+	m.refreshWarmupPacingLocked()
+	m.pacingMu.Unlock()
+	releaseMutation()
+	m.finishAuthUpdate(ctx, cloneNonRecoveryAuth(committed), false)
+	return committed, nil
+}
+
+// cloneNonRecoveryAuth isolates mutable terminal errors at transaction boundaries.
+// Opaque Storage/Runtime retain their existing ownership contract: callbacks must
+// not mutate manager-owned objects in place.
+func cloneNonRecoveryAuth(a *Auth) *Auth {
+	out := a.Clone()
+	if out != nil && a.LastError != nil {
+		lastError := *a.LastError
+		out.LastError = &lastError
+	}
+	return out
+}
+
+// Missing claims may be filled by storage; known claims cannot be replaced or
+// removed. This rejects publication, not external side effects of a bad Store.
+func nonRecoveryStoredIdentityMatches(before, after *Auth) bool {
+	for _, key := range []string{"account_id", "chatgpt_account_id", "email"} {
+		known, _ := before.Metadata[key].(string)
+		known = strings.TrimSpace(known)
+		if known == "" {
+			continue
+		}
+		value, ok := after.Metadata[key].(string)
+		value = strings.TrimSpace(value)
+		if !ok || (key == "email" && !strings.EqualFold(known, value)) || (key != "email" && known != value) {
+			return false
+		}
+	}
+	return true
+}
+
 // ReauthenticationIdentityMatches rejects a reused filename carrying a different
 // provider/account before it can inherit account history or operator metadata.
 func ReauthenticationIdentityMatches(existing, incoming *Auth) bool {

@@ -1164,7 +1164,12 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 			// An existing Codex identity may recover only through the complete
 			// transaction. Never fall back to the historical save/register lane.
 			if !completeCodexRecoveryMaterial(record, existing) {
-				return "", fmt.Errorf("%w: incomplete credentials for existing Codex account", errInvalidAuthFile)
+				// A login replacing every refresh partition still needs complete
+				// recovery evidence. Ordinary same-account edits cannot clear locks.
+				if coreauth.LoginReplacesOAuthCredentials(record.Metadata, existing.Metadata) {
+					return "", fmt.Errorf("%w: incomplete credentials for existing Codex account", errInvalidAuthFile)
+				}
+				return h.persistNonRecoveryCodexSave(ctx, existing, record)
 			}
 			path, registered, err := h.persistCompleteCodexReauthentication(ctx, existing, record)
 			if err == nil && h.postAuthPersistHook != nil {
@@ -1477,4 +1482,78 @@ func (h *Handler) persistCompleteCodexReauthentication(ctx context.Context, expe
 		return err
 	})
 	return path, registered, err
+}
+
+// persistNonRecoveryCodexSave persists a same-account edit without granting
+// recovery authority. Raw identity is checked before inheriting latest content.
+func (h *Handler) persistNonRecoveryCodexSave(ctx context.Context, expected, record *coreauth.Auth) (string, error) {
+	request := record.Clone()
+	if h.postAuthHook != nil {
+		if err := h.postAuthHook(ctx, request); err != nil {
+			return "", err
+		}
+	}
+	path := ""
+	committed, err := h.authManager.CommitNonRecoveryUpdate(ctx, expected.ID, expected.RegistrationEpoch, expected.CredentialVersion, func(current *coreauth.Auth) (*coreauth.Auth, error) {
+		if !uploadedCodexRecoveryIdentityMatches(current, request) {
+			return nil, fmt.Errorf("%w: saved credentials do not establish the same account identity", errInvalidAuthFile)
+		}
+		if typ, exists := request.Metadata["type"]; exists && typ != current.Provider {
+			return nil, fmt.Errorf("%w: credential provider changed", errInvalidAuthFile)
+		}
+		if coreauth.LoginReplacesOAuthCredentials(request.Metadata, current.Metadata) {
+			return nil, fmt.Errorf("%w: complete replacement requires reauthentication", errInvalidAuthFile)
+		}
+		fields := make(map[string]json.RawMessage)
+		for key, value := range request.Metadata {
+			if key == "siwc" {
+				part, ok := value.(map[string]any)
+				if !ok {
+					return nil, fmt.Errorf("%w: SIWC partial update must be an object", errInvalidAuthFile)
+				}
+				for nested, item := range part {
+					raw, err := json.Marshal(item)
+					if err != nil {
+						return nil, err
+					}
+					fields["siwc."+nested] = raw
+				}
+				continue
+			}
+			raw, err := json.Marshal(value)
+			if err != nil {
+				return nil, err
+			}
+			fields[key] = raw
+		}
+		next := current.Clone()
+		if err := applyAuthFileFieldsPatch(next, fields, authFileRequestRetryPatch{}); err != nil {
+			return nil, err
+		}
+		if !uploadedCodexRecoveryIdentityMatches(current, next) {
+			return nil, fmt.Errorf("%w: merged credential identity changed", errInvalidAuthFile)
+		}
+		if err := validateStoredAuthProxyURL(next); err != nil {
+			return nil, err
+		}
+		return next, nil
+	}, func(saveCtx context.Context, next *coreauth.Auth) error {
+		store := h.tokenStoreWithBaseDir()
+		if store == nil {
+			return fmt.Errorf("token store unavailable")
+		}
+		var err error
+		path, err = store.Save(coreauth.WithAuthCreationIntent(saveCtx), next)
+		return err
+	})
+	if err != nil {
+		return path, err
+	}
+	*record = *committed.Clone()
+	if h.postAuthPersistHook != nil {
+		if err := h.postAuthPersistHook(ctx, committed.Clone()); err != nil {
+			return path, err
+		}
+	}
+	return path, nil
 }
