@@ -1,6 +1,7 @@
 package watcher
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"os"
@@ -52,11 +53,16 @@ func reloadExcludedModels(t *testing.T, w *Watcher, model string) AuthUpdate {
 // newTrafficWatcher loads one Claude auth file through a scan into a manager on a real
 // file store, with oauth-excluded-models old-model; persist registers it as a login does,
 // skip-persist as the queue consumer does.
-func newTrafficWatcher(t *testing.T, persist bool) (*Watcher, *coreauth.Manager, string) {
+func newTrafficWatcher(t *testing.T, persist bool, establishedTraffic ...bool) (*Watcher, *coreauth.Manager, string) {
 	t.Helper()
 	dir := t.TempDir()
 	path := filepath.Join(dir, trafficAuthFile)
-	if errWrite := os.WriteFile(path, []byte(`{"type":"claude","email":"a@b.c"}`), 0o600); errWrite != nil {
+	authJSON := `{"type":"claude","email":"a@b.c"}`
+	if len(establishedTraffic) > 0 && establishedTraffic[0] {
+		// 已服务账号使后续成功仅更新runtime计数；首次服务本来就应改盘。
+		authJSON = `{"type":"claude","email":"a@b.c","proxy_url":"direct","account_scheduling":{"first_production_at":"2026-01-02T03:04:05Z"}}`
+	}
+	if errWrite := os.WriteFile(path, []byte(authJSON), 0o600); errWrite != nil {
 		t.Fatal(errWrite)
 	}
 	store := sdkauth.NewFileTokenStore()
@@ -116,10 +122,10 @@ func requireNextScanKeeps(t *testing.T, w *Watcher) {
 // the reload's scan and the apply of the scan's snapshot (its save leaves the file as is):
 // the snapshot applies and the next scan queues nothing.
 func TestRefreshAuthStateExcludedModelsReloadSurvivesRequestResult(t *testing.T) {
-	w, manager, _ := newTrafficWatcher(t, true)
+	w, manager, path := newTrafficWatcher(t, true, true)
 
 	update := reloadExcludedModels(t, w, "new-model")
-	manager.MarkResult(context.Background(), trafficRequestResult(true))
+	markNoOpTrafficSuccess(t, manager, path)
 	if !applyQueuedSnapshot(t, manager, update) {
 		t.Fatal("the reload's snapshot was discarded after a no-op result save")
 	}
@@ -202,7 +208,7 @@ func TestRefreshAuthStateAppliesExternalEditAfterRequestResult(t *testing.T) {
 // The fsnotify variant: the auth-files PATCH writes the file and the watcher reads it under
 // the new config; a request completes before the queue applies the snapshot.
 func TestAddOrUpdateClientConfigChangeSurvivesRequestResult(t *testing.T) {
-	w, manager, path := newTrafficWatcher(t, true)
+	w, manager, path := newTrafficWatcher(t, true, true)
 
 	setTrafficConfig(w, excludedModelsConfig(w.authDir, "new-model"))
 	patched, _ := manager.GetByID(trafficAuthFile)
@@ -213,7 +219,7 @@ func TestAddOrUpdateClientConfigChangeSurvivesRequestResult(t *testing.T) {
 	}
 	w.addOrUpdateClient(path)
 	update, _ := takeQueuedAuthUpdate(w, trafficAuthFile)
-	manager.MarkResult(context.Background(), trafficRequestResult(true))
+	markNoOpTrafficSuccess(t, manager, path)
 	if !applyQueuedSnapshot(t, manager, update) {
 		t.Fatal("the file event's snapshot was discarded after a no-op result save")
 	}
@@ -273,7 +279,8 @@ func (p hostConfigParser) ParseAuth(_ context.Context, req pluginapi.AuthParseRe
 	if errUnmarshal := json.Unmarshal(req.RawJSON, &metadata); errUnmarshal != nil {
 		return nil, false, nil
 	}
-	return &coreauth.Auth{ID: req.FileName, Provider: "claude", Metadata: metadata, Attributes: map[string]string{"host_config": *p.host}}, true, nil
+	proxyURL, _ := metadata["proxy_url"].(string)
+	return &coreauth.Auth{ID: req.FileName, Provider: "claude", ProxyURL: proxyURL, Metadata: metadata, Attributes: map[string]string{"host_config": *p.host}}, true, nil
 }
 
 // An auth-files PATCH writes the file and the watcher reads that write; its persisted update
@@ -282,7 +289,7 @@ func (p hostConfigParser) ParseAuth(_ context.Context, req pluginapi.AuthParseRe
 // what the plugin parser derives from the new host config reaches the runtime.
 func TestRefreshAuthStateRereadsAuthPersistedDuringScan(t *testing.T) {
 	ctx := context.Background()
-	w, manager, path := newTrafficWatcher(t, true)
+	w, manager, path := newTrafficWatcher(t, true, true)
 	host := "old"
 	w.SetPluginAuthParser(hostConfigParser{host: &host})
 
@@ -315,11 +322,59 @@ func TestRefreshAuthStateRereadsAuthPersistedDuringScan(t *testing.T) {
 	if !ok {
 		t.Fatal("nothing queued for the auth after the scan")
 	}
-	manager.MarkResult(ctx, trafficRequestResult(true))
+	markNoOpTrafficSuccess(t, manager, path)
 	applyQueuedSnapshot(t, manager, update)
 
 	if got, _ := manager.GetByID(trafficAuthFile); got.Attributes["host_config"] != "new" || got.Metadata["note"] != "patched" {
 		t.Fatalf("runtime host_config = %q note = %v, want the new host config and the PATCH's note", got.Attributes["host_config"], got.Metadata["note"])
+	}
+	requireNextScanKeeps(t, w)
+}
+
+// 三个“无变化保存”场景必须先证明真实文件没有变化，不能靠放宽摘要保护通过。
+func markNoOpTrafficSuccess(t *testing.T, manager *coreauth.Manager, path string) {
+	t.Helper()
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.MarkResult(context.Background(), trafficRequestResult(true))
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("expected an established account's result save to leave file bytes unchanged")
+	}
+}
+
+func TestRefreshAuthStateFirstProductionAnchorInvalidatesEarlierSnapshot(t *testing.T) {
+	// 只注入管理器结果，不发请求；新账号没有first-production anchor。
+	w, manager, path := newTrafficWatcher(t, true)
+	update := reloadExcludedModels(t, w, "new-model")
+	manager.MarkResult(context.Background(), trafficRequestResult(true))
+	current, _ := manager.GetByID(trafficAuthFile)
+	if _, ok := coreauth.AuthFirstProductionAt(current); !ok {
+		t.Fatal("first successful result did not create the production anchor")
+	}
+	scheduling, ok := readJSONField(t, path, "account_scheduling").(map[string]any)
+	if !ok || scheduling["first_production_at"] == nil {
+		t.Fatal("first production anchor was not persisted")
+	}
+	if applyQueuedSnapshot(t, manager, update) {
+		t.Fatal("snapshot predating the first production anchor was accepted")
+	}
+	w.addOrUpdateClient(path)
+	latest, ok := takeQueuedAuthUpdate(w, trafficAuthFile)
+	if !ok || !applyQueuedSnapshot(t, manager, latest) {
+		t.Fatal("file event with persisted anchor did not apply")
+	}
+	current, _ = manager.GetByID(trafficAuthFile)
+	if current.Success != 1 {
+		t.Fatalf("success count = %d, want 1", current.Success)
+	}
+	if _, ok := coreauth.AuthFirstProductionAt(current); !ok {
+		t.Fatal("fresh snapshot lost the first production anchor")
 	}
 	requireNextScanKeeps(t, w)
 }
