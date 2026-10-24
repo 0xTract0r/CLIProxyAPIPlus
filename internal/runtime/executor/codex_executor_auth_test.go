@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -78,21 +79,33 @@ func codexRefreshLinuxBoundary(t *testing.T) {
 		t.Fatal(err)
 	}
 	allowed := map[string]bool{}
+	dummyIPv6 := ""
 	for _, iface := range interfaces {
 		addresses, err := iface.Addrs()
 		if err != nil {
 			t.Fatal(err)
 		}
+		dummyIPv4 := false
 		for _, address := range addresses {
 			ip, network, err := net.ParseCIDR(address.String())
 			if err != nil {
 				t.Fatal(err)
 			}
 			ones, bits := network.Mask.Size()
-			if !ip.IsLoopback() && !(ip.String() == "10.254.254.1" && ones == 32 && bits == 32) {
+			switch {
+			case iface.Name == "lo" && iface.Flags&net.FlagLoopback != 0 && ip.IsLoopback():
+			case iface.Name == "cpa-self" && ip.String() == "10.254.254.1" && ones == 32 && bits == 32:
+				dummyIPv4 = true
+			case iface.Name == "cpa-self" && bits == 128 && ones == 64 && hex.EncodeToString(ip.To16()[:8]) == "fe80000000000000" && dummyIPv6 == "":
+				// dummy up 后内核会自动生成 fe80::/64；只核准该接口的实际地址。
+				dummyIPv6 = hex.EncodeToString(ip.To16())
+			default:
 				t.Fatal("nonlocal interface address in Linux fixture")
 			}
 			allowed[iface.Name] = true
+		}
+		if iface.Name == "cpa-self" && (!dummyIPv4 || iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 || iface.Flags&net.FlagBroadcast == 0) {
+			t.Fatal("unexpected cpa-self interface topology")
 		}
 		if iface.Flags&net.FlagUp != 0 && !allowed[iface.Name] {
 			t.Fatal("unverified active interface")
@@ -110,7 +123,7 @@ func codexRefreshLinuxBoundary(t *testing.T) {
 		if len(v) < 8 {
 			t.Fatal("unparseable IPv4 route")
 		}
-		if v[0] != "lo" && !(allowed[v[0]] && v[1] == "01FEFE0A" && v[2] == "00000000" && v[7] == "FFFFFFFF") {
+		if v[0] != "lo" && !(v[0] == "cpa-self" && allowed[v[0]] && v[1] == "01FEFE0A" && v[2] == "00000000" && v[7] == "FFFFFFFF") {
 			t.Fatal("external IPv4 route in fixture")
 		}
 	}
@@ -123,8 +136,18 @@ func codexRefreshLinuxBoundary(t *testing.T) {
 			continue
 		}
 		v := strings.Fields(line)
-		if len(v) != 10 || v[9] != "lo" {
-			t.Fatal("external or unparseable IPv6 route in fixture")
+		if len(v) != 10 {
+			t.Fatal("unparseable IPv6 route in fixture")
+		}
+		if v[9] == "lo" {
+			continue
+		}
+		zero := strings.Repeat("0", 32)
+		localPrefix := v[0] == "fe800000000000000000000000000000" && v[1] == "40" && v[8] == "00000001"
+		localHost := v[0] == dummyIPv6 && v[1] == "80" && v[8] == "80200001"
+		multicast := v[0] == "ff000000000000000000000000000000" && v[1] == "08" && v[8] == "00000001"
+		if v[9] != "cpa-self" || !allowed["cpa-self"] || dummyIPv6 == "" || v[2] != zero || v[3] != "00" || v[4] != zero || !(localPrefix || localHost || multicast) {
+			t.Fatal("external IPv6 route in fixture")
 		}
 	}
 	for _, address := range []string{"192.0.2.1:443", "198.51.100.1:8080", "[2001:db8::1]:443"} {
