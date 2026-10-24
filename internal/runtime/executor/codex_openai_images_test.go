@@ -243,10 +243,13 @@ func TestCodexExecutorDirectOpenAIImageGenerationUsesImagesEndpoint(t *testing.T
 		"Version":               "0.135.0",
 		"X-Codex-Turn-Metadata": `{"turn_id":"turn-1"}`,
 		"X-Client-Request-Id":   "client-request-1",
-		"Originator":            "Codex Desktop",
+		"Originator":            codexOriginator,
 	})
 	executor := NewCodexExecutor(&config.Config{})
-	resp, errExecute := executor.Execute(ctx, newCodexOpenAIImageTestAuth(server.URL), cliproxyexecutor.Request{
+	// 本测试明确覆盖调用方自管头；默认账号指纹由独立负控验证。
+	auth := newCodexOpenAIImageTestAuth(server.URL)
+	auth.Attributes[cliproxyauth.AttributeCodexDisableCloaking] = "true"
+	resp, errExecute := executor.Execute(ctx, auth, cliproxyexecutor.Request{
 		Model:   "codex/gpt-image-1.5",
 		Payload: []byte(`{"model":"codex/gpt-image-1.5","prompt":"A cute baby sea otter","n":1,"size":"1024x1024","quality":"high","background":"opaque","output_format":"jpeg","output_compression":70,"moderation":"low","extra":{"preserve":true},"stream":false}`),
 	}, codexOpenAIImageTestOptions(codexImagesGenerationsPath, false))
@@ -604,6 +607,54 @@ func TestCodexExecutorDirectOpenAIImage25Models(t *testing.T) {
 			}
 			if got := gjson.GetBytes(gotBody, "model").String(); got != baseModel {
 				t.Fatalf("model = %q, want %s; body=%s", got, baseModel, string(gotBody))
+			}
+		})
+	}
+}
+
+// 默认 managed 路径保留 F 的账号指纹和 Version 删除策略。
+func TestCodexDirectImageDefaultManagedHeaders(t *testing.T) {
+	var got http.Header
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Clone()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"data":[{"b64_json":"AA=="}]}`)
+	}))
+	defer server.Close()
+	ctx := contextWithGinHeaders(map[string]string{
+		"User-Agent": "untrusted-client/9.9", "Version": "0.135.0", "Originator": "untrusted-originator",
+	})
+	auth := newCodexOpenAIImageTestAuth(server.URL)
+	delete(auth.Attributes, "api_key")
+	auth.Metadata = map[string]any{"access_token": "managed-token"}
+	_, err := NewCodexExecutor(&config.Config{}).Execute(ctx, auth, cliproxyexecutor.Request{
+		Model: "codex/gpt-image-1.5", Payload: []byte(`{"model":"codex/gpt-image-1.5","prompt":"diagnostic"}`),
+	}, codexOpenAIImageTestOptions(codexImagesGenerationsPath, false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ua := got.Get("User-Agent"); ua == "" || ua == "untrusted-client/9.9" {
+		t.Fatalf("managed User-Agent leaked downstream identity: %q", ua)
+	}
+	if version := got.Get("Version"); version != "" {
+		t.Fatalf("managed Version = %q, want absent", version)
+	}
+	if origin := got.Get("Originator"); origin == "" || origin == "untrusted-originator" {
+		t.Fatalf("managed Originator leaked downstream identity: %q", origin)
+	}
+}
+
+func TestCodexDirectImageEndpointEligibility(t *testing.T) {
+	for _, tc := range []struct{ name, model, path, want string }{
+		{"generation", "codex/gpt-image-1.5", codexImagesGenerationsPath, "/images/generations"},
+		{"edit", "gpt-image-2.5", codexImagesEditsPath, "/images/edits"},
+		{"non-image model", "gpt-5.4-mini", codexImagesGenerationsPath, ""},
+		{"non-image endpoint", "gpt-image-1.5", "/v1/responses", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := cliproxyexecutor.Request{Model: tc.model, Payload: []byte(`{"prompt":"diagnostic"}`)}
+			if got := codexDirectOpenAIImageEndpoint(req, codexOpenAIImageTestOptions(tc.path, false)); got != tc.want {
+				t.Fatalf("endpoint = %q, want %q", got, tc.want)
 			}
 		})
 	}
