@@ -25,6 +25,8 @@ func ParseConfigBytes(data []byte) (*Config, error) {
 	cfg.Host = "" // Default empty: binds to all interfaces (IPv4 + IPv6)
 	cfg.LoggingToFile = false
 	cfg.LogsMaxTotalSizeMB = 0
+	cfg.LogsCompressAfterDays = DefaultLogsCompressAfterDays
+	cfg.LogsDeleteAfterDays = DefaultLogsDeleteAfterDays
 	cfg.LoggingDisplayTimezoneOffsetHours = DefaultLoggingDisplayTimezoneOffsetHours
 	cfg.ErrorLogsMaxFiles = 10
 	cfg.UsageStatisticsEnabled = false
@@ -96,6 +98,14 @@ func ParseConfigBytes(data []byte) (*Config, error) {
 
 	if cfg.LogsMaxTotalSizeMB < 0 {
 		cfg.LogsMaxTotalSizeMB = 0
+	}
+
+	// 与文件加载一致：负值回默认，显式0保留关闭语义。
+	if cfg.LogsCompressAfterDays < 0 {
+		cfg.LogsCompressAfterDays = DefaultLogsCompressAfterDays
+	}
+	if cfg.LogsDeleteAfterDays < 0 {
+		cfg.LogsDeleteAfterDays = DefaultLogsDeleteAfterDays
 	}
 
 	if cfg.ErrorLogsMaxFiles < 0 {
