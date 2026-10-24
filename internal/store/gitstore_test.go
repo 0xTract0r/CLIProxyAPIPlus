@@ -1799,6 +1799,9 @@ func corruptGitRepository(t *testing.T, repoDir string) {
 		t.Fatalf("open repository before corruption: %v", errOpen)
 	}
 	defer func() {
+		if repo == nil {
+			return
+		}
 		if errClose := repo.Close(); errClose != nil {
 			t.Errorf("close corrupted repository: %v", errClose)
 		}
@@ -1806,6 +1809,11 @@ func corruptGitRepository(t *testing.T, repoDir string) {
 	if errRepack := repo.RepackObjects(&git.RepackConfig{}); errRepack != nil {
 		t.Fatalf("repack repository objects: %v", errRepack)
 	}
+	// v6缓存已打开的对象/pack；物理损坏须在关闭旧handle后由fresh handle观察。
+	if errClose := repo.Close(); errClose != nil {
+		t.Fatalf("close repacked repository: %v", errClose)
+	}
+	repo = nil
 	objectsDir := filepath.Join(repoDir, ".git", "objects")
 	objectEntries, errReadDir := os.ReadDir(objectsDir)
 	if errReadDir != nil {
@@ -1829,6 +1837,10 @@ func corruptGitRepository(t *testing.T, repoDir string) {
 		if errRemove := os.Remove(packfile); errRemove != nil {
 			t.Fatalf("remove packfile %s: %v", filepath.Base(packfile), errRemove)
 		}
+	}
+	repo, errOpen = git.PlainOpen(repoDir)
+	if errOpen != nil {
+		t.Fatalf("fresh open corrupted repository: %v", errOpen)
 	}
 	if errVerify := verifyRepositoryHead(repo); !isRepositoryCorruptionError(errVerify) {
 		t.Fatalf("verifyRepositoryHead error = %v, want repository corruption", errVerify)
