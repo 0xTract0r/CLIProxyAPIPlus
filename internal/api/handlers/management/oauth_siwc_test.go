@@ -516,7 +516,7 @@ func TestSIWCBindRelativeAuthDirCommit(t *testing.T) {
 func TestSIWCBindRejectsReplacedAccount(t *testing.T) {
 	for _, mode := range []string{"legacy-upload", "watcher-update"} {
 		t.Run(mode, func(t *testing.T) {
-			f := setupSIWCFlow(t, false)
+			f := setupSIWCFlow(t, mode == "legacy-upload")
 			f.router.POST("/legacy", f.h.UploadAuthFile)
 			state, flow := f.start(t)
 			replacement := map[string]any{
@@ -524,6 +524,15 @@ func TestSIWCBindRejectsReplacedAccount(t *testing.T) {
 				"access_token":  "outer-b",
 				"refresh_token": "outer-refresh-b",
 				"account_id":    "account-b",
+				"id_token":      "e30.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOiB7ImNoYXRncHRfYWNjb3VudF9pZCI6ICJhY2NvdW50LWIifX0.",
+			}
+			var w *httptest.ResponseRecorder
+			if mode == "legacy-upload" {
+				w = siwcRequest(t, f.router, http.MethodPost, "/callback", map[string]any{"provider": "codex", "redirect_url": siwcCallbackURL(state)})
+				if w.Code != http.StatusOK {
+					t.Fatalf("callback before replacement: %d", w.Code)
+				}
+				<-f.service.inputs
 			}
 			switch mode {
 			case "legacy-upload":
@@ -542,7 +551,15 @@ func TestSIWCBindRejectsReplacedAccount(t *testing.T) {
 					t.Fatal(errUpdate)
 				}
 			}
-			w := siwcRequest(t, f.router, http.MethodPost, "/callback", map[string]any{"provider": "codex", "redirect_url": siwcCallbackURL(state)})
+			if mode == "watcher-update" {
+				w = siwcRequest(t, f.router, http.MethodPost, "/callback", map[string]any{"provider": "codex", "redirect_url": siwcCallbackURL(state)})
+			} else {
+				late := siwcRequest(t, f.router, http.MethodPost, "/callback", map[string]any{"provider": "codex", "redirect_url": siwcCallbackURL(state)})
+				if late.Code != http.StatusConflict {
+					t.Fatalf("replacement did not reject new callback: %d", late.Code)
+				}
+				f.unblock()
+			}
 			if w.Code != http.StatusOK {
 				t.Fatalf("callback: %d %s", w.Code, w.Body.String())
 			}
@@ -615,7 +632,9 @@ func TestSIWCBindLegacyUploadDuringCommitWindow(t *testing.T) {
 		"access_token":  "uploaded-outer",
 		"refresh_token": "uploaded-refresh",
 		"account_id":    "account",
+		"id_token":      "e30.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOiB7ImNoYXRncHRfYWNjb3VudF9pZCI6ICJhY2NvdW50In19.",
 		"note":          "uploaded-during-commit",
+		"siwc":          map[string]any{"access_token": "uploaded-siwc", "refresh_token": "uploaded-siwc-refresh"},
 	}
 	rawBody, errMarshal := json.Marshal(uploadedBody)
 	if errMarshal != nil {
@@ -631,6 +650,23 @@ func TestSIWCBindLegacyUploadDuringCommitWindow(t *testing.T) {
 		Context: flow.ctx,
 		onCall:  6,
 		hook: func() {
+			pcs := make([]uintptr, 32)
+			n := runtime.Callers(2, pcs)
+			frames := runtime.CallersFrames(pcs[:n])
+			insideLock := false
+			for {
+				frame, more := frames.Next()
+				if strings.HasSuffix(frame.Function, "/codex/credential.WithFileLock") {
+					insideLock = true
+				}
+				if !more {
+					break
+				}
+			}
+			if !insideLock {
+				t.Error("commit-window hook no longer runs inside Codex file lock")
+			}
+			t.Logf("450 bind commit window inside Codex file lock=%v", insideLock)
 			go func() {
 				req := httptest.NewRequest(http.MethodPost, "/legacy?name=codex.json", strings.NewReader(string(rawBody)))
 				req.Header.Set("Content-Type", "application/json")
@@ -696,8 +732,22 @@ func TestSIWCBindLegacyUploadDuringCommitWindow(t *testing.T) {
 	if disk["refresh_token"] != "uploaded-refresh" || got.Metadata["refresh_token"] != "uploaded-refresh" {
 		t.Fatal("uploaded outer refresh token was rolled back")
 	}
-	if got.RegistrationEpoch != f.auth.RegistrationEpoch || got.Index != f.auth.Index || !got.CreatedAt.Equal(f.auth.CreatedAt) || got.CredentialVersion <= f.auth.CredentialVersion {
+	if got.RegistrationEpoch <= f.auth.RegistrationEpoch || got.Index != f.auth.Index || !got.CreatedAt.Equal(f.auth.CreatedAt) || got.CredentialVersion <= f.auth.CredentialVersion {
 		t.Fatal("upload changed logical identity or failed to advance credential version")
+	}
+	if got.Metadata["siwc"].(map[string]any)["access_token"] != "uploaded-siwc" || disk["siwc"].(map[string]any)["refresh_token"] != "uploaded-siwc-refresh" {
+		t.Fatal("upload did not replace both token partitions")
+	}
+	f.manager.MarkResult(context.Background(), coreauth.Result{AuthID: f.auth.ID, Provider: "codex", RegistrationEpoch: f.auth.RegistrationEpoch, CredentialVersion: f.auth.CredentialVersion, AccessToken: "outer", Error: &coreauth.Error{HTTPStatus: 401, Message: "late old result"}})
+	stale := f.auth.Clone()
+	stale.Metadata["access_token"] = "late-old"
+	if _, err := f.manager.UpdateRefreshedAuth(context.Background(), f.auth, stale); err == nil {
+		t.Fatal("old epoch refresh accepted")
+	}
+	afterLate, _ := f.manager.GetByID(f.auth.ID)
+	diskAfterLate, errLate := os.ReadFile(f.path)
+	if errLate != nil || string(diskAfterLate) != string(diskData) || afterLate.RegistrationEpoch != got.RegistrationEpoch || afterLate.CredentialVersion != got.CredentialVersion || afterLate.Metadata["access_token"] != "uploaded-outer" || afterLate.AutoQuarantined {
+		t.Fatal("old epoch result/refresh mutated replacement")
 	}
 	if disk["use_siwc"] != got.Metadata["use_siwc"] {
 		t.Fatalf("disk and memory disagree on use_siwc: disk=%v memory=%v", disk["use_siwc"], got.Metadata["use_siwc"])
@@ -718,6 +768,7 @@ func TestWriteAuthFileWaitsForCodexFileLock(t *testing.T) {
 				"access_token":  "uploaded-outer",
 				"refresh_token": "uploaded-refresh",
 				"account_id":    "account",
+				"id_token":      "e30.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOiB7ImNoYXRncHRfYWNjb3VudF9pZCI6ICJhY2NvdW50In19.",
 				"note":          "after-lock",
 			},
 		},
@@ -732,6 +783,11 @@ func TestWriteAuthFileWaitsForCodexFileLock(t *testing.T) {
 			},
 		},
 		{
+			name:         "non_codex_replacing_existing_codex_symlink",
+			useSymlink:   true,
+			uploadedBody: map[string]any{"type": "claude", "access_token": "claude-access", "refresh_token": "claude-refresh", "note": "replaced-provider-symlink"},
+		},
+		{
 			name:       "symlinked_auth_dir_alias",
 			useSymlink: true,
 			uploadedBody: map[string]any{
@@ -739,6 +795,7 @@ func TestWriteAuthFileWaitsForCodexFileLock(t *testing.T) {
 				"access_token":  "uploaded-outer",
 				"refresh_token": "uploaded-refresh",
 				"account_id":    "account",
+				"id_token":      "e30.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOiB7ImNoYXRncHRfYWNjb3VudF9pZCI6ICJhY2NvdW50In19.",
 				"note":          "via-symlink-dir",
 			},
 		},
@@ -785,6 +842,9 @@ func TestWriteAuthFileWaitsForCodexFileLock(t *testing.T) {
 
 			reachedMutation := make(chan struct{})
 			reachedUpsert := make(chan struct{})
+			prepared := make(chan struct{})
+			f.h.postAuthHook = func(context.Context, *coreauth.Auth) error { close(prepared); return nil }
+			f.h.postAuthPersistHook = func(context.Context, *coreauth.Auth) error { close(reachedUpsert); return nil }
 			uploadDone := make(chan *httptest.ResponseRecorder, 1)
 			go func() {
 				req := httptest.NewRequest(http.MethodPost, "/legacy?name=codex.json", strings.NewReader(string(rawBody)))
@@ -792,20 +852,22 @@ func TestWriteAuthFileWaitsForCodexFileLock(t *testing.T) {
 				req = req.WithContext(&siwcUploadProgressContext{
 					Context: req.Context(),
 					valueCh: reachedMutation,
-					doneCh:  reachedUpsert,
+					doneCh:  make(chan struct{}),
 				})
 				w := httptest.NewRecorder()
 				f.router.ServeHTTP(w, req)
 				uploadDone <- w
 			}()
 			<-reachedMutation
-			for range 200 {
-				runtime.Gosched()
+			select {
+			case <-prepared:
+			case <-time.After(3 * time.Second):
+				t.Fatal("valid upload never reached preparation")
 			}
 			select {
 			case <-reachedUpsert:
 				t.Fatal("writeAuthFile bypassed codex.WithFileLock and reached upsertAuthRecord while lock was held")
-			default:
+			case <-time.After(100 * time.Millisecond):
 			}
 			diskWhileLocked, errRead := os.ReadFile(f.path)
 			if errRead != nil {
