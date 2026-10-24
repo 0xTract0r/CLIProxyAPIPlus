@@ -345,8 +345,18 @@ func TestRequestCodexTokenLoginDoesNotRaceConfigV8Save(t *testing.T) {
 		t.Fatal("timed out waiting for post-auth persist hook")
 	}
 	waitForOAuthSessionDone(t, state)
-	_, status, _, _, completed, ok := GetOAuthSessionDetails(state)
-	if !ok || !completed || status != "" {
-		t.Fatalf("expected completed codex session without error, got ok=%v completed=%v status=%q", ok, completed, status)
+	session, ok := oauthSessions.Get(state)
+	if !ok || session.Status != oauthSessionStatusComplete || session.Completed || session.CompletedAt.IsZero() || session.Provider != "codex" || IsOAuthSessionPending(state, "codex") {
+		t.Fatal("expected terminal result-bearing codex success")
+	}
+	if session.SavedPath == "" || session.AuthName == "" || filepath.Base(session.SavedPath) != session.AuthName || filepath.Clean(filepath.Dir(session.SavedPath)) != filepath.Clean(authDir) {
+		t.Fatal("missing or inconsistent saved auth result identity")
+	}
+	if info, errStat := os.Stat(session.SavedPath); errStat != nil || !info.Mode().IsRegular() {
+		t.Fatal("saved auth result is not a real file")
+	}
+	finalConfig, errFinal := config.LoadConfig(path)
+	if errFinal != nil || finalConfig.RequestRetry != 2 {
+		t.Fatal("final concurrent config save did not retain request-retry=2")
 	}
 }
