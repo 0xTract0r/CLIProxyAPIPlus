@@ -52,7 +52,7 @@ func TestClaudeExecutorPauseTurnContinuationRestoresFinishedSearchAndKeepsPaused
 			defer server.Close()
 
 			executor := NewClaudeExecutor(enabledClaudeWebSearchCacheConfig())
-			auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "key-pause", "base_url": server.URL}}
+			auth := &cliproxyauth.Auth{ProxyURL: "direct", Attributes: map[string]string{"api_key": "key-pause", "base_url": server.URL}}
 			run := func(input string) gjson.Result {
 				payload := []byte(`{"model":"claude-opus-5-5","stream":` + map[bool]string{false: "false", true: "true"}[stream] + `,"tools":[{"type":"web_search"}],"input":[` + input + `]}`)
 				req := cliproxyexecutor.Request{Model: "claude-opus-5-5", Payload: payload}
@@ -169,7 +169,7 @@ func TestClaudeExecutorChatRefusalStaysSuccessful(t *testing.T) {
 	}))
 	defer server.Close()
 
-	auth := &cliproxyauth.Auth{ID: "refusal", Attributes: map[string]string{"api_key": "sk-ant-test", "base_url": server.URL}}
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", ID: "refusal", Attributes: map[string]string{"api_key": "sk-ant-test", "base_url": server.URL}}
 	payload := []byte(`{"model":"claude-opus-5-5","messages":[{"role":"user","content":"hello"}]}`)
 	resp, errExecute := NewClaudeExecutor(&config.Config{}).Execute(context.Background(), auth, cliproxyexecutor.Request{
 		Model: "claude-opus-5-5", Payload: payload,

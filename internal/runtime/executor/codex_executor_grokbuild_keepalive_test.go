@@ -30,7 +30,7 @@ func TestCodexExecutorExecuteStream_GrokBuildConvertsKeepaliveToSSEComment(t *te
 	defer server.Close()
 
 	executor := NewCodexExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", Attributes: map[string]string{
 		"base_url": server.URL,
 		"api_key":  "test",
 	}}

@@ -148,6 +148,7 @@ func TestClaudeExecutorCompatThinkingReplayRestoresOmittedBlock(t *testing.T) {
 
 	executor := NewClaudeExecutor(nil)
 	auth := claudeReplayTestAuth(server.URL)
+	auth.ProxyURL = "direct"
 	firstPayload := []byte(`{"messages":[{"role":"user","content":"inspect"}]}`)
 	firstRequest, firstOptions := claudeReplayTestRequest(firstPayload, "nonstream-replay", true, sdktranslator.FormatClaude)
 	if _, errExecute := executor.Execute(context.Background(), auth, firstRequest, firstOptions); errExecute != nil {
@@ -207,6 +208,7 @@ func TestClaudeExecutorCompatThinkingReplayRestoresOmittedBlockInStream(t *testi
 
 	executor := NewClaudeExecutor(nil)
 	auth := claudeReplayTestAuth(server.URL)
+	auth.ProxyURL = "direct"
 	firstPayload := []byte(`{"messages":[{"role":"user","content":"inspect"}]}`)
 	firstRequest, firstOptions := claudeReplayTestRequest(firstPayload, "stream-replay", true, sdktranslator.FormatClaude)
 	firstResult, errExecute := executor.ExecuteStream(context.Background(), auth, firstRequest, firstOptions)
@@ -285,6 +287,7 @@ func TestClaudeExecutorCompatThinkingReplayClearsAfterUpstreamBadRequest(t *test
 
 	executor := NewClaudeExecutor(nil)
 	auth := claudeReplayTestAuth(server.URL)
+	auth.ProxyURL = "direct"
 	firstRequest, firstOptions := claudeReplayTestRequest([]byte(`{"messages":[{"role":"user","content":"inspect"}]}`), "bad-request-replay", true, sdktranslator.FormatClaude)
 	if _, errExecute := executor.Execute(context.Background(), auth, firstRequest, firstOptions); errExecute != nil {
 		t.Fatalf("first Execute() error = %v", errExecute)
@@ -335,6 +338,7 @@ func TestClaudeExecutorCompatThinkingReplayRestoresMultipleOmittedBlocks(t *test
 
 	executor := NewClaudeExecutor(nil)
 	auth := claudeReplayTestAuth(server.URL)
+	auth.ProxyURL = "direct"
 	firstRequest, firstOptions := claudeReplayTestRequest([]byte(`{"messages":[{"role":"user","content":"inspect"}]}`), "multi-turn-replay", true, sdktranslator.FormatClaude)
 	if _, errExecute := executor.Execute(context.Background(), auth, firstRequest, firstOptions); errExecute != nil {
 		t.Fatalf("first Execute() error = %v", errExecute)

@@ -98,7 +98,7 @@ func TestIssue6478_DevinClaudeOutputAndToolResultRoundTrip(t *testing.T) {
 
 			cfg := &config.Config{}
 			executor := NewDevinExecutor(cfg)
-			auth := &cliproxyauth.Auth{ID: t.Name(), Provider: "devin", Attributes: map[string]string{"api_key": "test-key", "base_url": server.URL}}
+			auth := &cliproxyauth.Auth{ProxyURL: "direct", ID: t.Name(), Provider: "devin", Attributes: map[string]string{"api_key": "test-key", "base_url": server.URL}}
 			payload := []byte(`{"model":"devin/swe-2","max_tokens":64,"messages":[{"role":"user","content":"run tools"}]}`)
 			req := cliproxyexecutor.Request{Model: "devin/swe-2", Payload: payload}
 			opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatClaude, OriginalRequest: payload, Stream: stream}

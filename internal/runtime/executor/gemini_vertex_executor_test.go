@@ -139,6 +139,7 @@ func TestGeminiVertexExecutorClaudeMalformedFunctionCallReturnsRetryableError(t 
 			ctx := context.Background()
 			auth := &cliproxyauth.Auth{ID: t.Name(), Provider: "vertex"}
 			if authMode == "api_key" {
+			auth.ProxyURL = "direct"
 				auth.Attributes = map[string]string{"api_key": "test-key", "base_url": server.URL}
 			} else {
 				var serviceAccount map[string]any
