@@ -89,6 +89,7 @@ func TestResponsesSteerInFlightWebSocket(t *testing.T) {
 	authID := "steering-red-test"
 	model := "steering-red-model"
 	if _, err := manager.Register(context.Background(), &coreauth.Auth{
+		ProxyURL:   "direct",
 		ID:         authID,
 		Provider:   "codex",
 		Status:     coreauth.StatusActive,

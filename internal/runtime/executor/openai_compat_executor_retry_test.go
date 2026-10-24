@@ -91,7 +91,7 @@ func TestOpenAICompatExecutorPropagatesRetryAfter(t *testing.T) {
 	t.Cleanup(server.Close)
 
 	executor := NewOpenAICompatExecutor("openai-compatibility", &config.Config{})
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", Attributes: map[string]string{
 		"base_url": server.URL + "/v1",
 		"api_key":  "test",
 	}}

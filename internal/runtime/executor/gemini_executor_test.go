@@ -943,6 +943,7 @@ func TestGeminiExecutorNativeInteractionsStripsPassthroughInputIDsBeforeUpstream
 
 			exec := NewGeminiInteractionsExecutor(&config.Config{})
 			auth := &cliproxyauth.Auth{
+				ProxyURL: "direct",
 				Provider: "gemini-interactions",
 				Attributes: map[string]string{
 					"api_key":  "test-key",
