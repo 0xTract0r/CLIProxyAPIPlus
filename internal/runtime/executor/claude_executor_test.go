@@ -232,6 +232,7 @@ func TestApplyClaudeHeaders_RejectsUnmeasuredClaudeCLIFingerprints(t *testing.T)
 			OS:                     "MacOS",
 			Arch:                   "arm64",
 			StabilizeDeviceProfile: &stabilize,
+			PinSoftwareBaseline:    true,
 		},
 	}
 	auth := &cliproxyauth.Auth{

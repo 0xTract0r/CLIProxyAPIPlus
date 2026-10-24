@@ -35,6 +35,10 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+// 保留 fork 默认头合同；220 列表来自固定 f3e25ab2 的实际声明，非 280 的别名。
+const claudeForkMessagesBetaFloor = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07"
+const claudePinned220MessagesBetas = "claude-code-20250219,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,effort-2025-11-24,fallback-credit-2026-06-01"
+
 const (
 	claudeTokenCountingBeta          = "token-counting-2024-11-01"
 	claudeFastModeBeta               = "fast-mode-2026-02-01"
@@ -132,6 +136,30 @@ var claudeManagedBetaSet = func() map[string]bool {
 
 func isManagedClaudeBeta(beta string) bool {
 	return claudeManagedBetaSet[strings.TrimSpace(beta)]
+}
+
+// 旧基线仍需携带实际新请求字段要求的 beta；生成器的无条件指纹项由各基线负责。
+func claudeRequiredBodyBetas(body []byte, oauthToken bool) []string {
+	var betas []string
+	for _, beta := range strings.Split(claudeCodeCLIBetas(body, nil, oauthToken), ",") {
+		switch beta {
+		case claudeCodeBeta, claudeOAuthBeta, claudeRedactThinkingBeta,
+			"interleaved-thinking-2025-05-14", "thinking-token-count-2026-05-13",
+			"context-management-2025-06-27", "prompt-caching-scope-2026-01-05",
+			claudeMidConvSystemBeta, claudeMidConvToolChangesBeta:
+			continue
+		case claudeEffortBeta:
+			if !gjson.GetBytes(body, "output_config.effort").Exists() {
+				continue
+			}
+		case claudeExtendedCacheTTLBeta:
+			if !helps.ClaudePayloadHas1hTTL(body) {
+				continue
+			}
+		}
+		betas = append(betas, beta)
+	}
+	return betas
 }
 
 // claudeCodeCLIBetas assembles the Anthropic-Beta baseline the way Claude Code
@@ -1243,8 +1271,9 @@ func applyClaudeHeadersWithNativeProfile(
 		helperProfile = false
 		sessionIDs = nil
 	}
-	applyCLIFingerprint := fp.ProfileClaudeCodeCLI || wirePolicy.Cloak
-	preserveCallerFingerprint := !applyCLIFingerprint && !confirmedClaudeCode
+	// never 只关闭正文 cloak；native UA 也不能绕过 fork 的设备 floor/high-water。
+	// 既有显式 uncloak 才将头部身份交还给调用方。
+	preserveCallerFingerprint := wirePolicy.Uncloak
 	useOAuthBetas := fp.UseOAuthBetas
 	isAnthropicBase := isAnthropicUpstreamURL(r.URL)
 	if strings.TrimSpace(apiKey) != "" {
@@ -1281,9 +1310,30 @@ func applyClaudeHeadersWithNativeProfile(
 	requestedMap := claudeRequestedBetas(incomingBetas, extraBetas)
 	advisorNeeded := requestedMap[claudeAdvisorToolBeta] || claudeBodyHasAdvisorTool(body)
 
+	// 只在显式 pin 的已知源码合同中选择版本；不借 CCH 的 220 阈值猜 beta。
+	pinnedBetaVersion := ""
+	if hd.PinSoftwareBaseline {
+		pinnedBetaVersion = deviceProfile.VersionString()
+	}
+	pinned220Betas := pinnedBetaVersion == "2.1.220"
+	pinned280Betas := pinnedBetaVersion == "2.1.280"
+	forkMessagesBetas := !countTokens && !pinned220Betas && !pinned280Betas
 	baseBetas := incomingBetas
 	if !preserveCallerFingerprint {
 		baseBetas = claudeCodeCLIBetas(body, requestedMap, useOAuthBetas)
+		if forkMessagesBetas || pinned220Betas {
+			baseBetas = claudeForkMessagesBetaFloor
+			if pinned220Betas {
+				baseBetas = claudePinned220MessagesBetas
+				if useOAuthBetas {
+					baseBetas = withClaudeOAuthCredentialBetas(baseBetas, false)
+				}
+			}
+			// 仅复用由真实 body/新模型能力触发的部分，不给 211 注入 280 默认项。
+			for _, beta := range claudeRequiredBodyBetas(body, useOAuthBetas) {
+				baseBetas = withClaudeBetaAppended(baseBetas, beta)
+			}
+		}
 		if countTokens {
 			baseBetas = claudeCountTokensBetasForCredential(useOAuthBetas)
 			if advisorNeeded {
@@ -1291,7 +1341,7 @@ func applyClaudeHeadersWithNativeProfile(
 			}
 		}
 	}
-	if confirmedClaudeCode && incomingBetas != "" {
+	if confirmedClaudeCode && incomingBetas != "" && !forkMessagesBetas {
 		baseBetas = incomingBetas
 		if advisorNeeded {
 			baseBetas = withClaudeAdvisorToolBeta(baseBetas)
@@ -1343,7 +1393,15 @@ func applyClaudeHeadersWithNativeProfile(
 		}
 		existingSet[beta] = true
 	}
-	if preserveCallerFingerprint {
+	if !preserveCallerFingerprint && (forkMessagesBetas || pinned220Betas) {
+		// F 的 header/body 并集保留顺序和扩展；220 固定基线也不吞调用方能力。
+		for _, beta := range strings.Split(incomingBetas, ",") {
+			appendBeta(beta)
+		}
+		for _, beta := range extraBetas {
+			appendBeta(beta)
+		}
+	} else if preserveCallerFingerprint {
 		// Caller-owned mode preserves both header and body-lifted betas verbatim.
 		// The explicit speed=fast request still needs its protocol beta.
 		if strings.EqualFold(strings.TrimSpace(gjson.GetBytes(body, "speed").String()), "fast") {
@@ -1373,8 +1431,8 @@ func applyClaudeHeadersWithNativeProfile(
 				appendBeta(beta)
 			}
 		}
-		if !isAnthropicBase {
-			for _, beta := range extraBetas {
+		for _, beta := range extraBetas {
+			if !isAnthropicBase || confirmedClaudeCode || !isManagedClaudeBeta(strings.TrimSpace(beta)) {
 				appendBeta(beta)
 			}
 		}
@@ -1395,29 +1453,36 @@ func applyClaudeHeadersWithNativeProfile(
 				baseBetas = withoutClaudeBeta(baseBetas, claudeExtendedCacheTTLBeta)
 			}
 		}
+		// F 显式 caller 项不是派生能力；保留原位置，operator 仍有最终裁决权。
+		removeDerivedBeta := func(beta string) {
+			if forkMessagesBetas && !preserveCallerFingerprint && requestedMap[beta] {
+				return
+			}
+			baseBetas = withoutClaudeBeta(baseBetas, beta)
+		}
 		// Enforce strict native Claude Code 2.1.280 model & turn beta gating:
 		if !claudeRequestSupportsEffort(body, nil) {
-			baseBetas = withoutClaudeBeta(baseBetas, claudeEffortBeta)
+			removeDerivedBeta(claudeEffortBeta)
 		}
 		reqProbeOrHelper := helps.IsClaudeProbeOrHelperRequest(body)
 		if reqProbeOrHelper && !helperProfile {
-			baseBetas = withoutClaudeBeta(baseBetas, claudeServerSideFallbackBeta)
-			baseBetas = withoutClaudeBeta(baseBetas, claudeThinkingDisplayUpdatesBeta)
-			baseBetas = withoutClaudeBeta(baseBetas, claudeExtendedCacheTTLBeta)
+			removeDerivedBeta(claudeServerSideFallbackBeta)
+			removeDerivedBeta(claudeThinkingDisplayUpdatesBeta)
+			removeDerivedBeta(claudeExtendedCacheTTLBeta)
 		}
 		reqThinkingType := gjson.GetBytes(body, "thinking.type").String()
 		if reqThinkingType == "disabled" {
-			baseBetas = withoutClaudeBeta(baseBetas, claudeThinkingDisplayUpdatesBeta)
+			removeDerivedBeta(claudeThinkingDisplayUpdatesBeta)
 		}
 		if helps.IsClaudeSubagentRequest(incomingHeaders, body) && !helps.ClaudeSubagentRequests1h(incomingHeaders, body) {
-			baseBetas = withoutClaudeBeta(baseBetas, claudeExtendedCacheTTLBeta)
+			removeDerivedBeta(claudeExtendedCacheTTLBeta)
 		}
 		if !reqProbeOrHelper && !countTokens && helps.ClaudePayloadHas1hTTL(body) {
 			baseBetas = withClaudeExtendedCacheTTLBeta(baseBetas)
 		}
 		reqModel := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "model").String()))
 		if isClaudeHaikuModel(reqModel) && !gjson.GetBytes(body, "fallbacks").Exists() && !helperProfile {
-			baseBetas = withoutClaudeBeta(baseBetas, claudeServerSideFallbackBeta)
+			removeDerivedBeta(claudeServerSideFallbackBeta)
 		}
 		// A body carrying thinking.block_binding is rejected upstream unless
 		// the binding-controls beta travels with it, in every fingerprint

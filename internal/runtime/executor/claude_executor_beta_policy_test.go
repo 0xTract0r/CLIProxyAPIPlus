@@ -36,7 +36,7 @@ func TestApplyClaudeHeaders_ConfirmedClientKeepsOAuthCredentialBetas(t *testing.
 
 	req := newClaudeHeaderTestRequest(t, nil)
 	if err := applyClaudeHeaders(req, claudeOAuthAuthForBetaPolicy(), claudeRaceProbeOAuthKey, false, nil,
-		[]byte(`{"model":"claude-opus-5"}`), nil, incoming, true); err != nil {
+		[]byte(`{"model":"claude-opus-5"}`), &config.Config{ClaudeHeaderDefaults: config.ClaudeHeaderDefaults{UserAgent: "claude-cli/2.1.280 (external, cli)", PinSoftwareBaseline: true}}, incoming, true); err != nil {
 		t.Fatalf("applyClaudeHeaders() error = %v", err)
 	}
 
@@ -69,7 +69,7 @@ func TestApplyClaudeHeaders_ConfirmedAPIKeyClientKeepsPurePassthrough(t *testing
 	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "key-passthrough"}}
 	req := newClaudeHeaderTestRequest(t, nil)
 	if err := applyClaudeHeaders(req, auth, "key-passthrough", false, nil,
-		[]byte(`{"model":"claude-opus-5"}`), nil, incoming, true); err != nil {
+		[]byte(`{"model":"claude-opus-5"}`), &config.Config{ClaudeHeaderDefaults: config.ClaudeHeaderDefaults{UserAgent: "claude-cli/2.1.280 (external, cli)", PinSoftwareBaseline: true}}, incoming, true); err != nil {
 		t.Fatalf("applyClaudeHeaders() error = %v", err)
 	}
 	if got, want := req.Header.Get("Anthropic-Beta"), claudeCodeBeta+","+claudeEffortBeta; got != want {
@@ -77,9 +77,9 @@ func TestApplyClaudeHeaders_ConfirmedAPIKeyClientKeepsPurePassthrough(t *testing
 	}
 }
 
-// Default API-key mode preserves body-lifted betas just like header betas.
+// 显式 uncloak 保留既有 caller-owned 能力；never/native 仍保 fork header floor。
 func TestApplyClaudeHeaders_UnknownBodyBetaPreservedOnAnthropic(t *testing.T) {
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "key-body-beta"}}
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "key-body-beta", "cloak_mode": "uncloak"}}
 	req := newClaudeHeaderTestRequest(t, nil)
 	if err := applyClaudeHeaders(req, auth, "key-body-beta", false, []string{"unknown-body-probe-2099-01-01"},
 		[]byte(`{"model":"claude-opus-5"}`), nil, nil, false); err != nil {
@@ -91,7 +91,7 @@ func TestApplyClaudeHeaders_UnknownBodyBetaPreservedOnAnthropic(t *testing.T) {
 }
 
 func TestApplyClaudeHeaders_KnownBodyBetaStillPlacedOnAnthropic(t *testing.T) {
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "key-known-body-beta"}}
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "key-known-body-beta", "cloak_mode": "uncloak"}}
 	req := newClaudeHeaderTestRequest(t, nil)
 	if err := applyClaudeHeaders(req, auth, "key-known-body-beta", false, []string{claudeContext1MBeta},
 		[]byte(`{"model":"claude-opus-5"}`), nil, nil, false); err != nil {
@@ -571,5 +571,255 @@ func TestResolveIncomingClaudeHeadersHandlesNilGinHeader(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// 同一个调用方扩展从 body 提升到 header 后，不能因凭据类型或默认 cloak 消失。
+func TestApplyClaudeHeaders_BodyBetaSurvivesCloakedProfiles(t *testing.T) {
+	for _, oauth := range []bool{false, true} {
+		for _, mode := range []string{"auto", "always"} {
+			for _, pin220 := range []bool{false, true} {
+				t.Run(fmt.Sprintf("oauth=%v/mode=%s/pin220=%v", oauth, mode, pin220), func(t *testing.T) {
+					resetClaudeDeviceProfileCache()
+					t.Cleanup(resetClaudeDeviceProfileCache)
+					apiKey := "key-body-beta-regression"
+					auth := &cliproxyauth.Auth{ID: "body-beta-regression", Attributes: map[string]string{"api_key": apiKey, "cloak_mode": mode}}
+					if oauth {
+						apiKey = claudeRaceProbeOAuthKey
+						auth = claudeOAuthAuthForBetaPolicy()
+						auth.Attributes = map[string]string{"cloak_mode": mode}
+					}
+					var cfg *config.Config
+					wantUA := "claude-cli/2.1.211 (external, cli)"
+					if pin220 {
+						wantUA = "claude-cli/2.1.220 (external, cli)"
+						cfg = &config.Config{ClaudeHeaderDefaults: config.ClaudeHeaderDefaults{
+							UserAgent: wantUA, PackageVersion: "0.94.0", RuntimeVersion: "v24.3.0", PinSoftwareBaseline: true,
+						}}
+					}
+					incoming := http.Header{"User-Agent": []string{"caller-sdk/1.0"}}
+					req := newClaudeHeaderTestRequest(t, incoming)
+					extra := []string{"unknown-body-probe-2099-01-01", claudeContext1MBeta}
+					body := []byte(`{"model":"claude-opus-4-6"}`)
+					if err := applyClaudeHeaders(req, auth, apiKey, false, extra, body, cfg, incoming, false); err != nil {
+						t.Fatal(err)
+					}
+					got := req.Header.Get("Anthropic-Beta")
+					for _, beta := range extra {
+						if !betaSetFromHeader(got)[beta] || strings.Count(got, beta) != 1 {
+							t.Fatalf("body beta %q must appear exactly once; got %q", beta, got)
+						}
+					}
+					if req.Header.Get("User-Agent") != wantUA {
+						t.Fatalf("User-Agent = %q, want %q", req.Header.Get("User-Agent"), wantUA)
+					}
+					if err := applyClaudeHeaders(req, auth, apiKey, false, extra, body, cfg, incoming, false); err != nil {
+						t.Fatal(err)
+					}
+					if again := req.Header.Get("Anthropic-Beta"); again != got {
+						t.Fatalf("beta application changed on repeat: %q -> %q", got, again)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestApplyClaudeHeaders_ForkHeaderOwnershipModes(t *testing.T) {
+	floor := "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07"
+	for _, oauth := range []bool{false, true} {
+		for _, mode := range []string{"auto", "always", "never"} {
+			for _, native := range []bool{false, true} {
+				t.Run(fmt.Sprintf("oauth=%v/mode=%s/native=%v", oauth, mode, native), func(t *testing.T) {
+					resetClaudeDeviceProfileCache()
+					t.Cleanup(resetClaudeDeviceProfileCache)
+					apiKey := "key-header-ownership"
+					auth := &cliproxyauth.Auth{ID: "header-ownership", Attributes: map[string]string{"api_key": apiKey, "cloak_mode": mode}}
+					if oauth {
+						apiKey = claudeRaceProbeOAuthKey
+						auth = claudeOAuthAuthForBetaPolicy()
+						auth.Attributes = map[string]string{"cloak_mode": mode}
+					}
+					incoming := http.Header{"User-Agent": []string{"caller-sdk/1.0"}, "Anthropic-Beta": []string{"caller-header-beta,context-1m-2025-08-07"}}
+					if native {
+						incoming.Set("User-Agent", "claude-cli/2.1.210 (external, cli)")
+						incoming.Set("X-Stainless-Package-Version", "0.94.0")
+						incoming.Set("X-Stainless-Runtime-Version", "v24.3.0")
+					}
+					req := newClaudeHeaderTestRequest(t, incoming)
+					if err := applyClaudeHeaders(req, auth, apiKey, false, []string{"caller-body-beta", "caller-header-beta"}, []byte(`{"model":"claude-opus-5"}`), nil, incoming, native); err != nil {
+						t.Fatal(err)
+					}
+					want := floor + ",caller-header-beta,context-1m-2025-08-07,caller-body-beta"
+					if got := req.Header.Get("Anthropic-Beta"); got != want {
+						t.Fatalf("Anthropic-Beta = %q, want F floor and ordered caller union %q", got, want)
+					}
+					if got := req.Header.Get("User-Agent"); got != "claude-cli/2.1.211 (external, cli)" {
+						t.Fatalf("User-Agent = %q, want configured default floor even for native/never", got)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestApplyClaudeHeaders_PinnedBetaProfilesUseFrozenContracts(t *testing.T) {
+	floor := "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07"
+	// 独立字面 oracle：分别来自 F 与 f3e25/d946 的声明，不调用生产生成器造期望。
+	base220 := "claude-code-20250219,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,effort-2025-11-24,fallback-credit-2026-06-01"
+	base280 := "claude-code-20250219,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,mid-conversation-tool-changes-2026-07-01,effort-2025-11-24"
+	for _, oauth := range []bool{false, true} {
+		for _, tc := range []struct{ name, ua, want string }{
+			{"default211", "", floor},
+			{"pin220", "claude-cli/2.1.220 (external, cli)", base220},
+			{"pin280", "claude-cli/2.1.280 (external, cli)", base280},
+			{"unknownPinned", "configured-sdk/1.0", floor},
+		} {
+			t.Run(fmt.Sprintf("oauth=%v/%s", oauth, tc.name), func(t *testing.T) {
+				resetClaudeDeviceProfileCache()
+				t.Cleanup(resetClaudeDeviceProfileCache)
+				apiKey := "key-pinned-beta"
+				auth := &cliproxyauth.Auth{ID: "pinned-beta", Attributes: map[string]string{"api_key": apiKey}}
+				if oauth {
+					apiKey = claudeRaceProbeOAuthKey
+					auth = claudeOAuthAuthForBetaPolicy()
+				}
+				var cfg *config.Config
+				if tc.ua != "" {
+					cfg = &config.Config{ClaudeHeaderDefaults: config.ClaudeHeaderDefaults{UserAgent: tc.ua, PackageVersion: "0.94.0", RuntimeVersion: "v24.3.0", PinSoftwareBaseline: true}}
+				}
+				req := newClaudeHeaderTestRequest(t, nil)
+				if err := applyClaudeHeaders(req, auth, apiKey, false, nil, []byte(`{"model":"claude-opus-5"}`), cfg, nil, false); err != nil {
+					t.Fatal(err)
+				}
+				want := tc.want
+				if oauth && (tc.name == "pin220" || tc.name == "pin280") {
+					want = strings.Replace(want, "claude-code-20250219,", "claude-code-20250219,oauth-2025-04-20,", 1)
+					if tc.name == "pin280" {
+						want += ",extended-cache-ttl-2025-04-11"
+					}
+				}
+				if got := req.Header.Get("Anthropic-Beta"); got != want {
+					t.Fatalf("Anthropic-Beta = %q, want source contract %q", got, want)
+				}
+			})
+		}
+	}
+}
+
+func TestApplyClaudeHeaders_ForkFloorRetainsActualBodyCapabilities(t *testing.T) {
+	for _, tc := range []struct{ name, field, beta string }{
+		{"fast", `"speed":"fast"`, "fast-mode-2026-02-01"},
+		{"effort", `"output_config":{"effort":"high"}`, "effort-2025-11-24"},
+		{"diagnostics", `"diagnostics":{"previous_message_id":"synthetic"}`, "cache-diagnosis-2026-04-07"},
+		{"fallback", `"fallback_credit_token":"synthetic"`, "fallback-credit-2026-06-01"},
+		{"binding", `"thinking":{"type":"adaptive","block_binding":{"prefix_mismatch_behavior":"drop_block"}}`, "thinking-binding-controls-2026-08-01"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resetClaudeDeviceProfileCache()
+			t.Cleanup(resetClaudeDeviceProfileCache)
+			auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "key-body-capability"}}
+			req := newClaudeHeaderTestRequest(t, nil)
+			body := []byte(`{"model":"claude-opus-5",` + tc.field + `}`)
+			if err := applyClaudeHeaders(req, auth, "key-body-capability", false, nil, body, nil, nil, false); err != nil {
+				t.Fatal(err)
+			}
+			got := betaSetFromHeader(req.Header.Get("Anthropic-Beta"))
+			if !got[tc.beta] || !got["oauth-2025-04-20"] || got["redact-thinking-2026-02-12"] || got["mid-conversation-tool-changes-2026-07-01"] {
+				t.Fatalf("body-required beta or F baseline violated: %q", req.Header.Get("Anthropic-Beta"))
+			}
+		})
+	}
+}
+
+// F literal union 合同：调用方显式 beta 应保留，只有 operator strip 可最终删除。
+func TestApplyClaudeHeaders_ForkExplicitKnownBetaSurvives(t *testing.T) {
+	cases := []struct{ name, beta, body string }{
+		{"effort-disabled", "effort-2025-11-24", `{"model":"claude-opus-4-6","thinking":{"type":"disabled"}}`},
+		{"haiku-fallback", "server-side-fallback-2026-06-01", `{"model":"claude-haiku-4-5-20251001"}`},
+	}
+	for _, tc := range cases {
+		for _, source := range []string{"header", "body"} {
+			t.Run(tc.name+"/"+source, func(t *testing.T) {
+				resetClaudeDeviceProfileCache()
+				t.Cleanup(resetClaudeDeviceProfileCache)
+				incoming := http.Header{"User-Agent": []string{"caller-sdk/1.0"}}
+				var extra []string
+				if source == "header" {
+					incoming.Set("Anthropic-Beta", tc.beta)
+				} else {
+					extra = []string{tc.beta}
+				}
+				auth := &cliproxyauth.Auth{ID: "independent-known-beta", Attributes: map[string]string{"api_key": "key-independent-known-beta"}}
+				req := newClaudeHeaderTestRequest(t, incoming)
+				if err := applyClaudeHeaders(req, auth, "key-independent-known-beta", false, extra, []byte(tc.body), nil, incoming, false); err != nil {
+					t.Fatal(err)
+				}
+				got := req.Header.Get("Anthropic-Beta")
+				if !betaSetFromHeader(got)[tc.beta] {
+					t.Fatalf("F explicit %s beta %s was removed after union: %s", source, tc.beta, got)
+				}
+			})
+		}
+	}
+}
+
+func TestApplyClaudeHeaders_KnownBetaOperatorAndPinnedPolicy(t *testing.T) {
+	for _, item := range []struct{ name, beta, body string }{
+		{"effort-disabled", "effort-2025-11-24", `{"model":"claude-opus-4-6","thinking":{"type":"disabled"}}`},
+		{"haiku-fallback", "server-side-fallback-2026-06-01", `{"model":"claude-haiku-4-5-20251001"}`},
+	} {
+		for _, source := range []string{"header", "body"} {
+			for _, rule := range []struct {
+				name, version       string
+				strip, append, want bool
+			}{
+				{name: "operator-strip", strip: true},
+				{name: "pin280-filter", version: "2.1.280"},
+				{name: "pin280-operator-append", version: "2.1.280", strip: true, append: true, want: true},
+				{name: "unknown-pin-F-contract", version: "2.1.221", want: true},
+			} {
+				t.Run(item.name+"/"+source+"/"+rule.name, func(t *testing.T) {
+					resetClaudeDeviceProfileCache()
+					t.Cleanup(resetClaudeDeviceProfileCache)
+					cfg := &config.Config{}
+					if rule.version != "" {
+						cfg.ClaudeHeaderDefaults.UserAgent = "claude-cli/" + rule.version + " (external, cli)"
+						cfg.ClaudeHeaderDefaults.PinSoftwareBaseline = true
+					}
+					if rule.strip {
+						cfg.ClaudeHeaderDefaults.AnthropicBetaStrip = []string{item.beta}
+					}
+					if rule.append {
+						cfg.ClaudeHeaderDefaults.AnthropicBetaAppend = []string{item.beta}
+					}
+					incoming := http.Header{"User-Agent": []string{"caller-sdk/1.0"}}
+					var extra []string
+					if source == "header" {
+						incoming.Set("Anthropic-Beta", item.beta+",caller-after-known")
+					} else {
+						extra = []string{item.beta, "caller-after-known"}
+					}
+					auth := &cliproxyauth.Auth{ID: "known-beta-policy", Attributes: map[string]string{"api_key": "key-known-beta-policy"}}
+					req := newClaudeHeaderTestRequest(t, incoming)
+					if err := applyClaudeHeaders(req, auth, "key-known-beta-policy", false, extra, []byte(item.body), cfg, incoming, false); err != nil {
+						t.Fatal(err)
+					}
+					got := req.Header.Get("Anthropic-Beta")
+					if betaSetFromHeader(got)[item.beta] != rule.want {
+						t.Fatalf("beta presence = %v, want %v; header=%s", betaSetFromHeader(got)[item.beta], rule.want, got)
+					}
+					if rule.name == "unknown-pin-F-contract" && strings.Index(got, item.beta) > strings.Index(got, "caller-after-known") {
+						t.Fatalf("F caller order changed: %s", got)
+					}
+					if err := applyClaudeHeaders(req, auth, "key-known-beta-policy", false, extra, []byte(item.body), cfg, incoming, false); err != nil {
+						t.Fatal(err)
+					}
+					if again := req.Header.Get("Anthropic-Beta"); again != got {
+						t.Fatalf("beta policy not idempotent: %q -> %q", got, again)
+					}
+				})
+			}
+		}
 	}
 }
