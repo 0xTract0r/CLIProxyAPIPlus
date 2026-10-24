@@ -455,7 +455,19 @@ func (s *Server) Start() error {
 //
 // Returns:
 //   - error: An error if the server fails to stop
+//
+// QuiesceQuotaSnapshots closes quota admission and joins all owned refresh work.
+func (s *Server) QuiesceQuotaSnapshots(ctx context.Context) error {
+	if s == nil || s.mgmt == nil {
+		return nil
+	}
+	return s.mgmt.ShutdownQuotaSnapshotAutoRefresh(ctx)
+}
+
 func (s *Server) Stop(ctx context.Context) error {
+	if s.mgmt != nil {
+		s.mgmt.StopQuotaSnapshotAutoRefresh()
+	}
 	log.Debug("Stopping API server...")
 
 	if s.keepAliveEnabled {

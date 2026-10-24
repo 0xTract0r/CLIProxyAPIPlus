@@ -65,6 +65,8 @@ type Handler struct {
 	pluginReleaseCache      map[string]pluginReleaseCacheEntry
 	managedHeaderScheduler  *managedHeaderSyncScheduler
 	quotaRefreshCancel      context.CancelFunc
+	quotaRefreshRuns        map[*quotaRefreshGeneration]struct{}
+	quotaRefreshClosed      bool
 	farmLivenessProbeCancel context.CancelFunc
 	// quotaRefreshLogMu / quotaRefreshLogState throttle the background quota
 	// poller's observability logs (see quotaRefreshLogAllowed). The poller ticks

@@ -282,6 +282,11 @@ func (s *Service) Shutdown(ctx context.Context) error {
 	if err := s.quiesceAntigravity(ctx); err != nil {
 		return fmt.Errorf("antigravity shutdown not quiescent: %w", err)
 	}
+	if s.server != nil {
+		if err := s.server.QuiesceQuotaSnapshots(ctx); err != nil {
+			return fmt.Errorf("quota shutdown not quiescent: %w", err)
+		}
+	}
 	var shutdownErr error
 	s.shutdownOnce.Do(func() {
 		if ctx == nil {
