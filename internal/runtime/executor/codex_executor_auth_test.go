@@ -766,6 +766,8 @@ func TestCodexExecutorUseSIWCExecuteAndStream(t *testing.T) {
 			},
 		},
 	}
+	// priority 正例须显式满足 fork 的账号/模型 Fast opt-in。
+	auth.Attributes["fast_models"] = "gpt-5.4"
 	streamExec := NewCodexExecutor(cfgWithRules)
 	sr, errStream := streamExec.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
 		Model:   "gpt-5.4",
@@ -777,6 +779,15 @@ func TestCodexExecutorUseSIWCExecuteAndStream(t *testing.T) {
 		t.Fatalf("ExecuteStream error: %v", errStream)
 	}
 	for range sr.Chunks {
+	}
+	if got := gotHeaders.Get("session_id"); got != "sess-123" {
+		t.Fatalf("stream session_id = %q, want sess-123", got)
+	}
+	if got := gotHeaders.Get("X-Client-Request-Id"); got != "sess-123" {
+		t.Fatalf("stream X-Client-Request-Id = %q, want sess-123", got)
+	}
+	if got := gotHeaders.Get("Session-Id"); got != "" {
+		t.Fatalf("stream retained non-SIWC session header: %q", got)
 	}
 	if gotBody["service_tier"] != "priority" {
 		t.Fatalf("expected user payload rule to set service_tier=priority after SIWC body cleanup, got %v", gotBody["service_tier"])
@@ -1350,9 +1361,10 @@ func TestCodexExecutorCodexClientIgnoresUseSIWC(t *testing.T) {
 				ID:       "codex-siwc-client-check",
 				Provider: "codex",
 				Attributes: map[string]string{
-					"base_url":   upstream.URL,
-					"use_siwc":   "true",
-					"websockets": "true",
+					"base_url":    upstream.URL,
+					"fast_models": "gpt-5.4",
+					"use_siwc":    "true",
+					"websockets":  "true",
 				},
 				Metadata: map[string]any{
 					"type":         "codex",
@@ -1500,7 +1512,10 @@ func TestCodexExecutorCodexClientIgnoresUseSIWC(t *testing.T) {
 				}, nil
 			})
 			ctxRT := context.WithValue(context.Background(), "cliproxy.roundtripper", rt)
-			if _, errCodex := executor.Execute(ctxRT, authDefaultBase, cliproxyexecutor.Request{
+			// 此小段只捕获默认 URL；显式 direct 优先于注入 transport，故用独立 clone。
+			authCaptured := authDefaultBase.Clone()
+			authCaptured.ProxyURL = ""
+			if _, errCodex := executor.Execute(ctxRT, authCaptured, cliproxyexecutor.Request{
 				Model:   "gpt-5.4",
 				Payload: []byte(`{"model":"gpt-5.4","input":[]}`),
 			}, cliproxyexecutor.Options{
@@ -1509,7 +1524,7 @@ func TestCodexExecutorCodexClientIgnoresUseSIWC(t *testing.T) {
 			}); errCodex != nil {
 				t.Fatalf("Execute (default URL Codex client) error: %v", errCodex)
 			}
-			if _, errNonCodex := executor.Execute(ctxRT, authDefaultBase, cliproxyexecutor.Request{
+			if _, errNonCodex := executor.Execute(ctxRT, authCaptured, cliproxyexecutor.Request{
 				Model:   "gpt-5.4",
 				Payload: []byte(`{"model":"gpt-5.4","input":[]}`),
 			}, cliproxyexecutor.Options{
@@ -1617,6 +1632,34 @@ func TestCodexExecutorCodexClientIgnoresUseSIWC(t *testing.T) {
 				Headers:      headers,
 			}); errMissingOuter == nil {
 				t.Fatal("expected Codex client request to fail when outer non-SIWC access_token is missing")
+			}
+		})
+	}
+}
+
+func TestCodexSIWCHeadersConsumeSessionIDCaseVariants(t *testing.T) {
+	for _, key := range []string{"session-id", "Session-Id", "sEsSiOn-Id", ""} {
+		t.Run(key, func(t *testing.T) {
+			req, err := http.NewRequest(http.MethodPost, "http://127.0.0.1/responses", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := ""
+			if key != "" {
+				req.Header[key] = []string{"sess-case"}
+				want = "sess-case"
+			}
+			applyCodexHeadersWithSIWC(req, nil, true, "test-token", true, nil, nil)
+			if got := headerValueCaseInsensitive(req.Header, "session_id"); got != want {
+				t.Fatalf("SIWC session header = %q, want %q", got, want)
+			}
+			if got := req.Header.Get("X-Client-Request-Id"); got != want {
+				t.Fatalf("request ID = %q, want %q", got, want)
+			}
+			for name := range req.Header {
+				if strings.EqualFold(name, "session-id") {
+					t.Fatalf("non-SIWC header retained: %q", name)
+				}
 			}
 		})
 	}

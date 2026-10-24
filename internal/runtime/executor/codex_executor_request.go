@@ -275,8 +275,8 @@ func applyCodexHeadersWithSIWC(r *http.Request, auth *cliproxyauth.Auth, useSIWC
 	}
 
 	if useSIWC {
-		if sessionID := strings.TrimSpace(r.Header.Get("Session-Id")); sessionID != "" {
-			r.Header.Del("Session-Id")
+		if sessionID := headerValueCaseInsensitive(r.Header, "Session-Id"); sessionID != "" {
+			deleteHeaderCaseInsensitive(r.Header, "Session-Id")
 			setHeaderCasePreserved(r.Header, "session_id", sessionID)
 			r.Header.Set("X-Client-Request-Id", sessionID)
 		}
