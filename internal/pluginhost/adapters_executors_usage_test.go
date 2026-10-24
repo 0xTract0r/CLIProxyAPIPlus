@@ -157,6 +157,7 @@ func TestExecutorAdapterExecuteThroughAuthManagerPublishesUsage(t *testing.T) {
 	auth := &coreauth.Auth{
 		ID:         "auth-mgr-1",
 		Provider:   "plugin-provider-mgr",
+		ProxyURL:   "direct",
 		Status:     coreauth.StatusActive,
 		FileName:   "auth-mgr-1.json",
 		Attributes: map[string]string{"type": "oauth"},
@@ -424,6 +425,7 @@ func TestExecutorAdapterExecuteStreamThroughAuthManagerPublishesUsage(t *testing
 	auth := &coreauth.Auth{
 		ID:         "auth-stream-mgr-1",
 		Provider:   "plugin-provider-stream-mgr",
+		ProxyURL:   "direct",
 		Status:     coreauth.StatusActive,
 		FileName:   "auth-stream-mgr-1.json",
 		Attributes: map[string]string{"type": "oauth"},
