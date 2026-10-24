@@ -61,7 +61,7 @@ func doClaudeHTTPWithTransportRetry(ctx context.Context, client *http.Client, re
 			}
 			return nil, gateErr
 		}
-		resp, err := client.Do(attemptReq)
+		resp, err := doClaudeUpstreamRequest(client, attemptReq)
 		if permit != nil {
 			if err != nil {
 				_ = permit.TransportFailed(err)

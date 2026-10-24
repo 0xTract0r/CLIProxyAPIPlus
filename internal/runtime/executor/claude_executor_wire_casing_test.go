@@ -194,7 +194,8 @@ func TestApplyClaudeHeaders_WireCasingPreservesValues(t *testing.T) {
 	}
 }
 
-// The three Claude request paths must all leave through doClaudeUpstreamRequest.
+// The three Claude request paths route through transport retry, whose attempts
+// must all leave through doClaudeUpstreamRequest.
 // A direct client.Do would skip the wire-casing pass silently, and no behavioural
 // test can catch that for a path it does not exercise, so the invariant is
 // checked structurally.
@@ -213,9 +214,16 @@ func TestClaudeExecutorHasSingleUpstreamSendBoundary(t *testing.T) {
 		if strings.Contains(text, "httpClient.Do(") {
 			t.Errorf("%s bypasses the send boundary with a direct httpClient.Do", name)
 		}
-		if !strings.Contains(text, "doClaudeUpstreamRequest(") {
-			t.Errorf("%s does not route through doClaudeUpstreamRequest", name)
+		if !strings.Contains(text, "doClaudeHTTPWithTransportRetry(") {
+			t.Errorf("%s does not route through the Claude retry boundary", name)
 		}
+	}
+	retrySource, err := os.ReadFile("claude_transport_retry.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(retrySource), "client.Do(") || !strings.Contains(string(retrySource), "doClaudeUpstreamRequest(client, attemptReq)") {
+		t.Fatal("Claude retry bypasses the single wire-casing/attempt send boundary")
 	}
 }
 
