@@ -1811,6 +1811,11 @@ func TestEndToEndAuthFilePartialPatchPreservesQuarantine(t *testing.T) {
 }
 
 func testEndToEndAuthFilePatchRecovery(t *testing.T, expectRecovery bool) {
+	// /v1/models is a process-global union. This fixture requires only its own
+	// credential, so run in a fresh process instead of hiding other clients.
+	if watcher265RunIsolated(t) {
+		return
+	}
 	authDir := t.TempDir()
 	fileName := "codex-patch.json"
 	filePath := filepath.Join(authDir, fileName)
