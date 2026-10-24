@@ -3,6 +3,8 @@ package management
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	fileauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -116,5 +118,91 @@ func TestSIWCMutationPathAliases(t *testing.T) {
 	}
 	if !sameSIWCMutationPath(alias, path) || sameSIWCMutationPath(path, filepath.Join(dir, "other.json")) {
 		t.Fatal("incorrect canonical path matching")
+	}
+}
+
+type failingSIWCStore315 struct{ *fileauth.FileTokenStore }
+
+func (s *failingSIWCStore315) Save(context.Context, *coreauth.Auth) (string, error) {
+	return "", errors.New("synthetic atomic Save failure")
+}
+func completeSIWCUpload315() map[string]any {
+	return map[string]any{"type": "codex", "account_id": "account", "access_token": "new-outer", "refresh_token": "new-outer-refresh", "id_token": "local-synthetic-id", "note": "upload-315"}
+}
+func TestSIWCPending315RejectedUploadContinues(t *testing.T) {
+	for _, mode := range []string{"material", "identity", "provider", "in-gate-validation", "persist-failure"} {
+		t.Run(mode, func(t *testing.T) {
+			f := setupSIWCFlow(t, false)
+			f.router.POST("/credentials", f.h.UploadAuthFileV8)
+			state, flow := f.start(t)
+			before, _ := os.ReadFile(f.path)
+			old, _ := f.manager.GetByID(f.auth.ID)
+			payload := completeSIWCUpload315()
+			switch mode {
+			case "material":
+				delete(payload, "id_token")
+			case "identity":
+				payload["account_id"] = "other"
+			case "provider":
+				payload["type"] = "other"
+			case "in-gate-validation":
+				f.h.postAuthHook = func(_ context.Context, a *coreauth.Auth) error { a.Metadata["account_id"] = "other"; return nil }
+			case "persist-failure":
+				f.h.tokenStore = &failingSIWCStore315{fileauth.NewFileTokenStore()}
+			}
+			w := siwcRequest(t, f.router, http.MethodPost, "/credentials?name=codex.json", payload)
+			after, _ := os.ReadFile(f.path)
+			live, _ := f.manager.GetByID(f.auth.ID)
+			session, exists := f.store.Get(state)
+			if w.Code < 400 {
+				t.Fatalf("reject returned %d", w.Code)
+			}
+			if !exists || session.Status != "" || session.Completed || !f.store.IsPending(state, "codex") || flow.ctx.Err() != nil || string(before) != string(after) || live.RegistrationEpoch != old.RegistrationEpoch || live.CredentialVersion != old.CredentialVersion {
+				t.Fatalf("rejected upload damaged pending: code=%d pending=%v canceled=%v status=%s diskEqual=%v", w.Code, f.store.IsPending(state, "codex"), flow.ctx.Err(), session.Status, string(before) == string(after))
+			}
+			f.h.postAuthHook = nil
+			f.h.tokenStore = nil
+			cb := siwcRequest(t, f.router, http.MethodPost, "/callback", map[string]any{"provider": "codex", "redirect_url": siwcCallbackURL(state)})
+			if cb.Code != http.StatusOK {
+				t.Fatalf("continuation callback: %d %s", cb.Code, cb.Body.String())
+			}
+			waitSIWCExchange(t, flow)
+			if status := performOAuthStatusRequest(t, f.router, state); status.Status != "ok" {
+				t.Fatalf("rejected upload prevented original bind: %#v", status)
+			}
+			live, _ = f.manager.GetByID(f.auth.ID)
+			if live.Metadata["siwc"].(map[string]any)["access_token"] != "new-siwc" {
+				t.Fatal("original bind did not publish its SIWC token")
+			}
+		})
+	}
+}
+func TestSIWCPending315SuccessfulUploadFencesLateExchange(t *testing.T) {
+	f := setupSIWCFlow(t, true)
+	f.router.POST("/credentials", f.h.UploadAuthFileV8)
+	state, flow := f.start(t)
+	cb := siwcRequest(t, f.router, http.MethodPost, "/callback", map[string]any{"provider": "codex", "redirect_url": siwcCallbackURL(state)})
+	if cb.Code != 200 {
+		t.Fatal(cb.Body.String())
+	}
+	<-f.service.inputs
+	other := siwcRequest(t, f.router, http.MethodPost, "/credentials?name=other.json", f.auth.Metadata)
+	if other.Code != 200 || flow.ctx.Err() != nil {
+		t.Fatal("unrelated file invalidated old binding")
+	}
+	w := siwcRequest(t, f.router, http.MethodPost, "/credentials?name=codex.json", completeSIWCUpload315())
+	if w.Code != 200 {
+		t.Fatalf("valid upload: %d %s", w.Code, w.Body.String())
+	}
+	if flow.ctx.Err() == nil || f.store.IsPending(state, "codex") {
+		t.Fatal("committed mutation did not invalidate old intent")
+	}
+	before, _ := os.ReadFile(f.path)
+	f.unblock()
+	waitSIWCExchange(t, flow)
+	after, _ := os.ReadFile(f.path)
+	live, _ := f.manager.GetByID(f.auth.ID)
+	if string(before) != string(after) || live.Metadata["access_token"] != "new-outer" || live.Metadata["use_siwc"] == true {
+		t.Fatal("late exchange overwrote committed upload")
 	}
 }

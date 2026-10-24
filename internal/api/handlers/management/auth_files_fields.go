@@ -1172,6 +1172,9 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 				return h.persistNonRecoveryCodexSave(ctx, existing, record)
 			}
 			path, registered, err := h.persistCompleteCodexReauthentication(ctx, existing, record)
+			if err == nil {
+				commitSIWCUploadMutation(ctx)
+			}
 			if err == nil && h.postAuthPersistHook != nil {
 				err = h.postAuthPersistHook(ctx, registered)
 			}

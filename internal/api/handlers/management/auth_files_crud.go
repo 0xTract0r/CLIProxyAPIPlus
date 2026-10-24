@@ -295,7 +295,7 @@ func (h *Handler) writeAuthFile(ctx context.Context, name string, data []byte) e
 	if err := validateStoredAuthProxyURL(auth); err != nil {
 		return err
 	}
-	release := h.beginSIWCFileMutation(ctx, dst)
+	ctx, release := h.beginSIWCUploadMutation(ctx, dst)
 	defer release()
 	if h.authManager != nil {
 		if existing, ok := h.authManager.GetByID(auth.ID); ok && (coreauth.IsCodexAuthRecord(existing) || coreauth.IsCodexAuthRecord(auth)) {
@@ -314,6 +314,7 @@ func (h *Handler) writeAuthFile(ctx context.Context, name string, data []byte) e
 	if errWrite := h.writeAuthFileBytes(dst, data, auth); errWrite != nil {
 		return fmt.Errorf("failed to write file: %w", errWrite)
 	}
+	commitSIWCUploadMutation(ctx)
 	if err := h.upsertAuthRecord(ctx, auth); err != nil {
 		return err
 	}

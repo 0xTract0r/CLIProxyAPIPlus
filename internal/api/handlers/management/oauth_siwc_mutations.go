@@ -33,6 +33,12 @@ func (h *Handler) beginSIWCFileMutation(ctx context.Context, path string) func()
 		return func() {}
 	}
 	h.siwcCommitMu.Lock()
+	h.invalidateSIWCFileMutationLocked(path)
+	return h.siwcCommitMu.Unlock
+}
+
+// invalidateSIWCFileMutationLocked requires siwcCommitMu; it never takes flow.mu.
+func (h *Handler) invalidateSIWCFileMutationLocked(path string) {
 	oauthSessions.mu.Lock()
 	now := time.Now()
 	for state, session := range oauthSessions.sessions {
@@ -47,7 +53,35 @@ func (h *Handler) beginSIWCFileMutation(ctx context.Context, path string) func()
 		flow.cancel()
 	}
 	oauthSessions.mu.Unlock()
-	return h.siwcCommitMu.Unlock
+}
+
+type siwcFileMutationCommitKey struct{}
+
+// beginSIWCUploadMutation serializes upload validation and publication without
+// retiring the old intent until an actual file/credential commit succeeds.
+func (h *Handler) beginSIWCUploadMutation(ctx context.Context, path string) (context.Context, func()) {
+	if ctx == nil || ctx.Value(siwcFileMutationKey{}) != true {
+		return ctx, func() {}
+	}
+	h.siwcCommitMu.Lock()
+	committed := false
+	markCommitted := func() {
+		if !committed {
+			committed = true
+			h.invalidateSIWCFileMutationLocked(path)
+		}
+	}
+	return context.WithValue(ctx, siwcFileMutationCommitKey{}, markCommitted), h.siwcCommitMu.Unlock
+}
+
+// commitSIWCUploadMutation is called synchronously before post-persist hooks.
+func commitSIWCUploadMutation(ctx context.Context) {
+	if ctx == nil {
+		return
+	}
+	if commit, ok := ctx.Value(siwcFileMutationCommitKey{}).(func()); ok {
+		commit()
+	}
 }
 
 func sameSIWCMutationPath(a, b string) bool {
