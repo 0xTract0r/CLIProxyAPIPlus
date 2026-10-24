@@ -2972,6 +2972,7 @@ func TestServerCodexAPIKeyResponsesStreamingRequestLog(t *testing.T) {
 	server.handlers.AuthManager.RegisterExecutor(codexExec)
 
 	credential := &auth.Auth{
+		ProxyURL: "direct",
 		ID:       "codex-api-key-test",
 		Provider: "codex",
 		Status:   auth.StatusActive,
@@ -3071,6 +3072,7 @@ func TestServerResponsesStreamingRequestLogCapturesUpstreamSections(t *testing.T
 	server.handlers.AuthManager.RegisterExecutor(mockExec)
 
 	credential := &auth.Auth{
+		ProxyURL: "direct",
 		ID:       "codex-stream-auth",
 		Provider: mockExec.Identifier(),
 		Status:   auth.StatusActive,
@@ -3152,6 +3154,7 @@ func TestServerResponsesWebsocketReauthorizesEachTurn(t *testing.T) {
 	wsExec := &serverResponsesWebsocketCaptureExecutor{}
 	server.handlers.AuthManager.RegisterExecutor(wsExec)
 	authEntry := &auth.Auth{
+		ProxyURL:   "direct",
 		ID:         "ws-reauth-auth",
 		Provider:   "codex",
 		Status:     auth.StatusActive,
@@ -3246,6 +3249,7 @@ func TestUpdateClientsContext_AntigravityConnectionPoolPurgesTransports(t *testi
 	defer srv.Close()
 
 	testAuth := &auth.Auth{
+		ProxyURL:   "direct",
 		ID:         "hot-reload-test-auth",
 		Provider:   "antigravity",
 		Attributes: map[string]string{"base_url": srv.URL},
