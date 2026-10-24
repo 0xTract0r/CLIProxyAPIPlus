@@ -362,29 +362,31 @@ func TestApplyClaudeHeadersHelperRequestIDFollowsUpstreamBase(t *testing.T) {
 
 func TestClaudeExecutor_Native280HaikuTitleHelperPreservesServerSideFallbackBeta(t *testing.T) {
 	var seenHeaders http.Header
-	transport := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
-		seenHeaders = req.Header.Clone()
-		return &http.Response{
-			StatusCode: http.StatusOK,
-			Header:     http.Header{"Content-Type": {"application/json"}},
-			Body:       io.NopCloser(strings.NewReader(`{"id":"msg_helper","type":"message","model":"claude-haiku-4-5-20251001","role":"assistant","content":[{"type":"text","text":"ok"}]}`)),
-			Request:    req,
-		}, nil
-	})
-	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", http.RoundTripper(transport))
+	var seenBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenHeaders = r.Header.Clone()
+		seenBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"msg_helper","type":"message","model":"claude-haiku-4-5-20251001","role":"assistant","content":[{"type":"text","text":"ok"}]}`)
+	}))
+	defer server.Close()
 	const titleBetas = claudeNativeHelperCoreBetas + ",structured-outputs-2025-12-15,server-side-fallback-2026-06-01,fallback-credit-2026-06-01,cache-diagnosis-2026-04-07"
 	headers := claudeNativeHelperHeaders(titleBetas, "gzip, deflate, br, zstd")
 	payload := []byte(`{"model":"claude-haiku-4-5-20251001","max_tokens":80,"messages":[{"role":"user","content":"generate title"}],"metadata":{"user_id":"` + strings.ReplaceAll(claudeNativeHelperUserID, `"`, `\"`) + `"},"output_config":{"format":{"type":"json_schema","schema":{"type":"object"}}}}`)
 
-	_, err := NewClaudeExecutor(&config.Config{}).Execute(ctx, claudeNativeHelperOAuthAuth("https://api.anthropic.com"), cliproxyexecutor.Request{
+	_, err := NewClaudeExecutor(claudeNativeHelperExplicit420Config()).Execute(context.Background(), claudeNativeHelperOAuthAuth(server.URL), cliproxyexecutor.Request{
 		Model:   "claude-haiku-4-5-20251001",
 		Payload: payload,
 	}, cliproxyexecutor.Options{
-		SourceFormat: sdktranslator.FormatClaude,
-		Headers:      headers,
+		SourceFormat:    sdktranslator.FormatClaude,
+		OriginalRequest: payload,
+		Headers:         headers,
 	})
 	if err != nil {
 		t.Fatalf("Execute() error = %v", err)
+	}
+	if got := gjson.GetBytes(seenBody, "messages.0.content").String(); got != "generate title" {
+		t.Fatalf("title task changed: %s", seenBody)
 	}
 	outBeta := helps.HeaderValueCaseInsensitive(seenHeaders, "Anthropic-Beta")
 	if !strings.Contains(outBeta, "server-side-fallback-2026-06-01") {
