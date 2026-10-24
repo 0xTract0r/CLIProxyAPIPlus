@@ -82,14 +82,16 @@ func TestCodexStreamDisconnectAfterHeadersFailsOver(t *testing.T) {
 			})
 
 			if _, errRegister := manager.Register(context.Background(), &cliproxyauth.Auth{
-				ID: authA, Provider: "codex", Status: cliproxyauth.StatusActive,
+				ProxyURL: "direct",
+				ID:       authA, Provider: "codex", Status: cliproxyauth.StatusActive,
 				Attributes: map[string]string{"priority": "100", "base_url": server.URL, "api_key": "account-a"},
 				Metadata:   map[string]any{"disable_cooling": true},
 			}); errRegister != nil {
 				t.Fatal(errRegister)
 			}
 			if _, errRegister := manager.Register(context.Background(), &cliproxyauth.Auth{
-				ID: authB, Provider: "codex", Status: cliproxyauth.StatusActive,
+				ProxyURL: "direct",
+				ID:       authB, Provider: "codex", Status: cliproxyauth.StatusActive,
 				Attributes: map[string]string{"priority": "0", "base_url": server.URL, "api_key": "account-b"},
 				Metadata:   map[string]any{"disable_cooling": true},
 			}); errRegister != nil {
@@ -250,14 +252,16 @@ func TestCodexStreamDisconnectAfterOutputDoesNotFailOver(t *testing.T) {
 			})
 
 			if _, errRegister := manager.Register(context.Background(), &cliproxyauth.Auth{
-				ID: authA, Provider: "codex", Status: cliproxyauth.StatusActive,
+				ProxyURL: "direct",
+				ID:       authA, Provider: "codex", Status: cliproxyauth.StatusActive,
 				Attributes: map[string]string{"priority": "100", "base_url": server.URL, "api_key": "account-a"},
 				Metadata:   map[string]any{"disable_cooling": true},
 			}); errRegister != nil {
 				t.Fatal(errRegister)
 			}
 			if _, errRegister := manager.Register(context.Background(), &cliproxyauth.Auth{
-				ID: authB, Provider: "codex", Status: cliproxyauth.StatusActive,
+				ProxyURL: "direct",
+				ID:       authB, Provider: "codex", Status: cliproxyauth.StatusActive,
 				Attributes: map[string]string{"priority": "0", "base_url": server.URL, "api_key": "account-b"},
 				Metadata:   map[string]any{"disable_cooling": true},
 			}); errRegister != nil {
@@ -365,14 +369,16 @@ func TestCodexStreamAbnormalDisconnectBeforeOutputFailsOver(t *testing.T) {
 	})
 
 	if _, errRegister := manager.Register(context.Background(), &cliproxyauth.Auth{
-		ID: authA, Provider: "codex", Status: cliproxyauth.StatusActive,
+		ProxyURL: "direct",
+		ID:       authA, Provider: "codex", Status: cliproxyauth.StatusActive,
 		Attributes: map[string]string{"priority": "100", "base_url": server.URL, "api_key": "account-a"},
 		Metadata:   map[string]any{"disable_cooling": true},
 	}); errRegister != nil {
 		t.Fatal(errRegister)
 	}
 	if _, errRegister := manager.Register(context.Background(), &cliproxyauth.Auth{
-		ID: authB, Provider: "codex", Status: cliproxyauth.StatusActive,
+		ProxyURL: "direct",
+		ID:       authB, Provider: "codex", Status: cliproxyauth.StatusActive,
 		Attributes: map[string]string{"priority": "0", "base_url": server.URL, "api_key": "account-b"},
 		Metadata:   map[string]any{"disable_cooling": true},
 	}); errRegister != nil {

@@ -86,7 +86,8 @@ func TestCodexTerminalQuotaCoolsAccountAcrossModels(t *testing.T) {
 				registry.GetGlobalRegistry().RegisterClient(id, "codex", []*registry.ModelInfo{{ID: model}, {ID: siblingModel}})
 				t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(id) })
 				if _, errRegister := manager.Register(context.Background(), &cliproxyauth.Auth{
-					ID: id, Provider: "codex", Status: cliproxyauth.StatusActive,
+					ProxyURL: "direct",
+					ID:       id, Provider: "codex", Status: cliproxyauth.StatusActive,
 					Attributes: map[string]string{"priority": fmt.Sprint(4 - i), "base_url": server.URL, "api_key": key},
 					Metadata:   map[string]any{"disable_cooling": false},
 				}); errRegister != nil {
@@ -223,7 +224,8 @@ func TestCodexModelLevelCoolingPreservesSiblingModel(t *testing.T) {
 				registry.GetGlobalRegistry().RegisterClient(id, "codex", []*registry.ModelInfo{{ID: model}, {ID: siblingModel}})
 				t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(id) })
 				if _, errRegister := manager.Register(context.Background(), &cliproxyauth.Auth{
-					ID: id, Provider: "codex", Status: cliproxyauth.StatusActive,
+					ProxyURL: "direct",
+					ID:       id, Provider: "codex", Status: cliproxyauth.StatusActive,
 					Attributes: map[string]string{"priority": fmt.Sprint(4 - i), "base_url": server.URL, "api_key": key},
 					Metadata:   map[string]any{"disable_cooling": false},
 				}); errRegister != nil {
