@@ -92,7 +92,7 @@ func TestResponsesSteeringFullDuplexIntegration(t *testing.T) {
 			manager.SetConfig(cfg)
 			manager.RegisterExecutor(runtimeexecutor.NewCodexAutoExecutor(cfg))
 			authID := "steering-integration-" + scenario
-			_, err := manager.Register(context.Background(), &coreauth.Auth{ID: authID, Provider: "codex", Status: coreauth.StatusActive, Attributes: map[string]string{"api_key": "test-key", "base_url": upstream.URL, "websockets": "true"}})
+			_, err := manager.Register(context.Background(), &coreauth.Auth{ProxyURL: "direct", ID: authID, Provider: "codex", Status: coreauth.StatusActive, Attributes: map[string]string{"api_key": "test-key", "base_url": upstream.URL, "websockets": "true"}})
 			if err != nil {
 				t.Fatal(err)
 			}

@@ -73,7 +73,7 @@ func TestResponsesSteeringLocalValidationRecovery(t *testing.T) {
 	manager.SetConfig(cfg)
 	manager.RegisterExecutor(runtimeexecutor.NewCodexAutoExecutor(cfg))
 	authID, model := "steering-local-validation", "steering-local-validation-model"
-	if _, err := manager.Register(context.Background(), &coreauth.Auth{ID: authID, Provider: "codex", Status: coreauth.StatusActive, Attributes: map[string]string{"api_key": "test-key", "base_url": upstream.URL, "websockets": "true"}}); err != nil {
+	if _, err := manager.Register(context.Background(), &coreauth.Auth{ProxyURL: "direct", ID: authID, Provider: "codex", Status: coreauth.StatusActive, Attributes: map[string]string{"api_key": "test-key", "base_url": upstream.URL, "websockets": "true"}}); err != nil {
 		t.Fatal(err)
 	}
 	registry.GetGlobalRegistry().RegisterClient(authID, "codex", []*registry.ModelInfo{{ID: model}})

@@ -64,7 +64,8 @@ func TestReproPermanentOAuthFailureClassification(t *testing.T) {
 			// TestManager_RefreshAuthUnauthorizedFailureStopsAutoRefreshRetry
 			// independently verifies that transition and unscheduling behavior.
 			failed := &coreauth.Auth{
-				ID: failedID, Provider: "codex", Status: coreauth.StatusError,
+				ProxyURL: "direct",
+				ID:       failedID, Provider: "codex", Status: coreauth.StatusError,
 				Unavailable: true, StatusMessage: "unauthorized",
 				LastError: &coreauth.Error{Code: "unauthorized", Message: reproOAuthMessage,
 					Retryable: false, HTTPStatus: http.StatusUnauthorized},
@@ -131,7 +132,7 @@ func TestReproPermanentOAuthFailureClassification(t *testing.T) {
 
 			// A healthy candidate must make this same route succeed, proving the
 			// earlier errors are not missing model registration or a bad handler.
-			healthy := &coreauth.Auth{ID: healthyID, Provider: "codex", Status: coreauth.StatusActive}
+			healthy := &coreauth.Auth{ProxyURL: "direct", ID: healthyID, Provider: "codex", Status: coreauth.StatusActive}
 			if _, errRegisterHealthy := manager.Register(context.Background(), healthy); errRegisterHealthy != nil {
 				t.Fatal(errRegisterHealthy)
 			}

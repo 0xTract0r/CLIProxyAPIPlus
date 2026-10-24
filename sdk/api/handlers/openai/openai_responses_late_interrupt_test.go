@@ -90,7 +90,8 @@ func TestResponsesLateInterruptDoesNotPoisonNextCreate(t *testing.T) {
 	const authID = "late-interrupt-integration"
 	const model = "late-interrupt-model"
 	_, errRegister := manager.Register(context.Background(), &coreauth.Auth{
-		ID: authID, Provider: "codex", Status: coreauth.StatusActive,
+		ProxyURL: "direct",
+		ID:       authID, Provider: "codex", Status: coreauth.StatusActive,
 		Attributes: map[string]string{"api_key": "synthetic-key", "base_url": upstream.URL, "websockets": "true"},
 	})
 	if errRegister != nil {

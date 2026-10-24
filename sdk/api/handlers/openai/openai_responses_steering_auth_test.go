@@ -51,7 +51,7 @@ func TestResponsesSteeringDisabledAccountCannotSendAnotherFrame(t *testing.T) {
 	manager.SetConfig(cfg)
 	manager.RegisterExecutor(runtimeexecutor.NewCodexAutoExecutor(cfg))
 	id := "steering-disable-test"
-	auth, err := manager.Register(context.Background(), &coreauth.Auth{ID: id, Provider: "codex", Status: coreauth.StatusActive, Attributes: map[string]string{"api_key": "test-key", "base_url": upstream.URL, "websockets": "true"}})
+	auth, err := manager.Register(context.Background(), &coreauth.Auth{ProxyURL: "direct", ID: id, Provider: "codex", Status: coreauth.StatusActive, Attributes: map[string]string{"api_key": "test-key", "base_url": upstream.URL, "websockets": "true"}})
 	if err != nil {
 		t.Fatal(err)
 	}
