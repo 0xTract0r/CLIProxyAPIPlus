@@ -277,6 +277,53 @@ func (m *Manager) CommitReauthenticated(ctx context.Context, id string, expected
 	return m.registerLocked(WithSkipPersist(ctx), next, true, releaseMutation)
 }
 
+// CommitOperatorReplacement publishes a separately authorized, fresh operator record.
+// prepare must validate full replacement authority and must not inherit old identity state.
+func (m *Manager) CommitOperatorReplacement(ctx context.Context, id string, expectedEpoch uint64, prepare func(*Auth) (*Auth, error), persist func(context.Context, *Auth) error) (*Auth, error) {
+	if m == nil || strings.TrimSpace(id) == "" || prepare == nil || persist == nil {
+		return nil, fmt.Errorf("reauthenticate: incomplete transaction")
+	}
+	releaseMutation, err := m.lockAuthMutationContext(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseMutation()
+	m.mu.RLock()
+	var current *Auth
+	if stored := m.auths[id]; stored != nil {
+		current = stored.Clone()
+	}
+	m.mu.RUnlock()
+	if current == nil || (expectedEpoch != 0 && current.RegistrationEpoch != expectedEpoch) {
+		return nil, fmt.Errorf("reauthenticate auth %s: missing or stale registration", id)
+	}
+	next, err := prepare(current.Clone())
+	if err != nil {
+		return nil, err
+	}
+	if next == nil || next.ID != current.ID {
+		return nil, fmt.Errorf("reauthenticate auth %s: replacement must retain its file ID", id)
+	}
+	hydrateRuntimeFields(next)
+	NormalizeCredentialMetadata(next.Metadata)
+	if err := ValidateAuthWeight(next); err != nil {
+		return nil, err
+	}
+	next.RegistrationEpoch, next.CredentialVersion = current.RegistrationEpoch, current.CredentialVersion
+	releaseSave, err := m.beginForegroundStoreSave(ctx)
+	if err != nil {
+		return nil, err
+	}
+	err = persist(ctx, next)
+	releaseSave()
+	if err != nil {
+		return nil, err
+	}
+	// Persistence has committed. Reuse normal publication without saving twice
+	// or reacquiring the credential gate; ordinary hooks run after its release.
+	return m.registerLocked(WithSkipPersist(ctx), next, false, releaseMutation)
+}
+
 // CommitNonRecoveryUpdate strictly persists an ordinary same-account edit without
 // opening a new registration or releasing terminal/operator/quota protections.
 // prepare receives the latest snapshot under the credential gate and must validate

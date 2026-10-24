@@ -305,7 +305,20 @@ func (h *Handler) writeAuthFile(ctx context.Context, name string, data []byte) e
 				return fmt.Errorf("%w: incomplete credentials for existing Codex account", errInvalidAuthFile)
 			}
 			if !uploadedCodexRecoveryIdentityMatches(existing, auth) {
-				return fmt.Errorf("%w: uploaded credentials do not establish the same account identity", errInvalidAuthFile)
+				if !strings.EqualFold(existing.Provider, "codex") || !strings.EqualFold(auth.Provider, "codex") || !operatorCodexReplacementIdentity(auth) {
+					return fmt.Errorf("%w: uploaded credentials do not establish replacement identity", errInvalidAuthFile)
+				}
+				// Cross-identity operator replacement also retires legacy pending binds.
+				if ctx == nil || ctx.Value(siwcFileMutationKey{}) != true {
+					if ctx == nil {
+						ctx = context.Background()
+					}
+					ctx = context.WithValue(ctx, siwcFileMutationKey{}, true)
+					var releaseReplacement func()
+					ctx, releaseReplacement = h.beginSIWCUploadMutation(ctx, dst)
+					defer releaseReplacement()
+				}
+				return h.replaceOperatorCodexAuth(ctx, dst, existing, auth)
 			}
 			_, errSave := h.saveTokenRecord(ctx, auth)
 			return errSave
@@ -324,6 +337,59 @@ func (h *Handler) writeAuthFile(ctx context.Context, name string, data []byte) e
 		}
 	}
 	return nil
+}
+
+// replaceOperatorCodexAuth accepts a full new Codex identity only at the upload
+// boundary. Internal saves/PATCH keep their same-identity recovery contract.
+func (h *Handler) replaceOperatorCodexAuth(ctx context.Context, path string, expected, incoming *coreauth.Auth) error {
+	request := incoming.Clone()
+	if h.postAuthHook != nil {
+		if err := h.postAuthHook(ctx, request); err != nil {
+			return err
+		}
+	}
+	registered, err := h.authManager.CommitOperatorReplacement(ctx, expected.ID, expected.RegistrationEpoch, func(current *coreauth.Auth) (*coreauth.Auth, error) {
+		kind, _ := request.Metadata["type"].(string)
+		if !strings.EqualFold(kind, "codex") || !strings.EqualFold(current.Provider, "codex") || !strings.EqualFold(request.Provider, "codex") || !completeCodexRecoveryMaterial(request, current) || !operatorCodexReplacementIdentity(request) || uploadedCodexRecoveryIdentityMatches(current, request) {
+			return nil, fmt.Errorf("%w: invalid operator Codex replacement", errInvalidAuthFile)
+		}
+		// Build a fresh principal: no old Runtime, Storage, refresh patch, history,
+		// headers, SIWC or profile are copied from the replaced registration.
+		next := &coreauth.Auth{ID: current.ID, FileName: current.FileName, Provider: "codex", Status: request.Status, Disabled: request.Disabled, Metadata: request.Clone().Metadata, Attributes: map[string]string{"path": path, "source": path}}
+		if err := validateStoredAuthProxyURL(next); err != nil {
+			return nil, err
+		}
+		return next, nil
+	}, func(saveCtx context.Context, next *coreauth.Auth) error {
+		store := h.tokenStoreWithBaseDir()
+		if store == nil {
+			return fmt.Errorf("token store unavailable")
+		}
+		_, err := store.Save(coreauth.WithAuthCreationIntent(saveCtx), next)
+		return err
+	})
+	if err != nil {
+		return err
+	}
+	commitSIWCUploadMutation(ctx)
+	if h.postAuthPersistHook != nil {
+		return h.postAuthPersistHook(ctx, registered.Clone())
+	}
+	return nil
+}
+
+// Cross-account replacement requires positive submitted Codex account claims;
+// an opaque nonempty ID token plus a changed account_id is not sufficient.
+func operatorCodexReplacementIdentity(auth *coreauth.Auth) bool {
+	if auth == nil {
+		return false
+	}
+	token, _ := auth.Metadata["id_token"].(string)
+	claims, err := codex.ParseJWTToken(token)
+	if err != nil || claims == nil || strings.TrimSpace(claims.GetAccountID()) == "" {
+		return false
+	}
+	return uploadedCodexRecoveryIdentityMatches(auth, auth) && codexRecoveryTokenClaimsConsistent(auth.Metadata, nil)
 }
 
 // uploadedCodexRecoveryIdentityMatches checks identity before the upload inherits
