@@ -383,5 +383,24 @@ func useExplicitSparkCatalog(t *testing.T) {
 		wait(func() bool { return reflect.DeepEqual(registry.GetCodexProModels(), original) })
 	})
 	registry.StartModelCatalogUpdaters(ctx, registry.CatalogSources{Catalog: file}, false)
-	wait(func() bool { return modelListContains(registry.GetCodexProModels(), "gpt-5.3-codex-spark") })
+	wait(func() bool {
+		for _, model := range registry.GetCodexProModels() {
+			if model.ID == "gpt-5.3-codex" && model.DisplayName == "" {
+				return true
+			}
+		}
+		return false
+	})
+}
+
+func TestCodexLegacy208SparkExclusion(t *testing.T) {
+	models := applyExcludedModels(registry.GetCodexModelsForPlan("pro"), []string{"gpt-5.3-codex-spark"})
+	if modelListContains(models, "gpt-5.3-codex-spark") {
+		t.Fatal("Spark exclusion failed")
+	}
+	for _, id := range []string{"gpt-5.4", "gpt-5.4-mini"} {
+		if !modelListContains(models, id) {
+			t.Errorf("exclusion lost %s", id)
+		}
+	}
 }

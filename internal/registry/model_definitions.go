@@ -3,6 +3,7 @@
 package registry
 
 import (
+	"encoding/json"
 	"strings"
 )
 
@@ -436,10 +437,39 @@ func WithCodexBuiltins(models []*ModelInfo) []*ModelInfo {
 	)
 }
 
+// 固定 fork F 的有限旧 ID 定义；仅补缺失，不替换新目录或重映模型。
+var codexLegacyCatalog = func() staticModelsJSON {
+	var data staticModelsJSON
+	if err := json.Unmarshal([]byte(codexLegacyCatalogJSON), &data); err != nil {
+		panic(err)
+	}
+	return data
+}()
+
+func appendMissingCodexLegacy(models, legacy []*ModelInfo) []*ModelInfo {
+	for _, fallback := range legacy {
+		found := false
+		for _, current := range models {
+			if current != nil && current.ID == fallback.ID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			models = append(models, cloneModelInfo(fallback))
+		}
+	}
+	return models
+}
+
 func applyCodexCatalogCompatibility(data *staticModelsJSON) {
 	if data == nil {
 		return
 	}
+	data.CodexFree = appendMissingCodexLegacy(data.CodexFree, codexLegacyCatalog.CodexFree)
+	data.CodexTeam = appendMissingCodexLegacy(data.CodexTeam, codexLegacyCatalog.CodexTeam)
+	data.CodexPlus = appendMissingCodexLegacy(data.CodexPlus, codexLegacyCatalog.CodexPlus)
+	data.CodexPro = appendMissingCodexLegacy(data.CodexPro, codexLegacyCatalog.CodexPro)
 	applyCodexFastModeMetadata(data.CodexFree)
 	applyCodexFastModeMetadata(data.CodexTeam)
 	applyCodexFastModeMetadata(data.CodexPlus)
@@ -1596,3 +1626,6 @@ func isEightDigits(s string) bool {
 	}
 	return true
 }
+
+// 来源：1228bf9b9ab3a916a32c193a9fdf3a9946ee2e26 models.json 的三 ID 原定义与计划。
+const codexLegacyCatalogJSON = `{"codex-free":[{"id":"gpt-5.4","object":"model","created":1772668800,"owned_by":"openai","type":"openai","display_name":"GPT 5.4","version":"gpt-5.4","description":"Stable version of GPT 5.4","context_length":1050000,"max_completion_tokens":128000,"supported_parameters":["tools"],"thinking":{"levels":["low","medium","high","xhigh"]}},{"id":"gpt-5.4-mini","object":"model","created":1773705600,"owned_by":"openai","type":"openai","display_name":"GPT 5.4 Mini","version":"gpt-5.4-mini","description":"GPT-5.4 mini brings the strengths of GPT-5.4 to a faster, more efficient model designed for high-volume workloads.","context_length":400000,"max_completion_tokens":128000,"supported_parameters":["tools"],"thinking":{"levels":["low","medium","high","xhigh"]}}],"codex-team":[{"id":"gpt-5.4","object":"model","created":1772668800,"owned_by":"openai","type":"openai","display_name":"GPT 5.4","version":"gpt-5.4","description":"Stable version of GPT 5.4","context_length":1050000,"max_completion_tokens":128000,"supported_parameters":["tools"],"thinking":{"levels":["low","medium","high","xhigh"]}},{"id":"gpt-5.4-mini","object":"model","created":1773705600,"owned_by":"openai","type":"openai","display_name":"GPT 5.4 Mini","version":"gpt-5.4-mini","description":"GPT-5.4 mini brings the strengths of GPT-5.4 to a faster, more efficient model designed for high-volume workloads.","context_length":400000,"max_completion_tokens":128000,"supported_parameters":["tools"],"thinking":{"levels":["low","medium","high","xhigh"]}}],"codex-plus":[{"id":"gpt-5.3-codex-spark","object":"model","created":1770912000,"owned_by":"openai","type":"openai","display_name":"GPT 5.3 Codex Spark","version":"gpt-5.3","description":"Ultra-fast coding model.","context_length":128000,"max_completion_tokens":128000,"supported_parameters":["tools"],"thinking":{"levels":["low","medium","high","xhigh"]}},{"id":"gpt-5.4","object":"model","created":1772668800,"owned_by":"openai","type":"openai","display_name":"GPT 5.4","version":"gpt-5.4","description":"Stable version of GPT 5.4","context_length":1050000,"max_completion_tokens":128000,"supported_parameters":["tools"],"thinking":{"levels":["low","medium","high","xhigh"]}},{"id":"gpt-5.4-mini","object":"model","created":1773705600,"owned_by":"openai","type":"openai","display_name":"GPT 5.4 Mini","version":"gpt-5.4-mini","description":"GPT-5.4 mini brings the strengths of GPT-5.4 to a faster, more efficient model designed for high-volume workloads.","context_length":400000,"max_completion_tokens":128000,"supported_parameters":["tools"],"thinking":{"levels":["low","medium","high","xhigh"]}}],"codex-pro":[{"id":"gpt-5.3-codex-spark","object":"model","created":1770912000,"owned_by":"openai","type":"openai","display_name":"GPT 5.3 Codex Spark","version":"gpt-5.3","description":"Ultra-fast coding model.","context_length":128000,"max_completion_tokens":128000,"supported_parameters":["tools"],"thinking":{"levels":["low","medium","high","xhigh"]}},{"id":"gpt-5.4","object":"model","created":1772668800,"owned_by":"openai","type":"openai","display_name":"GPT 5.4","version":"gpt-5.4","description":"Stable version of GPT 5.4","context_length":1050000,"max_completion_tokens":128000,"supported_parameters":["tools"],"thinking":{"levels":["low","medium","high","xhigh"]}},{"id":"gpt-5.4-mini","object":"model","created":1773705600,"owned_by":"openai","type":"openai","display_name":"GPT 5.4 Mini","version":"gpt-5.4-mini","description":"GPT-5.4 mini brings the strengths of GPT-5.4 to a faster, more efficient model designed for high-volume workloads.","context_length":400000,"max_completion_tokens":128000,"supported_parameters":["tools"],"thinking":{"levels":["low","medium","high","xhigh"]}}]}`

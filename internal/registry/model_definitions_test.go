@@ -110,8 +110,7 @@ func TestCodexStaticModelsIncludeGPT55(t *testing.T) {
 	assertGPT55ModelInfo(t, "lookup", model)
 }
 
-// Spark was removed from the embedded upstream catalog by 94b7cc2e.
-// Explicit/custom catalogs must still enforce the fork's Pro-only plan gate.
+// 旧 Spark 由有限兼容层恢复；所有来源仍必须执行 fork Pro-only gate.
 func TestCodexPlusModelsExcludeSpark(t *testing.T) {
 	models := []*ModelInfo{{ID: "gpt-5.3-codex-spark"}, {ID: "gpt-5.5"}}
 	for _, plan := range []string{"free", "plus", "team", ""} {
@@ -122,10 +121,13 @@ func TestCodexPlusModelsExcludeSpark(t *testing.T) {
 	if model := findModelInfo(FilterCodexModelsForPlan(models, "pro"), "gpt-5.3-codex-spark"); model == nil {
 		t.Fatal("Pro must retain Spark when explicitly present in a catalog")
 	}
-	for _, models := range [][]*ModelInfo{GetCodexFreeModels(), GetCodexPlusModels(), GetCodexProModels()} {
+	for _, models := range [][]*ModelInfo{GetCodexFreeModels(), GetCodexPlusModels()} {
 		if findModelInfo(models, "gpt-5.3-codex-spark") != nil {
-			t.Fatal("retired Spark must not be advertised by the embedded catalog")
+			t.Fatal("non-Pro embedded catalog must not advertise Spark")
 		}
+	}
+	if findModelInfo(GetCodexProModels(), "gpt-5.3-codex-spark") == nil {
+		t.Fatal("Pro embedded catalog lost legacy Spark")
 	}
 }
 
