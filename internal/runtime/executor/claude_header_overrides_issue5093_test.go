@@ -36,7 +36,7 @@ func TestApplyClaudeHeaders_OperatorBetaStripAndAppend(t *testing.T) {
       anthropic-beta-strip: [" extended-cache-ttl-2025-04-11 ", "not-emitted-2099-01-01"]
       anthropic-beta-append: ["context-1m-2025-08-07", "advisor-tool-2026-03-01", "claude-code-20250219", "context-1m-2025-08-07"]
 `)
-	body := []byte(`{"model":"claude-opus-5","messages":[{"role":"user","content":"hi"}]}`)
+	body := []byte(`{"model":"claude-opus-5","messages":[{"role":"user","content":[{"type":"text","text":"hi","cache_control":{"type":"ephemeral","ttl":"1h"}}]}]}`)
 	for _, stream := range []bool{false, true} {
 		baseline := newClaudeHeaderTestRequest(t, nil)
 		if err := applyClaudeHeaders(baseline, claudeOAuthAuthForBetaPolicy(), claudeRaceProbeOAuthKey, stream, nil,
@@ -109,6 +109,7 @@ func TestApplyClaudeHeaders_CredentialHeadersKeepPrecedenceOverOperatorDefaults(
 `)
 	auth := &cliproxyauth.Auth{Attributes: map[string]string{
 		"api_key":                    "key-credential-headers",
+		"cloak_mode":                 "uncloak",
 		"header:Anthropic-Beta":      "credential-beta-2099-01-01",
 		"header:X-Client-Request-Id": "credential-request-id",
 	}}
