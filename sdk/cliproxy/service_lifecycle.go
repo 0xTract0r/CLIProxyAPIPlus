@@ -32,7 +32,7 @@ import (
 //
 // Returns:
 //   - error: An error if the service fails to start or run
-func (s *Service) Run(ctx context.Context) error {
+func (s *Service) Run(ctx context.Context) (runErr error) {
 	if s == nil {
 		return fmt.Errorf("cliproxy: service is nil")
 	}
@@ -48,6 +48,14 @@ func (s *Service) Run(ctx context.Context) error {
 	s.homeMu.Unlock()
 	defer func() {
 		runCancel()
+		// Run 退出只拥有一个预算；Shutdown 已先等待全部受管后代，
+		// 失败不得另开 quiesce 窗口，也必须保留最初的退出错误。
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 90*time.Second)
+		defer shutdownCancel()
+		if err := s.Shutdown(shutdownCtx); err != nil {
+			log.Errorf("service shutdown returned error: %v", err)
+			runErr = errors.Join(runErr, err)
+		}
 		s.homeMu.Lock()
 		if s.runCancel != nil {
 			s.runCancel = nil
@@ -71,14 +79,6 @@ func (s *Service) Run(ctx context.Context) error {
 		s.cfgMu.Unlock()
 		redisqueue.SetUsageStatisticsEnabled(true)
 	}
-
-	defer func() {
-		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 90*time.Second)
-		defer shutdownCancel()
-		if errShutdown := s.Shutdown(shutdownCtx); errShutdown != nil {
-			log.Errorf("service shutdown returned error: %v", errShutdown)
-		}
-	}()
 
 	if !homeEnabled {
 		if errEnsureAuthDir := s.ensureAuthDir(); errEnsureAuthDir != nil {
@@ -279,6 +279,9 @@ func (s *Service) Shutdown(ctx context.Context) error {
 	if s == nil {
 		return nil
 	}
+	if err := s.quiesceAntigravity(ctx); err != nil {
+		return fmt.Errorf("antigravity shutdown not quiescent: %w", err)
+	}
 	var shutdownErr error
 	s.shutdownOnce.Do(func() {
 		if ctx == nil {
@@ -291,6 +294,7 @@ func (s *Service) Shutdown(ctx context.Context) error {
 		if runCancel != nil {
 			runCancel()
 		}
+		s.StopAntigravityProbes()
 
 		s.homeLifecycleMu.Lock()
 		if supervisor := s.homeSupervisor; supervisor != nil {
@@ -345,9 +349,6 @@ func (s *Service) Shutdown(ctx context.Context) error {
 		s.cfgMu.RUnlock()
 		if watcherCancel != nil {
 			watcherCancel()
-		}
-		if s.coreManager != nil {
-			s.coreManager.StopAutoRefresh()
 		}
 		if watcher := s.currentWatcher(); watcher != nil {
 			if err := watcher.Stop(); err != nil {

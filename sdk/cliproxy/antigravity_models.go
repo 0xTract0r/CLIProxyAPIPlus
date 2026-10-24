@@ -349,6 +349,11 @@ func (s *Service) fetchAntigravityModelCapabilityHints(ctx context.Context, auth
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	ctx, ticket := s.reserveAntigravityProbe(ctx)
+	if ticket == nil {
+		return "", antigravityModelCapabilityHints{}
+	}
+	defer ticket.abandon()
 	baseURLs, proxyURL := antigravityModelBaseURLs(auth), s.antigravityModelFetchProxyURL(auth)
 	userAgent := antigravityModelUserAgent()
 	cacheKey := antigravityCapabilityKeyForRoute(auth, baseURLs[0], proxyURL, userAgent)
@@ -380,6 +385,10 @@ func (s *Service) fetchAntigravityModelCapabilityHints(ctx context.Context, auth
 	// The initiating caller owns the shared HTTP operation. Followers may cancel
 	// their own wait without canceling that operation or blocking a refresh worker.
 	resultCh := antigravityCapabilityGroup.DoChan(failureKey, func() (any, error) {
+		if started, err := ticket.start(ctx); !started {
+			return antigravityModelCapabilityHints{}, err
+		}
+		defer ticket.finish()
 		if hints, cached := lookup(); cached {
 			return hints, nil
 		}

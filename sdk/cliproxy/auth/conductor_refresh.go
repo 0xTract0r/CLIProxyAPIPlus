@@ -80,52 +80,105 @@ func antiThrashRefreshBackoff(auth *Auth, now time.Time) time.Duration {
 	return half
 }
 
-// StartAutoRefresh launches a background loop that evaluates auth freshness
-// every few seconds and triggers refresh operations when required.
-// Only one loop is kept alive; starting a new one cancels the previous run.
+// StartAutoRefresh launches a background refresh generation. Replacing it cancels
+// the previous generation; its workers remain owned until persistence and hooks exit.
+// Calls after ShutdownAutoRefresh are ignored because that operation is terminal.
 func (m *Manager) StartAutoRefresh(parent context.Context, interval time.Duration) {
+	if m == nil {
+		return
+	}
+	if parent == nil {
+		parent = context.Background()
+	}
 	if interval <= 0 {
 		interval = refreshCheckInterval
 	}
-
+	ctx, cancelCtx := context.WithCancel(parent)
+	loop := newAuthAutoRefreshLoop(m, interval, m.refreshWorkers())
 	m.mu.Lock()
+	if m.refreshClosed {
+		m.mu.Unlock()
+		cancelCtx()
+		return
+	}
 	cancelPrev := m.refreshCancel
-	m.refreshCancel = nil
-	m.refreshLoop = nil
+	if m.refreshRuns == nil {
+		m.refreshRuns = make(map[*authAutoRefreshLoop]context.CancelFunc)
+	}
+	m.refreshRuns[loop] = cancelCtx
+	m.refreshCancel = cancelCtx
+	m.refreshLoop = loop
 	m.mu.Unlock()
 	if cancelPrev != nil {
 		cancelPrev()
 	}
-
-	ctx, cancelCtx := context.WithCancel(parent)
-	workers := m.refreshWorkers()
-	loop := newAuthAutoRefreshLoop(m, interval, workers)
-
-	m.mu.Lock()
-	m.refreshCancel = cancelCtx
-	m.refreshLoop = loop
-	m.mu.Unlock()
-
 	loop.rebuild(time.Now())
 	go loop.run(ctx)
 }
 
-// StopAutoRefresh cancels the background refresh loop, if running.
-// It also stops the selector if it implements StoppableSelector.
+// StopAutoRefresh requests cancellation without joining workers. It remains safe
+// in refresh hooks, permits a later restart, and stops a StoppableSelector.
 func (m *Manager) StopAutoRefresh() {
 	m.mu.Lock()
-	cancel := m.refreshCancel
+	cancels := make([]context.CancelFunc, 0, len(m.refreshRuns))
+	for _, cancel := range m.refreshRuns {
+		cancels = append(cancels, cancel)
+	}
 	m.refreshCancel = nil
 	m.refreshLoop = nil
 	m.mu.Unlock()
-	if cancel != nil {
+	for _, cancel := range cancels {
 		cancel()
 	}
-	// Stop selector if it implements StoppableSelector (e.g., SessionAffinitySelector)
 	sel := m.Selector()
 	if stoppable, ok := sel.(StoppableSelector); ok && stoppable != nil {
 		stoppable.Stop()
 	}
+}
+
+// ShutdownAutoRefresh permanently closes refresh admission, cancels all owned
+// generations and waits for their workers, persistence and synchronous hooks.
+// It does not stop the selector; hosts retain StopAutoRefresh for that operation.
+// A caller must supply a deadline to bound waiting. A context error means work
+// may still be running; another call can wait again. Refresh callbacks must not
+// join their own generation and are rejected without changing admission.
+func (m *Manager) ShutdownAutoRefresh(ctx context.Context) error {
+	if m == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if loop, _ := ctx.Value(authAutoRefreshContextKey{}).(*authAutoRefreshLoop); loop != nil && loop.manager == m {
+		return errors.New("cannot wait for auto-refresh from its own callback")
+	}
+	m.mu.Lock()
+	m.refreshClosed = true
+	m.refreshCancel = nil
+	m.refreshLoop = nil
+	done := make([]<-chan struct{}, 0, len(m.refreshRuns))
+	cancels := make([]context.CancelFunc, 0, len(m.refreshRuns))
+	for loop, cancel := range m.refreshRuns {
+		done = append(done, loop.done)
+		cancels = append(cancels, cancel)
+	}
+	m.mu.Unlock()
+	for _, cancel := range cancels {
+		cancel()
+	}
+	for _, finished := range done {
+		select {
+		case <-finished:
+			continue
+		default:
+		}
+		select {
+		case <-finished:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return nil
 }
 
 func (m *Manager) queueRefreshReschedule(authID string) {

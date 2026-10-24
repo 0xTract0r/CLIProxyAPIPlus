@@ -587,7 +587,13 @@ func TestAntigravityColdStart_RefreshesExpiredTokenUsingAuthProxy(t *testing.T) 
 
 	// 3. Start auto-refresh and verify executor receives refresh with proxy_url
 	svc.coreManager.StartAutoRefresh(ctx, 10*time.Millisecond)
-	defer svc.coreManager.StopAutoRefresh()
+	defer func() {
+		cancel()
+		// 必须完成Manager同步落盘/hook和真实probe后代后，才允许TempDir清理。
+		if err := svc.quiesceAntigravity(context.Background()); err != nil {
+			t.Errorf("cold-start cleanup not quiescent: %v", err)
+		}
+	}()
 
 	// Poll until refresh is called (should be immediate since expired)
 	for start := time.Now(); refreshCalls.Load() == 0 && time.Since(start) < 2*time.Second; {

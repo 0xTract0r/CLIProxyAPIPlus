@@ -28,6 +28,7 @@ type authAutoRefreshLoop struct {
 
 	wakeCh chan struct{}
 	jobs   chan *authRefreshJob
+	done   chan struct{}
 }
 
 type authRefreshJob struct {
@@ -57,6 +58,7 @@ func newAuthAutoRefreshLoop(manager *Manager, interval time.Duration, concurrenc
 		dirty:       make(map[string]struct{}),
 		wakeCh:      make(chan struct{}, 1),
 		jobs:        make(chan *authRefreshJob, jobBuffer),
+		done:        make(chan struct{}),
 	}
 }
 
@@ -78,20 +80,39 @@ func (l *authAutoRefreshLoop) run(ctx context.Context) {
 		return
 	}
 
-	defer l.releaseQueuedJobs()
+	var workerGroup sync.WaitGroup
+	defer func() {
+		l.releaseQueuedJobs()
+		workerGroup.Wait()
+		l.manager.mu.Lock()
+		delete(l.manager.refreshRuns, l)
+		if l.manager.refreshLoop == l {
+			l.manager.refreshLoop = nil
+			l.manager.refreshCancel = nil
+		}
+		close(l.done)
+		l.manager.mu.Unlock()
+	}()
 
 	workers := l.concurrency
 	if workers <= 0 {
 		workers = refreshMaxConcurrency
 	}
+	workerGroup.Add(workers)
 	for i := 0; i < workers; i++ {
-		go l.worker(ctx)
+		go func() {
+			defer workerGroup.Done()
+			l.worker(ctx)
+		}()
 	}
 
 	l.loop(ctx)
 }
 
+type authAutoRefreshContextKey struct{}
+
 func (l *authAutoRefreshLoop) worker(ctx context.Context) {
+	ctx = context.WithValue(ctx, authAutoRefreshContextKey{}, l)
 	for {
 		select {
 		case <-ctx.Done():

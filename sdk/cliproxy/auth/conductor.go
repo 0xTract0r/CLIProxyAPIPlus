@@ -235,6 +235,10 @@ type Manager struct {
 	// Auto refresh state
 	refreshCancel context.CancelFunc
 	refreshLoop   *authAutoRefreshLoop
+	// refreshRuns retains cancelled generations until their workers and hooks exit.
+	// refreshClosed prevents publication after terminal ShutdownAutoRefresh.
+	refreshRuns   map[*authAutoRefreshLoop]context.CancelFunc
+	refreshClosed bool
 	// refreshJobs retains queued and running jobs across loop restarts under m.mu.
 	refreshJobs map[string]*authRefreshJob
 
