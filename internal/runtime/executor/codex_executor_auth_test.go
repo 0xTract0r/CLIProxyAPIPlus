@@ -11,6 +11,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"math/big"
 	"net"
@@ -34,6 +35,7 @@ import (
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
+	"github.com/tidwall/gjson"
 )
 
 func makeTestCodexRefreshJWT(planType, accountID string) string {
@@ -1005,6 +1007,9 @@ func TestCodexWebsocketsExecutorUseSIWCExecuteAndStream(t *testing.T) {
 	var gotPath string
 	var gotHeaders http.Header
 	var gotFrame map[string]any
+	mainFrames := make(chan map[string]any, 2)
+	prewarmIDs := make(chan string, 2)
+	ownedConns := make(chan *websocket.Conn, 8)
 
 	wsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotPath = r.URL.Path
@@ -1014,18 +1019,50 @@ func TestCodexWebsocketsExecutorUseSIWCExecuteAndStream(t *testing.T) {
 			t.Errorf("upgrade websocket: %v", errUpgrade)
 			return
 		}
+		ownedConns <- conn
 		defer func() { _ = conn.Close() }()
-
-		_, payload, errRead := conn.ReadMessage()
-		if errRead != nil {
-			t.Errorf("read upstream websocket message: %v", errRead)
-			return
+		for frame := 1; ; frame++ {
+			_, payload, errRead := conn.ReadMessage()
+			if errRead != nil {
+				return
+			}
+			if generate := gjson.GetBytes(payload, "generate"); generate.Exists() && !generate.Bool() {
+				id := fmt.Sprintf("siwc-prewarm-%d", frame)
+				prewarmIDs <- id
+				t.Logf("435 peer frame=%d phase=prewarm main_hi=false", frame)
+				prewarm := []byte(fmt.Sprintf(`{"type":"response.completed","response":{"id":%q,"status":"completed","output":[],"prewarm_marker":"PREWARM_ONLY","usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}}`, id))
+				if err := conn.WriteMessage(websocket.TextMessage, prewarm); err != nil {
+					t.Error(err)
+					return
+				}
+				continue
+			}
+			var main map[string]any
+			if err := json.Unmarshal(payload, &main); err != nil {
+				t.Error(err)
+				return
+			}
+			mainFrames <- main
+			t.Logf("435 peer frame=%d phase=main generate_present=false main_hi=%t", frame, gjson.GetBytes(payload, "input.0.content.0.text").String() == "hi")
+			completed := []byte(`{"type":"response.completed","response":{"id":"resp_ws_siwc","status":"completed","model":"gpt-5.4","output":[{"type":"message","id":"msg_ws_1","role":"assistant","status":"completed","content":[{"type":"output_text","text":"hello via ws"}]}],"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}`)
+			if err := conn.WriteMessage(websocket.TextMessage, completed); err != nil {
+				t.Error(err)
+				return
+			}
 		}
-		_ = json.Unmarshal(payload, &gotFrame)
-		completed := []byte(`{"type":"response.completed","response":{"id":"resp_ws_siwc","status":"completed","model":"gpt-5.4","output":[{"type":"message","id":"msg_ws_1","role":"assistant","status":"completed","content":[{"type":"output_text","text":"hello via ws"}]}],"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}`)
-		_ = conn.WriteMessage(websocket.TextMessage, completed)
+
 	}))
-	defer wsServer.Close()
+	defer func() {
+		for {
+			select {
+			case conn := <-ownedConns:
+				_ = conn.Close()
+			default:
+				wsServer.Close()
+				return
+			}
+		}
+	}()
 
 	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID:       "codex-siwc-ws",
@@ -1081,7 +1118,7 @@ func TestCodexWebsocketsExecutorUseSIWCExecuteAndStream(t *testing.T) {
 	clientHeaders.Set("User-Agent", "curl/8.7.1")
 	wsCtx := cliproxyexecutor.WithDownstreamWebsocket(context.Background())
 
-	_, errExec := autoExec.Execute(wsCtx, auth, cliproxyexecutor.Request{
+	response, errExec := autoExec.Execute(wsCtx, auth, cliproxyexecutor.Request{
 		Model:   "gpt-5.4",
 		Payload: reqPayload,
 	}, cliproxyexecutor.Options{
@@ -1090,6 +1127,19 @@ func TestCodexWebsocketsExecutorUseSIWCExecuteAndStream(t *testing.T) {
 	})
 	if errExec != nil {
 		t.Fatalf("AutoExecutor.Execute (WebSocket SIWC) error: %v", errExec)
+	}
+
+	gotFrame = <-mainFrames
+	prewarmID := <-prewarmIDs
+	if gotFrame["generate"] != nil || gotFrame["previous_response_id"] != prewarmID {
+		t.Fatal("main frame did not follow its own prewarm")
+	}
+	mainBytes, _ := json.Marshal(gotFrame)
+	if gjson.GetBytes(mainBytes, "input.0.content.0.text").String() != "hi" {
+		t.Fatal("prewarm input impersonated real user input")
+	}
+	if strings.Contains(string(response.Payload), "PREWARM_ONLY") || !strings.Contains(string(response.Payload), "hello via ws") {
+		t.Fatal("prewarm terminal impersonated main Execute output")
 	}
 
 	if gotPath != "/v1/responses" {
@@ -1136,7 +1186,23 @@ func TestCodexWebsocketsExecutorUseSIWCExecuteAndStream(t *testing.T) {
 	if errStream != nil {
 		t.Fatalf("AutoExecutor.ExecuteStream (WebSocket SIWC) error: %v", errStream)
 	}
-	for range sr.Chunks {
+	var streamOutput strings.Builder
+	for chunk := range sr.Chunks {
+		if chunk.Err != nil {
+			t.Fatal(chunk.Err)
+		}
+		streamOutput.Write(chunk.Payload)
+	}
+	gotFrame = <-mainFrames
+	if gotFrame["generate"] != nil || gotFrame["previous_response_id"] != <-prewarmIDs {
+		t.Fatal("stream main did not follow its own prewarm")
+	}
+	mainBytes, _ = json.Marshal(gotFrame)
+	if gjson.GetBytes(mainBytes, "input.0.content.0.text").String() != "hi" {
+		t.Fatal("stream lost real user input")
+	}
+	if strings.Contains(streamOutput.String(), "PREWARM_ONLY") || !strings.Contains(streamOutput.String(), "hello via ws") {
+		t.Fatal("prewarm terminal impersonated main stream output")
 	}
 	if gotFrame["type"] != "response.create" || gotFrame["store"] != false || gotFrame["service_tier"] != "priority" {
 		t.Fatalf("unexpected SIWC WebSocket stream frame: %#v", gotFrame)
@@ -1868,6 +1934,99 @@ func TestCodexSIWCHeadersConsumeSessionIDCaseVariants(t *testing.T) {
 				if strings.EqualFold(name, "session-id") {
 					t.Fatalf("non-SIWC header retained: %q", name)
 				}
+			}
+		})
+	}
+}
+
+// PREWARM completed 不是 main completed；屏障挂住 main 时不得先返回，断流仍须失败。
+func TestSIWCFastPrewarmCannotCompleteMain435(t *testing.T) {
+	for _, mode := range []string{"hold-main", "close-before-main-terminal"} {
+		t.Run(mode, func(t *testing.T) {
+			mainArrived := make(chan struct{})
+			releaseMain := make(chan struct{})
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				conn, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				defer conn.Close()
+				_, prewarm, err := conn.ReadMessage()
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				if gjson.GetBytes(prewarm, "generate").Type != gjson.False {
+					t.Error("first frame must be prewarm")
+					return
+				}
+				if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"prewarm435","status":"completed","output":[],"prewarm_marker":"PREWARM_ONLY"}}`)); err != nil {
+					t.Error(err)
+					return
+				}
+				_, main, err := conn.ReadMessage()
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				if gjson.GetBytes(main, "generate").Exists() || gjson.GetBytes(main, "previous_response_id").String() != "prewarm435" || gjson.GetBytes(main, "input.0.content.0.text").String() != "hi" {
+					t.Error("main frame did not preserve prewarm link and real input")
+					return
+				}
+				close(mainArrived)
+				if mode == "close-before-main-terminal" {
+					return
+				}
+				<-releaseMain
+				if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"main435","status":"completed","output":[{"type":"message","id":"main-msg-435","role":"assistant","status":"completed","content":[{"type":"output_text","text":"MAIN_ONLY"}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`)); err != nil {
+					t.Error(err)
+					return
+				}
+				_, _, _ = conn.ReadMessage()
+			}))
+			defer server.Close()
+			exec := NewCodexWebsocketsExecutor(&config.Config{})
+			auth := &cliproxyauth.Auth{ID: t.Name(), Provider: "codex", ProxyURL: "direct", Attributes: map[string]string{"base_url": server.URL, "fast_models": "gpt-5.4"}, Metadata: map[string]any{"use_siwc": true, "access_token": "outer-unused", "siwc": map[string]any{"access_token": "siwc-synthetic"}}}
+			req := cliproxyexecutor.Request{Model: "gpt-5.4", Payload: []byte(`{"model":"gpt-5.4","service_tier":"priority","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],"prompt_cache_key":"` + t.Name() + `"}`)}
+			opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse, Headers: http.Header{"User-Agent": []string{"curl/8.7.1"}}}
+			defer exec.CloseExecutionSession(codexFastSessionFallbackID(opts, req))
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			type outcome struct {
+				payload []byte
+				err     error
+			}
+			done := make(chan outcome, 1)
+			go func() { response, err := exec.Execute(ctx, auth, req, opts); done <- outcome{response.Payload, err} }()
+			select {
+			case <-mainArrived:
+			case result := <-done:
+				t.Fatalf("returned before real main: %v", result.err)
+			case <-ctx.Done():
+				t.Fatal("main frame barrier timed out")
+			}
+			if mode == "hold-main" {
+				select {
+				case result := <-done:
+					t.Fatalf("prewarm terminal completed main: %v", result.err)
+				default:
+				}
+				close(releaseMain)
+			}
+			select {
+			case result := <-done:
+				if mode == "close-before-main-terminal" {
+					if result.err == nil {
+						t.Fatal("EOF before main terminal was swallowed")
+					}
+					return
+				}
+				if result.err != nil || strings.Contains(string(result.payload), "PREWARM_ONLY") || !strings.Contains(string(result.payload), "MAIN_ONLY") {
+					t.Fatalf("main result invalid: %v", result.err)
+				}
+			case <-ctx.Done():
+				t.Fatal("main completion timed out")
 			}
 		})
 	}
