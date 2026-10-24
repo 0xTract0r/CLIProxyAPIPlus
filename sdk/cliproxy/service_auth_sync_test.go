@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -1897,13 +1898,22 @@ func testEndToEndAuthFilePatchRecovery(t *testing.T, expectRecovery bool) {
 	}
 	teamModels := []string{"gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "codex-auto-review"}
 	for _, m := range teamModels {
+		// MarkResult是已执行请求的结果入口；和recordExecutionResult一样绑定实际凭据快照。
+		current, ok := service.coreManager.GetByID(authID)
+		if !ok || current == nil {
+			t.Fatal("missing credential before terminal fixture result")
+		}
+		token, _ := current.Metadata["access_token"].(string)
 		service.coreManager.MarkResult(context.Background(), coreauth.Result{
-			AuthID:     authID,
-			Provider:   "codex",
-			Model:      m,
-			RouteModel: m,
-			Success:    false,
-			Error:      unauthErr,
+			AuthID:            authID,
+			RegistrationEpoch: current.RegistrationEpoch,
+			CredentialVersion: current.CredentialVersion,
+			AccessToken:       token,
+			Provider:          "codex",
+			Model:             m,
+			RouteModel:        m,
+			Success:           false,
+			Error:             unauthErr,
 		})
 	}
 
@@ -1999,6 +2009,48 @@ func testEndToEndAuthFilePatchRecovery(t *testing.T, expectRecovery bool) {
 			t.Fatalf("expected %q to be restored in /v1/models after PATCH: %s", m, rec.Body.String())
 		}
 	}
+
+	t.Run("old-result-and-refresh-fenced", func(t *testing.T) {
+		recovered, ok := service.coreManager.GetByID(authID)
+		if !ok || recovered == nil || recovered.RegistrationEpoch <= beforePatch.RegistrationEpoch || recovered.CredentialVersion <= beforePatch.CredentialVersion {
+			t.Fatal("complete PATCH did not open a fresh credential generation")
+		}
+		diskBefore, e := os.ReadFile(filePath)
+		if e != nil {
+			t.Fatal(e)
+		}
+		for _, success := range []bool{false, true} {
+			result := coreauth.Result{AuthID: authID, Provider: "codex", Model: teamModels[0], RouteModel: teamModels[0], RegistrationEpoch: beforePatch.RegistrationEpoch, CredentialVersion: beforePatch.CredentialVersion, AccessToken: "token-old", Success: success}
+			if !success {
+				result.Error = unauthErr
+			}
+			service.coreManager.MarkResult(context.Background(), result)
+		}
+		stale := beforePatch.Clone()
+		stale.Metadata["access_token"] = "late-old-refresh-token"
+		if _, e := service.coreManager.UpdateRefreshedAuth(context.Background(), beforePatch, stale); e == nil {
+			t.Fatal("old epoch refresh accepted after complete PATCH")
+		}
+		after, _ := service.coreManager.GetByID(authID)
+		diskAfter, e := os.ReadFile(filePath)
+		if e != nil || !bytes.Equal(diskBefore, diskAfter) || !reflect.DeepEqual(recovered, after) {
+			t.Fatal("old epoch result/refresh changed recovered credential")
+		}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("models after old result: %d", rec.Code)
+		}
+		modelsResp.Data = nil
+		if e := json.Unmarshal(rec.Body.Bytes(), &modelsResp); e != nil {
+			t.Fatal(e)
+		}
+		for _, m := range teamModels {
+			if !hasModel(m) {
+				t.Fatalf("old epoch result hid recovered model %s", m)
+			}
+		}
+	})
 
 	// 4. Verify direct inference request succeeds using fresh token after PATCH
 	service.coreManager.RegisterExecutor(&syncTestExecutor{})
