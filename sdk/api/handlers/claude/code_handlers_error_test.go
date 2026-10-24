@@ -345,7 +345,7 @@ func TestClaudeMessagesHandlerSendKeepAliveBeforeFTWritesSSEErrorOnFailure(t *te
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
 	model := "pre-ft-keepalive-claude-model"
-	auth := &coreauth.Auth{ID: "pre-ft-keepalive-claude-auth", Provider: executor.Identifier(), Status: coreauth.StatusActive}
+	auth := &coreauth.Auth{ID: "pre-ft-keepalive-claude-auth", Provider: executor.Identifier(), Status: coreauth.StatusActive, ProxyURL: "direct"}
 	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
 		t.Fatalf("register auth: %v", errRegister)
 	}
@@ -396,7 +396,7 @@ func TestClaudeMessagesHandlerDeduplicatesTranslatedSSEErrorAndTerminalChunkErro
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
 	model := "dedup-sse-error-claude-model"
-	auth := &coreauth.Auth{ID: "dedup-sse-error-claude-auth", Provider: executor.Identifier(), Status: coreauth.StatusActive}
+	auth := &coreauth.Auth{ID: "dedup-sse-error-claude-auth", Provider: executor.Identifier(), Status: coreauth.StatusActive, ProxyURL: "direct"}
 	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
 		t.Fatalf("register auth: %v", errRegister)
 	}
@@ -434,7 +434,7 @@ func TestClaudeMessagesHandlerTruncatedStreamWithoutMessageStopWritesSSEError(t 
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
 	model := "truncated-stream-claude-model"
-	auth := &coreauth.Auth{ID: "truncated-stream-claude-auth", Provider: executor.Identifier(), Status: coreauth.StatusActive}
+	auth := &coreauth.Auth{ID: "truncated-stream-claude-auth", Provider: executor.Identifier(), Status: coreauth.StatusActive, ProxyURL: "direct"}
 	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
 		t.Fatalf("register auth: %v", errRegister)
 	}
@@ -530,7 +530,7 @@ func TestClaudeStreamCompleteWithMessageStopDoesNotEmitErrorOnClose(t *testing.T
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
 	model := "complete-stream-claude-model"
-	auth := &coreauth.Auth{ID: "complete-stream-claude-auth", Provider: executor.Identifier(), Status: coreauth.StatusActive}
+	auth := &coreauth.Auth{ID: "complete-stream-claude-auth", Provider: executor.Identifier(), Status: coreauth.StatusActive, ProxyURL: "direct"}
 	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
 		t.Fatalf("register auth: %v", errRegister)
 	}
@@ -598,7 +598,7 @@ func TestClaudeStreamBareCompletedMessageJSONDoesNotEmitErrorOnClose(t *testing.
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
 	model := "bare-json-stream-claude-model"
-	auth := &coreauth.Auth{ID: "bare-json-stream-claude-auth", Provider: executor.Identifier(), Status: coreauth.StatusActive}
+	auth := &coreauth.Auth{ID: "bare-json-stream-claude-auth", Provider: executor.Identifier(), Status: coreauth.StatusActive, ProxyURL: "direct"}
 	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
 		t.Fatalf("register auth: %v", errRegister)
 	}
@@ -636,7 +636,7 @@ func TestClaudeStreamMessageStopWithArbitraryJSONFormattingCompletesCleanly(t *t
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
 	model := "formatted-message-stop-claude-model"
-	auth := &coreauth.Auth{ID: "formatted-message-stop-claude-auth", Provider: executor.Identifier(), Status: coreauth.StatusActive}
+	auth := &coreauth.Auth{ID: "formatted-message-stop-claude-auth", Provider: executor.Identifier(), Status: coreauth.StatusActive, ProxyURL: "direct"}
 	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
 		t.Fatalf("register auth: %v", errRegister)
 	}
@@ -675,7 +675,7 @@ func TestClaudeStreamTextDeltaMentioningMessageStopStillFailsWhenTruncated(t *te
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
 	model := "false-positive-message-stop-claude-model"
-	auth := &coreauth.Auth{ID: "false-positive-message-stop-claude-auth", Provider: executor.Identifier(), Status: coreauth.StatusActive}
+	auth := &coreauth.Auth{ID: "false-positive-message-stop-claude-auth", Provider: executor.Identifier(), Status: coreauth.StatusActive, ProxyURL: "direct"}
 	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
 		t.Fatalf("register auth: %v", errRegister)
 	}

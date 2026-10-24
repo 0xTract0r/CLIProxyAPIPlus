@@ -64,7 +64,7 @@ func TestGeminiStreamGenerateContentDoesNotLoseErrorBeforeFirstPayload(t *testin
 			manager := coreauth.NewManager(nil, nil, nil)
 			manager.RegisterExecutor(executor)
 			authID := fmt.Sprintf("initial-failure-gemini-auth-%d", idx)
-			auth := &coreauth.Auth{ID: authID, Provider: executor.Identifier(), Status: coreauth.StatusActive}
+			auth := &coreauth.Auth{ID: authID, Provider: executor.Identifier(), Status: coreauth.StatusActive, ProxyURL: "direct"}
 			if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
 				t.Errorf("register auth %d: %v", idx, errRegister)
 				return
@@ -133,7 +133,7 @@ func TestGeminiStreamGenerateContentSendKeepAliveBeforeFTWritesSSEErrorOnFailure
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
 	model := "pre-ft-keepalive-gemini-model"
-	auth := &coreauth.Auth{ID: "pre-ft-keepalive-gemini-auth", Provider: executor.Identifier(), Status: coreauth.StatusActive}
+	auth := &coreauth.Auth{ID: "pre-ft-keepalive-gemini-auth", Provider: executor.Identifier(), Status: coreauth.StatusActive, ProxyURL: "direct"}
 	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
 		t.Fatalf("register auth: %v", errRegister)
 	}

@@ -332,6 +332,7 @@ func TestInteractionsVertexModelUsesNativeInteractionsEndpoint(t *testing.T) {
 		ID:       "interactions-vertex-auth",
 		Provider: "vertex",
 		Status:   coreauth.StatusActive,
+		ProxyURL: "direct",
 		Attributes: map[string]string{
 			"api_key":      "test-vertex-key",
 			"base_url":     server.URL,
@@ -400,7 +401,7 @@ func TestInteractionsStreamSendKeepAliveBeforeFTWritesSSEErrorOnFailure(t *testi
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(exec)
 	model := "pre-ft-keepalive-interactions-model"
-	auth := &coreauth.Auth{ID: "pre-ft-keepalive-interactions-auth", Provider: exec.Identifier(), Status: coreauth.StatusActive}
+	auth := &coreauth.Auth{ID: "pre-ft-keepalive-interactions-auth", Provider: exec.Identifier(), Status: coreauth.StatusActive, ProxyURL: "direct"}
 	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
 		t.Fatalf("register auth: %v", errRegister)
 	}

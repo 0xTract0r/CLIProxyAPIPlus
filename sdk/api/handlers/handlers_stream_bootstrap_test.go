@@ -1038,12 +1038,14 @@ func TestExecuteStreamWithAuthManager_ForwardsOverloadErrorWhenAllAuthsOverloade
 		ID:       "auth-overload-1",
 		Provider: "codex",
 		Status:   coreauth.StatusActive,
+		ProxyURL: "direct",
 		Metadata: map[string]any{"email": "test1@example.com"},
 	}
 	auth2 := &coreauth.Auth{
 		ID:       "auth-overload-2",
 		Provider: "codex",
 		Status:   coreauth.StatusActive,
+		ProxyURL: "direct",
 		Metadata: map[string]any{"email": "test2@example.com"},
 	}
 	if _, err := manager.Register(context.Background(), auth1); err != nil {
