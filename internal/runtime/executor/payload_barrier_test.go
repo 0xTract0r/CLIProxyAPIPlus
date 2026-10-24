@@ -64,7 +64,7 @@ func TestPayloadBarrierCodexImageFilter(t *testing.T) {
 					if transport == "websocket" {
 						executor = NewCodexWebsocketsExecutor(cfg)
 					}
-					auth := &cliproxyauth.Auth{ID: t.Name(), Provider: "codex", Attributes: map[string]string{"api_key": "test", "base_url": server.URL, "plan_type": "pro"}}
+					auth := &cliproxyauth.Auth{ID: t.Name(), Provider: "codex", ProxyURL: "direct", Attributes: map[string]string{"api_key": "test", "base_url": server.URL, "plan_type": "pro"}}
 					req := cliproxyexecutor.Request{Model: model, Payload: []byte(`{"input":"hello","prompt_cache_key":"injected-cache"}`)}
 					opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse}
 					if stream {
@@ -229,6 +229,9 @@ func TestPayloadBarrierEffectiveServiceTierUsageAfterOverride(t *testing.T) {
 				usage.RegisterPlugin(plugin)
 
 				auth := codexOAuthTestAuth(server.URL)
+				auth.ProxyURL = "direct"
+				// 此正例显式允许 Fast；最终账号策略仍高于 payload override。
+				auth.Attributes["fast_models"] = "gpt-6-astra"
 				auth.ID = authID
 				executor := NewCodexExecutor(cfg)
 				ctx := usage.WithServiceTier(context.Background(), usage.AutoServiceTier)
@@ -293,6 +296,7 @@ func TestPayloadBarrierEffectiveServiceTierUsageAfterOverride(t *testing.T) {
 				auth := &cliproxyauth.Auth{
 					ID:         authID,
 					Provider:   "openai-compatibility",
+					ProxyURL:   "direct",
 					Attributes: map[string]string{"base_url": server.URL, "api_key": "sk-test"},
 				}
 				executor := NewOpenAICompatExecutor("openai-compatibility", cfg)
@@ -358,6 +362,7 @@ func TestPayloadBarrierEffectiveServiceTierUsageAfterOverride(t *testing.T) {
 				auth := &cliproxyauth.Auth{
 					ID:         authID,
 					Provider:   "xai",
+					ProxyURL:   "direct",
 					Attributes: map[string]string{"base_url": server.URL},
 					Metadata:   map[string]any{"access_token": "xai-token"},
 				}
@@ -410,6 +415,7 @@ func TestPayloadBarrierEffectiveServiceTierUsageAfterOverride(t *testing.T) {
 				auth := &cliproxyauth.Auth{
 					ID:         authID,
 					Provider:   "devin",
+					ProxyURL:   "direct",
 					Attributes: map[string]string{"api_key": "test-key", "base_url": server.URL},
 				}
 				ctx := usage.WithServiceTier(context.Background(), usage.AutoServiceTier)

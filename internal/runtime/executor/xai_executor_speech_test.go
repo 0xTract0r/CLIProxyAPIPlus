@@ -72,6 +72,7 @@ func TestXAIExecutorExecuteSpeechPostsAudioRequest(t *testing.T) {
 	exec := NewXAIExecutor(&config.Config{})
 	auth := &cliproxyauth.Auth{
 		Provider: "xai",
+		ProxyURL: "direct",
 		Attributes: map[string]string{
 			"base_url":  server.URL + "/v1",
 			"auth_kind": "oauth",
@@ -148,6 +149,7 @@ func TestXAIExecutorExecuteSpeechPayloadRulesMatchOpenAIProtocol(t *testing.T) {
 	exec := NewXAIExecutor(cfg)
 	auth := &cliproxyauth.Auth{
 		Provider: "xai",
+		ProxyURL: "direct",
 		Attributes: map[string]string{
 			"base_url":  server.URL + "/v1",
 			"auth_kind": "oauth",
@@ -210,6 +212,7 @@ func TestXAIExecutorExecuteSpeechUpstreamErrorScope(t *testing.T) {
 			exec := NewXAIExecutor(&config.Config{})
 			auth := &cliproxyauth.Auth{
 				Provider: "xai",
+				ProxyURL: "direct",
 				Attributes: map[string]string{
 					"base_url":  server.URL + "/v1",
 					"auth_kind": "oauth",
