@@ -71,6 +71,11 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	originalPayload := originalPayloadSource
 	incomingHeaders, claudeCodeDetection := detectIncomingClaudeCodeRequest(ctx, opts.Headers, originalPayload, false, e.cfg)
 	wirePolicy, wireSettings := resolveClaudeWirePolicy(e.cfg, auth, apiKey, claudeCodeDetection.Confirmed, helps.HeaderValueCaseInsensitive(incomingHeaders, "User-Agent"))
+	// 显式普通 API-key caller-owned 正文优先于实验签名开关。
+	callerOwnedBody := wirePolicy.Uncloak && !wirePolicy.OAuth
+	if callerOwnedBody {
+		cchSigning = false
+	}
 	confirmedClaudeCode := isEffectiveConfirmedClaudeCode(claudeCodeDetection, wirePolicy)
 	claudeSessionID := ""
 	if fp.ProfileClaudeCodeCLI {
@@ -247,8 +252,11 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	if !wirePolicy.Uncloak || wirePolicy.OAuth {
 		bodyForUpstream = helps.InjectAccountDeviceID(bodyForUpstream, authDir, auth, apiKey)
 	}
-	bodyForUpstream, entrypointFolded := normalizeClaudeBillingEntrypoint(e.cfg, bodyForUpstream)
-	bodyForUpstream, billingVersionAligned := alignRealPathBillingVersion(e.cfg, bodyForUpstream, billingVersion)
+	entrypointFolded, billingVersionAligned := false, false
+	if !callerOwnedBody {
+		bodyForUpstream, entrypointFolded = normalizeClaudeBillingEntrypoint(e.cfg, bodyForUpstream)
+		bodyForUpstream, billingVersionAligned = alignRealPathBillingVersion(e.cfg, bodyForUpstream, billingVersion)
+	}
 	bodyForUpstream = stripDefaultKimiClaudeCodeAttribution(auth, url, fp.ProfileClaudeCodeCLI, bodyForUpstream)
 	bodyForUpstream = applyClaudePreservedThinkingBinding(bodyForUpstream)
 	// User rules match the fully prepared business body and are applied only once.
@@ -290,7 +298,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	}
 	// Identity rewrites re-sign an existing CCH only. Placeholder creation
 	// remains governed by cchSigning above; unsigned API-key paths stay unsigned.
-	if cchSigning || entrypointFolded || billingVersionAligned {
+	if !callerOwnedBody && (cchSigning || entrypointFolded || billingVersionAligned) {
 		bodyForUpstream, err = signClaudeHTTPRequestCCH(httpReq, bodyForUpstream)
 		if err != nil {
 			return nil, fmt.Errorf("sign Claude CCH: %w", err)

@@ -5558,8 +5558,9 @@ func TestClaudeExecutor_CustomBaseURLAPIKeyDoesNotEnableCCHSigning(t *testing.T)
 		}},
 	})
 	auth := &cliproxyauth.Auth{ProxyURL: "direct", Attributes: map[string]string{
-		"api_key":  "key-123",
-		"base_url": server.URL,
+		"cloak_mode": "uncloak",
+		"api_key":    "key-123",
+		"base_url":   server.URL,
 	}}
 	const messageText = "please keep literal cch=00000 in this message"
 	payload := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"please keep literal cch=00000 in this message"}]}]}`)
