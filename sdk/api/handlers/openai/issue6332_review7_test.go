@@ -35,7 +35,7 @@ func issue6332ReviewBase(t *testing.T, url string) (*handlers.BaseAPIHandler, *c
 	t.Helper()
 	manager := cliproxyauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(runtimeexecutor.NewAntigravityExecutor(&config.Config{}))
-	auth := &cliproxyauth.Auth{ID: t.Name(), Provider: "antigravity", Status: cliproxyauth.StatusActive, Metadata: map[string]any{"access_token": "token", "expired": time.Now().Add(time.Hour).Format(time.RFC3339), "project_id": "project"}, Attributes: map[string]string{"base_url": url}}
+	auth := &cliproxyauth.Auth{ID: t.Name(), Provider: "antigravity", Status: cliproxyauth.StatusActive, ProxyURL: "direct", Metadata: map[string]any{"access_token": "token", "expired": time.Now().Add(time.Hour).Format(time.RFC3339), "project_id": "project"}, Attributes: map[string]string{"base_url": url}}
 	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
 		t.Fatal(errRegister)
 	}
