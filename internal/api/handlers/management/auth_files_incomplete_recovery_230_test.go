@@ -9,6 +9,7 @@ import (
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 )
 
@@ -22,6 +23,14 @@ func TestSameIDIncompleteCodexRecovery230(t *testing.T) {
 				store.SetBaseDir(dir)
 				manager := coreauth.NewManager(store, nil, nil)
 				old := &coreauth.Auth{ID: "incomplete230.json", FileName: "incomplete230.json", Provider: "codex", ProxyURL: "direct", Metadata: map[string]any{"type": "codex", "account_id": "account-a", "email": "synthetic@example.invalid", "access_token": "old-access", "refresh_token": "old-refresh", "id_token": "old-id", "proxy_url": "direct", "siwc": map[string]any{"access_token": "old-siwc-access", "refresh_token": "old-siwc-refresh"}}}
+				// These two same-account save operations persist partial content;
+				// they do not grant recovery. All upload/full-material negatives remain.
+				ordinaryPartial := entry == "save" && (missing == "siwc-refresh" || missing == "outer-refresh")
+				if ordinaryPartial {
+					old.Metadata["quota_refresh_status"] = "reauth_required"
+					old.Metadata["quota_refresh_error"] = "old-quota-error"
+					old.Metadata["quota_next_refresh_after"] = "2035-01-01T00:00:00Z"
+				}
 				before, err := manager.Register(coreauth.WithAuthCreationIntent(ctx), old)
 				if err != nil {
 					t.Fatal(err)
@@ -78,6 +87,47 @@ func TestSameIDIncompleteCodexRecovery230(t *testing.T) {
 				after, readErr := os.ReadFile(path)
 				if readErr != nil {
 					t.Fatal(readErr)
+				}
+				if ordinaryPartial {
+					if err != nil || store.saves != 1 || hooks != 1 {
+						t.Fatalf("partial save err=%v saves=%d hooks=%d", err, store.saves, hooks)
+					}
+					var disk map[string]any
+					if e := json.Unmarshal(after, &disk); e != nil {
+						t.Fatal(e)
+					}
+					if bytes.Equal(original, after) || disk["access_token"] != "new-access" || live.Metadata["access_token"] != "new-access" {
+						t.Fatal("partial credentials not persisted")
+					}
+					if !coreauth.CredentialsChanged(before, live) || live.CredentialVersion != before.CredentialVersion+1 || live.RegistrationEpoch != before.RegistrationEpoch || live.Index != before.Index || !live.CreatedAt.Equal(before.CreatedAt) || live.Success != before.Success || live.Failed != before.Failed {
+						t.Fatal("partial registration/history/version changed")
+					}
+					if live.AutoQuarantined != before.AutoQuarantined || live.Unavailable != before.Unavailable || live.Status != before.Status || live.StatusMessage != before.StatusMessage || live.Disabled != before.Disabled || live.RejectedAccessToken != before.RejectedAccessToken || live.RejectedSIWCAccessToken != before.RejectedSIWCAccessToken || !reflect.DeepEqual(live.LastError, before.LastError) || !reflect.DeepEqual(live.Quota, before.Quota) {
+						t.Fatal("partial changed terminal state")
+					}
+					for _, k := range []string{"quota_refresh_status", "quota_refresh_error", "quota_next_refresh_after"} {
+						if !reflect.DeepEqual(disk[k], before.Metadata[k]) || !reflect.DeepEqual(live.Metadata[k], before.Metadata[k]) {
+							t.Fatalf("partial lost quota %s", k)
+						}
+					}
+					if missing == "outer-refresh" {
+						if disk["refresh_token"] != before.Metadata["refresh_token"] || live.Metadata["refresh_token"] != before.Metadata["refresh_token"] {
+							t.Fatal("missing outer refresh lost")
+						}
+					} else {
+						oldPart := before.Metadata["siwc"].(map[string]any)
+						if disk["siwc"].(map[string]any)["refresh_token"] != oldPart["refresh_token"] || live.Metadata["siwc"].(map[string]any)["refresh_token"] != oldPart["refresh_token"] {
+							t.Fatal("missing SIWC refresh lost")
+						}
+					}
+					manager.MarkResult(ctx, coreauth.Result{AuthID: before.ID, Provider: "codex", RegistrationEpoch: before.RegistrationEpoch, CredentialVersion: before.CredentialVersion, AccessToken: "old-access", Success: true})
+					manager.MarkResult(ctx, coreauth.Result{AuthID: before.ID, Provider: "codex", RegistrationEpoch: before.RegistrationEpoch, CredentialVersion: before.CredentialVersion, AccessToken: "old-access", Error: &coreauth.Error{HTTPStatus: 401, Message: "old credential result"}})
+					fenced, _ := manager.GetByID(before.ID)
+					fencedDisk, e := os.ReadFile(path)
+					if e != nil || !bytes.Equal(after, fencedDisk) || fenced.Failed != live.Failed || fenced.Success != live.Success || fenced.AutoQuarantined != live.AutoQuarantined || fenced.CredentialVersion != live.CredentialVersion || fenced.Metadata["access_token"] != "new-access" {
+						t.Fatal("old result changed partial credential")
+					}
+					return
 				}
 				if err == nil || store.saves != 0 || hooks != 0 || live.RegistrationEpoch != before.RegistrationEpoch || live.CredentialVersion != before.CredentialVersion || !live.AutoQuarantined || !bytes.Equal(original, after) || live.Metadata["access_token"] != "old-access" {
 					t.Fatalf("incomplete replacement was not atomic rejection: err=%v saves=%d hooks=%d epoch=%d/%d version=%d/%d quarantine=%v diskEqual=%v", err, store.saves, hooks, live.RegistrationEpoch, before.RegistrationEpoch, live.CredentialVersion, before.CredentialVersion, live.AutoQuarantined, bytes.Equal(original, after))
