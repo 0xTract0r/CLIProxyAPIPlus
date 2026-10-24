@@ -149,7 +149,7 @@ func TestCodexTerminalQuotaCoolsAccountAcrossModels(t *testing.T) {
 func TestCodexModelLevelCoolingPreservesSiblingModel(t *testing.T) {
 	for _, transport := range []string{"sse", "websocket-error", "websocket-failed"} {
 		t.Run(transport, func(t *testing.T) {
-			const model, siblingModel = "gpt-5.3-codex-spark", "gpt-5.6-sol"
+			const model, siblingModel = "gpt-6-astra", "gpt-5.6-sol"
 			const created = `{"type":"response.created","response":{"id":"quota-test-response"}}`
 			const quota = `{"type":"usage_limit_reached","message":"You've hit your usage limit.","resets_in_seconds":3600}`
 			const completed = `{"type":"response.completed","response":{"id":"quota-test-success","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`
