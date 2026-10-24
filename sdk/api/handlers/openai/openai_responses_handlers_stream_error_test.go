@@ -113,7 +113,7 @@ func TestResponsesHandlerEmitsFailureWhenExecutorStopsAfterPartialOutput(t *test
 	executor := &prematureResponsesStreamExecutor{}
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
-	auth := &coreauth.Auth{ID: "premature-responses-stream-auth", Provider: executor.Identifier(), Status: coreauth.StatusActive}
+	auth := &coreauth.Auth{ProxyURL: "direct", ID: "premature-responses-stream-auth", Provider: executor.Identifier(), Status: coreauth.StatusActive}
 	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
 		t.Fatalf("register auth: %v", errRegister)
 	}
@@ -158,7 +158,7 @@ func TestResponsesHandlerCommitsValidFrameBeforeMalformedFrameInSameChunk(t *tes
 	executor := &prematureResponsesStreamExecutor{}
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
-	auth := &coreauth.Auth{ID: "valid-then-malformed-responses-auth", Provider: executor.Identifier(), Status: coreauth.StatusActive}
+	auth := &coreauth.Auth{ProxyURL: "direct", ID: "valid-then-malformed-responses-auth", Provider: executor.Identifier(), Status: coreauth.StatusActive}
 	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
 		t.Fatalf("register auth: %v", errRegister)
 	}
@@ -188,7 +188,7 @@ func TestResponsesHandlerAcceptsMultilineDataAcrossExecutorChunks(t *testing.T) 
 	executor := &prematureResponsesStreamExecutor{}
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
-	auth := &coreauth.Auth{ID: "cross-chunk-multiline-responses-auth", Provider: executor.Identifier(), Status: coreauth.StatusActive}
+	auth := &coreauth.Auth{ProxyURL: "direct", ID: "cross-chunk-multiline-responses-auth", Provider: executor.Identifier(), Status: coreauth.StatusActive}
 	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
 		t.Fatalf("register auth: %v", errRegister)
 	}
@@ -217,7 +217,7 @@ func TestResponsesHandlerPreservesDirectResponseBeforeFirstFrame(t *testing.T) {
 	executor := &prematureResponsesStreamExecutor{}
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
-	auth := &coreauth.Auth{ID: "direct-initial-error-responses-auth", Provider: executor.Identifier(), Status: coreauth.StatusActive}
+	auth := &coreauth.Auth{ProxyURL: "direct", ID: "direct-initial-error-responses-auth", Provider: executor.Identifier(), Status: coreauth.StatusActive}
 	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
 		t.Fatalf("register auth: %v", errRegister)
 	}
@@ -249,7 +249,7 @@ func TestResponsesHandlerSanitizesErrorBeforeFirstFrame(t *testing.T) {
 	executor := &prematureResponsesStreamExecutor{}
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
-	auth := &coreauth.Auth{ID: "sensitive-initial-error-responses-auth", Provider: executor.Identifier(), Status: coreauth.StatusActive}
+	auth := &coreauth.Auth{ProxyURL: "direct", ID: "sensitive-initial-error-responses-auth", Provider: executor.Identifier(), Status: coreauth.StatusActive}
 	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
 		t.Fatalf("register auth: %v", errRegister)
 	}
@@ -288,7 +288,7 @@ func TestResponsesHandlerFlushesDataOnlyFrameBeforeStreamingError(t *testing.T) 
 	executor := &prematureResponsesStreamExecutor{}
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
-	auth := &coreauth.Auth{ID: "data-only-first-frame-responses-auth", Provider: executor.Identifier(), Status: coreauth.StatusActive}
+	auth := &coreauth.Auth{ProxyURL: "direct", ID: "data-only-first-frame-responses-auth", Provider: executor.Identifier(), Status: coreauth.StatusActive}
 	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
 		t.Fatalf("register auth: %v", errRegister)
 	}
@@ -323,7 +323,7 @@ func TestResponsesHandlerEmitsFailureWhenDataOnlyStreamClosesCleanly(t *testing.
 	executor := &prematureResponsesStreamExecutor{}
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
-	auth := &coreauth.Auth{ID: "data-only-clean-close-responses-auth", Provider: executor.Identifier(), Status: coreauth.StatusActive}
+	auth := &coreauth.Auth{ProxyURL: "direct", ID: "data-only-clean-close-responses-auth", Provider: executor.Identifier(), Status: coreauth.StatusActive}
 	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
 		t.Fatalf("register auth: %v", errRegister)
 	}
@@ -361,7 +361,7 @@ func TestResponsesHandlerDoesNotCommitHeadersForIncompleteFirstFrame(t *testing.
 	executor := &prematureResponsesStreamExecutor{}
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
-	auth := &coreauth.Auth{ID: "incomplete-first-frame-responses-auth", Provider: executor.Identifier(), Status: coreauth.StatusActive}
+	auth := &coreauth.Auth{ProxyURL: "direct", ID: "incomplete-first-frame-responses-auth", Provider: executor.Identifier(), Status: coreauth.StatusActive}
 	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
 		t.Fatalf("register auth: %v", errRegister)
 	}
@@ -394,7 +394,7 @@ func TestResponsesHandlerRejectsStreamClosedBeforeFirstPayload(t *testing.T) {
 	executor := &prematureResponsesStreamExecutor{}
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
-	auth := &coreauth.Auth{ID: "empty-responses-stream-auth", Provider: executor.Identifier(), Status: coreauth.StatusActive}
+	auth := &coreauth.Auth{ProxyURL: "direct", ID: "empty-responses-stream-auth", Provider: executor.Identifier(), Status: coreauth.StatusActive}
 	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
 		t.Fatalf("register auth: %v", errRegister)
 	}
@@ -428,7 +428,7 @@ func TestResponsesHandlerDoesNotLoseErrorBeforeFirstPayload(t *testing.T) {
 		executor := &prematureResponsesStreamExecutor{}
 		manager := coreauth.NewManager(nil, nil, nil)
 		manager.RegisterExecutor(executor)
-		auth := &coreauth.Auth{ID: fmt.Sprintf("initial-failure-responses-stream-auth-%d", i), Provider: executor.Identifier(), Status: coreauth.StatusActive}
+		auth := &coreauth.Auth{ProxyURL: "direct", ID: fmt.Sprintf("initial-failure-responses-stream-auth-%d", i), Provider: executor.Identifier(), Status: coreauth.StatusActive}
 		if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
 			t.Fatalf("register auth %d: %v", i, errRegister)
 		}
@@ -945,7 +945,7 @@ func TestResponsesHandlerSendKeepAliveBeforeFT(t *testing.T) {
 		manager := coreauth.NewManager(nil, nil, nil)
 		manager.RegisterExecutor(executor)
 		model := "pre-ft-keepalive-error-responses-model"
-		auth := &coreauth.Auth{ID: "pre-ft-keepalive-error-responses-auth", Provider: executor.Identifier(), Status: coreauth.StatusActive}
+		auth := &coreauth.Auth{ProxyURL: "direct", ID: "pre-ft-keepalive-error-responses-auth", Provider: executor.Identifier(), Status: coreauth.StatusActive}
 		if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
 			t.Fatalf("register auth: %v", errRegister)
 		}
@@ -1000,7 +1000,7 @@ func TestResponsesHandlerSendKeepAliveBeforeFT(t *testing.T) {
 		manager := coreauth.NewManager(nil, nil, nil)
 		manager.RegisterExecutor(executor)
 		model := "pre-ft-keepalive-ok-responses-model"
-		auth := &coreauth.Auth{ID: "pre-ft-keepalive-ok-responses-auth", Provider: executor.Identifier(), Status: coreauth.StatusActive}
+		auth := &coreauth.Auth{ProxyURL: "direct", ID: "pre-ft-keepalive-ok-responses-auth", Provider: executor.Identifier(), Status: coreauth.StatusActive}
 		if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
 			t.Fatalf("register auth: %v", errRegister)
 		}
@@ -1053,7 +1053,7 @@ func TestResponsesHandlerSendKeepAliveBeforeFT(t *testing.T) {
 		manager := coreauth.NewManager(nil, nil, nil)
 		manager.RegisterExecutor(executor)
 		model := "pre-ft-keepalive-early-err-responses-model"
-		auth := &coreauth.Auth{ID: "pre-ft-keepalive-early-err-responses-auth", Provider: executor.Identifier(), Status: coreauth.StatusActive}
+		auth := &coreauth.Auth{ProxyURL: "direct", ID: "pre-ft-keepalive-early-err-responses-auth", Provider: executor.Identifier(), Status: coreauth.StatusActive}
 		if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
 			t.Fatalf("register auth: %v", errRegister)
 		}
@@ -1096,7 +1096,7 @@ func TestResponsesHandlerSendKeepAliveBeforeFT(t *testing.T) {
 		manager := coreauth.NewManager(nil, nil, nil)
 		manager.RegisterExecutor(executor)
 		model := "pre-ft-keepalive-prompt-too-long-responses-model"
-		auth := &coreauth.Auth{ID: "pre-ft-keepalive-prompt-too-long-responses-auth", Provider: executor.Identifier(), Status: coreauth.StatusActive}
+		auth := &coreauth.Auth{ProxyURL: "direct", ID: "pre-ft-keepalive-prompt-too-long-responses-auth", Provider: executor.Identifier(), Status: coreauth.StatusActive}
 		if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
 			t.Fatalf("register auth: %v", errRegister)
 		}

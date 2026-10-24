@@ -4060,7 +4060,7 @@ func TestResponsesWebsocketExposesItemNotPersistedAndRecoversOnReconnect(t *test
 	}
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
-	auth := &coreauth.Auth{ID: "auth-xai-item-miss", Provider: "xai", Status: coreauth.StatusActive}
+	auth := &coreauth.Auth{ProxyURL: "direct", ID: "auth-xai-item-miss", Provider: "xai", Status: coreauth.StatusActive}
 	if _, err := manager.Register(context.Background(), auth); err != nil {
 		t.Fatalf("Register auth: %v", err)
 	}
@@ -4465,7 +4465,7 @@ func TestResponsesWebsocketPrewarmPreservesCompactedFollowup(t *testing.T) {
 			executor := &websocketPrewarmRetryExecutor{websocketProviderCaptureExecutor: websocketProviderCaptureExecutor{provider: "codex"}, failFirst: tc.failFirst}
 			manager := coreauth.NewManager(nil, nil, nil)
 			manager.RegisterExecutor(executor)
-			auth := &coreauth.Auth{ID: "prewarm-prefix-" + tc.name, Provider: "codex", Status: coreauth.StatusActive, Attributes: map[string]string{"websockets": "false"}}
+			auth := &coreauth.Auth{ProxyURL: "direct", ID: "prewarm-prefix-" + tc.name, Provider: "codex", Status: coreauth.StatusActive, Attributes: map[string]string{"websockets": "false"}}
 			if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
 				t.Fatal(errRegister)
 			}
@@ -4721,7 +4721,7 @@ func TestResponsesWebsocketMidConnectionPrewarmHandledLocallyForSSEUpstream(t *t
 	executor := &websocketCaptureExecutor{}
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
-	auth := &coreauth.Auth{ID: "auth-sse", Provider: executor.Identifier(), Status: coreauth.StatusActive}
+	auth := &coreauth.Auth{ProxyURL: "direct", ID: "auth-sse", Provider: executor.Identifier(), Status: coreauth.StatusActive}
 	if _, err := manager.Register(context.Background(), auth); err != nil {
 		t.Fatalf("Register auth: %v", err)
 	}
@@ -4863,7 +4863,7 @@ func TestResponsesWebsocketMidConnectionPrewarmEmptyInputFollowupForSSEUpstream(
 	executor := &websocketCaptureExecutor{}
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
-	auth := &coreauth.Auth{ID: "auth-sse", Provider: executor.Identifier(), Status: coreauth.StatusActive}
+	auth := &coreauth.Auth{ProxyURL: "direct", ID: "auth-sse", Provider: executor.Identifier(), Status: coreauth.StatusActive}
 	if _, err := manager.Register(context.Background(), auth); err != nil {
 		t.Fatalf("Register auth: %v", err)
 	}
@@ -4946,7 +4946,7 @@ func TestResponsesWebsocketMidConnectionIncrementalPrewarmHandledLocallyForSSEUp
 	executor := &websocketCaptureExecutor{}
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
-	auth := &coreauth.Auth{ID: "auth-sse", Provider: executor.Identifier(), Status: coreauth.StatusActive}
+	auth := &coreauth.Auth{ProxyURL: "direct", ID: "auth-sse", Provider: executor.Identifier(), Status: coreauth.StatusActive}
 	if _, err := manager.Register(context.Background(), auth); err != nil {
 		t.Fatalf("Register auth: %v", err)
 	}
@@ -5164,7 +5164,7 @@ func TestResponsesWebsocketUsesObservedCompactionResponseForReplay(t *testing.T)
 			}}
 			manager := coreauth.NewManager(nil, nil, nil)
 			manager.RegisterExecutor(executor)
-			auth := &coreauth.Auth{ID: "auth-sse-" + strings.ReplaceAll(tc.name, " ", "-"), Provider: executor.Identifier(), Status: coreauth.StatusActive}
+			auth := &coreauth.Auth{ProxyURL: "direct", ID: "auth-sse-" + strings.ReplaceAll(tc.name, " ", "-"), Provider: executor.Identifier(), Status: coreauth.StatusActive}
 			if _, err := manager.Register(context.Background(), auth); err != nil {
 				t.Fatalf("Register auth: %v", err)
 			}
@@ -5235,7 +5235,7 @@ func TestResponsesWebsocketRetainsObservedCompactionAcrossSubsequentTurns(t *tes
 	}}
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
-	auth := &coreauth.Auth{ID: "auth-multi-compact", Provider: executor.Identifier(), Status: coreauth.StatusActive}
+	auth := &coreauth.Auth{ProxyURL: "direct", ID: "auth-multi-compact", Provider: executor.Identifier(), Status: coreauth.StatusActive}
 	if _, err := manager.Register(context.Background(), auth); err != nil {
 		t.Fatalf("Register auth: %v", err)
 	}
@@ -5512,9 +5512,9 @@ func TestResponsesWebsocketProviderRoutePinsCompactionAuth(t *testing.T) {
 	}
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
-	dummyAuth := &coreauth.Auth{ID: "auth-dummy-source", Provider: "codex", Status: coreauth.StatusActive}
-	auth1 := &coreauth.Auth{ID: "auth-prov-1", Provider: "openai", Status: coreauth.StatusActive}
-	auth2 := &coreauth.Auth{ID: "auth-prov-2", Provider: "openai", Status: coreauth.StatusActive}
+	dummyAuth := &coreauth.Auth{ProxyURL: "direct", ID: "auth-dummy-source", Provider: "codex", Status: coreauth.StatusActive}
+	auth1 := &coreauth.Auth{ProxyURL: "direct", ID: "auth-prov-1", Provider: "openai", Status: coreauth.StatusActive}
+	auth2 := &coreauth.Auth{ProxyURL: "direct", ID: "auth-prov-2", Provider: "openai", Status: coreauth.StatusActive}
 	for _, auth := range []*coreauth.Auth{dummyAuth, auth1, auth2} {
 		if _, err := manager.Register(context.Background(), auth); err != nil {
 			t.Fatalf("Register auth %s: %v", auth.ID, err)
@@ -5600,7 +5600,7 @@ func TestResponsesWebsocketSuccessiveCompactionsInSameSession(t *testing.T) {
 	}}
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
-	auth := &coreauth.Auth{ID: "auth-successive-compact", Provider: executor.Identifier(), Status: coreauth.StatusActive}
+	auth := &coreauth.Auth{ProxyURL: "direct", ID: "auth-successive-compact", Provider: executor.Identifier(), Status: coreauth.StatusActive}
 	if _, err := manager.Register(context.Background(), auth); err != nil {
 		t.Fatalf("Register auth: %v", err)
 	}
@@ -5782,8 +5782,8 @@ func TestResponsesWebsocketProviderRouteSwitchDoesNotInheritCompaction(t *testin
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executorA)
 	manager.RegisterExecutor(executorB)
-	authA := &coreauth.Auth{ID: "auth-a", Provider: "prov-a", Status: coreauth.StatusActive}
-	authB := &coreauth.Auth{ID: "auth-b", Provider: "prov-b", Status: coreauth.StatusActive}
+	authA := &coreauth.Auth{ProxyURL: "direct", ID: "auth-a", Provider: "prov-a", Status: coreauth.StatusActive}
+	authB := &coreauth.Auth{ProxyURL: "direct", ID: "auth-b", Provider: "prov-b", Status: coreauth.StatusActive}
 	for _, auth := range []*coreauth.Auth{authA, authB} {
 		if _, err := manager.Register(context.Background(), auth); err != nil {
 			t.Fatalf("Register auth %s: %v", auth.ID, err)
@@ -5867,8 +5867,8 @@ func TestResponsesWebsocketProviderRouteSwitchBackDoesNotInheritStaleCompaction(
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executorA)
 	manager.RegisterExecutor(executorB)
-	authA := &coreauth.Auth{ID: "auth-a-switchback", Provider: "prov-a", Status: coreauth.StatusActive}
-	authB := &coreauth.Auth{ID: "auth-b-switchback", Provider: "prov-b", Status: coreauth.StatusActive}
+	authA := &coreauth.Auth{ProxyURL: "direct", ID: "auth-a-switchback", Provider: "prov-a", Status: coreauth.StatusActive}
+	authB := &coreauth.Auth{ProxyURL: "direct", ID: "auth-b-switchback", Provider: "prov-b", Status: coreauth.StatusActive}
 	for _, auth := range []*coreauth.Auth{authA, authB} {
 		if _, err := manager.Register(context.Background(), auth); err != nil {
 			t.Fatalf("Register auth %s: %v", auth.ID, err)
@@ -5948,8 +5948,8 @@ func TestResponsesWebsocketProviderRouteIgnoresResidualPinnedAuth(t *testing.T) 
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(unroutedExecutor)
 	manager.RegisterExecutor(routedExecutor)
-	unroutedAuth := &coreauth.Auth{ID: "auth-unrouted-pin", Provider: "xai", Status: coreauth.StatusActive, Attributes: map[string]string{"websockets": "true"}}
-	routedAuth := &coreauth.Auth{ID: "auth-routed-override", Provider: "openai", Status: coreauth.StatusActive}
+	unroutedAuth := &coreauth.Auth{ProxyURL: "direct", ID: "auth-unrouted-pin", Provider: "xai", Status: coreauth.StatusActive, Attributes: map[string]string{"websockets": "true"}}
+	routedAuth := &coreauth.Auth{ProxyURL: "direct", ID: "auth-routed-override", Provider: "openai", Status: coreauth.StatusActive}
 	for _, auth := range []*coreauth.Auth{unroutedAuth, routedAuth} {
 		if _, err := manager.Register(context.Background(), auth); err != nil {
 			t.Fatalf("Register auth %s: %v", auth.ID, err)
@@ -6031,7 +6031,7 @@ func TestResponsesWebsocketPluginToProviderOverrideSwitch(t *testing.T) {
 	}
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(provExecutor)
-	auth := &coreauth.Auth{ID: "auth-prov-target", Provider: "prov-target", Status: coreauth.StatusActive}
+	auth := &coreauth.Auth{ProxyURL: "direct", ID: "auth-prov-target", Provider: "prov-target", Status: coreauth.StatusActive}
 	if _, err := manager.Register(context.Background(), auth); err != nil {
 		t.Fatalf("Register auth: %v", err)
 	}
@@ -7832,7 +7832,7 @@ func TestResponsesWebsocketReauthorizesEachTurnAndKeepsSocketOpen(t *testing.T) 
 	executor := &websocketDirectCaptureExecutor{}
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
-	auth := &coreauth.Auth{
+	auth := &coreauth.Auth{ProxyURL: "direct",
 		ID:         "auth-ws-reauth",
 		Provider:   "codex",
 		Status:     coreauth.StatusActive,

@@ -68,7 +68,7 @@ func runMockStreamTestWithError(t *testing.T, chunks []string, trailingErr error
 	executor := &mockStreamExecutor{chunks: chunks, trailingErr: trailingErr}
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
-	auth := &coreauth.Auth{ID: authID, Provider: executor.Identifier(), Status: coreauth.StatusActive}
+	auth := &coreauth.Auth{ProxyURL: "direct", ID: authID, Provider: executor.Identifier(), Status: coreauth.StatusActive}
 	if _, err := manager.Register(context.Background(), auth); err != nil {
 		t.Fatalf("register auth: %v", err)
 	}
@@ -217,7 +217,7 @@ func TestCompletionsStreamWithoutFinishReasonIsReportedAsError(t *testing.T) {
 	executor := &mockStreamExecutor{chunks: chunks}
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
-	auth := &coreauth.Auth{ID: "truncated-legacy-auth-missing", Provider: executor.Identifier(), Status: coreauth.StatusActive}
+	auth := &coreauth.Auth{ProxyURL: "direct", ID: "truncated-legacy-auth-missing", Provider: executor.Identifier(), Status: coreauth.StatusActive}
 	if _, err := manager.Register(context.Background(), auth); err != nil {
 		t.Fatalf("register auth: %v", err)
 	}
@@ -255,7 +255,7 @@ func TestCompletionsStreamWithFinishReasonStillCompletes(t *testing.T) {
 	executor := &mockStreamExecutor{chunks: chunks}
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
-	auth := &coreauth.Auth{ID: "truncated-legacy-auth-present", Provider: executor.Identifier(), Status: coreauth.StatusActive}
+	auth := &coreauth.Auth{ProxyURL: "direct", ID: "truncated-legacy-auth-present", Provider: executor.Identifier(), Status: coreauth.StatusActive}
 	if _, err := manager.Register(context.Background(), auth); err != nil {
 		t.Fatalf("register auth: %v", err)
 	}
@@ -308,7 +308,7 @@ func TestCompletionsStreamSingleChunkWithFinishReasonStillCompletes(t *testing.T
 	executor := &mockStreamExecutor{chunks: chunks}
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
-	auth := &coreauth.Auth{ID: "truncated-legacy-auth-single-present", Provider: executor.Identifier(), Status: coreauth.StatusActive}
+	auth := &coreauth.Auth{ProxyURL: "direct", ID: "truncated-legacy-auth-single-present", Provider: executor.Identifier(), Status: coreauth.StatusActive}
 	if _, err := manager.Register(context.Background(), auth); err != nil {
 		t.Fatalf("register auth: %v", err)
 	}
