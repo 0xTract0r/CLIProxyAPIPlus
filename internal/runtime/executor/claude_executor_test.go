@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"regexp"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -817,72 +818,87 @@ func TestClaudeExecutor_NonClaudeRequestUsesClaudeCode220CLIFingerprint(t *testi
 	}))
 	defer server.Close()
 
-	executor := NewClaudeExecutor(claudeBeta280Config375())
-	auth := &cliproxyauth.Auth{ProxyURL: "direct", Attributes: map[string]string{
-		"api_key":    "key-sdk-fingerprint",
-		"base_url":   server.URL,
-		"cloak_mode": "always",
-	}}
-	payload := []byte(`{"model":"claude-opus-4-6","messages":[{"role":"user","content":[{"type":"text","text":"x"}]}]}`)
+	for _, stabilized := range []bool{false, true} {
+		t.Run(map[bool]string{false: "default-runtime-platform", true: "explicit-stabilized-platform"}[stabilized], func(t *testing.T) {
+			cfg := claudeBeta280Config375()
+			cfg.ClaudeHeaderDefaults.StabilizeDeviceProfile = &stabilized
+			executor := NewClaudeExecutor(cfg)
+			auth := &cliproxyauth.Auth{ProxyURL: "direct", Attributes: map[string]string{
+				"api_key":    "key-sdk-fingerprint",
+				"base_url":   server.URL,
+				"cloak_mode": "always",
+			}}
+			payload := []byte(`{"model":"claude-opus-4-6","messages":[{"role":"user","content":[{"type":"text","text":"x"}]}]}`)
 
-	_, errExecute := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
-		Model:   "claude-opus-4-6",
-		Payload: payload,
-	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatClaude})
-	if errExecute != nil {
-		t.Fatalf("Execute() error = %v", errExecute)
+			_, errExecute := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+				Model:   "claude-opus-4-6",
+				Payload: payload,
+			}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatClaude})
+			if errExecute != nil {
+				t.Fatalf("Execute() error = %v", errExecute)
+			}
+
+			osName, arch := "MacOS", "arm64"
+			if !stabilized {
+				osName = map[string]string{"darwin": "MacOS", "linux": "Linux", "windows": "Windows"}[runtime.GOOS]
+				arch = runtime.GOARCH
+				if arch == "amd64" {
+					arch = "x64"
+				}
+			}
+			assertClaudeFingerprint(t, seenHeaders, "claude-cli/2.1.280 (external, cli)", "0.112.1", "v26.3.0", osName, arch)
+			if got := seenHeaders.Get("X-App"); got != "cli" {
+				t.Fatalf("X-App = %q, want cli", got)
+			}
+			if want := claudeCodeCLIBetas(payload, nil, false); seenHeaders.Get("Anthropic-Beta") != want {
+				t.Fatalf("Anthropic-Beta = %q, want %q", seenHeaders.Get("Anthropic-Beta"), want)
+			}
+
+			system := gjson.GetBytes(seenBody, "system").Array()
+			if len(system) != 2 {
+				t.Fatalf("system block count = %d, want 2: %s", len(system), seenBody)
+			}
+			if got := system[0].Get("text").String(); got != "x-anthropic-billing-header: cc_version=2.1.280.d7b; cc_entrypoint=cli;" {
+				t.Fatalf("billing header = %q, want 2.1.280 CLI fingerprint", got)
+			}
+			if got := system[1].Get("text").String(); got != claudeCodeCLIIdentity {
+				t.Fatalf("system[1].text = %q, want official CLI identity", got)
+			}
+			if got := system[1].Get("cache_control.type").String(); got != "ephemeral" {
+				t.Fatalf("system[1].cache_control.type = %q, want ephemeral", got)
+			}
+			// This credential is an API key, and native only selects the 1h cache pool for
+			// OAuth. The body ttl therefore has to stay absent, matching the fact that
+			// claudeCodeCLIBetas does not emit extended-cache-ttl-2025-04-11 here either.
+			if system[1].Get("cache_control.ttl").Exists() {
+				t.Fatalf("API-key request must not carry a 1h body ttl: %s", system[1].Raw)
+			}
+			if betas := seenHeaders.Get("Anthropic-Beta"); strings.Contains(betas, claudeExtendedCacheTTLBeta) {
+				t.Fatalf("API-key request must not declare extended-cache-ttl: %s", betas)
+			}
+			content := gjson.GetBytes(seenBody, "messages.0.content").Array()
+			if len(content) != 2 {
+				t.Fatalf("messages[0].content has %d blocks, want currentDate and user text", len(content))
+			}
+			assertClaudeCodeCurrentDateBlock(t, content[0])
+			assertEphemeralUserTextBlock(t, content[1], "x", "")
+
+			userID := gjson.GetBytes(seenBody, "metadata.user_id").String()
+			if !helps.IsValidUserID(userID) {
+				t.Fatalf("metadata.user_id = %q, want Claude Code JSON shape", userID)
+			}
+			// F synthetic_device_id.go:256 fabricates a body session independently;
+			// F request.go:499–501 uses the API-key cache for this legacy header.
+			// Explicit CLI-profile/OAuth identity alignment has separate coverage.
+			if _, err := uuid.Parse(gjson.Get(userID, "session_id").String()); err != nil {
+				t.Fatalf("metadata session_id is not a UUID: %v", err)
+			}
+			if got, want := seenHeaders.Get("X-Claude-Code-Session-Id"), helps.CachedSessionID("key-sdk-fingerprint"); got != want {
+				t.Fatalf("legacy header session = %q, want API-key cached %q", got, want)
+			}
+		})
 	}
 
-	assertClaudeFingerprint(t, seenHeaders, "claude-cli/2.1.280 (external, cli)", "0.112.1", "v26.3.0", "MacOS", "arm64")
-	if got := seenHeaders.Get("X-App"); got != "cli" {
-		t.Fatalf("X-App = %q, want cli", got)
-	}
-	if want := claudeCodeCLIBetas(payload, nil, false); seenHeaders.Get("Anthropic-Beta") != want {
-		t.Fatalf("Anthropic-Beta = %q, want %q", seenHeaders.Get("Anthropic-Beta"), want)
-	}
-
-	system := gjson.GetBytes(seenBody, "system").Array()
-	if len(system) != 2 {
-		t.Fatalf("system block count = %d, want 2: %s", len(system), seenBody)
-	}
-	if got := system[0].Get("text").String(); got != "x-anthropic-billing-header: cc_version=2.1.280.d7b; cc_entrypoint=cli;" {
-		t.Fatalf("billing header = %q, want 2.1.280 CLI fingerprint", got)
-	}
-	if got := system[1].Get("text").String(); got != claudeCodeCLIIdentity {
-		t.Fatalf("system[1].text = %q, want official CLI identity", got)
-	}
-	if got := system[1].Get("cache_control.type").String(); got != "ephemeral" {
-		t.Fatalf("system[1].cache_control.type = %q, want ephemeral", got)
-	}
-	// This credential is an API key, and native only selects the 1h cache pool for
-	// OAuth. The body ttl therefore has to stay absent, matching the fact that
-	// claudeCodeCLIBetas does not emit extended-cache-ttl-2025-04-11 here either.
-	if system[1].Get("cache_control.ttl").Exists() {
-		t.Fatalf("API-key request must not carry a 1h body ttl: %s", system[1].Raw)
-	}
-	if betas := seenHeaders.Get("Anthropic-Beta"); strings.Contains(betas, claudeExtendedCacheTTLBeta) {
-		t.Fatalf("API-key request must not declare extended-cache-ttl: %s", betas)
-	}
-	content := gjson.GetBytes(seenBody, "messages.0.content").Array()
-	if len(content) != 2 {
-		t.Fatalf("messages[0].content has %d blocks, want currentDate and user text", len(content))
-	}
-	assertClaudeCodeCurrentDateBlock(t, content[0])
-	assertEphemeralUserTextBlock(t, content[1], "x", "")
-
-	userID := gjson.GetBytes(seenBody, "metadata.user_id").String()
-	if !helps.IsValidUserID(userID) {
-		t.Fatalf("metadata.user_id = %q, want Claude Code JSON shape", userID)
-	}
-	// F synthetic_device_id.go:256 fabricates a body session independently;
-	// F request.go:499–501 uses the API-key cache for this legacy header.
-	// Explicit CLI-profile/OAuth identity alignment has separate coverage.
-	if _, err := uuid.Parse(gjson.Get(userID, "session_id").String()); err != nil {
-		t.Fatalf("metadata session_id is not a UUID: %v", err)
-	}
-	if got, want := seenHeaders.Get("X-Claude-Code-Session-Id"), helps.CachedSessionID("key-sdk-fingerprint"); got != want {
-		t.Fatalf("legacy header session = %q, want API-key cached %q", got, want)
-	}
 }
 
 func TestClaudeExecutor_ConfirmedNewerPatchClaudeCodeRequestPreservesInteractiveIdentity(t *testing.T) {
@@ -1461,82 +1477,91 @@ func TestClaudeExecutor_CloakModeNeverPreservesConfirmedShapeClaudeCodeCallerHea
 }
 
 func TestClaudeExecutor_CloakModeNeverUsesConfiguredHeaderDefaultsBaseline(t *testing.T) {
-	helps.ResetClaudeDeviceProfileCache()
-	var seenHeaders http.Header
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		seenHeaders = r.Header.Clone()
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","model":"claude-sonnet-5-5","role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1,"output_tokens":1}}`))
-	}))
-	defer server.Close()
+	for _, stabilized := range []bool{false, true} {
+		t.Run(map[bool]string{false: "default-legacy-no-high-water", true: "stabilized-high-water"}[stabilized], func(t *testing.T) {
+			helps.ResetClaudeDeviceProfileCache()
+			var seenHeaders http.Header
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				seenHeaders = r.Header.Clone()
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","model":"claude-sonnet-5-5","role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1,"output_tokens":1}}`))
+			}))
+			defer server.Close()
 
-	const sessionID = "55555555-6666-4777-8888-999999999999"
-	const userID = `{"account_uuid":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","device_id":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","session_id":"55555555-6666-4777-8888-999999999999"}`
-	const callerUA = "claude-cli/2.2.5 (external, cli)"
-	payload := []byte(`{"model":"claude-sonnet-5-5","max_tokens":1024,"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.2.5.179; cc_entrypoint=cli;"},{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."}],"tools":[],"messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}],"metadata":{"user_id":` + fmt.Sprintf("%q", userID) + `}}`)
-	cfg := &config.Config{
-		ClaudeHeaderDefaults: config.ClaudeHeaderDefaults{
-			UserAgent:      "claude-cli/2.2.0 (external, cli)",
-			PackageVersion: "0.95.0",
-			RuntimeVersion: "v26.4.0",
-			OS:             "MacOS",
-			Arch:           "arm64",
-		},
-	}
-	deviceIDs := []string{"0000000000000000000000000000000000000000000000000000000000000000"}
-	executor := NewClaudeExecutor(cfg)
-	auth := &cliproxyauth.Auth{ProxyURL: "direct",
-		ID: "auth-cloak-never-configured-baseline",
-		Attributes: map[string]string{
-			"api_key":  "sk-ant-oat-cloak-never-cfg",
-			"base_url": server.URL,
-		},
-		Metadata: map[string]any{
-			"account_uuid":      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-			"claude_device_ids": deviceIDs,
-			"cloak_mode":        "never",
-		},
+			const sessionID = "55555555-6666-4777-8888-999999999999"
+			const userID = `{"account_uuid":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","device_id":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","session_id":"55555555-6666-4777-8888-999999999999"}`
+			const callerUA = "claude-cli/2.2.5 (external, cli)"
+			payload := []byte(`{"model":"claude-sonnet-5-5","max_tokens":1024,"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.2.5.179; cc_entrypoint=cli;"},{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."}],"tools":[],"messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}],"metadata":{"user_id":` + fmt.Sprintf("%q", userID) + `}}`)
+			cfg := &config.Config{
+				ClaudeHeaderDefaults: config.ClaudeHeaderDefaults{
+					UserAgent: "claude-cli/2.2.0 (external, cli)", StabilizeDeviceProfile: &stabilized,
+					PackageVersion: "0.95.0",
+					RuntimeVersion: "v26.4.0",
+					OS:             "MacOS",
+					Arch:           "arm64",
+				},
+			}
+			deviceIDs := []string{"0000000000000000000000000000000000000000000000000000000000000000"}
+			executor := NewClaudeExecutor(cfg)
+			auth := &cliproxyauth.Auth{ProxyURL: "direct",
+				ID: "auth-cloak-never-configured-baseline",
+				Attributes: map[string]string{
+					"api_key":  "sk-ant-oat-cloak-never-cfg",
+					"base_url": server.URL,
+				},
+				Metadata: map[string]any{
+					"account_uuid":      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+					"claude_device_ids": deviceIDs,
+					"cloak_mode":        "never",
+				},
+			}
+
+			incomingPlausible := http.Header{
+				"User-Agent":     {callerUA},
+				"X-App":          {"cli"},
+				"Anthropic-Beta": {"claude-code-20250219,interleaved-thinking-2025-05-14"},
+				"Anthropic-Dangerous-Direct-Browser-Access": {"true"},
+				"X-Claude-Code-Session-Id":                  {sessionID},
+				"X-Stainless-Package-Version":               {"0.128.0"},
+				"X-Stainless-Runtime-Version":               {"v26.5.0"},
+				"X-Stainless-Os":                            {"MacOS"},
+				"X-Stainless-Arch":                          {"arm64"},
+			}
+			_, errExecute := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+				Model:   "claude-sonnet-5-5",
+				Payload: payload,
+			}, cliproxyexecutor.Options{
+				SourceFormat:    sdktranslator.FormatClaude,
+				OriginalRequest: payload,
+				Headers:         incomingPlausible,
+			})
+			if errExecute != nil {
+				t.Fatalf("Execute() plausible headers error = %v", errExecute)
+			}
+			assertClaudeFingerprint(t, seenHeaders, callerUA, "0.128.0", "v26.5.0", "MacOS", "arm64")
+
+			incomingFallback := incomingPlausible.Clone()
+			incomingFallback.Set("X-Stainless-Package-Version", "0.80.0")
+			incomingFallback.Del("X-Stainless-Runtime-Version")
+			_, errExecute = executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+				Model:   "claude-sonnet-5-5",
+				Payload: payload,
+			}, cliproxyexecutor.Options{
+				SourceFormat:    sdktranslator.FormatClaude,
+				OriginalRequest: payload,
+				Headers:         incomingFallback,
+			})
+			if errExecute != nil {
+				t.Fatalf("Execute() fallback headers error = %v", errExecute)
+			}
+			if stabilized {
+				assertClaudeFingerprint(t, seenHeaders, callerUA, "0.128.0", "v26.5.0", "MacOS", "arm64")
+			} else {
+				assertClaudeFingerprint(t, seenHeaders, callerUA, "0.80.0", "v26.4.0", "MacOS", "arm64")
+			}
+		})
 	}
 
-	incomingPlausible := http.Header{
-		"User-Agent":     {callerUA},
-		"X-App":          {"cli"},
-		"Anthropic-Beta": {"claude-code-20250219,interleaved-thinking-2025-05-14"},
-		"Anthropic-Dangerous-Direct-Browser-Access": {"true"},
-		"X-Claude-Code-Session-Id":                  {sessionID},
-		"X-Stainless-Package-Version":               {"0.128.0"},
-		"X-Stainless-Runtime-Version":               {"v26.5.0"},
-		"X-Stainless-Os":                            {"MacOS"},
-		"X-Stainless-Arch":                          {"arm64"},
-	}
-	_, errExecute := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
-		Model:   "claude-sonnet-5-5",
-		Payload: payload,
-	}, cliproxyexecutor.Options{
-		SourceFormat:    sdktranslator.FormatClaude,
-		OriginalRequest: payload,
-		Headers:         incomingPlausible,
-	})
-	if errExecute != nil {
-		t.Fatalf("Execute() plausible headers error = %v", errExecute)
-	}
-	assertClaudeFingerprint(t, seenHeaders, callerUA, "0.128.0", "v26.5.0", "MacOS", "arm64")
-
-	incomingFallback := incomingPlausible.Clone()
-	incomingFallback.Set("X-Stainless-Package-Version", "0.80.0")
-	incomingFallback.Del("X-Stainless-Runtime-Version")
-	_, errExecute = executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
-		Model:   "claude-sonnet-5-5",
-		Payload: payload,
-	}, cliproxyexecutor.Options{
-		SourceFormat:    sdktranslator.FormatClaude,
-		OriginalRequest: payload,
-		Headers:         incomingFallback,
-	})
-	if errExecute != nil {
-		t.Fatalf("Execute() fallback headers error = %v", errExecute)
-	}
-	assertClaudeFingerprint(t, seenHeaders, callerUA, "0.95.0", "v26.4.0", "MacOS", "arm64")
 }
 
 func TestClaudeDeviceProfileStabilizationEnabled_DefaultFalse(t *testing.T) {
@@ -3057,12 +3082,14 @@ func TestClaudeExecutor_CountTokensRebuildsMidSystemMessagesBeforeValidation(t *
 
 func TestClaudeExecutor_ReusesUserIDAcrossModelsWhenCacheEnabled(t *testing.T) {
 	var userIDs []string
+	var headerSessions []string
 	var requestModels []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		userID := gjson.GetBytes(body, "metadata.user_id").String()
 		model := gjson.GetBytes(body, "model").String()
 		userIDs = append(userIDs, userID)
+		headerSessions = append(headerSessions, r.Header.Get("X-Claude-Code-Session-Id"))
 		requestModels = append(requestModels, model)
 		t.Logf("HTTP Server received request: model=%s, user_id=%s, url=%s", model, userID, r.URL.String())
 		w.Header().Set("Content-Type", "application/json")
@@ -3112,13 +3139,31 @@ func TestClaudeExecutor_ReusesUserIDAcrossModelsWhenCacheEnabled(t *testing.T) {
 	}
 	t.Logf("user_id[0] (model=%s): %s", requestModels[0], userIDs[0])
 	t.Logf("user_id[1] (model=%s): %s", requestModels[1], userIDs[1])
-	if userIDs[0] != userIDs[1] {
-		t.Fatalf("expected user_id to be reused across models, got %q and %q", userIDs[0], userIDs[1])
+	for i, id := range userIDs {
+		if gjson.Get(id, "device_id").String() != helps.SyntheticDeviceID("", auth, "key-123") || gjson.Get(id, "account_uuid").String() != "" {
+			t.Fatalf("wrong account binding: %s", id)
+		}
+		if _, err := uuid.Parse(gjson.Get(id, "session_id").String()); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := uuid.Parse(headerSessions[i]); err != nil {
+			t.Fatal(err)
+		}
+		if headerSessions[i] == gjson.Get(id, "session_id").String() {
+			t.Fatal("header cache and body request session domains collapsed")
+		}
 	}
+	if gjson.Get(userIDs[0], "session_id").String() == gjson.Get(userIDs[1], "session_id").String() {
+		t.Fatal("independent requests reused body session")
+	}
+	if headerSessions[0] != headerSessions[1] {
+		t.Fatal("cached header session did not span models")
+	}
+
 	if !helps.IsValidUserID(userIDs[0]) {
 		t.Fatalf("user_id %q is not valid", userIDs[0])
 	}
-	t.Logf("✓ End-to-end test passed: Same user_id (%s) was used for both models", userIDs[0])
+	t.Logf("✓ End-to-end test passed: Account identity and header-cache session span models; body session remains per request (%s)", userIDs[0])
 }
 
 func TestClaudeExecutor_DefaultDoesNotInjectUserID(t *testing.T) {

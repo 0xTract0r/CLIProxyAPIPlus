@@ -59,8 +59,8 @@ func TestIssue6193_Sonnet55ToolChangeBeta(t *testing.T) {
 	}
 
 	// 2. Outgoing Anthropic-Beta on Claude OAuth / CLI fingerprint path for claude-sonnet-5-5
-	// must contain mid-conversation-tool-changes-2026-07-01, both when caller sends an explicit beta
-	// and when caller sends no client beta.
+	// follows the default software floor unless the caller supplies the beta;
+	// an explicit 2.1.280 baseline also supplies it without a caller beta.
 	body := []byte(`{
 		"model": "claude-sonnet-5-5",
 		"max_tokens": 64,
@@ -79,9 +79,12 @@ func TestIssue6193_Sonnet55ToolChangeBeta(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
 		clientBetas string
+		pinned      bool
 	}{
-		{name: "with explicit legacy beta", clientBetas: "mid-conversation-tool-changes-2026-07-01"},
-		{name: "without client beta", clientBetas: ""},
+		{name: "default with explicit beta", clientBetas: "mid-conversation-tool-changes-2026-07-01"},
+		{name: "default without client beta"},
+		{name: "pinned280 with explicit beta", clientBetas: "mid-conversation-tool-changes-2026-07-01", pinned: true},
+		{name: "pinned280 without client beta", pinned: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			incomingHeaders := http.Header{}
@@ -94,12 +97,17 @@ func TestIssue6193_Sonnet55ToolChangeBeta(t *testing.T) {
 				t.Fatalf("http.NewRequest failed: %v", err)
 			}
 
-			if errApply := applyClaudeHeaders(req, auth, "sk-ant-oat-issue-6193", false, nil, body, &config.Config{}, incomingHeaders, false); errApply != nil {
+			cfg := &config.Config{}
+			if tc.pinned {
+				cfg.ClaudeHeaderDefaults.UserAgent = "claude-cli/2.1.280 (external, cli)"
+				cfg.ClaudeHeaderDefaults.PinSoftwareBaseline = true
+			}
+			if errApply := applyClaudeHeaders(req, auth, "sk-ant-oat-issue-6193", false, nil, body, cfg, incomingHeaders, false); errApply != nil {
 				t.Fatalf("applyClaudeHeaders failed: %v", errApply)
 			}
 
 			upstreamBetas := req.Header.Get("Anthropic-Beta")
-			if !strings.Contains(upstreamBetas, "mid-conversation-tool-changes-2026-07-01") {
+			if want := tc.pinned || tc.clientBetas != ""; strings.Contains(upstreamBetas, "mid-conversation-tool-changes-2026-07-01") != want {
 				t.Fatalf("applyClaudeHeaders for claude-sonnet-5-5 missing mid-conversation-tool-changes-2026-07-01, got Anthropic-Beta: %s", upstreamBetas)
 			}
 		})

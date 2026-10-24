@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -113,28 +114,30 @@ func TestClaudeMessageIDFromSSECommitsOnlyCompletedMessage(t *testing.T) {
 
 func TestClaudeExecutorContinuityAdvancesRequestIDAndPromptIDInBillingHeader(t *testing.T) {
 	var capturedBillingHeaders []string
+	var capturedUAs []string
 	call := 0
-	transport := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		body, errRead := io.ReadAll(req.Body)
 		if errRead != nil {
 			t.Fatal(errRead)
 		}
 		billing := gjson.GetBytes(body, "system.0.text").String()
 		capturedBillingHeaders = append(capturedBillingHeaders, billing)
+		capturedUAs = append(capturedUAs, req.Header.Get("User-Agent"))
 		call++
 		response := `{"id":"msg_turn_` + string(rune('0'+call)) + `","type":"message","model":"claude-sonnet-5","role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1,"output_tokens":1}}`
-		header := http.Header{
-			"Content-Type": []string{"application/json"},
-			"request-id":   []string{fmt.Sprintf("req_upstream_turn_%d", call)},
-		}
-		return &http.Response{StatusCode: http.StatusOK, Header: header, Body: io.NopCloser(strings.NewReader(response)), Request: req}, nil
-	})
-	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", http.RoundTripper(transport))
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("request-id", fmt.Sprintf("req_upstream_turn_%d", call))
+		_, _ = w.Write([]byte(response))
+	}))
+	defer server.Close()
+	ctx := context.Background()
+
 	deviceIDs := []string{"0000000000000000000000000000000000000000000000000000000000000000"}
 	testID := uuid.NewString()
 	auth := &cliproxyauth.Auth{
-		ID:         "continuity-test-" + testID,
-		Attributes: map[string]string{"api_key": "sk-ant-oat-continuity-test", "cloak_mode": "always"},
+		ID: "continuity-test-" + testID, ProxyURL: "direct",
+		Attributes: map[string]string{"api_key": "sk-ant-oat-continuity-test", "cloak_mode": "always", "base_url": server.URL},
 		Metadata: map[string]any{
 			"account_uuid":                        "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
 			claudeauth.ClaudeDeviceIDsMetadataKey: deviceIDs,
@@ -193,7 +196,7 @@ func TestClaudeExecutorContinuityAdvancesRequestIDAndPromptIDInBillingHeader(t *
 
 	// Verify Turn 1:
 	h1 := capturedBillingHeaders[0]
-	if !strings.Contains(h1, "cc_version=2.1.280.") || !strings.Contains(h1, "cc_entrypoint=cli;") || !strings.Contains(h1, "cch=") {
+	if !strings.Contains(h1, "cc_version="+strings.Fields(strings.TrimPrefix(capturedUAs[0], "claude-cli/"))[0]+".") || !strings.Contains(h1, "cc_entrypoint=cli;") || !strings.Contains(h1, "cch=") {
 		t.Fatalf("h1 invalid: %s", h1)
 	}
 	if strings.Contains(h1, "cc_prev_req=") {
