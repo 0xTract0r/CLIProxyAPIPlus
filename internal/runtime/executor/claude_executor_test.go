@@ -649,6 +649,8 @@ func TestApplyClaudeHeaders_LegacyModePreservesConfiguredUserAgentOverrideForCla
 			PackageVersion:         "0.70.0",
 			RuntimeVersion:         "v22.0.0",
 			StabilizeDeviceProfile: &stabilize,
+			// Preserve the U software oracle only under explicit baseline pinning.
+			PinSoftwareBaseline: true,
 		},
 	}
 	auth := &cliproxyauth.Auth{
@@ -12612,6 +12614,8 @@ func TestClaudeExecutorStream_AlignsBillingVersionWithStabilizedUserAgent(t *tes
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = w.Write([]byte("data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"model\":\"claude-sonnet-4-6\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n"))
+		// Complete the successful stream; truncated-stream behavior has separate guards.
+		_, _ = w.Write([]byte("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"))
 	}))
 	defer server.Close()
 
@@ -12686,6 +12690,8 @@ func TestClaudeExecutorStream_RewritesStaleBillingVersionToStabilizedUserAgent(t
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = w.Write([]byte("data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"model\":\"claude-sonnet-4-6\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n"))
+		// Complete the successful stream; truncated-stream behavior has separate guards.
+		_, _ = w.Write([]byte("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"))
 	}))
 	defer server.Close()
 

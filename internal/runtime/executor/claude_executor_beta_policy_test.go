@@ -106,7 +106,9 @@ func TestApplyClaudeHeaders_KnownBodyBetaStillPlacedOnAnthropic(t *testing.T) {
 // could rewrite the reconstructed identity on Anthropic itself.
 func TestApplyClaudeHeaders_CustomHeadersCannotOverrideAnthropicIdentity(t *testing.T) {
 	auth := &cliproxyauth.Auth{Attributes: map[string]string{
-		"api_key":                "key-custom-headers",
+		"api_key": "key-custom-headers",
+		// The full-compression transport contract requires explicit CLI profile opt-in.
+		"fingerprint_profile":    claudeFingerprintProfileClaudeCodeCLI,
 		"header:Anthropic-Beta":  "attacker-controlled-2099-01-01",
 		"header:Accept-Encoding": "identity",
 	}}
@@ -626,6 +628,8 @@ func TestApplyClaudeHeaders_BodyBetaSurvivesCloakedProfiles(t *testing.T) {
 }
 
 func TestApplyClaudeHeaders_ForkHeaderOwnershipModes(t *testing.T) {
+	stabilize := true
+	cfg := &config.Config{ClaudeHeaderDefaults: config.ClaudeHeaderDefaults{StabilizeDeviceProfile: &stabilize}}
 	floor := "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07"
 	for _, oauth := range []bool{false, true} {
 		for _, mode := range []string{"auto", "always", "never"} {
@@ -647,7 +651,7 @@ func TestApplyClaudeHeaders_ForkHeaderOwnershipModes(t *testing.T) {
 						incoming.Set("X-Stainless-Runtime-Version", "v24.3.0")
 					}
 					req := newClaudeHeaderTestRequest(t, incoming)
-					if err := applyClaudeHeaders(req, auth, apiKey, false, []string{"caller-body-beta", "caller-header-beta"}, []byte(`{"model":"claude-opus-5"}`), nil, incoming, native); err != nil {
+					if err := applyClaudeHeaders(req, auth, apiKey, false, []string{"caller-body-beta", "caller-header-beta"}, []byte(`{"model":"claude-opus-5"}`), cfg, incoming, native); err != nil {
 						t.Fatal(err)
 					}
 					want := floor + ",caller-header-beta,context-1m-2025-08-07,caller-body-beta"
@@ -819,6 +823,63 @@ func TestApplyClaudeHeaders_KnownBetaOperatorAndPinnedPolicy(t *testing.T) {
 						t.Fatalf("beta policy not idempotent: %q -> %q", got, again)
 					}
 				})
+			}
+		}
+	}
+}
+
+// Default/disabled stabilization retains the F caller software fields. Cloaking
+// mode selects the body policy and must not silently enable a device floor.
+func TestApplyClaudeHeaders_ForkLegacyHeaderOwnershipModes(t *testing.T) {
+	for _, oauth := range []bool{false, true} {
+		for _, mode := range []string{"auto", "always", "never"} {
+			for _, explicitFalse := range []bool{false, true} {
+				for _, native := range []bool{false, true} {
+					for _, stream := range []bool{false, true} {
+						t.Run(fmt.Sprintf("oauth=%v/mode=%s/explicitFalse=%v/native=%v/stream=%v", oauth, mode, explicitFalse, native, stream), func(t *testing.T) {
+							resetClaudeDeviceProfileCache()
+							t.Cleanup(resetClaudeDeviceProfileCache)
+							var cfg *config.Config
+							if explicitFalse {
+								stabilize := false
+								cfg = &config.Config{ClaudeHeaderDefaults: config.ClaudeHeaderDefaults{StabilizeDeviceProfile: &stabilize}}
+							}
+							key := "key-legacy-header-ownership"
+							auth := &cliproxyauth.Auth{ID: "legacy-header-ownership", Attributes: map[string]string{"api_key": key}}
+							if oauth {
+								key = claudeRaceProbeOAuthKey
+								auth = claudeOAuthAuthForBetaPolicy()
+							}
+							if auth.Attributes == nil {
+								auth.Attributes = make(map[string]string)
+							}
+							auth.Attributes["cloak_mode"] = mode
+							auth.Attributes["header:Accept"] = "attacker/invalid"
+							auth.Attributes["header:Accept-Encoding"] = "attacker-encoding"
+							incoming := http.Header{"User-Agent": []string{"caller-sdk/1.0"}, "X-Stainless-Package-Version": []string{"0.94.0"}, "X-Stainless-Runtime-Version": []string{"v24.3.0"}, "X-Stainless-Os": []string{"Linux"}, "X-Stainless-Arch": []string{"x64"}}
+							wantUA := "claude-cli/2.1.211 (external, cli)"
+							if native {
+								wantUA = "claude-cli/2.1.210 (external, cli)"
+								incoming.Set("User-Agent", wantUA)
+							}
+							req := newClaudeHeaderTestRequest(t, incoming)
+							if err := applyClaudeHeaders(req, auth, key, stream, nil, []byte(`{"model":"claude-opus-5"}`), cfg, incoming, native); err != nil {
+								t.Fatal(err)
+							}
+							assertClaudeFingerprint(t, req.Header, wantUA, "0.94.0", "v24.3.0", "Linux", "x64")
+							wantAccept, wantEncoding := "application/json", "gzip, deflate, br, zstd"
+							if stream && !native {
+								wantAccept, wantEncoding = "text/event-stream", "identity"
+							}
+							if got := req.Header.Get("Accept"); got != wantAccept {
+								t.Fatalf("Accept = %q, want %q", got, wantAccept)
+							}
+							if got := req.Header.Get("Accept-Encoding"); got != wantEncoding {
+								t.Fatalf("Accept-Encoding = %q, want %q", got, wantEncoding)
+							}
+						})
+					}
+				}
 			}
 		}
 	}
