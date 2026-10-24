@@ -62,7 +62,7 @@ func newSpeechRoutingTestHandlers(t *testing.T, executor *speechCaptureExecutor)
 
 	manager := coreauth.NewManager(nil, &coreauth.RoundRobinSelector{}, nil)
 	manager.RegisterExecutor(executor)
-	auth := &coreauth.Auth{ID: "speech-routing-auth", Provider: "xai", Status: coreauth.StatusActive}
+	auth := &coreauth.Auth{ProxyURL: "direct", ID: "speech-routing-auth", Provider: "xai", Status: coreauth.StatusActive}
 	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
 		t.Fatalf("manager.Register: %v", errRegister)
 	}

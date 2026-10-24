@@ -90,6 +90,7 @@ func TestResponsesInterruptInFlight(t *testing.T) {
 			authID := fmt.Sprintf("interrupt-%t", steering)
 			model := "interrupt-model-" + authID
 			_, errRegister := manager.Register(context.Background(), &coreauth.Auth{
+				ProxyURL: "direct",
 				ID:       authID,
 				Provider: "codex",
 				Status:   coreauth.StatusActive,
@@ -324,6 +325,7 @@ func TestResponsesInterruptStopsHTTPUpstream(t *testing.T) {
 	const authID = "interrupt-http-auth"
 	const model = "interrupt-http-model"
 	_, errRegister := manager.Register(context.Background(), &coreauth.Auth{
+		ProxyURL:   "direct",
 		ID:         authID,
 		Provider:   "codex",
 		Status:     coreauth.StatusActive,

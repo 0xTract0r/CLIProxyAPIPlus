@@ -237,8 +237,8 @@ func TestOpenAIResponsesCompactTransientFailureDoesNotCooldownAuthAndPreservesEr
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
 
-	auth1 := &coreauth.Auth{ID: "auth1", Provider: executor.Identifier(), Status: coreauth.StatusActive}
-	auth2 := &coreauth.Auth{ID: "auth2", Provider: executor.Identifier(), Status: coreauth.StatusActive}
+	auth1 := &coreauth.Auth{ProxyURL: "direct", ID: "auth1", Provider: executor.Identifier(), Status: coreauth.StatusActive}
+	auth2 := &coreauth.Auth{ProxyURL: "direct", ID: "auth2", Provider: executor.Identifier(), Status: coreauth.StatusActive}
 	if _, err := manager.Register(context.Background(), auth1); err != nil {
 		t.Fatalf("Register auth1: %v", err)
 	}
@@ -310,8 +310,8 @@ func TestOpenAIResponsesCompactRequestFaultStopsFallbackAndPreservesError(t *tes
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
 
-	auth1 := &coreauth.Auth{ID: "auth1", Provider: executor.Identifier(), Status: coreauth.StatusActive}
-	auth2 := &coreauth.Auth{ID: "auth2", Provider: executor.Identifier(), Status: coreauth.StatusActive}
+	auth1 := &coreauth.Auth{ProxyURL: "direct", ID: "auth1", Provider: executor.Identifier(), Status: coreauth.StatusActive}
+	auth2 := &coreauth.Auth{ProxyURL: "direct", ID: "auth2", Provider: executor.Identifier(), Status: coreauth.StatusActive}
 	if _, err := manager.Register(context.Background(), auth1); err != nil {
 		t.Fatalf("Register auth1: %v", err)
 	}

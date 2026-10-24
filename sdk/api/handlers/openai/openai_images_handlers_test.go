@@ -742,6 +742,7 @@ func newXAIImagesRoutingTestHandler(t *testing.T, forceModelPrefix bool, authID 
 	manager := coreauth.NewManager(nil, &coreauth.RoundRobinSelector{}, nil)
 	manager.RegisterExecutor(executor)
 	auth := &coreauth.Auth{
+		ProxyURL: "direct",
 		ID:       authID,
 		Provider: "xai",
 		Prefix:   prefix,
