@@ -19,6 +19,7 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 func TestResolveClaudeFingerprintPolicy(t *testing.T) {
@@ -495,17 +496,33 @@ func TestClaudeExecutor_OfficialAPIKeyDefaultPreservesCallerCCH(t *testing.T) {
 	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", http.RoundTripper(transport))
 	auth := &cliproxyauth.Auth{ID: "official-caller-cch", Attributes: map[string]string{"api_key": "key-official-caller-cch"}}
 	payload := []byte(`{"model":"claude-sonnet-5","max_tokens":64,"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=caller; cch=abcde;"},{"type":"text","text":"Keep this rule."}],"messages":[{"role":"user","content":"hello"}]}`)
-	if _, errExecute := NewClaudeExecutor(&config.Config{}).Execute(ctx, auth, cliproxyexecutor.Request{
-		Model: "claude-sonnet-5", Payload: payload,
-	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatClaude, OriginalRequest: payload}); errExecute != nil {
-		t.Fatalf("Execute() error = %v", errExecute)
+	for _, mode := range []string{"", "uncloak"} {
+		t.Run(map[bool]string{true: "default-auto-cloaks", false: "explicit-uncloak-preserves-caller"}[mode == ""], func(t *testing.T) {
+			auth.Attributes["cloak_mode"] = mode
+			if _, errExecute := NewClaudeExecutor(&config.Config{}).Execute(ctx, auth, cliproxyexecutor.Request{
+				Model: "claude-sonnet-5", Payload: payload,
+			}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatClaude, OriginalRequest: payload}); errExecute != nil {
+				t.Fatalf("Execute() error = %v", errExecute)
+			}
+
+			if mode == "uncloak" {
+				if got := gjson.GetBytes(seenBody, "system.0.text").String(); got != "x-anthropic-billing-header: cc_version=caller; cch=abcde;" {
+					t.Fatalf("caller billing/CCH = %q, want byte-preserved text", got)
+				}
+				if got := gjson.GetBytes(seenBody, "system.1.text").String(); got != "Keep this rule." {
+					t.Fatalf("caller system text = %q, want preserved", got)
+				}
+			} else {
+				if got := gjson.GetBytes(seenBody, "system.0.text").String(); !strings.HasPrefix(got, "x-anthropic-billing-header: cc_version=") || strings.Contains(got, "cc_version=caller;") {
+					t.Fatalf("default auto did not cloak billing: %s", seenBody)
+				}
+				if !strings.Contains(string(seenBody), claudeCodeCLIIdentity) || !strings.Contains(string(seenBody), "Keep this rule.") || !strings.Contains(string(seenBody), "hello") {
+					t.Fatalf("default auto lost identity/caller task: %s", seenBody)
+				}
+			}
+		})
 	}
-	if got := gjson.GetBytes(seenBody, "system.0.text").String(); got != "x-anthropic-billing-header: cc_version=caller; cch=abcde;" {
-		t.Fatalf("caller billing/CCH = %q, want byte-preserved text", got)
-	}
-	if got := gjson.GetBytes(seenBody, "system.1.text").String(); got != "Keep this rule." {
-		t.Fatalf("caller system text = %q, want preserved", got)
-	}
+
 }
 
 func TestClaudeExecutor_OfficialAPIKeyClaudeCodeCLIFingerprintIncludesDiagnostics(t *testing.T) {
@@ -1529,8 +1546,12 @@ func TestClaudeExecutor_GlobalDisableClaudeCloakModePreservesConfirmedCallerIden
 	if got := gjson.GetBytes(seenBody, "system.1.text").String(); got != claudeCodeCLIIdentity {
 		t.Fatalf("system.1.text = %q, want preserved caller CLI identity", got)
 	}
-	if got := gjson.GetBytes(seenBody, "metadata.user_id").String(); got != userID {
-		t.Fatalf("metadata.user_id = %q, want preserved %q", got, userID)
+	wantUserID, errID := sjson.Set(userID, "device_id", helps.SyntheticDeviceID(cfg.AuthDir, auth, "sk-ant-api03-global-disable-passthrough"))
+	if errID != nil {
+		t.Fatal(errID)
+	}
+	if got := gjson.GetBytes(seenBody, "metadata.user_id").String(); got != wantUserID {
+		t.Fatalf("metadata.user_id = %q, want preserved %q", got, wantUserID)
 	}
 	if got := claudeFingerprintHeaderValue(seenHeaders, "X-App"); got != "cli" {
 		t.Fatalf("X-App = %q, want preserved cli", got)
