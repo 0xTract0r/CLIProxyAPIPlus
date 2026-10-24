@@ -62,6 +62,8 @@ func newCodexWebsocketHintServer(t *testing.T, rec *codexWebsocketHintRecorder) 
 	}))
 }
 
+// Fork Fast is opt-in per account/model; these routing tests leave it off.
+// An explicit client/payload priority is therefore default in the final body.
 // Native Codex sends the routing hint only in the websocket handshake and keeps
 // an open connection when the tier changes. The gateway mirrors that: an
 // incremental request that turns on Fast continues on the same socket with the
@@ -96,14 +98,14 @@ func TestCodexWebsocketsFastToggleKeepsIncrementalConnection(t *testing.T) {
 
 	rec.mu.Lock()
 	defer rec.mu.Unlock()
-	wantHandshakes := []string{"model=gpt-5.5", "model=gpt-5.5;tier=priority"}
+	wantHandshakes := []string{"model=gpt-5.5", "model=gpt-5.5;tier=default"}
 	if len(rec.handshakes) != len(wantHandshakes) || rec.handshakes[0] != wantHandshakes[0] || rec.handshakes[1] != wantHandshakes[1] {
 		t.Fatalf("handshakes = %q, want %q", rec.handshakes, wantHandshakes)
 	}
 	wantFrames := []codexWebsocketHintFrame{
 		{conn: 0, model: "gpt-5.5"},
-		{conn: 0, model: "gpt-5.5", tier: "priority", previousResponseID: "resp-1"},
-		{conn: 1, model: "gpt-5.5", tier: "priority"},
+		{conn: 0, model: "gpt-5.5", tier: "default", previousResponseID: "resp-1"},
+		{conn: 1, model: "gpt-5.5", tier: "default"},
 	}
 	if len(rec.frames) != len(wantFrames) {
 		t.Fatalf("frames = %+v, want %+v", rec.frames, wantFrames)
@@ -125,7 +127,7 @@ func TestCodexWebsocketsRoutingHintDynamicOperatorRule(t *testing.T) {
 		operatorHint string
 		want         string
 	}{
-		{name: "missing reference falls back to derived hint", want: "model=gpt-5.5;tier=priority"},
+		{name: "missing reference falls back to derived hint", want: "model=gpt-5.5;tier=default"},
 		{name: "resolved reference wins", operatorHint: "model=operator-dynamic", want: "model=operator-dynamic"},
 	}
 	for _, tc := range cases {
@@ -203,11 +205,11 @@ func TestCodexWebsocketsRoutingHintOverridesForwardedClientHint(t *testing.T) {
 
 	rec.mu.Lock()
 	defer rec.mu.Unlock()
-	if len(rec.handshakes) != 1 || rec.handshakes[0] != "model=gpt-5.5;tier=priority" {
-		t.Fatalf("handshakes = %q, want [\"model=gpt-5.5;tier=priority\"]", rec.handshakes)
+	if len(rec.handshakes) != 1 || rec.handshakes[0] != "model=gpt-5.5;tier=default" {
+		t.Fatalf("handshakes = %q, want [\"model=gpt-5.5;tier=default\"]", rec.handshakes)
 	}
-	if len(rec.frames) != 1 || rec.frames[0].model != "gpt-5.5" || rec.frames[0].tier != "priority" {
-		t.Fatalf("frames = %+v, want one frame with model=gpt-5.5 and service_tier=priority", rec.frames)
+	if len(rec.frames) != 1 || rec.frames[0].model != "gpt-5.5" || rec.frames[0].tier != "default" {
+		t.Fatalf("frames = %+v, want one frame with model=gpt-5.5 and service_tier=default", rec.frames)
 	}
 	if rec.handshakes[0] != "model="+rec.frames[0].model+";tier="+rec.frames[0].tier {
 		t.Fatalf("handshake hint = %q, does not match frame %+v", rec.handshakes[0], rec.frames[0])
@@ -240,10 +242,39 @@ func TestCodexWebsocketsStreamRoutingHintMatchesBodyModel(t *testing.T) {
 	if len(rec.handshakes) != 1 || len(rec.frames) != 1 {
 		t.Fatalf("handshakes = %q, frames = %+v, want one each", rec.handshakes, rec.frames)
 	}
-	if rec.frames[0].model != "gpt-5.5" || rec.frames[0].tier != "priority" {
-		t.Fatalf("frame = %+v, want model=gpt-5.5 and service_tier=priority", rec.frames[0])
+	if rec.frames[0].model != "gpt-5.5" || rec.frames[0].tier != "default" {
+		t.Fatalf("frame = %+v, want model=gpt-5.5 and service_tier=default", rec.frames[0])
 	}
 	if rec.handshakes[0] != "model="+rec.frames[0].model+";tier="+rec.frames[0].tier {
 		t.Fatalf("handshake hint = %q, does not match frame %+v", rec.handshakes[0], rec.frames[0])
+	}
+}
+
+// F codexFastEnabled + applyCodexServiceTierPolicy are the oracle: caller tier
+// cannot grant another account/model premium access. No Fast prewarm is needed
+// to verify this authority boundary; the four roots exercise actual wire routing.
+func TestRoutingHint343ForkAccountModelPolicy(t *testing.T) {
+	for _, tc := range []struct{ name, allow, model, want string }{
+		{"default-cannot-escalate", "", "gpt-5.5", "default"},
+		{"different-model-not-authorized", "gpt-5.4", "gpt-5.5", "default"},
+		{"explicit-target-model", "gpt-5.5", "gpt-5.5", "priority"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := codexOAuthTestAuth("http://127.0.0.1")
+			a.ID = "343-" + tc.name
+			if tc.allow != "" {
+				a.Attributes["fast_models"] = tc.allow
+			}
+			enabled := codexFastEnabled(a, tc.model)
+			body := applyCodexServiceTierPolicy([]byte(`{"model":"gpt-5.5","service_tier":"priority"}`), enabled)
+			if got := gjson.GetBytes(body, "service_tier").String(); got != tc.want {
+				t.Fatalf("account/model policy=%q want=%q", got, tc.want)
+			}
+			other := codexOAuthTestAuth("http://127.0.0.1")
+			other.ID = "343-other"
+			if codexFastEnabled(other, tc.model) {
+				t.Fatal("Fast authorization leaked to other account")
+			}
+		})
 	}
 }
