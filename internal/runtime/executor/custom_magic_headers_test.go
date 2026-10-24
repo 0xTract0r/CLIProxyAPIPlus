@@ -92,7 +92,7 @@ func TestOpenAICompatExecutor_UserAgentPassthroughAndDefault(t *testing.T) {
 	executor := NewOpenAICompatExecutor("openai-compatibility", &config.Config{
 		OpenAICompatibility: []config.OpenAICompatibility{{Name: "compat"}},
 	})
-	baseAuth := &cliproxyauth.Auth{
+	baseAuth := &cliproxyauth.Auth{ProxyURL: "direct",
 		Provider: "openai-compatibility",
 		Attributes: map[string]string{
 			"base_url": server.URL,
@@ -183,7 +183,7 @@ func TestOpenAICompatExecutor_UserAgentPassthroughAndDefault(t *testing.T) {
 
 	t.Run("configured header:User-Agent overrides downstream User-Agent", func(t *testing.T) {
 		gotUserAgent = ""
-		overrideAuth := &cliproxyauth.Auth{
+		overrideAuth := &cliproxyauth.Auth{ProxyURL: "direct",
 			Provider: "openai-compatibility",
 			Attributes: map[string]string{
 				"base_url":          server.URL,
@@ -829,7 +829,7 @@ func TestCustomMagicHeaders_CPASessionID_SessionAffinityOnAndOff(t *testing.T) {
 			}
 
 			executor := NewOpenAICompatExecutor("openai-compatibility", cfg)
-			auth := &cliproxyauth.Auth{
+			auth := &cliproxyauth.Auth{ProxyURL: "direct",
 				ID:       "auth-compat-1",
 				Provider: "openai-compatibility",
 				Attributes: map[string]string{

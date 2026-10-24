@@ -57,9 +57,11 @@ func TestCodexExecutorClaudeStandaloneEffortFinalPayload(t *testing.T) {
 					Model:   "gpt-6.1-sol",
 					Payload: []byte(`{"model":"gpt-6.1-sol","max_tokens":256,"messages":[{"role":"user","content":"Reply exactly OK."}],"output_config":{"effort":"high"}}`),
 				}
+				auth := codexOAuthTestAuth(server.URL)
+				auth.ProxyURL = "direct"
 				opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatClaude, Stream: stream}
 				if stream {
-					result, errStream := executor.ExecuteStream(context.Background(), codexOAuthTestAuth(server.URL), req, opts)
+					result, errStream := executor.ExecuteStream(context.Background(), auth, req, opts)
 					if errStream != nil {
 						t.Fatalf("ExecuteStream: %v", errStream)
 					}
@@ -68,7 +70,7 @@ func TestCodexExecutorClaudeStandaloneEffortFinalPayload(t *testing.T) {
 							t.Fatalf("stream chunk: %v", chunk.Err)
 						}
 					}
-				} else if _, errExecute := executor.Execute(context.Background(), codexOAuthTestAuth(server.URL), req, opts); errExecute != nil {
+				} else if _, errExecute := executor.Execute(context.Background(), auth, req, opts); errExecute != nil {
 					t.Fatalf("Execute: %v", errExecute)
 				}
 				body := <-bodies

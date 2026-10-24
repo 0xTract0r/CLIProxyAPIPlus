@@ -348,6 +348,7 @@ func TestGeminiVertexExecutorClaudeStreamTruncationReportsError(t *testing.T) {
 			ctx := context.Background()
 			auth := &cliproxyauth.Auth{Provider: "vertex"}
 			if authMode == "api_key" {
+				auth.ProxyURL = "direct"
 				auth.Attributes = map[string]string{
 					"api_key":  "test-vertex-key",
 					"base_url": server.URL,
@@ -577,7 +578,7 @@ func TestGeminiAndVertexClaudeStreamWithFinishSignalCompletes(t *testing.T) {
 			defer server.Close()
 
 			exec := NewGeminiExecutor(&config.Config{})
-			auth := &cliproxyauth.Auth{
+			auth := &cliproxyauth.Auth{ProxyURL: "direct",
 				Provider: "gemini",
 				Attributes: map[string]string{
 					"api_key":  "test-gemini-key",
@@ -615,7 +616,7 @@ func TestGeminiAndVertexClaudeStreamWithFinishSignalCompletes(t *testing.T) {
 			defer server.Close()
 
 			exec := NewGeminiVertexExecutor(&config.Config{})
-			auth := &cliproxyauth.Auth{
+			auth := &cliproxyauth.Auth{ProxyURL: "direct",
 				Provider: "vertex",
 				Attributes: map[string]string{
 					"api_key":  "test-vertex-key",

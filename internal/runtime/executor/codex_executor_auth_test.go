@@ -655,7 +655,7 @@ func TestCodexExecutorUseSIWCExecuteAndStream(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID:       "codex-siwc-req",
 		Provider: "codex",
 		Attributes: map[string]string{
@@ -1006,7 +1006,7 @@ func TestCodexExecutorUseSIWCImageRequestsRouteThroughResponsesSSE(t *testing.T)
 	defer srv.Close()
 
 	executor := NewCodexExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID:       "codex-siwc-img",
 		Provider: "codex",
 		Attributes: map[string]string{
@@ -1346,7 +1346,7 @@ func TestCodexExecutorCodexClientIgnoresUseSIWC(t *testing.T) {
 			}))
 			defer upstream.Close()
 
-			auth := &cliproxyauth.Auth{
+			auth := &cliproxyauth.Auth{ProxyURL: "direct",
 				ID:       "codex-siwc-client-check",
 				Provider: "codex",
 				Attributes: map[string]string{

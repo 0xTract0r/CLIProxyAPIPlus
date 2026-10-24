@@ -957,7 +957,7 @@ func TestClaudeExecutor_ConfirmedClaudeCodeWithoutCacheControlPreservesContent(t
 				"X-Claude-Code-Session-Id": {sessionID},
 			}
 			executor := NewClaudeExecutor(&config.Config{})
-			auth := &cliproxyauth.Auth{Attributes: map[string]string{
+			auth := &cliproxyauth.Auth{ProxyURL: "direct", Attributes: map[string]string{
 				"api_key":  "key-confirmed-markerless",
 				"base_url": server.URL,
 			}}
@@ -2019,7 +2019,7 @@ func TestClaudeExecutor_ExecuteStripsInvalidBase64ThinkingBeforeUpstream(t *test
 	defer server.Close()
 
 	executor := NewClaudeExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", Attributes: map[string]string{
 		"api_key":  "key-123",
 		"base_url": server.URL,
 	}}
@@ -3262,7 +3262,7 @@ func TestClaudeExecutor_ExecutePayloadStreamOverrideDoesNotChangeResponseParser(
 				attributes["header:Accept"] = "application/json"
 				attributes["header:Accept-Encoding"] = "gzip, deflate, br, zstd"
 			}
-			auth := &cliproxyauth.Auth{Attributes: attributes}
+			auth := &cliproxyauth.Auth{ProxyURL: "direct", Attributes: attributes}
 			payload := []byte(`{"model":"claude-3-5-sonnet-20241022","stream":false,"messages":[{"role":"user","content":"hi"}]}`)
 
 			_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
@@ -3718,7 +3718,7 @@ func testClaudeExecutorInvalidCompressedErrorBody(
 	defer server.Close()
 
 	executor := NewClaudeExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", Attributes: map[string]string{
 		"api_key":  "key-123",
 		"base_url": server.URL,
 	}}
@@ -5584,7 +5584,7 @@ func TestClaudeExecutor_CustomBaseURLOAuthGeneratesMissingCCH(t *testing.T) {
 	defer server.Close()
 
 	executor := NewClaudeExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		Attributes: map[string]string{
 			"api_key":    "sk-ant-oat-custom-cch",
 			"base_url":   server.URL,
@@ -9704,7 +9704,7 @@ func TestClaudeExecutor_CacheTTLIsPairedWithExtendedCacheTTLBeta(t *testing.T) {
 			defer server.Close()
 
 			executor := NewClaudeExecutor(&config.Config{})
-			auth := &cliproxyauth.Auth{
+			auth := &cliproxyauth.Auth{ProxyURL: "direct",
 				ID: "cache-ttl-pairing",
 				Attributes: map[string]string{
 					"api_key":    test.apiKey,
@@ -9803,7 +9803,7 @@ func TestClaudeExecutor_PreservesNativeAgentAndEnvironmentHeaders(t *testing.T) 
 			defer server.Close()
 
 			executor := NewClaudeExecutor(&config.Config{})
-			auth := &cliproxyauth.Auth{
+			auth := &cliproxyauth.Auth{ProxyURL: "direct",
 				ID: "agent-header-test",
 				Attributes: map[string]string{
 					"api_key":    "sk-ant-test-key",
@@ -10320,7 +10320,7 @@ func runClaudeExecutorCapture(t *testing.T, cfg *config.Config, cloakMode string
 		attrs["cloak_mode"] = cloakMode
 	}
 	executor := NewClaudeExecutor(cfg)
-	auth := &cliproxyauth.Auth{Attributes: attrs}
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", Attributes: attrs}
 	req := cliproxyexecutor.Request{Model: model, Payload: payload}
 	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatClaude}
 	if stream {
