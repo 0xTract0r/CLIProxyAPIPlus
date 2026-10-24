@@ -332,8 +332,7 @@ func (e *ClaudeExecutor) countTokensUpstream(ctx context.Context, auth *cliproxy
 		body = alignClaudeCloakedBillingBuild(body, version)
 		if legacyCCH != "" {
 			if offset, found := claudeBillingCCHDigitsOffset(body); found {
-				body = bytes.Clone(body)
-				copy(body[offset:offset+5], legacyCCH)
+				body = bytes.Join([][]byte{body[:offset], []byte(legacyCCH), body[offset+5:]}, nil)
 			}
 		}
 		_ = httpReq.Body.Close()
