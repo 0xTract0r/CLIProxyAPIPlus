@@ -277,7 +277,12 @@ func claudeBillingFingerprintMessageText(payload []byte) string {
 	return ""
 }
 
-func claudeCCHFallbackBillingHeader(ctx context.Context, cfg *config.Config, payload []byte, entrypoint string) string {
+func claudeCCHFallbackBillingHeader(ctx context.Context, cfg *config.Config, payload []byte, entrypoint string, resolvedVersions ...string) string {
+	// Serving 已解析账号/请求指纹；不能在补 billing 时重新退回全局默认版本。
+	version := helps.DefaultClaudeVersion(cfg)
+	if len(resolvedVersions) > 0 && strings.TrimSpace(resolvedVersions[0]) != "" {
+		version = strings.TrimSpace(resolvedVersions[0])
+	}
 	isProbeOrHelper := helps.IsClaudeProbeOrHelperRequest(payload)
 	prevReq, promptID := helps.ExtractClaudeBillingTags(payload)
 	if !isProbeOrHelper {
@@ -293,7 +298,7 @@ func claudeCCHFallbackBillingHeader(ctx context.Context, cfg *config.Config, pay
 	isSubagent := helps.IsClaudeSubagentRequest(incomingHeaders, payload)
 	return generateBillingHeader(
 		true,
-		helps.DefaultClaudeVersion(cfg),
+		version,
 		claudeBillingFingerprintMessageText(payload),
 		entrypoint,
 		getWorkloadFromContext(ctx),
