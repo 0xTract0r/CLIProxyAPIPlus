@@ -17,10 +17,11 @@ import (
 
 type captureClaudeUsagePlugin struct {
 	records chan usage.Record
+	authID  string
 }
 
 func (p *captureClaudeUsagePlugin) HandleUsage(_ context.Context, record usage.Record) {
-	if p == nil || record.Provider != "claude" {
+	if p == nil || record.Provider != "claude" || (p.authID != "" && record.AuthID != p.authID) {
 		return
 	}
 	select {
@@ -69,6 +70,7 @@ func TestClaudeExecutor_ExecuteStream_Translated_ClientDisconnectAfterTerminalEv
 	pluginName := "test-claude-translated-disconnect"
 	plugin := &captureClaudeUsagePlugin{
 		records: make(chan usage.Record, 4),
+		authID:  "claude-terminal-translated-300",
 	}
 	usage.RegisterNamedPlugin(pluginName, plugin)
 	t.Cleanup(func() {
@@ -76,7 +78,7 @@ func TestClaudeExecutor_ExecuteStream_Translated_ClientDisconnectAfterTerminalEv
 	})
 
 	exec := NewClaudeExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{ProxyURL: "direct",
+	auth := &cliproxyauth.Auth{ID: "claude-terminal-translated-300", ProxyURL: "direct",
 		Attributes: map[string]string{
 			"api_key":  "key-123",
 			"base_url": server.URL,
