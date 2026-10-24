@@ -213,9 +213,11 @@ func TestClaudeExecutor_NativeToolSearchCountTokensLocalFallback(t *testing.T) {
 	payload := []byte(nativeToolSearchResponsesPayload)
 	stripped := helps.StripResponsesToolSearch(append([]byte(nil), payload...))
 	auth := nativeToolSearchAuth(map[string]string{"base_url": nativeToolSearchGateway})
+	cfg := &config.Config{}
+	cfg.Claude.LocalTokenCount = true // 本用例验证显式本地估算，不改变默认上游合同。
 	count := func(body []byte) string {
 		t.Helper()
-		resp, err := NewClaudeExecutor(&config.Config{}).CountTokens(context.Background(), auth, cliproxyexecutor.Request{Model: "claude-sonnet-4-5", Payload: body},
+		resp, err := NewClaudeExecutor(cfg).CountTokens(context.Background(), auth, cliproxyexecutor.Request{Model: "claude-sonnet-4-5", Payload: body},
 			cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse})
 		if err != nil {
 			t.Fatalf("CountTokens: %v", err)

@@ -98,6 +98,7 @@ func runClaudeWebSearchScenario(t *testing.T, cfg *config.Config, stream bool, r
 		auth := defaultAuth
 		if run.auth != nil {
 			cloned := run.auth.Clone()
+			cloned.ProxyURL = "direct" // fixture只访问本测试loopback，不改变凭据缓存identity。
 			if cloned.Attributes == nil {
 				cloned.Attributes = make(map[string]string)
 			}
@@ -282,8 +283,12 @@ func TestClaudeExecutor_CountTokensRestoresWebSearchResultsWhenEnabled(t *testin
 	defer server.Close()
 
 	auth := &cliproxyauth.Auth{ProxyURL: "direct", Attributes: map[string]string{"api_key": "key-web-search", "base_url": server.URL}}
-	enabledExec := NewClaudeExecutor(enabledClaudeWebSearchCacheConfig())
-	disabledExec := NewClaudeExecutor(&config.Config{})
+	enabledCfg := enabledClaudeWebSearchCacheConfig()
+	enabledCfg.Claude.LocalTokenCount = true
+	disabledCfg := &config.Config{}
+	disabledCfg.Claude.LocalTokenCount = true
+	enabledExec := NewClaudeExecutor(enabledCfg)
+	disabledExec := NewClaudeExecutor(disabledCfg)
 
 	firstPayload := []byte(`{"model":"claude-opus-5-5","stream":false,"input":[` + claudeWebSearchExecutorUser + `]}`)
 	firstReq := cliproxyexecutor.Request{Model: "claude-opus-5-5", Payload: firstPayload}

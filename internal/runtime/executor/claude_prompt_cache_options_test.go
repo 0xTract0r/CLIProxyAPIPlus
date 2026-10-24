@@ -1004,9 +1004,11 @@ func TestClaudeExecutor_CountTokensUpstream_OAuthRelocatesAffectedSystemPrompts(
 			defer server.Close()
 
 			auth := &cliproxyauth.Auth{
+				ProxyURL: "direct",
 				Attributes: map[string]string{
-					"api_key":  "sk-ant-oat-count-tokens",
-					"base_url": server.URL,
+					"api_key":                      "sk-ant-oat-count-tokens",
+					"cloak_preserve_caller_system": "true",
+					"base_url":                     server.URL,
 				},
 				Metadata: claudeOAuthTestMetadata(),
 			}
@@ -1025,8 +1027,14 @@ func TestClaudeExecutor_CountTokensUpstream_OAuthRelocatesAffectedSystemPrompts(
 			if len(resp.Payload) == 0 {
 				t.Fatal("expected non-empty countTokensUpstream payload")
 			}
-			if gjson.GetBytes(seenBody, "system").Exists() {
-				t.Fatalf("OAuth caller system prompt must not remain top-level: %s", seenBody)
+			// 显式保留caller guidance；F billing/CC仍拥有top-level system，U迁移合同只约束caller内容。
+			topSystem := []byte(gjson.GetBytes(seenBody, "system").Raw)
+			if bytes.Contains(topSystem, []byte("caller guidance")) {
+				t.Fatalf("OAuth caller guidance must not remain in top-level system: %s", seenBody)
+			}
+			if !bytes.Contains(topSystem, []byte("x-anthropic-billing-header:")) ||
+				!bytes.Contains(topSystem, []byte("You are Claude Code, Anthropic's official CLI for Claude.")) {
+				t.Fatalf("fork billing/Claude Code system blocks must remain present: %s", seenBody)
 			}
 			if got := gjson.GetBytes(seenBody, "messages.#").Int(); got != test.wantMessages {
 				t.Fatalf("message count = %d, want %d: %s", got, test.wantMessages, seenBody)
