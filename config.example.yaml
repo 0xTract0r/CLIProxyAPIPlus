@@ -741,8 +741,8 @@ upstream:
 #           native-tool-search: false # optional: default is false; when true, trust this key's custom base-url with Anthropic native tool search (defer_loading + tool_reference) for Codex tool_search; requires upstream.claude.tool-search: true
 #           cloak:                         # optional: explicitly enable request cloaking for non-Claude-Code clients
 #             mode: "auto"                 # "auto" (default inside this block): cloak only when client is not Claude Code
-#                                          # "always": cloak every unconfirmed client; confirmed native Claude Code still passes through
-#                                          # "never" / "uncloak": never apply cloaking; on non-CLI API keys, also strip incoming Claude Code identity/billing attribution
+#                                          # "always": cloak every caller, including native Claude Code
+#                                          # "never": skip body cloaking while keeping account identity; "uncloak": explicit non-CLI API-key caller ownership
 #             # This "cloak" block applies to this api-keys.claude key entry only. For Claude OAuth
 #             # credentials, set the same options in the auth/token JSON file via "cloak_mode" /
 #             # "cloak_strict_mode" / "cloak_sensitive_words" / "cloak_cache_user_id".
@@ -753,6 +753,13 @@ upstream:
 #             sensitive-words:             # optional: words to obfuscate with zero-width characters
 #               - "API"
 #               - "proxy"
+#             preserve-caller-system: false # optional: default OAuth cloaking replaces caller system with a neutral reminder.
+#                                          # true retains caller tasks through the existing model-specific relocation and MCP alias path.
+#                                          # strict-mode and farm credentials always override this option; device/account identity is unchanged.
+#                                          # OAuth auth JSON uses operator string "cloak_preserve_caller_system": "true" (or "false").
+#                                          # Explicit configured false overrides the credential flag. Management PUT omission keeps it;
+#                                          # explicit false disables, field null (or cloak:null) clears this override. Reordering is identity-based.
+#                                          # Older binaries ignore this option and return to the F neutral reminder; they cannot preserve the new capability.
 #             cache-user-id: true          # optional: default is false; set true to reuse cached user_id per API key instead of generating a random one each request
 #             # Every custom tool on a cloaked OAuth request automatically uses a caller-stable opaque mcp__<server>__<tool> alias.
 #

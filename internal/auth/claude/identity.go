@@ -284,3 +284,18 @@ func ValidDeviceID(value string) bool {
 	decoded, errDecode := hex.DecodeString(value)
 	return errDecode == nil && len(decoded) == claudeDeviceIDByteSize
 }
+
+// SnapshotMetadata copies the top-level metadata under the credential lock.
+// Nested values remain read-only; scalar classification must use this snapshot.
+func SnapshotMetadata(metadata *map[string]any) map[string]any {
+	if metadata == nil {
+		return nil
+	}
+	claudeDevicePoolMu.Lock()
+	defer claudeDevicePoolMu.Unlock()
+	snapshot := make(map[string]any, len(*metadata))
+	for key, value := range *metadata {
+		snapshot[key] = value
+	}
+	return snapshot
+}

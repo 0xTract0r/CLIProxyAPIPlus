@@ -246,7 +246,7 @@ func (e *ClaudeExecutor) countTokensUpstream(ctx context.Context, auth *cliproxy
 				}
 			}
 			if !strings.HasPrefix(baseModel, "claude-3-5-haiku") {
-				if policy.OAuth && !settings.strictMode {
+				if policy.OAuth && !settings.strictMode && !settings.preserveCallerSystem {
 					body = neutralizeClaudeOAuthCallerSystem(body)
 				}
 				body = relocateClaudeSystemPromptForCountTokensWithPolicy(body, settings.strictMode, explicitCacheMode, !policy.OAuth)

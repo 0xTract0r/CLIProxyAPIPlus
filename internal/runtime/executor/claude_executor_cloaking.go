@@ -1637,9 +1637,10 @@ type claudeWirePolicy struct {
 }
 
 type claudeCloakSettings struct {
-	strictMode     bool
-	sensitiveWords []string
-	cacheUserID    bool
+	preserveCallerSystem bool
+	strictMode           bool
+	sensitiveWords       []string
+	cacheUserID          bool
 }
 
 func isClaudeCodeIdentitySystemText(text string) bool {
@@ -1727,8 +1728,13 @@ func uncloakClaudeCodePayload(payload []byte, confirmedClaudeCode bool) []byte {
 }
 
 func resolveClaudeWirePolicy(cfg *config.Config, auth *cliproxyauth.Auth, apiKey string, confirmedClaudeCode bool, clientUserAgents ...string) (claudeWirePolicy, claudeCloakSettings) {
-	if auth != nil && auth.AuthKind() == cliproxyauth.AuthKindAPIKey {
-		cfg = cfg.ForAPIKey()
+	var metadataSnapshot map[string]any
+	if auth != nil {
+		metadataSnapshot = claudeauth.SnapshotMetadata(&auth.Metadata)
+		classification := &cliproxyauth.Auth{Attributes: auth.Attributes, Metadata: metadataSnapshot}
+		if classification.AuthKind() == cliproxyauth.AuthKindAPIKey {
+			cfg = cfg.ForAPIKey()
+		}
 	}
 	cloakCfg := resolveClaudeKeyCloakConfig(cfg, auth)
 	attrMode, attrStrict, attrWords, attrCache := getCloakConfigFromAuth(auth)
@@ -1762,6 +1768,28 @@ func resolveClaudeWirePolicy(cfg *config.Config, auth *cliproxyauth.Auth, apiKey
 		}
 	}
 
+	// Only trusted operator configuration can enable preservation. Never inspect
+	// request headers/body for this setting; farm and strict remain authoritative.
+	if auth != nil {
+		value := strings.TrimSpace(auth.Attributes["cloak_preserve_caller_system"])
+		if value == "" {
+			stored, _ := metadataSnapshot["cloak_preserve_caller_system"].(string)
+			value = strings.TrimSpace(stored)
+		}
+		settings.preserveCallerSystem = strings.EqualFold(value, "true")
+	}
+	if cloakCfg != nil && cloakCfg.PreserveCallerSystem != nil {
+		settings.preserveCallerSystem = *cloakCfg.PreserveCallerSystem
+	}
+	if auth != nil {
+		farmSnapshot := &cliproxyauth.Auth{Metadata: map[string]any{cliproxyauth.FarmEnrolledMetadataKey: metadataSnapshot[cliproxyauth.FarmEnrolledMetadataKey]}}
+		if cliproxyauth.AuthFarmEnrolled(farmSnapshot) || cliproxyauth.IsValidClaudeDeviceID(strings.TrimSpace(auth.Attributes[cliproxyauth.ClaudeDeviceIDAttributeKey])) {
+			settings.preserveCallerSystem = false
+		}
+	}
+	if settings.strictMode {
+		settings.preserveCallerSystem = false
+	}
 	fp := resolveClaudeFingerprintPolicy(cfg, auth, apiKey)
 	trimmedMode := strings.ToLower(strings.TrimSpace(cloakMode))
 	userAgent := ""
@@ -1871,7 +1899,7 @@ func applyCloakingWithDeviceIdentityPolicy(
 		}
 	}
 
-	if policy.OAuth && !settings.strictMode && !strings.HasPrefix(gjson.GetBytes(payload, "model").String(), "claude-3-5-haiku") {
+	if policy.OAuth && !settings.strictMode && !settings.preserveCallerSystem && !strings.HasPrefix(gjson.GetBytes(payload, "model").String(), "claude-3-5-haiku") {
 		payload = neutralizeClaudeOAuthCallerSystem(payload)
 	}
 	billingVersion := resolveClaudeBillingVersion(ctx, cfg, auth, apiKey)

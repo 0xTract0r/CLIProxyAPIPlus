@@ -2591,8 +2591,9 @@ func TestClaudeExecutor_LegacySystemReminderAcrossMessagesAndStream(t *testing.T
 	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID: "oauth-legacy-reminder-paths",
 		Attributes: map[string]string{
-			"api_key":  "sk-ant-oat-legacy-reminder-paths",
-			"base_url": server.URL,
+			"cloak_preserve_caller_system": "true",
+			"api_key":                      "sk-ant-oat-legacy-reminder-paths",
+			"base_url":                     server.URL,
 		},
 		Metadata: map[string]any{
 			"account_uuid": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
@@ -2805,8 +2806,9 @@ func TestClaudeExecutor_CountTokensCloakRelocatesCallerSystemAndObfuscates(t *te
 			})
 			ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", http.RoundTripper(transport))
 			auth := &cliproxyauth.Auth{Attributes: map[string]string{
-				"api_key":               "sk-ant-oat-count-relocate",
-				"cloak_sensitive_words": sensitiveWord,
+				"cloak_preserve_caller_system": "true",
+				"api_key":                      "sk-ant-oat-count-relocate",
+				"cloak_sensitive_words":        sensitiveWord,
 			}}
 			payload := []byte(`{"model":"` + testCase.model + `","system":[{"type":"text","text":"` + callerSystem + `"}],` +
 				`"messages":[{"role":"user","content":[{"type":"text","text":"hello"}]},` +
@@ -8375,12 +8377,13 @@ func TestClaudeExecutor_ExecuteOAuthCustomToolMCPAliasRoundTrip(t *testing.T) {
 	}))
 	defer server.Close()
 
-	executor := NewClaudeExecutor(&config.Config{})
+	executor := NewClaudeExecutor(claudeBeta280Config375())
 	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID: "oauth-mcp-round-trip",
 		Attributes: map[string]string{
-			"api_key":  "sk-ant-oat-mcp-round-trip",
-			"base_url": server.URL,
+			"cloak_preserve_caller_system": "true",
+			"api_key":                      "sk-ant-oat-mcp-round-trip",
+			"base_url":                     server.URL,
 		},
 		Metadata: claudeOAuthTestMetadata(),
 	}
@@ -8424,6 +8427,7 @@ func TestClaudeExecutor_ExecuteOAuthCustomToolMCPAliasRoundTrip(t *testing.T) {
 		t.Fatalf("Messages count = %d, want user and relocated system turns", got)
 	}
 	assertClaudeMidConversationSystemMessage(t, upstreamBody, 1, "messages-system-prompt", "1h")
+	assertPreserve425FinalCCH(t, upstreamBody)
 }
 
 func TestClaudeExecutor_ExecuteStreamOAuthCustomToolMCPAliasRoundTrip(t *testing.T) {
@@ -8443,12 +8447,15 @@ func TestClaudeExecutor_ExecuteStreamOAuthCustomToolMCPAliasRoundTrip(t *testing
 	deviceIDs := []string{
 		"0000000000000000000000000000000000000000000000000000000000000000",
 	}
-	executor := NewClaudeExecutor(&config.Config{})
+	cfg := claudeBeta280Config375()
+	expectedDevice := configure425SyntheticDevice(t, cfg, "oauth-mcp-stream-round-trip")
+	executor := NewClaudeExecutor(cfg)
 	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID: "oauth-mcp-stream-round-trip",
 		Attributes: map[string]string{
-			"api_key":  "sk-ant-oat-mcp-stream-round-trip",
-			"base_url": server.URL,
+			"cloak_preserve_caller_system": "true",
+			"api_key":                      "sk-ant-oat-mcp-stream-round-trip",
+			"base_url":                     server.URL,
 		},
 		Metadata: map[string]any{
 			"account_uuid":                        "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
@@ -8504,13 +8511,14 @@ func TestClaudeExecutor_ExecuteStreamOAuthCustomToolMCPAliasRoundTrip(t *testing
 		t.Fatalf("streaming message count = %d, want user and relocated system turns", got)
 	}
 	assertClaudeMidConversationSystemMessage(t, upstreamBody, 1, "stream-system-prompt", "1h")
-	assertClaudeCredentialIdentity(t, upstreamBody, upstreamHeaders, deviceIDs, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+	assertClaudeCredentialIdentity(t, upstreamBody, upstreamHeaders, []string{expectedDevice}, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 	if !strings.Contains(downstream.String(), `"name":"fetch_url"`) {
 		t.Fatalf("downstream stream did not restore fetch_url: %s", downstream.String())
 	}
 	if strings.Contains(downstream.String(), upstreamAlias) {
 		t.Fatalf("downstream leaked upstream alias %q: %s", upstreamAlias, downstream.String())
 	}
+	assertPreserve425FinalCCH(t, upstreamBody)
 }
 
 func TestPrependClaudeSystemReminders_FollowsToolResultsAndIsIdempotent(t *testing.T) {

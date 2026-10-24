@@ -684,9 +684,10 @@ type PayloadModelRule struct {
 type CloakConfig struct {
 	// Mode controls cloaking behavior: "auto" (default), "always", "never", or "uncloak".
 	// Supplying this CloakConfig explicitly enables cloaking for an unprofiled API key.
-	// - "auto": cloak unless strong request signals identify a verified native entrypoint
-	// - "always": cloak every unconfirmed client; confirmed native Claude Code remains passthrough
-	// - "never" / "uncloak": never apply cloaking; on non-CLI API keys, also strip incoming Claude Code identity and billing attribution
+	// - "auto": cloak unless the caller User-Agent starts with claude-cli
+	// - "always": cloak every caller, including native Claude Code
+	// - "never": skip body cloaking; account identity still applies.
+	// - "uncloak": explicit caller ownership for non-CLI API keys.
 	Mode string `yaml:"mode,omitempty" json:"mode,omitempty"`
 
 	// StrictMode controls how caller system prompts are handled when cloaking.
@@ -701,6 +702,10 @@ type CloakConfig struct {
 	// CacheUserID controls whether Claude user_id values are cached per API key.
 	// When false, a fresh random user_id is generated for every request.
 	CacheUserID *bool `yaml:"cache-user-id,omitempty" json:"cache-user-id,omitempty"`
+
+	// PreserveCallerSystem explicitly retains caller task guidance during non-strict
+	// OAuth/CLI-profile cloaking. Nil defaults to false; farm credentials ignore it.
+	PreserveCallerSystem *bool `yaml:"preserve-caller-system,omitempty" json:"preserve-caller-system,omitempty"`
 }
 
 // ClaudeKey represents the configuration for a Claude API key,

@@ -603,6 +603,58 @@ func (h *Handler) findExistingClaudeKey(existing []config.ClaudeKey, item config
 	return nil
 }
 
+// Stable key/base identity survives routing edits. Where that pair occurs more
+// than once, use the runtime identity's prefix/proxy/normalized headers to resolve
+// exactly one predecessor. Never infer authority from array position/auth_index.
+func matchClaudePreserveSystemEntry(existing []config.ClaudeKey, item config.ClaudeKey) (int, error) {
+	candidates := make([]int, 0, 1)
+	for i := range existing {
+		if strings.TrimSpace(existing[i].APIKey) == strings.TrimSpace(item.APIKey) && strings.TrimSpace(existing[i].BaseURL) == strings.TrimSpace(item.BaseURL) {
+			candidates = append(candidates, i)
+		}
+	}
+	// Existing clients that never configured this option retain their previous
+	// mode-only update behavior. There is no option authority to inherit/reset.
+	hasOverride := false
+	for _, i := range candidates {
+		if existing[i].Cloak != nil && existing[i].Cloak.PreserveCallerSystem != nil {
+			hasOverride = true
+			break
+		}
+	}
+	if !hasOverride {
+		return -1, nil
+	}
+	if len(candidates) == 0 {
+		return -1, nil
+	}
+	if len(candidates) == 1 {
+		return candidates[0], nil
+	}
+	route := func(k config.ClaudeKey) string {
+		cfg := config.Config{ClaudeKey: []config.ClaudeKey{{Prefix: k.Prefix, ProxyURL: k.ProxyURL, Headers: k.Headers}}}
+		cfg.SanitizeClaudeKeys()
+		normalized := cfg.ClaudeKey[0]
+		// Length-safe JSON tuple, not delimiter concatenation of operator strings.
+		raw, _ := json.Marshal([]string{normalized.Prefix, strings.TrimSpace(normalized.ProxyURL), config.FormatSortedHeaders(normalized.Headers)})
+		return string(raw)
+	}
+	wanted := route(item)
+	match := -1
+	for _, i := range candidates {
+		if route(existing[i]) == wanted {
+			if match >= 0 {
+				return -1, fmt.Errorf("ambiguous credential")
+			}
+			match = i
+		}
+	}
+	if match < 0 {
+		return -1, fmt.Errorf("ambiguous credential")
+	}
+	return match, nil
+}
+
 // claude-api-key: []ClaudeKey
 func (h *Handler) GetClaudeKeys(c *gin.Context) {
 	c.JSON(200, gin.H{"claude-api-key": h.claudeKeysWithAuthIndex()})
@@ -613,20 +665,64 @@ func (h *Handler) PutClaudeKeys(c *gin.Context) {
 		c.JSON(400, gin.H{"error": "failed to read body"})
 		return
 	}
+	rawArray := data
 	var arr []config.ClaudeKey
 	if err = json.Unmarshal(data, &arr); err != nil {
 		var obj struct {
-			Items []config.ClaudeKey `json:"items"`
+			Items json.RawMessage `json:"items"`
 		}
-		if err2 := json.Unmarshal(data, &obj); err2 != nil || len(obj.Items) == 0 {
+		if err2 := json.Unmarshal(data, &obj); err2 != nil || json.Unmarshal(obj.Items, &arr) != nil || len(arr) == 0 {
 			c.JSON(400, gin.H{"error": "invalid body"})
 			return
 		}
-		arr = obj.Items
+		rawArray = obj.Items
+	}
+	var supplied []struct {
+		Cloak json.RawMessage `json:"cloak"`
+	}
+	if err := json.Unmarshal(rawArray, &supplied); err != nil || len(supplied) != len(arr) {
+		c.JSON(400, gin.H{"error": "invalid body"})
+		return
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	claimed := make(map[int]bool)
 	for i := range arr {
+		// Only omission inherits. Explicit field null (or parent null) removes
+		// this override; false remains an authoritative configured value.
+		omitted := len(supplied[i].Cloak) == 0
+		if !omitted && !bytes.Equal(bytes.TrimSpace(supplied[i].Cloak), []byte("null")) {
+			var fields map[string]json.RawMessage
+			if err := json.Unmarshal(supplied[i].Cloak, &fields); err != nil {
+				c.JSON(400, gin.H{"error": "invalid cloak"})
+				return
+			}
+			omitted = true
+			for name := range fields {
+				if strings.EqualFold(name, "preserve-caller-system") {
+					omitted = false
+					break
+				}
+			}
+		}
+		if omitted {
+			oldIndex, matchErr := matchClaudePreserveSystemEntry(h.cfg.ClaudeKey, arr[i])
+			if matchErr != nil || (oldIndex >= 0 && claimed[oldIndex]) {
+				c.JSON(400, gin.H{"error": "ambiguous Claude credential; explicitly set preserve-caller-system"})
+				return
+			}
+			if oldIndex >= 0 {
+				claimed[oldIndex] = true
+				old := h.cfg.ClaudeKey[oldIndex].Cloak
+				if old != nil && old.PreserveCallerSystem != nil {
+					if arr[i].Cloak == nil {
+						arr[i].Cloak = &config.CloakConfig{}
+					}
+					value := *old.PreserveCallerSystem
+					arr[i].Cloak.PreserveCallerSystem = &value
+				}
+			}
+		}
 		if arr[i].Cloak == nil {
 			if old := h.findExistingClaudeKey(h.cfg.ClaudeKey, arr[i]); old != nil && old.Cloak != nil && old.Cloak.Mode != "" {
 				arr[i].Cloak = &config.CloakConfig{Mode: old.Cloak.Mode}
