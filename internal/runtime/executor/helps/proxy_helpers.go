@@ -115,7 +115,17 @@ var (
 // Returns:
 //   - *http.Client: An HTTP client with configured proxy or transport
 func newProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, timeout time.Duration) (clientOut *http.Client) {
-	defer func() { clientOut = httptransport.Decorate(ctx, clientOut) }()
+	defer func() {
+		clientOut = httptransport.Decorate(ctx, clientOut)
+		// Claude 运行态传输也携带请求级握手上限；不改缓存或全局 TLS 配置。
+		if cfg != nil && cfg.TLSHandshakeTimeout() > 0 && clientOut != nil {
+			if profile := ResolveRuntimeTransportProfile(auth); profile != nil && profile.Provider == "claude" {
+				copyClient := *clientOut
+				copyClient.Transport = &tlsHandshakeTimeoutRoundTripper{base: clientOut.Transport, timeout: cfg.TLSHandshakeTimeout()}
+				clientOut = &copyClient
+			}
+		}
+	}()
 	// Priority: request override, then auth.ProxyURL, then cfg.ProxyURL.
 	proxyURL := effectiveProxyURL(ctx, cfg, auth)
 

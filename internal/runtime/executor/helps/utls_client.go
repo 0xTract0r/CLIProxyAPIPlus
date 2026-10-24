@@ -18,6 +18,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/httpwire"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/httptransport"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/proxyutil"
 	log "github.com/sirupsen/logrus"
@@ -328,6 +329,11 @@ func (t *utlsRoundTripper) dialTLSContext(ctx context.Context, network, addr str
 		return t.maybeWrapClaudeHeaderOrder(conn), nil
 	}
 
+	if strings.EqualFold(host, "api.anthropic.com") && t.customSpecID != codexRustlsClientHelloProfileID && cliproxyexecutor.IsConfiguredTLSHandshakeTimeoutError(err) {
+		atomic.AddInt64(&t.hardFailCount, 1)
+		log.Warnf("utls: configured Claude TLS handshake deadline reached for %s; retry delegated to Manager without downgrade", host)
+		return nil, err
+	}
 	fallbackHello := tls.HelloChrome_133
 	// If the configured ClientHello already IS the Chrome-like preset, there is
 	// nothing to downgrade to: return the error directly.
@@ -392,6 +398,10 @@ func (t *utlsRoundTripper) handshakeWithRetry(ctx context.Context, host, addr st
 			return conn, nil
 		}
 		lastErr = err
+		// Claude 的配置期限由 Manager 负责重试；避免每轮嵌套三次握手。
+		if strings.EqualFold(host, "api.anthropic.com") && t.customSpecID != codexRustlsClientHelloProfileID && cliproxyexecutor.IsConfiguredTLSHandshakeTimeoutError(err) {
+			return nil, err
+		}
 		// If the context is done, stop retrying: further attempts cannot help.
 		if ctx.Err() != nil {
 			return nil, lastErr

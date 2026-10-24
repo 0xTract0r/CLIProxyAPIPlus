@@ -57,10 +57,12 @@ func claudeNativeHelperHeaders(betas, compression string) http.Header {
 
 func claudeNativeHelperOAuthAuth(baseURL string) *cliproxyauth.Auth {
 	return &cliproxyauth.Auth{
-		ID: "native-helper-oauth",
+		ID:       "native-helper-oauth",
+		ProxyURL: "direct",
 		Attributes: map[string]string{
-			"api_key":  "sk-ant-oat-native-helper",
-			"base_url": baseURL,
+			"api_key":    "sk-ant-oat-native-helper",
+			"base_url":   baseURL,
+			"cloak_mode": "never",
 		},
 		Metadata: claudeOAuthTestMetadata(),
 	}
@@ -74,7 +76,7 @@ func TestApplyClaudeHeadersPreservesCallerAsyncWithoutFingerprintOptIn(t *testin
 		wantAsync string
 	}{
 		{name: "confirmed native", confirmed: true, wantAsync: "async"},
-		{name: "unconfirmed caller default", wantAsync: "async"},
+		{name: "unconfirmed caller default"},
 		{name: "unconfirmed caller profile", profile: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -121,7 +123,7 @@ func TestClaudeExecutorMinimalNativeHelperPreservesMarkerlessWire(t *testing.T) 
 
 	payload := []byte(`{"model":"claude-haiku-4-5-20251001","max_tokens":1,"messages":[{"role":"user","content":"helper probe"}],"metadata":{"user_id":"` + strings.ReplaceAll(claudeNativeHelperUserID, `"`, `\"`) + `"}}`)
 	headers := claudeNativeHelperHeaders(claudeNativeHelperCoreBetas, "gzip, deflate, br, zstd")
-	executor := NewClaudeExecutor(&config.Config{})
+	executor := NewClaudeExecutor(claudeNativeHelperExplicit420Config())
 	_, errExecute := executor.Execute(context.Background(), claudeNativeHelperOAuthAuth(server.URL), cliproxyexecutor.Request{
 		Model:   "claude-haiku-4-5-20251001",
 		Payload: payload,
@@ -148,6 +150,7 @@ func TestClaudeExecutorMinimalNativeHelperPreservesMarkerlessWire(t *testing.T) 
 	if !bytes.HasPrefix(upstreamBody, []byte(`{"model":"claude-haiku-4-5-20251001","max_tokens":1,"messages":`)) {
 		t.Fatalf("helper top-level order changed: %s", upstreamBody)
 	}
+	assertClaude420ManagedHelperIdentity(t, upstreamBody, upstreamHeaders)
 	assertClaudeNativeHelperHeaders(t, upstreamHeaders, headers)
 }
 
@@ -165,7 +168,7 @@ func TestClaudeExecutorStructuredNativeHelperPreservesStreamProfile(t *testing.T
 	betas := claudeNativeHelperCoreBetas + ",structured-outputs-2025-12-15"
 	payload := []byte(`{"model":"claude-haiku-4-5-20251001","messages":[{"role":"user","content":[{"type":"text","text":"helper probe"}]}],"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.258; cc_entrypoint=cli; cch=00000;"},{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."},{"type":"text","text":"Return a short title."}],"tools":[],"metadata":{"user_id":"` + strings.ReplaceAll(claudeNativeHelperUserID, `"`, `\"`) + `"},"max_tokens":32000,"thinking":{"type":"disabled"},"temperature":1,"output_config":{"format":{"type":"json_schema","schema":{"type":"object","properties":{"title":{"type":"string"}},"required":["title"],"additionalProperties":false}}},"stream":true}`)
 	headers := claudeNativeHelperHeaders(betas, "gzip, deflate, br, zstd")
-	executor := NewClaudeExecutor(&config.Config{})
+	executor := NewClaudeExecutor(claudeNativeHelperExplicit420Config())
 	result, errStream := executor.ExecuteStream(context.Background(), claudeNativeHelperOAuthAuth(server.URL), cliproxyexecutor.Request{
 		Model:   "claude-haiku-4-5-20251001",
 		Payload: payload,
@@ -203,6 +206,12 @@ func TestClaudeExecutorStructuredNativeHelperPreservesStreamProfile(t *testing.T
 	if got := gjson.GetBytes(upstreamBody, "system.0.text").String(); strings.Contains(got, "cch=00000") || !strings.Contains(got, " cch=") {
 		t.Fatalf("structured helper billing CCH was not re-signed: %q", got)
 	}
+	for _, path := range []string{"max_tokens", "thinking", "temperature", "tools", "messages", "output_config.format"} {
+		if got, want := gjson.GetBytes(upstreamBody, path).Raw, gjson.GetBytes(payload, path).Raw; got != want {
+			t.Fatalf("structured helper %s=%s want preserved %s", path, got, want)
+		}
+	}
+	assertClaude420ManagedHelperIdentity(t, upstreamBody, upstreamHeaders)
 	assertClaudeNativeHelperHeaders(t, upstreamHeaders, headers)
 }
 
@@ -380,5 +389,27 @@ func TestClaudeExecutor_Native280HaikuTitleHelperPreservesServerSideFallbackBeta
 	outBeta := helps.HeaderValueCaseInsensitive(seenHeaders, "Anthropic-Beta")
 	if !strings.Contains(outBeta, "server-side-fallback-2026-06-01") {
 		t.Fatalf("Anthropic-Beta = %q, want server-side-fallback-2026-06-01 preserved for 2.1.280 title helper", outBeta)
+	}
+}
+
+// 显式 native 软件基线，避免将 caller 的设备字段当作账号默认身份。
+func claudeNativeHelperExplicit420Config() *config.Config {
+	replay := true
+	return &config.Config{ClaudeHeaderDefaults: config.ClaudeHeaderDefaults{UserAgent: "claude-cli/2.1.280 (external, cli)", PackageVersion: "0.112.1", RuntimeVersion: "v26.3.0", OS: "MacOS", Arch: "arm64", PinSoftwareBaseline: true, ReplayWireHeaderOrder: &replay}}
+}
+
+func assertClaude420ManagedHelperIdentity(t *testing.T, body []byte, headers http.Header) {
+	t.Helper()
+	user := gjson.Parse(gjson.GetBytes(body, "metadata.user_id").String())
+	if got := user.Get("account_uuid").String(); got != "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" {
+		t.Fatalf("account identity=%q want selected credential", got)
+	}
+	// F 的 InjectAccountDeviceID 在 OAuth metadata 之后写入进程盐派生的账号 ID；
+	// 不能用 metadata pool 的零值或当前进程生成值伪造固定 oracle。
+	if got := user.Get("device_id").String(); len(got) != 64 || strings.Trim(got, "0123456789abcdef") != "" || got == strings.Repeat("f", 64) || got == strings.Repeat("0", 64) {
+		t.Fatalf("device identity=%q want valid account-synthetic ID, not caller/pool ID", got)
+	}
+	if got := user.Get("session_id").String(); got != headers.Get("X-Claude-Code-Session-Id") || got != claudeNativeHelperSessionID {
+		t.Fatalf("body/header session mismatch=%q", got)
 	}
 }

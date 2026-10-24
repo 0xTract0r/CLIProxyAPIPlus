@@ -153,6 +153,10 @@ func (p *silentConnectProxy) handle(conn net.Conn) {
 		p.reportError(fmt.Errorf("read CONNECT request: %w", errRead))
 		return
 	}
+	if request.Host != "api.anthropic.com:443" {
+		p.reportError(fmt.Errorf("unexpected CONNECT authority %q", request.Host))
+		return
+	}
 	if request.Method != http.MethodConnect {
 		p.reportError(fmt.Errorf("proxy method = %q, want CONNECT", request.Method))
 		return
@@ -204,6 +208,7 @@ func TestClaudeExecutorManagerRetriesSilentTLSHandshakeThroughConnectProxy(t *te
 	auth := &cliproxyauth.Auth{
 		ID:       authID,
 		Provider: "claude",
+		ProxyURL: proxyURL,
 		Attributes: map[string]string{
 			"api_key":  "sk-ant-api03-silent-handshake-test",
 			"base_url": "https://api.anthropic.com",

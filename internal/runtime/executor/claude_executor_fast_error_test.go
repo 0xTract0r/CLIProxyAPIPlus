@@ -228,8 +228,16 @@ func TestClaudeExecutorFastTransportErrorIsRequestScopedWithoutRetry(t *testing.
 		SourceFormat:   sdktranslator.FormatClaude,
 		ResponseFormat: sdktranslator.FormatClaude,
 	})
-	if !errors.Is(errExecute, upstreamErr) {
-		t.Fatalf("error = %v, want wrapped transport error", errExecute)
+	// F 的客户端错误必须脱敏，但仍保留 Fast 的请求作用域和单次尝试。
+	if errExecute == nil || errExecute.Error() != claudeClientSafeTransportErrorMessage {
+		t.Fatalf("error = %v, want safe transport message", errExecute)
+	}
+	if errors.Is(errExecute, upstreamErr) || strings.Contains(errExecute.Error(), upstreamErr.Error()) {
+		t.Fatal("transport cause leaked")
+	}
+	var status interface{ StatusCode() int }
+	if !errors.As(errExecute, &status) || status.StatusCode() != 0 {
+		t.Fatalf("error = %v, want transport status 0", errExecute)
 	}
 	if got := attempts.Load(); got != 1 {
 		t.Fatalf("upstream attempts = %d, want 1", got)

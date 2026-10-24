@@ -415,7 +415,21 @@ func claudeUpstreamTransportError(err error) error {
 	if err == nil {
 		return nil
 	}
+	// 只保留已验证的内部 TLS 截止时间分类，丢弃原始 URL/代理/账号信息。
+	if cliproxyexecutor.IsConfiguredTLSHandshakeTimeoutError(err) {
+		return &claudeSafeConfiguredTLSHandshakeTimeoutError{}
+	}
 	return statusErr{code: http.StatusBadGateway, msg: claudeClientSafeTransportErrorMessage}
+}
+
+type claudeSafeConfiguredTLSHandshakeTimeoutError struct{}
+
+func (*claudeSafeConfiguredTLSHandshakeTimeoutError) Error() string {
+	return claudeClientSafeTransportErrorMessage
+}
+func (*claudeSafeConfiguredTLSHandshakeTimeoutError) StatusCode() int { return 0 }
+func (*claudeSafeConfiguredTLSHandshakeTimeoutError) Unwrap() error {
+	return cliproxyexecutor.NewConfiguredTLSHandshakeTimeoutError(context.DeadlineExceeded)
 }
 
 func newClaudeStatusErr(statusCode int, body []byte, headers http.Header, now time.Time) statusErr {
