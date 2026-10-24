@@ -1163,7 +1163,7 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 		if existing, ok := h.authManager.GetByID(record.ID); ok && (coreauth.IsCodexAuthRecord(existing) || coreauth.IsCodexAuthRecord(record)) {
 			// An existing Codex identity may recover only through the complete
 			// transaction. Never fall back to the historical save/register lane.
-			if !completeCodexRecoveryMaterial(record, existing) {
+			if !completeCodexSavedRecoveryMaterial(record, existing) {
 				// A login replacing every refresh partition still needs complete
 				// recovery evidence. Ordinary same-account edits cannot clear locks.
 				if coreauth.LoginReplacesOAuthCredentials(record.Metadata, existing.Metadata) {
@@ -1171,7 +1171,7 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 				}
 				return h.persistNonRecoveryCodexSave(ctx, existing, record)
 			}
-			path, registered, err := h.persistCompleteCodexReauthentication(ctx, existing, record)
+			path, registered, err := h.persistCodexReauthentication(ctx, existing, record, completeCodexSavedRecoveryMaterial)
 			if err == nil {
 				commitSIWCUploadMutation(ctx)
 			}
@@ -1404,9 +1404,81 @@ func completeCodexRecoveryMaterial(incoming, existing *coreauth.Auth) bool {
 	if incoming == nil || existing == nil {
 		return false
 	}
-	access, _ := incoming.Metadata["access_token"].(string)
 	id, _ := incoming.Metadata["id_token"].(string)
-	if strings.TrimSpace(access) == "" || strings.TrimSpace(id) == "" || !coreauth.LoginReplacesOAuthCredentials(incoming.Metadata, existing.Metadata) {
+	return strings.TrimSpace(id) != "" && completeCodexRecoveryCredentials(incoming, existing)
+}
+
+// Internal OAuth saves historically allow an omitted ID token when the request
+// itself names the same account. Upload/PATCH retain their complete-material gate.
+func completeCodexSavedRecoveryMaterial(incoming, existing *coreauth.Auth) bool {
+	if incoming == nil || existing == nil || !codexRecoveryTokenClaimsConsistent(incoming.Metadata, existing.Metadata) {
+		return false
+	}
+	if completeCodexRecoveryMaterial(incoming, existing) {
+		return true
+	}
+	if incoming == nil || existing == nil {
+		return false
+	}
+	id, _ := incoming.Metadata["id_token"].(string)
+	account, _ := incoming.Metadata["account_id"].(string)
+	alias, _ := incoming.Metadata["chatgpt_account_id"].(string)
+	return strings.TrimSpace(id) == "" &&
+		(strings.TrimSpace(account) != "" || strings.TrimSpace(alias) != "") &&
+		uploadedCodexRecoveryIdentityMatches(existing, incoming) &&
+		completeCodexRecoveryCredentials(incoming, existing)
+}
+
+// Claims only reject contradictory supplied evidence; they do not prove provider
+// authorization or fill missing request identity from the previous registration.
+func codexRecoveryTokenClaimsConsistent(metadata, existing map[string]any) bool {
+	text := func(m map[string]any, key string) string {
+		value, _ := m[key].(string)
+		return strings.TrimSpace(value)
+	}
+	// Prior identity is a veto only; it never fills submitted credential fields.
+	account, email := "", ""
+	for _, identity := range []map[string]any{existing, metadata} {
+		for _, key := range []string{"account_id", "chatgpt_account_id"} {
+			if next := text(identity, key); next != "" {
+				if account != "" && account != next {
+					return false
+				}
+				account = next
+			}
+		}
+		if next := text(identity, "email"); next != "" {
+			if email != "" && !strings.EqualFold(email, next) {
+				return false
+			}
+			email = next
+		}
+	}
+	siwc, _ := metadata["siwc"].(map[string]any)
+	for _, token := range []string{text(existing, "id_token"), text(metadata, "id_token"), text(metadata, "access_token"), text(siwc, "id_token"), text(siwc, "access_token")} {
+		claims, err := codex.ParseJWTToken(token)
+		if err != nil || claims == nil {
+			continue
+		}
+		if next := strings.TrimSpace(claims.GetAccountID()); next != "" {
+			if account != "" && account != next {
+				return false
+			}
+			account = next
+		}
+		if next := strings.TrimSpace(claims.GetUserEmail()); next != "" {
+			if email != "" && !strings.EqualFold(email, next) {
+				return false
+			}
+			email = next
+		}
+	}
+	return true
+}
+
+func completeCodexRecoveryCredentials(incoming, existing *coreauth.Auth) bool {
+	access, _ := incoming.Metadata["access_token"].(string)
+	if strings.TrimSpace(access) == "" || !coreauth.LoginReplacesOAuthCredentials(incoming.Metadata, existing.Metadata) {
 		return false
 	}
 	if oldSIWC, ok := existing.Metadata["siwc"].(map[string]any); ok {
@@ -1424,6 +1496,10 @@ func completeCodexRecoveryMaterial(incoming, existing *coreauth.Auth) bool {
 // Both complete file saves and complete fields PATCH use the same validated,
 // persist-before-publication transaction. Hooks stay outside the manager gate.
 func (h *Handler) persistCompleteCodexReauthentication(ctx context.Context, expected, incoming *coreauth.Auth) (string, *coreauth.Auth, error) {
+	return h.persistCodexReauthentication(ctx, expected, incoming, completeCodexRecoveryMaterial)
+}
+
+func (h *Handler) persistCodexReauthentication(ctx context.Context, expected, incoming *coreauth.Auth, complete func(*coreauth.Auth, *coreauth.Auth) bool) (string, *coreauth.Auth, error) {
 	request := incoming.Clone()
 	if h.postAuthHook != nil {
 		if err := h.postAuthHook(ctx, request); err != nil {
@@ -1432,7 +1508,7 @@ func (h *Handler) persistCompleteCodexReauthentication(ctx context.Context, expe
 	}
 	path := ""
 	registered, err := h.authManager.CommitReauthenticated(ctx, expected.ID, expected.RegistrationEpoch, func(current *coreauth.Auth) (*coreauth.Auth, error) {
-		if !completeCodexRecoveryMaterial(request, current) || !uploadedCodexRecoveryIdentityMatches(current, request) {
+		if !complete(request, current) || !uploadedCodexRecoveryIdentityMatches(current, request) {
 			return nil, &authFileFieldPatchError{message: "complete credentials must replace every refresh partition and establish the same account identity"}
 		}
 		next := request.Clone()
