@@ -2314,9 +2314,10 @@ func TestClaudeExecutor_ExecuteStreamDirectPassthroughEmitsCompleteSSEEvents(t *
 		payloads = append(payloads, string(chunk.Payload))
 	}
 
+	// F 1228bf9 direct passthrough按行发chunk，逐行修复不可被event合并替代。
 	want := []string{
-		"event: content_block_delta\n" + "data: " + firstData + "\n\n",
-		"event: message_stop\n" + "data: " + secondData + "\n\n",
+		"event: content_block_delta\n", "data: " + firstData + "\n", "\n",
+		"event: message_stop\n", "data: " + secondData + "\n", "\n",
 	}
 	if len(payloads) != len(want) {
 		t.Fatalf("payload count = %d, want %d: %#v", len(payloads), len(want), payloads)
@@ -2325,6 +2326,9 @@ func TestClaudeExecutor_ExecuteStreamDirectPassthroughEmitsCompleteSSEEvents(t *
 		if payloads[i] != want[i] {
 			t.Fatalf("payload[%d] = %q, want %q", i, payloads[i], want[i])
 		}
+	}
+	if got := strings.Join(payloads, ""); got != upstreamStream {
+		t.Fatalf("concatenated passthrough = %q, want exact upstream stream %q", got, upstreamStream)
 	}
 }
 
@@ -2447,9 +2451,10 @@ func TestClaudeExecutor_ExecuteStreamDecodesCompressedSSE(t *testing.T) {
 		payloads = append(payloads, string(chunk.Payload))
 	}
 
+	// F 1228bf9 direct passthrough按行发chunk，逐行修复不可被event合并替代。
 	want := []string{
-		"event: content_block_delta\n" + "data: " + firstData + "\n\n",
-		"event: message_stop\n" + "data: " + secondData + "\n\n",
+		"event: content_block_delta\n", "data: " + firstData + "\n", "\n",
+		"event: message_stop\n", "data: " + secondData + "\n", "\n",
 	}
 	if len(payloads) != len(want) {
 		t.Fatalf("payload count = %d, want %d: %#v", len(payloads), len(want), payloads)
@@ -2458,6 +2463,9 @@ func TestClaudeExecutor_ExecuteStreamDecodesCompressedSSE(t *testing.T) {
 		if payloads[i] != want[i] {
 			t.Fatalf("payload[%d] = %q, want %q", i, payloads[i], want[i])
 		}
+	}
+	if got := strings.Join(payloads, ""); got != upstreamStream {
+		t.Fatalf("concatenated passthrough = %q, want exact upstream stream %q", got, upstreamStream)
 	}
 }
 
@@ -2693,7 +2701,7 @@ func TestClaudeExecutor_CountTokensUpstreamConfirmedVSCodePreservesCustomTool(t 
 			"base_url": server.URL,
 		},
 		Metadata: map[string]any{
-			"cloak_mode": "always",
+			"cloak_mode": "auto",
 		},
 	}
 	payload := []byte(`{"model":"claude-opus-4-6","messages":[{"role":"user","content":"search"}],"tools":[{"name":"search_web","input_schema":{"type":"object"}}]}`)
@@ -9627,6 +9635,7 @@ func TestApplyCloakingRejectsNonTextCallerSystemBlock(t *testing.T) {
 // lose information and must not fail the request.
 func TestApplyCloakingStrictModeIgnoresNonTextCallerSystemBlock(t *testing.T) {
 	cfg := &config.Config{
+		ClaudeHeaderDefaults: claudeBeta280Config375().ClaudeHeaderDefaults,
 		ClaudeKey: []config.ClaudeKey{{
 			APIKey: "key-123",
 			Cloak:  &config.CloakConfig{StrictMode: true},
@@ -9887,6 +9896,7 @@ func TestClaudeExecutor_ProbeStripsCaller1hTTLAndBetas(t *testing.T) {
 	defer server.Close()
 
 	cfg := &config.Config{
+		ClaudeHeaderDefaults: claudeBeta280Config375().ClaudeHeaderDefaults,
 		ClaudeKey: []config.ClaudeKey{{
 			APIKey: "sk-ant-oat-probe-ttl-test",
 		}},
@@ -10019,6 +10029,7 @@ func TestClaudeExecutor_DisabledThinkingStripsDisplayBeta(t *testing.T) {
 	defer server.Close()
 
 	cfg := &config.Config{
+		ClaudeHeaderDefaults: claudeBeta280Config375().ClaudeHeaderDefaults,
 		ClaudeKey: []config.ClaudeKey{{
 			APIKey: "sk-ant-oat-disabled-thinking-beta-test",
 		}},
