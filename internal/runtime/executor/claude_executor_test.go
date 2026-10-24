@@ -5517,8 +5517,9 @@ func TestClaudeExecutor_CustomBaseURLPreservesBodyByDefault(t *testing.T) {
 
 	executor := NewClaudeExecutor(&config.Config{})
 	auth := &cliproxyauth.Auth{ProxyURL: "direct", Attributes: map[string]string{
-		"api_key":  "key-123",
-		"base_url": server.URL,
+		"cloak_mode": "uncloak",
+		"api_key":    "key-123",
+		"base_url":   server.URL,
 	}}
 	payload := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
 
@@ -7129,8 +7130,9 @@ func TestClaudeExecutor_UncloakedProbePreservesCallerBillingTags(t *testing.T) {
 	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID: "auth-uncloaked-probe-test",
 		Attributes: map[string]string{
-			"api_key":  "sk-ant-api03-uncloaked-test",
-			"base_url": server.URL,
+			"cloak_mode": "uncloak",
+			"api_key":    "sk-ant-api03-uncloaked-test",
+			"base_url":   server.URL,
 		},
 	}
 
@@ -9000,7 +9002,8 @@ func TestWithClaudeAdvisorToolBeta_InsertsBeforeTrailingBetas(t *testing.T) {
 }
 
 func TestApplyClaudeHeaders_StreamTransportNegotiation(t *testing.T) {
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "key-stream-accept"}}
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"cloak_mode": "uncloak", "api_key": "key-stream-accept"}}
 	body := []byte(`{"model":"claude-opus-4-6","stream":true}`)
 
 	directReq := newClaudeHeaderTestRequest(t, http.Header{})
@@ -9029,7 +9032,8 @@ func TestApplyClaudeHeaders_StreamTransportNegotiation(t *testing.T) {
 
 func TestApplyClaudeHeaders_DefaultPreservesCallerBetas(t *testing.T) {
 	incoming := http.Header{"Anthropic-Beta": []string{"caller-only-beta"}}
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "key-caller-betas"}}
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"cloak_mode": "uncloak", "api_key": "key-caller-betas"}}
 	body := []byte(`{"model":"claude-opus-4-6"}`)
 
 	// Default API-key mode preserves caller betas on direct Anthropic.
