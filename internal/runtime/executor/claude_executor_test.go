@@ -290,6 +290,7 @@ func TestApplyClaudeHeaders_DoesNotDowngradeConfiguredBaselineOnFirstClaudeClien
 
 	cfg := &config.Config{
 		ClaudeHeaderDefaults: config.ClaudeHeaderDefaults{
+			PinSoftwareBaseline:    true,
 			UserAgent:              "claude-cli/2.1.70 (external, cli)",
 			PackageVersion:         "0.80.0",
 			RuntimeVersion:         "v24.5.0",
@@ -332,6 +333,7 @@ func TestApplyClaudeHeaders_UpgradesCachedSoftwareFingerprintWhenBaselineAdvance
 
 	oldCfg := &config.Config{
 		ClaudeHeaderDefaults: config.ClaudeHeaderDefaults{
+			PinSoftwareBaseline:    true,
 			UserAgent:              "claude-cli/2.1.70 (external, cli)",
 			PackageVersion:         "0.80.0",
 			RuntimeVersion:         "v24.5.0",
@@ -342,6 +344,7 @@ func TestApplyClaudeHeaders_UpgradesCachedSoftwareFingerprintWhenBaselineAdvance
 	}
 	newCfg := &config.Config{
 		ClaudeHeaderDefaults: config.ClaudeHeaderDefaults{
+			PinSoftwareBaseline:    true,
 			UserAgent:              "claude-cli/2.1.77 (external, cli)",
 			PackageVersion:         "0.87.0",
 			RuntimeVersion:         "v24.8.0",
@@ -385,6 +388,7 @@ func TestApplyClaudeHeaders_LearnsOfficialFingerprintAfterCustomBaselineFallback
 
 	cfg := &config.Config{
 		ClaudeHeaderDefaults: config.ClaudeHeaderDefaults{
+			PinSoftwareBaseline:    true,
 			UserAgent:              "my-gateway/1.0",
 			PackageVersion:         "custom-pkg",
 			RuntimeVersion:         "custom-runtime",
@@ -544,6 +548,7 @@ func TestApplyClaudeHeaders_ThirdPartyBaselineThenOfficialUpgradeKeepsPinnedPlat
 
 	cfg := &config.Config{
 		ClaudeHeaderDefaults: config.ClaudeHeaderDefaults{
+			PinSoftwareBaseline:    true,
 			UserAgent:              "claude-cli/2.1.70 (external, cli)",
 			PackageVersion:         "0.80.0",
 			RuntimeVersion:         "v24.5.0",

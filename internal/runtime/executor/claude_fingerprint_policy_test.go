@@ -255,7 +255,8 @@ func TestApplyClaudeHeaders_OfficialAPIKeyDefaultRespectsClient(t *testing.T) {
 	t.Parallel()
 
 	auth := &cliproxyauth.Auth{Attributes: map[string]string{
-		"api_key": "key-official",
+		"cloak_mode": "uncloak",
+		"api_key":    "key-official",
 	}}
 	req, errReq := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages?beta=true", nil)
 	if errReq != nil {
@@ -434,7 +435,8 @@ func TestClaudeExecutor_OfficialAPIKeyDefaultRespectsClient(t *testing.T) {
 	auth := &cliproxyauth.Auth{
 		ID: "official-api-key-default",
 		Attributes: map[string]string{
-			"api_key": "key-official-default",
+			"cloak_mode": "uncloak",
+			"api_key":    "key-official-default",
 		},
 	}
 	payload := []byte(`{"model":"claude-sonnet-5","max_tokens":64,"messages":[{"role":"user","content":"hello"}],"tools":[{"name":"read_file","input_schema":{"type":"object"}}]}`)
@@ -924,6 +926,7 @@ func TestApplyClaudeHeaders_CallerOwnedRestoreKeepsCallerAccept(t *testing.T) {
 	auth := &cliproxyauth.Auth{
 		ID: "caller-owned-restore",
 		Attributes: map[string]string{
+			"cloak_mode":    "uncloak",
 			"api_key":       "key-restore",
 			"header:Accept": "application/vnd.operator+json",
 		},
@@ -951,9 +954,10 @@ func TestClaudeExecutor_CallerOwnedNeverSendsGoTransportUserAgent(t *testing.T) 
 	}))
 	defer server.Close()
 
-	auth := &cliproxyauth.Auth{ID: "caller-owned-ua", Attributes: map[string]string{
-		"api_key":  "key-caller-owned-ua",
-		"base_url": server.URL,
+	auth := &cliproxyauth.Auth{ProxyURL: "direct", ID: "caller-owned-ua", Attributes: map[string]string{
+		"cloak_mode": "uncloak",
+		"api_key":    "key-caller-owned-ua",
+		"base_url":   server.URL,
 	}}
 	if _, err := NewClaudeExecutor(&config.Config{}).Execute(context.Background(), auth,
 		cliproxyexecutor.Request{Model: "claude-opus-4-6", Payload: []byte(`{"model":"claude-opus-4-6","messages":[{"role":"user","content":"hi"}]}`)},
@@ -980,8 +984,9 @@ func TestClaudeExecutor_CallerOwnedForwardsCallerUserAgent(t *testing.T) {
 	defer server.Close()
 
 	auth := &cliproxyauth.Auth{ProxyURL: "direct", ID: "caller-owned-ua-keep", Attributes: map[string]string{
-		"api_key":  "key-caller-owned-ua-keep",
-		"base_url": server.URL,
+		"cloak_mode": "uncloak",
+		"api_key":    "key-caller-owned-ua-keep",
+		"base_url":   server.URL,
 	}}
 	if _, err := NewClaudeExecutor(&config.Config{}).Execute(context.Background(), auth,
 		cliproxyexecutor.Request{Model: "claude-opus-4-6", Payload: []byte(`{"model":"claude-opus-4-6","messages":[{"role":"user","content":"hi"}]}`)},
