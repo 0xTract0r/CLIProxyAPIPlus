@@ -10,7 +10,9 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sync"
 	"testing"
+	"time"
 )
 
 func TestSameIDIncompleteCodexRecovery230(t *testing.T) {
@@ -23,6 +25,17 @@ func TestSameIDIncompleteCodexRecovery230(t *testing.T) {
 				store.SetBaseDir(dir)
 				manager := coreauth.NewManager(store, nil, nil)
 				old := &coreauth.Auth{ID: "incomplete230.json", FileName: "incomplete230.json", Provider: "codex", ProxyURL: "direct", Metadata: map[string]any{"type": "codex", "account_id": "account-a", "email": "synthetic@example.invalid", "access_token": "old-access", "refresh_token": "old-refresh", "id_token": "old-id", "proxy_url": "direct", "siwc": map[string]any{"access_token": "old-siwc-access", "refresh_token": "old-siwc-refresh"}}}
+				// 333/337恢复内部完整same-account保存缺id合同；外部upload仍要求id。
+				completeWithoutID := entry == "save" && missing == "id"
+				if completeWithoutID {
+					old.CreatedAt = time.Date(2025, 1, 2, 3, 4, 5, 0, time.UTC)
+					old.Success, old.Failed = 7, 9
+					old.Metadata["note"] = "operator-note-358"
+					old.Metadata["account_settings"] = map[string]any{"schema_version": 1, "refresh_enabled": false}
+					old.Metadata["quota_refresh_status"] = "reauth_required"
+					old.Metadata["quota_refresh_error"] = "old-quota-error"
+					old.Metadata["quota_next_refresh_after"] = "2035-01-01T00:00:00Z"
+				}
 				// These two same-account save operations persist partial content;
 				// they do not grant recovery. All upload/full-material negatives remain.
 				ordinaryPartial := entry == "save" && (missing == "siwc-refresh" || missing == "outer-refresh")
@@ -42,6 +55,18 @@ func TestSameIDIncompleteCodexRecovery230(t *testing.T) {
 				before, _ = manager.GetByID(old.ID)
 				if !before.AutoQuarantined || before.RejectedAccessToken != "old-access" {
 					t.Fatal("real terminal state was not established")
+				}
+				if completeWithoutID {
+					disabled, ok, e := manager.Modify(ctx, old.ID, before.RegistrationEpoch, func(a *coreauth.Auth) error {
+						a.Disabled = true
+						a.Status = coreauth.StatusDisabled
+						a.Metadata["disabled"] = true
+						return nil
+					})
+					if e != nil || !ok {
+						t.Fatalf("operator disable: %v", e)
+					}
+					before = disabled
 				}
 				path := filepath.Join(dir, old.FileName)
 				original, err := os.ReadFile(path)
@@ -87,6 +112,68 @@ func TestSameIDIncompleteCodexRecovery230(t *testing.T) {
 				after, readErr := os.ReadFile(path)
 				if readErr != nil {
 					t.Fatal(readErr)
+				}
+				if completeWithoutID {
+					if err != nil || store.saves != 1 || hooks != 1 {
+						t.Fatalf("complete no-id save err=%v saves=%d hooks=%d", err, store.saves, hooks)
+					}
+					var disk map[string]any
+					if e := json.Unmarshal(after, &disk); e != nil {
+						t.Fatal(e)
+					}
+					for where, metadata := range map[string]map[string]any{"disk": disk, "runtime": live.Metadata} {
+						if metadata["access_token"] != "new-access" || metadata["refresh_token"] != "new-refresh" {
+							t.Fatalf("%s outer credentials not replaced", where)
+						}
+						part, ok := metadata["siwc"].(map[string]any)
+						if !ok || part["access_token"] != "new-siwc-access" || part["refresh_token"] != "new-siwc-refresh" {
+							t.Fatalf("%s SIWC credentials not replaced", where)
+						}
+						if coreauth.IsReauthRequiredMetadata(metadata) {
+							t.Fatalf("%s retained recovery lock", where)
+						}
+						for _, key := range []string{"quota_refresh_status", "quota_refresh_error", "quota_next_refresh_after"} {
+							if _, ok := metadata[key]; ok {
+								t.Fatalf("%s stale quota %s survived", where, key)
+							}
+						}
+						settings, ok := metadata["account_settings"].(map[string]any)
+						if !ok || settings["refresh_enabled"] != false || metadata["disabled"] != true || metadata["note"] != "operator-note-358" {
+							t.Fatalf("%s operator policy lost", where)
+						}
+					}
+					if bytes.Equal(original, after) || live.RegistrationEpoch <= before.RegistrationEpoch || live.CredentialVersion <= before.CredentialVersion || live.Index != before.Index || !live.CreatedAt.Equal(before.CreatedAt) || live.Success != before.Success || live.Failed != before.Failed {
+						t.Fatal("recovery registration/history/credentials boundary changed")
+					}
+					if !live.Disabled || !live.RefreshDisabled() || live.AutoQuarantined || live.Status == coreauth.StatusQuarantined || live.RejectedAccessToken != "" || live.RejectedSIWCAccessToken != "" || live.LastError != nil || !reflect.ValueOf(live.Quota).IsZero() {
+						t.Fatalf("terminal cleanup or operator disable incorrect: %+v", live)
+					}
+					// 真实并发旧epoch refresh/result同时尝试，不能污染已提交新代。
+					var wg sync.WaitGroup
+					staleErr := make(chan error, 1)
+					wg.Add(2)
+					go func() {
+						defer wg.Done()
+						stale := before.Clone()
+						stale.Metadata["access_token"] = "late-old-access"
+						_, e := manager.UpdateRefreshedAuth(ctx, before, stale)
+						staleErr <- e
+					}()
+					go func() {
+						defer wg.Done()
+						manager.MarkResult(ctx, coreauth.Result{AuthID: before.ID, Provider: "codex", RegistrationEpoch: before.RegistrationEpoch, CredentialVersion: before.CredentialVersion, AccessToken: "old-access", Success: true})
+						manager.MarkResult(ctx, coreauth.Result{AuthID: before.ID, Provider: "codex", RegistrationEpoch: before.RegistrationEpoch, CredentialVersion: before.CredentialVersion, AccessToken: "old-access", Error: &coreauth.Error{HTTPStatus: 401, Message: "old terminal result"}})
+					}()
+					wg.Wait()
+					if e := <-staleErr; e == nil {
+						t.Fatal("old epoch refresh admitted")
+					}
+					fenced, _ := manager.GetByID(before.ID)
+					fencedDisk, e := os.ReadFile(path)
+					if e != nil || !bytes.Equal(after, fencedDisk) || !reflect.DeepEqual(fenced, live) || store.saves != 1 || hooks != 1 {
+						t.Fatal("concurrent old epoch changed recovered state")
+					}
+					return
 				}
 				if ordinaryPartial {
 					if err != nil || store.saves != 1 || hooks != 1 {

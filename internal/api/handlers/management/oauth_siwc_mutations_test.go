@@ -2,6 +2,7 @@ package management
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	fileauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth"
@@ -31,6 +32,11 @@ func TestSIWCFileMutationRejectsLateExchange(t *testing.T) {
 			}
 			switch operation {
 			case "upload":
+				var supplied map[string]any
+				if err := json.Unmarshal(original, &supplied); err != nil {
+					t.Fatal(err)
+				}
+				original, _ = json.Marshal(completeSIWCMaterial351(supplied, "mutation"))
 				w = siwcRequest(t, f.router, http.MethodPost, "/credentials?name=codex.json", json.RawMessage(original))
 			case "delete":
 				w = siwcRequest(t, f.router, http.MethodDelete, "/credentials?name=codex.json", nil)
@@ -83,7 +89,7 @@ func TestSIWCFileMutationScopeAndValidation(t *testing.T) {
 	}{
 		{"/credentials?name=codex.json", map[string]any{"excluded_models": 123}, http.StatusBadRequest},
 		{"/credentials?name=other.json", f.auth.Metadata, http.StatusOK},
-		{"/legacy?name=codex.json", f.auth.Metadata, http.StatusOK},
+		{"/legacy?name=codex.json", completeSIWCMaterial351(f.auth.Metadata, "legacy"), http.StatusOK},
 	} {
 		w := siwcRequest(t, f.router, http.MethodPost, test.path, test.body)
 		if w.Code != test.status {
@@ -100,7 +106,7 @@ func TestSIWCFileMutationScopeAndValidation(t *testing.T) {
 		}
 		return nil
 	}
-	w := siwcRequest(t, f.router, http.MethodPost, "/credentials?name=codex.json", f.auth.Metadata)
+	w := siwcRequest(t, f.router, http.MethodPost, "/credentials?name=codex.json", completeSIWCMaterial351(f.auth.Metadata, "final"))
 	if w.Code != http.StatusOK || flow.ctx.Err() == nil {
 		t.Fatalf("reupload failed to invalidate binding: %d", w.Code)
 	}
@@ -205,4 +211,31 @@ func TestSIWCPending315SuccessfulUploadFencesLateExchange(t *testing.T) {
 	if string(before) != string(after) || live.Metadata["access_token"] != "new-outer" || live.Metadata["use_siwc"] == true {
 		t.Fatal("late exchange overwrote committed upload")
 	}
+}
+
+// Diagnostic only: supply current-request identity and fresh credential partitions.
+// Cross-account/provider and unchanged epoch expectations are deliberately kept.
+func completeSIWCMaterial351(input map[string]any, tag string) map[string]any {
+	raw, _ := json.Marshal(input)
+	out := map[string]any{}
+	_ = json.Unmarshal(raw, &out)
+	account, _ := out["account_id"].(string)
+	if account == "" {
+		account = "account"
+		out["account_id"] = account
+	}
+	claims, _ := json.Marshal(map[string]any{"https://api.openai.com/auth": map[string]any{"chatgpt_account_id": account}})
+	out["id_token"] = "e30." + base64.RawURLEncoding.EncodeToString(claims) + "."
+	if _, ok := out["access_token"]; !ok {
+		out["access_token"] = "fresh-access-" + tag
+	}
+	if tag == "mutation" || tag == "legacy" || tag == "final" {
+		out["access_token"] = "fresh-access-" + tag
+		out["refresh_token"] = "fresh-refresh-" + tag
+	}
+	out["disabled"] = false
+	if tag == "commit" {
+		out["siwc"] = map[string]any{"access_token": "fresh-siwc-access-" + tag, "refresh_token": "fresh-siwc-refresh-" + tag}
+	}
+	return out
 }
