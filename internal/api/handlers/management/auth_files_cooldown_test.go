@@ -60,7 +60,8 @@ func TestListAuthFilesCooldownsSnapshot(t *testing.T) {
 	manager.SetConfig(cfg)
 	for _, id := range []string{"a", "b"} {
 		registerAuthForLookupTest(t, manager, &coreauth.Auth{
-			ID: id, Index: "index-" + id, Provider: "codex", Status: coreauth.StatusError,
+			ProxyURL: "direct",
+			ID:       id, Index: "index-" + id, Provider: "codex", Status: coreauth.StatusError,
 			Unavailable: true, NextRetryAfter: next,
 			Attributes: map[string]string{"runtime_only": "true"},
 			Quota:      coreauth.QuotaState{Exceeded: true, Reason: "quota", NextRecoverAt: next, ObservedAt: now, Signals: map[string]string{"x-codex-primary-used-percent": "90"}},
@@ -73,6 +74,11 @@ func TestListAuthFilesCooldownsSnapshot(t *testing.T) {
 	beforeA, _ := manager.GetByID("a")
 	beforeB, _ := manager.GetByID("b")
 	h := NewHandlerWithoutConfigFilePath(cfg, manager)
+	// 冷却快照用例使用刚完成身份头同步的账号，避免并行测试另一项后台迁移职责。
+	// 调度器的真实最近成功冷却期只抑制本轮重复同步，原 GET 全状态不变断言保留。
+	for _, id := range []string{"a", "b"} {
+		h.managedHeaderSyncSchedulerForHandler().recordSuccess(id, time.Now())
+	}
 	for range 2 {
 		payload := requestAuthFilesCooldowns(t, h, "")
 		if len(payload.Files) != 2 {
