@@ -411,7 +411,9 @@ func TestXAIExecutorExecuteFoldsNamespacesWhenToolsExceed200(t *testing.T) {
 		nsList = append(nsList, fmt.Sprintf(`{"type":"namespace","name":"mcp__app_%d","description":"App %d tools","tools":[%s]}`, i, i, strings.Join(childTools, ",")))
 	}
 
-	exec := NewXAIExecutor(&config.Config{})
+	cfg := &config.Config{}
+	cfg.XAI.SetInjectXSearch(false)
+	exec := NewXAIExecutor(cfg)
 	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		Provider:   "xai",
 		Attributes: map[string]string{"base_url": server.URL},
@@ -520,7 +522,9 @@ func TestXAIExecutorExecuteStreamFoldsNamespacesWhenToolsExceed200(t *testing.T)
 		nsList = append(nsList, fmt.Sprintf(`{"type":"namespace","name":"mcp__app_%d","tools":[%s]}`, i, strings.Join(childTools, ",")))
 	}
 
-	exec := NewXAIExecutor(&config.Config{})
+	cfg := &config.Config{}
+	cfg.XAI.SetInjectXSearch(false)
+	exec := NewXAIExecutor(cfg)
 	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		Provider:   "xai",
 		Attributes: map[string]string{"base_url": server.URL},
@@ -1487,7 +1491,9 @@ func TestXAIExecutorPrepareRewritesImageOnlyAllowedToolsAutoToAuto(t *testing.T)
 func TestXAIExecutorPrepareStripsImageGenerationFromMixedAllowedTools(t *testing.T) {
 	t.Parallel()
 
-	exec := NewXAIExecutor(&config.Config{})
+	cfg := &config.Config{}
+	cfg.XAI.SetInjectXSearch(false)
+	exec := NewXAIExecutor(cfg)
 	prepared, err := exec.prepareResponsesRequest(context.Background(), cliproxyexecutor.Request{
 		Model: "grok-4.6",
 		Payload: []byte(`{
@@ -1627,7 +1633,9 @@ func TestXAIExecutorPrepareRewritesWebSearchOnlyAllowedToolsAutoToAuto(t *testin
 func TestXAIExecutorPrepareStripsWebSearchFromMixedAllowedTools(t *testing.T) {
 	t.Parallel()
 
-	exec := NewXAIExecutor(&config.Config{})
+	cfg := &config.Config{}
+	cfg.XAI.SetInjectXSearch(false)
+	exec := NewXAIExecutor(cfg)
 	prepared, err := exec.prepareResponsesRequest(context.Background(), cliproxyexecutor.Request{
 		Model: "grok-4.6",
 		Payload: []byte(`{
@@ -6719,7 +6727,9 @@ func TestXAIExecutorExecuteVideosOAuthBaseURLResolution(t *testing.T) {
 func TestXAIExecutorAliasesClientWebSearchFunctionInRequest(t *testing.T) {
 	t.Parallel()
 
-	exec := NewXAIExecutor(&config.Config{})
+	cfg := &config.Config{}
+	cfg.XAI.SetInjectXSearch(false)
+	exec := NewXAIExecutor(cfg)
 	prepared, errPrepare := exec.prepareResponsesRequest(context.Background(), cliproxyexecutor.Request{
 		Model: "grok-4.6",
 		Payload: []byte(`{
@@ -6782,7 +6792,9 @@ func TestXAIExecutorAliasesClientWebSearchFunctionInRequest(t *testing.T) {
 func TestXAIExecutorPreservesHostedWebSearchToolType(t *testing.T) {
 	t.Parallel()
 
-	exec := NewXAIExecutor(&config.Config{})
+	cfg := &config.Config{}
+	cfg.XAI.SetInjectXSearch(false)
+	exec := NewXAIExecutor(cfg)
 	prepared, errPrepare := exec.prepareResponsesRequest(context.Background(), cliproxyexecutor.Request{
 		Model: "grok-4.6",
 		Payload: []byte(`{
@@ -6886,7 +6898,9 @@ func TestXAIExecutorRestoresAliasedWebSearchInStreamAndExecute(t *testing.T) {
 func TestXAIExecutorAliasesClientWebSearchWithExistingAliasCollision(t *testing.T) {
 	t.Parallel()
 
-	exec := NewXAIExecutor(&config.Config{})
+	cfg := &config.Config{}
+	cfg.XAI.SetInjectXSearch(false)
+	exec := NewXAIExecutor(cfg)
 	prepared, errPrepare := exec.prepareResponsesRequest(context.Background(), cliproxyexecutor.Request{
 		Model: "grok-4.6",
 		Payload: []byte(`{
@@ -6945,7 +6959,9 @@ func TestXAIExecutorAliasesClientWebSearchWithExistingAliasCollision(t *testing.
 func TestXAIExecutorDoesNotAliasNamespacedWebSearchToolChoice(t *testing.T) {
 	t.Parallel()
 
-	exec := NewXAIExecutor(&config.Config{})
+	cfg := &config.Config{}
+	cfg.XAI.SetInjectXSearch(false)
+	exec := NewXAIExecutor(cfg)
 	prepared, errPrepare := exec.prepareResponsesRequest(context.Background(), cliproxyexecutor.Request{
 		Model: "grok-4.6",
 		Payload: []byte(`{
@@ -7215,7 +7231,7 @@ func testApplyPatchResponsesExecutor(t *testing.T, provider string, exec interfa
 				_, _ = fmt.Fprintf(w, "data: %s\n\ndata: %s\n\n", `{"type":"response.output_item.done","output_index":0,"item":`+item+`}`, completed)
 			}))
 			defer server.Close()
-			auth := &cliproxyauth.Auth{Provider: provider, Attributes: map[string]string{"api_key": "test", "base_url": server.URL}}
+			auth := &cliproxyauth.Auth{Provider: provider, ProxyURL: "direct", Attributes: map[string]string{"api_key": "test", "base_url": server.URL}}
 			req := cliproxyexecutor.Request{Model: model, Payload: request}
 			opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse, Stream: stream}
 			var output []byte
@@ -7365,7 +7381,7 @@ func TestXAIApplyPatchFoldedNamespaceHTTP(t *testing.T) {
 			}))
 			defer server.Close()
 			exec := NewXAIExecutor(&config.Config{})
-			auth := &cliproxyauth.Auth{Provider: "xai", Attributes: map[string]string{"base_url": server.URL, "api_key": "test"}}
+			auth := &cliproxyauth.Auth{Provider: "xai", ProxyURL: "direct", Attributes: map[string]string{"base_url": server.URL, "api_key": "test"}}
 			req := cliproxyexecutor.Request{Model: "grok-4", Payload: request}
 			opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse}
 			var final, output []byte
@@ -7495,7 +7511,7 @@ func TestXAIApplyPatchDispatcherEvidenceLifecycle(t *testing.T) {
 					declarations = append(declarations, fmt.Sprintf(`{"type":"function","name":"lookup%d","parameters":{"type":"object"}}`, i))
 				}
 				request := []byte(`{"input":[],"tools":[{"type":"function","name":"plain","parameters":{"type":"object"}},{"type":"namespace","name":"n","tools":[` + strings.Join(declarations, ",") + `]}]}`)
-				auth := &cliproxyauth.Auth{Provider: "xai", Attributes: map[string]string{"base_url": server.URL, "api_key": "test", "websockets": "true"}}
+				auth := &cliproxyauth.Auth{Provider: "xai", ProxyURL: "direct", Attributes: map[string]string{"base_url": server.URL, "api_key": "test", "websockets": "true"}}
 				req := cliproxyexecutor.Request{Model: "grok-4", Payload: request}
 				opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse}
 				var output, final []byte
@@ -7593,7 +7609,7 @@ func TestApplyPatchResponsesExecutorLocalFailures(t *testing.T) {
 					exec = NewKimiExecutor(&config.Config{})
 					model = "kimi-k2.5"
 				}
-				auth := &cliproxyauth.Auth{ID: "task6-owned", Provider: provider, Attributes: map[string]string{"api_key": "test", "base_url": server.URL}}
+				auth := &cliproxyauth.Auth{ID: "task6-owned", Provider: provider, ProxyURL: "direct", Attributes: map[string]string{"api_key": "test", "base_url": server.URL}}
 				checkUsage := task6CaptureFailureUsage(t, auth.ID)
 				defer checkUsage()
 				req := cliproxyexecutor.Request{Model: model, Payload: []byte(`{"input":[],"tools":[{"type":"custom","name":"apply_patch"}]}`)}
