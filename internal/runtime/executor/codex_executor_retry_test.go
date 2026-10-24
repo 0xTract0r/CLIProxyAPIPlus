@@ -124,10 +124,13 @@ func TestParseCodexRetryAfterQuotaLayouts(t *testing.T) {
 			{name: "absolute reset wins", body: `{"type":"usage_limit_reached","resets_at":1700000300,"resets_in_seconds":1}`, want: 5 * time.Minute},
 			{name: "expired absolute reset falls back", body: `{"type":"usage_limit_reached","resets_at":1699999940,"resets_in_seconds":77}`, want: 77 * time.Second},
 			{name: "type matching agrees with quota classification", body: `{"type":" USAGE_LIMIT_REACHED ","resets_in_seconds":30}`, want: 30 * time.Second},
-			{name: "missing reset", body: `{"type":"usage_limit_reached"}`},
-			{name: "expired reset", body: `{"type":"usage_limit_reached","resets_at":1699999940}`},
-			{name: "nonpositive reset", body: `{"type":"usage_limit_reached","resets_at":0,"resets_in_seconds":-1}`},
+			{name: "missing reset", body: `{"type":"usage_limit_reached"}`, want: time.Hour},
+			{name: "expired reset", body: `{"type":"usage_limit_reached","resets_at":1699999940}`, want: time.Hour},
+			{name: "nonpositive reset", body: `{"type":"usage_limit_reached","resets_at":0,"resets_in_seconds":-1}`, want: time.Hour},
 			{name: "transient limit", body: `{"type":"rate_limit_error","resets_in_seconds":30}`},
+			{name: "missing quota type", body: `{"resets_in_seconds":30}`},
+			{name: "server error", body: `{"type":"server_error","resets_in_seconds":30}`},
+			{name: "message-only fallback", body: `{"message":"You've hit your usage limit. Upgrade to Pro."}`, want: time.Hour},
 		} {
 			t.Run(layout+"/"+test.name, func(t *testing.T) {
 				body := []byte(test.body)
