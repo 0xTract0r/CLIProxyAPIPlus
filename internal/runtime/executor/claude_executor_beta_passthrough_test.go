@@ -32,7 +32,7 @@ func TestApplyClaudeHeaders_ForwardsUnmanagedCallerBetas(t *testing.T) {
 	}
 	incoming := http.Header{}
 	incoming.Set("Anthropic-Beta", "message-threads-2026-08-12")
-	if errHeaders := applyClaudeHeaders(req, auth, auth.Attributes[cliproxyauth.AttributeAPIKey], false, nil, []byte(`{"model":"claude-fable-5-1"}`), &config.Config{}, incoming, false); errHeaders != nil {
+	if errHeaders := applyClaudeHeaders(req, auth, auth.Attributes[cliproxyauth.AttributeAPIKey], false, nil, []byte(`{"model":"claude-fable-5-1"}`), claudeBeta280Config375(), incoming, false); errHeaders != nil {
 		t.Fatalf("applyClaudeHeaders() error = %v", errHeaders)
 	}
 	betas := req.Header.Get("Anthropic-Beta")
@@ -57,7 +57,7 @@ func TestApplyClaudeHeaders_StillGatesManagedCallerBetas(t *testing.T) {
 	}
 	incoming := http.Header{}
 	incoming.Set("Anthropic-Beta", "effort-2025-11-24")
-	if errHeaders := applyClaudeHeaders(req, auth, auth.Attributes[cliproxyauth.AttributeAPIKey], false, nil, []byte(`{"model":"claude-haiku-4-5"}`), &config.Config{}, incoming, false); errHeaders != nil {
+	if errHeaders := applyClaudeHeaders(req, auth, auth.Attributes[cliproxyauth.AttributeAPIKey], false, nil, []byte(`{"model":"claude-haiku-4-5"}`), claudeBeta280Config375(), incoming, false); errHeaders != nil {
 		t.Fatalf("applyClaudeHeaders() error = %v", errHeaders)
 	}
 	if betas := req.Header.Get("Anthropic-Beta"); strings.Contains(betas, "effort-2025-11-24") {
@@ -130,7 +130,7 @@ func TestApplyClaudeHeaders_ForwardsUnmanagedCallerBetas_OAuth(t *testing.T) {
 			{"role": "user",   "content": "say ok"}
 		]
 	}`)
-	if errHeaders := applyClaudeHeaders(req, auth, "sk-ant-oat-fixture", false, nil, body, &config.Config{}, incoming, false); errHeaders != nil {
+	if errHeaders := applyClaudeHeaders(req, auth, "sk-ant-oat-fixture", false, nil, body, claudeBeta280Config375(), incoming, false); errHeaders != nil {
 		t.Fatalf("applyClaudeHeaders() error = %v", errHeaders)
 	}
 	betas := req.Header.Get("Anthropic-Beta")
@@ -139,5 +139,41 @@ func TestApplyClaudeHeaders_ForwardsUnmanagedCallerBetas_OAuth(t *testing.T) {
 	}
 	if !strings.Contains(betas, "mid-conversation-system-2026-04-07,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01") {
 		t.Fatalf("Anthropic-Beta = %q, want fable-5-1 per-turn-control assembled", betas)
+	}
+}
+
+// 明确选择U的280 beta模型门；无caller UA/农场身份，不把软件pin解释为强盖caller UA。
+func claudeBeta280Config375() *config.Config {
+	return &config.Config{ClaudeHeaderDefaults: config.ClaudeHeaderDefaults{
+		UserAgent: "claude-cli/2.1.280 (external, cli)", PackageVersion: "0.112.1", RuntimeVersion: "v26.3.0", PinSoftwareBaseline: true,
+	}}
+}
+
+// F request.go:540-545 的固定floor+caller并集，和SD15的显式uncloak分开断言。
+func TestClaudeBeta375ForkDefaultAndExplicitCallerOwnership(t *testing.T) {
+	const floor = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07"
+	const feature = "caller-feature-2099-01-01"
+	for _, mode := range []string{"", "uncloak"} {
+		t.Run("mode="+mode, func(t *testing.T) {
+			incoming := http.Header{"Anthropic-Beta": {feature + ",effort-2025-11-24,claude-code-20250219"}}
+			auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "key-default-beta-375", "cloak_mode": mode}}
+			req, err := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := applyClaudeHeaders(req, auth, "key-default-beta-375", false, nil, []byte(`{"model":"claude-haiku-4-5"}`), &config.Config{}, incoming, false); err != nil {
+				t.Fatal(err)
+			}
+			want := floor + "," + feature + ",effort-2025-11-24"
+			if mode == "uncloak" {
+				want = feature
+			}
+			if got := req.Header.Get("Anthropic-Beta"); got != want {
+				t.Fatalf("mode=%q beta=%q want=%q", mode, got, want)
+			}
+			if req.Header.Get("x-api-key") != "key-default-beta-375" || req.Header.Get("Authorization") != "" {
+				t.Fatal("API-key authority changed")
+			}
+		})
 	}
 }

@@ -83,15 +83,16 @@ func TestApplyClaudeHeaders_OperatorBetaOverridesStableAcrossReapplication(t *te
 		t.Fatalf("CLI Anthropic-Beta = %q, want suffix %q", got, wantSuffix)
 	}
 
+	// 显式caller-owned使用真实扩展beta；uncloak本来就剥除CLI身份beta。
 	incoming := http.Header{}
-	incoming.Set("Anthropic-Beta", claudeCodeBeta)
+	incoming.Set("Anthropic-Beta", "caller-feature-2099-01-01")
 	callerReq := newClaudeHeaderTestRequest(t, incoming)
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "key-caller-owned"}}
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "key-caller-owned", "cloak_mode": "uncloak"}}
 	if err := applyClaudeHeaders(callerReq, auth, "key-caller-owned", false, nil,
 		[]byte(`{"model":"claude-opus-5"}`), cfg, incoming, false); err != nil {
 		t.Fatalf("caller-owned applyClaudeHeaders() error = %v", err)
 	}
-	if got, want := callerReq.Header.Get("Anthropic-Beta"), claudeCodeBeta+wantSuffix; got != want {
+	if got, want := callerReq.Header.Get("Anthropic-Beta"), "caller-feature-2099-01-01"+wantSuffix; got != want {
 		t.Fatalf("caller-owned Anthropic-Beta = %q, want %q", got, want)
 	}
 }
@@ -148,16 +149,17 @@ func TestApplyClaudeHeaders_OperatorBetaStripAppliesToCallerOwnedBetas(t *testin
     header-defaults:
       anthropic-beta-strip: ["fine-grained-tool-streaming-2025-05-14"]
 `)
+	// 显式caller-owned使用真实扩展beta；uncloak本来就剥除CLI身份beta。
 	incoming := http.Header{}
-	incoming.Set("Anthropic-Beta", claudeCodeBeta+",fine-grained-tool-streaming-2025-05-14")
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "key-caller-owned"}}
+	incoming.Set("Anthropic-Beta", "caller-feature-2099-01-01"+",fine-grained-tool-streaming-2025-05-14")
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "key-caller-owned", "cloak_mode": "uncloak"}}
 	req := newClaudeHeaderTestRequest(t, incoming)
 	if err := applyClaudeHeaders(req, auth, "key-caller-owned", false, nil,
 		[]byte(`{"model":"claude-opus-5"}`), cfg, incoming, false); err != nil {
 		t.Fatalf("applyClaudeHeaders() error = %v", err)
 	}
-	if got := req.Header.Get("Anthropic-Beta"); got != claudeCodeBeta {
-		t.Fatalf("Anthropic-Beta = %q, want %q", got, claudeCodeBeta)
+	if got := req.Header.Get("Anthropic-Beta"); got != "caller-feature-2099-01-01" {
+		t.Fatalf("Anthropic-Beta = %q, want %q", got, "caller-feature-2099-01-01")
 	}
 }
 
