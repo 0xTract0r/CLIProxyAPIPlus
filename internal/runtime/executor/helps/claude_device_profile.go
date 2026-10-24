@@ -1585,6 +1585,10 @@ func ApplyClaudeLegacyDeviceHeaders(r *http.Request, ginHeaders http.Header, cfg
 		r.Header.Set(name, fallback)
 	}
 
+	// legacy只在稳定化关闭时使用；平台保留F已有值→入站值→运行平台的优先级。
+	miscEnsure("X-Stainless-Os", mapStainlessOS(), nil)
+	miscEnsure("X-Stainless-Arch", mapStainlessArch(), nil)
+
 	if confirmedClaudeCode {
 		validRuntime := func(value string) bool {
 			if !allowNewer && cfg != nil && strings.TrimSpace(cfg.ClaudeHeaderDefaults.RuntimeVersion) != "" {
@@ -1600,8 +1604,6 @@ func ApplyClaudeLegacyDeviceHeaders(r *http.Request, ginHeaders http.Header, cfg
 		}
 		miscEnsure("X-Stainless-Runtime-Version", profile.RuntimeVersion, validRuntime)
 		miscEnsure("X-Stainless-Package-Version", profile.PackageVersion, validPackage)
-		miscEnsure("X-Stainless-Os", mapStainlessOS(), nil)
-		miscEnsure("X-Stainless-Arch", mapStainlessArch(), nil)
 		if clientUA := strings.TrimSpace(ginHeaders.Get("User-Agent")); plausibleClaudeCodeUserAgent(clientUA, cfg) {
 			r.Header.Set("User-Agent", clientUA)
 			return
@@ -1612,7 +1614,5 @@ func ApplyClaudeLegacyDeviceHeaders(r *http.Request, ginHeaders http.Header, cfg
 	// into the upstream Claude Code SDK fingerprint.
 	r.Header.Set("X-Stainless-Runtime-Version", profile.RuntimeVersion)
 	r.Header.Set("X-Stainless-Package-Version", profile.PackageVersion)
-	r.Header.Set("X-Stainless-Os", profile.OS)
-	r.Header.Set("X-Stainless-Arch", profile.Arch)
 	r.Header.Set("User-Agent", profile.UserAgent)
 }
