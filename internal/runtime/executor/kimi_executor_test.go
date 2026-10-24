@@ -607,8 +607,10 @@ func TestKimiExecutorClaudeStreamForwardsAnthropicBetaAndLogsUpstream(t *testing
 		t.Fatalf("upstream URL = %q, want Kimi messages endpoint", got)
 	}
 	upstreamBetas := upstreamRequest.Header.Get("Anthropic-Beta")
-	if upstreamBetas != "client-beta-one,client-beta-two" {
-		t.Fatalf("Anthropic-Beta = %q, want caller beta values only", upstreamBetas)
+	// 固定F=1228bf9 request:540-545：维护floor与真实caller有序去重合并。
+	const fixedForkFloor376 = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07"
+	if want := fixedForkFloor376 + ",client-beta-one,client-beta-two"; upstreamBetas != want {
+		t.Fatalf("Anthropic-Beta = %q, want fixed fork floor plus caller %q", upstreamBetas, want)
 	}
 
 	rawAPIRequest, existsRequest := ginCtx.Get("API_REQUEST")
