@@ -235,6 +235,9 @@ func codexIndependentLeafToolDeclaration(tool gjson.Result) bool {
 }
 
 func (e *CodexWebsocketsExecutor) acquireSessionLease(ctx context.Context, sessionID string, auth *cliproxyauth.Auth, wsURL string, independent bool) (*codexWebsocketSessionLease, error) {
+	if cliproxyexecutor.RequiredUpstreamWebsocket(ctx) {
+		return e.acquireBoundContinuationLease(ctx, sessionID, auth, wsURL)
+	}
 	proxy := executionProxyURL(ctx, e.cfg, auth)
 	base := e.getOrCreateSession(sessionID, auth, wsURL, proxy)
 	if base == nil {
@@ -304,6 +307,81 @@ func (e *CodexWebsocketsExecutor) acquireSessionLease(ctx context.Context, sessi
 	}
 }
 
+// A required continuation may borrow only its live owner binding. A global
+// config reload changes future dials, never the route of this existing socket.
+// No fallback dial is authorized here. Keep the close order: owner fence -> store.
+func (e *CodexWebsocketsExecutor) acquireBoundContinuationLease(ctx context.Context, sessionID string, auth *cliproxyauth.Auth, wsURL string) (*codexWebsocketSessionLease, error) {
+	replay := func() (*codexWebsocketSessionLease, error) {
+		return nil, cliproxyexecutor.NewUpstreamWebsocketReplayRequiredError()
+	}
+	if auth == nil || strings.TrimSpace(sessionID) == "" {
+		return replay()
+	}
+	store := e.sessionStore()
+	store.mu.Lock()
+	owner := store.disconnects[strings.TrimSpace(sessionID)]
+	store.mu.Unlock()
+	if owner == nil {
+		return replay()
+	}
+	// Pin the observed response-state generation before any wait. A wakeup may
+	// only retry this binding; a reopened logical ID owns different history.
+	owner.connMu.Lock()
+	sess, generation := owner.activeDisconnectSession, owner.activeDisconnectConn
+	owner.connMu.Unlock()
+	if sess == nil || generation == nil {
+		return replay()
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if err := lockCodexWebsocketContext(ctx, &owner.interruptFence); err != nil {
+			return nil, err
+		}
+		store.mu.Lock()
+		if store.leaseChanged == nil {
+			store.leaseChanged = make(chan struct{})
+		}
+		changed := store.leaseChanged
+		owner.connMu.Lock()
+		sameGeneration := !owner.closed && owner.activeDisconnectSession == sess && owner.activeDisconnectConn == generation
+		owner.connMu.Unlock()
+		valid := store.disconnects[strings.TrimSpace(sessionID)] == owner && sameGeneration
+		acquired := false
+		if valid {
+			sess.connMu.Lock()
+			key := codexWebsocketSessionStoreKey(sessionID, auth, wsURL, sess.proxyURL)
+			valid = !sess.closed && sess.conn == generation && sess.connCloser != nil && sess.hasConnCfg &&
+				sess.connEpoch == auth.RegistrationEpoch && sess.connProvider == auth.Provider && sess.authID == auth.ID && sess.wsURL == wsURL &&
+				sess.connAuthProxy == strings.TrimSpace(auth.ProxyURL) && sess.connRequestProxy == cliproxyexecutor.RequestProxyURL(ctx) &&
+				store.sessions[key] == sess
+			if valid {
+				acquired = sess.reqMu.TryLock()
+			}
+			sess.connMu.Unlock()
+		}
+		store.mu.Unlock()
+		owner.interruptFence.Unlock()
+		if !valid {
+			return replay()
+		}
+		if acquired {
+			lease := &codexWebsocketSessionLease{store: store, session: sess}
+			if err := ctx.Err(); err != nil {
+				lease.release()
+				return nil, err
+			}
+			return lease, nil
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-changed:
+		}
+	}
+}
+
 var globalCodexWebsocketSessionStore = &codexWebsocketSessionStore{
 	sessions: make(map[string]*codexWebsocketSession),
 }
@@ -343,6 +421,10 @@ type codexWebsocketSession struct {
 	authID                    string
 	proxyURL                  string
 	useSIWC                   bool
+	connProvider              string
+	connEpoch                 uint64
+	connAuthProxy             string
+	connRequestProxy          string
 	connCfg                   *config.Config
 	hasConnCfg                bool
 	multiAgentV2OptimizedConn *websocket.Conn
@@ -1270,6 +1352,13 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConnWithSIWC(ctx context.Context
 	}
 	sess.conn = conn
 	sess.connCloser = closer
+	sess.connEpoch, sess.connProvider, sess.connAuthProxy = 0, "", ""
+	if auth != nil {
+		sess.connEpoch = auth.RegistrationEpoch
+		sess.connProvider = auth.Provider
+		sess.connAuthProxy = strings.TrimSpace(auth.ProxyURL)
+	}
+	sess.connRequestProxy = cliproxyexecutor.RequestProxyURL(ctx)
 	sess.connCfg = e.cfg
 	sess.hasConnCfg = true
 	sess.multiAgentV2OptimizedConn = nil
@@ -1564,13 +1653,18 @@ func codexWebsocketSessionStoreKey(sessionID string, auth *cliproxyauth.Auth, ws
 	} else if auth != nil {
 		proxyURL = strings.TrimSpace(auth.ProxyURL)
 	}
+	epoch := uint64(0)
+	if auth != nil {
+		epoch = auth.RegistrationEpoch
+	}
 	return fmt.Sprintf(
-		"%s|%s|%s|%s|%s",
+		"%s|%s|%s|%s|%s|epoch:%d",
 		baseSessionID,
 		codexWebsocketAuthKey(auth),
 		proxyURL,
 		strings.TrimSpace(wsURL),
 		codexWebsocketTransportProfileToken(auth),
+		epoch,
 	)
 }
 

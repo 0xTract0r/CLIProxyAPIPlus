@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -243,6 +244,10 @@ func TestEnsureExecutorsForAuth_XAIReplacesExecutorAfterConfigUpdate(t *testing.
 }
 
 func TestApplyWatcherConfigUpdate_PreservesExistingWebsocketConnections(t *testing.T) {
+	if watcher265RunIsolated(t) {
+		return
+	}
+	fixtureTLS := watcher265TLS(t)
 	testCases := []struct {
 		name     string
 		provider string
@@ -257,7 +262,13 @@ func TestApplyWatcherConfigUpdate_PreservesExistingWebsocketConnections(t *testi
 			upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 			var connections atomic.Int32
 			var closedConnections atomic.Int32
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Host != "watcher265.invalid" || r.TLS == nil || r.TLS.ServerName != "watcher265.invalid" {
+					t.Error("wrong authority/TLS/SNI")
+					http.Error(w, "denied", 403)
+					return
+				}
+				t.Logf("sink authority=%s path=%s TLS=true SNI=%s", r.Host, r.URL.Path, r.TLS.ServerName)
 				conn, errUpgrade := upgrader.Upgrade(w, r, nil)
 				if errUpgrade != nil {
 					t.Errorf("upgrade websocket: %v", errUpgrade)
@@ -278,14 +289,25 @@ func TestApplyWatcherConfigUpdate_PreservesExistingWebsocketConnections(t *testi
 					}
 				}
 			}))
+			server.TLS = fixtureTLS.Clone()
+			server.StartTLS()
 			defer server.Close()
+			logicalBaseURL := "https://watcher265.invalid"
 
+			proxyURL, proxyConnects := newWatcher265LoopbackCONNECTProxy(t, "watcher265.invalid:443", server.Listener.Addr().String())
 			initialCfg := &config.Config{
 				SDKConfig: config.SDKConfig{
+					ProxyURL:               proxyURL,
 					DisableImageGeneration: internalconfig.DisableImageGenerationAll,
 				},
 			}
+			// 保原OAuth凭据/模型ID，明确endpoint配置catalog供重载重注册。
+			initialCfg.CodexKey = []config.CodexKey{{APIKey: "fixture-catalog-only", BaseURL: logicalBaseURL, Models: []internalconfig.CodexModel{{Name: tt.model}}}}
+			initialCfg.XAIKey = []config.CodexKey{{APIKey: "fixture-catalog-only", BaseURL: logicalBaseURL, Models: []internalconfig.CodexModel{{Name: tt.model}}}}
 			manager := coreauth.NewManager(nil, nil, nil)
+			if !manager.ApplyConfigWithCooldownStateStore(context.Background(), initialCfg, nil) {
+				t.Fatal("initial manager config rejected")
+			}
 			service := &Service{
 				cfg:         initialCfg,
 				coreManager: manager,
@@ -301,7 +323,7 @@ func TestApplyWatcherConfigUpdate_PreservesExistingWebsocketConnections(t *testi
 				Provider: tt.provider,
 				Status:   coreauth.StatusActive,
 				Attributes: map[string]string{
-					"base_url":   server.URL,
+					"base_url":   logicalBaseURL,
 					"websockets": "true",
 				},
 				Metadata: map[string]any{
@@ -312,7 +334,10 @@ func TestApplyWatcherConfigUpdate_PreservesExistingWebsocketConnections(t *testi
 			if _, errReg := manager.Register(context.Background(), auth); errReg != nil {
 				t.Fatalf("register auth: %v", errReg)
 			}
-			GlobalModelRegistry().RegisterClient(auth.ID, tt.provider, []*ModelInfo{{ID: tt.model}})
+			service.registerModelsForAuth(context.Background(), auth)
+			if !GlobalModelRegistry().ClientSupportsModel(auth.ID, tt.model) {
+				t.Fatal("initial configured catalog did not publish original model")
+			}
 			t.Cleanup(func() { GlobalModelRegistry().UnregisterClient(auth.ID) })
 			service.ensureExecutorsForAuth(auth)
 
@@ -360,7 +385,20 @@ func TestApplyWatcherConfigUpdate_PreservesExistingWebsocketConnections(t *testi
 					Strategy: "fill-first",
 				},
 			}
+			reloadedCfg.CodexKey = initialCfg.CodexKey
+			reloadedCfg.XAIKey = initialCfg.XAIKey
+			if auth.ProxyURL != "" {
+				t.Fatal("account proxy override defeats global reload fixture")
+			}
+			if proxyConnects.Load() == 0 {
+				t.Fatal("first turn bypassed controlled global proxy")
+			}
+			beforeReloadProxy := proxyConnects.Load()
 			service.applyWatcherConfigUpdate(reloadedCfg)
+			if !GlobalModelRegistry().ClientSupportsModel(auth.ID, tt.model) {
+				t.Fatal("reload lost explicitly configured original model")
+			}
+			t.Logf("after reload model=%s proxy-connects=%d account-proxy-empty=%v", tt.model, proxyConnects.Load(), auth.ProxyURL == "")
 
 			updatedExec, okUpdated := manager.Executor(tt.provider)
 			if !okUpdated || updatedExec == nil {
@@ -379,6 +417,10 @@ func TestApplyWatcherConfigUpdate_PreservesExistingWebsocketConnections(t *testi
 				t.Fatalf("connections after continuation turn = %d, want 1 (reused existing connection)", got)
 			}
 
+			if proxyConnects.Load() != beforeReloadProxy {
+				t.Fatal("continuation redialed initial proxy")
+			}
+			t.Log("continuation reused existing upstream connection")
 			newSessionID := sessionID + "-new"
 			t.Cleanup(func() { manager.CloseExecutionSession(newSessionID) })
 			_, errNewStream := manager.ExecuteStream(
@@ -398,6 +440,10 @@ func TestApplyWatcherConfigUpdate_PreservesExistingWebsocketConnections(t *testi
 			if errNewStream == nil {
 				t.Fatal("expected new session after config hot reload to use new proxy configuration and fail to dial 127.0.0.1:1")
 			}
+			if !strings.Contains(errNewStream.Error(), "127.0.0.1:1") {
+				t.Fatalf("new session failed before bad global proxy dial: %v", errNewStream)
+			}
+			t.Logf("new session reached bad global proxy: %v", errNewStream)
 		})
 	}
 }
@@ -436,4 +482,156 @@ func TestRegisterExecutorsForAuths_DisabledXAIDoesNotSkipSubsequentForceReplace(
 	if firstExecutor == secondExecutor {
 		t.Fatal("expected active xai auth after disabled xai auth to replace executor")
 	}
+}
+
+func TestWatcher349CredentialEpochFence(t *testing.T) {
+	if watcher265RunIsolated(t) {
+		return
+	}
+	fixtureTLS := watcher265TLS(t)
+	testCases := []struct {
+		name     string
+		provider string
+		model    string
+	}{
+		{name: "codex", provider: "codex", model: "gpt-6-astra"},
+		{name: "xai", provider: "xai", model: "grok-4.6"},
+	}
+
+	for _, tt := range testCases {
+ if tt.provider != "codex" {continue}
+		t.Run(tt.name, func(t *testing.T) {
+			upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+			var connections atomic.Int32
+			var closedConnections atomic.Int32
+			server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Host != "watcher265.invalid" || r.TLS == nil || r.TLS.ServerName != "watcher265.invalid" {
+					t.Error("wrong authority/TLS/SNI")
+					http.Error(w, "denied", 403)
+					return
+				}
+				t.Logf("sink authority=%s path=%s TLS=true SNI=%s", r.Host, r.URL.Path, r.TLS.ServerName)
+				conn, errUpgrade := upgrader.Upgrade(w, r, nil)
+				if errUpgrade != nil {
+					t.Errorf("upgrade websocket: %v", errUpgrade)
+					return
+				}
+				connections.Add(1)
+				defer func() {
+					closedConnections.Add(1)
+					_ = conn.Close()
+				}()
+				for {
+					if _, _, errRead := conn.ReadMessage(); errRead != nil {
+						return
+					}
+					completed := []byte(`{"type":"response.completed","response":{"id":"resp-1","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`)
+					if errWrite := conn.WriteMessage(websocket.TextMessage, completed); errWrite != nil {
+						return
+					}
+				}
+			}))
+			server.TLS = fixtureTLS.Clone()
+			server.StartTLS()
+			defer server.Close()
+			logicalBaseURL := "https://watcher265.invalid"
+
+			proxyURL, proxyConnects := newWatcher265LoopbackCONNECTProxy(t, "watcher265.invalid:443", server.Listener.Addr().String())
+			initialCfg := &config.Config{
+				SDKConfig: config.SDKConfig{
+					ProxyURL:               proxyURL,
+					DisableImageGeneration: internalconfig.DisableImageGenerationAll,
+				},
+			}
+			// 保原OAuth凭据/模型ID，明确endpoint配置catalog供重载重注册。
+			initialCfg.CodexKey = []config.CodexKey{{APIKey: "fixture-catalog-only", BaseURL: logicalBaseURL, Models: []internalconfig.CodexModel{{Name: tt.model}}}}
+			initialCfg.XAIKey = []config.CodexKey{{APIKey: "fixture-catalog-only", BaseURL: logicalBaseURL, Models: []internalconfig.CodexModel{{Name: tt.model}}}}
+			manager := coreauth.NewManager(nil, nil, nil)
+			if !manager.ApplyConfigWithCooldownStateStore(context.Background(), initialCfg, nil) {
+				t.Fatal("initial manager config rejected")
+			}
+			service := &Service{
+				cfg:         initialCfg,
+				coreManager: manager,
+				pluginHost:  pluginhost.New(),
+			}
+			t.Cleanup(func() {
+				sdkAuth.RegisterPluginAuthParser(nil)
+				sdktranslator.SetPluginHooks(nil)
+			})
+
+			auth := &coreauth.Auth{
+				ID:       tt.provider + "-ws-hot-reload-auth",
+				Provider: tt.provider,
+				Status:   coreauth.StatusActive,
+				Attributes: map[string]string{
+					"base_url":   logicalBaseURL,
+					"websockets": "true",
+				},
+				Metadata: map[string]any{
+					"access_token": "test-token",
+					"websockets":   true,
+				},
+			}
+			if _, errReg := manager.Register(context.Background(), auth); errReg != nil {
+				t.Fatalf("register auth: %v", errReg)
+			}
+			service.registerModelsForAuth(context.Background(), auth)
+			if !GlobalModelRegistry().ClientSupportsModel(auth.ID, tt.model) {
+				t.Fatal("initial configured catalog did not publish original model")
+			}
+			t.Cleanup(func() { GlobalModelRegistry().UnregisterClient(auth.ID) })
+			service.ensureExecutorsForAuth(auth)
+
+			sessionID := "hot-reload-ws-session-" + tt.provider
+			t.Cleanup(func() { manager.CloseExecutionSession(sessionID) })
+
+			runTurn := func(ctx context.Context, payload string) {
+				t.Helper()
+				result, errStream := manager.ExecuteStream(
+					ctx,
+					[]string{tt.provider},
+					cliproxyexecutor.Request{Model: tt.model, Payload: []byte(payload)},
+					cliproxyexecutor.Options{
+						Stream:         true,
+						SourceFormat:   sdktranslator.FormatOpenAIResponse,
+						ResponseFormat: sdktranslator.FormatOpenAIResponse,
+						Metadata: map[string]any{
+							cliproxyexecutor.ExecutionSessionMetadataKey: sessionID,
+							cliproxyexecutor.PinnedAuthMetadataKey:       auth.ID,
+						},
+					},
+				)
+				if errStream != nil {
+					t.Fatalf("ExecuteStream error = %v", errStream)
+				}
+				for chunk := range result.Chunks {
+					if chunk.Err != nil {
+						t.Fatalf("ExecuteStream chunk error = %v", chunk.Err)
+					}
+				}
+			}
+
+			wsCtx := cliproxyexecutor.WithDownstreamWebsocket(context.Background())
+			runTurn(wsCtx, `{"model":"`+tt.model+`","input":[{"type":"message","role":"user","content":"turn 1"}]}`)
+			if got := connections.Load(); got != 1 {
+				t.Fatalf("connections after turn 1 = %d, want 1", got)
+			}
+
+            if proxyConnects.Load()!=1 {t.Fatal("epoch probe first turn did not traverse controlled global proxy")}
+            previous, _ := manager.GetByID(auth.ID)
+            replacement := previous.Clone()
+            replacement.Metadata["access_token"] = "fresh-349-token"
+            next, errReauth := manager.RegisterReauthenticated(coreauth.WithSkipPersist(context.Background()), replacement)
+            if errReauth != nil {t.Fatal(errReauth)}
+            if next.RegistrationEpoch <= previous.RegistrationEpoch || next.CredentialVersion <= previous.CredentialVersion {t.Fatal("probe did not advance credential epoch/version")}
+            t.Logf("same-ID reauth epoch=%d->%d version=%d->%d",previous.RegistrationEpoch,next.RegistrationEpoch,previous.CredentialVersion,next.CredentialVersion)
+
+            continuationCtx := cliproxyexecutor.WithRequiredUpstreamWebsocket(wsCtx)
+            result, err := manager.ExecuteStream(continuationCtx, []string{tt.provider}, cliproxyexecutor.Request{Model:tt.model,Payload:[]byte(`{"model":"`+tt.model+`","previous_response_id":"resp-1","input":[{"type":"message","role":"user","content":"after reauth"}]}`)},cliproxyexecutor.Options{Stream:true,SourceFormat:sdktranslator.FormatOpenAIResponse,ResponseFormat:sdktranslator.FormatOpenAIResponse,Metadata:map[string]any{cliproxyexecutor.ExecutionSessionMetadataKey:sessionID,cliproxyexecutor.PinnedAuthMetadataKey:auth.ID}})
+            if err == nil {for chunk:=range result.Chunks {if chunk.Err!=nil {err=chunk.Err;break}}}
+            if err == nil {t.Fatalf("same logical owner reused old credential connection after reauth: connections=%d closed=%d",connections.Load(),closedConnections.Load())}
+            t.Logf("reauth continuation rejected: %v",err)
+        })
+    }
 }
