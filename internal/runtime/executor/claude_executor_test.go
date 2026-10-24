@@ -11923,6 +11923,16 @@ func TestClaudeExecutor_Explicit1MAliasUsesOfficialModelWithoutLegacyContextBeta
 		"api_key":  "sk-ant-oat-test",
 		"base_url": server.URL,
 	}}
+	// 仅补本地正例缺失的账号元数据，不覆盖现有token/identity/operator配置。
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	for key, value := range claudeOAuthTestMetadata() {
+		if _, exists := auth.Metadata[key]; !exists {
+			auth.Metadata[key] = value
+		}
+	}
+
 	payload := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
 
 	tests := []struct {
@@ -11996,6 +12006,16 @@ func TestClaudeExecutor_AlignsBillingVersionWithStabilizedUserAgent(t *testing.T
 			"tool_prefix": "disabled",
 		},
 	}
+	// 仅补本地正例缺失的账号元数据，不覆盖现有token/identity/operator配置。
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	for key, value := range claudeOAuthTestMetadata() {
+		if _, exists := auth.Metadata[key]; !exists {
+			auth.Metadata[key] = value
+		}
+	}
+
 	ctx := contextWithGinHeaders(map[string]string{
 		"User-Agent":                  "claude-cli/2.1.80 (external, cli)",
 		"X-Stainless-Package-Version": "0.81.0",
@@ -12055,6 +12075,16 @@ func TestClaudeExecutor_RewritesStaleBillingVersionToStabilizedUserAgent(t *test
 			"tool_prefix": "disabled",
 		},
 	}
+	// 仅补本地正例缺失的账号元数据，不覆盖现有token/identity/operator配置。
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	for key, value := range claudeOAuthTestMetadata() {
+		if _, exists := auth.Metadata[key]; !exists {
+			auth.Metadata[key] = value
+		}
+	}
+
 	ctx := contextWithGinHeaders(map[string]string{
 		"User-Agent":                  "claude-cli/2.1.83 (external, cli)",
 		"X-Stainless-Package-Version": "0.81.0",
@@ -12115,6 +12145,16 @@ func TestClaudeExecutor_OutboundUserAgentSuffixMatchesCCEntrypoint(t *testing.T)
 			"tool_prefix": "disabled",
 		},
 	}
+	// 仅补本地正例缺失的账号元数据，不覆盖现有token/identity/operator配置。
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	for key, value := range claudeOAuthTestMetadata() {
+		if _, exists := auth.Metadata[key]; !exists {
+			auth.Metadata[key] = value
+		}
+	}
+
 	payload := []byte(`{"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.63.abc; cc_entrypoint=cli; cch=12345;"},{"type":"text","text":"existing"}],"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
 
 	// Seed the high-water device profile with an SDK ("claude --print") request:
@@ -12200,6 +12240,16 @@ func TestClaudeExecutor_MessagesEntrypointMatchesUserAgentInAutoCloakMode(t *tes
 				"tool_prefix": "disabled",
 			},
 		}
+		// 仅补本地正例缺失的账号元数据，不覆盖现有token/identity/operator配置。
+		if auth.Metadata == nil {
+			auth.Metadata = make(map[string]any)
+		}
+		for key, value := range claudeOAuthTestMetadata() {
+			if _, exists := auth.Metadata[key]; !exists {
+				auth.Metadata[key] = value
+			}
+		}
+
 		ctx := contextWithGinHeaders(map[string]string{
 			"User-Agent":                  inboundUA,
 			"X-Stainless-Package-Version": "0.90.0",
@@ -12288,6 +12338,16 @@ func TestClaudeExecutor_AlignsBillingVersionWithSavedManagedUserAgent(t *testing
 			},
 		},
 	}
+	// 仅补本地正例缺失的账号元数据，不覆盖现有token/identity/operator配置。
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	for key, value := range claudeOAuthTestMetadata() {
+		if _, exists := auth.Metadata[key]; !exists {
+			auth.Metadata[key] = value
+		}
+	}
+
 	payload := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
 
 	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
@@ -12500,6 +12560,16 @@ func TestClaudeExecutor_UsesOptionsHeadersForClientVersionObservation(t *testing
 			"tool_prefix": "disabled",
 		},
 	}
+	// 仅补本地正例缺失的账号元数据，不覆盖现有token/identity/operator配置。
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	for key, value := range claudeOAuthTestMetadata() {
+		if _, exists := auth.Metadata[key]; !exists {
+			auth.Metadata[key] = value
+		}
+	}
+
 	payload := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
 	headers := http.Header{
 		"User-Agent":                  []string{"claude-cli/2.1.262 (external, cli)"},
@@ -12564,6 +12634,16 @@ func TestClaudeExecutorStream_AlignsBillingVersionWithStabilizedUserAgent(t *tes
 			"tool_prefix": "disabled",
 		},
 	}
+	// 仅补本地正例缺失的账号元数据，不覆盖现有token/identity/operator配置。
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	for key, value := range claudeOAuthTestMetadata() {
+		if _, exists := auth.Metadata[key]; !exists {
+			auth.Metadata[key] = value
+		}
+	}
+
 	ctx := contextWithGinHeaders(map[string]string{
 		"User-Agent":                  "claude-cli/2.1.81 (external, cli)",
 		"X-Stainless-Package-Version": "0.81.0",
@@ -12628,6 +12708,16 @@ func TestClaudeExecutorStream_RewritesStaleBillingVersionToStabilizedUserAgent(t
 			"tool_prefix": "disabled",
 		},
 	}
+	// 仅补本地正例缺失的账号元数据，不覆盖现有token/identity/operator配置。
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	for key, value := range claudeOAuthTestMetadata() {
+		if _, exists := auth.Metadata[key]; !exists {
+			auth.Metadata[key] = value
+		}
+	}
+
 	ctx := contextWithGinHeaders(map[string]string{
 		"User-Agent":                  "claude-cli/2.1.84 (external, cli)",
 		"X-Stainless-Package-Version": "0.81.0",
