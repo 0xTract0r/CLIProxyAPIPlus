@@ -47,3 +47,28 @@ func TestLocalRecoveryHintsSurviveDefaultHeaderPolicyAndEnrichment(t *testing.T)
 		}
 	}
 }
+
+func TestAuthUnavailableWithoutTrustedLocalHintUsesFallback(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, code := range []string{"auth_not_found", "auth_unavailable"} {
+		for _, streaming := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/stream=%t", code, streaming), func(t *testing.T) {
+				err := &coreauth.Error{Code: code, Message: "synthetic empty pool", HTTPStatus: 503}
+				if got := coreauth.SafeResponseHeaders(err).Get("Retry-After"); got != "" {
+					t.Fatalf("expected no trusted local hint, got %q", got)
+				}
+				recorder := httptest.NewRecorder()
+				recorder.Header().Set("Retry-After", "99") // 既有writer值不能伪装为可信local hint。
+				ctx, _ := gin.CreateTestContext(recorder)
+				ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+				if streaming {
+					ctx.Request.Header.Set("Accept", "text/event-stream")
+				}
+				NewBaseAPIHandlers(nil, nil).WriteErrorResponse(ctx, executionErrorMessage(err))
+				if recorder.Code != 503 || recorder.Header().Get("Retry-After") != "30" {
+					t.Fatalf("status=%d hint=%q", recorder.Code, recorder.Header().Get("Retry-After"))
+				}
+			})
+		}
+	}
+}

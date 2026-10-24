@@ -153,14 +153,15 @@ func (h *BaseAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.Erro
 		return
 	}
 	if msg != nil && msg.Error != nil {
-		for _, value := range coreauth.SafeResponseHeaders(msg.Error).Values("Retry-After") {
+		localHeaders := coreauth.SafeResponseHeaders(msg.Error)
+		for _, value := range localHeaders.Values("Retry-After") {
 			c.Writer.Header().Add("Retry-After", value)
 		}
 		// Anti-correlation back-pressure (fork): auth-selection 503s (auth_not_found /
 		// auth_unavailable) carry no Retry-After of their own, so synthesize a short,
 		// fixed hint directly from the error code. This is independent of the passthrough
 		// gate and of msg.Addon, so it never relaxes the Addon passthrough below.
-		if retryAfter, ok := authUnavailableRetryAfter(msg.Error); ok {
+		if retryAfter, ok := authUnavailableRetryAfter(msg.Error); ok && strings.TrimSpace(localHeaders.Get("Retry-After")) == "" {
 			c.Writer.Header().Set("Retry-After", retryAfter)
 		}
 	}
