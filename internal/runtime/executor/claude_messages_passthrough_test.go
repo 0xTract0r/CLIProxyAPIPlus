@@ -127,7 +127,8 @@ func TestClaudeExecutor_DirectMessagesOfficialUpstreamPreservesCallerShape(t *te
 func directClaudeAPIKeyAuth() *cliproxyauth.Auth {
 	return &cliproxyauth.Auth{
 		Attributes: map[string]string{
-			"api_key": "sk-ant-api03-direct-messages-test",
+			"api_key":    "sk-ant-api03-direct-messages-test",
+			"cloak_mode": "uncloak",
 		},
 	}
 }

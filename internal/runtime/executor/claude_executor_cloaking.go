@@ -1832,6 +1832,10 @@ func applyCloakingWithDeviceIdentityPolicy(
 	explicitCacheMode ...bool,
 ) ([]byte, bool, error) {
 	policy, settings := resolveClaudeWirePolicy(cfg, auth, apiKey, confirmedClaudeCode, getClientUserAgent(ctx))
+	// 显式 API-key caller 所有权在身份改写前返回；OAuth 与 CLI profile 仍走绑定。
+	if policy.Uncloak && !policy.OAuth {
+		return payload, false, nil
+	}
 	// The account-bound device ID also applies to confirmed native clients and
 	// cloak=never; it must run before the broader-cloaking early return.
 	authDir := ""
