@@ -794,6 +794,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		pinnedAuthAttempted := false
 		cliCtx, cliCancel := h.GetContextWithCancel(h, c, executionParent)
 		cliCtx = cliproxyexecutor.WithDownstreamWebsocket(cliCtx)
+		cliCtx = cliproxyexecutor.WithLocalStreamInterruptTracker(cliCtx)
 		if duplexInput != nil {
 			cliCtx = cliproxyexecutor.WithWebsocketInput(cliCtx, duplexInput)
 			cliCtx = cliproxyexecutor.WithWebsocketAuthCheck(cliCtx, func(authID string) bool {
@@ -867,6 +868,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 				toolCacheTurn:            toolCacheTurn,
 				suppressError:            replayPinnedAuthFailure,
 				localInterrupt:           localInterrupt,
+				localInterruptible:       func() bool { return cliproxyexecutor.LocalStreamInterruptible(cliCtx) },
 			},
 		)
 		if errForward != nil {

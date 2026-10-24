@@ -376,7 +376,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 				reporter.PublishFailure(ctx, emptyErr)
 				closedCh := make(chan cliproxyexecutor.StreamChunk)
 				close(closedCh)
-				return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: closedCh}, nil
+				return &cliproxyexecutor.StreamResult{InterruptOwner: cliproxyexecutor.StreamInterruptLocal, Headers: httpResp.Header.Clone(), Chunks: closedCh}, nil
 			}
 			streamErr := newCodexIncompleteStreamError()
 			helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
@@ -401,12 +401,12 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		// stream and delivers this failure in-stream, exactly as the unbuffered path would.
 		out <- cliproxyexecutor.StreamChunk{Err: bootstrapTerminalErr}
 		close(out)
-		return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
+		return &cliproxyexecutor.StreamResult{InterruptOwner: cliproxyexecutor.StreamInterruptLocal, Headers: httpResp.Header.Clone(), Chunks: out}, nil
 	}
 	if immediateTerminal {
 		closeBootstrapBody()
 		close(out)
-		return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
+		return &cliproxyexecutor.StreamResult{InterruptOwner: cliproxyexecutor.StreamInterruptLocal, Headers: httpResp.Header.Clone(), Chunks: out}, nil
 	}
 
 	emittedCount := 0
@@ -533,5 +533,5 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		case <-ctx.Done():
 		}
 	}()
-	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
+	return &cliproxyexecutor.StreamResult{InterruptOwner: cliproxyexecutor.StreamInterruptLocal, Headers: httpResp.Header.Clone(), Chunks: out}, nil
 }

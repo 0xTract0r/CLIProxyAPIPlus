@@ -357,7 +357,7 @@ func wrapHomeStream(ctx context.Context, result *cliproxyexecutor.StreamResult, 
 			}
 		}
 	}()
-	return &cliproxyexecutor.StreamResult{Headers: result.Headers, Chunks: out}
+	return &cliproxyexecutor.StreamResult{InterruptOwner: result.InterruptOwner, Headers: result.Headers, Chunks: out}
 }
 
 func sanitizeDownstreamWebsocketFallbackRequest(ctx context.Context, auth *Auth, req cliproxyexecutor.Request) cliproxyexecutor.Request {

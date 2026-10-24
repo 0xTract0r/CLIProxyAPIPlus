@@ -262,9 +262,19 @@ type StreamChunk struct {
 	Err error
 }
 
+// StreamInterruptOwner is trusted control ownership, never inferred from headers/body.
+// Zero preserves local context cancellation for existing executors and plugins.
+type StreamInterruptOwner uint8
+
+const (
+	StreamInterruptLocal StreamInterruptOwner = iota
+	StreamInterruptNativeWebsocket
+)
+
 // StreamResult wraps the streaming response, providing both the chunk channel
 // and the upstream HTTP response headers captured before streaming begins.
 type StreamResult struct {
+	InterruptOwner StreamInterruptOwner
 	// Headers carries upstream HTTP response headers from the initial connection.
 	Headers http.Header
 	// Chunks is the channel of streaming payload units.

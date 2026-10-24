@@ -42,7 +42,7 @@ func (h *BaseAPIHandler) streamWithPluginExecutor(ctx context.Context, entryProt
 		close(errChan)
 		return nil, nil, errChan
 	}
-	execCtx, nestedTracker := withNestedExecutionTracker(coreusage.WithStream(ctx, true))
+	execCtx, nestedTracker := withNestedExecutionTracker(coreusage.WithStream(coreexecutor.WithLocalStreamInterruptTracker(ctx), true))
 	req, opts := h.pluginExecutorRequest(execCtx, entryProtocol, responseProtocol, modelName, originalRequestedModel, rawJSON, alt, true, execOptions)
 	lifecycle := h.newRequestLifecycleTracker(execCtx, entryProtocol, modelName, originalRequestedModel, true, opts.Metadata, execOptions.SkipInterceptorPluginID)
 	var interceptErr *interfaces.ErrorMessage
@@ -92,6 +92,7 @@ func (h *BaseAPIHandler) streamWithPluginExecutor(ctx context.Context, entryProt
 		return nil, nil, errChan
 	}
 
+	coreexecutor.SetLocalStreamInterruptible(ctx, streamResult.InterruptOwner != coreexecutor.StreamInterruptNativeWebsocket)
 	passthroughHeadersEnabled := executionPassthroughHeaders(h.CurrentConfig(), execOptions.InternalSource)
 	interceptorHost := h.interceptorHost()
 	streamInterceptorsActive := streamInterceptorsEnabled(interceptorHost)
@@ -352,6 +353,9 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 		return nil, nil, errChan
 	}
 	ctx = enrichContextWithSessionHierarchy(ctx, opts.Headers, req.Payload, opts.Metadata)
+	selectedOwnerContext := ctx
+	// Attempts/nested calls receive a private tracker; late work cannot publish into this turn.
+	ctx = coreexecutor.WithLocalStreamInterruptTracker(ctx)
 	streamResult, err := h.AuthManager.ExecuteStream(ctx, providers, req, opts)
 	if err != nil {
 		err = enrichAuthSelectionError(err, providers, normalizedModel)
@@ -385,6 +389,7 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 	rawStreamHeaders := cloneHeader(streamResult.Headers)
 	baseStreamHeaders := cloneHeader(streamResult.Headers)
 	chunks := streamResult.Chunks
+	selectedTransport := streamResult.InterruptOwner
 	if chunks == nil {
 		closed := make(chan coreexecutor.StreamChunk)
 		close(closed)
@@ -580,6 +585,7 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 		if responseSSEValidator != nil {
 			responseSSEValidator = &sseJSONValidationState{}
 		}
+		selectedTransport = retryResult.InterruptOwner
 		chunks = retryResult.Chunks
 		if chunks == nil {
 			closed := make(chan coreexecutor.StreamChunk)
@@ -588,6 +594,9 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 		}
 	}
 
+	// Commit provenance once, after all bootstrap retries, before delivering any payload.
+	// Failed/discarded attempts and plugins cannot mutate this turn's transport fact.
+	coreexecutor.SetLocalStreamInterruptible(selectedOwnerContext, bootstrapErr == nil && !streamCanceledBeforeRead && selectedTransport != coreexecutor.StreamInterruptNativeWebsocket)
 	upstreamHeaders := downstreamHeadersAfterInterceptors(baseStreamHeaders, rawStreamHeaders, passthroughHeadersEnabled)
 	if upstreamHeaders == nil && (passthroughHeadersEnabled || streamInterceptorsActive) {
 		upstreamHeaders = make(http.Header)

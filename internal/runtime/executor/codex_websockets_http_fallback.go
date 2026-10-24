@@ -112,5 +112,5 @@ func (e *CodexWebsocketsExecutor) executeHTTPFallbackStream(ctx context.Context,
 			}
 		}
 	}()
-	return &cliproxyexecutor.StreamResult{Headers: result.Headers, Chunks: out}, nil
+	return &cliproxyexecutor.StreamResult{InterruptOwner: result.InterruptOwner, Headers: result.Headers, Chunks: out}, nil
 }

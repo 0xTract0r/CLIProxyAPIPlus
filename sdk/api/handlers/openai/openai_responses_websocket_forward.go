@@ -28,6 +28,7 @@ type responsesWebsocketForwardOptions struct {
 	suppressError            func(*interfaces.ErrorMessage) bool
 	keepAliveInterval        *time.Duration
 	localInterrupt           *responsesLocalInterrupt
+	localInterruptible       func() bool
 }
 
 func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
@@ -71,15 +72,22 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 		defer keepAliveTicker.Stop()
 		keepAliveC = keepAliveTicker.C
 	}
-	if opts.localInterrupt != nil {
-		opts.localInterrupt.begin()
-		defer opts.localInterrupt.end()
+	var localTurn *responsesLocalInterruptTurn
+	var localFrames <-chan []byte
+	startLocal := func() {
+		if localTurn == nil && opts.localInterrupt != nil && opts.localInterruptible != nil && opts.localInterruptible() {
+			localTurn = opts.localInterrupt.begin()
+			localFrames = localTurn.frames
+		}
 	}
-	localFrames := opts.localInterrupt.framesChan()
+	retireLocal := func() { opts.localInterrupt.end(localTurn); localFrames = nil }
+	startLocal()
+	defer func() { opts.localInterrupt.end(localTurn) }()
 
 	for {
 		select {
 		case interruptPayload := <-localFrames:
+			retireLocal()
 			return completeResponsesWebsocketLocalInterrupt(writer, wsTimelineLog, cancel, interruptPayload, outputItemsByIndex, outputItemsFallback, pendingToolCallIDs)
 		case <-c.Request.Context().Done():
 			cancel(c.Request.Context().Err())
@@ -99,6 +107,7 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 				return completedOutput, completedResponseID, sortedStringSet(pendingToolCallIDs), nil, nil
 			}
 
+			retireLocal()
 			h.LoggingAPIResponseError(context.WithValue(context.Background(), "gin", c), errMsg)
 			if opts.suppressError != nil && opts.suppressError(errMsg) {
 				cancel(errMsg.Error)
@@ -143,6 +152,7 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 						Error:      fmt.Errorf("stream closed before response.completed"),
 					}
 					h.LoggingAPIResponseError(context.WithValue(context.Background(), "gin", c), errMsg)
+					retireLocal()
 					markAPIResponseTimestamp(c)
 					_, errClose := writer.closeWithoutError()
 					cancel(errMsg.Error)
@@ -165,6 +175,8 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 					continue
 				}
 				if eventType == "response.created" {
+					startLocal()
+					opts.localInterrupt.bind(localTurn, strings.TrimSpace(gjson.GetBytes(payloads[i], "response.id").String()))
 					responseStarted = true
 					completed = false
 					outputItemsByIndex = make(map[int64][]byte)
@@ -202,6 +214,9 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 					completed = true
 					completedOutput = responseCompletedOutputFromPayload(payloads[i], outputItemsByIndex, outputItemsFallback)
 					completedResponseID = responseCompletedIDFromPayload(payloads[i])
+				}
+				if completed || payloadErrMsg != nil || eventType == "response.failed" {
+					retireLocal()
 				}
 				markAPIResponseTimestamp(c)
 				if payloadErrMsg != nil {

@@ -663,5 +663,5 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 			}
 		}
 	}()
-	return &cliproxyexecutor.StreamResult{Headers: headers, Chunks: out}
+	return &cliproxyexecutor.StreamResult{InterruptOwner: cliproxyexecutor.StreamInterruptNativeWebsocket, Headers: headers, Chunks: out}
 }

@@ -681,7 +681,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		// branch above, so only the buffered payloads plus the in-stream error remain to emit.
 		out <- cliproxyexecutor.StreamChunk{Err: bootstrapTerminalErr}
 		close(out)
-		return &cliproxyexecutor.StreamResult{Headers: upstreamHeaders, Chunks: out}, nil
+		return &cliproxyexecutor.StreamResult{InterruptOwner: cliproxyexecutor.StreamInterruptNativeWebsocket, Headers: upstreamHeaders, Chunks: out}, nil
 	}
 	if immediateTerminal {
 		startupReason = "completed"
@@ -698,7 +698,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			}
 		}
 		close(out)
-		return &cliproxyexecutor.StreamResult{Headers: upstreamHeaders, Chunks: out}, nil
+		return &cliproxyexecutor.StreamResult{InterruptOwner: cliproxyexecutor.StreamInterruptNativeWebsocket, Headers: upstreamHeaders, Chunks: out}, nil
 	}
 
 	streamOwnsConnection = true
@@ -928,7 +928,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		}
 	}()
 
-	return &cliproxyexecutor.StreamResult{Headers: upstreamHeaders, Chunks: out}, nil
+	return &cliproxyexecutor.StreamResult{InterruptOwner: cliproxyexecutor.StreamInterruptNativeWebsocket, Headers: upstreamHeaders, Chunks: out}, nil
 }
 
 // codexWebsocketPrepared contains the request pipeline output shared by the

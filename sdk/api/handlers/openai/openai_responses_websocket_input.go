@@ -22,58 +22,66 @@ import (
 // responsesLocalInterrupt cancels an in-flight HTTP turn. A websocket upstream
 // does not use it; that interrupt is written to the existing socket instead.
 type responsesLocalInterrupt struct {
-	mu     sync.Mutex
-	active bool
-	frames chan []byte
+	mu      sync.Mutex
+	current *responsesLocalInterruptTurn
+}
+type responsesLocalInterruptTurn struct {
+	responseID string
+	frames     chan []byte
 }
 
-func newResponsesLocalInterrupt() *responsesLocalInterrupt {
-	return &responsesLocalInterrupt{frames: make(chan []byte, 1)}
-}
+func newResponsesLocalInterrupt() *responsesLocalInterrupt { return &responsesLocalInterrupt{} }
 
-func (s *responsesLocalInterrupt) begin() {
+// 每代拥有自己的队列；迟到的 end/事件永远不能修改下一代。
+func (s *responsesLocalInterrupt) begin() *responsesLocalInterruptTurn {
 	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	turn := &responsesLocalInterruptTurn{frames: make(chan []byte, 1)}
+	s.current = turn
+	return turn
+}
+func (s *responsesLocalInterrupt) bind(turn *responsesLocalInterruptTurn, id string) {
+	if s == nil || turn == nil {
 		return
 	}
 	s.mu.Lock()
-	s.active = true
-	s.mu.Unlock()
+	defer s.mu.Unlock()
+	if s.current == turn {
+		turn.responseID = id
+	}
 }
-
-func (s *responsesLocalInterrupt) end() {
-	if s == nil {
+func (s *responsesLocalInterrupt) end(turn *responsesLocalInterruptTurn) {
+	if s == nil || turn == nil {
 		return
 	}
 	s.mu.Lock()
-	s.active = false
-	select {
-	case <-s.frames:
-	default:
+	defer s.mu.Unlock()
+	if s.current == turn {
+		s.current = nil
 	}
-	s.mu.Unlock()
 }
-
 func (s *responsesLocalInterrupt) deliver(payload []byte) bool {
 	if s == nil {
 		return false
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.active {
+	turn := s.current
+	if turn == nil {
+		return false
+	}
+	id := strings.TrimSpace(gjson.GetBytes(payload, "response_id").String())
+	if id == "" || id != turn.responseID {
 		return false
 	}
 	select {
-	case s.frames <- bytes.Clone(payload):
+	case turn.frames <- bytes.Clone(payload):
 	default:
 	}
 	return true
-}
-
-func (s *responsesLocalInterrupt) framesChan() <-chan []byte {
-	if s == nil {
-		return nil
-	}
-	return s.frames
 }
 
 // readResponsesWebsocketInput is the only downstream reader. Interrupts are

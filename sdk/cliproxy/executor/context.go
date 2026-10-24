@@ -77,3 +77,33 @@ func UpstreamAttempted(ctx context.Context) bool {
 	tracker, ok := ctx.Value(upstreamAttemptTrackerContextKey{}).(*upstreamAttemptTracker)
 	return ok && tracker != nil && tracker.attempted.Load()
 }
+
+type localStreamInterruptContextKey struct{}
+
+// WithLocalStreamInterruptTracker records control ownership after stream selection.
+// The handler commits once after bootstrap retries; executors never mutate this state.
+func WithLocalStreamInterruptTracker(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, localStreamInterruptContextKey{}, &atomic.Bool{})
+}
+
+// SetLocalStreamInterruptible publishes the selected result control owner after bootstrap.
+func SetLocalStreamInterruptible(ctx context.Context, established bool) {
+	if ctx == nil {
+		return
+	}
+	if state, ok := ctx.Value(localStreamInterruptContextKey{}).(*atomic.Bool); ok {
+		state.Store(established)
+	}
+}
+
+// LocalStreamInterruptible excludes native websocket control owned by the executor.
+func LocalStreamInterruptible(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	state, ok := ctx.Value(localStreamInterruptContextKey{}).(*atomic.Bool)
+	return ok && state.Load()
+}

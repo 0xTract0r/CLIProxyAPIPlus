@@ -277,7 +277,7 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, re
 	return &cliproxyexecutor.StreamResult{Headers: headers, Chunks: out}
 }
 
-func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor ProviderExecutor, auth *Auth, provider string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, routeModel, executionModel string, execModels []string, pooled bool, aliasResult OAuthModelAliasResult, routing *apiKeyModelRoutingSnapshot, allowRetry bool, ephemeralResult bool) (*cliproxyexecutor.StreamResult, error) {
+func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor ProviderExecutor, auth *Auth, provider string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, routeModel, executionModel string, execModels []string, pooled bool, aliasResult OAuthModelAliasResult, routing *apiKeyModelRoutingSnapshot, allowRetry bool, ephemeralResult bool) (outResult *cliproxyexecutor.StreamResult, outErr error) {
 	if executor == nil {
 		return nil, &Error{Code: "executor_not_found", Message: "executor not registered"}
 	}
@@ -616,6 +616,13 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			return nil, preferredExecutionAttemptError(currentErr, upstreamErr)
 		}
 
+		// Bootstrap/retries have selected this immutable attempt; wrapper never switches source.
+		selectedTransport := streamResult.InterruptOwner
+		defer func() {
+			if outResult != nil {
+				outResult.InterruptOwner = selectedTransport
+			}
+		}()
 		remaining := streamResult.Chunks
 		if closed {
 			closedCh := make(chan cliproxyexecutor.StreamChunk)
