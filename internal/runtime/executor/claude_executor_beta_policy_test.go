@@ -207,7 +207,7 @@ func TestApplyClaudeHeaders_FastModeBetaMatchesAcrossStreamModes(t *testing.T) {
 func TestApplyClaudeHeaders_FastModePrecedesOAuthTrailer(t *testing.T) {
 	req := newClaudeHeaderTestRequest(t, nil)
 	if err := applyClaudeHeaders(req, claudeOAuthAuthForBetaPolicy(), claudeRaceProbeOAuthKey, true, nil,
-		[]byte(`{"model":"claude-opus-5","speed":"fast"}`), nil, nil, false); err != nil {
+		[]byte(`{"model":"claude-opus-5","speed":"fast"}`), &config.Config{ClaudeHeaderDefaults: config.ClaudeHeaderDefaults{UserAgent: "claude-cli/2.1.280 (external, cli)", PinSoftwareBaseline: true}}, nil, false); err != nil {
 		t.Fatalf("applyClaudeHeaders() error = %v", err)
 	}
 	got := req.Header.Get("Anthropic-Beta")
@@ -228,7 +228,7 @@ func TestApplyClaudeHeaders_DiagnosticsBetaFollowsBodyInNativeOrder(t *testing.T
 		req := newClaudeHeaderTestRequest(t, nil)
 		body := []byte(`{"model":"claude-opus-5","diagnostics":{"previous_message_id":null}}`)
 		if err := applyClaudeHeaders(req, claudeOAuthAuthForBetaPolicy(), claudeRaceProbeOAuthKey, stream, nil,
-			body, nil, nil, false); err != nil {
+			body, &config.Config{ClaudeHeaderDefaults: config.ClaudeHeaderDefaults{UserAgent: "claude-cli/2.1.280 (external, cli)", PinSoftwareBaseline: true}}, nil, false); err != nil {
 			t.Fatalf("applyClaudeHeaders(stream=%v) error = %v", stream, err)
 		}
 		got := req.Header.Get("Anthropic-Beta")
@@ -514,7 +514,7 @@ func TestApplyClaudeHeaders_StructuredHelperBetaOrderPreservedWithAdvisor(t *tes
 
 	req := newClaudeHeaderTestRequest(t, nil)
 	if err := applyClaudeHeadersWithNativeProfile(req, claudeOAuthAuthForBetaPolicy(), claudeRaceProbeOAuthKey, false, nil,
-		body, nil, incoming, true, true); err != nil {
+		body, &config.Config{ClaudeHeaderDefaults: config.ClaudeHeaderDefaults{UserAgent: "claude-cli/2.1.280 (external, cli)", PinSoftwareBaseline: true}}, incoming, true, true); err != nil {
 		t.Fatalf("applyClaudeHeadersWithNativeProfile() error = %v", err)
 	}
 
