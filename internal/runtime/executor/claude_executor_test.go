@@ -3113,8 +3113,9 @@ func TestClaudeExecutor_DefaultDoesNotInjectUserID(t *testing.T) {
 
 	executor := NewClaudeExecutor(&config.Config{})
 	auth := &cliproxyauth.Auth{ProxyURL: "direct", Attributes: map[string]string{
-		"api_key":  "key-123",
-		"base_url": server.URL,
+		"cloak_mode": "uncloak",
+		"api_key":    "key-123",
+		"base_url":   server.URL,
 	}}
 
 	payload := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)

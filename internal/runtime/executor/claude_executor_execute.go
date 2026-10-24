@@ -249,7 +249,10 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	if e.cfg != nil {
 		authDir = e.cfg.AuthDir
 	}
-	bodyForUpstream = helps.InjectAccountDeviceID(bodyForUpstream, authDir, auth, apiKey)
+	// 显式普通 API-key Uncloak 保调用方身份；其他模式仍绑定账号。
+	if !wirePolicy.Uncloak || wirePolicy.OAuth {
+		bodyForUpstream = helps.InjectAccountDeviceID(bodyForUpstream, authDir, auth, apiKey)
+	}
 	bodyForUpstream, entrypointFolded := normalizeClaudeBillingEntrypoint(e.cfg, bodyForUpstream)
 	bodyForUpstream, billingVersionAligned := alignRealPathBillingVersion(e.cfg, bodyForUpstream, billingVersion)
 	bodyForUpstream = stripDefaultKimiClaudeCodeAttribution(auth, url, fp.ProfileClaudeCodeCLI, bodyForUpstream)
