@@ -392,9 +392,48 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 		return
 	}
 
-	updatedAuth, committed, errModify := h.authManager.Modify(ctx, targetAuth.ID, targetAuth.RegistrationEpoch, func(current *coreauth.Auth) error {
-		return applyAuthFileFieldsPatch(current, req, requestRetryPatch)
-	})
+	var updatedAuth *coreauth.Auth
+	var committed bool
+	var errModify error
+	var complete *coreauth.Auth
+	if coreauth.IsCodexAuthRecord(targetAuth) {
+		// Identity evidence must come from this request, never inherited metadata.
+		incoming := &coreauth.Auth{ID: targetAuth.ID, FileName: targetAuth.FileName, Provider: targetAuth.Provider, Metadata: make(map[string]any)}
+		if errPatch := applyAuthFileFieldsPatch(incoming, req, requestRetryPatch); errPatch != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": errPatch.Error()})
+			return
+		}
+		if completeCodexRecoveryMaterial(incoming, targetAuth) {
+			complete = incoming
+		}
+	}
+	if complete != nil {
+		path := filepath.Join(h.configSnapshot().AuthDir, filepath.Base(targetAuth.FileName))
+		release := h.beginSIWCFileMutation(ctx, path)
+		_, updatedAuth, errModify = h.persistCompleteCodexReauthentication(ctx, targetAuth, complete)
+		release()
+		committed = errModify == nil && updatedAuth != nil
+	} else {
+		updatedAuth, committed, errModify = h.authManager.Modify(ctx, targetAuth.ID, targetAuth.RegistrationEpoch, func(current *coreauth.Auth) error {
+			fields := req
+			if coreauth.IsCodexAuthRecord(current) && (current.AutoQuarantined || coreauth.IsReauthRequiredMetadata(current.Metadata)) {
+				// Discard incomplete credential edits before version accounting. A
+				// retained old token must not acquire a new credential version.
+				fields = make(map[string]json.RawMessage, len(req))
+				for key, value := range req {
+					root := rootAuthFileField(strings.TrimSpace(key))
+					if coreauth.IsAuthTokenPayloadKey(root) || root == "siwc" || root == "account_id" || root == "chatgpt_account_id" || root == "email" || root == "type" {
+						continue
+					}
+					fields[key] = value
+				}
+				if len(fields) == 0 && !requestRetryPatch.Set {
+					return nil
+				}
+			}
+			return applyAuthFileFieldsPatch(current, fields, requestRetryPatch)
+		})
+	}
 	if errModify != nil {
 		var patchErr *authFileFieldPatchError
 		if errors.As(errModify, &patchErr) {
@@ -1121,6 +1160,20 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 		return "", fmt.Errorf("token record is nil")
 	}
 	if h.authManager != nil {
+		if existing, ok := h.authManager.GetByID(record.ID); ok && (coreauth.IsCodexAuthRecord(existing) || coreauth.IsCodexAuthRecord(record)) {
+			// An existing Codex identity may recover only through the complete
+			// transaction. Never fall back to the historical save/register lane.
+			if !completeCodexRecoveryMaterial(record, existing) {
+				return "", fmt.Errorf("%w: incomplete credentials for existing Codex account", errInvalidAuthFile)
+			}
+			path, registered, err := h.persistCompleteCodexReauthentication(ctx, existing, record)
+			if err == nil && h.postAuthPersistHook != nil {
+				err = h.postAuthPersistHook(ctx, registered)
+			}
+			return path, err
+		}
+	}
+	if h.authManager != nil {
 		if existing, ok := h.authManager.GetByID(record.ID); ok && !coreauth.ReauthenticationIdentityMatches(existing, record) {
 			return "", fmt.Errorf("reauthenticate auth %s: account identity changed", record.ID)
 		}
@@ -1335,4 +1388,93 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 		}
 	}
 	return savedPath, nil
+}
+
+// completeCodexRecoveryMaterial deliberately examines submitted fields only.
+// A partial patch remains an ordinary metadata update and cannot clear locks.
+func completeCodexRecoveryMaterial(incoming, existing *coreauth.Auth) bool {
+	if incoming == nil || existing == nil {
+		return false
+	}
+	access, _ := incoming.Metadata["access_token"].(string)
+	id, _ := incoming.Metadata["id_token"].(string)
+	if strings.TrimSpace(access) == "" || strings.TrimSpace(id) == "" || !coreauth.LoginReplacesOAuthCredentials(incoming.Metadata, existing.Metadata) {
+		return false
+	}
+	if oldSIWC, ok := existing.Metadata["siwc"].(map[string]any); ok {
+		if oldRefresh, _ := oldSIWC["refresh_token"].(string); strings.TrimSpace(oldRefresh) != "" {
+			nextSIWC, _ := incoming.Metadata["siwc"].(map[string]any)
+			access, _ := nextSIWC["access_token"].(string)
+			if strings.TrimSpace(access) == "" {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// Both complete file saves and complete fields PATCH use the same validated,
+// persist-before-publication transaction. Hooks stay outside the manager gate.
+func (h *Handler) persistCompleteCodexReauthentication(ctx context.Context, expected, incoming *coreauth.Auth) (string, *coreauth.Auth, error) {
+	request := incoming.Clone()
+	if h.postAuthHook != nil {
+		if err := h.postAuthHook(ctx, request); err != nil {
+			return "", nil, err
+		}
+	}
+	path := ""
+	registered, err := h.authManager.CommitReauthenticated(ctx, expected.ID, expected.RegistrationEpoch, func(current *coreauth.Auth) (*coreauth.Auth, error) {
+		if !completeCodexRecoveryMaterial(request, current) || !uploadedCodexRecoveryIdentityMatches(current, request) {
+			return nil, &authFileFieldPatchError{message: "complete credentials must replace every refresh partition and establish the same account identity"}
+		}
+		next := request.Clone()
+		next.FileName = current.FileName
+		if next.Metadata == nil {
+			next.Metadata = make(map[string]any)
+		}
+		next.Metadata["type"] = current.Provider
+		coreauth.MergeExistingAuthMetadata(next, current.Metadata)
+		mergeUserDefinedAuthMetadataInto(next, current)
+		inheritUserDefinedAuthAttributesInto(next, current)
+		for key := range next.Metadata {
+			if isReauthRuntimeMetadataKey(key) {
+				if _, supplied := request.Metadata[key]; !supplied {
+					delete(next.Metadata, key)
+				}
+			}
+		}
+		clearStaleReauthLockOnSave(next)
+		next.ClearAutoQuarantine()
+		if current.Disabled {
+			next.Disabled = true
+			next.Metadata["disabled"] = true
+		}
+		data, err := json.Marshal(next.Metadata)
+		if err != nil {
+			return nil, err
+		}
+		fileName := next.FileName
+		if fileName == "" {
+			fileName = current.ID
+		}
+		filePath := filepath.Join(h.configSnapshot().AuthDir, filepath.Base(fileName))
+		rebuilt, err := h.buildAuthFromFileData(filePath, data)
+		if err != nil {
+			return nil, err
+		}
+		inheritUserDefinedAuthAttributesInto(rebuilt, next)
+		if err := validateStoredAuthProxyURL(rebuilt); err != nil {
+			return nil, err
+		}
+		return rebuilt, nil
+	}, func(saveCtx context.Context, next *coreauth.Auth) error {
+		store := h.tokenStoreWithBaseDir()
+		if store == nil {
+			return fmt.Errorf("token store unavailable")
+		}
+		var err error
+		path, err = store.Save(coreauth.WithAuthCreationIntent(saveCtx), next)
+		return err
+	})
+	return path, registered, err
 }

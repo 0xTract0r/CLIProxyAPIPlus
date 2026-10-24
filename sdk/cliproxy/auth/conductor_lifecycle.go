@@ -124,6 +124,12 @@ func (m *Manager) register(ctx context.Context, auth *Auth, reauthenticated bool
 	if errMutation != nil {
 		return nil, errMutation
 	}
+	return m.registerLocked(ctx, auth, reauthenticated, releaseMutation)
+}
+
+// registerLocked publishes while the caller owns the reload/credential gate.
+// The release function is idempotent and is run before reentrant hooks.
+func (m *Manager) registerLocked(ctx context.Context, auth *Auth, reauthenticated bool, releaseMutation func()) (*Auth, error) {
 	defer releaseMutation()
 	now := time.Now()
 	if auth.Generation == 0 {
@@ -217,6 +223,58 @@ func (m *Manager) register(ctx context.Context, auth *Auth, reauthenticated bool
 		m.persistCooldownStates(context.Background())
 	}
 	return auth.Clone(), nil
+}
+
+// CommitReauthenticated validates and persists a complete replacement under the
+// same credential gate as ordinary edits and refresh commits. prepare must
+// independently authorize the replacement from the submitted login material;
+// callbacks may read this manager but must not mutate it or run lifecycle hooks.
+// A persistence failure never advances the registration or publishes recovery.
+func (m *Manager) CommitReauthenticated(ctx context.Context, id string, expectedEpoch uint64, prepare func(*Auth) (*Auth, error), persist func(context.Context, *Auth) error) (*Auth, error) {
+	if m == nil || strings.TrimSpace(id) == "" || prepare == nil || persist == nil {
+		return nil, fmt.Errorf("reauthenticate: incomplete transaction")
+	}
+	releaseMutation, err := m.lockAuthMutationContext(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseMutation()
+	m.mu.RLock()
+	var current *Auth
+	if stored := m.auths[id]; stored != nil {
+		current = stored.Clone()
+	}
+	m.mu.RUnlock()
+	if current == nil || (expectedEpoch != 0 && current.RegistrationEpoch != expectedEpoch) {
+		return nil, fmt.Errorf("reauthenticate auth %s: missing or stale registration", id)
+	}
+	next, err := prepare(current.Clone())
+	if err != nil {
+		return nil, err
+	}
+	if next == nil || !ReauthenticationIdentityMatches(current, next) {
+		return nil, fmt.Errorf("reauthenticate auth %s: account identity changed", id)
+	}
+	hydrateRuntimeFields(next)
+	NormalizeCredentialMetadata(next.Metadata)
+	if err := ValidateAuthWeight(next); err != nil {
+		return nil, err
+	}
+	next.CreatedAt = current.CreatedAt
+	next.Index, next.indexAssigned = current.Index, current.indexAssigned
+	next.RegistrationEpoch, next.CredentialVersion = current.RegistrationEpoch, current.CredentialVersion
+	releaseSave, err := m.beginForegroundStoreSave(ctx)
+	if err != nil {
+		return nil, err
+	}
+	err = persist(ctx, next)
+	releaseSave()
+	if err != nil {
+		return nil, err
+	}
+	// Persistence has committed. Reuse normal publication without saving twice
+	// or reacquiring the credential gate; ordinary hooks run after its release.
+	return m.registerLocked(WithSkipPersist(ctx), next, true, releaseMutation)
 }
 
 // ReauthenticationIdentityMatches rejects a reused filename carrying a different

@@ -1935,6 +1935,9 @@ func testEndToEndAuthFilePatchRecovery(t *testing.T, expectRecovery bool) {
 
 	// 2. Patch auth file fields with fresh access token
 	patchBody := fmt.Sprintf(`{"name":%q,"access_token":"token-fresh","id_token":%q}`, fileName, teamIDToken)
+	if expectRecovery {
+		patchBody = fmt.Sprintf(`{"name":%q,"access_token":"token-fresh","refresh_token":"refresh-fresh","id_token":%q}`, fileName, teamIDToken)
+	}
 	rec = httptest.NewRecorder()
 	req = httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/fields", strings.NewReader(patchBody))
 	req.Header.Set("Authorization", "Bearer test-secret")

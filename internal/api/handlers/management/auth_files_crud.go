@@ -297,18 +297,18 @@ func (h *Handler) writeAuthFile(ctx context.Context, name string, data []byte) e
 	}
 	release := h.beginSIWCFileMutation(ctx, dst)
 	defer release()
-	if coreauth.IsCodexAuthRecord(auth) {
-		if existing, ok := h.authManager.GetByID(auth.ID); ok {
-			accessToken, _ := auth.Metadata["access_token"].(string)
-			idToken, _ := auth.Metadata["id_token"].(string)
-			if strings.TrimSpace(accessToken) != "" && strings.TrimSpace(idToken) != "" && coreauth.LoginReplacesOAuthCredentials(auth.Metadata, existing.Metadata) {
-				if !uploadedCodexRecoveryIdentityMatches(existing, auth) {
-					return fmt.Errorf("%w: uploaded credentials do not establish the same account identity", errInvalidAuthFile)
-				}
-				// 完整上传沿已验证的重认证链先保存、再切换代际；普通字段更新不放开恢复锁。
-				_, errSave := h.saveTokenRecord(ctx, auth)
-				return errSave
+	if h.authManager != nil {
+		if existing, ok := h.authManager.GetByID(auth.ID); ok && (coreauth.IsCodexAuthRecord(existing) || coreauth.IsCodexAuthRecord(auth)) {
+			// Replacing an existing file is not a metadata PATCH. Reject partial
+			// credentials before any disk write; complete saves revalidate in-gate.
+			if !completeCodexRecoveryMaterial(auth, existing) {
+				return fmt.Errorf("%w: incomplete credentials for existing Codex account", errInvalidAuthFile)
 			}
+			if !uploadedCodexRecoveryIdentityMatches(existing, auth) {
+				return fmt.Errorf("%w: uploaded credentials do not establish the same account identity", errInvalidAuthFile)
+			}
+			_, errSave := h.saveTokenRecord(ctx, auth)
+			return errSave
 		}
 	}
 	if errWrite := h.writeAuthFileBytes(dst, data, auth); errWrite != nil {
