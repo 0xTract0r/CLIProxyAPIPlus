@@ -911,8 +911,9 @@ func TestClaudeExecutor_ConfirmedNewerPatchClaudeCodeRequestPreservesInteractive
 	}
 	executor := NewClaudeExecutor(&config.Config{})
 	auth := &cliproxyauth.Auth{ProxyURL: "direct", Attributes: map[string]string{
-		"api_key":  "key-confirmed-client",
-		"base_url": server.URL,
+		cliproxyauth.ClaudeDeviceIDAttributeKey: strings.Repeat("d", 64),
+		"api_key":                               "key-confirmed-client",
+		"base_url":                              server.URL,
 	}}
 
 	_, errExecute := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
@@ -934,11 +935,16 @@ func TestClaudeExecutor_ConfirmedNewerPatchClaudeCodeRequestPreservesInteractive
 	if got := gjson.GetBytes(seenBody, "system.#").Int(); got != 1 {
 		t.Fatalf("system block count = %d, want 1", got)
 	}
-	if got := gjson.GetBytes(seenBody, "metadata.user_id").String(); got != userID {
-		t.Fatalf("metadata.user_id = %q, want preserved %q", got, userID)
+	// F SD15 只投影所选账号 device_id；其余原生字段保持原值。
+	wantUserID := strings.Replace(userID, strings.Repeat("a", 64), strings.Repeat("d", 64), 1)
+	if got := gjson.GetBytes(seenBody, "metadata.user_id").String(); got != wantUserID {
+		t.Fatalf("metadata.user_id = %q, want account-bound %q", got, wantUserID)
 	}
-	if got := seenHeaders.Get("Anthropic-Beta"); got != incoming.Get("Anthropic-Beta") {
-		t.Fatalf("Anthropic-Beta = %q, want preserved %q", got, incoming.Get("Anthropic-Beta"))
+	// F1228 request.go:540–575：先固定七项 floor，再按 caller 顺序追加未出现项。
+	// 该 fixture UA=2.1.281 且未 pin 280；不把 caller 版本暗当 pinned beta 基线。
+	const wantBetas = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,redact-thinking-2026-02-12,effort-2025-11-24"
+	if got := seenHeaders.Get("Anthropic-Beta"); got != wantBetas {
+		t.Fatalf("Anthropic-Beta = %q, want exact F floor/caller union %q", got, wantBetas)
 	}
 }
 
@@ -1102,8 +1108,9 @@ func TestClaudeExecutor_ConfirmedVSCodeAgentSDKRequestPreservesIdentity(t *testi
 	stabilize := true
 	executor := NewClaudeExecutor(&config.Config{ClaudeHeaderDefaults: config.ClaudeHeaderDefaults{StabilizeDeviceProfile: &stabilize}})
 	auth := &cliproxyauth.Auth{ProxyURL: "direct", ID: "auth-vscode-agent-sdk", Attributes: map[string]string{
-		"api_key":  "key-vscode-agent-sdk",
-		"base_url": server.URL,
+		cliproxyauth.ClaudeDeviceIDAttributeKey: strings.Repeat("e", 64),
+		"api_key":                               "key-vscode-agent-sdk",
+		"base_url":                              server.URL,
 	}}
 
 	_, errExecute := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
@@ -1140,8 +1147,10 @@ func TestClaudeExecutor_ConfirmedVSCodeAgentSDKRequestPreservesIdentity(t *testi
 	if got := gjson.GetBytes(seenBody, "system.#").Int(); got != 3 {
 		t.Fatalf("system block count = %d, want 3", got)
 	}
-	if got := gjson.GetBytes(seenBody, "metadata.user_id").String(); got != userID {
-		t.Fatalf("metadata.user_id = %q, want preserved %q", got, userID)
+	// F SD15 只投影所选账号 device_id；会话/account_uuid 与其它原生字段保持原值。
+	wantUserID := strings.Replace(userID, strings.Repeat("b", 64), strings.Repeat("e", 64), 1)
+	if got := gjson.GetBytes(seenBody, "metadata.user_id").String(); got != wantUserID {
+		t.Fatalf("metadata.user_id = %q, want account-bound %q", got, wantUserID)
 	}
 }
 
@@ -1263,13 +1272,14 @@ func TestClaudeExecutor_ConfirmedVSCodeOAuthPreservesToolNames(t *testing.T) {
 	executor := NewClaudeExecutor(&config.Config{})
 	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		Attributes: map[string]string{
-			"api_key":  "sk-ant-oat-native-vscode",
-			"base_url": server.URL,
+			cliproxyauth.ClaudeDeviceIDAttributeKey: deviceIDs[0],
+			"api_key":                               "sk-ant-oat-native-vscode",
+			"base_url":                              server.URL,
 		},
 		Metadata: map[string]any{
 			"account_uuid":      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
 			"claude_device_ids": deviceIDs,
-			"cloak_mode":        "always",
+			"cloak_mode":        "auto",
 		},
 	}
 	_, errExecute := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
@@ -5743,7 +5753,7 @@ func TestResolveClaudeWirePolicy(t *testing.T) {
 		{name: "unknown always", mode: "always", wantCloak: true},
 		{name: "unknown never", mode: "never", wantCloak: false},
 		{name: "confirmed auto", confirmed: true, mode: "auto", wantCloak: false},
-		{name: "confirmed always", confirmed: true, mode: "always", wantCloak: false},
+		{name: "confirmed always", confirmed: true, mode: "always", wantCloak: true},
 		{name: "confirmed never", confirmed: true, mode: "never", wantCloak: false},
 	}
 	for _, test := range tests {
@@ -5810,7 +5820,7 @@ func TestApplyCloaking_Opus55FallbackOnlyForUnconfirmedClients(t *testing.T) {
 	cfg := &config.Config{ClaudeKey: []config.ClaudeKey{{
 		APIKey: "sk-ant-oat-opus55-test", Cloak: &config.CloakConfig{},
 	}}}
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "sk-ant-oat-opus55-test"}}
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "sk-ant-oat-opus55-test", cliproxyauth.ClaudeDeviceIDAttributeKey: strings.Repeat("f", 64)}}
 	for _, tt := range []struct {
 		name      string
 		payload   string
@@ -5819,6 +5829,7 @@ func TestApplyCloaking_Opus55FallbackOnlyForUnconfirmedClients(t *testing.T) {
 	}{
 		{name: "non-native Opus 5.5", payload: `{"model":"claude-opus-5-5","messages":[{"role":"user","content":"test"}]}`, wantModel: "claude-opus-4-8"},
 		{name: "native Opus 5.5 stays untouched", payload: `{"model":"claude-opus-5-5","messages":[{"role":"user","content":"test"}]}`, confirmed: true},
+		{name: "native Opus metadata siblings preserved", payload: `{"model":"claude-opus-5-5","metadata":{"caller_tag":"keep","nested":{"value":1}},"messages":[{"role":"user","content":"test"}]}`, confirmed: true},
 		{name: "caller fallback takes precedence", payload: `{"model":"claude-opus-5-5","fallbacks":[{"model":"claude-sonnet-5"}],"messages":[{"role":"user","content":"test"}]}`, wantModel: "claude-sonnet-5"},
 		{name: "other model does not inherit fallback", payload: `{"model":"claude-opus-5","messages":[{"role":"user","content":"test"}]}`},
 	} {
@@ -5838,8 +5849,16 @@ func TestApplyCloaking_Opus55FallbackOnlyForUnconfirmedClients(t *testing.T) {
 			} else if len(fallbacks) != 1 || fallbacks[0].Get("model").String() != tt.wantModel {
 				t.Fatalf("fallbacks = %s, want %s", gjson.GetBytes(body, "fallbacks").Raw, tt.wantModel)
 			}
-			if tt.confirmed && string(body) != tt.payload {
-				t.Fatal("confirmed native payload was cloaked")
+			if tt.confirmed {
+				// F SD15 可注入 metadata.user_id；其余 body（含 system/messages）仍须逐字不变。
+				identity := gjson.GetBytes(body, "metadata.user_id").String()
+				if gjson.Get(identity, "device_id").String() != strings.Repeat("f", 64) {
+					t.Fatal("native request escaped account-bound identity")
+				}
+				equal, errCompare := claudeSD15NonIdentityEqual426(body, []byte(tt.payload))
+				if errCompare != nil || !equal {
+					t.Fatal("confirmed native non-identity payload was cloaked")
+				}
 			}
 			if !tt.confirmed && !strings.Contains(gjson.GetBytes(body, "system.0.text").String(), "cc_turn_origin=human;") {
 				t.Fatal("cloaked main request is missing its CLI turn origin")
@@ -14699,5 +14718,128 @@ func TestHeader329StabilizationPlatformPriority(t *testing.T) {
 			}
 			assertClaudeFingerprint(t, missing.Header, "claude-cli/2.1.60 (external, cli)", "0.70.0", "v22.0.0", helps.MapStainlessOS(), helps.MapStainlessArch())
 		}
+	}
+}
+
+// F SD15: caller device 不能覆盖账号，派生 identity 同账号稳定、换账号隔离。
+func TestClaudeSD15AccountIdentityBinding414(t *testing.T) {
+	cfg := &config.Config{AuthDir: t.TempDir()}
+	authA := &cliproxyauth.Auth{ID: "sd15-account-a", Provider: "claude"}
+	authB := &cliproxyauth.Auth{ID: "sd15-account-b", Provider: "claude"}
+	const input = `{"model":"claude-opus-5","system":"native-system","tools":[{"name":"bash","input_schema":{"type":"object"}}],"messages":[{"role":"user","content":"x"}],"metadata":{"user_id":"{\"device_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"account_uuid\":\"\",\"session_id\":\"11111111-2222-4333-8444-555555555555\"}"}}`
+	run := func(auth *cliproxyauth.Auth, key, callerDevice string) string {
+		t.Helper()
+		payload := []byte(strings.Replace(input, strings.Repeat("a", 64), callerDevice, 1))
+		out, cloaked, err := applyCloaking(context.Background(), cfg, auth, payload, key, true, false)
+		if err != nil || cloaked {
+			t.Fatalf("confirmed auto: err=%v cloak=%v", err, cloaked)
+		}
+		identity := gjson.GetBytes(out, "metadata.user_id").String()
+		device := gjson.Get(identity, "device_id").String()
+		if len(device) != 64 || device == callerDevice {
+			t.Fatal("caller device escaped account projection")
+		}
+		if gjson.Get(identity, "account_uuid").String() != "" || gjson.Get(identity, "session_id").String() != "11111111-2222-4333-8444-555555555555" {
+			t.Fatal("SD15 changed non-device identity fields")
+		}
+		restored := strings.Replace(string(out), device, callerDevice, 1)
+		if restored != string(payload) {
+			t.Fatal("SD15 changed fields outside device identity")
+		}
+		return device
+	}
+	a1 := run(authA, "key-a", strings.Repeat("a", 64))
+	a2 := run(authA, "key-a", strings.Repeat("b", 64))
+	b := run(authB, "key-b", strings.Repeat("a", 64))
+	if a1 != a2 || a1 == b {
+		t.Fatal("account identity is unstable or shared between accounts")
+	}
+}
+
+// 独立模式护栏：confirmed native 的 auto 保 tools，always 仍必须执行更广 cloak。
+func TestClaudeSD15ConfirmedModeAuthority414(t *testing.T) {
+	for _, mode := range []string{"auto", "always"} {
+		t.Run(mode, func(t *testing.T) {
+			auth := &cliproxyauth.Auth{ID: "sd15-mode-" + mode, Attributes: map[string]string{cliproxyauth.ClaudeDeviceIDAttributeKey: strings.Repeat("d", 64)}, Metadata: map[string]any{"cloak_mode": mode}}
+			const payload = `{"model":"claude-opus-4-6","tools":[{"name":"bash","description":"native","input_schema":{"type":"object"}}],"messages":[{"role":"user","content":"x"}]}`
+			ctx := contextWithGinHeaders(map[string]string{"User-Agent": "claude-cli/2.1.280 (external, claude-vscode, agent-sdk/0.3.220)"})
+			out, cloaked, err := applyCloaking(ctx, &config.Config{}, auth, []byte(payload), "sk-ant-oat-sd15-mode", true, false)
+			if err != nil || cloaked != (mode == "always") {
+				t.Fatalf("mode=%s cloak=%v err=%v", mode, cloaked, err)
+			}
+			if mode == "auto" && gjson.GetBytes(out, "tools").Raw != gjson.Get(payload, "tools").Raw {
+				t.Fatal("auto changed confirmed native tools")
+			}
+			if mode == "always" && gjson.GetBytes(out, "system.#").Int() == 0 {
+				t.Fatal("always did not inject cloak system for confirmed client")
+			}
+		})
+	}
+}
+
+// 显式 uncloak 仍支持真正 caller 扩展项的精确有序 raw header；身份 beta 的剥离合同不变。
+func TestClaudeSD15ExplicitUncloakCallerBetas419(t *testing.T) {
+	const callerBetas = "caller-feature-b-20260202,caller-feature-a-20260101"
+	incoming := http.Header{"Anthropic-Beta": []string{callerBetas}, "User-Agent": []string{"custom-client/1.0"}}
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "key-uncloak-419", "cloak_mode": "uncloak"}}
+	req := httptest.NewRequest(http.MethodPost, "https://example.invalid/v1/messages", nil)
+	body := []byte(`{"model":"claude-opus-4-6","messages":[{"role":"user","content":"x"}]}`)
+	if err := applyClaudeHeaders(req, auth, "key-uncloak-419", false, nil, body, &config.Config{}, incoming, false); err != nil {
+		t.Fatal(err)
+	}
+	if got := req.Header.Get("Anthropic-Beta"); got != callerBetas {
+		t.Fatalf("uncloak betas=%q, want exact caller order %q", got, callerBetas)
+	}
+}
+
+// 只豁免 SD15 的 metadata.user_id；其它 body 字节（包括 metadata 兄弟字段）必须相同。
+func claudeSD15NonIdentityEqual426(actual, expected []byte) (bool, error) {
+	originalHasMetadata := gjson.GetBytes(expected, "metadata").Exists()
+	withoutUserID := func(body []byte) ([]byte, error) {
+		out, err := sjson.DeleteBytes(body, "metadata.user_id")
+		if err != nil {
+			return nil, err
+		}
+		metadata := gjson.GetBytes(out, "metadata")
+		// 仅允许清理原输入没有、因 user_id 注入而产生的空 object 容器。
+		if !originalHasMetadata && metadata.IsObject() && len(metadata.Map()) == 0 {
+			return sjson.DeleteBytes(out, "metadata")
+		}
+		return out, nil
+	}
+	got, err := withoutUserID(actual)
+	if err != nil {
+		return false, err
+	}
+	want, err := withoutUserID(expected)
+	if err != nil {
+		return false, err
+	}
+	return bytes.Equal(got, want), nil
+}
+
+func TestClaudeSD15NonIdentityComparisonPreservesMetadataSiblings426(t *testing.T) {
+	const siblingInput = `{"model":"claude-opus-5-5","metadata":{"caller_tag":"keep","nested":{"value":1}},"messages":[]}`
+	for _, tt := range []struct {
+		name, original, actual string
+		want                   bool
+	}{
+		{"identity only change allowed", `{"metadata":{"caller_tag":"keep","user_id":"caller"},"messages":[]}`, `{"metadata":{"caller_tag":"keep","user_id":"bound"},"messages":[]}`, true},
+		{"insert identity keeps siblings", siblingInput, `{"model":"claude-opus-5-5","metadata":{"caller_tag":"keep","nested":{"value":1},"user_id":"bound"},"messages":[]}`, true},
+		{"changed sibling rejected", siblingInput, `{"model":"claude-opus-5-5","metadata":{"caller_tag":"changed","nested":{"value":1},"user_id":"bound"},"messages":[]}`, false},
+		{"changed nested sibling rejected", siblingInput, `{"model":"claude-opus-5-5","metadata":{"caller_tag":"keep","nested":{"value":2},"user_id":"bound"},"messages":[]}`, false},
+		{"added sibling rejected", siblingInput, `{"model":"claude-opus-5-5","metadata":{"caller_tag":"keep","nested":{"value":1},"extra":true,"user_id":"bound"},"messages":[]}`, false},
+		{"removed sibling rejected", siblingInput, `{"model":"claude-opus-5-5","metadata":{"caller_tag":"keep","user_id":"bound"},"messages":[]}`, false},
+		{"new empty container normalized", `{"messages":[]}`, `{"messages":[],"metadata":{"user_id":"bound"}}`, true},
+		{"new sibling never normalized", `{"messages":[]}`, `{"messages":[],"metadata":{"user_id":"bound","extra":true}}`, false},
+		{"explicit empty container retained", `{"messages":[],"metadata":{}}`, `{"messages":[]}`, false},
+		{"body change rejected", `{"messages":[]}`, `{"messages":[{"role":"user","content":"changed"}],"metadata":{"user_id":"bound"}}`, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := claudeSD15NonIdentityEqual426([]byte(tt.actual), []byte(tt.original))
+			if err != nil || got != tt.want {
+				t.Fatalf("equal=%v want=%v err=%v", got, tt.want, err)
+			}
+		})
 	}
 }
