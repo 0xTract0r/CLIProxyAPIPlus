@@ -241,10 +241,10 @@ func TestClaudeExecutor_AuthManager_FableOnlyRejectionDoesNotBlockOpus(t *testin
 	manager.SetRetryConfig(0, 0, 0)
 	manager.RegisterExecutor(NewClaudeExecutor(&config.Config{DisableCooling: false}))
 
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID:       uuid.NewString() + "-fable-model-scope",
 		Provider: "claude",
-		Attributes: map[string]string{
+		Attributes: map[string]string{"plan_type": "max",
 			"api_key":  "sanitized-test-key",
 			"base_url": server.URL,
 		},
@@ -336,7 +336,7 @@ func TestClaudeExecutor_AuthManager_OverageSpendCapReachedDoesNotBlockOpus_Issue
 	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID:       uuid.NewString() + "-overage-model-scope",
 		Provider: "claude",
-		Attributes: map[string]string{
+		Attributes: map[string]string{"plan_type": "max",
 			"api_key":  "sanitized-test-key",
 			"base_url": server.URL,
 		},
@@ -458,10 +458,10 @@ func TestClaudeExecutor_AuthManager_ModelLevelCoolingConfigScopesSharedRejection
 		},
 	}))
 
-	auth := &cliproxyauth.Auth{
+	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID:       uuid.NewString() + "-claude-model-cooling-cfg",
 		Provider: "claude",
-		Attributes: map[string]string{
+		Attributes: map[string]string{"plan_type": "max",
 			"api_key":  "sanitized-test-key",
 			"base_url": server.URL,
 		},
@@ -628,7 +628,7 @@ func TestClaudeExecutor_AuthManager_OverageSpendCapWithRetryAfter_Issue5920(t *t
 	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID:       uuid.NewString() + "-issue-5920-overage",
 		Provider: "claude",
-		Attributes: map[string]string{
+		Attributes: map[string]string{"plan_type": "max",
 			"api_key":  "sanitized-test-key",
 			"base_url": server.URL,
 		},
@@ -743,7 +743,7 @@ func TestClaudeExecutor_AuthManager_OverageSpendCapFirstRequestAllowsOpus_Issue5
 	auth := &cliproxyauth.Auth{ProxyURL: "direct",
 		ID:       uuid.NewString() + "-issue-5920-first-fable",
 		Provider: "claude",
-		Attributes: map[string]string{
+		Attributes: map[string]string{"plan_type": "max",
 			"api_key":  "sanitized-test-key",
 			"base_url": server.URL,
 		},
