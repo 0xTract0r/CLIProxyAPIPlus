@@ -616,7 +616,7 @@ func TestApplyClaudeHeaders_DisableDeviceProfileStabilization(t *testing.T) {
 		"X-Stainless-Arch":            []string{"x64"},
 	})
 	applyClaudeHeaders(firstReq, auth, "key-disable-stability", false, nil, nil, cfg, nil, true)
-	assertClaudeFingerprint(t, firstReq.Header, "claude-cli/2.1.62 (external, cli)", "0.70.0", "v22.0.0", "Linux", "x64")
+	assertClaudeFingerprint(t, firstReq.Header, "claude-cli/2.1.62 (external, cli)", "0.74.0", "v24.3.0", "Linux", "x64")
 
 	thirdPartyReq := newClaudeHeaderTestRequest(t, http.Header{
 		"User-Agent":                  []string{"lobe-chat/1.0"},
@@ -626,17 +626,18 @@ func TestApplyClaudeHeaders_DisableDeviceProfileStabilization(t *testing.T) {
 		"X-Stainless-Arch":            []string{"x64"},
 	})
 	applyClaudeHeaders(thirdPartyReq, auth, "key-disable-stability", false, nil, nil, cfg, nil, false)
-	assertClaudeFingerprint(t, thirdPartyReq.Header, "claude-cli/2.1.60 (external, cli)", "0.70.0", "v22.0.0", "MacOS", "arm64")
+	assertClaudeFingerprint(t, thirdPartyReq.Header, "claude-cli/2.1.60 (external, cli)", "0.10.0", "v18.0.0", "Windows", "x64")
 
+	// F keeps the lower observed caller tuple with stabilization disabled.
 	olderReq := newClaudeHeaderTestRequest(t, http.Header{
-		"User-Agent":                  []string{"claude-cli/2.1.59 (external, cli)"},
+		"User-Agent":                  []string{"claude-cli/2.1.61 (external, cli)"},
 		"X-Stainless-Package-Version": []string{"0.73.0"},
 		"X-Stainless-Runtime-Version": []string{"v24.2.0"},
 		"X-Stainless-Os":              []string{"Windows"},
 		"X-Stainless-Arch":            []string{"x64"},
 	})
 	applyClaudeHeaders(olderReq, auth, "key-disable-stability", false, nil, nil, cfg, nil, true)
-	assertClaudeFingerprint(t, olderReq.Header, "claude-cli/2.1.60 (external, cli)", "0.70.0", "v22.0.0", "MacOS", "arm64")
+	assertClaudeFingerprint(t, olderReq.Header, "claude-cli/2.1.61 (external, cli)", "0.73.0", "v24.2.0", "Windows", "x64")
 }
 
 func TestApplyClaudeHeaders_LegacyModePreservesConfiguredUserAgentOverrideForClaudeClients(t *testing.T) {
@@ -697,6 +698,9 @@ func TestApplyClaudeHeaders_LegacyThirdPartyUsesStableConfiguredOSArch(t *testin
 
 	req := newClaudeHeaderTestRequest(t, http.Header{
 		"User-Agent": []string{"curl/8.7.1"},
+		// F legacy mode preserves an explicit caller platform.
+		"X-Stainless-Os":   []string{"Windows"},
+		"X-Stainless-Arch": []string{"x64"},
 	})
 	applyClaudeHeaders(req, auth, "key-legacy-runtime-os-arch", false, nil, nil, cfg, nil, false)
 
@@ -732,9 +736,11 @@ func TestApplyClaudeHeaders_UnsetStabilizationUsesStableConfiguredOSArch(t *test
 }
 
 func TestApplyClaudeHeaders_UsesOAuthAuthorizationAndBrowserFingerprint(t *testing.T) {
+	// OAuth browser-shaped headers require explicit wire replay.
+	replay := true
 	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "sk-ant-oat-header-test"}}
 	req := newClaudeHeaderTestRequest(t, nil)
-	if errHeaders := applyClaudeHeaders(req, auth, "sk-ant-oat-header-test", false, nil, nil, &config.Config{}, nil, false, "11111111-2222-4333-8444-555555555555"); errHeaders != nil {
+	if errHeaders := applyClaudeHeaders(req, auth, "sk-ant-oat-header-test", false, nil, nil, &config.Config{ClaudeHeaderDefaults: config.ClaudeHeaderDefaults{ReplayWireHeaderOrder: &replay}}, nil, false, "11111111-2222-4333-8444-555555555555"); errHeaders != nil {
 		t.Fatalf("applyClaudeHeaders() error = %v", errHeaders)
 	}
 	if got := req.Header.Get("Authorization"); got != "Bearer sk-ant-oat-header-test" {
@@ -14637,6 +14643,44 @@ func TestClaudeExecutorCountTokens_NativeAutoBillingOwnership(t *testing.T) {
 					t.Fatalf("excluded native shape gained billing: %s", seen)
 				}
 			})
+		}
+	}
+}
+
+func TestOAuthHeader329DefaultDoesNotPretendBrowser(t *testing.T) {
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "sk-ant-oat-header-default-329"}}
+	req := newClaudeHeaderTestRequest(t, nil)
+	if err := applyClaudeHeaders(req, auth, "sk-ant-oat-header-default-329", false, nil, nil, &config.Config{}, nil, false, "11111111-2222-4333-8444-555555555555"); err != nil {
+		t.Fatal(err)
+	}
+	if req.Header.Get("Authorization") != "Bearer sk-ant-oat-header-default-329" || req.Header.Get("x-api-key") != "" || !strings.Contains(req.Header.Get("Anthropic-Beta"), "oauth-2025-04-20") {
+		t.Fatal("default lost real OAuth authentication")
+	}
+	if got := req.Header.Get("Anthropic-Dangerous-Direct-Browser-Access"); got != "" {
+		t.Fatalf("default OAuth fabricated browser access: %q", got)
+	}
+}
+
+func TestHeader329StabilizationPlatformPriority(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		resetClaudeDeviceProfileCache()
+		cfg := &config.Config{ClaudeHeaderDefaults: config.ClaudeHeaderDefaults{UserAgent: "claude-cli/2.1.60 (external, cli)", PackageVersion: "0.70.0", RuntimeVersion: "v22.0.0", OS: "Windows", Arch: "x64", StabilizeDeviceProfile: &enabled}}
+		auth := &cliproxyauth.Auth{ID: "platform-329", Attributes: map[string]string{"api_key": "key-platform-329", "cloak_mode": "always"}}
+		req := newClaudeHeaderTestRequest(t, http.Header{"User-Agent": {"curl/8.7.1"}, "X-Stainless-Os": {"MacOS"}, "X-Stainless-Arch": {"arm64"}})
+		if err := applyClaudeHeaders(req, auth, "key-platform-329", false, nil, nil, cfg, nil, false); err != nil {
+			t.Fatal(err)
+		}
+		wantOS, wantArch := "MacOS", "arm64"
+		if enabled {
+			wantOS, wantArch = "Windows", "x64"
+		}
+		assertClaudeFingerprint(t, req.Header, "claude-cli/2.1.60 (external, cli)", "0.70.0", "v22.0.0", wantOS, wantArch)
+		if !enabled {
+			missing := newClaudeHeaderTestRequest(t, http.Header{"User-Agent": {"curl/8.7.1"}})
+			if err := applyClaudeHeaders(missing, auth, "key-platform-329", false, nil, nil, cfg, nil, false); err != nil {
+				t.Fatal(err)
+			}
+			assertClaudeFingerprint(t, missing.Header, "claude-cli/2.1.60 (external, cli)", "0.70.0", "v22.0.0", helps.MapStainlessOS(), helps.MapStainlessArch())
 		}
 	}
 }
