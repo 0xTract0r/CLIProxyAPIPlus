@@ -332,6 +332,8 @@ func TestClaudeExecutor_ClaudeCodeCLIFingerprintOnThirdPartyGateway(t *testing.T
 	defer server.Close()
 
 	cfg := &config.Config{
+		// Explicit modern CLI profile fixture: pin the supported 2.1.280 software baseline.
+		ClaudeHeaderDefaults: config.ClaudeHeaderDefaults{PinSoftwareBaseline: true, UserAgent: "claude-cli/2.1.280 (external, cli)"},
 		ClaudeKey: []config.ClaudeKey{{
 			APIKey:             "key-claude-code-cli-fp",
 			BaseURL:            server.URL,
@@ -358,6 +360,9 @@ func TestClaudeExecutor_ClaudeCodeCLIFingerprintOnThirdPartyGateway(t *testing.T
 		t.Fatalf("Execute() error = %v", errExecute)
 	}
 
+	if got := seenHeaders.Get("User-Agent"); got != "claude-cli/2.1.280 (external, cli)" {
+		t.Fatalf("User-Agent = %q, want explicitly pinned modern CLI baseline", got)
+	}
 	if got := seenHeaders.Get("Authorization"); got != "Bearer key-claude-code-cli-fp" {
 		t.Fatalf("Authorization = %q, want API key bearer", got)
 	}
@@ -723,7 +728,7 @@ func TestKimiExecutor_ClaudeMessagesWithAndWithoutClaudeCodeCLIFingerprint(t *te
 	executor := NewKimiExecutor(&config.Config{})
 	payload := []byte(`{"model":"kimi-k2.5(max)","max_tokens":32,"messages":[{"role":"user","content":"hello"}]}`)
 
-	// 1. Default Kimi OAuth: no fingerprint injection.
+	// 1. F 默认 auto 经过 Claude 请求路径，并绑定账号设备。
 	defaultAuth := &cliproxyauth.Auth{
 		ID:         "kimi-auth-default",
 		Provider:   "kimi",
@@ -766,24 +771,51 @@ func TestKimiExecutor_ClaudeMessagesWithAndWithoutClaudeCodeCLIFingerprint(t *te
 		t.Fatalf("fingerprint Execute() error = %v", errFP)
 	}
 
-	mu.Lock()
-	defer mu.Unlock()
-	if len(seenBodies) != 2 {
-		t.Fatalf("expected 2 captured requests, got %d", len(seenBodies))
+	callerAuth := defaultAuth.Clone()
+	callerAuth.ID = "kimi-caller-owned"
+	callerAuth.Attributes["cloak_mode"] = "uncloak"
+	if _, err := executor.Execute(ctx, callerAuth, cliproxyexecutor.Request{Model: "kimi-k2.5(max)", Payload: payload}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatClaude, OriginalRequest: payload, Headers: http.Header{"Anthropic-Beta": {"kimi-caller-beta"}, "User-Agent": {"kimi-caller/1.0"}}}); err != nil {
+		t.Fatal(err)
 	}
 
-	// Default Kimi preserves caller fingerprint headers and strips billing/CCH.
-	if got := gjson.GetBytes(seenBodies[0], "metadata.user_id").String(); got != "" {
-		t.Fatalf("default Kimi request should not have metadata.user_id: %q", got)
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seenBodies) != 3 {
+		t.Fatalf("expected 3 captured requests, got %d", len(seenBodies))
 	}
+
+	for i, auth := range []*cliproxyauth.Auth{defaultAuth} {
+		id := gjson.GetBytes(seenBodies[i], "metadata.user_id").String()
+		if gjson.Get(id, "device_id").String() != helps.SyntheticDeviceID("", auth, "test-token") || gjson.Get(id, "account_uuid").String() != "" || gjson.Get(id, "session_id").String() == "" {
+			t.Fatalf("Kimi[%d] invalid account binding: %s", i, id)
+		}
+		if !strings.Contains(string(seenBodies[i]), claudeCodeCLIIdentity) || !strings.Contains(string(seenBodies[i]), "hello") || !strings.HasPrefix(claudeFingerprintHeaderValue(seenHeaders[i], "User-Agent"), "claude-cli/") {
+			t.Fatalf("Kimi[%d] lost default/profile CLI identity or task", i)
+		}
+	}
+	for _, body := range seenBodies {
+		if !strings.Contains(string(body), "hello") {
+			t.Fatalf("lost caller task: %s", body)
+		}
+	}
+	// 显式 uncloak 保留 U 的 caller-owned 能力；默认 auto 独立验证 F 合同。
 	if strings.Contains(string(seenBodies[0]), "cch=") || strings.Contains(string(seenBodies[0]), "x-anthropic-billing-header:") {
 		t.Fatalf("default Kimi request should not have billing/CCH: %s", seenBodies[0])
 	}
-	if got := claudeFingerprintHeaderValue(seenHeaders[0], "Anthropic-Beta"); got != "kimi-caller-beta" {
-		t.Fatalf("default Kimi Anthropic-Beta = %q, want caller beta", got)
+	if !strings.Contains(claudeFingerprintHeaderValue(seenHeaders[0], "Anthropic-Beta"), "kimi-caller-beta") {
+		t.Fatal("default auto lost caller beta capability")
 	}
-	if got := claudeFingerprintHeaderValue(seenHeaders[0], "User-Agent"); got != "kimi-caller/1.0" {
-		t.Fatalf("default Kimi User-Agent = %q, want caller value", got)
+	if got := gjson.GetBytes(seenBodies[2], "metadata.user_id").String(); got != "" {
+		t.Fatalf("explicit uncloak Kimi request should not have metadata.user_id: %q", got)
+	}
+	if strings.Contains(string(seenBodies[2]), "cch=") || strings.Contains(string(seenBodies[2]), "x-anthropic-billing-header:") {
+		t.Fatalf("explicit uncloak Kimi request should not have billing/CCH: %s", seenBodies[2])
+	}
+	if got := claudeFingerprintHeaderValue(seenHeaders[2], "Anthropic-Beta"); got != "kimi-caller-beta" {
+		t.Fatalf("explicit uncloak Kimi Anthropic-Beta = %q, want caller beta", got)
+	}
+	if got := claudeFingerprintHeaderValue(seenHeaders[2], "User-Agent"); got != "kimi-caller/1.0" {
+		t.Fatalf("explicit uncloak Kimi User-Agent = %q, want caller value", got)
 	}
 
 	// Opt-in Kimi requests use the complete CLI fingerprint. Kimi is not a native
@@ -795,6 +827,9 @@ func TestKimiExecutor_ClaudeMessagesWithAndWithoutClaudeCodeCLIFingerprint(t *te
 	}
 	if got := gjson.Get(userID, "account_uuid").String(); got == "" {
 		t.Fatal("opt-in Kimi request should have non-empty synthesized account_uuid")
+	}
+	if !strings.Contains(string(seenBodies[1]), claudeCodeCLIIdentity) || !strings.HasPrefix(claudeFingerprintHeaderValue(seenHeaders[1], "User-Agent"), "claude-cli/") {
+		t.Fatal("profile lost CLI identity or UA")
 	}
 	billing := gjson.GetBytes(seenBodies[1], "system.0.text").String()
 	if !strings.HasPrefix(billing, "x-anthropic-billing-header:") {
@@ -1420,60 +1455,82 @@ func TestClaudeExecutor_OfficialAPIKeyCloakNeverStripsClaudeCodeIdentity(t *test
 				}
 			}
 
-			if strings.Contains(string(seenBody), "x-anthropic-billing-header:") || strings.Contains(string(seenBody), "cch=") {
-				t.Fatalf("upstream body still contains Claude Code billing header: %s", seenBody)
+			// F never保留正文并绑定账号；explicit uncloak交还正文，但剥离代理管理的CLI头。
+			if got := gjson.GetBytes(seenBody, "system.0.text").String(); got != billing {
+				t.Fatalf("billing changed: %q", got)
 			}
-			if strings.Contains(string(seenBody), claudeCodeCLIIdentity) {
-				t.Fatalf("upstream body still contains Claude Code CLI identity block: %s", seenBody)
+			if got := gjson.GetBytes(seenBody, "system.1.text").String(); got != claudeCodeCLIIdentity {
+				t.Fatalf("identity changed: %q", got)
 			}
-			if got := gjson.GetBytes(seenBody, "system.#").Int(); got != 1 {
-				t.Fatalf("system block count = %d, want 1 preserved instruction block: %s", got, seenBody)
+			if got := gjson.GetBytes(seenBody, "system.2.text").String(); got != "You are an interactive CLI tool that helps users with software engineering tasks." {
+				t.Fatalf("caller instruction changed: %q", got)
 			}
-			if got := gjson.GetBytes(seenBody, "system.0.text").String(); got != "You are an interactive CLI tool that helps users with software engineering tasks." {
-				t.Fatalf("system.0.text = %q, want preserved caller instructions", got)
+			if gjson.GetBytes(seenBody, "system.#").Int() != 3 || gjson.GetBytes(seenBody, "messages.0.content").String() != "hello" {
+				t.Fatalf("caller task/system lost: %s", seenBody)
 			}
-			if gjson.GetBytes(seenBody, "metadata").Exists() {
-				t.Fatalf("metadata = %s, want Claude Code metadata stripped", gjson.GetBytes(seenBody, "metadata").Raw)
-			}
-			if gjson.GetBytes(seenBody, "diagnostics").Exists() {
-				t.Fatalf("diagnostics = %s, want Claude Code diagnostics stripped", gjson.GetBytes(seenBody, "diagnostics").Raw)
-			}
-
-			ua := claudeFingerprintHeaderValue(seenHeaders, "User-Agent")
-			if strings.HasPrefix(strings.ToLower(ua), "claude-cli/") {
-				t.Fatalf("User-Agent = %q, must not forward claude-cli user-agent", ua)
-			}
-			if !strings.HasPrefix(ua, tc.wantUserAgent) {
-				t.Fatalf("User-Agent = %q, want prefix %q", ua, tc.wantUserAgent)
-			}
-			for _, forbiddenHdr := range []string{
-				"X-App",
-				"Anthropic-Dangerous-Direct-Browser-Access",
-				"X-Claude-Code-Session-Id",
-				"X-Claude-Code-Request-Class",
-				"X-Stainless-Runtime",
-				"X-Stainless-Lang",
-				"X-Stainless-Package-Version",
-			} {
-				if got := claudeFingerprintHeaderValue(seenHeaders, forbiddenHdr); got != "" {
-					t.Fatalf("header %s = %q, want stripped", forbiddenHdr, got)
+			if tc.countTokens {
+				if gjson.GetBytes(seenBody, "metadata").Exists() || gjson.GetBytes(seenBody, "diagnostics").Exists() {
+					t.Fatalf("count must omit metadata/diagnostics: %s", seenBody)
+				}
+			} else {
+				wantID := userID
+				if tc.mode == "never" {
+					var err error
+					wantID, err = sjson.Set(userID, "device_id", helps.SyntheticDeviceID(cfg.AuthDir, auth, "sk-ant-api03-promotional-key"))
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+				wantBody, err := sjson.SetBytes(payload, "metadata.user_id", wantID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if gjson.GetBytes(seenBody, "metadata").Raw != gjson.GetBytes(wantBody, "metadata").Raw || gjson.GetBytes(seenBody, "diagnostics").Raw != gjson.GetBytes(payload, "diagnostics").Raw {
+					t.Fatalf("caller metadata/diagnostics changed: %s", seenBody)
 				}
 			}
-
+			ua := claudeFingerprintHeaderValue(seenHeaders, "User-Agent")
 			betas := claudeFingerprintHeaderValue(seenHeaders, "Anthropic-Beta")
-			for _, forbiddenBeta := range []string{
-				"claude-code-20250219",
-				"oauth-2025-04-20",
-				"redact-thinking-2026-02-12",
-				"cache-diagnosis-2026-04-07",
-			} {
-				if strings.Contains(betas, forbiddenBeta) {
-					t.Fatalf("Anthropic-Beta = %q, want %q stripped", betas, forbiddenBeta)
+			if tc.mode == "uncloak" {
+				if strings.HasPrefix(strings.ToLower(ua), "claude-cli/") || !strings.HasPrefix(ua, tc.wantUserAgent) {
+					t.Fatalf("uncloak UA=%q", ua)
+				}
+				for _, hdr := range []string{"X-App", "Anthropic-Dangerous-Direct-Browser-Access", "X-Claude-Code-Session-Id", "X-Claude-Code-Request-Class", "X-Stainless-Runtime", "X-Stainless-Lang", "X-Stainless-Package-Version"} {
+					if got := claudeFingerprintHeaderValue(seenHeaders, hdr); got != "" {
+						t.Fatalf("uncloak header %s=%q", hdr, got)
+					}
+				}
+				for _, beta := range []string{"claude-code-20250219", "oauth-2025-04-20", "redact-thinking-2026-02-12"} {
+					if strings.Contains(betas, beta) {
+						t.Fatalf("uncloak beta leaked %s: %s", beta, betas)
+					}
+				}
+				if !strings.Contains(betas, "cache-diagnosis-2026-04-07") {
+					t.Fatalf("uncloak lost diagnostics capability beta: %s", betas)
+				}
+			} else {
+				wantUA := incoming.Get("User-Agent")
+				if tc.customUA != "" {
+					wantUA = tc.customUA
+				}
+				if ua != wantUA {
+					t.Fatalf("never UA=%q want %q", ua, wantUA)
+				}
+				for _, hdr := range []string{"X-App", "Anthropic-Dangerous-Direct-Browser-Access", "X-Claude-Code-Session-Id", "X-Claude-Code-Request-Class", "X-Stainless-Runtime", "X-Stainless-Lang", "X-Stainless-Package-Version"} {
+					if claudeFingerprintHeaderValue(seenHeaders, hdr) == "" {
+						t.Fatalf("never lost fingerprint header %s", hdr)
+					}
+				}
+				for _, beta := range []string{"claude-code-20250219", "oauth-2025-04-20", "redact-thinking-2026-02-12", "cache-diagnosis-2026-04-07"} {
+					if !strings.Contains(betas, beta) {
+						t.Fatalf("never lost caller beta %s: %s", beta, betas)
+					}
 				}
 			}
 			if !strings.Contains(betas, tc.wantBetaSubstr) {
-				t.Fatalf("Anthropic-Beta = %q, want capability beta %q preserved", betas, tc.wantBetaSubstr)
+				t.Fatalf("capability beta lost: %s", betas)
 			}
+
 		})
 	}
 }

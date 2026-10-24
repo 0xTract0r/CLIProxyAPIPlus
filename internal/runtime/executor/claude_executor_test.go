@@ -1258,14 +1258,17 @@ func TestClaudeExecutor_AgentSDKEntrypointWithStrongSignalsUsesCLICloak(t *testi
 		t.Fatalf("Execute() error = %v", errExecute)
 	}
 
-	if got := seenHeaders.Get("User-Agent"); got != "claude-cli/2.1.280 (external, cli)" {
-		t.Fatalf("User-Agent = %q, want CLI cloak", got)
+	if got := seenHeaders.Get("User-Agent"); got != "claude-cli/2.1.280 (external, sdk-ts, agent-sdk/0.3.220)" {
+		t.Fatalf("User-Agent = %q, want caller sdk-ts suffix with CLI cloak", got)
 	}
-	if got := gjson.GetBytes(seenBody, "system.0.text").String(); !strings.Contains(got, "cc_entrypoint=cli;") {
-		t.Fatalf("billing attribution = %q, want cli", got)
+	if got := gjson.GetBytes(seenBody, "system.0.text").String(); !strings.Contains(got, "cc_entrypoint=sdk-ts;") {
+		t.Fatalf("billing attribution = %q, want sdk-ts", got)
 	}
 	if got := gjson.GetBytes(seenBody, "system.1.text").String(); got != claudeCodeCLIIdentity {
 		t.Fatalf("system.1.text = %q, want official CLI identity", got)
+	}
+	if !strings.Contains(string(seenBody), "agent-sdk-system") || !strings.Contains(string(seenBody), "<system-reminder>") || !strings.Contains(string(seenBody), `"text":"x"`) {
+		t.Fatalf("lost caller task/reminder: %s", seenBody)
 	}
 }
 
