@@ -2,16 +2,26 @@ package executor
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"regexp"
+	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -41,10 +51,163 @@ func makeTestCodexRefreshJWT(planType, accountID string) string {
 	return header + "." + claims + "."
 }
 
+// Linux只接受已由run-loopback-only.sh建立的内核隔离，flag仅用于fresh child分流。
+func codexRefreshLinuxBoundary(t *testing.T) {
+	t.Helper()
+	status, err := os.ReadFile("/proc/self/status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fields := map[string]string{}
+	for _, line := range strings.Split(string(status), "\n") {
+		if parts := strings.SplitN(line, ":", 2); len(parts) == 2 {
+			fields[parts[0]] = strings.TrimSpace(parts[1])
+		}
+	}
+	for _, key := range []string{"CapEff", "CapPrm", "CapInh", "CapAmb", "CapBnd"} {
+		value := fields[key]
+		if value == "" || strings.Trim(value, "0") != "" {
+			t.Fatalf("Linux isolation requires %s=0", key)
+		}
+	}
+	if fields["NoNewPrivs"] != "1" {
+		t.Fatal("Linux isolation requires NoNewPrivs=1")
+	}
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		t.Fatal(err)
+	}
+	allowed := map[string]bool{}
+	for _, iface := range interfaces {
+		addresses, err := iface.Addrs()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, address := range addresses {
+			ip, network, err := net.ParseCIDR(address.String())
+			if err != nil {
+				t.Fatal(err)
+			}
+			ones, bits := network.Mask.Size()
+			if !ip.IsLoopback() && !(ip.String() == "10.254.254.1" && ones == 32 && bits == 32) {
+				t.Fatal("nonlocal interface address in Linux fixture")
+			}
+			allowed[iface.Name] = true
+		}
+		if iface.Flags&net.FlagUp != 0 && !allowed[iface.Name] {
+			t.Fatal("unverified active interface")
+		}
+	}
+	route, err := os.ReadFile("/proc/net/route")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, line := range strings.Split(strings.TrimSpace(string(route)), "\n") {
+		if i == 0 {
+			continue
+		}
+		v := strings.Fields(line)
+		if len(v) < 8 {
+			t.Fatal("unparseable IPv4 route")
+		}
+		if v[0] != "lo" && !(allowed[v[0]] && v[1] == "01FEFE0A" && v[2] == "00000000" && v[7] == "FFFFFFFF") {
+			t.Fatal("external IPv4 route in fixture")
+		}
+	}
+	route6, err := os.ReadFile("/proc/net/ipv6_route")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(route6)), "\n") {
+		if line == "" {
+			continue
+		}
+		v := strings.Fields(line)
+		if len(v) != 10 || v[9] != "lo" {
+			t.Fatal("external or unparseable IPv6 route in fixture")
+		}
+	}
+	for _, address := range []string{"192.0.2.1:443", "198.51.100.1:8080", "[2001:db8::1]:443"} {
+		conn, err := net.DialTimeout("tcp", address, time.Second)
+		if conn != nil {
+			conn.Close()
+			t.Fatal("Linux fixture escaped isolation")
+		}
+		if !errors.Is(err, syscall.EPERM) && !errors.Is(err, syscall.EACCES) && !errors.Is(err, syscall.ENETUNREACH) && !errors.Is(err, syscall.EHOSTUNREACH) {
+			t.Fatalf("Linux kernel rejection unproven: %v", err)
+		}
+	}
+	t.Log("Linux kernel boundary verified: capabilities=0 NNP=1 local routes only")
+}
+
+func codexRefreshSandboxChild(t *testing.T) bool {
+	t.Helper()
+	if runtime.GOOS == "darwin" {
+		return claudeCountSandboxChild(t)
+	}
+	if runtime.GOOS != "linux" {
+		t.Fatal("unsupported strict TLS fixture isolation")
+		return false
+	}
+	codexRefreshLinuxBoundary(t)
+	if os.Getenv("CPA_CODEX_REFRESH_CHILD") == "1" {
+		return true
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^"+regexp.QuoteMeta(t.Name())+"$", "-test.v", "-test.timeout=25s")
+	for _, entry := range os.Environ() {
+		if !strings.HasPrefix(entry, "CPA_CODEX_REFRESH_CHILD=") {
+			cmd.Env = append(cmd.Env, entry)
+		}
+	}
+	cmd.Env = append(cmd.Env, "CPA_CODEX_REFRESH_CHILD=1")
+	output, err := cmd.CombinedOutput()
+	t.Logf("Linux isolated fresh child:\n%s", output)
+	if err != nil {
+		t.Fatalf("Linux isolated child failed: %v", err)
+	}
+	return false
+}
+
+// 复用 claudeCountSandboxChild 保证独立、只允许 loopback 的私有根证书进程。
+func startCodexRefreshStrictTLSServer(t *testing.T, handler http.Handler) *httptest.Server {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := &x509.Certificate{SerialNumber: big.NewInt(163), DNSNames: []string{"auth.openai.com"}, NotBefore: time.Now().Add(-time.Minute), NotAfter: time.Now().Add(time.Hour), IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roots := x509.NewCertPool()
+	roots.AddCert(cert)
+	t.Setenv("GODEBUG", os.Getenv("GODEBUG")+",x509usefallbackroots=1")
+	x509.SetFallbackRoots(roots)
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Host != "auth.openai.com" || r.Method != http.MethodPost || (r.URL.Path != "/oauth/token" && r.URL.Path != "/api/accounts/oauth/token") || r.TLS == nil || r.TLS.ServerName != "auth.openai.com" {
+			t.Errorf("unexpected refresh destination: %s %s host=%s tls=%v", r.Method, r.URL, r.Host, r.TLS)
+			http.Error(w, "fixture target denied", http.StatusForbidden)
+			return
+		}
+		t.Logf("strict TLS refresh: sni=%s host=%s method=%s path=%s", r.TLS.ServerName, r.Host, r.Method, r.URL.Path)
+		handler.ServeHTTP(w, r)
+	}))
+	server.TLS = &tls.Config{Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key}}, NextProtos: []string{"http/1.1"}}
+	server.StartTLS()
+	return server
+}
+
 func startCodexMockOAuthServers(t *testing.T, idToken string) (proxyURL string, teardown func()) {
 	t.Helper()
 
-	mockAuthServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	mockAuthServer := startCodexRefreshStrictTLSServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		respBody := map[string]any{
 			"access_token":  "new-mock-access-token",
 			"refresh_token": "new-mock-refresh-token",
@@ -57,7 +220,7 @@ func startCodexMockOAuthServers(t *testing.T, idToken string) (proxyURL string, 
 	}))
 
 	mockProxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodConnect {
+		if r.Method == http.MethodConnect && r.Host == "auth.openai.com:443" {
 			destConn, errDial := net.Dial("tcp", mockAuthServer.Listener.Addr().String())
 			if errDial != nil {
 				http.Error(w, errDial.Error(), http.StatusServiceUnavailable)
@@ -90,14 +253,7 @@ func startCodexMockOAuthServers(t *testing.T, idToken string) (proxyURL string, 
 		http.Error(w, "proxy only supports CONNECT", http.StatusBadRequest)
 	}))
 
-	// Allow self-signed cert for the mock TLS server in HTTP transport
-	origTransport := http.DefaultTransport
-	http.DefaultTransport = &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-	}
-
 	teardown = func() {
-		http.DefaultTransport = origTransport
 		mockProxy.Close()
 		mockAuthServer.Close()
 	}
@@ -106,6 +262,9 @@ func startCodexMockOAuthServers(t *testing.T, idToken string) (proxyURL string, 
 }
 
 func TestCodexExecutorRefresh_MissingPlanTypeDefaultsToFree(t *testing.T) {
+	if !codexRefreshSandboxChild(t) {
+		return
+	}
 	idTokenWithoutPlan := makeTestCodexRefreshJWT("", "acc-codex-test")
 	proxyURL, teardown := startCodexMockOAuthServers(t, idTokenWithoutPlan)
 	defer teardown()
@@ -182,6 +341,9 @@ func TestCodexExecutorRefresh_MissingPlanTypeDefaultsToFree(t *testing.T) {
 }
 
 func TestCodexExecutorRefresh_ExtractsPlanTypeWhenPresent(t *testing.T) {
+	if !codexRefreshSandboxChild(t) {
+		return
+	}
 	idTokenWithPlan := makeTestCodexRefreshJWT("team", "acc-codex-test-team")
 	proxyURL, teardown := startCodexMockOAuthServers(t, idTokenWithPlan)
 	defer teardown()
@@ -258,6 +420,9 @@ func TestCodexExecutorRefresh_ExtractsPlanTypeWhenPresent(t *testing.T) {
 }
 
 func TestCodexExecutorRefresh_EmptyAttributesSnapshotIsolation(t *testing.T) {
+	if !codexRefreshSandboxChild(t) {
+		return
+	}
 	idTokenWithoutPlan := makeTestCodexRefreshJWT("", "acc-codex-empty-attrs")
 	proxyURL, teardown := startCodexMockOAuthServers(t, idTokenWithoutPlan)
 	defer teardown()
