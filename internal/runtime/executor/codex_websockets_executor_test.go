@@ -3044,26 +3044,40 @@ func TestCodexWebsockets_KeepalivePingDuringUpload_WithSession(t *testing.T) {
 		})
 
 		// Start server reader loop so server processes control frames.
-		readErrCh := make(chan error, 1)
+		requestReceived := make(chan error, 1)
 		go func() {
-			for {
-				if _, _, errRead := conn.ReadMessage(); errRead != nil {
-					readErrCh <- errRead
-					return
-				}
+			messageType, payload, errRead := conn.ReadMessage()
+			if errRead != nil {
+				requestReceived <- fmt.Errorf("read complete response.create: %w", errRead)
+				return
 			}
+			if messageType != websocket.TextMessage || !gjson.ValidBytes(payload) {
+				requestReceived <- fmt.Errorf("expected a complete JSON text request, got frame type %d", messageType)
+				return
+			}
+			if eventType := gjson.GetBytes(payload, "type").String(); eventType != "response.create" {
+				requestReceived <- fmt.Errorf("unexpected request event %q, want response.create", eventType)
+				return
+			}
+			requestReceived <- nil
 		}()
 
 		// Wait until client has entered writeMessage and is actively holding writeMu.
 		select {
 		case <-inWriteHook:
+		case errRead := <-requestReceived:
+			t.Errorf("request reader completed before upload hook: %v", errRead)
+			return
 		case <-time.After(2 * time.Second):
 			t.Errorf("timed out waiting for client write hook")
 			return
 		}
 
 		// Upstream sends Ping WHILE client payload write is in progress holding writeMu.
-		_ = conn.WriteControl(websocket.PingMessage, []byte("session-ping"), time.Now().Add(time.Second))
+		if errPing := conn.WriteControl(websocket.PingMessage, []byte("session-ping"), time.Now().Add(time.Second)); errPing != nil {
+			t.Errorf("write keepalive ping: %v", errPing)
+			return
+		}
 
 		// Server asserts Pong arrives while client write is still blocked in the hook.
 		select {
@@ -3072,14 +3086,33 @@ func TestCodexWebsockets_KeepalivePingDuringUpload_WithSession(t *testing.T) {
 				t.Errorf("unexpected pong payload: got %q, want session-ping", got)
 			}
 			close(pongDeliveredDuringWrite)
+		case errRead := <-requestReceived:
+			t.Errorf("request reader completed before Pong released the upload hook: %v", errRead)
+			return
 		case <-time.After(2 * time.Second):
 			t.Errorf("pong was not received while payload write was in progress")
 			return
 		}
 
 		// Now send terminal response.
+		// The Pong assertion released the hook; wait for the full client upload
+		// before sending terminal and letting the server close its connection.
+		select {
+		case errRead := <-requestReceived:
+			if errRead != nil {
+				t.Errorf("receive complete response.create: %v", errRead)
+				return
+			}
+		case <-time.After(2 * time.Second):
+			t.Error("timed out waiting for complete response.create after Pong released upload")
+			return
+		}
+
 		respPayload := []byte(`{"type":"response.completed","response":{"id":"resp-1","status":"completed","output":[]}}`)
-		_ = conn.WriteMessage(websocket.TextMessage, respPayload)
+		if errTerminal := conn.WriteMessage(websocket.TextMessage, respPayload); errTerminal != nil {
+			t.Errorf("write terminal response: %v", errTerminal)
+			return
+		}
 	}))
 	defer server.Close()
 
@@ -3142,24 +3175,40 @@ func TestCodexWebsockets_KeepalivePingDuringUpload_Sessionless(t *testing.T) {
 			return nil
 		})
 
+		requestReceived := make(chan error, 1)
 		go func() {
-			for {
-				if _, _, errRead := conn.ReadMessage(); errRead != nil {
-					return
-				}
+			messageType, payload, errRead := conn.ReadMessage()
+			if errRead != nil {
+				requestReceived <- fmt.Errorf("read complete response.create: %w", errRead)
+				return
 			}
+			if messageType != websocket.TextMessage || !gjson.ValidBytes(payload) {
+				requestReceived <- fmt.Errorf("expected a complete JSON text request, got frame type %d", messageType)
+				return
+			}
+			if eventType := gjson.GetBytes(payload, "type").String(); eventType != "response.create" {
+				requestReceived <- fmt.Errorf("unexpected request event %q, want response.create", eventType)
+				return
+			}
+			requestReceived <- nil
 		}()
 
 		// Wait until client has entered writeMessage on sessionless path.
 		select {
 		case <-inWriteHook:
+		case errRead := <-requestReceived:
+			t.Errorf("request reader completed before upload hook: %v", errRead)
+			return
 		case <-time.After(2 * time.Second):
 			t.Errorf("timed out waiting for client write hook")
 			return
 		}
 
 		// Upstream sends Ping WHILE client payload write is in progress.
-		_ = conn.WriteControl(websocket.PingMessage, []byte("sessionless-ping"), time.Now().Add(time.Second))
+		if errPing := conn.WriteControl(websocket.PingMessage, []byte("sessionless-ping"), time.Now().Add(time.Second)); errPing != nil {
+			t.Errorf("write keepalive ping: %v", errPing)
+			return
+		}
 
 		// Server asserts Pong arrives while client write is still in progress.
 		select {
@@ -3168,13 +3217,32 @@ func TestCodexWebsockets_KeepalivePingDuringUpload_Sessionless(t *testing.T) {
 				t.Errorf("unexpected pong payload: got %q, want sessionless-ping", got)
 			}
 			close(pongDeliveredDuringWrite)
+		case errRead := <-requestReceived:
+			t.Errorf("request reader completed before Pong released the upload hook: %v", errRead)
+			return
 		case <-time.After(2 * time.Second):
 			t.Errorf("pong was not received while payload write was in progress on sessionless connection")
 			return
 		}
 
+		// The Pong assertion released the hook; wait for the full client upload
+		// before sending terminal and letting the server close its connection.
+		select {
+		case errRead := <-requestReceived:
+			if errRead != nil {
+				t.Errorf("receive complete response.create: %v", errRead)
+				return
+			}
+		case <-time.After(2 * time.Second):
+			t.Error("timed out waiting for complete response.create after Pong released upload")
+			return
+		}
+
 		respPayload := []byte(`{"type":"response.completed","response":{"id":"resp-1","status":"completed","output":[]}}`)
-		_ = conn.WriteMessage(websocket.TextMessage, respPayload)
+		if errTerminal := conn.WriteMessage(websocket.TextMessage, respPayload); errTerminal != nil {
+			t.Errorf("write terminal response: %v", errTerminal)
+			return
+		}
 	}))
 	defer server.Close()
 

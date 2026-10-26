@@ -2256,22 +2256,38 @@ func TestXAIWebsockets_KeepalivePingDuringUpload_WithSession(t *testing.T) {
 			return nil
 		})
 
+		requestReceived := make(chan error, 1)
 		go func() {
-			for {
-				if _, _, errReadLoop := conn.ReadMessage(); errReadLoop != nil {
-					return
-				}
+			messageType, payload, errRead := conn.ReadMessage()
+			if errRead != nil {
+				requestReceived <- fmt.Errorf("read complete response.create: %w", errRead)
+				return
 			}
+			if messageType != websocket.TextMessage || !gjson.ValidBytes(payload) {
+				requestReceived <- fmt.Errorf("expected a complete JSON text request, got frame type %d", messageType)
+				return
+			}
+			if eventType := gjson.GetBytes(payload, "type").String(); eventType != "response.create" {
+				requestReceived <- fmt.Errorf("unexpected request event %q, want response.create", eventType)
+				return
+			}
+			requestReceived <- nil
 		}()
 
 		select {
 		case <-inWriteHook:
+		case errRead := <-requestReceived:
+			t.Errorf("request reader completed before upload hook: %v", errRead)
+			return
 		case <-time.After(2 * time.Second):
 			t.Errorf("timed out waiting for client write hook")
 			return
 		}
 
-		_ = conn.WriteControl(websocket.PingMessage, []byte("xai-session-ping"), time.Now().Add(time.Second))
+		if errPing := conn.WriteControl(websocket.PingMessage, []byte("xai-session-ping"), time.Now().Add(time.Second)); errPing != nil {
+			t.Errorf("write keepalive ping: %v", errPing)
+			return
+		}
 
 		select {
 		case got := <-serverPongCh:
@@ -2279,13 +2295,32 @@ func TestXAIWebsockets_KeepalivePingDuringUpload_WithSession(t *testing.T) {
 				t.Errorf("unexpected pong payload: got %q, want xai-session-ping", got)
 			}
 			close(pongDeliveredDuringWrite)
+		case errRead := <-requestReceived:
+			t.Errorf("request reader completed before Pong released the upload hook: %v", errRead)
+			return
 		case <-time.After(2 * time.Second):
 			t.Errorf("pong was not received while payload write was in progress")
 			return
 		}
 
+		// The Pong assertion released the hook; wait for the full client upload
+		// before sending terminal and letting the server close its connection.
+		select {
+		case errRead := <-requestReceived:
+			if errRead != nil {
+				t.Errorf("receive complete response.create: %v", errRead)
+				return
+			}
+		case <-time.After(2 * time.Second):
+			t.Error("timed out waiting for complete response.create after Pong released upload")
+			return
+		}
+
 		respPayload := []byte(`{"type":"response.done","response":{"id":"resp-1","status":"completed","output":[]}}`)
-		_ = conn.WriteMessage(websocket.TextMessage, respPayload)
+		if errTerminal := conn.WriteMessage(websocket.TextMessage, respPayload); errTerminal != nil {
+			t.Errorf("write terminal response: %v", errTerminal)
+			return
+		}
 	}))
 	defer server.Close()
 
@@ -2352,22 +2387,38 @@ func TestXAIWebsockets_KeepalivePingDuringUpload_Sessionless(t *testing.T) {
 			return nil
 		})
 
+		requestReceived := make(chan error, 1)
 		go func() {
-			for {
-				if _, _, errReadLoop := conn.ReadMessage(); errReadLoop != nil {
-					return
-				}
+			messageType, payload, errRead := conn.ReadMessage()
+			if errRead != nil {
+				requestReceived <- fmt.Errorf("read complete response.create: %w", errRead)
+				return
 			}
+			if messageType != websocket.TextMessage || !gjson.ValidBytes(payload) {
+				requestReceived <- fmt.Errorf("expected a complete JSON text request, got frame type %d", messageType)
+				return
+			}
+			if eventType := gjson.GetBytes(payload, "type").String(); eventType != "response.create" {
+				requestReceived <- fmt.Errorf("unexpected request event %q, want response.create", eventType)
+				return
+			}
+			requestReceived <- nil
 		}()
 
 		select {
 		case <-inWriteHook:
+		case errRead := <-requestReceived:
+			t.Errorf("request reader completed before upload hook: %v", errRead)
+			return
 		case <-time.After(2 * time.Second):
 			t.Errorf("timed out waiting for client write hook")
 			return
 		}
 
-		_ = conn.WriteControl(websocket.PingMessage, []byte("xai-sessionless-ping"), time.Now().Add(time.Second))
+		if errPing := conn.WriteControl(websocket.PingMessage, []byte("xai-sessionless-ping"), time.Now().Add(time.Second)); errPing != nil {
+			t.Errorf("write keepalive ping: %v", errPing)
+			return
+		}
 
 		select {
 		case got := <-serverPongCh:
@@ -2375,13 +2426,32 @@ func TestXAIWebsockets_KeepalivePingDuringUpload_Sessionless(t *testing.T) {
 				t.Errorf("unexpected pong payload: got %q, want xai-sessionless-ping", got)
 			}
 			close(pongDeliveredDuringWrite)
+		case errRead := <-requestReceived:
+			t.Errorf("request reader completed before Pong released the upload hook: %v", errRead)
+			return
 		case <-time.After(2 * time.Second):
 			t.Errorf("pong was not received while payload write was in progress on sessionless connection")
 			return
 		}
 
+		// The Pong assertion released the hook; wait for the full client upload
+		// before sending terminal and letting the server close its connection.
+		select {
+		case errRead := <-requestReceived:
+			if errRead != nil {
+				t.Errorf("receive complete response.create: %v", errRead)
+				return
+			}
+		case <-time.After(2 * time.Second):
+			t.Error("timed out waiting for complete response.create after Pong released upload")
+			return
+		}
+
 		respPayload := []byte(`{"type":"response.done","response":{"id":"resp-1","status":"completed","output":[]}}`)
-		_ = conn.WriteMessage(websocket.TextMessage, respPayload)
+		if errTerminal := conn.WriteMessage(websocket.TextMessage, respPayload); errTerminal != nil {
+			t.Errorf("write terminal response: %v", errTerminal)
+			return
+		}
 	}))
 	defer server.Close()
 
