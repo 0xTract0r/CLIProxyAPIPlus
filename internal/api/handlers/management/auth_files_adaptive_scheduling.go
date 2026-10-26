@@ -254,7 +254,7 @@ func (h *Handler) buildAccountSchedulingView(auth *coreauth.Auth) gin.H {
 	//     serve.
 	// Each field is emitted only when its source parses as a non-zero RFC3339
 	// timestamp (re-normalized to RFC3339 UTC to match the other time fields); a
-	// missing/empty/unparseable source omits that field, and if both are absent the
+	// missing/empty/unparseable source omits that field, and if all are absent the
 	// whole anchor_candidates object is omitted (never an empty object).
 	anchorCandidates := gin.H{}
 	var accountCfg *config.Config
@@ -273,6 +273,24 @@ func (h *Handler) buildAccountSchedulingView(auth *coreauth.Auth) gin.H {
 	}
 	if len(anchorCandidates) > 0 {
 		view["anchor_candidates"] = anchorCandidates
+	}
+
+	// account_created_at (fix-account-origin-anchors, read-only display field --
+	// deliberately NOT part of anchor_candidates): the Anthropic-reported account
+	// creation instant, read through coreauth.AccountCreatedAt --
+	// quota_snapshot.profile.account.created_at, falling back to
+	// quota_snapshot.profile.organization.subscription_created_at when the former
+	// is absent/unparseable. Unlike the anchor_candidates entries above (both
+	// describe when THIS system first saw the account), this is Anthropic's own
+	// record of when the account/subscription actually came into being. It is
+	// exposed for display only -- never as a one-click first_production_at pick --
+	// because letting the warm-up anchor be set to the account's true creation
+	// time would inflate the account's apparent maturity, skip the deliberate
+	// warm-up ramp, and raise ban risk. It is never synthesized from
+	// first_auth_at / RuntimeIdentityState / the current time when both
+	// quota-snapshot sources are missing -- it is simply omitted.
+	if createdAt, ok := coreauth.AccountCreatedAt(auth); ok {
+		view["account_created_at"] = createdAt.UTC().Format(time.RFC3339)
 	}
 
 	return view
