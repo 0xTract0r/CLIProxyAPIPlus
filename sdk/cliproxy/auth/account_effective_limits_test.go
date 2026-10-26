@@ -4,7 +4,7 @@ import (
 	"math"
 	"testing"
 
-	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 )
 
 // effWithScale stamps a per-account rate_scale override onto an adaptive test

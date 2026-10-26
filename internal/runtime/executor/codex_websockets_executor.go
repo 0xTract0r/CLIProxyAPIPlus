@@ -9,9 +9,10 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	log "github.com/sirupsen/logrus"
 )
 
 // CodexWebsocketsExecutor executes Codex Responses requests using a WebSocket transport.
@@ -65,6 +66,11 @@ func NewCodexAutoExecutorWithManager(cfg *config.Config, manager *cliproxyauth.M
 }
 
 func (e *CodexAutoExecutor) Identifier() string { return "codex" }
+
+// UsesConfig reports whether the executor was created for cfg.
+func (e *CodexAutoExecutor) UsesConfig(cfg *config.Config) bool {
+	return e != nil && e.httpExec != nil && e.httpExec.cfg == cfg
+}
 
 func (e *CodexAutoExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Auth) error {
 	if e == nil || e.httpExec == nil {
@@ -127,6 +133,20 @@ func (e *CodexAutoExecutor) CloseExecutionSession(sessionID string) {
 	e.wsExec.CloseExecutionSession(sessionID)
 }
 
+func (e *CodexAutoExecutor) SharesExecutionSessionsWith(other cliproxyauth.ProviderExecutor) bool {
+	if e == nil || e.wsExec == nil {
+		return false
+	}
+	return e.wsExec.SharesExecutionSessionsWith(other)
+}
+
+func (e *CodexAutoExecutor) CloseAuthExecutionSessions(authID string) {
+	if e == nil || e.wsExec == nil {
+		return
+	}
+	e.wsExec.CloseAuthExecutionSessions(authID)
+}
+
 func (e *CodexAutoExecutor) UpstreamDisconnectChan(sessionID string) <-chan error {
 	if e == nil || e.wsExec == nil {
 		return nil
@@ -177,4 +197,74 @@ func codexWebsocketsEnabled(auth *cliproxyauth.Auth) bool {
 	default:
 	}
 	return false
+}
+
+// SupportsApplyPatch requires both selectable transports to support the tool.
+func (e *CodexAutoExecutor) SupportsApplyPatch() bool {
+	return e != nil && e.httpExec != nil && e.wsExec != nil && e.httpExec.SupportsApplyPatch() && e.wsExec.SupportsApplyPatch()
+}
+
+// InterruptExecutionSession forwards a response.interrupt control frame on the
+// current upstream socket. It does not dial, replay, or select another credential.
+func (e *CodexAutoExecutor) InterruptExecutionSession(ctx context.Context, sessionID string, payload []byte) error {
+	if e == nil || e.wsExec == nil {
+		return cliproxyexecutor.ErrNoActiveUpstreamWebsocket
+	}
+	return e.wsExec.InterruptExecutionSession(ctx, sessionID, payload)
+}
+
+// InterruptExecutionSession writes the original interrupt payload to the session
+// socket captured for this execution. Payload rules and response.create defaults
+// must not rewrite response_id, mode, or extension fields.
+func (e *CodexWebsocketsExecutor) InterruptExecutionSession(ctx context.Context, sessionID string, payload []byte) error {
+	if e == nil {
+		return cliproxyexecutor.ErrNoActiveUpstreamWebsocket
+	}
+	if ctx != nil {
+		if errCtx := ctx.Err(); errCtx != nil {
+			return errCtx
+		}
+	}
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return cliproxyexecutor.ErrNoActiveUpstreamWebsocket
+	}
+	store := e.store
+	if store == nil {
+		store = globalCodexWebsocketSessionStore
+	}
+	store.mu.Lock()
+	owner := store.disconnects[sessionID]
+	store.mu.Unlock()
+	if owner == nil {
+		return cliproxyexecutor.ErrNoActiveUpstreamWebsocket
+	}
+	// 裸 ID 只定位逻辑会话；物理连接必须取当前绑定的账号/代理 generation。
+	owner.connMu.Lock()
+	sess, conn := owner.activeDisconnectSession, owner.activeDisconnectConn
+	ownerClosed := owner.closed
+	owner.connMu.Unlock()
+	if ownerClosed || sess == nil || conn == nil {
+		return cliproxyexecutor.ErrNoActiveUpstreamWebsocket
+	}
+	sess.connMu.Lock()
+	authID := sess.authID
+	valid := !sess.closed && sess.conn == conn
+	sess.connMu.Unlock()
+	if !valid {
+		return cliproxyexecutor.ErrNoActiveUpstreamWebsocket
+	}
+	// Account checks may call back into the auth manager; do not hold session
+	// locks across them. Take the lifecycle snapshot only after they finish.
+	authEnabled := cliproxyexecutor.WebsocketAuthEnabled(ctx, authID)
+	written, errWrite := sess.writeInterrupt(ctx, owner, conn, payload, authEnabled)
+	if errWrite != nil {
+		return errWrite
+	}
+	if !written {
+		log.WithField("outcome", "already_terminal").Debug("codex websockets: response.interrupt handled")
+		return nil
+	}
+	log.WithField("outcome", "forwarded").Debug("codex websockets: response.interrupt handled")
+	return nil
 }

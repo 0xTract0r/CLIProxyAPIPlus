@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"net/url"
 
-	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 )
 
 // RequestedModelMetadataKey stores the client-requested model name in Options.Metadata.
@@ -45,9 +45,45 @@ const (
 	// ExecutionSessionMetadataKey identifies a long-lived downstream execution session.
 	ExecutionSessionMetadataKey = "execution_session_id"
 	// DerivedSessionIDMetadataKey stores a stable session identity inferred from request context.
+	// It may be used to derive a provider session identity.
 	DerivedSessionIDMetadataKey = "derived_session_id"
+	// LCPAffinitySessionIDMetadataKey stores an LCP-only routing identity. Executors
+	// must not use it as a provider conversation or execution-session identity. The
+	// current phase also keeps it out of SessionTree topology until downstream wiring exists.
+	LCPAffinitySessionIDMetadataKey = "lcp_affinity_session_id"
+	// CanonicalSessionIDMetadataKey stores the single unified session identity reconciled
+	// across explicit harness headers, body fields, execution sessions, LCP inference,
+	// and fallback context derivation for unified debugging and cross-subsystem tracing.
+	CanonicalSessionIDMetadataKey = "canonical_session_id"
+	// ParentSessionIDMetadataKey stores the parent session identity for hierarchical sessions and forks.
+	// For top-level Merkle LCP forks, it represents the deterministic Merkle prefix hash at the divergence point.
+	ParentSessionIDMetadataKey = "parent_session_id"
+	// IsForkMetadataKey indicates whether the request represents a conversational branch or fork.
+	IsForkMetadataKey = "is_fork"
+	// IsCompactionMetadataKey indicates whether the request represents a context compaction continuation.
+	IsCompactionMetadataKey = "is_compaction"
+	// NodeKindMetadataKey indicates the session DAG topology kind ("compaction", "fork", or "trunk").
+	NodeKindMetadataKey = "node_kind"
+	// LCPTailFingerprintsMetadataKey stores the actual trailing turn fingerprints for context compaction matching.
+	LCPTailFingerprintsMetadataKey = "lcp_tail_fingerprints"
+	// LCPEnvironmentDigestMetadataKey stores the environment digest across all system and developer instructions.
+	LCPEnvironmentDigestMetadataKey = "lcp_environment_digest"
+	// LCPAccessGenerationMetadataKey stores the monotonic access generation when an LCP entry was touched or bound.
+	LCPAccessGenerationMetadataKey = "lcp_access_generation"
+	// LCPFingerprintMetadataKey stores bounded request-scoped turn fingerprints so
+	// SessionAffinitySelector.OnResult can avoid reparsing the original payload.
+	LCPFingerprintMetadataKey = "lcp_fingerprints"
+	// LCPMinPrefixLengthMetadataKey stores the minimum eligible prefix boundary for
+	// the bounded LCP fingerprint sequence.
+	LCPMinPrefixLengthMetadataKey = "lcp_min_prefix_length"
 	// CallerScopeMetadataKey isolates inferred session identities between downstream callers.
 	CallerScopeMetadataKey = "caller_scope"
+	// SessionAffinityProviderMetadataKey carries the affinity selection namespace
+	// (provider string, e.g. the literal "mixed" pool key) used by SessionAffinitySelector.Pick,
+	// so OnResult keys the session cache identically to how selection read it.
+	SessionAffinityProviderMetadataKey = "session_affinity_provider"
+	// SessionAffinityModelMetadataKey carries the model used during session affinity selection.
+	SessionAffinityModelMetadataKey = "session_affinity_model"
 )
 
 // Request encapsulates the translated payload that will be sent to a provider executor.
@@ -79,7 +115,7 @@ type RequestAfterAuthInterceptRequest struct {
 	Stream bool
 	// Headers contains the current upstream request headers.
 	Headers http.Header
-	// Body contains the current request payload.
+	// Body contains the current request payload. Treat it as read-only; modifications must be returned in RequestAfterAuthInterceptResponse.Body.
 	Body []byte
 	// Metadata is a best-effort cloned context snapshot. Treat it as read-only and JSON-like.
 	Metadata map[string]any
@@ -87,13 +123,77 @@ type RequestAfterAuthInterceptRequest struct {
 
 // RequestAfterAuthInterceptResponse returns selected-auth request modifications.
 type RequestAfterAuthInterceptResponse struct {
+	// Path optionally overrides the inbound request path in Options.Metadata[RequestPathMetadataKey].
+	Path string
 	// Headers replaces matching current request headers and preserves headers not mentioned here.
 	Headers http.Header
 	// Body replaces the current request body only when non-empty.
 	Body []byte
 	// ClearHeaders explicitly removes current request headers before Headers is applied.
 	ClearHeaders []string
+	// Terminate prevents the selected executor from receiving the request.
+	Terminate bool
+	// StatusCode is the downstream HTTP status used when Terminate is true.
+	StatusCode int
+	// ResponseHeaders contains downstream response headers used when Terminate is true.
+	ResponseHeaders http.Header
+	// ResponseBody contains the downstream response body used when Terminate is true.
+	ResponseBody []byte
 }
+
+// RequestTerminatedError carries a plugin-defined downstream response without executing upstream.
+type RequestTerminatedError struct {
+	HTTPStatus int
+	Header     http.Header
+	Body       []byte
+}
+
+func (e *RequestTerminatedError) Error() string {
+	return "request terminated by plugin"
+}
+
+// StatusCode returns the plugin-defined downstream HTTP status.
+func (e *RequestTerminatedError) StatusCode() int {
+	if e == nil {
+		return 0
+	}
+	return e.HTTPStatus
+}
+
+// ResponseHeaders returns a copy of the plugin-defined downstream headers.
+func (e *RequestTerminatedError) ResponseHeaders() http.Header {
+	if e == nil {
+		return nil
+	}
+	return e.Header.Clone()
+}
+
+// ResponseBody returns a copy of the plugin-defined downstream body.
+func (e *RequestTerminatedError) ResponseBody() []byte {
+	if e == nil {
+		return nil
+	}
+	return append([]byte(nil), e.Body...)
+}
+
+// WebSocketResponseEvent describes an upstream WebSocket response event received during execution.
+type WebSocketResponseEvent struct {
+	RequestID      string
+	TraceID        string
+	SourceFormat   string
+	Model          string
+	RequestedModel string
+	Provider       string
+	AuthID         string
+	AuthLabel      string
+	AuthType       string
+	EventType      string
+	Payload        []byte
+	Metadata       map[string]any
+}
+
+// WebSocketResponseObserver receives upstream WebSocket response events during execution.
+type WebSocketResponseObserver func(context.Context, WebSocketResponseEvent)
 
 // Options controls execution behavior for both streaming and non-streaming calls.
 type Options struct {
@@ -116,8 +216,24 @@ type Options struct {
 	Metadata map[string]any
 	// RequestAfterAuthInterceptor runs after credential selection and before executor translation.
 	RequestAfterAuthInterceptor RequestAfterAuthInterceptor
+	// WebSocketResponseObserver receives upstream WebSocket response events during execution.
+	WebSocketResponseObserver WebSocketResponseObserver
 	// ExecutionLifecycle owns Home-dispatched execution resources. Executors must not add it to request metadata.
 	ExecutionLifecycle ExecutionLifecycle
+	// ProxyURL overrides the credential and global proxy for this execution only.
+	// Credential refresh and token exchange must ignore it.
+	ProxyURL string
+	// KeepTopLevelEffort tells SIWC request-body rules to keep the resolved
+	// top-level reasoning.effort when configuration_update items are collapsed.
+	KeepTopLevelEffort bool
+}
+
+// EnsureMetadata initializes and returns Metadata, ensuring it is non-nil.
+func (o *Options) EnsureMetadata() map[string]any {
+	if o.Metadata == nil {
+		o.Metadata = make(map[string]any)
+	}
+	return o.Metadata
 }
 
 // ResponseFormatOrSource returns the response target format for an execution.
@@ -146,9 +262,19 @@ type StreamChunk struct {
 	Err error
 }
 
+// StreamInterruptOwner is trusted control ownership, never inferred from headers/body.
+// Zero preserves local context cancellation for existing executors and plugins.
+type StreamInterruptOwner uint8
+
+const (
+	StreamInterruptLocal StreamInterruptOwner = iota
+	StreamInterruptNativeWebsocket
+)
+
 // StreamResult wraps the streaming response, providing both the chunk channel
 // and the upstream HTTP response headers captured before streaming begins.
 type StreamResult struct {
+	InterruptOwner StreamInterruptOwner
 	// Headers carries upstream HTTP response headers from the initial connection.
 	Headers http.Header
 	// Chunks is the channel of streaming payload units.

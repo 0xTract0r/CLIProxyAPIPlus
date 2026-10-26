@@ -3,17 +3,18 @@ package executor
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
-	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
-	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -21,92 +22,334 @@ import (
 
 func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
 	ctx = contextWithClaudeInboundHeaders(ctx, opts.Headers)
+	apiKey, baseURL := claudeCreds(auth)
+	// A configured upstream keeps the fork's count endpoint behavior. Local
+	// estimation is explicit; unauthenticated SDK calls may still count locally.
+	localCount := e.cfg != nil && e.cfg.Claude.LocalTokenCount
+	if !localCount && (strings.TrimSpace(apiKey) != "" || strings.TrimSpace(baseURL) != "") {
+		return e.countTokensUpstream(ctx, auth, req, opts)
+	}
+
+	baseModel := thinking.ParseSuffix(req.Model).ModelName
+	from := opts.SourceFormat
+	ctx, req, opts = e.applyNativeToolSearchFallback(ctx, auth, from, e.upstreamModel(baseModel), req, opts)
+	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
+	to := sdktranslator.FromString("claude")
+
+	// Use streaming translation to preserve function calling, except for claude.
+	stream := from != to
+	body, err := helps.TranslateRequestReturningError(ctx, opts.Headers, e.cfg, from, to, baseModel, req.Payload, stream, helps.APIKeyModelIsCompat(req))
+	if err != nil {
+		return cliproxyexecutor.Response{}, err
+	}
+	originalTranslatedForPayload := append([]byte(nil), body...)
+	if len(opts.OriginalRequest) > 0 {
+		originalTranslatedForPayload = helps.TranslateRequestWithAPIKeyModelCompatibility(ctx, opts.Headers, e.cfg, from, to, baseModel, opts.OriginalRequest, stream, helps.APIKeyModelIsCompat(req))
+	}
+	var errThinking error
+	body, errThinking = helps.ApplyRequestThinking(body, req, opts, from.String(), to.String(), e.Identifier())
+	if errThinking != nil {
+		return cliproxyexecutor.Response{}, errThinking
+	}
+	originalPayload := req.Payload
+	if len(opts.OriginalRequest) > 0 {
+		originalPayload = opts.OriginalRequest
+	}
+	webSearchSessionKey, webSearchTTL, _ := e.claudeWebSearchResultCacheScope(ctx, auth, from, req, opts, originalPayload)
+	body = helps.RestoreClaudeWebSearchResultsContext(ctx, body, webSearchSessionKey, webSearchTTL)
+	if rebuildMidSystemMessageEnabled(e.cfg, auth) {
+		body = rebuildMidSystemMessagesToTopLevel(body)
+	}
+	body = sanitizeClaudeMessagesForClaudeUpstreamWithDebug(ctx, body, baseModel, helps.APIKeyModelIsCompat(req))
+	body = applyClaudePreservedThinkingBinding(body)
+	body = helps.NewPayloadFinalizer(e.cfg, e.Identifier(), baseModel, to.String(), "", originalTranslatedForPayload, req, opts)(body)
+	body = stripPromptCacheOptions(body)
+	if errValidate := validateClaudeTokenCountRequest(body); errValidate != nil {
+		return cliproxyexecutor.Response{}, errValidate
+	}
+
+	// Custom API-key gateways without a native count_tokens contract continue to
+	// use the local estimator without injecting generation-only CLI instructions.
+	count, err := helps.CountClaudeInputTokens(body)
+	if err != nil {
+		return cliproxyexecutor.Response{}, fmt.Errorf("claude executor: token counting failed: %w", err)
+	}
+
+	usageJSON := []byte(fmt.Sprintf(`{"input_tokens":%d}`, count))
+	out := sdktranslator.TranslateTokenCount(ctx, to, responseFormat, count, usageJSON)
+	return cliproxyexecutor.Response{Payload: out}, nil
+}
+
+type claudeTokenCountValidationError struct {
+	statusErr
+}
+
+func (claudeTokenCountValidationError) IsRequestScoped() bool {
+	return true
+}
+
+func newClaudeTokenCountValidationError(message string) error {
+	return claudeTokenCountValidationError{statusErr{code: http.StatusBadRequest, msg: message}}
+}
+
+func validateClaudeTokenCountRequest(body []byte) error {
+	if !gjson.ValidBytes(body) {
+		return newClaudeTokenCountValidationError("invalid Claude token count request JSON")
+	}
+	root := gjson.ParseBytes(body)
+	if !root.IsObject() {
+		return newClaudeTokenCountValidationError("Claude token count request must be a JSON object")
+	}
+	messages := root.Get("messages")
+	if !messages.IsArray() || len(messages.Array()) == 0 {
+		return newClaudeTokenCountValidationError("Claude token count request messages must be a non-empty array")
+	}
+	for _, message := range messages.Array() {
+		if !message.IsObject() {
+			return newClaudeTokenCountValidationError("Claude token count request messages must contain objects")
+		}
+		role := message.Get("role").String()
+		if role != "user" && role != "assistant" {
+			return newClaudeTokenCountValidationError("Claude token count request message role must be user or assistant")
+		}
+		content := message.Get("content")
+		if content.Type == gjson.String {
+			continue
+		}
+		if !content.IsArray() {
+			return newClaudeTokenCountValidationError("Claude token count request message content must be a string or array")
+		}
+		for _, block := range content.Array() {
+			if !block.IsObject() || block.Get("type").Type != gjson.String || block.Get("type").String() == "" {
+				return newClaudeTokenCountValidationError("Claude token count request content blocks must be typed objects")
+			}
+		}
+	}
+	return nil
+}
+
+// claudeLegacyCountPayloadCCH复现F非OAuth摘要的preimage：caller system转发后、
+// 注入billing/system模板前的payload。仅供custom Count旧SHA兼容，不是最终正文签名。
+func claudeLegacyCountPayloadCCH(payload []byte, strictMode bool) string {
+	if !strictMode {
+		var parts []string
+		system := gjson.GetBytes(payload, "system")
+		if system.IsArray() {
+			for _, part := range system.Array() {
+				if part.Get("type").String() == "text" {
+					if text := strings.TrimSpace(part.Get("text").String()); text != "" {
+						parts = append(parts, text)
+					}
+				}
+			}
+		} else if system.Type == gjson.String && strings.TrimSpace(system.String()) != "" {
+			parts = append(parts, strings.TrimSpace(system.String()))
+		}
+		if len(parts) > 0 {
+			payload = prependToFirstUserMessage(payload, strings.Join(parts, "\n\n"))
+		}
+	}
+	sum := sha256.Sum256(payload)
+	return fmt.Sprintf("%x", sum[:])[:5]
+}
+
+func shouldUseClaudeUpstreamTokenCount(apiKey, baseURL string) bool {
+	return strings.TrimSpace(apiKey) != "" && isAnthropicUpstreamBase(baseURL)
+}
+
+// countTokensUpstream preserves Anthropic's native token-counting contract.
+func (e *ClaudeExecutor) countTokensUpstream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 	upstreamModel := e.upstreamModel(baseModel)
 
 	apiKey, baseURL := claudeCreds(auth)
+	baseURL = strings.TrimSpace(baseURL)
 	if baseURL == "" {
 		baseURL = "https://api.anthropic.com"
 	}
+	url := fmt.Sprintf("%s/v1/messages/count_tokens?beta=true", baseURL)
+	fp := resolveClaudeFingerprintPolicy(e.cfg, auth, apiKey)
 
 	from := opts.SourceFormat
+	ctx, req, opts = e.applyNativeToolSearchFallback(ctx, auth, from, upstreamModel, req, opts)
+	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
 	to := sdktranslator.FromString("claude")
+	originalPayload := req.Payload
+	if len(opts.OriginalRequest) > 0 {
+		originalPayload = opts.OriginalRequest
+	}
+	incomingHeaders, claudeCodeDetection := detectIncomingClaudeCodeRequest(ctx, opts.Headers, originalPayload, true, e.cfg)
+	initialPolicy, _ := resolveClaudeWirePolicy(e.cfg, auth, apiKey, claudeCodeDetection.Confirmed, helps.HeaderValueCaseInsensitive(incomingHeaders, "User-Agent"))
+	confirmedClaudeCode := isEffectiveConfirmedClaudeCode(claudeCodeDetection, initialPolicy)
+	claudeSessionID := ""
+	if fp.ProfileClaudeCodeCLI {
+		claudeSessionID = helps.ClaudeAgentSessionUUIDForRequest(incomingHeaders, originalPayload, req.Payload, confirmedClaudeCode, opts.Metadata, req.Metadata)
+	}
 	// Use streaming translation to preserve function calling, except for claude.
 	stream := from != to
-	body := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, stream)
-	body, _ = sjson.SetBytes(body, "model", upstreamModel)
+	body, err := helps.TranslateRequestReturningError(ctx, opts.Headers, e.cfg, from, to, baseModel, req.Payload, stream, helps.APIKeyModelIsCompat(req))
+	if err != nil {
+		return cliproxyexecutor.Response{}, err
+	}
+	originalTranslatedForPayload := append([]byte(nil), body...)
+	if len(opts.OriginalRequest) > 0 {
+		originalTranslatedForPayload = helps.TranslateRequestWithAPIKeyModelCompatibility(ctx, opts.Headers, e.cfg, from, to, baseModel, opts.OriginalRequest, stream, helps.APIKeyModelIsCompat(req))
+	}
+	body = helps.SetStringIfDifferent(body, "model", upstreamModel)
+	var errThinking error
+	body, errThinking = helps.ApplyRequestThinking(body, req, opts, from.String(), to.String(), e.Identifier())
+	if errThinking != nil {
+		return cliproxyexecutor.Response{}, errThinking
+	}
+	webSearchSessionKey, webSearchTTL, _ := e.claudeWebSearchResultCacheScope(ctx, auth, from, req, opts, originalPayload)
+	body = helps.RestoreClaudeWebSearchResultsContext(ctx, body, webSearchSessionKey, webSearchTTL)
 	if rebuildMidSystemMessageEnabled(e.cfg, auth) {
 		body = rebuildMidSystemMessagesToTopLevel(body)
 	}
 
-	// 反关联修复 A（C1）：count_tokens 必须与 messages 走同一套 cch 签名路径。
-	// 真实 claude-cli 的 count_tokens 与 messages 共用同一个 SDK client，billing-header
-	// 用"cch=00000 占位再 xxHash64 回填"模式，两端点同一套 cch。此前 count_tokens 硬钉
-	// 非签名模式（generateBillingHeader 走 sha256[:5]）且从不调用 signAnthropicMessagesBody，
-	// 导致同一 OAuth 账号 messages=xxHash64 / count_tokens=sha256，成为跨端点分辨信号。
-	// 这里对 OAuth / experimentalCCHSigning 启用与 messages 完全一致的条件与参数：
-	//   - 签名模式占位 cch=00000（与 messages 的 applyCloaking 路径一致）
-	//   - 使用与 messages 相同的 entrypoint（从 UA 解析）/ workload（从 ctx 取）
-	// 真正的 xxHash64 回填在 body 全部规范化（device_id ⑦ env）之后进行（见下方）。
-	oauthToken := isClaudeOAuthToken(apiKey)
-	useCCHSigning := oauthToken || experimentalCCHSigningEnabled(e.cfg, auth)
-	if !strings.HasPrefix(baseModel, "claude-3-5-haiku") {
-		billingVersion := resolveClaudeBillingVersion(ctx, e.cfg, auth, apiKey)
-		if useCCHSigning {
-			clientUserAgent := getClientUserAgent(ctx)
-			entrypoint := parseEntrypointFromUA(e.cfg, clientUserAgent)
-			workload := getWorkloadFromContext(ctx)
-			body = checkSystemInstructionsWithSigningMode(body, false, useCCHSigning, oauthToken, billingVersion, entrypoint, workload)
-		} else {
-			// 非签名（纯 API key）路径保持原状：messages 本来也是非签名 sha256，
-			// count_tokens 维持 sha256 即与 messages 一致，行为零变化。
-			body = checkSystemInstructionsWithVersion(body, false, billingVersion)
+	directAnthropic := isAnthropicUpstreamBase(baseURL)
+	// 官方/显式原生profile与其他provider沿用native Count形状；普通Claude gateway保fork职责。
+	customClaudeCount := !directAnthropic && (auth == nil || strings.TrimSpace(auth.Provider) == "" || strings.EqualFold(strings.TrimSpace(auth.Provider), "claude")) &&
+		claudeFingerprintProfileFromConfig(e.cfg, auth) == claudeFingerprintProfileDefault
+	policy, settings := resolveClaudeWirePolicy(e.cfg, auth, apiKey, confirmedClaudeCode, helps.HeaderValueCaseInsensitive(incomingHeaders, "User-Agent"))
+	cloaked := policy.Cloak
+	// F custom Count maintained billing even when auto skipped body cloaking.
+	// Preserve the native shape on first-party/delegated/profile paths and keep
+	// explicit never/uncloak independent of the caller's native UA.
+	maintainNativeCountBilling := customClaudeCount && !isKimiAPIEndpoint(baseURL) &&
+		policy.AutoMode && !cloaked && !strings.HasPrefix(baseModel, "claude-3-5-haiku")
+	explicitCacheMode := isExplicitPromptCacheMode(originalPayload, req.Payload, body)
+	useCCHSigning := customClaudeCount && (policy.OAuth || experimentalCCHSigningEnabled(e.cfg, auth))
+	if customClaudeCount {
+		legacyCCH := ""
+		var legacyCCHOutput *string
+		if cloaked && !useCCHSigning && !strings.HasPrefix(baseModel, "claude-3-5-haiku") {
+			legacyCCHOutput = &legacyCCH
+		}
+		ctx = helps.WithIncomingHeaders(ctx, incomingHeaders)
+		body, cloaked, err = applyCloakingWithDeviceIdentityPolicy(ctx, e.cfg, auth, body, apiKey, confirmedClaudeCode, useCCHSigning, true, false, legacyCCHOutput, explicitCacheMode)
+		if err != nil {
+			return cliproxyexecutor.Response{}, err
+		}
+		if legacyCCH != "" {
+			billing := gjson.GetBytes(body, "system.0.text").String()
+			if strings.HasPrefix(billing, "x-anthropic-billing-header:") {
+				billing = claudeBillingHeaderEntrypointPattern.ReplaceAllStringFunc(billing, func(entrypoint string) string { return entrypoint + " cch=" + legacyCCH + ";" })
+				body, _ = sjson.SetBytes(body, "system.0.text", billing)
+			}
+		}
+	} else {
+		if cloaked {
+			if !settings.strictMode {
+				if errSystem := validateClaudeCallerSystemBlocks(gjson.GetBytes(body, "system")); errSystem != nil {
+					return cliproxyexecutor.Response{}, errSystem
+				}
+			}
+			if !strings.HasPrefix(baseModel, "claude-3-5-haiku") {
+				if policy.OAuth && !settings.strictMode && !settings.preserveCallerSystem {
+					body = neutralizeClaudeOAuthCallerSystem(body)
+				}
+				body = relocateClaudeSystemPromptForCountTokensWithPolicy(body, settings.strictMode, explicitCacheMode, !policy.OAuth)
+			}
+			if len(settings.sensitiveWords) > 0 {
+				body = helps.ObfuscateSensitiveWords(body, helps.BuildSensitiveWordMatcher(settings.sensitiveWords))
+			}
+		} else if policy.Uncloak {
+			body = uncloakClaudeCodePayload(body, confirmedClaudeCode)
 		}
 	}
-
 	// Keep count_tokens requests compatible with Anthropic cache-control constraints too.
 	body = enforceCacheControlLimit(body, 4)
-	body = normalizeCacheControlTTL(body)
+	if !explicitCacheMode {
+		body = normalizeCacheControlTTL(body)
+	}
 
 	// Extract betas from body and convert to header (for count_tokens too)
 	var extraBetas []string
 	extraBetas, body = extractAndRemoveBetas(body)
-	if oauthToken {
-		body, _ = prepareClaudeOAuthToolNamesForUpstream(body, claudeToolPrefix, auth.ToolPrefixDisabled())
+	// Claude Code 2.1.220's beta.messages.countTokens() always appends this beta.
+	extraBetas = append(extraBetas, claudeTokenCountingBeta)
+	if fp.MCPAlias && cloaked {
+		mcpAliases := resolveClaudeMCPAliasOptions(ctx)
+		body, _ = prepareClaudeOAuthToolNamesForUpstream(body, mcpAliases)
 	}
-	body = sanitizeClaudeMessagesForClaudeUpstreamWithDebug(ctx, body, baseModel)
-
-	// Account-scoped device_id normalization for the count_tokens path. Unlike the
-	// main messages path (applyCloaking), this only rewrites an existing
-	// metadata.user_id.device_id and never fabricates the field when it is absent:
-	// the real claude-cli count_tokens fingerprint is not yet captured, so emitting
-	// an extra metadata.user_id we are not sure the client sends could itself become
-	// a detection signal. Existing user_id objects still get their device_id swapped
-	// to the same account-derived value used by Execute; a parse failure is a safe
-	// pass-through (never a 400).
-	countTokensAuthDir := ""
-	if e.cfg != nil {
-		countTokensAuthDir = e.cfg.AuthDir
+	body = sanitizeClaudeMessagesForClaudeUpstreamWithDebug(ctx, body, baseModel, helps.APIKeyModelIsCompat(req))
+	body = applyClaudePreservedThinkingBinding(body)
+	body = stripPromptCacheOptions(body)
+	// Two different reasons converge on the same deletions, and they must stay
+	// separable.
+	//
+	// Match the fixed upstream's first-party native count profile. This is a
+	// client wire-shape choice, not a claim that Anthropic rejects system prompts;
+	// the public count API supports system. Caller semantics were handled above.
+	//
+	// Elsewhere (Kimi, delegated Anthropic Messages providers) the caller owns its
+	// body by default: a caller that deliberately sends context_management expects
+	// the token count to reflect it, so CPA must not silently rewrite the request.
+	// Only an explicit claude-code-cli profile aligns the shape, and then it aligns
+	// to the measured one: Claude Code 2.1.220 count_tokens carries exactly model,
+	// messages and tools, never a system block.
+	alignCLICountTokensShape := fp.ProfileClaudeCodeCLI && !customClaudeCount
+	if directAnthropic || alignCLICountTokensShape {
+		body, _ = sjson.DeleteBytes(body, "metadata")
+		body, _ = sjson.DeleteBytes(body, "context_management")
+		body, _ = sjson.DeleteBytes(body, "diagnostics")
 	}
-	body = helps.InjectAccountDeviceIDWithOptions(body, countTokensAuthDir, auth, apiKey, false)
-
-	// 反关联修复 A（C1）续：在 body 完成全部规范化（sanitize / device_id ⑦ / env）之后，
-	// 与 messages 路径（Execute / ExecuteStream）完全相同地回填 cch。
-	// signAnthropicMessagesBody 会先把 billing-header 的 cch 归一为 00000 再做 xxHash64，
-	// 因此只要上面用签名模式注入了 cch=00000 占位且其余 billing 字段（cc_version /
-	// build / entrypoint / workload）与 messages 一致，同一逻辑请求两端点得到同一 cch。
-	if useCCHSigning {
-		body = signAnthropicMessagesBody(body)
+	if alignCLICountTokensShape {
+		body = util.StripClaudeCodeAttributionSystem(body)
 	}
-
-	url := fmt.Sprintf("%s/v1/messages/count_tokens?beta=true", baseURL)
+	// Runs on the finished body: payload rules can rewrite model and messages
+	// long after translation, so an earlier check would not describe the request
+	// that is about to be sent.
+	body = helps.NewPayloadFinalizer(e.cfg, e.Identifier(), baseModel, to.String(), "", originalTranslatedForPayload, req, opts)(body)
+	body = stripPromptCacheOptions(body)
+	if errMidSystem := validateClaudeMidSystemMessageModel(body, confirmedClaudeCode, directAnthropic); errMidSystem != nil {
+		return cliproxyexecutor.Response{}, errMidSystem
+	}
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return cliproxyexecutor.Response{}, err
 	}
-	applyClaudeHeaders(httpReq, auth, apiKey, false, extraBetas, e.cfg)
-	// claude 版本高水位持久化（真实 serving count_tokens 路径）：count_tokens 也经 applyClaudeHeaders
-	// 记入内存观测，接上写回更全且单调抬升幂等无害（稳态零写盘）。
+	if errHeaders := applyClaudeHeaders(httpReq, auth, apiKey, false, extraBetas, body, e.cfg, incomingHeaders, confirmedClaudeCode && !cloaked, claudeSessionID); errHeaders != nil {
+		return cliproxyexecutor.Response{}, errHeaders
+	}
+	if maintainNativeCountBilling {
+		// Identity and payload rules have already run. Billing follows the actual
+		// outgoing UA; the compatibility SHA sees the body before this insertion.
+		version, ok := helps.ClaudeVersionFromUserAgent(httpReq.Header.Get("User-Agent"))
+		if !ok {
+			version = resolveClaudeBillingVersion(ctx, e.cfg, auth, apiKey)
+		}
+		legacyCCH := ""
+		if !useCCHSigning {
+			legacyCCH = claudeLegacyCountPayloadCCH(body, settings.strictMode)
+		}
+		fallback := claudeCCHFallbackBillingHeader(ctx, e.cfg, body, parseEntrypointFromUA(e.cfg, httpReq.Header.Get("User-Agent")), version)
+		body, err = ensureClaudeBillingHeaderCCHPlaceholder(body, fallback)
+		if err != nil {
+			return cliproxyexecutor.Response{}, fmt.Errorf("maintain Claude count billing: %w", err)
+		}
+		body = alignClaudeCloakedBillingBuild(body, version)
+		if legacyCCH != "" {
+			if offset, found := claudeBillingCCHDigitsOffset(body); found {
+				body = bytes.Join([][]byte{body[:offset], []byte(legacyCCH), body[offset+5:]}, nil)
+			}
+		}
+		_ = httpReq.Body.Close()
+		httpReq.Body = io.NopCloser(bytes.NewReader(body))
+		httpReq.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(body)), nil }
+		httpReq.ContentLength = int64(len(body))
+		if httpReq.Header.Get("Content-Length") != "" {
+			httpReq.Header.Set("Content-Length", fmt.Sprint(len(body)))
+		}
+	}
+	// 最后payload规则与出站UA确定后签名；request Body/GetBody/长度及日志共用最终字节。
+	if useCCHSigning {
+		body, err = signClaudeHTTPRequestCCH(httpReq, body)
+		if err != nil {
+			return cliproxyexecutor.Response{}, fmt.Errorf("sign Claude count CCH: %w", err)
+		}
+	}
 	e.persistClaudeDeviceHighWater(auth, apiKey)
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
@@ -143,12 +386,12 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 		// Decompress error responses — pass the Content-Encoding value (may be empty)
 		// and let decodeResponseBody handle both header-declared and magic-byte-detected
 		// compression.  This keeps error-path behaviour consistent with the success path.
-		errBody, decErr := decodeResponseBody(resp.Body, resp.Header.Get("Content-Encoding"))
+		errBody, decErr := decodeResponseBody(resp.Body, claudeResponseContentEncoding(resp.Header))
 		if decErr != nil {
 			helps.RecordAPIResponseError(ctx, e.cfg, decErr)
 			msg := fmt.Sprintf("failed to decode error response body: %v", decErr)
-			logWithRequestID(ctx).Warn(msg)
-			return cliproxyexecutor.Response{}, newClaudeStatusErr(resp.StatusCode, []byte(msg), resp.Header, time.Now())
+			helps.LogWithRequestID(ctx).Warn(msg)
+			return cliproxyexecutor.Response{}, classifyClaudeUpstreamErrorWithCooling(resp.StatusCode, resp.Header, []byte(msg), e.modelLevelCooling())
 		}
 		errBody = attempt.ObserveDecoded(errBody)
 		b, readErr := io.ReadAll(errBody)
@@ -162,9 +405,9 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 		if errClose := errBody.Close(); errClose != nil {
 			log.Errorf("response body close error: %v", errClose)
 		}
-		return cliproxyexecutor.Response{}, newClaudeStatusErr(resp.StatusCode, b, resp.Header, time.Now())
+		return cliproxyexecutor.Response{}, classifyClaudeUpstreamErrorWithCooling(resp.StatusCode, resp.Header, b, e.modelLevelCooling())
 	}
-	decodedBody, err := decodeResponseBody(resp.Body, resp.Header.Get("Content-Encoding"))
+	decodedBody, err := decodeResponseBody(resp.Body, claudeResponseContentEncoding(resp.Header))
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		if errClose := resp.Body.Close(); errClose != nil {
@@ -185,6 +428,6 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 	}
 	helps.AppendAPIResponseChunk(ctx, e.cfg, data)
 	count := gjson.GetBytes(data, "input_tokens").Int()
-	out := sdktranslator.TranslateTokenCount(ctx, to, from, count, data)
+	out := sdktranslator.TranslateTokenCount(ctx, to, responseFormat, count, data)
 	return cliproxyexecutor.Response{Payload: out, Headers: resp.Header.Clone()}, nil
 }

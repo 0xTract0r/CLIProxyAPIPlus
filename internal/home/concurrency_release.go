@@ -5,8 +5,8 @@ import (
 	"sync"
 	"time"
 
-	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executionregistry"
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executionregistry"
 )
 
 // ConcurrencyReleaseFrame is the cumulative release accepted by Home for one credential and model.
@@ -57,6 +57,17 @@ func (f *releaseFlusher) SetConfigProvider(provider func() internalconfig.Creden
 	}
 	f.mu.Lock()
 	f.configProvider = provider
+	f.mu.Unlock()
+	f.signal()
+}
+
+// SetSender replaces the Home lifetime used for subsequent release attempts.
+func (f *releaseFlusher) SetSender(send func(context.Context, ConcurrencyReleaseFrame) error) {
+	if f == nil {
+		return
+	}
+	f.mu.Lock()
+	f.send = send
 	f.mu.Unlock()
 	f.signal()
 }
@@ -174,11 +185,12 @@ func (f *releaseFlusher) timings() releaseFlusherTimings {
 }
 
 func (f *releaseFlusher) flush(ctx context.Context) bool {
-	if f == nil || f.send == nil {
+	if f == nil {
 		return false
 	}
 
 	f.mu.Lock()
+	send := f.send
 	pending := make(map[executionregistry.ReleaseGroup]int64, len(f.groups))
 	for group, state := range f.groups {
 		if state.Latest > state.Acked {
@@ -186,10 +198,13 @@ func (f *releaseFlusher) flush(ctx context.Context) bool {
 		}
 	}
 	f.mu.Unlock()
+	if send == nil {
+		return false
+	}
 
 	failed := false
 	for group, sequence := range pending {
-		errSend := f.send(ctx, ConcurrencyReleaseFrame{
+		errSend := send(ctx, ConcurrencyReleaseFrame{
 			CredentialID: group.CredentialID,
 			Model:        group.Model,
 			ReleaseSeq:   sequence,

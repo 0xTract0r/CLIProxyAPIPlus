@@ -5,11 +5,13 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"net/http"
 	"strings"
 	"time"
 
-	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	cliproxysession "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/session"
 )
 
 const warmupServingCapacity = 4096
@@ -168,12 +170,10 @@ func (s *AdaptiveSelector) clearWarmupServingLocked() {
 		defer s.cache.mu.Unlock()
 		for key, entry := range s.cache.entries {
 			if entry.serving != nil && entry.serving.child {
-				s.cache.rememberServingExpiryLocked(key, entry)
-				delete(s.cache.entries, key)
+				s.cache.expireAliasGroupLocked(entry)
 			} else if entry.serving != nil {
 				s.releasePacingBinding(key, entry)
-				entry.serving = nil
-				s.cache.entries[key] = entry
+				s.cache.setAliasGroupServingLocked(key, nil)
 			}
 		}
 	}
@@ -190,8 +190,7 @@ func (s *AdaptiveSelector) servingEntry(key string, now time.Time) (sessionEntry
 		return sessionEntry{}, false
 	}
 	if time.Now().After(entry.expiresAt) || (entry.serving != nil && now.Sub(entry.serving.lastSeen) > s.cache.ttl) {
-		s.cache.rememberServingExpiryLocked(key, entry)
-		delete(s.cache.entries, key)
+		s.cache.expireAliasGroupLocked(entry)
 		return sessionEntry{}, false
 	}
 	return entry, true
@@ -205,7 +204,7 @@ func (s *AdaptiveSelector) setServingEntry(key, authID string, state warmupServi
 	s.cache.mu.Lock()
 	defer s.cache.mu.Unlock()
 	previous, exists := s.cache.entries[key]
-	if exists && previous.serving != nil && (previous.authID != authID || state.revision != previous.serving.revision) {
+	if exists && previous.serving != nil && previous.authID == authID && state.revision != previous.serving.revision {
 		s.releasePacingBinding(key, previous)
 	}
 	if state.revision == 0 || !exists || previous.serving == nil || previous.authID != authID || previous.serving.revision != state.revision {
@@ -220,11 +219,13 @@ func (s *AdaptiveSelector) setServingEntry(key, authID string, state warmupServi
 				oldestKey, oldest = k, entry.expiresAt
 			}
 		}
-		s.cache.rememberServingExpiryLocked(oldestKey, s.cache.entries[oldestKey])
-		delete(s.cache.entries, oldestKey)
+		s.cache.expireAliasGroupLocked(s.cache.entries[oldestKey])
 	}
 	delete(s.cache.servingExpired, key)
-	s.cache.entries[key] = sessionEntry{authID: authID, expiresAt: time.Now().Add(s.cache.ttl), serving: &state}
+	s.cache.ensureInitializedLocked()
+	aliases := compactSessionAliases(mergeSessionAliases([]string{key}, previous.aliases...))
+	s.cache.replaceAliasGroupsLocked(authID, time.Now().Add(s.cache.ttl), aliases, previous.binding, previous)
+	s.cache.setAliasGroupServingLocked(key, &state)
 	return state.revision
 }
 
@@ -248,6 +249,18 @@ func (s *AdaptiveSelector) pickWithWarmupServing(ctx context.Context, provider, 
 	retry := failoverMatureOnlyFromMetadata(opts.Metadata)
 	agentID := sessionHeaderValue(opts.Headers, "X-Claude-Code-Agent-Id")
 	primaryID, fallbackID := extractSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
+	// Session extraction now namespaces a child as root:agent:id. Warmup has
+	// its own child binding key so retain the root here; otherwise it hashes the
+	// child twice and cannot find the parent's protection or pacing group.
+	if agentID != "" && strings.HasPrefix(primaryID, "claude:") {
+		primaryID = strings.TrimSuffix(primaryID, ":agent:"+agentID)
+	}
+	// A conflicting header must not mint a fresh warming opportunity or lose
+	// the existing body-identified parent binding. Keep the body's root for
+	// warmup bookkeeping and let identityConflict force parent affinity.
+	if bodyRoot, _, _ := cliproxysession.ClaudeMetadataIdentities(opts.OriginalRequest); bodyRoot != "" {
+		primaryID = "claude:" + bodyRoot
+	}
 	headerRoot := sessionHeaderValue(opts.Headers, "X-Claude-Code-Session-Id")
 	if headerRoot != "" && (primaryID == "" || strings.HasPrefix(primaryID, "msg:") || strings.HasPrefix(primaryID, "derived:")) {
 		primaryID, fallbackID = "claude:"+headerRoot, ""
@@ -974,4 +987,18 @@ func warmupTextOnly(value any) bool {
 	default:
 		return false
 	}
+}
+
+func sessionHeaderValue(headers http.Header, name string) string {
+	for key, values := range headers {
+		if !strings.EqualFold(key, name) {
+			continue
+		}
+		for _, value := range values {
+			if value = strings.TrimSpace(value); value != "" {
+				return value
+			}
+		}
+	}
+	return ""
 }

@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 )
 
 func pacingManagerFixture(t *testing.T) (*Manager, *AdaptiveSelector, *Auth, *internalconfig.Config, *time.Time) {

@@ -5,8 +5,7 @@ import (
 	"testing"
 )
 
-// TestIsRequestInvalidError_ImageGenerationUserError 验证：HTTP 400 且 message 含
-// image_generation_user_error 时归类为请求级不可重试（返回 true），不触发账号轮换。
+// Image generation user errors are request faults and must not rotate credentials.
 func TestIsRequestInvalidError_ImageGenerationUserError(t *testing.T) {
 	err := &Error{
 		HTTPStatus: http.StatusBadRequest,
@@ -17,8 +16,7 @@ func TestIsRequestInvalidError_ImageGenerationUserError(t *testing.T) {
 	}
 }
 
-// TestIsRequestInvalidError_PlainBadRequestStillNotInvalid 验证：不含已知请求级标记的
-// 普通 400 维持原行为（返回 false），不被新逻辑误伤。
+// Plain 400s without recognized request-fault markers retain credential failover.
 func TestIsRequestInvalidError_PlainBadRequestStillNotInvalid(t *testing.T) {
 	err := &Error{
 		HTTPStatus: http.StatusBadRequest,
@@ -29,7 +27,7 @@ func TestIsRequestInvalidError_PlainBadRequestStillNotInvalid(t *testing.T) {
 	}
 }
 
-// TestIsRequestInvalidError_ExistingMarkersUnchanged 验证既有请求级标记行为不变。
+// Existing explicit request-fault markers remain non-retryable.
 func TestIsRequestInvalidError_ExistingMarkersUnchanged(t *testing.T) {
 	cases := []string{
 		`{"error":{"type":"invalid_request_error","message":"bad"}}`,
@@ -41,5 +39,32 @@ func TestIsRequestInvalidError_ExistingMarkersUnchanged(t *testing.T) {
 		if !isRequestInvalidError(err) {
 			t.Fatalf("expected existing request-level marker to stay true: %s", msg)
 		}
+	}
+}
+
+// Plain overload 400 remains retryable in the fork; explicit upstream request
+// identifiers stop rotation, while payment/quota statuses still belong to auth.
+func TestIsRequestInvalidError_UpstreamMarkersAndCredentialFailures(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		status  int
+		message string
+		want    bool
+	}{
+		{"plain overload", 400, `{"error":{"type":"server_overloaded","message":"please retry"}}`, false},
+		{"context marker", 400, `{"error":{"code":"context_length_exceeded"}}`, true},
+		{"continuation marker", 400, `{"error":{"code":"previous_response_not_found"}}`, true},
+		{"cyber marker", 400, `{"error":{"code":"cyber_policy"}}`, true},
+		{"payment wins", 402, `{"error":{"type":"invalid_request_error"}}`, false},
+		{"quota wins", 429, `{"error":{"type":"invalid_request_error"}}`, false},
+		{"model capability", 400, `{"error":{"code":"model_not_found"}}`, false},
+		{"unknown upstream internal error", 500, `{"error":{"code":500,"status":"UNKNOWN","message":"Internal error encountered."}}`, false},
+		{"explicit request fault behind unknown status", 500, `{"error":{"type":"invalid_request_error","status":"UNKNOWN","message":"bad input"}}`, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isRequestInvalidError(&Error{HTTPStatus: tc.status, Message: tc.message}); got != tc.want {
+				t.Fatalf("request invalid=%v, want %v", got, tc.want)
+			}
+		})
 	}
 }

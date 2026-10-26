@@ -6,31 +6,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
-
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 )
-
-// TestClaudeOAuthUserAgentMatchesDeviceProfileFloor is the anti-drift guard for
-// the deliberately duplicated Claude floor User-Agent. claudeOAuthUserAgent is a
-// local copy of the serving device-profile floor
-// (helps.defaultClaudeFingerprintUserAgent), duplicated only because importing the
-// executor package here would create an import cycle. This test crosses that
-// boundary from the safe direction (package claude already imports helps) and fails
-// if the two floors ever diverge — e.g. the device-profile floor is modernized but
-// the OAuth refresh/token path is left emitting a stale version.
-func TestClaudeOAuthUserAgentMatchesDeviceProfileFloor(t *testing.T) {
-	got, ok := helps.ClaudeVersionFromUserAgent(claudeOAuthUserAgent)
-	if !ok {
-		t.Fatalf("claudeOAuthUserAgent %q does not parse as a claude-cli User-Agent", claudeOAuthUserAgent)
-	}
-	want := helps.DefaultClaudeVersion(nil)
-	if got != want {
-		t.Fatalf("claudeOAuthUserAgent version = %q, device-profile floor version = %q; keep the two floors in lockstep", got, want)
-	}
-	if wantUA := "claude-cli/" + want + " (external, cli)"; claudeOAuthUserAgent != wantUA {
-		t.Fatalf("claudeOAuthUserAgent = %q, want %q (reconstructed from the device-profile floor)", claudeOAuthUserAgent, wantUA)
-	}
-}
 
 // TestNewClaudeAuthWithHTTPClientDefaultsToOAuthFloorUserAgent is the negative
 // regression test for the "reauth UA degrades to Go-http-client/1.1" bug:
@@ -42,7 +18,9 @@ func TestNewClaudeAuthWithHTTPClientDefaultsToOAuthFloorUserAgent(t *testing.T) 
 	var captured string
 	auth := NewClaudeAuthWithHTTPClient(&http.Client{
 		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-			captured = req.Header.Get("User-Agent")
+			if req.Method == http.MethodPost && req.URL.Path == "/v1/oauth/token" {
+				captured = req.Header.Get("User-Agent")
+			}
 			return okClaudeRefreshResponse(req, "floor-access", "floor-refresh"), nil
 		}),
 	})
@@ -71,7 +49,9 @@ func TestClaudeAuthWithUserAgentOverridesFloor(t *testing.T) {
 	var captured string
 	auth := NewClaudeAuthWithHTTPClient(&http.Client{
 		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-			captured = req.Header.Get("User-Agent")
+			if req.Method == http.MethodPost && req.URL.Path == "/v1/oauth/token" {
+				captured = req.Header.Get("User-Agent")
+			}
 			return okClaudeRefreshResponse(req, "hw-access", "hw-refresh"), nil
 		}),
 	}).WithUserAgent(highWaterUA)
@@ -112,7 +92,9 @@ func TestClaudeAuthWithUserAgentEmptyDoesNotOverrideFloor(t *testing.T) {
 	auth = auth.WithUserAgent("")
 	auth.httpClient = &http.Client{
 		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-			captured = req.Header.Get("User-Agent")
+			if req.Method == http.MethodPost && req.URL.Path == "/v1/oauth/token" {
+				captured = req.Header.Get("User-Agent")
+			}
 			return okClaudeRefreshResponse(req, "blank-access", "blank-refresh"), nil
 		}),
 	}

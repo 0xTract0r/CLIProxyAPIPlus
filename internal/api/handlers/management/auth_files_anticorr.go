@@ -30,21 +30,21 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/claude"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/copilot"
-	geminiAuth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/gemini"
-	gitlabauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/gitlab"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/kilo"
-	kiroauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/kiro"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
-	runtimehelps "github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/proxyutil"
-	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/claude"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/copilot"
+	geminiAuth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/gemini"
+	gitlabauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/gitlab"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/kilo"
+	kiroauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/kiro"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/misc"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	runtimehelps "github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/proxyutil"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"golang.org/x/oauth2"
@@ -3187,15 +3187,16 @@ func claudeReauthHighWaterUserAgent(cfg *config.Config, target *coreauth.Auth) s
 }
 
 func (h *Handler) newClaudeOAuthAuth(ctx context.Context, target *coreauth.Auth) *claude.ClaudeAuth {
+	cfg := h.configSnapshot()
 	if target == nil {
-		return claude.NewClaudeAuth(h.cfg)
+		return claude.NewClaudeAuth(cfg)
 	}
 	client := h.oauthIdentityHTTPClient(ctx, "api.anthropic.com", target, anthropicOAuthExchangeTimeout)
 	// Raise the reauth User-Agent to this account's persisted device-profile
 	// high-water mark (when present) so the OAuth exchange/refresh presents
 	// the same claude-cli identity this account's serving requests use,
 	// instead of falling back to the generic claudeOAuthUserAgent floor.
-	return claude.NewClaudeAuthWithHTTPClient(client).WithUserAgent(claudeReauthHighWaterUserAgent(h.cfg, target))
+	return claude.NewClaudeAuthWithHTTPClient(client).WithUserAgent(claudeReauthHighWaterUserAgent(cfg, target))
 }
 
 func (h *Handler) newClaudeOAuthAccountProxyFallbackAuth(target *coreauth.Auth) *claude.ClaudeAuth {

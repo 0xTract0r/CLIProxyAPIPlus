@@ -340,3 +340,44 @@ func TestManagerUpdate_DoesNotRollBackTokensFromStaleWriteback(t *testing.T) {
 		t.Fatalf("quota_refresh_status = %q, want ok (non-token write must apply)", qs)
 	}
 }
+
+// 外层 token 的迟到写回保护不能使用当前 SIWC 分区的有效期。
+func TestPreserveNewerTokenOwnedFieldsUsesOuterPartition(t *testing.T) {
+	for _, tc := range []struct {
+		name, storedOuter, incomingOuter, storedSIWC, incomingSIWC string
+		wantPreserve                                               bool
+	}{
+		{"new outer despite longer stored SIWC", "2029-01-01T00:00:00Z", "2030-01-01T00:00:00Z", "2035-01-01T00:00:00Z", "2031-01-01T00:00:00Z", false},
+		{"old outer despite newer incoming SIWC", "2030-01-01T00:00:00Z", "2029-01-01T00:00:00Z", "2031-01-01T00:00:00Z", "2035-01-01T00:00:00Z", true},
+		{"unversioned outer replacement after SIWC bind", "", "", "2035-01-01T00:00:00Z", "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			makeAuth := func(outerToken, outerExpiry, siwcExpiry string) *Auth {
+				metadata := map[string]any{"access_token": outerToken, "refresh_token": outerToken + "-refresh", "note": outerToken}
+				if outerExpiry != "" {
+					metadata["expired"] = outerExpiry
+				}
+				if siwcExpiry != "" {
+					metadata["use_siwc"] = true
+					metadata["siwc"] = map[string]any{"access_token": "synthetic-siwc", "refresh_token": "synthetic-siwc-refresh", "expires_at": siwcExpiry}
+				}
+				return &Auth{ID: "outer-partition", Provider: "codex", Metadata: metadata}
+			}
+			existing := makeAuth("stored-outer", tc.storedOuter, tc.storedSIWC)
+			incoming := makeAuth("incoming-outer", tc.incomingOuter, tc.incomingSIWC)
+			if got := preserveNewerTokenOwnedFields(incoming, existing); got != tc.wantPreserve {
+				t.Fatalf("preserve=%v, want %v; outer freshness must ignore SIWC expiration", got, tc.wantPreserve)
+			}
+			wantToken := "incoming-outer"
+			if tc.wantPreserve {
+				wantToken = "stored-outer"
+			}
+			if incoming.Metadata["access_token"] != wantToken || incoming.Metadata["refresh_token"] != wantToken+"-refresh" || incoming.Metadata["note"] != "incoming-outer" {
+				t.Fatalf("outer guard corrupted intended update: %#v", incoming.Metadata)
+			}
+			if tc.incomingSIWC != "" && incoming.Metadata["siwc"].(map[string]any)["expires_at"] != tc.incomingSIWC {
+				t.Fatal("outer guard modified independent SIWC partition")
+			}
+		})
+	}
+}

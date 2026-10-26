@@ -11,10 +11,10 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 )
 
 type testMessageCaptureExecutor struct {
@@ -253,6 +253,7 @@ func TestTestAuthFileMessageUsesProviderDefaultModelWhenNoRegisteredModel(t *tes
 	if executor.authID != "codex-no-model.json" {
 		t.Fatalf("executor authID = %q, want codex-no-model.json", executor.authID)
 	}
+	// 有限兼容目录已恢复F旧ID；继续核对F原provider默认。
 	if executor.model != "gpt-5.4-mini" {
 		t.Fatalf("executor model = %q, want gpt-5.4-mini", executor.model)
 	}

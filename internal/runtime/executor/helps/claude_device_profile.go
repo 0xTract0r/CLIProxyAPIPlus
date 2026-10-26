@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"regexp"
 	"runtime"
@@ -13,8 +15,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	homekv "github.com/router-for-me/CLIProxyAPI/v8/internal/home"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
 const (
@@ -70,6 +73,7 @@ const (
 	defaultClaudeFarmFingerprintOS   = "Linux"
 	defaultClaudeFarmFingerprintArch = "x64"
 
+	claudeDeviceProfileLockTTL       = 5 * time.Second
 	claudeDeviceProfileTTL           = 7 * 24 * time.Hour
 	claudeDeviceProfileCleanupPeriod = time.Hour
 
@@ -103,7 +107,9 @@ const (
 )
 
 var (
-	claudeCLIVersionPattern = regexp.MustCompile(`^claude-cli/(\d+)\.(\d+)\.(\d+)`)
+	claudeCLIVersionPattern     = regexp.MustCompile(`^claude-cli/(\d+)\.(\d+)\.(\d+)`)
+	claudePackageVersionPattern = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+$`)
+	claudeRuntimeVersionPattern = regexp.MustCompile(`^v[0-9]+\.[0-9]+\.[0-9]+$`)
 
 	claudeDeviceProfileCache        = make(map[string]claudeDeviceProfileCacheEntry)
 	claudeDeviceProfileObservations = make(map[string][]claudeDeviceProfileObservationEntry)
@@ -116,6 +122,17 @@ var (
 
 	ClaudeDeviceProfileBeforeCandidateStore func(ClaudeDeviceProfile)
 )
+
+type claudeDeviceProfileKVClient interface {
+	KVGet(ctx context.Context, key string) ([]byte, bool, error)
+	KVSet(ctx context.Context, key string, value []byte, opts homekv.KVSetOptions) (bool, error)
+	KVSetNX(ctx context.Context, key string, value []byte, ttl time.Duration) (bool, error)
+	KVExpire(ctx context.Context, key string, ttl time.Duration) (bool, error)
+}
+
+var currentClaudeDeviceProfileKVClient = func() (claudeDeviceProfileKVClient, bool, error) {
+	return homekv.CurrentKVClient()
+}
 
 type claudeCLIVersion struct {
 	major int
@@ -146,6 +163,7 @@ func (v claudeCLIVersion) Compare(other claudeCLIVersion) int {
 }
 
 type ClaudeDeviceProfile struct {
+	pinSoftware    bool
 	UserAgent      string
 	PackageVersion string
 	RuntimeVersion string
@@ -179,6 +197,14 @@ type claudeDeviceProfileObservationEntry struct {
 	firstSeen time.Time
 	lastSeen  time.Time
 	count     int
+}
+
+type claudeDeviceProfileKVValue struct {
+	UserAgent      string `json:"user_agent"`
+	PackageVersion string `json:"package_version"`
+	RuntimeVersion string `json:"runtime_version"`
+	OS             string `json:"os"`
+	Arch           string `json:"arch"`
 }
 
 func ClaudeDeviceProfileStabilizationEnabled(cfg *config.Config) bool {
@@ -268,6 +294,7 @@ func defaultClaudeDeviceProfile(cfg *config.Config) ClaudeDeviceProfile {
 		OS:             hdrDefault(hd.OS, defaultClaudeFingerprintOS),
 		Arch:           hdrDefault(hd.Arch, defaultClaudeFingerprintArch),
 		Source:         defaultManagedHeaderProfileSource(),
+		pinSoftware:    hd.PinSoftwareBaseline,
 	}
 	if version, ok := parseClaudeCLIVersion(profile.UserAgent); ok {
 		profile.version = version
@@ -607,17 +634,84 @@ func shouldUpgradeClaudeDeviceProfile(candidate, current ClaudeDeviceProfile) bo
 	return candidate.version.Compare(current.version) > 0
 }
 
+// plausibleClaudeCLIVersion treats the baseline as a floor for patch releases.
+// Claude Code auto-updates in the background; allow newer patch versions in the
+// same major/minor line to preserve native passthrough and prompt caching.
+func plausibleClaudeCLIVersion(candidate, baseline claudeCLIVersion) bool {
+	return candidate.major == baseline.major &&
+		candidate.minor == baseline.minor &&
+		candidate.patch >= baseline.patch
+}
+
+func parseClaudeSemver(raw string) (claudeCLIVersion, bool) {
+	parts := strings.Split(strings.TrimSpace(raw), ".")
+	if len(parts) != 3 {
+		return claudeCLIVersion{}, false
+	}
+	major, errMajor := strconv.Atoi(parts[0])
+	if errMajor != nil {
+		return claudeCLIVersion{}, false
+	}
+	minor, errMinor := strconv.Atoi(parts[1])
+	if errMinor != nil {
+		return claudeCLIVersion{}, false
+	}
+	patch, errPatch := strconv.Atoi(parts[2])
+	if errPatch != nil {
+		return claudeCLIVersion{}, false
+	}
+	return claudeCLIVersion{major: major, minor: minor, patch: patch}, true
+}
+
+func plausibleClaudePackageVersion(candidate, baseline string) bool {
+	candidate = strings.TrimSpace(candidate)
+	if !claudePackageVersionPattern.MatchString(candidate) {
+		return false
+	}
+	candVer, okCand := parseClaudeSemver(candidate)
+	baseVer, okBase := parseClaudeSemver(baseline)
+	if !okCand || !okBase {
+		return candidate == strings.TrimSpace(baseline)
+	}
+	return candVer.Compare(baseVer) >= 0
+}
+
+func plausibleClaudeRuntimeVersion(candidate, baseline string) bool {
+	candidate = strings.TrimSpace(candidate)
+	if !claudeRuntimeVersionPattern.MatchString(candidate) {
+		return false
+	}
+	candVer, okCand := parseClaudeSemver(strings.TrimPrefix(candidate, "v"))
+	baseVer, okBase := parseClaudeSemver(strings.TrimPrefix(strings.TrimSpace(baseline), "v"))
+	if !okCand || !okBase {
+		return candidate == strings.TrimSpace(baseline)
+	}
+	return candVer.Compare(baseVer) >= 0
+}
+
+func meetsClaudeDeviceProfileBaseline(candidate, baseline ClaudeDeviceProfile) bool {
+	if candidate.UserAgent == "" || !candidate.hasVersion {
+		return false
+	}
+	if baseline.UserAgent == "" || !baseline.hasVersion {
+		return false
+	}
+	return candidate.version.Compare(baseline.version) == 0 &&
+		candidate.PackageVersion == baseline.PackageVersion &&
+		candidate.RuntimeVersion == baseline.RuntimeVersion
+}
+
 func pinClaudeDeviceProfilePlatform(profile, baseline ClaudeDeviceProfile) ClaudeDeviceProfile {
 	profile.OS = baseline.OS
 	profile.Arch = baseline.Arch
 	return profile
 }
 
-// normalizeClaudeDeviceProfile keeps stabilized profiles pinned to the current
-// baseline platform and enforces the baseline software fingerprint as a floor.
+// normalizeClaudeDeviceProfile pins stabilized profiles to the configured platform
+// and replaces any software tuple that does not exactly match the measured baseline.
 func normalizeClaudeDeviceProfile(profile, baseline ClaudeDeviceProfile) ClaudeDeviceProfile {
 	profile = pinClaudeDeviceProfilePlatform(profile, baseline)
-	if profile.UserAgent == "" || !profile.hasVersion || shouldUpgradeClaudeDeviceProfile(baseline, profile) {
+	if (baseline.pinSoftware && !meetsClaudeDeviceProfileBaseline(profile, baseline)) || (!baseline.pinSoftware && (profile.UserAgent == "" || !profile.hasVersion || shouldUpgradeClaudeDeviceProfile(baseline, profile))) {
 		profile.UserAgent = baseline.UserAgent
 		profile.PackageVersion = baseline.PackageVersion
 		profile.RuntimeVersion = baseline.RuntimeVersion
@@ -636,15 +730,23 @@ func extractClaudeDeviceProfile(headers http.Header, cfg *config.Config) (Claude
 
 	userAgent := strings.TrimSpace(headers.Get("User-Agent"))
 	version, ok := parseClaudeCLIVersion(userAgent)
-	if !ok {
+	if !ok || !claudeCodeNativeUserAgentPattern.MatchString(userAgent) {
 		return ClaudeDeviceProfile{}, false
 	}
 
 	baseline := defaultClaudeDeviceProfile(cfg)
+	packageVersion := firstNonEmptyHeader(headers, "X-Stainless-Package-Version", baseline.PackageVersion)
+	if !claudePackageVersionPattern.MatchString(packageVersion) {
+		packageVersion = baseline.PackageVersion
+	}
+	runtimeVersion := firstNonEmptyHeader(headers, "X-Stainless-Runtime-Version", baseline.RuntimeVersion)
+	if !claudeRuntimeVersionPattern.MatchString(runtimeVersion) {
+		runtimeVersion = baseline.RuntimeVersion
+	}
 	profile := ClaudeDeviceProfile{
 		UserAgent:      userAgent,
-		PackageVersion: firstNonEmptyHeader(headers, "X-Stainless-Package-Version", baseline.PackageVersion),
-		RuntimeVersion: firstNonEmptyHeader(headers, "X-Stainless-Runtime-Version", baseline.RuntimeVersion),
+		PackageVersion: packageVersion,
+		RuntimeVersion: runtimeVersion,
 		OS:             firstNonEmptyHeader(headers, "X-Stainless-Os", baseline.OS),
 		Arch:           firstNonEmptyHeader(headers, "X-Stainless-Arch", baseline.Arch),
 		Source:         observedManagedHeaderProfileSource(),
@@ -693,8 +795,30 @@ func claudeDeviceProfileScopeKey(auth *cliproxyauth.Auth, apiKey string) string 
 	}
 }
 
-func claudeDeviceProfileCacheKey(auth *cliproxyauth.Auth, apiKey string) string {
-	sum := sha256.Sum256([]byte(claudeDeviceProfileScopeKey(auth, apiKey)))
+// claudeDeviceProfileSubclientScope keeps first-party clients with distinct
+// wire identities from replacing one another in a credential's stabilized
+// profile. The CLI retains the legacy base scope for cache compatibility.
+func claudeDeviceProfileSubclientScope(profile ClaudeDeviceProfile) string {
+	entrypoint, _ := parseClaudeCodeUserAgentDetails(profile.UserAgent)
+	if entrypoint == "" || entrypoint == "cli" {
+		return ""
+	}
+	if nativeClaudeEntrypoints[entrypoint] {
+		return entrypoint
+	}
+	return "other"
+}
+
+func claudeDeviceProfileScopedKey(auth *cliproxyauth.Auth, apiKey string, profile ClaudeDeviceProfile) string {
+	key := claudeDeviceProfileScopeKey(auth, apiKey)
+	if subclient := claudeDeviceProfileSubclientScope(profile); subclient != "" {
+		key += "|subclient:" + subclient
+	}
+	return key
+}
+
+func claudeDeviceProfileCacheKey(auth *cliproxyauth.Auth, apiKey string, profile ClaudeDeviceProfile) string {
+	sum := sha256.Sum256([]byte(claudeDeviceProfileScopedKey(auth, apiKey, profile)))
 	return hex.EncodeToString(sum[:])
 }
 
@@ -727,6 +851,14 @@ func claudeDeviceProfileObservationCacheKeys(auth *cliproxyauth.Auth, apiKey str
 		out = append(out, hex.EncodeToString(sum[:]))
 	}
 	return out
+}
+
+func claudeDeviceProfileKVKey(auth *cliproxyauth.Auth, apiKey string, profile ClaudeDeviceProfile) string {
+	return "cpa:claude:device-profile:" + homekv.HashKeyPart(claudeDeviceProfileScopedKey(auth, apiKey, profile))
+}
+
+func claudeDeviceProfileLockKVKey(auth *cliproxyauth.Auth, apiKey string, profile ClaudeDeviceProfile) string {
+	return "cpa:claude:device-profile-lock:" + homekv.HashKeyPart(claudeDeviceProfileScopedKey(auth, apiKey, profile))
 }
 
 func startClaudeDeviceProfileCacheCleanup() {
@@ -917,6 +1049,7 @@ func applyFarmDevicePlatformBaseline(auth *cliproxyauth.Auth, baseline ClaudeDev
 		return baseline
 	}
 	baseline.OS, baseline.Arch = farmClaudeDevicePlatform(cfg)
+	baseline.pinSoftware = false
 	return baseline
 }
 
@@ -928,6 +1061,9 @@ func claudeFallbackBaseline(auth *cliproxyauth.Auth, apiKey string, cfg *config.
 	// MacOS/arm64 baseline。放在版本高水位抬升之前，因为 withClaudeFloorProfile 只换
 	// UA/pkg/runtime、保留 OS/Arch，此处钉住的平台位不会被后续版本抬升覆盖。
 	baseline = applyFarmDevicePlatformBaseline(auth, baseline, cfg)
+	if baseline.pinSoftware {
+		return baseline
+	}
 
 	// 反关联 A1：农场号出站版本自动对齐容器实际版本。农场号在 ResolveClaudeDeviceProfile
 	// 里直出容器入站真实版本（candidate），baseline 仅作「无 candidate」时的保守兜底
@@ -995,9 +1131,12 @@ func withClaudeFloorProfile(profile, source ClaudeDeviceProfile, profileSource M
 }
 
 func ResolveClaudeDeviceProfile(auth *cliproxyauth.Auth, apiKey string, headers http.Header, cfg *config.Config) ClaudeDeviceProfile {
+	return resolveClaudeDeviceProfileLocal(auth, apiKey, headers, cfg)
+}
+
+func resolveClaudeDeviceProfileLocal(auth *cliproxyauth.Auth, apiKey string, headers http.Header, cfg *config.Config) ClaudeDeviceProfile {
 	claudeDeviceProfileCacheCleanupOnce.Do(startClaudeDeviceProfileCacheCleanup)
 
-	cacheKey := claudeDeviceProfileCacheKey(auth, apiKey)
 	now := time.Now()
 	baseline := claudeFallbackBaseline(auth, apiKey, cfg)
 	// 反关联 A1：农场号（绑定容器 device_id）出站版本直出容器入站真实版本、不 floor-up
@@ -1031,13 +1170,14 @@ func ResolveClaudeDeviceProfile(auth *cliproxyauth.Auth, apiKey string, headers 
 	// emitted/cached profile. Recording carries NO lower bound beyond the sanity
 	// ceiling, and this is the only record site per resolve (the request path
 	// memoizes one resolve per request), so each request adds exactly one observation.
-	if hasCandidate {
+	observationKey := claudeDeviceProfileCacheKey(auth, apiKey, ClaudeDeviceProfile{})
+	if hasCandidate && !baseline.pinSoftware {
 		claudeDeviceProfileCacheMu.Lock()
-		recordClaudeDeviceProfileObservation(cacheKey, candidate, now)
+		recordClaudeDeviceProfileObservation(observationKey, candidate, now)
 		// 反关联 A1：农场号观测仍记录（供反关联管理端点的诊断历史），但把该 cacheKey 标记
 		// 为农场，globalClaudeObservedHighWater* 遍历时跳过，杜绝农场版本污染普通号全局池。
 		if farmBound {
-			claudeFarmObservationCacheKeys[cacheKey] = true
+			claudeFarmObservationCacheKeys[observationKey] = true
 		}
 		claudeDeviceProfileCacheMu.Unlock()
 	}
@@ -1057,9 +1197,14 @@ func ResolveClaudeDeviceProfile(auth *cliproxyauth.Auth, apiKey string, headers 
 	// 通道声称的版本跨通道自洽；把它 floor-up 到（可能更高的）账号高水位反而制造「同一
 	// device_id 两个版本」的反关联信号。candidate 已在上面过 sanity-ceiling gate，故农场
 	// 直出仍受伪造超高 UA 保护。普通号（共享上游账号）保持 unify-to-high-water 不变。
-	if hasCandidate && !farmBound && !shouldUpgradeClaudeDeviceProfile(candidate, baseline) {
+	if hasCandidate && ((baseline.pinSoftware && !meetsClaudeDeviceProfileBaseline(candidate, baseline)) || (!baseline.pinSoftware && !farmBound && shouldUpgradeClaudeDeviceProfile(baseline, candidate))) {
 		hasCandidate = false
 	}
+	cacheProfile := ClaudeDeviceProfile{}
+	if hasCandidate {
+		cacheProfile = candidate
+	}
+	cacheKey := claudeDeviceProfileCacheKey(auth, apiKey, cacheProfile)
 
 	claudeDeviceProfileCacheMu.RLock()
 	entry, hasCached := claudeDeviceProfileCache[cacheKey]
@@ -1111,23 +1256,137 @@ func ResolveClaudeDeviceProfile(auth *cliproxyauth.Auth, apiKey string, headers 
 	return baseline
 }
 
-// ResolveClaudeDeviceProfileRequired is the context/error-returning entrypoint that
-// the (upstream-restructured) claude executor request path calls. This fork keeps the
-// full anti-correlation resolve — the sanity-ceiling gate, the per-account/global
-// observed high-water triple, UA-suffix/entrypoint alignment inputs, and platform
-// pinning — inside ResolveClaudeDeviceProfile and runs it entirely in local mode, so
-// this call always succeeds and never returns an error. The error return exists only
-// to satisfy the upstream call signature so the ported executor compiles unchanged.
-//
-// The upstream home-KV device-profile backend (homekv-backed KVGet/KVSet/KVSetNX
-// locking) is intentionally NOT adopted here: in its upstream form it persists only a
-// bare UA/pkg/runtime/os/arch tuple and would bypass this fork's sanity-ceiling gate
-// and observation-based high-water, weakening anti-correlation. Restart persistence is
-// instead handled fidelity-preservingly via the auth.Metadata high-water triple
-// (claudePersistedHighWaterProfile / SeedClaudeObservedHighWaterFromAuth).
 func ResolveClaudeDeviceProfileRequired(ctx context.Context, auth *cliproxyauth.Auth, apiKey string, headers http.Header, cfg *config.Config) (ClaudeDeviceProfile, error) {
-	_ = ctx
-	return ResolveClaudeDeviceProfile(auth, apiKey, headers, cfg), nil
+	client, homeMode, errClient := currentClaudeDeviceProfileKVClient()
+	if homeMode {
+		if errClient != nil {
+			return ClaudeDeviceProfile{}, errClient
+		}
+		return resolveClaudeDeviceProfileHome(ctx, client, auth, apiKey, headers, cfg)
+	}
+	return resolveClaudeDeviceProfileLocal(auth, apiKey, headers, cfg), nil
+}
+
+func resolveClaudeDeviceProfileHome(ctx context.Context, client claudeDeviceProfileKVClient, auth *cliproxyauth.Auth, apiKey string, headers http.Header, cfg *config.Config) (ClaudeDeviceProfile, error) {
+	baseline := claudeFallbackBaseline(auth, apiKey, cfg)
+	_, farmBound := cliproxyauth.ClaudeDeviceIDSource(auth)
+	candidate, hasCandidate := extractClaudeDeviceProfile(headers, cfg)
+	if hasCandidate {
+		candidate = pinClaudeDeviceProfilePlatform(candidate, baseline)
+	}
+	if hasCandidate && (!claudeObservationWithinSanityCeiling(candidate, cfg) || (baseline.pinSoftware && !meetsClaudeDeviceProfileBaseline(candidate, baseline)) || (!baseline.pinSoftware && !farmBound && shouldUpgradeClaudeDeviceProfile(baseline, candidate))) {
+		hasCandidate = false
+	}
+
+	cacheProfile := ClaudeDeviceProfile{}
+	if hasCandidate {
+		cacheProfile = candidate
+	}
+	valueKey := claudeDeviceProfileKVKey(auth, apiKey, cacheProfile)
+	if !hasCandidate {
+		return readClaudeDeviceProfileFromHome(ctx, client, valueKey, baseline)
+	}
+
+	lockKey := claudeDeviceProfileLockKVKey(auth, apiKey, cacheProfile)
+	gotLock, errLock := client.KVSetNX(ctx, lockKey, []byte("1"), claudeDeviceProfileLockTTL)
+	if errLock != nil {
+		return ClaudeDeviceProfile{}, errLock
+	}
+	if ClaudeDeviceProfileBeforeCandidateStore != nil {
+		ClaudeDeviceProfileBeforeCandidateStore(candidate)
+	}
+
+	cached, found, errRead := readClaudeDeviceProfileValueFromHome(ctx, client, valueKey, baseline)
+	if errRead != nil {
+		return ClaudeDeviceProfile{}, errRead
+	}
+	if found && !farmBound && !shouldUpgradeClaudeDeviceProfile(candidate, cached) {
+		if _, errExpire := client.KVExpire(ctx, valueKey, claudeDeviceProfileTTL); errExpire != nil {
+			return ClaudeDeviceProfile{}, errExpire
+		}
+		return cached, nil
+	}
+	if !gotLock {
+		if found {
+			return cached, nil
+		}
+		return ClaudeDeviceProfile{}, fmt.Errorf("home kv device profile lock not acquired and profile missing")
+	}
+
+	if errWrite := writeClaudeDeviceProfileToHome(ctx, client, valueKey, candidate); errWrite != nil {
+		return ClaudeDeviceProfile{}, errWrite
+	}
+	return candidate, nil
+}
+
+func readClaudeDeviceProfileFromHome(ctx context.Context, client claudeDeviceProfileKVClient, key string, baseline ClaudeDeviceProfile) (ClaudeDeviceProfile, error) {
+	profile, found, errRead := readClaudeDeviceProfileValueFromHome(ctx, client, key, baseline)
+	if errRead != nil {
+		return ClaudeDeviceProfile{}, errRead
+	}
+	if !found {
+		return baseline, nil
+	}
+	if _, errExpire := client.KVExpire(ctx, key, claudeDeviceProfileTTL); errExpire != nil {
+		return ClaudeDeviceProfile{}, errExpire
+	}
+	return profile, nil
+}
+
+func readClaudeDeviceProfileValueFromHome(ctx context.Context, client claudeDeviceProfileKVClient, key string, baseline ClaudeDeviceProfile) (ClaudeDeviceProfile, bool, error) {
+	raw, found, errGet := client.KVGet(ctx, key)
+	if errGet != nil || !found {
+		return ClaudeDeviceProfile{}, false, errGet
+	}
+	var value claudeDeviceProfileKVValue
+	if errUnmarshal := json.Unmarshal(raw, &value); errUnmarshal != nil {
+		return ClaudeDeviceProfile{}, false, errUnmarshal
+	}
+	profile := value.ToProfile()
+	if strings.TrimSpace(profile.UserAgent) == "" {
+		return ClaudeDeviceProfile{}, false, nil
+	}
+	return normalizeClaudeDeviceProfile(profile, baseline), true, nil
+}
+
+func writeClaudeDeviceProfileToHome(ctx context.Context, client claudeDeviceProfileKVClient, key string, profile ClaudeDeviceProfile) error {
+	raw, errMarshal := json.Marshal(claudeDeviceProfileKVValueFromProfile(profile))
+	if errMarshal != nil {
+		return errMarshal
+	}
+	written, errSet := client.KVSet(ctx, key, raw, homekv.KVSetOptions{EX: claudeDeviceProfileTTL})
+	if errSet != nil {
+		return errSet
+	}
+	if !written {
+		return fmt.Errorf("home kv device profile write skipped")
+	}
+	return nil
+}
+
+func claudeDeviceProfileKVValueFromProfile(profile ClaudeDeviceProfile) claudeDeviceProfileKVValue {
+	return claudeDeviceProfileKVValue{
+		UserAgent:      profile.UserAgent,
+		PackageVersion: profile.PackageVersion,
+		RuntimeVersion: profile.RuntimeVersion,
+		OS:             profile.OS,
+		Arch:           profile.Arch,
+	}
+}
+
+func (value claudeDeviceProfileKVValue) ToProfile() ClaudeDeviceProfile {
+	profile := ClaudeDeviceProfile{
+		UserAgent:      strings.TrimSpace(value.UserAgent),
+		PackageVersion: strings.TrimSpace(value.PackageVersion),
+		RuntimeVersion: strings.TrimSpace(value.RuntimeVersion),
+		OS:             strings.TrimSpace(value.OS),
+		Arch:           strings.TrimSpace(value.Arch),
+	}
+	if version, ok := parseClaudeCLIVersion(profile.UserAgent); ok {
+		profile.version = version
+		profile.hasVersion = true
+	}
+	return profile
 }
 
 func ApplyClaudeDeviceProfileHeaders(r *http.Request, profile ClaudeDeviceProfile) {
@@ -1305,7 +1564,13 @@ func DefaultClaudeVersion(cfg *config.Config) string {
 	return "2.1.211"
 }
 
-func ApplyClaudeLegacyDeviceHeaders(r *http.Request, ginHeaders http.Header, cfg *config.Config) {
+func ApplyClaudeDefaultDeviceProfileHeaders(r *http.Request, cfg *config.Config) {
+	ApplyClaudeDeviceProfileHeaders(r, defaultClaudeDeviceProfile(cfg))
+}
+
+// ApplyClaudeLegacyCompatibilityHeaders 保留 fork 未启用稳定化时的调用方软件字段。
+// 仅由无显式 pin/profile 的 legacy 路径调用；账号自定义头仍在调用方最后覆盖。
+func ApplyClaudeLegacyCompatibilityHeaders(r *http.Request, ginHeaders http.Header, cfg *config.Config) {
 	if r == nil {
 		return
 	}
@@ -1314,31 +1579,71 @@ func ApplyClaudeLegacyDeviceHeaders(r *http.Request, ginHeaders http.Header, cfg
 		if strings.TrimSpace(r.Header.Get(name)) != "" {
 			return
 		}
-		if strings.TrimSpace(ginHeaders.Get(name)) != "" {
-			r.Header.Set(name, strings.TrimSpace(ginHeaders.Get(name)))
+		if incoming := strings.TrimSpace(ginHeaders.Get(name)); incoming != "" {
+			r.Header.Set(name, incoming)
+			return
+		}
+		r.Header.Set(name, fallback)
+	}
+	miscEnsure("X-Stainless-Runtime-Version", profile.RuntimeVersion)
+	miscEnsure("X-Stainless-Package-Version", profile.PackageVersion)
+	miscEnsure("X-Stainless-Os", mapStainlessOS())
+	miscEnsure("X-Stainless-Arch", mapStainlessArch())
+	if strings.TrimSpace(r.Header.Get("User-Agent")) != "" {
+		return
+	}
+	if clientUA := strings.TrimSpace(ginHeaders.Get("User-Agent")); isClaudeCodeClient(clientUA) {
+		r.Header.Set("User-Agent", clientUA)
+		return
+	}
+	r.Header.Set("User-Agent", profile.UserAgent)
+}
+
+func ApplyClaudeLegacyDeviceHeaders(r *http.Request, ginHeaders http.Header, cfg *config.Config, confirmedClaudeCode bool, keepNewerVersions ...bool) {
+	if r == nil {
+		return
+	}
+	allowNewer := len(keepNewerVersions) > 0 && keepNewerVersions[0]
+	profile := defaultClaudeDeviceProfile(cfg)
+	miscEnsure := func(name, fallback string, valid func(string) bool) {
+		if current := strings.TrimSpace(r.Header.Get(name)); current != "" && (valid == nil || valid(current)) {
+			return
+		}
+		if incoming := strings.TrimSpace(ginHeaders.Get(name)); incoming != "" && (valid == nil || valid(incoming)) {
+			r.Header.Set(name, incoming)
 			return
 		}
 		r.Header.Set(name, fallback)
 	}
 
-	miscEnsure("X-Stainless-Runtime-Version", profile.RuntimeVersion)
-	miscEnsure("X-Stainless-Package-Version", profile.PackageVersion)
-	miscEnsure("X-Stainless-Os", mapStainlessOS())
-	miscEnsure("X-Stainless-Arch", mapStainlessArch())
+	// legacy只在稳定化关闭时使用；平台保留F已有值→入站值→运行平台的优先级。
+	miscEnsure("X-Stainless-Os", mapStainlessOS(), nil)
+	miscEnsure("X-Stainless-Arch", mapStainlessArch(), nil)
 
-	// Legacy mode preserves per-auth custom header overrides. By the time we get
-	// here, ApplyCustomHeadersFromAttrs has already populated r.Header.
-	if strings.TrimSpace(r.Header.Get("User-Agent")) != "" {
-		return
+	if confirmedClaudeCode {
+		validRuntime := func(value string) bool {
+			if !allowNewer && cfg != nil && strings.TrimSpace(cfg.ClaudeHeaderDefaults.RuntimeVersion) != "" {
+				return value == profile.RuntimeVersion
+			}
+			return plausibleClaudeRuntimeVersion(value, profile.RuntimeVersion)
+		}
+		validPackage := func(value string) bool {
+			if !allowNewer && cfg != nil && strings.TrimSpace(cfg.ClaudeHeaderDefaults.PackageVersion) != "" {
+				return value == profile.PackageVersion
+			}
+			return plausibleClaudePackageVersion(value, profile.PackageVersion)
+		}
+		miscEnsure("X-Stainless-Runtime-Version", profile.RuntimeVersion, validRuntime)
+		miscEnsure("X-Stainless-Package-Version", profile.PackageVersion, validPackage)
+		if clientUA := strings.TrimSpace(ginHeaders.Get("User-Agent")); plausibleClaudeCodeUserAgent(clientUA, cfg) {
+			r.Header.Set("User-Agent", clientUA)
+			return
+		}
 	}
 
-	clientUA := ""
-	if ginHeaders != nil {
-		clientUA = strings.TrimSpace(ginHeaders.Get("User-Agent"))
-	}
-	if isClaudeCodeClient(clientUA) {
-		r.Header.Set("User-Agent", clientUA)
-		return
-	}
+	// Unconfirmed clients must not leak a copied or third-party software profile
+	// into the upstream Claude Code SDK fingerprint.
+	r.Header.Set("X-Stainless-Runtime-Version", profile.RuntimeVersion)
+	r.Header.Set("X-Stainless-Package-Version", profile.PackageVersion)
 	r.Header.Set("User-Agent", profile.UserAgent)
 }

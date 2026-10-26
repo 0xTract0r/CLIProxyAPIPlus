@@ -39,6 +39,13 @@ func GetCodexClientModelsJSON() []byte {
 	return data
 }
 
+// GetCodexClientModelsRevision returns the current revision of the Codex client model catalog.
+func GetCodexClientModelsRevision() uint64 {
+	codexClientCatalogStore.mu.RLock()
+	defer codexClientCatalogStore.mu.RUnlock()
+	return codexClientCatalogStore.revision
+}
+
 // GetCodexClientModelsSnapshot returns a consistent catalog copy and revision.
 // The revision changes only when validated catalog content changes.
 func GetCodexClientModelsSnapshot() ([]byte, uint64) {
@@ -88,9 +95,6 @@ func ValidateCodexClientModelsJSON(data []byte) error {
 		if err = validateCodexClientModel(model); err != nil {
 			return fmt.Errorf("Codex client model catalog model %q: %w", slug, err)
 		}
-	}
-	if _, ok := seen["gpt-5.5"]; !ok {
-		return fmt.Errorf("Codex client model catalog is missing default template %q", "gpt-5.5")
 	}
 	return nil
 }

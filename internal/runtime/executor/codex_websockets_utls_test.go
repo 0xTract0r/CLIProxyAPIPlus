@@ -1,14 +1,15 @@
 package executor
 
 import (
+	"context"
 	"net"
 	"net/http"
 	"testing"
 
 	"github.com/gorilla/websocket"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	sdkconfig "github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
 )
 
 // TestApplyCodexRustlsWebsocketTLSForcesUTLSAndNilProxy verifies the codex-only
@@ -46,7 +47,7 @@ func TestApplyCodexRustlsWebsocketTLSForcesUTLSAndNilProxy(t *testing.T) {
 func TestSharedWebsocketDialerDoesNotApplyUTLS(t *testing.T) {
 	t.Parallel()
 
-	dialer := newProxyAwareWebsocketDialer(
+	dialer := newProxyAwareWebsocketDialer(context.Background(),
 		&config.Config{SDKConfig: sdkconfig.SDKConfig{ProxyURL: "socks5h://global.example.com:1080"}},
 		&cliproxyauth.Auth{ProxyURL: "socks5h://account.example.com:1080"},
 	)

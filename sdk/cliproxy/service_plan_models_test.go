@@ -2,15 +2,20 @@ package cliproxy
 
 import (
 	"context"
+	"os"
+	"path/filepath"
+	"reflect"
 	"testing"
+	"time"
 
-	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
 )
 
 func TestRegisterModelsForAuth_CodexPlanFiltersSpark(t *testing.T) {
+	useExplicitSparkCatalog(t)
 	service := &Service{cfg: &config.Config{}}
 
 	tests := []struct {
@@ -94,6 +99,7 @@ func TestRegisterModelsForAuth_CodexConfigModelsAdvertiseFastMetadata(t *testing
 }
 
 func TestCoreAuthUpdateHookRefreshesPlanFilteredModelRegistry(t *testing.T) {
+	useExplicitSparkCatalog(t)
 	ctx := context.Background()
 	cfg := &config.Config{}
 	cfg.SanitizeOAuthModelAlias()
@@ -345,4 +351,56 @@ func serviceTierSliceContains(values []registry.ServiceTierInfo, id string) bool
 		}
 	}
 	return false
+}
+
+// 默认目录已撤下 Spark；本守护显式测试用户自定义目录的订阅过滤。
+func useExplicitSparkCatalog(t *testing.T) {
+	t.Helper()
+	original := registry.GetCodexProModels()
+	registry.SetLocalModelCatalogs(true)
+	catalog := `{"codex-free":[{"id":"gpt-5.3-codex"},{"id":"gpt-5.3-codex-spark"}],"codex-team":[{"id":"gpt-5.3-codex"},{"id":"gpt-5.3-codex-spark"}],"codex-plus":[{"id":"gpt-5.3-codex"},{"id":"gpt-5.3-codex-spark"}],"codex-pro":[{"id":"gpt-5.3-codex"},{"id":"gpt-5.3-codex-spark"}]}`
+	file := filepath.Join(t.TempDir(), "explicit-spark-catalog.json")
+	if err := os.WriteFile(file, []byte(catalog), 0600); err != nil {
+		t.Fatal(err)
+	}
+	wait := func(ready func() bool) {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for !ready() {
+			if time.Now().After(deadline) {
+				t.Fatal("catalog fixture publication timed out")
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(func() {
+		cancel()
+		restoreCtx, restoreCancel := context.WithCancel(context.Background())
+		defer restoreCancel()
+		defer registry.SetLocalModelCatalogs(false)
+		registry.StartModelCatalogUpdaters(restoreCtx, registry.CatalogSources{}, false)
+		wait(func() bool { return reflect.DeepEqual(registry.GetCodexProModels(), original) })
+	})
+	registry.StartModelCatalogUpdaters(ctx, registry.CatalogSources{Catalog: file}, false)
+	wait(func() bool {
+		for _, model := range registry.GetCodexProModels() {
+			if model.ID == "gpt-5.3-codex" && model.DisplayName == "" {
+				return true
+			}
+		}
+		return false
+	})
+}
+
+func TestCodexLegacy208SparkExclusion(t *testing.T) {
+	models := applyExcludedModels(registry.GetCodexModelsForPlan("pro"), []string{"gpt-5.3-codex-spark"})
+	if modelListContains(models, "gpt-5.3-codex-spark") {
+		t.Fatal("Spark exclusion failed")
+	}
+	for _, id := range []string{"gpt-5.4", "gpt-5.4-mini"} {
+		if !modelListContains(models, id) {
+			t.Errorf("exclusion lost %s", id)
+		}
+	}
 }

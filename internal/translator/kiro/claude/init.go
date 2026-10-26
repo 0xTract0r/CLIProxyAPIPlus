@@ -2,16 +2,18 @@
 package claude
 
 import (
-	. "github.com/router-for-me/CLIProxyAPI/v7/internal/constant"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/translator/translator"
+	. "github.com/router-for-me/CLIProxyAPI/v8/internal/constant"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/translator/translator"
 )
 
 func init() {
 	translator.Register(
 		Claude,
 		Kiro,
-		ConvertClaudeRequestToKiro,
+		func(model string, payload []byte, stream bool) ([]byte, error) {
+			return ConvertClaudeRequestToKiro(model, payload, stream), nil
+		},
 		interfaces.TranslateResponse{
 			Stream:    ConvertKiroStreamToClaude,
 			NonStream: ConvertKiroNonStreamToClaude,

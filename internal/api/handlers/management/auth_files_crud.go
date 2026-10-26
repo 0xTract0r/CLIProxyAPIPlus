@@ -17,9 +17,11 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher/synthesizer"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/codex"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/watcher/synthesizer"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
 // Download single auth file by name
@@ -57,7 +59,7 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 
 	fileHeaders, errMultipart := h.multipartAuthFileHeaders(c)
 	if errMultipart != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("invalid multipart form: %v", errMultipart)})
+		c.JSON(clienterror.HTTPStatusFromErrorOr(errMultipart, http.StatusBadRequest), gin.H{"error": fmt.Sprintf("invalid multipart form: %v", errMultipart)})
 		return
 	}
 	if len(fileHeaders) == 1 {
@@ -66,7 +68,7 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 				c.JSON(http.StatusBadRequest, gin.H{"error": "file must be .json"})
 				return
 			}
-			if errors.Is(errUpload, errAuthFileInvalidProxyURL) {
+			if errors.Is(errUpload, errAuthFileInvalidProxyURL) || errors.Is(errUpload, errInvalidAuthFile) {
 				c.JSON(http.StatusBadRequest, gin.H{"error": errUpload.Error()})
 				return
 			}
@@ -122,15 +124,15 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 	}
 	data, err := io.ReadAll(c.Request.Body)
 	if err != nil {
-		c.JSON(400, gin.H{"error": "failed to read body"})
+		c.JSON(clienterror.HTTPStatusFromErrorOr(err, http.StatusBadRequest), gin.H{"error": "failed to read body"})
 		return
 	}
 	if err = h.writeAuthFile(ctx, filepath.Base(name), data); err != nil {
-		if errors.Is(err, errAuthFileInvalidProxyURL) {
-			c.JSON(400, gin.H{"error": err.Error()})
-			return
+		status := http.StatusInternalServerError
+		if errors.Is(err, errInvalidAuthFile) || errors.Is(err, errAuthFileInvalidProxyURL) {
+			status = http.StatusBadRequest
 		}
-		c.JSON(500, gin.H{"error": err.Error()})
+		c.JSON(status, gin.H{"error": err.Error()})
 		return
 	}
 	c.JSON(200, gin.H{"status": "ok"})
@@ -164,13 +166,22 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 					full = abs
 				}
 			}
-			if err = os.Remove(full); err == nil {
+			errDelete := func() error {
+				release := h.beginSIWCFileMutation(ctx, full)
+				defer release()
+				if errRemove := os.Remove(full); errRemove != nil {
+					return nil
+				}
 				if errDel := h.deleteTokenRecord(ctx, full); errDel != nil {
-					c.JSON(500, gin.H{"error": errDel.Error()})
-					return
+					return errDel
 				}
 				deleted++
 				h.removeAuth(ctx, full)
+				return nil
+			}()
+			if errDelete != nil {
+				c.JSON(500, gin.H{"error": errDelete.Error()})
+				return
 			}
 		}
 		c.JSON(200, gin.H{"status": "ok", "deleted": deleted})
@@ -179,7 +190,7 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 
 	names, errNames := requestedAuthFileNamesForDelete(c)
 	if errNames != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": errNames.Error()})
+		c.JSON(clienterror.HTTPStatusFromErrorOr(errNames, http.StatusBadRequest), gin.H{"error": errNames.Error()})
 		return
 	}
 	if len(names) == 0 {
@@ -284,13 +295,225 @@ func (h *Handler) writeAuthFile(ctx context.Context, name string, data []byte) e
 	if err := validateStoredAuthProxyURL(auth); err != nil {
 		return err
 	}
-	if errWrite := os.WriteFile(dst, data, 0o600); errWrite != nil {
+	ctx, release := h.beginSIWCUploadMutation(ctx, dst)
+	defer release()
+	if h.authManager != nil {
+		if existing, ok := h.authManager.GetByID(auth.ID); ok && !strings.EqualFold(existing.Provider, auth.Provider) {
+			return h.replaceOperatorProviderAuth(ctx, dst, existing, auth)
+		}
+		if existing, ok := h.authManager.GetByID(auth.ID); ok && (coreauth.IsCodexAuthRecord(existing) || coreauth.IsCodexAuthRecord(auth)) {
+			// Replacing an existing file is not a metadata PATCH. Reject partial
+			// credentials before any disk write; complete saves revalidate in-gate.
+			if !completeCodexRecoveryMaterial(auth, existing) {
+				return fmt.Errorf("%w: incomplete credentials for existing Codex account", errInvalidAuthFile)
+			}
+			if !uploadedCodexRecoveryIdentityMatches(existing, auth) {
+				if !strings.EqualFold(existing.Provider, "codex") || !strings.EqualFold(auth.Provider, "codex") || !operatorCodexReplacementIdentity(auth) {
+					return fmt.Errorf("%w: uploaded credentials do not establish replacement identity", errInvalidAuthFile)
+				}
+				// Cross-identity operator replacement also retires legacy pending binds.
+				if ctx == nil || ctx.Value(siwcFileMutationKey{}) != true {
+					if ctx == nil {
+						ctx = context.Background()
+					}
+					ctx = context.WithValue(ctx, siwcFileMutationKey{}, true)
+					var releaseReplacement func()
+					ctx, releaseReplacement = h.beginSIWCUploadMutation(ctx, dst)
+					defer releaseReplacement()
+				}
+				return h.replaceOperatorCodexAuth(ctx, dst, existing, auth)
+			}
+			_, errSave := h.saveTokenRecord(ctx, auth)
+			return errSave
+		}
+	}
+	if errWrite := h.writeAuthFileBytes(dst, data, auth); errWrite != nil {
 		return fmt.Errorf("failed to write file: %w", errWrite)
 	}
+	commitSIWCUploadMutation(ctx)
 	if err := h.upsertAuthRecord(ctx, auth); err != nil {
 		return err
 	}
+	if h.postAuthPersistHook != nil {
+		if errHook := h.postAuthPersistHook(ctx, auth); errHook != nil {
+			return fmt.Errorf("post-auth persist hook failed: %w", errHook)
+		}
+	}
 	return nil
+}
+
+// replaceOperatorProviderAuth preserves the generic upload storage contract:
+// parsed files may replace a different provider even without a registered executor.
+// It grants no Codex recovery and carries no state from the retired principal.
+func (h *Handler) replaceOperatorProviderAuth(ctx context.Context, path string, expected, incoming *coreauth.Auth) error {
+	if ctx == nil || ctx.Value(siwcFileMutationKey{}) != true {
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		ctx = context.WithValue(ctx, siwcFileMutationKey{}, true)
+		var release func()
+		ctx, release = h.beginSIWCUploadMutation(ctx, path)
+		defer release()
+	}
+	request := incoming.Clone()
+	if h.postAuthHook != nil {
+		if err := h.postAuthHook(ctx, request); err != nil {
+			return err
+		}
+	}
+	registered, err := h.authManager.CommitOperatorReplacement(ctx, expected.ID, expected.RegistrationEpoch, func(current *coreauth.Auth) (*coreauth.Auth, error) {
+		kind, _ := request.Metadata["type"].(string)
+		originalKind, _ := incoming.Metadata["type"].(string)
+		if strings.EqualFold(current.Provider, request.Provider) || request.Provider != incoming.Provider || kind != originalKind {
+			return nil, fmt.Errorf("%w: replacement provider changed", errInvalidAuthFile)
+		}
+		access, _ := request.Metadata["access_token"].(string)
+		refresh, _ := request.Metadata["refresh_token"].(string)
+		if coreauth.IsCodexAuthRecord(request) && (strings.TrimSpace(access) == "" || strings.TrimSpace(refresh) == "" || !operatorCodexReplacementIdentity(request)) {
+			return nil, fmt.Errorf("%w: incomplete operator Codex replacement", errInvalidAuthFile)
+		}
+		next := request.Clone()
+		next.ID, next.FileName = current.ID, current.FileName
+		if err := validateStoredAuthProxyURL(next); err != nil {
+			return nil, err
+		}
+		return next, nil
+	}, func(saveCtx context.Context, next *coreauth.Auth) error {
+		store := h.tokenStoreWithBaseDir()
+		if store == nil {
+			return fmt.Errorf("token store unavailable")
+		}
+		_, err := store.Save(coreauth.WithAuthCreationIntent(saveCtx), next)
+		return err
+	})
+	if err != nil {
+		return err
+	}
+	commitSIWCUploadMutation(ctx)
+	if h.postAuthPersistHook != nil {
+		return h.postAuthPersistHook(ctx, registered.Clone())
+	}
+	return nil
+}
+
+// replaceOperatorCodexAuth accepts a full new Codex identity only at the upload
+// boundary. Internal saves/PATCH keep their same-identity recovery contract.
+func (h *Handler) replaceOperatorCodexAuth(ctx context.Context, path string, expected, incoming *coreauth.Auth) error {
+	request := incoming.Clone()
+	if h.postAuthHook != nil {
+		if err := h.postAuthHook(ctx, request); err != nil {
+			return err
+		}
+	}
+	registered, err := h.authManager.CommitOperatorReplacement(ctx, expected.ID, expected.RegistrationEpoch, func(current *coreauth.Auth) (*coreauth.Auth, error) {
+		kind, _ := request.Metadata["type"].(string)
+		if !strings.EqualFold(kind, "codex") || !strings.EqualFold(current.Provider, "codex") || !strings.EqualFold(request.Provider, "codex") || !completeCodexRecoveryMaterial(request, current) || !operatorCodexReplacementIdentity(request) || uploadedCodexRecoveryIdentityMatches(current, request) {
+			return nil, fmt.Errorf("%w: invalid operator Codex replacement", errInvalidAuthFile)
+		}
+		// Build a fresh principal: no old Runtime, Storage, refresh patch, history,
+		// headers, SIWC or profile are copied from the replaced registration.
+		next := &coreauth.Auth{ID: current.ID, FileName: current.FileName, Provider: "codex", Status: request.Status, Disabled: request.Disabled, Metadata: request.Clone().Metadata, Attributes: map[string]string{"path": path, "source": path}}
+		if err := validateStoredAuthProxyURL(next); err != nil {
+			return nil, err
+		}
+		return next, nil
+	}, func(saveCtx context.Context, next *coreauth.Auth) error {
+		store := h.tokenStoreWithBaseDir()
+		if store == nil {
+			return fmt.Errorf("token store unavailable")
+		}
+		_, err := store.Save(coreauth.WithAuthCreationIntent(saveCtx), next)
+		return err
+	})
+	if err != nil {
+		return err
+	}
+	commitSIWCUploadMutation(ctx)
+	if h.postAuthPersistHook != nil {
+		return h.postAuthPersistHook(ctx, registered.Clone())
+	}
+	return nil
+}
+
+// Cross-account replacement requires positive submitted Codex account claims;
+// an opaque nonempty ID token plus a changed account_id is not sufficient.
+func operatorCodexReplacementIdentity(auth *coreauth.Auth) bool {
+	if auth == nil {
+		return false
+	}
+	token, _ := auth.Metadata["id_token"].(string)
+	claims, err := codex.ParseJWTToken(token)
+	if err != nil || claims == nil || strings.TrimSpace(claims.GetAccountID()) == "" {
+		return false
+	}
+	return uploadedCodexRecoveryIdentityMatches(auth, auth) && codexRecoveryTokenClaimsConsistent(auth.Metadata, nil)
+}
+
+// uploadedCodexRecoveryIdentityMatches checks identity before the upload inherits
+// any old account fields. JWT parsing only extracts claims; it does not validate
+// a signature or authenticate credentials with the provider.
+func uploadedCodexRecoveryIdentityMatches(existing, incoming *coreauth.Auth) bool {
+	if existing == nil || incoming == nil || existing.ID != incoming.ID || !strings.EqualFold(existing.Provider, incoming.Provider) {
+		return false
+	}
+	identity := func(metadata map[string]any) (accountID, email string, valid bool) {
+		text := func(key string) string {
+			value, _ := metadata[key].(string)
+			return strings.TrimSpace(value)
+		}
+		accountID, email = text("account_id"), text("email")
+		if alias := text("chatgpt_account_id"); alias != "" {
+			if accountID != "" && accountID != alias {
+				return "", "", false
+			}
+			accountID = alias
+		}
+		if claims, err := codex.ParseJWTToken(text("id_token")); err == nil && claims != nil {
+			if claimedID := strings.TrimSpace(claims.GetAccountID()); claimedID != "" {
+				if accountID != "" && accountID != claimedID {
+					return "", "", false
+				}
+				accountID = claimedID
+			}
+			if claimedEmail := strings.TrimSpace(claims.GetUserEmail()); claimedEmail != "" {
+				if email != "" && !strings.EqualFold(email, claimedEmail) {
+					return "", "", false
+				}
+				email = claimedEmail
+			}
+		}
+		return accountID, email, true
+	}
+	beforeID, beforeEmail, beforeValid := identity(existing.Metadata)
+	afterID, afterEmail, afterValid := identity(incoming.Metadata)
+	if !beforeValid || !afterValid {
+		return false
+	}
+	if beforeID != "" || afterID != "" {
+		return beforeID != "" && beforeID == afterID
+	}
+	return beforeEmail != "" && afterEmail != "" && strings.EqualFold(beforeEmail, afterEmail)
+}
+
+func (h *Handler) writeAuthFileBytes(dst string, data []byte, auth *coreauth.Auth) error {
+	if h.shouldLockCodexAuthFile(auth) {
+		return codex.WithFileLock(dst, func() error {
+			return os.WriteFile(dst, data, 0o600)
+		})
+	}
+	return os.WriteFile(dst, data, 0o600)
+}
+
+func (h *Handler) shouldLockCodexAuthFile(auth *coreauth.Auth) bool {
+	if coreauth.IsCodexAuthRecord(auth) {
+		return true
+	}
+	if h != nil && h.authManager != nil && auth != nil && auth.ID != "" {
+		if existing, ok := h.authManager.GetByID(auth.ID); ok && coreauth.IsCodexAuthRecord(existing) {
+			return true
+		}
+	}
+	return false
 }
 
 func requestedAuthFileNamesForDelete(c *gin.Context) ([]string, error) {
@@ -304,6 +527,10 @@ func requestedAuthFileNamesForDelete(c *gin.Context) ([]string, error) {
 
 	body, err := io.ReadAll(c.Request.Body)
 	if err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			return nil, err
+		}
 		return nil, fmt.Errorf("failed to read body")
 	}
 	body = bytes.TrimSpace(body)
@@ -376,6 +603,8 @@ func (h *Handler) deleteAuthFileByName(ctx context.Context, name string) (string
 			targetPath = abs
 		}
 	}
+	release := h.beginSIWCFileMutation(ctx, targetPath)
+	defer release()
 	if errRemove := os.Remove(targetPath); errRemove != nil {
 		if os.IsNotExist(errRemove) {
 			return filepath.Base(name), http.StatusNotFound, errAuthFileNotFound
@@ -489,7 +718,12 @@ func (h *Handler) buildAuthFromFileData(path string, data []byte) (*coreauth.Aut
 	}
 	metadata := make(map[string]any)
 	if err := json.Unmarshal(data, &metadata); err != nil {
-		return nil, fmt.Errorf("invalid auth file: %w", err)
+		return nil, fmt.Errorf("%w: %w", errInvalidAuthFile, err)
+	}
+	coreauth.NormalizeCredentialMetadata(metadata)
+	// Loading tolerates invalid exclusion rules, so reject them here before anything is persisted.
+	if _, errExcluded := synthesizer.ExtractExcludedModelsFromMetadata(metadata); errExcluded != nil {
+		return nil, fmt.Errorf("%w: %w", errInvalidAuthFile, errExcluded)
 	}
 	provider, _ := metadata["type"].(string)
 	if provider == "" {
@@ -513,7 +747,11 @@ func (h *Handler) buildAuthFromFileData(path string, data []byte) (*coreauth.Aut
 			Now:         time.Now(),
 			IDGenerator: synthesizer.NewStableIDGenerator(),
 		}
-		if generated := synthesizer.SynthesizeAuthFile(sctx, path, data); len(generated) > 0 && generated[0] != nil {
+		generated, errSynthesize := synthesizer.SynthesizeAuthFile(sctx, path, data)
+		if errSynthesize != nil {
+			return nil, fmt.Errorf("%w: %w", errInvalidAuthFile, errSynthesize)
+		}
+		if len(generated) > 0 && generated[0] != nil {
 			auth = generated[0].Clone()
 		}
 	}
@@ -538,7 +776,8 @@ func (h *Handler) buildAuthFromFileData(path string, data []byte) (*coreauth.Aut
 		auth.LastRefreshedAt = lastRefresh
 	}
 	if h != nil && h.authManager != nil {
-		if existing, ok := h.authManager.GetByID(authID); ok {
+		// A different provider is a new principal, never a runtime reload.
+		if existing, ok := h.authManager.GetByID(authID); ok && strings.EqualFold(existing.Provider, auth.Provider) {
 			auth.CreatedAt = existing.CreatedAt
 			if !hasLastRefresh {
 				auth.LastRefreshedAt = existing.LastRefreshedAt

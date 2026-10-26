@@ -7,9 +7,9 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -26,10 +26,52 @@ func ApplyPayloadConfigWithRoot(cfg *config.Config, model, protocol, root string
 
 // ApplyPayloadConfigWithRequest applies payload config using source protocol and request header gates.
 func ApplyPayloadConfigWithRequest(cfg *config.Config, model, protocol, fromProtocol, root string, payload, original []byte, requestedModel string, requestPath string, headers http.Header) []byte {
-	if cfg == nil || len(payload) == 0 {
-		return payload
+	out, _ := ApplyPayloadConfigWithRequestTracked(cfg, model, protocol, fromProtocol, root, payload, original, requestedModel, requestPath, headers, "")
+	return out
+}
+
+// ApplyPayloadConfigWithRequestForExecutor applies payload config with explicit target executor context.
+func ApplyPayloadConfigWithRequestForExecutor(cfg *config.Config, targetExecutor, model, protocol, fromProtocol, root string, payload, original []byte, requestedModel string, requestPath string, headers http.Header) []byte {
+	out, _ := ApplyPayloadConfigWithTrackedPathsForExecutor(cfg, targetExecutor, model, protocol, fromProtocol, root, payload, original, requestedModel, requestPath, headers)
+	return out
+}
+
+func isCodexTargetExecutor(targetExecutor string) bool {
+	te := strings.ToLower(strings.TrimSpace(targetExecutor))
+	return te == "codex" || te == "codex-websockets" || te == "codex_websockets"
+}
+
+// ApplyPayloadConfigWithTrackedPaths applies payload config and reports which
+// tracked paths (or their descendants) were targeted by an applied rule.
+func ApplyPayloadConfigWithTrackedPaths(cfg *config.Config, model, protocol, fromProtocol, root string, payload, original []byte, requestedModel string, requestPath string, headers http.Header, trackedPaths ...string) ([]byte, map[string]bool) {
+	return ApplyPayloadConfigWithTrackedPathsForExecutor(cfg, "", model, protocol, fromProtocol, root, payload, original, requestedModel, requestPath, headers, trackedPaths...)
+}
+
+// ApplyPayloadConfigWithTrackedPathsForExecutor applies payload config with target executor awareness.
+// When headers indicate a Codex client and the target executor is not Codex or Codex WebSocket,
+// it normalizes tool parameter integer types to satisfy client-side integer deserialization (#6237).
+// For Codex and Codex WebSocket targets, integer normalization is skipped (#6244).
+func ApplyPayloadConfigWithTrackedPathsForExecutor(cfg *config.Config, targetExecutor, model, protocol, fromProtocol, root string, payload, original []byte, requestedModel string, requestPath string, headers http.Header, trackedPaths ...string) ([]byte, map[string]bool) {
+	touched := make(map[string]bool)
+	if len(payload) == 0 {
+		return payload, touched
+	}
+	if IsCodexUserAgent(headers) && !isCodexTargetExecutor(targetExecutor) {
+		payload = NormalizeCodexToolIntegerTypes(payload, headers)
+	}
+	if cfg == nil {
+		return payload, touched
 	}
 	out := payload
+
+	markTouched := func(resolvedPath string) {
+		for _, tp := range trackedPaths {
+			tp = strings.TrimSpace(tp)
+			if tp != "" && payloadRuleTargetsPath(resolvedPath, tp) {
+				touched[tp] = true
+			}
+		}
+	}
 
 	// Apply disable-image-generation filtering before payload rules so config payload
 	// overrides can explicitly re-enable image_generation when desired.
@@ -74,6 +116,7 @@ func ApplyPayloadConfigWithRequest(cfg *config.Config, model, protocol, fromProt
 						}
 						out = updated
 						appliedDefaults[resolvedPath] = struct{}{}
+						markTouched(resolvedPath)
 					}
 				}
 			}
@@ -105,6 +148,7 @@ func ApplyPayloadConfigWithRequest(cfg *config.Config, model, protocol, fromProt
 						}
 						out = updated
 						appliedDefaults[resolvedPath] = struct{}{}
+						markTouched(resolvedPath)
 					}
 				}
 			}
@@ -120,7 +164,11 @@ func ApplyPayloadConfigWithRequest(cfg *config.Config, model, protocol, fromProt
 						continue
 					}
 					for _, resolvedPath := range resolvePayloadRulePaths(out, fullPath) {
-						out = setPayloadValueIfDifferent(out, resolvedPath, value)
+						var applied bool
+						out, applied = setPayloadValueIfDifferentTracked(out, resolvedPath, value)
+						if applied {
+							markTouched(resolvedPath)
+						}
 					}
 				}
 			}
@@ -140,7 +188,11 @@ func ApplyPayloadConfigWithRequest(cfg *config.Config, model, protocol, fromProt
 						continue
 					}
 					for _, resolvedPath := range resolvePayloadRulePaths(out, fullPath) {
-						out = SetRawIfDifferent(out, resolvedPath, rawValue)
+						var applied bool
+						out, applied = setPayloadRawValueIfDifferentTracked(out, resolvedPath, rawValue)
+						if applied {
+							markTouched(resolvedPath)
+						}
 					}
 				}
 			}
@@ -163,12 +215,20 @@ func ApplyPayloadConfigWithRequest(cfg *config.Config, model, protocol, fromProt
 							continue
 						}
 						out = updated
+						markTouched(resolvedPath)
 					}
 				}
 			}
 		}
 	}
-	return out
+	return out, touched
+}
+
+// ApplyPayloadConfigWithRequestTracked applies payload config and reports whether
+// an applied rule targeted trackedPath or one of its descendants.
+func ApplyPayloadConfigWithRequestTracked(cfg *config.Config, model, protocol, fromProtocol, root string, payload, original []byte, requestedModel string, requestPath string, headers http.Header, trackedPath string) ([]byte, bool) {
+	out, touched := ApplyPayloadConfigWithTrackedPaths(cfg, model, protocol, fromProtocol, root, payload, original, requestedModel, requestPath, headers, trackedPath)
+	return out, touched[trackedPath]
 }
 
 func isImagesEndpointRequestPath(path string) bool {
@@ -487,6 +547,13 @@ func buildPayloadPath(root, path string) string {
 		p = p[1:]
 	}
 	return r + "." + p
+}
+
+func payloadRuleTargetsPath(path, trackedPath string) bool {
+	if trackedPath == "" || path == "" {
+		return false
+	}
+	return path == trackedPath || strings.HasPrefix(path, trackedPath+".") || strings.HasPrefix(trackedPath, path+".")
 }
 
 func resolvePayloadRulePaths(payload []byte, path string) []string {
@@ -809,43 +876,60 @@ func removeToolTypeFromToolsArray(payload []byte, toolsPath string, toolType str
 }
 
 func setPayloadValueIfDifferent(payload []byte, path string, value any) []byte {
+	updated, _ := setPayloadValueIfDifferentTracked(payload, path, value)
+	return updated
+}
+
+func setPayloadValueIfDifferentTracked(payload []byte, path string, value any) ([]byte, bool) {
 	current := gjson.GetBytes(payload, path)
 	switch typed := value.(type) {
 	case string:
 		if current.Type == gjson.String && current.String() == typed {
-			return payload
+			return payload, true
 		}
 	case bool:
 		if (typed && current.Type == gjson.True) || (!typed && current.Type == gjson.False) {
-			return payload
+			return payload, true
 		}
 	case nil:
 		if current.Raw == "null" {
-			return payload
+			return payload, true
 		}
 	default:
 		expectedJSON, errSet := sjson.SetBytes([]byte(`{}`), "value", value)
 		if errSet != nil {
-			return payload
+			return payload, false
 		}
 		expected := gjson.GetBytes(expectedJSON, "value")
 		if expected.Raw == "" {
-			return payload
+			return payload, false
 		}
 		if len(current.Indexes) == 0 && current.Raw == expected.Raw {
-			return payload
+			return payload, true
 		}
 		updated, errSet := sjson.SetRawBytes(payload, path, []byte(expected.Raw))
 		if errSet != nil {
-			return payload
+			return payload, false
 		}
-		return updated
+		return updated, true
 	}
 	updated, errSet := sjson.SetBytes(payload, path, value)
 	if errSet != nil {
-		return payload
+		return payload, false
 	}
-	return updated
+	return updated, true
+}
+
+func setPayloadRawValueIfDifferentTracked(payload []byte, path string, value []byte) ([]byte, bool) {
+	current := gjson.GetBytes(payload, path)
+	if current.Exists() && len(current.Indexes) == 0 && current.Raw == string(value) {
+		return payload, true
+	}
+	updated, errSet := sjson.SetRawBytes(payload, path, value)
+	if errSet != nil {
+		return payload, false
+	}
+	return updated, true
 }
 
 func payloadRawValue(value any) ([]byte, bool) {

@@ -7,7 +7,7 @@ import (
 	"testing"
 
 	tls "github.com/refraction-networking/utls"
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
 // assertClaudeCLIClientHelloRoundTripper verifies that the given round tripper

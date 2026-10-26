@@ -3,18 +3,27 @@
 package registry
 
 import (
+	"encoding/json"
 	"strings"
 )
 
 const (
-	codexBuiltinImage15ModelID      = "gpt-image-1.5"
-	codexBuiltinImageModelID        = "gpt-image-2"
-	codexSparkModelID               = "gpt-5.3-codex-spark"
-	codexFastServiceTierID          = "priority"
-	xaiBuiltinImageModelID          = "grok-imagine-image"
-	xaiBuiltinImageQualityModelID   = "grok-imagine-image-quality"
-	xaiBuiltinVideoModelID          = "grok-imagine-video"
-	xaiBuiltinVideo15PreviewModelID = "grok-imagine-video-1.5-preview"
+	codexBuiltinImage15ModelID         = "gpt-image-1.5"
+	codexBuiltinImageModelID           = "gpt-image-2"
+	codexBuiltinImage25FlareModelID    = "gpt-image-2.5-flare"
+	codexBuiltinImage25SunburstModelID = "gpt-image-2.5-sunburst"
+	codexBuiltinImage25ModelID         = "gpt-image-2.5"
+	xaiBuiltinImageModelID             = "grok-imagine-image"
+	xaiBuiltinImageQualityModelID      = "grok-imagine-image-quality"
+	xaiBuiltinImage20ModelID           = "grok-imagine-image-2.0"
+	xaiBuiltinVideoModelID             = "grok-imagine-video"
+	xaiBuiltinVideo15ModelID           = "grok-imagine-video-1.5"
+	xaiBuiltinVideo15PreviewID         = "grok-imagine-video-1.5-preview"
+	xaiBuiltinSpeechModelID            = "grok-tts"
+	xaiBuiltinSpeechVoiceModelID       = "grok-voice-tts-1.0"
+	codexSparkModelID                  = "gpt-5.3-codex-spark"
+	codexFastServiceTierID             = "priority"
+	xaiBuiltinVideo15PreviewModelID    = xaiBuiltinVideo15PreviewID
 )
 
 var codexFastServiceTier = ServiceTierInfo{
@@ -37,6 +46,8 @@ type staticModelsJSON struct {
 	Kimi        []*ModelInfo `json:"kimi"`
 	Antigravity []*ModelInfo `json:"antigravity"`
 	XAI         []*ModelInfo `json:"xai"`
+	Devin       []*ModelInfo `json:"devin"`
+	Meta        []*ModelInfo `json:"meta"`
 }
 
 // GetClaudeModels returns the standard Claude model definitions.
@@ -258,6 +269,131 @@ func GetAntigravityModels() []*ModelInfo {
 	return cloneModelInfos(getModels().Antigravity)
 }
 
+var staticDevinModels = []*ModelInfo{
+	devinBuiltinSWE16SlowModelInfo(),
+	{
+		ID:                  "devin/swe-2",
+		Type:                "devin",
+		OwnedBy:             "cognition",
+		DisplayName:         "SWE-2",
+		ContextLength:       262000,
+		MaxCompletionTokens: 128000,
+		Thinking: &ThinkingSupport{
+			Levels: []string{"medium", "high", "max"},
+		},
+	},
+	{
+		ID:                  "devin/claude-fable-5-1",
+		Type:                "devin",
+		OwnedBy:             "anthropic",
+		DisplayName:         "Claude Fable 5.1",
+		ContextLength:       1000000,
+		MaxCompletionTokens: 64000,
+		Thinking: &ThinkingSupport{
+			Levels: []string{"low", "medium", "high", "xhigh", "max"},
+		},
+	},
+	{
+		ID:                  "devin/gpt-6-astra",
+		Type:                "devin",
+		OwnedBy:             "openai",
+		DisplayName:         "GPT-6 Astra",
+		ContextLength:       1000000,
+		MaxCompletionTokens: 64000,
+		Thinking: &ThinkingSupport{
+			Levels: []string{"low", "medium", "high", "xhigh", "max"},
+		},
+	},
+	{
+		ID:                  "devin/glm-5-2",
+		Type:                "devin",
+		OwnedBy:             "zhipu",
+		DisplayName:         "GLM-5.2",
+		ContextLength:       200000,
+		MaxCompletionTokens: 64000,
+		Thinking: &ThinkingSupport{
+			Levels: []string{"none", "high"},
+		},
+	},
+	{
+		ID:                  "devin/glm-5-3",
+		Type:                "devin",
+		OwnedBy:             "zhipu",
+		DisplayName:         "GLM-5.3",
+		ContextLength:       1048576,
+		MaxCompletionTokens: 128000,
+		Thinking: &ThinkingSupport{
+			Levels: []string{"low", "high", "max"},
+		},
+	},
+	{
+		ID:                  "devin/glm-5-3-flash",
+		Type:                "devin",
+		OwnedBy:             "zhipu",
+		DisplayName:         "GLM-5.3 Flash",
+		ContextLength:       1000000,
+		MaxCompletionTokens: 128000,
+		Thinking: &ThinkingSupport{
+			Levels: []string{"low", "high", "max"},
+		},
+	},
+	{
+		ID:                  "devin/gpt-5-6-sol",
+		Type:                "devin",
+		OwnedBy:             "openai",
+		DisplayName:         "GPT-5.6 Sol",
+		ContextLength:       1000000,
+		MaxCompletionTokens: 128000,
+		Thinking: &ThinkingSupport{
+			Levels: []string{"none", "low", "medium", "high", "xhigh", "max"},
+		},
+	},
+	{
+		ID:                  "devin/gemini-3-8-flash",
+		Type:                "devin",
+		OwnedBy:             "google",
+		DisplayName:         "Gemini 3.8 Flash",
+		ContextLength:       1048576,
+		MaxCompletionTokens: 65536,
+		Thinking: &ThinkingSupport{
+			Levels: []string{"low", "medium", "high"},
+		},
+	},
+	{
+		ID:                  "devin/grok-4-6",
+		Type:                "devin",
+		OwnedBy:             "xai",
+		DisplayName:         "Grok 4.6",
+		ContextLength:       500000,
+		MaxCompletionTokens: 131072,
+		Thinking: &ThinkingSupport{
+			Levels: []string{"low", "medium", "high", "xhigh"},
+		},
+	},
+	{
+		ID:                  "devin/deepseek-v4-flash",
+		Type:                "devin",
+		OwnedBy:             "deepseek",
+		DisplayName:         "DeepSeek V4 Flash",
+		ContextLength:       1048576,
+		MaxCompletionTokens: 64000,
+		Thinking: &ThinkingSupport{
+			Levels: []string{"high", "max"},
+		},
+	},
+	{
+		ID:                  "devin/deepseek-v4-1-flash",
+		Type:                "devin",
+		OwnedBy:             "deepseek",
+		DisplayName:         "DeepSeek V4.1 Flash",
+		ContextLength:       1048576,
+		MaxCompletionTokens: 64000,
+		Thinking: &ThinkingSupport{
+			Levels: []string{"high", "max"},
+		},
+	},
+}
+
 // AntigravityWebSearchModelFor returns the Antigravity model that should run a
 // native web search request for modelID.
 func AntigravityWebSearchModelFor(modelID string) string {
@@ -292,13 +428,48 @@ func GetXAIModels() []*ModelInfo {
 // not depend on remote models.json updates. Built-ins replace any matching IDs
 // already present in the provided slice.
 func WithCodexBuiltins(models []*ModelInfo) []*ModelInfo {
-	return upsertModelInfos(models, codexBuiltinImage15ModelInfo(), codexBuiltinImageModelInfo())
+	return upsertModelInfos(models,
+		codexBuiltinImage15ModelInfo(),
+		codexBuiltinImageModelInfo(),
+		codexBuiltinImage25FlareModelInfo(),
+		codexBuiltinImage25SunburstModelInfo(),
+		codexBuiltinImage25ModelInfo(),
+	)
+}
+
+// 固定 fork F 的有限旧 ID 定义；仅补缺失，不替换新目录或重映模型。
+var codexLegacyCatalog = func() staticModelsJSON {
+	var data staticModelsJSON
+	if err := json.Unmarshal([]byte(codexLegacyCatalogJSON), &data); err != nil {
+		panic(err)
+	}
+	return data
+}()
+
+func appendMissingCodexLegacy(models, legacy []*ModelInfo) []*ModelInfo {
+	for _, fallback := range legacy {
+		found := false
+		for _, current := range models {
+			if current != nil && current.ID == fallback.ID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			models = append(models, cloneModelInfo(fallback))
+		}
+	}
+	return models
 }
 
 func applyCodexCatalogCompatibility(data *staticModelsJSON) {
 	if data == nil {
 		return
 	}
+	data.CodexFree = appendMissingCodexLegacy(data.CodexFree, codexLegacyCatalog.CodexFree)
+	data.CodexTeam = appendMissingCodexLegacy(data.CodexTeam, codexLegacyCatalog.CodexTeam)
+	data.CodexPlus = appendMissingCodexLegacy(data.CodexPlus, codexLegacyCatalog.CodexPlus)
+	data.CodexPro = appendMissingCodexLegacy(data.CodexPro, codexLegacyCatalog.CodexPro)
 	applyCodexFastModeMetadata(data.CodexFree)
 	applyCodexFastModeMetadata(data.CodexTeam)
 	applyCodexFastModeMetadata(data.CodexPlus)
@@ -382,10 +553,10 @@ func appendUniqueServiceTier(values []ServiceTierInfo, value ServiceTierInfo) []
 	return append(values, value)
 }
 
-// WithXAIBuiltins injects hard-coded xAI image/video model definitions that should
-// not depend on remote models.json updates.
+// WithXAIBuiltins injects hard-coded xAI image, video, and speech model definitions
+// that should not depend on remote models.json updates.
 func WithXAIBuiltins(models []*ModelInfo) []*ModelInfo {
-	return upsertModelInfos(models, xaiBuiltinImageModelInfo(), xaiBuiltinImageQualityModelInfo(), xaiBuiltinVideoModelInfo(), xaiBuiltinVideo15PreviewModelInfo())
+	return upsertModelInfos(models, xaiBuiltinImageModelInfo(), xaiBuiltinImageQualityModelInfo(), xaiBuiltinImage20ModelInfo(), xaiBuiltinVideoModelInfo(), xaiBuiltinVideo15ModelInfo(), xaiBuiltinVideo15PreviewModelInfo(), xaiBuiltinSpeechModelInfo(), xaiBuiltinSpeechVoiceModelInfo())
 }
 
 func normalizeAntigravityCapabilityModelID(modelID string) string {
@@ -420,6 +591,42 @@ func codexBuiltinImageModelInfo() *ModelInfo {
 	}
 }
 
+func codexBuiltinImage25FlareModelInfo() *ModelInfo {
+	return &ModelInfo{
+		ID:          codexBuiltinImage25FlareModelID,
+		Object:      "model",
+		Created:     1704067200, // 2024-01-01
+		OwnedBy:     "openai",
+		Type:        "openai",
+		DisplayName: "GPT Image 2.5 Flare",
+		Version:     codexBuiltinImage25FlareModelID,
+	}
+}
+
+func codexBuiltinImage25SunburstModelInfo() *ModelInfo {
+	return &ModelInfo{
+		ID:          codexBuiltinImage25SunburstModelID,
+		Object:      "model",
+		Created:     1704067200, // 2024-01-01
+		OwnedBy:     "openai",
+		Type:        "openai",
+		DisplayName: "GPT Image 2.5 Sunburst",
+		Version:     codexBuiltinImage25SunburstModelID,
+	}
+}
+
+func codexBuiltinImage25ModelInfo() *ModelInfo {
+	return &ModelInfo{
+		ID:          codexBuiltinImage25ModelID,
+		Object:      "model",
+		Created:     1704067200, // 2024-01-01
+		OwnedBy:     "openai",
+		Type:        "openai",
+		DisplayName: "GPT Image 2.5",
+		Version:     codexBuiltinImage25ModelID,
+	}
+}
+
 func xaiBuiltinImageModelInfo() *ModelInfo {
 	return &ModelInfo{
 		ID:          xaiBuiltinImageModelID,
@@ -446,6 +653,19 @@ func xaiBuiltinImageQualityModelInfo() *ModelInfo {
 	}
 }
 
+func xaiBuiltinImage20ModelInfo() *ModelInfo {
+	return &ModelInfo{
+		ID:          xaiBuiltinImage20ModelID,
+		Object:      "model",
+		Created:     1786060800, // 2026-08-07
+		OwnedBy:     "xai",
+		Type:        "xai",
+		DisplayName: "Grok Imagine Image 2.0",
+		Name:        xaiBuiltinImage20ModelID,
+		Description: "xAI Grok image generation model.",
+	}
+}
+
 func xaiBuiltinVideoModelInfo() *ModelInfo {
 	return &ModelInfo{
 		ID:          xaiBuiltinVideoModelID,
@@ -459,16 +679,55 @@ func xaiBuiltinVideoModelInfo() *ModelInfo {
 	}
 }
 
+func xaiBuiltinVideo15ModelInfo() *ModelInfo {
+	return &ModelInfo{
+		ID:          xaiBuiltinVideo15ModelID,
+		Object:      "model",
+		Created:     1735689600, // 2025-01-01
+		OwnedBy:     "xai",
+		Type:        "xai",
+		DisplayName: "Grok Imagine Video 1.5",
+		Name:        xaiBuiltinVideo15ModelID,
+		Description: "xAI Grok video generation model.",
+	}
+}
+
 func xaiBuiltinVideo15PreviewModelInfo() *ModelInfo {
 	return &ModelInfo{
-		ID:          xaiBuiltinVideo15PreviewModelID,
+		ID:          xaiBuiltinVideo15PreviewID,
 		Object:      "model",
 		Created:     1735689600, // 2025-01-01
 		OwnedBy:     "xai",
 		Type:        "xai",
 		DisplayName: "Grok Imagine Video 1.5 Preview",
-		Name:        xaiBuiltinVideo15PreviewModelID,
-		Description: "xAI Grok preview video generation model.",
+		Name:        xaiBuiltinVideo15PreviewID,
+		Description: "Compatibility alias for the xAI Grok video generation model.",
+	}
+}
+
+func xaiBuiltinSpeechModelInfo() *ModelInfo {
+	return &ModelInfo{
+		ID:          xaiBuiltinSpeechModelID,
+		Object:      "model",
+		Created:     1773619200, // 2026-03-16
+		OwnedBy:     "xai",
+		Type:        "xai",
+		DisplayName: "Grok TTS",
+		Name:        xaiBuiltinSpeechModelID,
+		Description: "xAI Grok unary text-to-speech model.",
+	}
+}
+
+func xaiBuiltinSpeechVoiceModelInfo() *ModelInfo {
+	return &ModelInfo{
+		ID:          xaiBuiltinSpeechVoiceModelID,
+		Object:      "model",
+		Created:     1773619200, // 2026-03-16
+		OwnedBy:     "xai",
+		Type:        "xai",
+		DisplayName: "Grok Voice TTS 1.0",
+		Name:        xaiBuiltinSpeechVoiceModelID,
+		Description: "xAI Grok unary text-to-speech model.",
 	}
 }
 
@@ -536,6 +795,7 @@ func cloneModelInfos(models []*ModelInfo) []*ModelInfo {
 // Supported channels:
 //   - claude
 //   - gemini
+//   - gemini-interactions
 //   - vertex
 //   - aistudio
 //   - codex
@@ -546,6 +806,8 @@ func cloneModelInfos(models []*ModelInfo) []*ModelInfo {
 //   - amazonq
 //   - antigravity
 //   - xai
+//   - devin
+//   - meta
 func GetStaticModelDefinitionsByChannel(channel string) []*ModelInfo {
 	key := strings.ToLower(strings.TrimSpace(channel))
 	switch key {
@@ -555,13 +817,15 @@ func GetStaticModelDefinitionsByChannel(channel string) []*ModelInfo {
 		return GetGeminiModels()
 	case "gemini-cli":
 		return GetGeminiCLIModels()
+	case "gemini-interactions":
+		return GetGeminiModels()
 	case "vertex":
 		return GetGeminiVertexModels()
 	case "aistudio":
 		return GetAIStudioModels()
 	case "codex":
 		return GetCodexProModels()
-	case "kimi":
+	case "kimi", "kimi-ai", "kimi.ai", "kimi.com":
 		return GetKimiModels()
 	case "github-copilot":
 		return GetGitHubCopilotModels()
@@ -575,9 +839,43 @@ func GetStaticModelDefinitionsByChannel(channel string) []*ModelInfo {
 		return GetAntigravityModels()
 	case "xai", "x-ai", "grok":
 		return GetXAIModels()
+	case "devin":
+		return GetDevinModels()
+	case "meta", "muse":
+		return GetMetaModels()
 	default:
 		return nil
 	}
+}
+
+// LookupStaticModelInfoByChannel searches one provider-specific static section.
+// It does not fall back across providers, so callers can preserve provenance.
+func LookupStaticModelInfoByChannel(modelID, channel string) *ModelInfo {
+	modelID = strings.TrimSpace(modelID)
+	if modelID == "" {
+		return nil
+	}
+	models := GetStaticModelDefinitionsByChannel(channel)
+	for _, model := range models {
+		if model != nil && model.ID == modelID {
+			return cloneModelInfo(model)
+		}
+	}
+	if strings.EqualFold(strings.TrimSpace(channel), "claude") {
+		for _, familyID := range claudeFamilyModelIDs(modelID) {
+			for _, model := range models {
+				if model != nil && model.ID == familyID {
+					return cloneModelInfo(model)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// GetMetaModels returns the standard Meta Muse model definitions.
+func GetMetaModels() []*ModelInfo {
+	return cloneModelInfos(getModels().Meta)
 }
 
 // LookupStaticModelInfo searches all static model definitions for a model by ID.
@@ -601,10 +899,22 @@ func LookupStaticModelInfo(modelID string) *ModelInfo {
 		GetKiroModels(),
 		GetKiloModels(),
 		GetAmazonQModels(),
+		GetDevinModels(),
+		GetMetaModels(),
 	}
 	for _, models := range allModels {
 		for _, m := range models {
 			if m != nil && m.ID == modelID {
+				return cloneModelInfo(m)
+			}
+		}
+	}
+
+	// Dated and bracketed Claude variants (claude-sonnet-5-5-20261001,
+	// claude-opus-5-5[1m]) share the capabilities of their catalog entry.
+	for _, familyID := range claudeFamilyModelIDs(modelID) {
+		for _, m := range data.Claude {
+			if m != nil && m.ID == familyID {
 				return cloneModelInfo(m)
 			}
 		}
@@ -1286,3 +1596,36 @@ func GetAmazonQModels() []*ModelInfo {
 		},
 	}
 }
+
+// claudeFamilyModelIDs returns the catalog IDs a Claude model variant may belong
+// to: without a "[...]" context suffix, then also without a "-YYYYMMDD" date.
+func claudeFamilyModelIDs(modelID string) []string {
+	if !strings.HasPrefix(modelID, "claude-") {
+		return nil
+	}
+	var ids []string
+	base := modelID
+	if i := strings.IndexByte(base, '['); i > 0 && strings.HasSuffix(base, "]") {
+		base = base[:i]
+		ids = append(ids, base)
+	}
+	if n := len(base); n > 9 && base[n-9] == '-' && isEightDigits(base[n-8:]) {
+		ids = append(ids, base[:n-9])
+	}
+	return ids
+}
+
+func isEightDigits(s string) bool {
+	if len(s) != 8 {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// 来源：1228bf9b9ab3a916a32c193a9fdf3a9946ee2e26 models.json 的三 ID 原定义与计划。
+const codexLegacyCatalogJSON = `{"codex-free":[{"id":"gpt-5.4","object":"model","created":1772668800,"owned_by":"openai","type":"openai","display_name":"GPT 5.4","version":"gpt-5.4","description":"Stable version of GPT 5.4","context_length":1050000,"max_completion_tokens":128000,"supported_parameters":["tools"],"thinking":{"levels":["low","medium","high","xhigh"]}},{"id":"gpt-5.4-mini","object":"model","created":1773705600,"owned_by":"openai","type":"openai","display_name":"GPT 5.4 Mini","version":"gpt-5.4-mini","description":"GPT-5.4 mini brings the strengths of GPT-5.4 to a faster, more efficient model designed for high-volume workloads.","context_length":400000,"max_completion_tokens":128000,"supported_parameters":["tools"],"thinking":{"levels":["low","medium","high","xhigh"]}}],"codex-team":[{"id":"gpt-5.4","object":"model","created":1772668800,"owned_by":"openai","type":"openai","display_name":"GPT 5.4","version":"gpt-5.4","description":"Stable version of GPT 5.4","context_length":1050000,"max_completion_tokens":128000,"supported_parameters":["tools"],"thinking":{"levels":["low","medium","high","xhigh"]}},{"id":"gpt-5.4-mini","object":"model","created":1773705600,"owned_by":"openai","type":"openai","display_name":"GPT 5.4 Mini","version":"gpt-5.4-mini","description":"GPT-5.4 mini brings the strengths of GPT-5.4 to a faster, more efficient model designed for high-volume workloads.","context_length":400000,"max_completion_tokens":128000,"supported_parameters":["tools"],"thinking":{"levels":["low","medium","high","xhigh"]}}],"codex-plus":[{"id":"gpt-5.3-codex-spark","object":"model","created":1770912000,"owned_by":"openai","type":"openai","display_name":"GPT 5.3 Codex Spark","version":"gpt-5.3","description":"Ultra-fast coding model.","context_length":128000,"max_completion_tokens":128000,"supported_parameters":["tools"],"thinking":{"levels":["low","medium","high","xhigh"]}},{"id":"gpt-5.4","object":"model","created":1772668800,"owned_by":"openai","type":"openai","display_name":"GPT 5.4","version":"gpt-5.4","description":"Stable version of GPT 5.4","context_length":1050000,"max_completion_tokens":128000,"supported_parameters":["tools"],"thinking":{"levels":["low","medium","high","xhigh"]}},{"id":"gpt-5.4-mini","object":"model","created":1773705600,"owned_by":"openai","type":"openai","display_name":"GPT 5.4 Mini","version":"gpt-5.4-mini","description":"GPT-5.4 mini brings the strengths of GPT-5.4 to a faster, more efficient model designed for high-volume workloads.","context_length":400000,"max_completion_tokens":128000,"supported_parameters":["tools"],"thinking":{"levels":["low","medium","high","xhigh"]}}],"codex-pro":[{"id":"gpt-5.3-codex-spark","object":"model","created":1770912000,"owned_by":"openai","type":"openai","display_name":"GPT 5.3 Codex Spark","version":"gpt-5.3","description":"Ultra-fast coding model.","context_length":128000,"max_completion_tokens":128000,"supported_parameters":["tools"],"thinking":{"levels":["low","medium","high","xhigh"]}},{"id":"gpt-5.4","object":"model","created":1772668800,"owned_by":"openai","type":"openai","display_name":"GPT 5.4","version":"gpt-5.4","description":"Stable version of GPT 5.4","context_length":1050000,"max_completion_tokens":128000,"supported_parameters":["tools"],"thinking":{"levels":["low","medium","high","xhigh"]}},{"id":"gpt-5.4-mini","object":"model","created":1773705600,"owned_by":"openai","type":"openai","display_name":"GPT 5.4 Mini","version":"gpt-5.4-mini","description":"GPT-5.4 mini brings the strengths of GPT-5.4 to a faster, more efficient model designed for high-volume workloads.","context_length":400000,"max_completion_tokens":128000,"supported_parameters":["tools"],"thinking":{"levels":["low","medium","high","xhigh"]}}]}`

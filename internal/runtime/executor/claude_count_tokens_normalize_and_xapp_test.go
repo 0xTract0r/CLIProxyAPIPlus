@@ -4,7 +4,7 @@ import (
 	"net/http"
 	"testing"
 
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
 // TestApplyClaudeHeaders_NonStructuredOperatorXAppCannotLeakNonCli covers requirement ⑥:
@@ -30,7 +30,7 @@ func TestApplyClaudeHeaders_NonStructuredOperatorXAppCannotLeakNonCli(t *testing
 		t.Fatal("test setup error: auth should take the non-structured managed-header path")
 	}
 
-	applyClaudeHeaders(req, auth, "key-xapp-nonstruct", false, nil, nil)
+	applyClaudeHeaders(req, auth, "key-xapp-nonstruct", false, nil, nil, nil, nil, false)
 
 	if got := req.Header.Get("X-App"); got != "cli" {
 		t.Fatalf("X-App = %q, want %q (operator header:X-App must not leak a non-cli value)", got, "cli")
@@ -56,7 +56,7 @@ func TestApplyClaudeHeaders_NonStructuredOperatorOtherHeaderStillOverrides(t *te
 		t.Fatal("test setup error: auth should take the non-structured managed-header path")
 	}
 
-	applyClaudeHeaders(req, auth, "key-other-nonstruct", false, nil, nil)
+	applyClaudeHeaders(req, auth, "key-other-nonstruct", false, nil, nil, nil, nil, false)
 
 	if got := req.Header.Get("X-Stainless-Timeout"); got != "123" {
 		t.Fatalf("X-Stainless-Timeout = %q, want %q (operator override must still apply)", got, "123")

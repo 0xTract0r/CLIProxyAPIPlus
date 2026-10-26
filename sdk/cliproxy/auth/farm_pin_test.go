@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 )
 
 // TestResolveFarmPinAuthID covers resolving a farm pin value (auth ID or account

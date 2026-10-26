@@ -17,8 +17,10 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - name: Download test dependencies
+        run: GOTOOLCHAIN=auto go mod download
       - name: Test
-        run: GOTOOLCHAIN=auto go test -timeout 600s ./...
+        run: bash scripts/ci/run-loopback-only.sh env GOPROXY=off GOTOOLCHAIN=local go test -timeout 600s ./...
       # IMPORTANT: keep "Refresh models catalog" AFTER "Test". This step rewrites the
       # committed model catalog on disk; registry tests assert the committed catalog
       # state, so running it before "Test" mutates the catalog and turns those

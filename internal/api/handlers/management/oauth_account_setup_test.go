@@ -12,8 +12,8 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -459,5 +459,24 @@ func TestOAuthStartResponseIncludesCountdown(t *testing.T) {
 	}
 	if _, err := json.Marshal(payload); err != nil {
 		t.Fatalf("response should be JSON serializable: %v", err)
+	}
+}
+
+func TestConfigForOAuthSetupPreservesAccountProxyAcrossConfigSnapshots(t *testing.T) {
+	cfg := &config.Config{AuthDir: "old-auth-dir", SDKConfig: config.SDKConfig{ProxyURL: "http://global.invalid:8080"}}
+	h := NewHandlerWithoutConfigFilePath(cfg, coreauth.NewManager(nil, nil, nil))
+	first := h.configForOAuthSetup(&oauthAccountSetup{ProxyURL: "http://account.invalid:8081"})
+	if first.ProxyURL != "http://account.invalid:8081" || first.AuthDir != "old-auth-dir" || cfg.ProxyURL != "http://global.invalid:8080" {
+		t.Fatal("account setup did not isolate proxy from global config")
+	}
+	h.SetConfig(&config.Config{AuthDir: "new-auth-dir", SDKConfig: config.SDKConfig{ProxyURL: "http://next-global.invalid:8082"}})
+	if first.ProxyURL != "http://account.invalid:8081" || first.AuthDir != "old-auth-dir" {
+		t.Fatal("active OAuth snapshot was changed by reload")
+	}
+	if got := h.configForOAuthSetup(nil); got.ProxyURL != "http://next-global.invalid:8082" || got.AuthDir != "new-auth-dir" {
+		t.Fatal("empty setup did not use current config")
+	}
+	if got := h.configForOAuthSetup(&oauthAccountSetup{ProxyURL: "direct"}); got.ProxyURL != "direct" || got.AuthDir != "new-auth-dir" {
+		t.Fatal("explicit account direct was not retained")
 	}
 }

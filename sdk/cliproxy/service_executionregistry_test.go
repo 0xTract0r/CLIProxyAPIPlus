@@ -17,15 +17,14 @@ import (
 	"testing"
 	"time"
 
-	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/homeplugins"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executionregistry"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
-	sdkpluginstore "github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginstore"
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/home"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/homeplugins"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executionregistry"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
+	sdkpluginstore "github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginstore"
 )
 
 type blockingServiceCooldownStore struct {
@@ -132,9 +131,11 @@ func TestServiceConcurrentReplacementWaitsForInFlightDrain(t *testing.T) {
 	}()
 	deadline := time.Now().Add(time.Second)
 	for {
-		if _, errLate := registry.BeginDispatch(); errLate != nil {
+		late, errLate := registry.BeginDispatch()
+		if errLate != nil {
 			break
 		}
+		late.End()
 		if time.Now().After(deadline) {
 			t.Fatal("first replacement did not begin draining")
 		}
@@ -648,82 +649,25 @@ func TestHomeConfigWorkerShutdownCancelsBlockedRuntimeUpdatesBeforePublish(t *te
 	}
 }
 
-func TestHomeConfigWorkerCancelsBlockedAntigravityModelRefreshBeforePublish(t *testing.T) {
-	modelRefreshStarted := make(chan struct{})
-	releaseModelRefresh := make(chan struct{})
-	var releaseModelRefreshOnce sync.Once
-	modelServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		close(modelRefreshStarted)
-		select {
-		case <-r.Context().Done():
-		case <-releaseModelRefresh:
-		}
-	}))
-	t.Cleanup(modelServer.Close)
-	t.Cleanup(func() { releaseModelRefreshOnce.Do(func() { close(releaseModelRefresh) }) })
-
-	client, _ := newHomePluginTaskTestClient(t, nil, 0)
-	baseCfg := &config.Config{}
-	baseCfg.Home.Enabled = true
+func TestHomeModelRegistrationSkipsAntigravityProbes(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { requests.Add(1); w.WriteHeader(500) }))
+	defer server.Close()
+	cfg := &config.Config{}
+	cfg.Home.Enabled = true
 	manager := coreauth.NewManager(nil, nil, nil)
-	auth := &coreauth.Auth{
-		ID:       "blocked-antigravity-refresh",
-		Provider: "antigravity",
-		Metadata: map[string]any{"access_token": "test-token"},
-		Attributes: map[string]string{
-			"base_url": modelServer.URL,
-		},
-	}
-	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
-		t.Fatal(errRegister)
+	auth := antigravityTestAuth("home-no-probe", server.URL)
+	if _, err := manager.Register(t.Context(), auth); err != nil {
+		t.Fatal(err)
 	}
 	t.Cleanup(func() { GlobalModelRegistry().UnregisterClient(auth.ID) })
-
-	parentCtx, cancelParent := context.WithCancel(context.Background())
-	t.Cleanup(cancelParent)
-	homeCtx, cancelHome := context.WithCancel(parentCtx)
-	t.Cleanup(cancelHome)
-	lifetimeCtx, cancelLifetime := context.WithCancel(homeCtx)
-	t.Cleanup(cancelLifetime)
-	service := &Service{
-		cfg:            baseCfg,
-		coreManager:    manager,
-		pluginHost:     pluginhost.New(),
-		homeGeneration: 1,
-	}
-	queue := newHomeConfigWorkQueue()
-	queue.enqueue([]byte("routing:\n  strategy: fill-first\n"))
-	ready := make(chan struct{})
-	close(ready)
-	published := atomic.Bool{}
-	cancelBound := atomic.Int64{}
-	cancelBound.Store(int64(time.Second))
-	workerDone := make(chan struct{})
-	go func() {
-		defer close(workerDone)
-		service.runHomeConfigWorker(lifetimeCtx, homeCtx, 1, client, executionregistry.New(), queue, ready, &published, &cancelBound)
-	}()
-
-	select {
-	case <-modelRefreshStarted:
-	case <-time.After(time.Second):
-		t.Fatal("Home config worker did not start Antigravity model refresh")
-	}
-	cancelLifetime()
-	select {
-	case <-workerDone:
-	case <-time.After(time.Second):
-		t.Fatal("Home config worker did not stop after model refresh cancellation")
-	}
-	if published.Load() {
-		t.Fatal("canceled model refresh published Home runtime")
-	}
-	service.homeMu.Lock()
-	publishedClient := service.homeClient
-	publishedRegistry := service.homeRegistry
-	service.homeMu.Unlock()
-	if publishedClient != nil || publishedRegistry != nil {
-		t.Fatal("canceled model refresh exposed Home runtime state")
+	service := &Service{cfg: cfg, coreManager: manager}
+	service.registerModelsForAuth(t.Context(), auth)
+	service.WaitAntigravityProbes()
+	service.refreshAntigravityModels(t.Context())
+	service.WaitAntigravityProbes()
+	if requests.Load() != 0 {
+		t.Fatal("Home mode launched standalone entitlement probe")
 	}
 }
 
@@ -1250,7 +1194,7 @@ func TestServiceExplicitReplacementCancelsRunWhenDrainTimesOut(t *testing.T) {
 	scope.End("test cleanup")
 }
 
-func TestServiceReplacesRegistryOnlyAfterNewSubscriptionAck(t *testing.T) {
+func TestServiceKeepsRegistryAcrossHeartbeatFailoverAndExposesOnlyAfterNewACK(t *testing.T) {
 	listener, errListen := net.Listen("tcp", "127.0.0.1:0")
 	if errListen != nil {
 		t.Fatalf("listen: %v", errListen)
@@ -1325,15 +1269,15 @@ func TestServiceReplacesRegistryOnlyAfterNewSubscriptionAck(t *testing.T) {
 
 	close(allowSecondAck)
 	secondRegistry := waitForServiceRegistry(t, service, time.Second)
-	if secondRegistry == firstRegistry {
-		t.Fatal("replacement subscription reused the old registry")
+	if secondRegistry != firstRegistry {
+		t.Fatal("heartbeat failover replaced the execution registry")
 	}
 	if home.Current() == nil {
 		t.Fatal("replacement client was not exposed after the replacement ACK")
 	}
 }
 
-func TestServiceDrainsBeforePreAckRetriesAndExposesOnlyAfterNewAck(t *testing.T) {
+func TestServicePreservesActiveScopeDuringPreACKFailoverRetries(t *testing.T) {
 	listener, errListen := net.Listen("tcp", "127.0.0.1:0")
 	if errListen != nil {
 		t.Fatalf("listen: %v", errListen)
@@ -1393,16 +1337,9 @@ func TestServiceDrainsBeforePreAckRetriesAndExposesOnlyAfterNewAck(t *testing.T)
 	close(loseFirst)
 	select {
 	case <-resourceClosed:
-	case <-time.After(time.Second):
-		t.Fatal("heartbeat loss did not close the active scope resource")
-	}
-	select {
-	case <-preAckAttempts:
-		t.Fatal("pre-ACK retry started before the active scope owner ended")
+		t.Fatal("heartbeat failover drained the active scope")
 	case <-time.After(50 * time.Millisecond):
 	}
-	scope.End("canceled")
-
 	firstPreAck := <-preAckAttempts
 	secondPreAck := <-preAckAttempts
 	if retryDelay := secondPreAck.Sub(firstPreAck); retryDelay < 75*time.Millisecond {
@@ -1423,12 +1360,13 @@ func TestServiceDrainsBeforePreAckRetriesAndExposesOnlyAfterNewAck(t *testing.T)
 
 	close(allowFinalAck)
 	secondRegistry := waitForServiceRegistry(t, service, time.Second)
-	if secondRegistry == firstRegistry || home.Current() == nil {
+	if secondRegistry != firstRegistry || home.Current() == nil {
 		t.Fatal("new Home lifetime was not exposed only after its subscription ACK")
 	}
+	scope.End("completed")
 }
 
-func TestServiceCancelsRunWhenBlockingScopeExceedsDrainBound(t *testing.T) {
+func TestServiceHeartbeatFailoverDoesNotDrainBlockingScope(t *testing.T) {
 	listener, errListen := net.Listen("tcp", "127.0.0.1:0")
 	if errListen != nil {
 		t.Fatalf("listen: %v", errListen)
@@ -1507,28 +1445,241 @@ func TestServiceCancelsRunWhenBlockingScopeExceedsDrainBound(t *testing.T) {
 	close(loseFirst)
 	select {
 	case <-started:
-	case <-time.After(time.Second):
-		t.Fatal("drain did not start closing the blocking scope")
+		t.Fatal("heartbeat failover started draining the blocking scope")
+	case <-time.After(50 * time.Millisecond):
 	}
 	select {
 	case <-secondSubscribe:
-		t.Fatal("new subscription started before the old registry drained")
-	case <-time.After(50 * time.Millisecond):
+	case <-time.After(time.Second):
+		t.Fatal("new subscription did not start while the old scope remained active")
 	}
 	service.homeMu.Lock()
 	exposedRegistry := service.homeRegistry
 	service.homeMu.Unlock()
 	if exposedRegistry != nil {
-		t.Fatal("new registry was exposed before the old registry drained")
+		t.Fatal("registry was exposed before the replacement ACK")
+	}
+	close(allowSecondAck)
+	if nextRegistry := waitForServiceRegistry(t, service, time.Second); nextRegistry != registry {
+		t.Fatal("heartbeat failover replaced the registry containing the active scope")
 	}
 	select {
 	case <-serviceCtx.Done():
-	case <-time.After(time.Second):
-		t.Fatal("service run was not canceled after drain timeout")
+		t.Fatal("heartbeat failover canceled the service run")
+	case <-time.After(50 * time.Millisecond):
 	}
 
 	close(release)
 	scope.End("test cleanup")
+}
+
+func TestServiceShutdownDrainsDetachedRegistryDuringRetry(t *testing.T) {
+	listener, errListen := net.Listen("tcp", "127.0.0.1:0")
+	if errListen != nil {
+		t.Fatalf("listen: %v", errListen)
+	}
+	firstAck := make(chan struct{})
+	loseFirst := make(chan struct{})
+	secondSubscribe := make(chan struct{})
+	var secondSubscribeOnce sync.Once
+	allowSecondAck := make(chan struct{})
+	stop := make(chan struct{})
+	var subscriptionMu sync.Mutex
+	subscriptions := 0
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		for {
+			conn, errAccept := listener.Accept()
+			if errAccept != nil {
+				return
+			}
+			go serveRegistryTestHomeConnection(conn, &subscriptionMu, &subscriptions, firstAck, loseFirst, secondSubscribe, &secondSubscribeOnce, allowSecondAck, stop)
+		}
+	}()
+	t.Cleanup(func() {
+		close(stop)
+		_ = listener.Close()
+		<-serverDone
+		home.ClearCurrent()
+	})
+
+	service := newRegistryTestService(t, listener)
+	serviceCtx, cancelService := context.WithCancel(context.Background())
+	t.Cleanup(cancelService)
+	service.homeMu.Lock()
+	service.runCancel = cancelService
+	service.homeMu.Unlock()
+	service.startHomeSubscriber(serviceCtx)
+
+	select {
+	case <-firstAck:
+	case <-time.After(time.Second):
+		t.Fatal("first subscription was not acknowledged")
+	}
+	registry := waitForServiceRegistry(t, service, time.Second)
+	pendingRetry, errBegin := registry.BeginDispatch()
+	if errBegin != nil {
+		t.Fatal(errBegin)
+	}
+	pendingScope, errBegin := registry.BeginDispatch()
+	if errBegin != nil {
+		t.Fatal(errBegin)
+	}
+	scope, errInstall := registry.Install(pendingScope, executionregistry.ScopeSpec{})
+	if errInstall != nil {
+		t.Fatal(errInstall)
+	}
+	resourceClosed := make(chan struct{})
+	if errBind := scope.Bind(func() error {
+		close(resourceClosed)
+		go scope.End("shutdown")
+		return nil
+	}); errBind != nil {
+		t.Fatal(errBind)
+	}
+	t.Cleanup(func() {
+		pendingRetry.End()
+		scope.End("test cleanup")
+	})
+
+	service.homeMu.Lock()
+	client := service.homeClient
+	service.homeMu.Unlock()
+	if client == nil {
+		t.Fatal("ready Home client is unavailable")
+	}
+	close(loseFirst)
+	deadline := time.After(time.Second)
+	for {
+		errRelease := client.PushConcurrencyRelease(context.Background(), home.ConcurrencyReleaseFrame{CredentialID: "cred-a", Model: "model-a", ReleaseSeq: 1})
+		if errors.Is(errRelease, home.ErrDispatchFenced) {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("subscriber retry did not close the previous Home client")
+		case <-time.After(time.Millisecond):
+		}
+	}
+
+	shutdownDone := make(chan error, 1)
+	go func() {
+		shutdownDone <- service.Shutdown(context.Background())
+	}()
+	pendingRetry.End()
+
+	select {
+	case <-resourceClosed:
+	case <-time.After(time.Second):
+		t.Fatal("shutdown did not drain the detached execution registry")
+	}
+	select {
+	case errShutdown := <-shutdownDone:
+		if errShutdown != nil {
+			t.Fatalf("Shutdown() error = %v", errShutdown)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Shutdown() did not complete after draining the detached registry")
+	}
+}
+
+func TestServiceAmbiguousDispatchDrainsRegistryBeforeRetry(t *testing.T) {
+	listener, errListen := net.Listen("tcp", "127.0.0.1:0")
+	if errListen != nil {
+		t.Fatalf("listen: %v", errListen)
+	}
+	firstAck := make(chan struct{})
+	loseFirst := make(chan struct{})
+	secondSubscribe := make(chan struct{})
+	var secondSubscribeOnce sync.Once
+	allowSecondAck := make(chan struct{})
+	stop := make(chan struct{})
+	var subscriptionMu sync.Mutex
+	subscriptions := 0
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		for {
+			conn, errAccept := listener.Accept()
+			if errAccept != nil {
+				return
+			}
+			go serveRegistryTestHomeConnection(conn, &subscriptionMu, &subscriptions, firstAck, loseFirst, secondSubscribe, &secondSubscribeOnce, allowSecondAck, stop)
+		}
+	}()
+	t.Cleanup(func() {
+		close(stop)
+		_ = listener.Close()
+		<-serverDone
+		home.ClearCurrent()
+	})
+
+	service := newRegistryTestService(t, listener)
+	serviceCtx, cancelService := context.WithCancel(context.Background())
+	t.Cleanup(cancelService)
+	service.homeMu.Lock()
+	service.runCancel = cancelService
+	service.homeMu.Unlock()
+	service.startHomeSubscriber(serviceCtx)
+
+	select {
+	case <-firstAck:
+	case <-time.After(time.Second):
+		t.Fatal("first subscription was not acknowledged")
+	}
+	registry := waitForServiceRegistry(t, service, time.Second)
+	pending, errBegin := registry.BeginDispatch()
+	if errBegin != nil {
+		t.Fatal(errBegin)
+	}
+	scope, errInstall := registry.Install(pending, executionregistry.ScopeSpec{})
+	if errInstall != nil {
+		t.Fatal(errInstall)
+	}
+	resourceClosed := make(chan struct{})
+	if errBind := scope.Bind(func() error {
+		close(resourceClosed)
+		go scope.End("ambiguous dispatch")
+		return nil
+	}); errBind != nil {
+		t.Fatal(errBind)
+	}
+
+	service.homeMu.Lock()
+	client := service.homeClient
+	service.homeMu.Unlock()
+	if client == nil {
+		t.Fatal("ready Home client is unavailable")
+	}
+	client.AbortAmbiguousDispatch()
+	select {
+	case <-resourceClosed:
+	case <-time.After(time.Second):
+		t.Fatal("ambiguous dispatch did not drain the active registry")
+	}
+	select {
+	case <-secondSubscribe:
+	case <-time.After(time.Second):
+		t.Fatal("subscriber did not retry after ambiguous dispatch drain")
+	}
+	service.homeMu.Lock()
+	exposedRegistry := service.homeRegistry
+	service.homeMu.Unlock()
+	if exposedRegistry != nil {
+		t.Fatal("replacement registry was exposed before its subscription ACK")
+	}
+
+	close(allowSecondAck)
+	nextRegistry := waitForServiceRegistry(t, service, time.Second)
+	if nextRegistry == registry {
+		t.Fatal("ambiguous dispatch reused the drained execution registry")
+	}
+	select {
+	case <-serviceCtx.Done():
+		t.Fatal("successful ambiguous dispatch recovery canceled the service run")
+	case <-time.After(50 * time.Millisecond):
+	}
 }
 
 func TestServiceBacksOffAfterRepeatedPreAckFailures(t *testing.T) {
@@ -1585,7 +1736,7 @@ func TestServiceBacksOffAfterRepeatedPreAckFailures(t *testing.T) {
 	}
 }
 
-func TestServiceHeartbeatLossCancelsBlockedConfigFinalizationBeforeDrain(t *testing.T) {
+func TestServiceHeartbeatLossCancelsBlockedConfigFinalizationWithoutDrainingRegistry(t *testing.T) {
 	listener, errListen := net.Listen("tcp", "127.0.0.1:0")
 	if errListen != nil {
 		t.Fatalf("listen: %v", errListen)
@@ -1648,8 +1799,8 @@ func TestServiceHeartbeatLossCancelsBlockedConfigFinalizationBeforeDrain(t *test
 	}
 	select {
 	case <-resourceClosed:
-	case <-time.After(500 * time.Millisecond):
-		t.Fatal("heartbeat loss did not cancel the worker and drain the active execution")
+		t.Fatal("heartbeat loss drained the active execution")
+	case <-time.After(200 * time.Millisecond):
 	}
 	select {
 	case <-secondConfig:
@@ -1663,6 +1814,7 @@ func TestServiceHeartbeatLossCancelsBlockedConfigFinalizationBeforeDrain(t *test
 	if currentRegistry != nil || currentClient != nil || home.Current() != nil {
 		t.Fatal("heartbeat-lost lifetime left a published Home client or registry")
 	}
+	scope.End("completed")
 }
 
 func TestServiceConfigWorkerFinalizesRapidUpdatesInOrder(t *testing.T) {
@@ -2704,6 +2856,113 @@ func TestServiceApplyConfigRuntimePreservesSelectorForUnchangedRouting(t *testin
 	}
 	if got := manager.Selector(); got != changedSelector {
 		t.Fatalf("unrelated-update selector = %p, want changed selector %p", got, changedSelector)
+	}
+}
+
+func TestServiceApplyConfigRuntimeSessionAffinitySubagentsChangeRecreatesSelector(t *testing.T) {
+	manager := coreauth.NewManager(nil, &coreauth.RoundRobinSelector{}, nil)
+	service := &Service{cfg: &config.Config{}, coreManager: manager}
+
+	subagentsEnabled := true
+	initial := service.commitConfigUpdate(&config.Config{Routing: internalconfig.RoutingConfig{
+		Strategy:                 "round-robin",
+		SessionAffinity:          true,
+		SessionAffinityTTL:       "1h",
+		SessionAffinitySubagents: &subagentsEnabled,
+	}})
+	if !service.applyConfigRuntime(context.Background(), initial, false) {
+		t.Fatal("initial config runtime apply failed")
+	}
+	initialSelector := manager.Selector()
+
+	subagentsDisabled := false
+	changed := service.commitConfigUpdate(&config.Config{Routing: internalconfig.RoutingConfig{
+		Strategy:                 "round-robin",
+		SessionAffinity:          true,
+		SessionAffinityTTL:       "1h",
+		SessionAffinitySubagents: &subagentsDisabled,
+	}})
+	if !service.applyConfigRuntime(context.Background(), changed, false) {
+		t.Fatal("changed config runtime apply failed")
+	}
+	changedSelector := manager.Selector()
+	if changedSelector == initialSelector {
+		t.Fatal("changing SessionAffinitySubagents should recreate selector")
+	}
+}
+
+func TestServiceApplyConfigRuntimeSessionAffinityDisabledSubagentsChangeIsNoOp(t *testing.T) {
+	manager := coreauth.NewManager(nil, &coreauth.RoundRobinSelector{}, nil)
+	service := &Service{cfg: &config.Config{}, coreManager: manager}
+
+	subagentsEnabled := true
+	initial := service.commitConfigUpdate(&config.Config{Routing: internalconfig.RoutingConfig{
+		Strategy:                 "round-robin",
+		SessionAffinity:          false,
+		SessionAffinityTTL:       "1h",
+		SessionAffinitySubagents: &subagentsEnabled,
+	}})
+	if !service.applyConfigRuntime(context.Background(), initial, false) {
+		t.Fatal("initial config runtime apply failed")
+	}
+	initialSelector := manager.Selector()
+
+	subagentsDisabled := false
+	changed := service.commitConfigUpdate(&config.Config{Routing: internalconfig.RoutingConfig{
+		Strategy:                 "round-robin",
+		SessionAffinity:          false,
+		SessionAffinityTTL:       "1h",
+		SessionAffinitySubagents: &subagentsDisabled,
+	}})
+	if !service.applyConfigRuntime(context.Background(), changed, false) {
+		t.Fatal("changed config runtime apply failed")
+	}
+	changedSelector := manager.Selector()
+	if changedSelector != initialSelector {
+		t.Fatal("toggling SessionAffinitySubagents when SessionAffinity is false must be a no-op")
+	}
+}
+
+func TestServiceApplyConfigRuntimeSessionAffinityRebindOnChangeRecreatesSelector(t *testing.T) {
+	manager := coreauth.NewManager(nil, &coreauth.RoundRobinSelector{}, nil)
+	service := &Service{cfg: &config.Config{}, coreManager: manager}
+
+	initial := service.commitConfigUpdate(&config.Config{Routing: internalconfig.RoutingConfig{
+		Strategy:                "round-robin",
+		SessionAffinity:         true,
+		SessionAffinityTTL:      "1h",
+		SessionAffinityRebindOn: "any",
+	}})
+	if !service.applyConfigRuntime(context.Background(), initial, false) {
+		t.Fatal("initial config runtime apply failed")
+	}
+	initialSelector := manager.Selector()
+
+	same := service.commitConfigUpdate(&config.Config{Routing: internalconfig.RoutingConfig{
+		Strategy:                "round-robin",
+		SessionAffinity:         true,
+		SessionAffinityTTL:      "1h",
+		SessionAffinityRebindOn: "",
+	}})
+	if !service.applyConfigRuntime(context.Background(), same, false) {
+		t.Fatal("same config runtime apply failed")
+	}
+	if manager.Selector() != initialSelector {
+		t.Fatal("equivalent default SessionAffinityRebindOn should preserve selector")
+	}
+
+	changed := service.commitConfigUpdate(&config.Config{Routing: internalconfig.RoutingConfig{
+		Strategy:                "round-robin",
+		SessionAffinity:         true,
+		SessionAffinityTTL:      "1h",
+		SessionAffinityRebindOn: "quota",
+	}})
+	if !service.applyConfigRuntime(context.Background(), changed, false) {
+		t.Fatal("changed config runtime apply failed")
+	}
+	changedSelector := manager.Selector()
+	if changedSelector == initialSelector {
+		t.Fatal("changing SessionAffinityRebindOn should recreate selector")
 	}
 }
 

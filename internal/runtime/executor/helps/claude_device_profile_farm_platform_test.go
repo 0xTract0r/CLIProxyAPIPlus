@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
 // validFarmClaudeDeviceID is a well-formed 64-hex claude_device_id override,
@@ -169,12 +169,60 @@ func TestResolveClaudeDeviceProfile_FarmBoundVersionRaiseKeepsLinux(t *testing.T
 // the CI host GOOS/GOARCH.
 func TestApplyClaudeLegacyDeviceHeaders_FarmAgnostic(t *testing.T) {
 	r := httptest.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", nil)
-	ApplyClaudeLegacyDeviceHeaders(r, nil, &config.Config{})
+	ApplyClaudeLegacyDeviceHeaders(r, nil, &config.Config{}, false)
 
 	if got, want := r.Header.Get("X-Stainless-Os"), MapStainlessOS(); got != want {
 		t.Fatalf("legacy X-Stainless-Os = %q, want runtime-derived %q (must ignore farm binding)", got, want)
 	}
 	if got, want := r.Header.Get("X-Stainless-Arch"), MapStainlessArch(); got != want {
 		t.Fatalf("legacy X-Stainless-Arch = %q, want runtime-derived %q", got, want)
+	}
+}
+
+func TestApplyClaudeLegacyDeviceHeadersPlatformPrecedenceWithStabilizationDisabled(t *testing.T) {
+	ResetClaudeDeviceProfileCache()
+	t.Cleanup(ResetClaudeDeviceProfileCache)
+	disabled := false
+	cfg := &config.Config{ClaudeHeaderDefaults: config.ClaudeHeaderDefaults{
+		StabilizeDeviceProfile: &disabled, OS: "Windows", Arch: "x86",
+		UserAgent: "claude-cli/2.2.0 (external, cli)", PackageVersion: "0.95.0", RuntimeVersion: "v26.4.0",
+	}}
+	baseline := defaultClaudeDeviceProfile(cfg)
+	for _, mode := range []struct {
+		name               string
+		confirmed, validUA bool
+	}{
+		{"unconfirmed", false, false}, {"confirmed", true, true}, {"confirmed-invalid-software", true, false},
+	} {
+		for _, platform := range []string{"existing", "incoming", "runtime"} {
+			t.Run(mode.name+"/"+platform, func(t *testing.T) {
+				r := httptest.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", nil)
+				incoming := http.Header{"User-Agent": {"third-party/1.0"}, "X-Stainless-Runtime-Version": {"v999.0.0"}, "X-Stainless-Package-Version": {"999.0.0"}}
+				if mode.validUA {
+					incoming.Set("User-Agent", baseline.UserAgent)
+				}
+				wantOS, wantArch := MapStainlessOS(), MapStainlessArch()
+				if platform == "incoming" || platform == "existing" {
+					incoming.Set("X-Stainless-Os", "Windows")
+					incoming.Set("X-Stainless-Arch", "x64")
+					wantOS, wantArch = "Windows", "x64"
+				}
+				if platform == "existing" {
+					r.Header.Set("X-Stainless-Os", "FreeBSD")
+					r.Header.Set("X-Stainless-Arch", "x86")
+					wantOS, wantArch = "FreeBSD", "x86"
+				}
+				ApplyClaudeLegacyDeviceHeaders(r, incoming, cfg, mode.confirmed)
+				if got := r.Header.Get("X-Stainless-Os"); got != wantOS {
+					t.Fatalf("legacy OS = %q, want %q", got, wantOS)
+				}
+				if got := r.Header.Get("X-Stainless-Arch"); got != wantArch {
+					t.Fatalf("legacy arch = %q, want %q", got, wantArch)
+				}
+				if r.Header.Get("User-Agent") != baseline.UserAgent || r.Header.Get("X-Stainless-Package-Version") != baseline.PackageVersion || r.Header.Get("X-Stainless-Runtime-Version") != baseline.RuntimeVersion {
+					t.Fatal("platform preservation bypassed software profile sanitization")
+				}
+			})
+		}
 	}
 }

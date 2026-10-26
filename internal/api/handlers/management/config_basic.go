@@ -11,10 +11,10 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
-	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/proxyutil"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
+	sdkconfig "github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/proxyutil"
 	log "github.com/sirupsen/logrus"
 	"gopkg.in/yaml.v3"
 )
@@ -37,6 +37,14 @@ type releaseInfo struct {
 	Name    string `json:"name"`
 }
 
+func setLatestReleaseRequestHeaders(req *http.Request) {
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("User-Agent", latestReleaseUserAgent)
+	if token := util.ResolveGitHubToken(); token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+}
+
 // GetLatestVersion returns the latest release version from GitHub without downloading assets.
 func (h *Handler) GetLatestVersion(c *gin.Context) {
 	client := &http.Client{Timeout: 10 * time.Second}
@@ -54,8 +62,7 @@ func (h *Handler) GetLatestVersion(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "request_create_failed", "message": err.Error()})
 		return
 	}
-	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("User-Agent", latestReleaseUserAgent)
+	setLatestReleaseRequestHeaders(req)
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -93,6 +100,17 @@ func (h *Handler) GetLatestVersion(c *gin.Context) {
 }
 
 func WriteConfig(path string, data []byte) error {
+	var doc yaml.Node
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		return err
+	}
+	if len(doc.Content) > 0 && config.IsV8ConfigLayout(doc.Content[0]) {
+		var err error
+		data, _, err = config.NormalizeConfigLayout(data, true)
+		if err != nil {
+			return err
+		}
+	}
 	data = config.NormalizeCommentIndentation(data)
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {
@@ -218,8 +236,10 @@ func (h *Handler) PutLogsMaxTotalSizeMB(c *gin.Context) {
 	if value < 0 {
 		value = 0
 	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	h.cfg.LogsMaxTotalSizeMB = value
-	h.persist(c)
+	h.persistLocked(c)
 }
 
 // LogsCompressAfterDays
@@ -238,8 +258,10 @@ func (h *Handler) PutLogsCompressAfterDays(c *gin.Context) {
 	if value < 0 {
 		value = config.DefaultLogsCompressAfterDays
 	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	h.cfg.LogsCompressAfterDays = value
-	h.persist(c)
+	h.persistLocked(c)
 }
 
 // LogsDeleteAfterDays
@@ -258,8 +280,10 @@ func (h *Handler) PutLogsDeleteAfterDays(c *gin.Context) {
 	if value < 0 {
 		value = config.DefaultLogsDeleteAfterDays
 	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	h.cfg.LogsDeleteAfterDays = value
-	h.persist(c)
+	h.persistLocked(c)
 }
 
 // ErrorLogsMaxFiles
@@ -278,8 +302,10 @@ func (h *Handler) PutErrorLogsMaxFiles(c *gin.Context) {
 	if value < 0 {
 		value = 10
 	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	h.cfg.ErrorLogsMaxFiles = value
-	h.persist(c)
+	h.persistLocked(c)
 }
 
 // Request log
@@ -302,6 +328,14 @@ func (h *Handler) GetRequestRetry(c *gin.Context) {
 }
 func (h *Handler) PutRequestRetry(c *gin.Context) {
 	h.updateIntField(c, func(v int) { h.cfg.RequestRetry = v })
+}
+
+// Max retry credentials
+func (h *Handler) GetMaxRetryCredentials(c *gin.Context) {
+	c.JSON(200, gin.H{"max-retry-credentials": h.cfg.MaxRetryCredentials})
+}
+func (h *Handler) PutMaxRetryCredentials(c *gin.Context) {
+	h.updateIntField(c, func(v int) { h.cfg.MaxRetryCredentials = v })
 }
 
 // Max retry interval
@@ -342,6 +376,8 @@ func normalizeRoutingStrategy(strategy string) (string, bool) {
 	switch normalized {
 	case "", "round-robin", "roundrobin", "rr":
 		return "round-robin", true
+	case "weighted-round-robin", "weightedroundrobin", "wrr":
+		return "weighted-round-robin", true
 	case "fill-first", "fillfirst", "ff":
 		return "fill-first", true
 	case config.RoutingStrategyAdaptive:
@@ -380,8 +416,10 @@ func (h *Handler) PutRoutingStrategy(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid strategy"})
 		return
 	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	h.cfg.Routing.Strategy = normalized
-	h.persist(c)
+	h.persistLocked(c)
 }
 
 // Proxy URL
@@ -405,10 +443,14 @@ func (h *Handler) PutProxyURL(c *gin.Context) {
 			return
 		}
 	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	h.cfg.ProxyURL = proxyURL
-	h.persist(c)
+	h.persistLocked(c)
 }
 func (h *Handler) DeleteProxyURL(c *gin.Context) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	h.cfg.ProxyURL = ""
-	h.persist(c)
+	h.persistLocked(c)
 }

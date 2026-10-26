@@ -16,11 +16,17 @@ func ParseConfigBytes(data []byte) (*Config, error) {
 		return nil, fmt.Errorf("config payload is empty")
 	}
 
+	if errValidate := validateCredentialWeightYAML(data); errValidate != nil {
+		return nil, errValidate
+	}
+
 	var cfg Config
 	// Keep defaults aligned with LoadConfigOptional.
 	cfg.Host = "" // Default empty: binds to all interfaces (IPv4 + IPv6)
 	cfg.LoggingToFile = false
 	cfg.LogsMaxTotalSizeMB = 0
+	cfg.LogsCompressAfterDays = DefaultLogsCompressAfterDays
+	cfg.LogsDeleteAfterDays = DefaultLogsDeleteAfterDays
 	cfg.LoggingDisplayTimezoneOffsetHours = DefaultLoggingDisplayTimezoneOffsetHours
 	cfg.ErrorLogsMaxFiles = 10
 	cfg.UsageStatisticsEnabled = false
@@ -36,6 +42,9 @@ func ParseConfigBytes(data []byte) (*Config, error) {
 	// defaults-block rewrite silently dropped during the merge. Default false: API key
 	// auth is sufficient, so the Amp management surface is not locked to localhost.
 	cfg.AmpCode.RestrictManagementToLocalhost = false
+	cfg.Discovery.Enabled = false
+	cfg.Discovery.ServiceType = DefaultDiscoveryServiceType
+	cfg.Discovery.Subtypes = []string{"_chat-completions", "_responses", "_messages", "_generate-content", "_interactions"}
 	cfg.RemoteManagement.PanelGitHubRepository = DefaultPanelGitHubRepository
 	cfg.CredentialInFlight = DefaultCredentialInFlightConfig()
 	// fork(add-adaptive-account-scheduling): keep aligned with LoadConfigOptional.
@@ -44,6 +53,9 @@ func ParseConfigBytes(data []byte) (*Config, error) {
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("parse config payload: %w", err)
 	}
+	if errValidate := validateTrustedProxies(cfg.TrustedProxies); errValidate != nil {
+		return nil, errValidate
+	}
 
 	cfg.CredentialConcurrency = cfg.CredentialConcurrency.WithDefaults()
 	if errValidate := cfg.CredentialInFlight.Validate(); errValidate != nil {
@@ -51,6 +63,18 @@ func ParseConfigBytes(data []byte) (*Config, error) {
 	}
 	if errValidate := cfg.AccountScheduling.Validate(); errValidate != nil {
 		return nil, errValidate
+	}
+	if errValidate := cfg.ValidateCredentialWeights(); errValidate != nil {
+		return nil, errValidate
+	}
+	if errValidate := cfg.Codex.LiveMediaRelay.Validate(); errValidate != nil {
+		return nil, errValidate
+	}
+	if cfg.Discovery.ServiceType == "" {
+		cfg.Discovery.ServiceType = DefaultDiscoveryServiceType
+	}
+	if len(cfg.Discovery.Subtypes) == 0 {
+		cfg.Discovery.Subtypes = []string{"_chat-completions", "_responses", "_messages", "_generate-content", "_interactions"}
 	}
 
 	// Hash remote management key if plaintext is detected (nested), but do NOT persist.
@@ -74,6 +98,14 @@ func ParseConfigBytes(data []byte) (*Config, error) {
 
 	if cfg.LogsMaxTotalSizeMB < 0 {
 		cfg.LogsMaxTotalSizeMB = 0
+	}
+
+	// 与文件加载一致：负值回默认，显式0保留关闭语义。
+	if cfg.LogsCompressAfterDays < 0 {
+		cfg.LogsCompressAfterDays = DefaultLogsCompressAfterDays
+	}
+	if cfg.LogsDeleteAfterDays < 0 {
+		cfg.LogsDeleteAfterDays = DefaultLogsDeleteAfterDays
 	}
 
 	if cfg.ErrorLogsMaxFiles < 0 {
@@ -100,6 +132,7 @@ func ParseConfigBytes(data []byte) (*Config, error) {
 	// that call. Only SetRetryConfig maps 0/negative to their runtime meaning.
 
 	cfg.NormalizePluginsConfig()
+	cfg.NormalizeClaudeConfig()
 	if errResolvePluginsDir := cfg.ResolvePluginsDir(); errResolvePluginsDir != nil && cfg.Plugins.Enabled {
 		return nil, errResolvePluginsDir
 	}
@@ -110,6 +143,7 @@ func ParseConfigBytes(data []byte) (*Config, error) {
 	cfg.SanitizeVertexCompatKeys()
 	cfg.SanitizeCodexKeys()
 	cfg.SanitizeXAIKeys()
+	cfg.SanitizeMetaKeys()
 	cfg.SanitizeCodexHeaderDefaults()
 	cfg.SanitizeClaudeHeaderDefaults()
 	// fork(anticorr): mirror LoadConfigOptional's Claude/managed-header/quota
@@ -123,6 +157,8 @@ func ParseConfigBytes(data []byte) (*Config, error) {
 	cfg.SanitizeOpenAICompatibility()
 	cfg.OAuthExcludedModels = NormalizeOAuthExcludedModels(cfg.OAuthExcludedModels)
 	cfg.SanitizeOAuthModelAlias()
+	cfg.SanitizeOAuthSettings()
+	cfg.SanitizeOAuthRequestScopedErrors()
 	cfg.SanitizePayloadRules()
 
 	return &cfg, nil

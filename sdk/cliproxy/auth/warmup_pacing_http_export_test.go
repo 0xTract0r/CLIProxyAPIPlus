@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 )
 
 // CheckWarmupPacingHTTPPoolReselect is exported only in the test build so the
@@ -51,7 +51,7 @@ func CheckWarmupPacingHTTPPoolReselect(t *testing.T, begin func(context.Context,
 		*now = now.Add(21 * time.Second)
 		return nil, firstErr
 	}
-	_, err := m.executeStreamWithModelPool(ctx, e, a, "claude", cliproxyexecutor.Request{Model: model, Payload: opts.OriginalRequest}, opts, model, "", []string{"up-a", "up-b"}, true, OAuthModelAliasResult{}, true, false)
+	_, err := m.executeStreamWithModelPool(ctx, e, a, "claude", cliproxyexecutor.Request{Model: model, Payload: opts.OriginalRequest}, opts, model, "", []string{"up-a", "up-b"}, true, OAuthModelAliasResult{}, nil, true, false)
 	var local *warmupAdmissionReselect
 	if !markedChanged || !errors.As(err, &local) || local.previous != firstErr || len(models) != 2 || models[1] != "up-b" {
 		t.Fatalf("real helper wrapper lost pool continuation: marked=%v models=%v err=%v", markedChanged, models, err)

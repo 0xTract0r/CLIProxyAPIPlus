@@ -1,5 +1,7 @@
 package codex
 
+import "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/codex/credential"
+
 // PKCECodes holds the verification codes for the OAuth2 PKCE (Proof Key for Code Exchange) flow.
 // PKCE is an extension to the Authorization Code flow to prevent CSRF and authorization code injection attacks.
 type PKCECodes struct {
@@ -25,7 +27,12 @@ type CodexTokenData struct {
 	Email string `json:"email"`
 	// Expire is the timestamp of the token expire
 	Expire string `json:"expired"`
+	// PlanType is the subscription plan type (e.g. "free", "plus", "pro", "team")
+	PlanType string `json:"plan_type,omitempty"`
 }
+
+// CodexSIWCTokenData remains source-compatible with the shared credential state.
+type CodexSIWCTokenData = credential.CodexSIWCTokenData
 
 // CodexAuthBundle aggregates all authentication-related data after the OAuth flow is complete.
 // This includes the API key, token data, and the timestamp of the last refresh.

@@ -10,11 +10,12 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
-	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 // cchBillingPattern 抽取 billing-header 里的 5 位 cch 占位。
@@ -79,7 +80,7 @@ func TestClaudeExecutorCountTokens_OAuthSignsCCHWithXXHash64(t *testing.T) {
 	// 用 messages 路径完全相同的签名器复算：证明 count_tokens 走的就是 xxHash64 算法。
 	// signAnthropicMessagesBody 对已签名 body 是幂等的（先归一 cch=00000 再 xxHash64），
 	// 因此若 count_tokens 的 cch 已经是 xxHash64 签名值，复算结果必然相等。
-	wantBody := signAnthropicMessagesBody(seenBody)
+	wantBody := mustSignClaudeMessagesForIntegration(t, seenBody)
 	wantCCH := cchFromBody(t, wantBody)
 	if actualCCH != wantCCH {
 		t.Fatalf("count_tokens cch = %q, want xxHash64-signed %q (algorithm mismatch with messages)\nbody: %s",
@@ -125,7 +126,7 @@ func TestClaudeExecutorCountTokens_SameBodyYieldsSameCCHAsMessages(t *testing.T)
 	countTokensCCH := cchFromBody(t, seenBody)
 
 	// messages 路径对同一 body 的签名结果。
-	messagesSigned := signAnthropicMessagesBody(seenBody)
+	messagesSigned := mustSignClaudeMessagesForIntegration(t, seenBody)
 	messagesCCH := cchFromBody(t, messagesSigned)
 
 	if countTokensCCH != messagesCCH {
@@ -135,7 +136,7 @@ func TestClaudeExecutorCountTokens_SameBodyYieldsSameCCHAsMessages(t *testing.T)
 
 	// 二次回填应是幂等的（已签名 body 再签一次 cch 不变），佐证 count_tokens 已是
 	// 与 messages 等价的最终签名态。
-	if reSigned := cchFromBody(t, signAnthropicMessagesBody(messagesSigned)); reSigned != messagesCCH {
+	if reSigned := cchFromBody(t, mustSignClaudeMessagesForIntegration(t, messagesSigned)); reSigned != messagesCCH {
 		t.Fatalf("signing is not idempotent: %q -> %q", messagesCCH, reSigned)
 	}
 }
@@ -179,8 +180,115 @@ func TestClaudeExecutorCountTokens_NonOAuthKeepsSha256(t *testing.T) {
 	actualCCH := cchFromBody(t, seenBody)
 	// 若签名器对该 body 运行会得到不同的 cch，则证明实际外发的不是 xxHash64 签名值，
 	// 即 count_tokens 在纯 API key 下没有进入签名路径，cch 维持 sha256 旧行为。
-	signedCCH := cchFromBody(t, signAnthropicMessagesBody(seenBody))
+	signedCCH := cchFromBody(t, mustSignClaudeMessagesForIntegration(t, seenBody))
 	if actualCCH == signedCCH {
 		t.Fatalf("non-OAuth count_tokens cch = %q equals xxHash64-signed value; signing must not run for plain API key", actualCCH)
 	}
+}
+
+// 显式 local Count 后的 Messages 签名守护，独立于远程 Count oracle。
+func TestClaudeExecutorLocalCountThenMessages_OAuthSignsCCHWithXXHash64(t *testing.T) {
+	body := captureClaudeGatewayAfterLocalCount(t, true, false)
+	if got, want := cchFromBody(t, body), recomputeExpectedCCH(t, body); got != want || got == "00000" {
+		t.Fatalf("gateway Messages CCH=%s want legacy final-byte hash %s", got, want)
+	}
+}
+
+// Same-body signature stability belongs to Messages, the endpoint that still
+// sends CCH. Custom Count must also retain caller guidance in its estimate.
+func TestClaudeExecutorLocalCountThenMessages_SameBodyStableCCH(t *testing.T) {
+	body := captureClaudeGatewayAfterLocalCount(t, true, true)
+	signed := mustSignClaudeMessagesForIntegration(t, body)
+	if !bytes.Equal(body, signed) || !bytes.Equal(signed, mustSignClaudeMessagesForIntegration(t, signed)) {
+		t.Fatal("Messages same-body signature changed on repeat signing")
+	}
+	changed, err := sjson.SetBytes(body, "messages.0.content.0.text", "changed final request")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cchFromBody(t, mustSignClaudeMessagesForIntegration(t, changed)) == cchFromBody(t, body) {
+		t.Fatal("legacy Messages signature ignored changed final request bytes")
+	}
+}
+
+// Preserve the API-key guard against OAuth signing. The upstream gateway gate
+// omits CCH; this explicitly replaces the old SHA256 shape rather than claiming
+// that an absent CCH retains SHA256.
+func TestClaudeExecutorLocalCountThenMessages_NonOAuthRemainsUnsigned(t *testing.T) {
+	body := captureClaudeGatewayAfterLocalCount(t, false, false)
+	if bytes.Contains(body, []byte("cch=")) {
+		t.Fatalf("ordinary API-key gateway gained CCH: %s", body)
+	}
+	if !bytes.Equal(body, mustSignClaudeMessagesForIntegration(t, body)) {
+		t.Fatal("unsigned API-key request unexpectedly entered CCH signing")
+	}
+}
+
+func captureClaudeGatewayAfterLocalCount(t *testing.T, oauth, expandedSystem bool) []byte {
+	t.Helper()
+	resetClaudeDeviceProfileCache()
+	captured := make(chan []byte, 4)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/messages" {
+			t.Errorf("custom gateway count must remain local; got %s", r.URL.Path)
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		captured <- bytes.Clone(body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"msg-local","type":"message","role":"assistant","model":"claude-opus-5","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1,"output_tokens":1},"stop_reason":"end_turn"}`)
+	}))
+	defer server.Close()
+	key := "synthetic-gateway-key"
+	if oauth {
+		key = "sk-ant-oat-synthetic-gateway"
+	}
+	auth := &cliproxyauth.Auth{ID: t.Name(), Provider: "claude", ProxyURL: "direct", Attributes: map[string]string{"api_key": key, "base_url": server.URL}, Metadata: claudeOAuthTestMetadata()}
+	cfg := &config.Config{}
+	cfg.Claude.LocalTokenCount = true
+	e := NewClaudeExecutor(cfg)
+	req := cliproxyexecutor.Request{Model: "claude-opus-5", Payload: []byte(`{"model":"claude-opus-5","messages":[{"role":"user","content":[{"type":"text","text":"hello world"}]}]}`)}
+	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatClaude}
+	counted, err := e.CountTokens(context.Background(), auth, req, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseCount := gjson.GetBytes(counted.Payload, "input_tokens").Int()
+	if baseCount <= 0 {
+		t.Fatalf("local count missing: %s", counted.Payload)
+	}
+	if expandedSystem {
+		req.Payload, err = sjson.SetBytes(req.Payload, "system", strings.Repeat("Keep all caller guidance in the custom gateway estimate. ", 64))
+		if err != nil {
+			t.Fatal(err)
+		}
+		extra, err := e.CountTokens(context.Background(), auth, req, opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if gjson.GetBytes(extra.Payload, "input_tokens").Int() <= baseCount {
+			t.Fatal("local count discarded caller system")
+		}
+	}
+	select {
+	case body := <-captured:
+		t.Fatalf("Count unexpectedly dialed custom gateway: %s", body)
+	default:
+	}
+	if _, err := e.Execute(context.Background(), auth, req, opts); err != nil {
+		t.Fatal(err)
+	}
+	return <-captured
+}
+
+func mustSignClaudeMessagesForIntegration(t *testing.T, body []byte) []byte {
+	t.Helper()
+	signed, err := signAnthropicMessagesBodyForVersion(body, "2.1.211")
+	if err != nil {
+		t.Fatalf("signAnthropicMessagesBody: %v", err)
+	}
+	return signed
 }

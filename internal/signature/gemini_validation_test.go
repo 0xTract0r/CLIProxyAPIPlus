@@ -104,6 +104,69 @@ func TestInspectGeminiThoughtSignature_AcceptsCapturedGemini31FlashLiteEnvelope(
 	}
 }
 
+func TestInspectGeminiThoughtSignature_AcceptsServerSideToolProtobufEnvelope(t *testing.T) {
+	// Real live capture from Gemini 3.8 Flash toolCall (googleSearch)
+	const liveCapturedToolCallSig = "ErUDCrIDCAISrQMBEU0yD9ECvDhSY1DQJNUGafArdfd2mDfO8VQq7XjLx/91zESuo0QPSdkRFWkLeVIocSQmQULonYMOJcs6XDLV2LTRC9myb3MCCP9CUoWbEeqhAvXKTScyS3nwBDDVJYuDDbY3YvR4V86T/DnU3qufpaVZ3wQOiJVyBVZ515dYTN+XGq7SuUc3RpfAqVU06jgxaCM0WKV4Df5mGMJWb25e/aFG2Jc7upSqpf3n6aElj+4c/eWr4GdKd0TUIElXBZ0HEN/vNcWzD3F0S4MeVbk1LDakL6HG6oyaSS2gocxYNYxqm9mdMHaXYa4mIYqWqmqBEnbgcHp8H4fgqBxc3Cx8C3otV8IarO5OALaVDA3NaXB1zjLet1587kEpkCNr9OvrYOES2nCl/i4EgbPK01nlXo+Wwm5jsZU5nEG4/Z0bErzqC5TKwOsqpJ7afL2sPWI0IGrXhXL+QCumWCS5iUtwybSkL7CYSk9GC+iY+ev6FAmC4V5JEc4OaWOc9+m/29LniN/iPTSxtUQSZT94pUa3/irIIdH7ReAS3cpeM6OTvumR1PwNxXx3XM1mEGc="
+
+	info, err := InspectGeminiThoughtSignature(liveCapturedToolCallSig, GeminiThoughtSignatureValidationOptions{RequireKnownEnvelope: true})
+	if err != nil {
+		t.Fatalf("captured Gemini 3.8 Flash server-side toolCall envelope should be known: %v", err)
+	}
+	if info.Envelope != GeminiThoughtSignatureEnvelopeProtobufField2 {
+		t.Fatalf("Envelope = %q, want %q", info.Envelope, GeminiThoughtSignatureEnvelopeProtobufField2)
+	}
+	if !info.KnownEnvelope {
+		t.Fatal("KnownEnvelope should be true for server-side toolCall envelope")
+	}
+	if provider := DetectSignatureProviderForBlock(liveCapturedToolCallSig, SignatureBlockKindGeminiModelPart); provider != SignatureProviderGemini {
+		t.Fatalf("DetectSignatureProviderForBlock = %q, want %q", provider, SignatureProviderGemini)
+	}
+}
+
+func TestInspectGeminiThoughtSignature_RejectsMalformedToolInvocationPayload(t *testing.T) {
+	// 1. Truncated protobuf
+	truncated := testGemini3ThoughtSignature([]byte{0x08, 0x02, 0x12, 0x10, 0x01}) // declares 16 bytes, only gives 1
+	if info, err := InspectGeminiThoughtSignature(truncated, GeminiThoughtSignatureValidationOptions{RequireKnownEnvelope: true}); err == nil && info.KnownEnvelope {
+		t.Fatal("truncated inner protobuf payload should not be a known envelope")
+	}
+
+	// 2. Valid protobuf without Tink 0x01 prefix in any bytes field
+	noTink := testGemini3ThoughtSignature([]byte{0x08, 0x02, 0x12, 0x04, 0x99, 0x98, 0x97, 0x96})
+	if info, err := InspectGeminiThoughtSignature(noTink, GeminiThoughtSignatureValidationOptions{RequireKnownEnvelope: true}); err == nil && info.KnownEnvelope {
+		t.Fatal("protobuf payload without Tink 0x01 prefix should not be a known envelope")
+	}
+
+	// 3. Protobuf with pure varint, no bytes field
+	pureVarint := testGemini3ThoughtSignature([]byte{0x08, 0x02, 0x10, 0x05})
+	if info, err := InspectGeminiThoughtSignature(pureVarint, GeminiThoughtSignatureValidationOptions{RequireKnownEnvelope: true}); err == nil && info.KnownEnvelope {
+		t.Fatal("protobuf payload without length-delimited bytes field should not be a known envelope")
+	}
+}
+
+func TestValidateGeminiFunctionCallPairing_AcceptsServerSideToolBlocks(t *testing.T) {
+	input := []byte(`{
+		"contents": [
+			{
+				"role": "model",
+				"parts": [
+					{"toolCall": {"id": "search_1", "toolType": "GOOGLE_SEARCH_WEB"}},
+					{"toolResponse": {"id": "search_1", "response": {}}},
+					{"functionCall": {"id": "call_1", "name": "do_something", "args": {}}}
+				]
+			},
+			{
+				"role": "user",
+				"parts": [
+					{"functionResponse": {"id": "call_1", "name": "do_something", "response": {"result": "ok"}}}
+				]
+			}
+		]
+	}`)
+	if err := ValidateGeminiFunctionCallPairing(input); err != nil {
+		t.Fatalf("pairing validator should accept server-side tool blocks alongside functionCall: %v", err)
+	}
+}
+
 func TestInspectGeminiThoughtSignature_AcceptsGemini3WrappedUUIDEnvelope(t *testing.T) {
 	const providerUUID = "e24830a7-5cd6-42fe-998b-ee539e72b9c3"
 	sig := testGemini3ThoughtSignature([]byte(providerUUID))
@@ -126,24 +189,35 @@ func TestInspectGeminiThoughtSignature_AcceptsGemini3WrappedUUIDEnvelope(t *test
 	}
 }
 
-func TestInspectGeminiThoughtSignature_AcceptsGemini25Field1Envelope(t *testing.T) {
+// TestInspectGeminiThoughtSignature_RejectsGemini25Field1Envelope pins the removal
+// of the repeated field-1 envelope. Gemini 2.5 is out of scope, so its signatures
+// are no longer a known envelope; they degrade to the bypass sentinel on Gemini
+// model parts instead of being replayed verbatim.
+func TestInspectGeminiThoughtSignature_RejectsGemini25Field1Envelope(t *testing.T) {
 	sig := testGemini25ThoughtSignature([]byte{0x01, 0x8f}, []byte{0x01, 0x90, 0x91})
 
-	info, err := InspectGeminiThoughtSignature(sig, GeminiThoughtSignatureValidationOptions{RequireKnownEnvelope: true})
+	if _, err := InspectGeminiThoughtSignature(sig, GeminiThoughtSignatureValidationOptions{RequireKnownEnvelope: true}); err == nil {
+		t.Fatal("Gemini 2.5 field-1 envelope should no longer be a known envelope")
+	}
+
+	info, err := InspectGeminiThoughtSignature(sig)
 	if err != nil {
-		t.Fatalf("Gemini 2.5 field-1 envelope should be known: %v", err)
+		t.Fatalf("inspection without RequireKnownEnvelope should still succeed: %v", err)
 	}
-	if info.Envelope != GeminiThoughtSignatureEnvelopeProtobufField1 {
-		t.Fatalf("Envelope = %q, want %q", info.Envelope, GeminiThoughtSignatureEnvelopeProtobufField1)
+	if info.Envelope != GeminiThoughtSignatureEnvelopeUnknown {
+		t.Fatalf("Envelope = %q, want %q", info.Envelope, GeminiThoughtSignatureEnvelopeUnknown)
 	}
-	if info.HasObservedMarker {
-		t.Fatal("Gemini 2.5 field-1 envelope should not be marked as 0x12")
+	if info.KnownEnvelope {
+		t.Fatal("KnownEnvelope should be false for the retired field-1 envelope")
 	}
-	if info.RecordCount != 2 {
-		t.Fatalf("RecordCount = %d, want 2", info.RecordCount)
+
+	// Gemini model parts still recover through the documented sentinel.
+	decision := DecideSignatureCompatibility(SignatureProviderGemini, sig, SignatureBlockKindGeminiModelPart)
+	if decision.Action != SignatureActionReplaceWithGeminiBypass {
+		t.Fatalf("action = %q, want %q", decision.Action, SignatureActionReplaceWithGeminiBypass)
 	}
-	if info.OpaquePayloadLen != 5 {
-		t.Fatalf("OpaquePayloadLen = %d, want 5", info.OpaquePayloadLen)
+	if decision.ReplacementSignature != GeminiSkipThoughtSignatureValidator {
+		t.Fatalf("replacement = %q, want %q", decision.ReplacementSignature, GeminiSkipThoughtSignatureValidator)
 	}
 }
 
@@ -354,10 +428,17 @@ func TestValidateGeminiFunctionCallPairing_ValidParallelGroup(t *testing.T) {
 	}
 }
 
-func TestValidateGeminiFunctionCallPairing_RejectsUserBoundaryBeforeResponse(t *testing.T) {
-	payload := []byte(`{"contents":[{"role":"model","parts":[{"functionCall":{"id":"call-1","name":"run","args":{}}}]},{"role":"user","parts":[{"text":"boundary"}]},{"role":"model","parts":[{"functionResponse":{"id":"call-1","name":"run","response":{"result":"ok"}}}]}]}`)
+func TestValidateGeminiFunctionCallPairing_AllowsUserBoundaryBeforeResponse(t *testing.T) {
+	payload := []byte(`{"contents":[{"role":"model","parts":[{"functionCall":{"id":"call-1","name":"run","args":{}}}]},{"role":"user","parts":[{"text":"boundary"}]},{"role":"user","parts":[{"functionResponse":{"id":"call-1","name":"run","response":{"result":"ok"}}}]}]}`)
+	if err := ValidateGeminiFunctionCallPairing(payload); err != nil {
+		t.Fatalf("user boundary before function response should be accepted: %v", err)
+	}
+}
+
+func TestValidateGeminiFunctionCallPairing_RejectsModelBoundaryBeforeResponse(t *testing.T) {
+	payload := []byte(`{"contents":[{"role":"model","parts":[{"functionCall":{"id":"call-1","name":"run","args":{}}}]},{"role":"model","parts":[{"text":"boundary"}]},{"role":"user","parts":[{"functionResponse":{"id":"call-1","name":"run","response":{"result":"ok"}}}]}]}`)
 	if err := ValidateGeminiFunctionCallPairing(payload); err == nil {
-		t.Fatal("user boundary before function response was accepted")
+		t.Fatal("model boundary before function response should be rejected")
 	}
 }
 

@@ -9,7 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 )
 
 // AccountConcurrencyGate is the per-account in-flight concurrency semaphore and

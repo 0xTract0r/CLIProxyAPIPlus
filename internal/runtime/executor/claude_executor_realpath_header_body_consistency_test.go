@@ -8,10 +8,10 @@ import (
 	"regexp"
 	"testing"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
-	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 )
 
 // This file pins scenario D.1(1): on the REAL serving path (genuine interactive
@@ -66,7 +66,7 @@ func runRealPathServingCapture(t *testing.T, stabilize, align bool, inboundUA, a
 		Claude:               config.ClaudeConfig{AlignRealPathBillingVersion: &align},
 	}
 	executor := NewClaudeExecutor(cfg)
-	auth := &cliproxyauth.Auth{ProxyURL: "direct", ID: "realpath-consistency", Attributes: map[string]string{
+	auth := &cliproxyauth.Auth{Metadata: claudeOAuthTestMetadata(), ProxyURL: "direct", ID: "realpath-consistency", Attributes: map[string]string{
 		"api_key":  apiKey,
 		"base_url": server.URL,
 	}}

@@ -9,7 +9,7 @@ import (
 )
 
 func TestConvertInteractionsRequestToClaudeWithToolMessagesDirect(t *testing.T) {
-	out := ConvertInteractionsRequestToClaude("claude-test", []byte(`{"model":"claude-test","system_instruction":"be brief","input":[{"type":"user_input","content":[{"type":"text","text":"hi"}]},{"type":"function_call","name":"lookup","call_id":"toolu_1","arguments":{"q":"x"}},{"type":"function_result","name":"lookup","call_id":"toolu_1","result":{"ok":true}}]}`), false)
+	out, _ := ConvertInteractionsRequestToClaude("claude-test", []byte(`{"model":"claude-test","system_instruction":"be brief","input":[{"type":"user_input","content":[{"type":"text","text":"hi"}]},{"type":"function_call","name":"lookup","call_id":"toolu_1","arguments":{"q":"x"}},{"type":"function_result","name":"lookup","call_id":"toolu_1","result":{"ok":true}}]}`), false)
 	if got := gjson.GetBytes(out, "system").String(); got != "be brief" {
 		t.Fatalf("system = %q, want be brief. Output: %s", got, string(out))
 	}
@@ -27,8 +27,75 @@ func TestConvertInteractionsRequestToClaudeWithToolMessagesDirect(t *testing.T) 
 	}
 }
 
+func TestConvertInteractionsRequestToClaudePropagatesIsError(t *testing.T) {
+	out, _ := ConvertInteractionsRequestToClaude("claude-test", []byte(`{"model":"claude-test","input":[{"type":"function_result","name":"lookup","call_id":"toolu_err","result":"command failed","is_error":true}]}`), false)
+	if got := gjson.GetBytes(out, "messages.0.content.0.type").String(); got != "tool_result" {
+		t.Fatalf("content type = %q, want tool_result. Output: %s", got, string(out))
+	}
+	if !gjson.GetBytes(out, "messages.0.content.0.is_error").Bool() {
+		t.Fatalf("expected is_error = true. Output: %s", string(out))
+	}
+}
+
+func TestConvertInteractionsRequestToClaudeGroupsConsecutiveRoleTurns(t *testing.T) {
+	raw := []byte(`{
+		"input":[
+			{"type":"thought","content":[{"type":"thinking","thinking":"reason"}]},
+			{"type":"model_output","content":[{"type":"text","text":"answer"}]},
+			{"type":"function_call","name":"first","call_id":"call_1","arguments":{}},
+			{"type":"function_call","name":"second","call_id":"call_2","arguments":{}},
+			{"type":"function_result","call_id":"call_1","result":{"value":"one"}},
+			{"type":"function_result","call_id":"call_2","result":{"value":"two"}}
+		]
+	}`)
+	out, _ := ConvertInteractionsRequestToClaude("claude-test", raw, false)
+	messages := gjson.GetBytes(out, "messages").Array()
+	if len(messages) != 2 {
+		t.Fatalf("message count = %d, want 2. Output: %s", len(messages), string(out))
+	}
+	assistantContent := messages[0].Get("content").Array()
+	wantAssistantTypes := []string{"thinking", "text", "tool_use", "tool_use"}
+	if len(assistantContent) != len(wantAssistantTypes) {
+		t.Fatalf("assistant content count = %d, want %d. Output: %s", len(assistantContent), len(wantAssistantTypes), string(out))
+	}
+	for i, wantType := range wantAssistantTypes {
+		if got := assistantContent[i].Get("type").String(); got != wantType {
+			t.Fatalf("assistant content[%d].type = %q, want %q", i, got, wantType)
+		}
+	}
+	userContent := messages[1].Get("content").Array()
+	if len(userContent) != 2 {
+		t.Fatalf("user content count = %d, want 2. Output: %s", len(userContent), string(out))
+	}
+	for i, wantID := range []string{"call_1", "call_2"} {
+		if got := userContent[i].Get("tool_use_id").String(); got != wantID {
+			t.Fatalf("user content[%d].tool_use_id = %q, want %q", i, got, wantID)
+		}
+	}
+}
+
+func TestConvertInteractionsRequestToClaudeDoesNotMergeAcrossRoleChanges(t *testing.T) {
+	raw := []byte(`{
+		"input":[
+			{"type":"model_output","content":"first assistant"},
+			{"type":"user_input","content":"user reply"},
+			{"type":"model_output","content":"second assistant"}
+		]
+	}`)
+	out, _ := ConvertInteractionsRequestToClaude("claude-test", raw, false)
+	messages := gjson.GetBytes(out, "messages").Array()
+	if len(messages) != 3 {
+		t.Fatalf("message count = %d, want 3. Output: %s", len(messages), string(out))
+	}
+	for i, wantRole := range []string{"assistant", "user", "assistant"} {
+		if got := messages[i].Get("role").String(); got != wantRole {
+			t.Fatalf("messages[%d].role = %q, want %q", i, got, wantRole)
+		}
+	}
+}
+
 func TestConvertInteractionsRequestToClaudeStringInputDirect(t *testing.T) {
-	out := ConvertInteractionsRequestToClaude("claude-test", []byte(`{"model":"claude-test","input":"hello"}`), false)
+	out, _ := ConvertInteractionsRequestToClaude("claude-test", []byte(`{"model":"claude-test","input":"hello"}`), false)
 	if got := gjson.GetBytes(out, "messages.0.role").String(); got != "user" {
 		t.Fatalf("messages.0.role = %q, want user. Output: %s", got, string(out))
 	}
@@ -38,7 +105,7 @@ func TestConvertInteractionsRequestToClaudeStringInputDirect(t *testing.T) {
 }
 
 func TestConvertInteractionsRequestToClaudeMapsGenerationConfigToolsAndStreamDirect(t *testing.T) {
-	out := ConvertInteractionsRequestToClaude("claude-test", []byte(`{"model":"claude-test","stream":true,"input":[{"type":"user_input","content":[{"type":"text","text":"hi"}]}],"tools":[{"type":"function","name":"lookup","description":"Lookup data","parameters":{"type":"object","properties":{"q":{"type":"string"}}}}],"generation_config":{"max_output_tokens":99,"top_p":0.7,"stop_sequences":["END"],"tool_choice":{"type":"function","name":"lookup"},"thinking_level":"high"}}`), false)
+	out, _ := ConvertInteractionsRequestToClaude("claude-test", []byte(`{"model":"claude-test","stream":true,"input":[{"type":"user_input","content":[{"type":"text","text":"hi"}]}],"tools":[{"type":"function","name":"lookup","description":"Lookup data","parameters":{"type":"object","properties":{"q":{"type":"string"}}}}],"generation_config":{"max_output_tokens":99,"top_p":0.7,"stop_sequences":["END"],"tool_choice":{"type":"function","name":"lookup"},"thinking_level":"high"}}`), false)
 	if !gjson.GetBytes(out, "stream").Bool() {
 		t.Fatalf("stream should be true when request body asks for stream. Output: %s", string(out))
 	}
@@ -57,7 +124,7 @@ func TestConvertInteractionsRequestToClaudeMapsGenerationConfigToolsAndStreamDir
 }
 
 func TestConvertInteractionsRequestToClaudeAcceptsImageContent(t *testing.T) {
-	out := ConvertInteractionsRequestToClaude("claude-test", []byte(`{"model":"claude-test","input":[{"type":"user_input","content":[{"type":"image","mime_type":"image/png","data":"aGVsbG8="}]}]}`), false)
+	out, _ := ConvertInteractionsRequestToClaude("claude-test", []byte(`{"model":"claude-test","input":[{"type":"user_input","content":[{"type":"image","mime_type":"image/png","data":"aGVsbG8="}]}]}`), false)
 	if got := gjson.GetBytes(out, "messages.0.content.0.type").String(); got != "image" {
 		t.Fatalf("content type = %q, want image. Output: %s", got, string(out))
 	}
@@ -70,7 +137,7 @@ func TestConvertInteractionsRequestToClaudeAcceptsImageContent(t *testing.T) {
 }
 
 func TestConvertInteractionsRequestToClaudePreservesNonImageMediaContent(t *testing.T) {
-	out := ConvertInteractionsRequestToClaude("claude-test", []byte(`{"model":"claude-test","input":[{"type":"thought","content":[{"type":"audio","mime_type":"audio/wav","data":"UklGRg=="},{"type":"video","mime_type":"video/mp4","data":"AAAAIGZ0eXA="},{"type":"document","mime_type":"application/pdf","data":"JVBERi0="}]}]}`), false)
+	out, _ := ConvertInteractionsRequestToClaude("claude-test", []byte(`{"model":"claude-test","input":[{"type":"thought","content":[{"type":"audio","mime_type":"audio/wav","data":"UklGRg=="},{"type":"video","mime_type":"video/mp4","data":"AAAAIGZ0eXA="},{"type":"document","mime_type":"application/pdf","data":"JVBERi0="}]}]}`), false)
 
 	if got := gjson.GetBytes(out, "messages.0.role").String(); got != "assistant" {
 		t.Fatalf("messages.0.role = %q, want assistant. Output: %s", got, string(out))

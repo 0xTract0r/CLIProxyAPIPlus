@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 )
 
 var claudeProxyTransportRetryBackoffs = []time.Duration{
@@ -61,7 +61,7 @@ func doClaudeHTTPWithTransportRetry(ctx context.Context, client *http.Client, re
 			}
 			return nil, gateErr
 		}
-		resp, err := client.Do(attemptReq)
+		resp, err := doClaudeUpstreamRequest(client, attemptReq)
 		if permit != nil {
 			if err != nil {
 				_ = permit.TransportFailed(err)
@@ -102,6 +102,9 @@ func cloneClaudeRequestForRetry(ctx context.Context, req *http.Request) (*http.R
 }
 
 func shouldRetryClaudeTransportError(ctx context.Context, req *http.Request, err error, attempt int) bool {
+	if cliproxyexecutor.IsConfiguredTLSHandshakeTimeoutError(err) {
+		return false // Manager 负责配置的握手超时重试，避免每轮再做三次。
+	}
 	if err == nil || attempt < 0 || attempt >= len(claudeProxyTransportRetryBackoffs) {
 		return false
 	}

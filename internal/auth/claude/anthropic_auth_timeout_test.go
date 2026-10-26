@@ -5,11 +5,8 @@ import (
 	"errors"
 	"net"
 	"net/http"
-	"sync"
 	"testing"
 	"time"
-
-	"golang.org/x/net/http2"
 )
 
 type contextBlockingRoundTripper struct{}
@@ -51,11 +48,8 @@ func (cancelledDialer) Dial(network, addr string) (net.Conn, error) {
 }
 
 func TestUTLSRoundTripperDoesNotDialAfterContextCancelled(t *testing.T) {
-	transport := &utlsRoundTripper{
-		connections: make(map[string]*http2.ClientConn),
-		pending:     make(map[string]*sync.Cond),
-		dialer:      cancelledDialer{},
-	}
+	transport := newUtlsRoundTripper(nil)
+	transport.dialer = cancelledDialer{}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, TokenURL, nil)

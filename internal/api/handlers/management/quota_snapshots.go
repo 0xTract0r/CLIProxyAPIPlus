@@ -17,9 +17,9 @@ import (
 	"github.com/andybalholm/brotli"
 	"github.com/gin-gonic/gin"
 	"github.com/klauspost/compress/zstd"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 )
@@ -203,6 +203,12 @@ func (h *Handler) quotaSnapshotRefreshPolicy() QuotaSnapshotRefreshPolicy {
 // StartQuotaSnapshotAutoRefresh launches the core-owned quota refresher. The
 // management UI should read these persisted snapshots instead of directly
 // fanning out provider quota API calls on page entry.
+type quotaRefreshGeneration struct {
+	cancel context.CancelFunc
+	done   chan struct{}
+}
+type quotaRefreshOwnerKey struct{}
+
 func (h *Handler) StartQuotaSnapshotAutoRefresh(parent context.Context, policy QuotaSnapshotRefreshPolicy) {
 	if h == nil {
 		return
@@ -211,24 +217,91 @@ func (h *Handler) StartQuotaSnapshotAutoRefresh(parent context.Context, policy Q
 		parent = context.Background()
 	}
 	policy = policy.normalized()
-
 	h.mu.Lock()
-	cancelPrev := h.quotaRefreshCancel
-	h.quotaRefreshCancel = nil
-	h.mu.Unlock()
-	if cancelPrev != nil {
-		cancelPrev()
-	}
-	if !policy.Enabled {
+	if h.quotaRefreshClosed {
+		h.mu.Unlock()
 		return
 	}
-
-	ctx, cancel := context.WithCancel(parent)
-	h.mu.Lock()
+	previous := h.quotaRefreshCancel
+	h.quotaRefreshCancel = nil
+	if !policy.Enabled {
+		h.mu.Unlock()
+		if previous != nil {
+			previous()
+		}
+		return
+	}
+	ctx, cancel := context.WithCancel(context.WithValue(parent, quotaRefreshOwnerKey{}, h))
+	generation := &quotaRefreshGeneration{cancel: cancel, done: make(chan struct{})}
+	if h.quotaRefreshRuns == nil {
+		h.quotaRefreshRuns = make(map[*quotaRefreshGeneration]struct{})
+	}
+	h.quotaRefreshRuns[generation] = struct{}{}
 	h.quotaRefreshCancel = cancel
 	h.mu.Unlock()
+	if previous != nil {
+		previous()
+	}
+	go func() {
+		defer func() {
+			cancel()
+			h.mu.Lock()
+			delete(h.quotaRefreshRuns, generation)
+			close(generation.done)
+			h.mu.Unlock()
+		}()
+		h.runQuotaSnapshotAutoRefresh(ctx, policy)
+	}()
+}
 
-	go h.runQuotaSnapshotAutoRefresh(ctx, policy)
+// StopQuotaSnapshotAutoRefresh closes admission and requests cancellation without waiting.
+func (h *Handler) StopQuotaSnapshotAutoRefresh() {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	h.quotaRefreshClosed = true
+	for generation := range h.quotaRefreshRuns {
+		generation.cancel()
+	}
+	h.quotaRefreshCancel = nil
+	h.mu.Unlock()
+}
+
+// ShutdownQuotaSnapshotAutoRefresh joins every active and retired generation.
+// A deadline leaves ownership intact so a later call can finish the join.
+func (h *Handler) ShutdownQuotaSnapshotAutoRefresh(ctx context.Context) error {
+	if h == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	h.mu.Lock()
+	h.quotaRefreshClosed = true
+	runs := make([]*quotaRefreshGeneration, 0, len(h.quotaRefreshRuns))
+	for generation := range h.quotaRefreshRuns {
+		generation.cancel()
+		runs = append(runs, generation)
+	}
+	h.quotaRefreshCancel = nil
+	h.mu.Unlock()
+	if ctx.Value(quotaRefreshOwnerKey{}) == h {
+		return fmt.Errorf("quota refresh cannot join its own generation")
+	}
+	for _, generation := range runs {
+		select {
+		case <-generation.done:
+			continue
+		default:
+		}
+		select {
+		case <-generation.done:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return nil
 }
 
 func (h *Handler) runQuotaSnapshotAutoRefresh(ctx context.Context, policy QuotaSnapshotRefreshPolicy) {

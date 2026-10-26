@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
-	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 )
 
 // This executor explicitly exercises the SDK contract, not an HTTP transport.
@@ -514,7 +514,7 @@ func TestWarmupPacingExecutionPoolGateReselectKeepsContinuation(t *testing.T) {
 		*now = now.Add(21 * time.Second)
 		return nil, firstErr
 	}
-	_, err := m.executeStreamWithModelPool(ctx, e, a, "claude", cliproxyexecutor.Request{Model: model, Payload: opts.OriginalRequest}, opts, model, "", []string{"up-a", "up-b"}, true, OAuthModelAliasResult{}, true, false)
+	_, err := m.executeStreamWithModelPool(ctx, e, a, "claude", cliproxyexecutor.Request{Model: model, Payload: opts.OriginalRequest}, opts, model, "", []string{"up-a", "up-b"}, true, OAuthModelAliasResult{}, nil, true, false)
 	var local *warmupAdmissionReselect
 	if !errors.As(err, &local) || local.previous != firstErr || len(calls) != 2 || calls[0] != "up-a" || calls[1] != "up-b" {
 		t.Fatalf("pool local reselect lost history: calls=%v err=%v", calls, err)
