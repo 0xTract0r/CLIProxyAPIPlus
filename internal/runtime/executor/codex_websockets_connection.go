@@ -26,6 +26,7 @@ import (
 const (
 	codexResponsesWebsocketBetaHeaderValue = "responses_websockets=2026-02-06"
 	codexResponsesWebsocketIdleTimeout     = 5 * time.Minute
+	codexResponsesWebsocketPingInterval    = 30 * time.Second
 	codexResponsesWebsocketHandshakeTO     = 30 * time.Second
 )
 
@@ -96,8 +97,41 @@ func (e *CodexWebsocketsExecutor) dialCodexWebsocket(ctx context.Context, auth *
 		// Avoid gorilla/websocket flate tail validation issues on some upstreams/Go versions.
 		// Negotiating permessage-deflate is fine; we just don't compress outbound messages.
 		conn.EnableWriteCompression(false)
+		conn.SetPingHandler(func(appData string) error {
+			if err := conn.SetReadDeadline(time.Now().Add(codexResponsesWebsocketIdleTimeout)); err != nil {
+				return err
+			}
+			return conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(10*time.Second))
+		})
+		conn.SetPongHandler(func(string) error {
+			return conn.SetReadDeadline(time.Now().Add(codexResponsesWebsocketIdleTimeout))
+		})
+		startCodexWebsocketHeartbeat(closer, codexResponsesWebsocketPingInterval)
 	}
 	return conn, closer, resp, err
+}
+
+// Control writes may run alongside the single data writer. Closing the owning
+// resource stops the heartbeat; sending a ping alone never refreshes liveness.
+func startCodexWebsocketHeartbeat(closer *websocketConnectionCloser, interval time.Duration) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-closer.done:
+				return
+			case <-ticker.C:
+				if err := closer.conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(10*time.Second)); err != nil {
+					_ = closer.Close()
+					return
+				}
+			}
+		}
+	}()
+	return done
 }
 
 func writeCodexWebsocketMessage(sess *codexWebsocketSession, conn *websocket.Conn, payload []byte) error {
@@ -194,9 +228,19 @@ func readCodexWebsocketEvent(ctx context.Context, sess *codexWebsocketSession, c
 			return codexWebsocketRead{err: fmt.Errorf("codex websockets executor: websocket conn is nil")}
 		}
 		_ = conn.SetReadDeadline(time.Now().Add(codexResponsesWebsocketIdleTimeout))
+		// This connection belongs to one request. Interrupt ReadMessage when
+		// its downstream cancels instead of waiting for the liveness deadline.
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		stopCancel := context.AfterFunc(ctx, func() { _ = conn.Close() })
+		defer stopCancel()
 		started := time.Now()
 		msgType, payload, errRead := conn.ReadMessage()
 		arrival := time.Now()
+		if ctx.Err() != nil {
+			errRead = ctx.Err()
+		}
 		return codexWebsocketRead{conn: conn, msgType: msgType, payload: payload, err: errRead, arrival: arrival, readDuration: arrival.Sub(started)}
 	}
 	if conn == nil {

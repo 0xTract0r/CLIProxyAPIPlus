@@ -307,6 +307,7 @@ var globalCodexWebsocketSessionStore = &codexWebsocketSessionStore{
 
 type websocketConnectionCloser struct {
 	conn *websocket.Conn
+	done chan struct{}
 	once sync.Once
 	err  error
 }
@@ -315,7 +316,7 @@ func newWebsocketConnectionCloser(conn *websocket.Conn) *websocketConnectionClos
 	if conn == nil {
 		return nil
 	}
-	return &websocketConnectionCloser{conn: conn}
+	return &websocketConnectionCloser{conn: conn, done: make(chan struct{})}
 }
 
 func (c *websocketConnectionCloser) Close() error {
@@ -323,6 +324,9 @@ func (c *websocketConnectionCloser) Close() error {
 		return nil
 	}
 	c.once.Do(func() {
+		if c.done != nil {
+			close(c.done)
+		}
 		c.err = c.conn.Close()
 	})
 	return c.err
@@ -481,7 +485,19 @@ func (s *codexWebsocketSession) configureConn(conn *websocket.Conn) {
 		return
 	}
 	s.resetUpstreamDisconnectError(conn)
+	refreshActiveDeadline := func() error {
+		// Preserve idle-session reclamation: only an active turn may extend
+		// the read deadline on control traffic.
+		if ch, _ := s.activeForConn(conn); ch != nil {
+			return conn.SetReadDeadline(time.Now().Add(codexResponsesWebsocketIdleTimeout))
+		}
+		return nil
+	}
+	conn.SetPongHandler(func(string) error { return refreshActiveDeadline() })
 	conn.SetPingHandler(func(appData string) error {
+		if err := refreshActiveDeadline(); err != nil {
+			return err
+		}
 		s.writeMu.Lock()
 		defer s.writeMu.Unlock()
 		// Reply pongs from the same write lock to avoid concurrent writes.
