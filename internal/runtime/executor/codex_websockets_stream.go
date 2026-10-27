@@ -104,12 +104,14 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	e.persistCodexDeviceHighWater(ctx, auth)
 	applyModelHeaderOverrides(wsHeaders, baseModel)
 	applyCodexIdentityConfuseHeaders(wsHeaders, &identityState)
-	httpFallbackAllowed = fastEnabled && codexHTTPFallbackAllowed(ctx, req, opts, upstreamBody)
+	httpFallbackAllowed = codexHTTPFallbackAllowed(ctx, req, opts, upstreamBody)
 	if httpFallbackAllowed {
-		mainBody := buildCodexWebsocketFastMainBody(upstreamBody, "")
-		prewarmBody := buildCodexWebsocketPrewarmBody(upstreamBody)
-		if len(prewarmBody) > len(mainBody) {
-			mainBody = prewarmBody
+		mainBody := buildCodexWebsocketRequestBody(upstreamBody)
+		if fastEnabled {
+			mainBody = buildCodexWebsocketFastMainBody(upstreamBody, "")
+			if prewarmBody := buildCodexWebsocketPrewarmBody(upstreamBody); len(prewarmBody) > len(mainBody) {
+				mainBody = prewarmBody
+			}
 		}
 		if codexFastWebsocketSizeGate(ctx, mainBody, wsBudget, "prepare") {
 			httpFallbackStarted = true

@@ -47,6 +47,109 @@ func TestCodexFastTransportLogSurvivesProductionFormatter(t *testing.T) {
 	}
 }
 
+func TestCodexNormalWebsocketHTTPFallback(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		for _, scenario := range []string{"size-gate", "close1009", "created-then1009", "tool-then1009", "eof", "previous-response", "generate-false", "required-websocket", "downstream-websocket", "lifecycle"} {
+			t.Run(fmt.Sprintf("stream=%t/%s", stream, scenario), func(t *testing.T) {
+				t.Setenv(codexFastWebsocketMessageBytesEnv, "4096")
+				var wsCalls, httpCalls atomic.Int32
+				capturedHTTP := make(chan []byte, 1)
+				upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if !websocket.IsWebSocketUpgrade(r) {
+						httpCalls.Add(1)
+						body, _ := io.ReadAll(r.Body)
+						capturedHTTP <- body
+						w.Header().Set("Content-Type", "text/event-stream")
+						_, _ = io.WriteString(w, "data: "+`{"type":"response.completed","response":{"id":"resp_http","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"normal fallback ok"}]}]}}`+"\n\n")
+						return
+					}
+					wsCalls.Add(1)
+					conn, err := upgrader.Upgrade(w, r, nil)
+					if err != nil {
+						t.Errorf("upgrade: %v", err)
+						return
+					}
+					defer func() { _ = conn.Close() }()
+					if _, body, err := conn.ReadMessage(); err != nil {
+						t.Errorf("read main: %v", err)
+						return
+					} else if gjson.GetBytes(body, "generate").Exists() && scenario != "generate-false" {
+						t.Error("normal WS unexpectedly sent prewarm")
+					}
+					switch scenario {
+					case "created-then1009":
+						_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.created","response":{"id":"started","status":"in_progress","output":[]}}`))
+					case "tool-then1009":
+						_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"tool1","call_id":"call1","name":"example","arguments":""}}`))
+					case "eof":
+						return
+					}
+					_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseMessageTooBig, "too big"), time.Now().Add(time.Second))
+				}))
+				t.Cleanup(server.Close)
+				payload := []byte(`{"model":"gpt-5-codex","instructions":"preserved","prompt_cache_key":"normal-size-cache","service_tier":"priority","input":[{"role":"user","content":"complete history"}]}`)
+				if scenario == "size-gate" {
+					payload, _ = sjson.SetBytes(payload, "tools", []any{map[string]any{"type": "function", "name": "large_tool", "description": strings.Repeat("preserved tool ", 512), "parameters": map[string]any{"type": "object"}}})
+				}
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("codex"), ResponseFormat: sdktranslator.FromString("codex")}
+				switch scenario {
+				case "previous-response":
+					payload, _ = sjson.SetBytes(payload, "previous_response_id", "resp_previous")
+				case "generate-false":
+					payload, _ = sjson.SetBytes(payload, "generate", false)
+				case "downstream-websocket":
+					ctx = cliproxyexecutor.WithDownstreamWebsocket(ctx)
+				case "lifecycle":
+					opts.ExecutionLifecycle = newTerminalFailureLifecycle()
+				}
+				opts.OriginalRequest = bytes.Clone(payload)
+				exec := NewCodexAutoExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
+				auth := &cliproxyauth.Auth{ID: t.Name(), Provider: "codex", ProxyURL: "direct", Attributes: map[string]string{"api_key": "test", "base_url": server.URL, "fast_models": ""}, Metadata: map[string]any{"websockets": true}}
+				if scenario == "required-websocket" {
+					opts.Metadata = map[string]any{cliproxyexecutor.ExecutionSessionMetadataKey: t.Name()}
+					wsURL, _ := buildCodexResponsesWebsocketURL(server.URL + "/responses")
+					sess := exec.wsExec.getOrCreateSession(t.Name(), auth, wsURL)
+					if _, _, _, err := exec.wsExec.ensureUpstreamConn(ctx, auth, sess, auth.ID, wsURL, nil); err != nil {
+						t.Fatalf("prime required WS: %v", err)
+					}
+					t.Cleanup(func() { exec.CloseExecutionSession(t.Name()) })
+					ctx = cliproxyexecutor.WithRequiredUpstreamWebsocket(ctx)
+				}
+				out, _, err := runCodexFallbackRequest(ctx, exec, auth, cliproxyexecutor.Request{Model: "gpt-5-codex", Payload: payload}, opts, stream)
+				wantHTTP := scenario == "size-gate" || scenario == "close1009"
+				wantWS := int32(1)
+				if scenario == "size-gate" {
+					wantWS = 0
+				}
+				if wsCalls.Load() != wantWS {
+					t.Fatalf("WS calls=%d, want %d", wsCalls.Load(), wantWS)
+				}
+				if !wantHTTP {
+					if err == nil || httpCalls.Load() != 0 {
+						t.Fatalf("unsafe HTTP replay: err=%v calls=%d", err, httpCalls.Load())
+					}
+					return
+				}
+				if err != nil || httpCalls.Load() != 1 || !strings.Contains(string(out), "normal fallback ok") {
+					t.Fatalf("normal HTTP recovery: err=%v calls=%d", err, httpCalls.Load())
+				}
+				body := <-capturedHTTP
+				for _, key := range []string{"input", "instructions", "tools", "prompt_cache_key"} {
+					if gjson.GetBytes(body, key).Raw != gjson.GetBytes(payload, key).Raw {
+						t.Errorf("HTTP changed original %s", key)
+					}
+				}
+				if tier := gjson.GetBytes(body, "service_tier").String(); tier != "default" {
+					t.Errorf("normal fallback service_tier=%q, want default", tier)
+				}
+			})
+		}
+	}
+}
+
 type captureCodexFallbackUsage struct {
 	model   string
 	records chan usage.Record
