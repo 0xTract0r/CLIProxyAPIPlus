@@ -980,7 +980,7 @@ func TestCodexWebsocketsExecuteStreamMapsMessageTooBigClose(t *testing.T) {
 		ResponseFormat: sdktranslator.FromString("openai-response"),
 	}
 
-	result, err := exec.ExecuteStream(context.Background(), auth, req, opts)
+	result, err := exec.ExecuteStream(cliproxyexecutor.WithDownstreamWebsocket(context.Background()), auth, req, opts)
 	if err != nil {
 		t.Fatalf("ExecuteStream() error = %v", err)
 	}
