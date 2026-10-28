@@ -128,6 +128,11 @@ func codexTerminalFailureStatus(body []byte) int {
 	errorType := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "error.type").String()))
 	errorCode := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "error.code").String()))
 	switch {
+	case errorCode == "websocket_connection_limit_reached":
+		// Connection pressure is temporary upstream unavailability, not a bad
+		// request or exhausted plan quota. Reuse transient cooldown scheduling
+		// for subsequent requests without replaying this response's frames.
+		return http.StatusServiceUnavailable
 	case errorType == "invalid_request_error", errorType == "bad_request_error":
 		return http.StatusBadRequest
 	case errorType == "authentication_error", errorCode == "invalid_api_key", errorCode == "unauthorized":
@@ -167,6 +172,9 @@ func codexTerminalFailureBody(eventData []byte) ([]byte, bool) {
 }
 
 func codexTerminalStreamErrShouldHandle(body []byte) bool {
+	if isCodexWebsocketConnectionPressure(body) {
+		return false
+	}
 	if codexTerminalErrorIsContextLength(body) {
 		return true
 	}
@@ -175,6 +183,10 @@ func codexTerminalStreamErrShouldHandle(body []byte) bool {
 	}
 	code, _, ok := codexStatusErrorClassification(http.StatusBadRequest, body)
 	return ok && code == "thinking_signature_invalid"
+}
+
+func isCodexWebsocketConnectionPressure(body []byte) bool {
+	return strings.EqualFold(strings.TrimSpace(gjson.GetBytes(body, "error.code").String()), "websocket_connection_limit_reached")
 }
 
 func codexTerminalErrorBody(eventData []byte, path string) []byte {
@@ -259,7 +271,7 @@ func newCodexStatusErr(statusCode int, body []byte, headers ...http.Header) stat
 		respHeaders = headers[0]
 	}
 	errCode := statusCode
-	if isCodexModelCapacityError(body) || isCodexUsageLimitError(body) {
+	if !isCodexWebsocketConnectionPressure(body) && (isCodexModelCapacityError(body) || isCodexUsageLimitError(body)) {
 		errCode = http.StatusTooManyRequests
 	}
 	body = classifyCodexStatusError(errCode, body)

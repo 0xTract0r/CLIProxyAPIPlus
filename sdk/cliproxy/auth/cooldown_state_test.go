@@ -20,6 +20,54 @@ type recordingCooldownStateStore struct {
 	load      []CooldownStateRecord
 }
 
+func TestManagerConnectionPressureTransientRecovery(t *testing.T) {
+	for _, model := range []string{"gpt-6.1-sol", ""} {
+		for _, disabled := range []bool{false, true} {
+			name := model
+			if disabled {
+				name += "/disabled"
+			}
+			t.Run(name, func(t *testing.T) {
+				manager := NewManager(nil, nil, nil)
+				manager.SetConfig(&internalconfig.Config{DisableCooling: disabled})
+				ctx := WithSkipPersist(context.Background())
+				a := &Auth{ID: "connection-pressure-fixture", Provider: "codex", Status: StatusActive}
+				if _, err := manager.Register(ctx, a); err != nil {
+					t.Fatal(err)
+				}
+				now := time.Now()
+				manager.MarkResult(ctx, Result{AuthID: a.ID, Provider: "codex", Model: model, Error: &Error{
+					HTTPStatus: 503, Message: `{"error":{"type":"invalid_request_error","code":"websocket_connection_limit_reached"}}`,
+				}})
+				got, _ := manager.GetByID(a.ID)
+				next, quota := got.NextRetryAfter, got.Quota
+				if model != "" {
+					s := got.ModelStates[model]
+					if s == nil {
+						t.Fatal("missing model failure state")
+					}
+					next, quota = s.NextRetryAfter, s.Quota
+				}
+				if disabled && !next.IsZero() || !disabled && !next.After(now) {
+					t.Fatalf("cooldown disabled=%v, next=%v, now=%v", disabled, next, now)
+				}
+				if quota.Exceeded || got.AutoQuarantined {
+					t.Fatal("connection pressure must not exhaust quota or quarantine auth")
+				}
+				manager.MarkResult(ctx, Result{AuthID: a.ID, Provider: "codex", Model: model, Success: true})
+				got, _ = manager.GetByID(a.ID)
+				next = got.NextRetryAfter
+				if model != "" {
+					next = got.ModelStates[model].NextRetryAfter
+				}
+				if !next.IsZero() {
+					t.Fatal("successful request did not clear transient cooldown")
+				}
+			})
+		}
+	}
+}
+
 func (s *recordingCooldownStateStore) Load(context.Context) ([]CooldownStateRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
