@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -18,6 +19,72 @@ type recordingCooldownStateStore struct {
 	mu        sync.Mutex
 	records   []CooldownStateRecord
 	load      []CooldownStateRecord
+}
+
+func TestManagerExplicitConnectionLimitCoolsWithoutChangingRequestRetry(t *testing.T) {
+	for _, status := range []int{400, 429, 503} {
+		for _, model := range []string{"gpt-6.1-sol", ""} {
+			for _, disabled := range []bool{false, true} {
+				t.Run(fmt.Sprintf("status=%d/model=%s/disabled=%t", status, model, disabled), func(t *testing.T) {
+					manager := NewManager(nil, nil, nil)
+					manager.SetConfig(&internalconfig.Config{DisableCooling: disabled})
+					ctx := WithSkipPersist(context.Background())
+					a := &Auth{ID: "explicit-pressure", Provider: "codex", ProxyURL: "direct", Status: StatusActive}
+					if _, err := manager.Register(ctx, a); err != nil {
+						t.Fatal(err)
+					}
+					original := &Error{HTTPStatus: status, Message: `{"error":{"type":"invalid_request_error","code":"websocket_connection_limit_reached"}}`}
+					converted := resultErrorFromError(original)
+					if converted.HTTPStatus != status || original.Code != "" {
+						t.Fatal("cooldown classification changed the original wire error")
+					}
+					if status == 400 && !isRequestInvalidError(original) {
+						t.Fatal("current request must still stop rather than replay a submitted generation")
+					}
+					before := time.Now()
+					manager.MarkResult(ctx, Result{AuthID: a.ID, Provider: "codex", Model: model, Error: converted})
+					got, _ := manager.GetByID(a.ID)
+					next, quota := got.NextRetryAfter, got.Quota
+					if model != "" {
+						state := got.ModelStates[model]
+						if state == nil {
+							t.Fatal("explicit connection pressure was discarded as request-scoped")
+						}
+						next, quota = state.NextRetryAfter, state.Quota
+					}
+					if disabled && !next.IsZero() || !disabled && !next.After(before) {
+						t.Fatalf("disabled=%t retry=%v", disabled, next)
+					}
+					if quota.Exceeded || got.AutoQuarantined {
+						t.Fatal("connection pressure became quota or quarantine")
+					}
+					manager.MarkResult(ctx, Result{AuthID: a.ID, Provider: "codex", Model: model, Success: true})
+					got, _ = manager.GetByID(a.ID)
+					next = got.NextRetryAfter
+					if model != "" {
+						next = got.ModelStates[model].NextRetryAfter
+					}
+					if !next.IsZero() {
+						t.Fatal("success did not clear pressure cooldown")
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestConnectionPressureClassificationDoesNotOverrideRequestScope(t *testing.T) {
+	for _, source := range []*Error{
+		{HTTPStatus: 400, Message: `{"error":{"type":"invalid_request_error","code":"invalid_value","message":"websocket_connection_limit_reached"}}`},
+		{Code: requestScopedErrorCode, HTTPStatus: 400, Message: `{"error":{"code":"websocket_connection_limit_reached"}}`},
+	} {
+		if got := resultErrorFromError(source); !got.IsRequestScoped() {
+			t.Fatalf("explicit request scope changed: %#v", got)
+		}
+	}
+	if got := resultErrorFromError(&Error{HTTPStatus: 401, Message: `{"error":{"code":"websocket_connection_limit_reached"}}`}); statusCodeFromResult(got) != 401 {
+		t.Fatalf("explicit authentication status changed: %#v", got)
+	}
 }
 
 func TestManagerConnectionPressureTransientRecovery(t *testing.T) {

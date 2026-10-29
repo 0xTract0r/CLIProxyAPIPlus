@@ -5,11 +5,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -90,7 +92,22 @@ func (e *CodexWebsocketsExecutor) dialCodexWebsocket(ctx context.Context, auth *
 			_ = conn.Close()
 			conn = nil
 		}
+		helps.LogWithRequestID(ctx).Info("codex websocket setup outcome=context_done")
 		return nil, nil, resp, ctx.Err()
+	}
+	if err != nil {
+		failureClass := codexWebsocketSetupFailureClass(err)
+		if resp != nil {
+			helps.LogWithRequestID(ctx).Infof("codex websocket setup outcome=upstream_rejection status=%d", resp.StatusCode)
+		} else if failureClass != "" {
+			// No WebSocket has been established and no response.create was sent.
+			// Reuse transient credential scheduling after the existing uTLS retry
+			// budget, without adding retries or replaying an active generation.
+			helps.LogWithRequestID(ctx).Infof("codex websocket setup outcome=transport_error class=%s status=503", failureClass)
+			err = codexWebsocketSetupError{cause: err}
+		} else {
+			helps.LogWithRequestID(ctx).Info("codex websocket setup outcome=failed class=other")
+		}
 	}
 	closer := newWebsocketConnectionCloser(conn)
 	if conn != nil {
@@ -109,6 +126,37 @@ func (e *CodexWebsocketsExecutor) dialCodexWebsocket(ctx context.Context, auth *
 		startCodexWebsocketHeartbeat(closer, codexResponsesWebsocketPingInterval)
 	}
 	return conn, closer, resp, err
+}
+
+type codexWebsocketSetupError struct{ cause error }
+
+func (codexWebsocketSetupError) Error() string {
+	return `{"error":{"message":"upstream websocket connection temporarily unavailable","type":"server_error","code":"upstream_connection_error"}}`
+}
+func (e codexWebsocketSetupError) Unwrap() error { return e.cause }
+func (codexWebsocketSetupError) StatusCode() int { return http.StatusServiceUnavailable }
+
+func codexWebsocketSetupFailureClass(err error) string {
+	if err == nil || errors.Is(err, context.Canceled) {
+		return ""
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		if strings.Contains(strings.ToLower(err.Error()), "socks") {
+			return "proxy_connect_eof"
+		}
+		return "eof"
+	}
+	var networkError net.Error
+	if errors.Is(err, context.DeadlineExceeded) || errors.As(err, &networkError) && networkError.Timeout() {
+		return "timeout"
+	}
+	if errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE) {
+		return "connection_reset"
+	}
+	if errors.Is(err, syscall.ECONNREFUSED) {
+		return "connection_refused"
+	}
+	return ""
 }
 
 // Control writes may run alongside the single data writer. Closing the owning
