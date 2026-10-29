@@ -1501,7 +1501,13 @@ func resultErrorFromError(err error) *Error {
 	if resultErr.HTTPStatus == 0 {
 		resultErr.HTTPStatus = statusCodeFromError(err)
 	}
-	if isRequestScopedError(err) || isRequestInvalidError(err) {
+	if isRequestScopedError(err) {
+		resultErr.Code = requestScopedErrorCode
+	} else if isWebsocketConnectionLimitResultError(resultErr) {
+		// This is scheduling metadata only. Keep the original status and the
+		// current request's no-retry decision, including explicit upstream 400s.
+		resultErr.Code = "websocket_connection_limit_reached"
+	} else if isRequestInvalidError(err) {
 		resultErr.Code = requestScopedErrorCode
 	}
 	return resultErr
@@ -1564,7 +1570,34 @@ func statusCodeFromResult(err *Error) int {
 	if err == nil {
 		return 0
 	}
+	if isWebsocketConnectionLimitResultError(err) {
+		return http.StatusServiceUnavailable
+	}
 	return err.StatusCode()
+}
+
+func isWebsocketConnectionLimitResultError(err *Error) bool {
+	if err == nil || (err.HTTPStatus != 400 && err.HTTPStatus != 429 && err.HTTPStatus != 503) {
+		return false
+	}
+	if err.Code != "" {
+		return err.Code == "websocket_connection_limit_reached"
+	}
+	var body struct {
+		Error json.RawMessage `json:"error"`
+	}
+	if json.Unmarshal([]byte(err.Message), &body) != nil {
+		return false
+	}
+	var detail struct {
+		Code string `json:"code"`
+		Type string `json:"type"`
+	}
+	if json.Unmarshal(body.Error, &detail) == nil {
+		return detail.Code == "websocket_connection_limit_reached" || detail.Type == "websocket_connection_limit_reached"
+	}
+	var code string
+	return json.Unmarshal(body.Error, &code) == nil && code == "websocket_connection_limit_reached"
 }
 
 func isModelSupportErrorMessage(message string) bool {
