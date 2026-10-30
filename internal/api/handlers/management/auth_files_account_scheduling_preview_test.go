@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -98,6 +99,7 @@ func TestPreviewAccountSchedulingReadOnlyRuntimeAndFiles(t *testing.T) {
 	h := &Handler{cfg: cfg, authManager: m}
 	a, _ := m.GetByID("acct.json")
 	beforeAuth := m.List()
+	sort.Slice(beforeAuth, func(i, j int) bool { return beforeAuth[i].ID < beforeAuth[j].ID })
 	beforeFiles := previewTree(t, cfg.AuthDir)
 	beforePacing := m.WarmupTrafficPacingSnapshot(a.ID)
 	if beforePacing.RequestBalance == nil || *beforePacing.RequestBalance <= 0 {
@@ -113,8 +115,17 @@ func TestPreviewAccountSchedulingReadOnlyRuntimeAndFiles(t *testing.T) {
 			t.Fatal(w.Code, w.Body.String())
 		}
 	}
-	if !reflect.DeepEqual(beforeAuth, m.List()) || !reflect.DeepEqual(beforeFiles, previewTree(t, cfg.AuthDir)) || !reflect.DeepEqual(beforePacing, m.WarmupTrafficPacingSnapshot(a.ID)) {
-		t.Fatal("preview changed auth/UpdatedAt, durable files, usage or pacing balance/leases")
+	// Manager.List来自map，列表顺序不属于只读不变量；逐账号完整字段仍须保持一致。
+	afterAuth := m.List()
+	sort.Slice(afterAuth, func(i, j int) bool { return afterAuth[i].ID < afterAuth[j].ID })
+	if !reflect.DeepEqual(beforeAuth, afterAuth) {
+		t.Fatal("preview changed auth/UpdatedAt or usage")
+	}
+	if !reflect.DeepEqual(beforeFiles, previewTree(t, cfg.AuthDir)) {
+		t.Fatal("preview changed durable files or modification times")
+	}
+	if !reflect.DeepEqual(beforePacing, m.WarmupTrafficPacingSnapshot(a.ID)) {
+		t.Fatal("preview changed pacing balance or leases")
 	}
 	if hook.updates.Load() != 0 || h.managedHeaderScheduler != nil || h.reloadGeneration != 0 {
 		t.Fatal("preview published an auth/config update or scheduled header refresh")
