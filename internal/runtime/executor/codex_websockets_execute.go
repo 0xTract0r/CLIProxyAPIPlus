@@ -36,7 +36,22 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 
 	reporter := helps.NewExecutorUsageReporter(ctx, e, baseModel, auth)
 	reporter.SetWebsocketTelemetry()
-	defer reporter.TrackFailure(ctx, &err)
+	httpFallbackAllowed, httpFallbackStarted, receivedMainResponse := false, false, false
+	wsBudget, wsMessageBytes, wsPhase := codexFastWebsocketMessageBytes(), 0, "prepare"
+	defer func() {
+		if !httpFallbackStarted {
+			reporter.TrackFailure(ctx, &err)
+		}
+	}()
+	// Connection cleanup/unlock executes before HTTP; only HTTP owns its outcome.
+	defer func() {
+		if httpFallbackAllowed && !receivedMainResponse && ctx.Err() == nil && isCodexWebsocketMessageTooBig(err) {
+			httpFallbackStarted = true
+			logCodexFastTransport(ctx, wsPhase, "http_upstream_1009", wsMessageBytes, wsBudget)
+			resp, err = e.httpFallbackExecutor().Execute(ctx, auth, req, opts)
+			err = scopedCodexHTTPFallbackError(err)
+		}
+	}()
 
 	from := opts.SourceFormat
 	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
@@ -95,6 +110,20 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	e.persistCodexDeviceHighWater(ctx, auth)
 	applyModelHeaderOverrides(wsHeaders, baseModel)
 	applyCodexIdentityConfuseHeaders(wsHeaders, &identityState)
+	httpFallbackAllowed = codexHTTPFallbackAllowed(ctx, req, opts, upstreamBody)
+	if httpFallbackAllowed {
+		mainBody := buildCodexWebsocketRequestBody(upstreamBody)
+		if fastEnabled {
+			mainBody = buildCodexWebsocketFastMainBody(upstreamBody, "")
+			if prewarmBody := buildCodexWebsocketPrewarmBody(upstreamBody); len(prewarmBody) > len(mainBody) {
+				mainBody = prewarmBody
+			}
+		}
+		if codexFastWebsocketSizeGate(ctx, mainBody, wsBudget, "prepare") {
+			httpFallbackStarted = true
+			return e.httpFallbackExecutor().Execute(ctx, auth, req, opts)
+		}
+	}
 
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
@@ -111,20 +140,16 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		// per-conversation id. Scoped to the fast path only.
 		executionSessionID = codexFastSessionFallbackID(opts, req)
 	}
+	lease, errLease := e.acquireSessionLease(ctx, executionSessionID, auth, wsURL, codexFastIndependentRequest(ctx, req, opts, upstreamBody, fastEnabled))
+	if errLease != nil {
+		return resp, errLease
+	}
 	var sess *codexWebsocketSession
-	sessionLocked := false
-	unlockSession := func() {
-		if sess != nil && sessionLocked {
-			sess.reqMu.Unlock()
-			sessionLocked = false
-		}
+	if lease != nil {
+		sess = lease.session
 	}
-	if executionSessionID != "" {
-		sess = e.getOrCreateSession(executionSessionID, auth, wsURL)
-		sess.reqMu.Lock()
-		sessionLocked = true
-		defer unlockSession()
-	}
+	unlockSession := func() { lease.release() }
+	defer unlockSession()
 
 	wsReqBody := buildCodexWebsocketRequestBody(upstreamBody)
 	wsReqLog := helps.UpstreamRequestLog{
@@ -161,6 +186,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 			if opts.ExecutionLifecycle != nil || cliproxyexecutor.DownstreamWebsocket(ctx) {
 				return resp, statusErr{code: respHS.StatusCode, msg: string(bodyErr)}
 			}
+			unlockSession()
 			return e.CodexExecutor.Execute(ctx, auth, req, opts)
 		}
 		if respHS != nil && respHS.StatusCode > 0 {
@@ -170,8 +196,8 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		return resp, errDial
 	}
 	if errBind := sess.bindExecutionLifecycle(opts, conn, closer, req.Model); errBind != nil {
-		unlockSession()
 		closeWebsocketAfterBindFailure(sess, conn, closer)
+		unlockSession()
 		return resp, errBind
 	}
 	recordAPIWebsocketHandshake(ctx, e.cfg, respHS)
@@ -204,13 +230,19 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		}()
 	}
 
-	// Codex fast: run the generate:false prewarm -> main turn link on this same
-	// connection (the necessary condition for upstream priority). Fail-closed: a
-	// prewarm error aborts the turn (the deferred close/unlock/clearActive above and
-	// the sess==nil close defer handle teardown).
+	if httpFallbackAllowed {
+		recoveryCloser := closer
+		stopCancel := context.AfterFunc(ctx, func() { _ = recoveryCloser.Close() })
+		defer stopCancel()
+	}
+	// Preserve the preferred Fast WS prewarm/turn link for eligible small requests.
 	if fastEnabled {
+		wsPhase, wsMessageBytes = "prewarm", len(buildCodexWebsocketPrewarmBody(upstreamBody))
 		prewarmID, errPrewarm := e.runCodexFastPrewarm(ctx, sess, conn, readCh, upstreamBody, identityState)
 		if errPrewarm != nil {
+			if ctx.Err() != nil {
+				errPrewarm = ctx.Err()
+			}
 			if sess != nil {
 				e.invalidateUpstreamConn(sess, conn, "fast_prewarm_error", errPrewarm)
 			}
@@ -218,6 +250,17 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 			return resp, errPrewarm
 		}
 		wsReqBody = buildCodexWebsocketFastMainBody(upstreamBody, prewarmID)
+		if httpFallbackAllowed && codexFastWebsocketSizeGate(ctx, wsReqBody, wsBudget, "main") {
+			httpFallbackStarted = true
+			if sess != nil {
+				e.invalidateUpstreamConn(sess, conn, "http_size_gate", nil)
+				sess.clearActive(conn, readCh)
+			} else {
+				_ = closer.Close()
+			}
+			unlockSession()
+			return e.httpFallbackExecutor().Execute(ctx, auth, req, opts)
+		}
 		helps.RecordAPIWebsocketRequest(ctx, e.cfg, helps.UpstreamRequestLog{
 			URL:       wsURL,
 			Method:    "WEBSOCKET",
@@ -231,6 +274,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		})
 	}
 
+	wsPhase, wsMessageBytes = "main", len(wsReqBody)
 	if errSend := writeCodexWebsocketMessage(sess, conn, wsReqBody); errSend != nil {
 		errSend = mapCodexWebsocketWriteError(sess, conn, errSend)
 		if sess != nil {
@@ -258,8 +302,8 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 				closer = closerRetry
 				if errBind := sess.bindExecutionLifecycle(opts, conn, closer, req.Model); errBind != nil {
 					clearRetryActiveState(sess, previousConn, previousReadCh)
-					unlockSession()
 					closeWebsocketAfterBindFailure(sess, conn, closer)
+					unlockSession()
 					return resp, errBind
 				}
 				readCh = sess.activate(conn)
@@ -304,10 +348,14 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		}
 		msgType, payload, errRead := readCodexWebsocketMessage(ctx, sess, conn, readCh)
 		if errRead != nil {
+			if ctx.Err() != nil {
+				errRead = ctx.Err()
+			}
 			mappedErr := mapCodexWebsocketReadError(errRead)
 			helps.RecordAPIWebsocketError(ctx, e.cfg, "read", mappedErr)
 			return resp, mappedErr
 		}
+		receivedMainResponse = true
 		if msgType != websocket.TextMessage {
 			if msgType == websocket.BinaryMessage {
 				err = fmt.Errorf("codex websockets executor: unexpected binary message")
@@ -342,8 +390,8 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		}
 		if streamErr, terminalBody, ok := codexTerminalFailureErr(payload); ok {
 			if sess != nil {
-				unlockSession()
 				e.invalidateUpstreamConn(sess, conn, "terminal_failure", streamErr)
+				unlockSession()
 			}
 			if errClearReplay := clearCodexReasoningReplayOnInvalidSignature(ctx, replayScope, streamErr.StatusCode(), terminalBody); errClearReplay != nil {
 				return resp, errClearReplay

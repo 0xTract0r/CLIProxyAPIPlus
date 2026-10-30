@@ -13,10 +13,80 @@ import (
 
 // FileBodySource stores large log sections as ordered temp-file parts.
 type FileBodySource struct {
-	mu      sync.Mutex
-	dir     string
-	paths   []string
-	cleaned bool
+	mu                   sync.Mutex
+	dir                  string
+	paths                []string
+	cleaned              bool
+	timelineFile         *os.File
+	timelineWriter       io.Writer
+	timelineWritten      int64
+	failedTimelineLimits map[string]int64
+	timelineHasPart      bool
+}
+
+func (s *FileBodySource) closeTimelineLocked() error {
+	if s.timelineFile == nil {
+		return nil
+	}
+	errClose := s.timelineFile.Close()
+	s.timelineFile = nil
+	s.timelineWriter = nil
+	s.timelineWritten = 0
+	s.timelineHasPart = false
+	return errClose
+}
+
+// AppendTimelinePart keeps adjacent timeline events in one ordered file.
+// Its separators match AppendPart followed by WriteTo; other parts stay separate.
+func (s *FileBodySource) AppendTimelinePart(data []byte) error {
+	data = bytes.TrimSpace(data)
+	if len(data) == 0 {
+		return nil
+	}
+	if s == nil {
+		return fmt.Errorf("file body source is nil")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.cleaned {
+		return fmt.Errorf("file body source has been cleaned")
+	}
+	if s.timelineFile != nil {
+		if _, errStat := os.Stat(s.timelineFile.Name()); errStat != nil {
+			if errClose := s.closeTimelineLocked(); errClose != nil {
+				return errClose
+			}
+		}
+	}
+	if s.timelineFile == nil {
+		if errMkdir := os.MkdirAll(s.dir, 0755); errMkdir != nil {
+			return errMkdir
+		}
+		file, errCreate := os.CreateTemp(s.dir, "timeline-*.tmp")
+		if errCreate != nil {
+			return errCreate
+		}
+		s.timelineFile = file
+		s.timelineWriter = file
+		s.paths = append(s.paths, file.Name())
+	}
+	start := s.timelineWritten
+	if errWrite := writeLogPart(s.timelineWriter, data, s.timelineHasPart); errWrite != nil {
+		// Do not leave a partial event duplicated by the memory fallback.
+		if s.failedTimelineLimits == nil {
+			s.failedTimelineLimits = make(map[string]int64)
+		}
+		s.failedTimelineLimits[s.timelineFile.Name()] = start
+		_ = s.timelineFile.Truncate(start)
+		_ = s.closeTimelineLocked()
+		return errWrite
+	}
+	s.timelineWritten += int64(len(data) + 1)
+	if s.timelineHasPart {
+		s.timelineWritten++
+	}
+	s.timelineHasPart = true
+	return nil
 }
 
 // NewFileBodySourceInDir creates a temp-backed source under baseDir.
@@ -73,6 +143,9 @@ func (s *FileBodySource) CreatePart(prefix string) (*os.File, error) {
 	if s.cleaned {
 		return nil, fmt.Errorf("file body source has been cleaned")
 	}
+	if errClose := s.closeTimelineLocked(); errClose != nil {
+		return nil, errClose
+	}
 	prefix = sanitizeTempPrefix(prefix)
 	if errMkdir := os.MkdirAll(s.dir, 0755); errMkdir != nil {
 		return nil, errMkdir
@@ -116,6 +189,9 @@ func (s *FileBodySource) AppendBytes(data []byte) error {
 	defer s.mu.Unlock()
 	if s.cleaned {
 		return fmt.Errorf("file body source has been cleaned")
+	}
+	if errClose := s.closeTimelineLocked(); errClose != nil {
+		return errClose
 	}
 	if errMkdir := os.MkdirAll(s.dir, 0755); errMkdir != nil {
 		return errMkdir
@@ -171,7 +247,13 @@ func (s *FileBodySource) WriteTo(w io.Writer) error {
 	if s == nil || w == nil {
 		return nil
 	}
-	paths := s.Paths()
+	s.mu.Lock()
+	paths := append([]string(nil), s.paths...)
+	limits := make(map[string]int64, len(s.failedTimelineLimits))
+	for path, limit := range s.failedTimelineLimits {
+		limits[path] = limit
+	}
+	s.mu.Unlock()
 	wrote := false
 	for _, path := range paths {
 		file, errOpen := os.Open(path)
@@ -189,7 +271,11 @@ func (s *FileBodySource) WriteTo(w io.Writer) error {
 				return errWrite
 			}
 		}
-		_, errCopy := io.Copy(w, file)
+		var reader io.Reader = file
+		if limit, exists := limits[path]; exists {
+			reader = io.LimitReader(file, limit)
+		}
+		_, errCopy := io.Copy(w, reader)
 		if errClose := file.Close(); errClose != nil {
 			log.WithError(errClose).Warn("failed to close log part file")
 			if errCopy == nil {
@@ -223,6 +309,7 @@ func (s *FileBodySource) Cleanup() error {
 		s.mu.Unlock()
 		return nil
 	}
+	firstErr := s.closeTimelineLocked()
 	paths := make([]string, len(s.paths))
 	copy(paths, s.paths)
 	dir := s.dir
@@ -230,7 +317,6 @@ func (s *FileBodySource) Cleanup() error {
 	s.cleaned = true
 	s.mu.Unlock()
 
-	var firstErr error
 	for _, path := range paths {
 		if errRemove := os.Remove(path); errRemove != nil && !os.IsNotExist(errRemove) && firstErr == nil {
 			firstErr = errRemove

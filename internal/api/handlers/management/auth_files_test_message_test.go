@@ -3,10 +3,12 @@ package management
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
@@ -47,6 +49,112 @@ func (e *testMessageCaptureExecutor) CountTokens(context.Context, *coreauth.Auth
 
 func (e *testMessageCaptureExecutor) HttpRequest(context.Context, *coreauth.Auth, *http.Request) (*http.Response, error) {
 	return nil, nil
+}
+
+type testMessagePacingExecutor struct {
+	testMessageCaptureExecutor
+	sends int
+}
+
+func (*testMessagePacingExecutor) SupportsHTTPAttemptGate() bool { return true }
+
+func (e *testMessagePacingExecutor) Execute(ctx context.Context, auth *coreauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	gate := cliproxyexecutor.HTTPAttemptGateFromContext(ctx)
+	if gate == nil {
+		return cliproxyexecutor.Response{}, errors.New("test message bypassed pacing gate")
+	}
+	permit, err := gate.Before(ctx, cliproxyexecutor.HTTPAttemptInfo{Provider: "claude", Model: req.Model, EstimateKnown: true})
+	if err != nil {
+		return cliproxyexecutor.Response{}, &cliproxyexecutor.HTTPAttemptGateError{Cause: err}
+	}
+	if err := permit.MarkSent(ctx); err != nil {
+		_ = permit.CancelUnsent(ctx)
+		return cliproxyexecutor.Response{}, &cliproxyexecutor.HTTPAttemptGateError{Cause: err}
+	}
+	e.sends++
+	resp, err := e.testMessageCaptureExecutor.Execute(ctx, auth, req, opts)
+	if errFinish := permit.Finish(ctx, cliproxyexecutor.HTTPAttemptResult{Complete: true, StatusCode: http.StatusOK}); errFinish != nil {
+		return cliproxyexecutor.Response{}, errFinish
+	}
+	return resp, err
+}
+
+func TestTestAuthFileMessageWarmingClaudePacing(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+	now := time.Now()
+	cfg := &config.Config{AuthDir: t.TempDir(), AccountScheduling: config.DefaultAccountSchedulingConfig()}
+	cfg.AccountScheduling.WarmupTrafficPacing.Enabled = true
+	cfg.AccountScheduling.WarmupTrafficPacing.RequestBurst = 2
+	cfg.AccountScheduling.WarmupTrafficPacing.MinAdmissionRequests = 1
+	for i := range cfg.AccountScheduling.WarmupCurve {
+		cfg.AccountScheduling.WarmupCurve[i].DailyBudget = 2
+		cfg.AccountScheduling.WarmupCurve[i].RPMLimit = 100
+	}
+	selector := coreauth.NewAdaptiveSelector(coreauth.AdaptiveSelectorConfig{Scheduling: cfg.AccountScheduling, SessionAffinity: true}, coreauth.WithAdaptiveClock(func() time.Time { return now }))
+	t.Cleanup(selector.Stop)
+	manager := coreauth.NewManager(nil, selector, nil)
+	manager.SetConfig(cfg)
+	t.Cleanup(func() { coreauth.RegisterAccountPacingUsageSink(nil) })
+	executor := &testMessagePacingExecutor{testMessageCaptureExecutor: testMessageCaptureExecutor{provider: "claude"}}
+	manager.RegisterExecutor(executor)
+	const model = "claude-test-message-pacing"
+	ids := []string{"claude-probe-one.json", "claude-probe-two.json"}
+	for _, id := range ids {
+		registry.GetGlobalRegistry().RegisterClient(id, "claude", []*registry.ModelInfo{{ID: model}})
+		t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(id) })
+		_, err := manager.Register(context.Background(), &coreauth.Auth{
+			ID: id, FileName: id, Provider: "claude", Status: coreauth.StatusActive, ProxyURL: "http://proxy.invalid:8080",
+			Metadata: map[string]any{
+				"type":               "claude",
+				"account_scheduling": map[string]any{"first_production_at": now.Add(-time.Hour).UTC().Format(time.RFC3339)},
+				"quota_snapshot":     map[string]any{"profile": map[string]any{"organization": map[string]any{"rate_limit_tier": "default_claude_max_5x"}}},
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	now = now.Add(24 * time.Hour)
+	h := NewHandlerWithoutConfigFilePath(cfg, manager)
+	probe := func(ctx context.Context, id string) *httptest.ResponseRecorder {
+		t.Helper()
+		body, _ := json.Marshal(map[string]any{"name": id, "model": model, "message": "Reply OK", "max_tokens": 8})
+		rec := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(rec)
+		c.Request = httptest.NewRequest(http.MethodPost, "/v0/management/auth-files/test-message", strings.NewReader(string(body))).WithContext(ctx)
+		c.Request.Header.Set("Content-Type", "application/json")
+		h.TestAuthFileMessage(c)
+		return rec
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if rec := probe(ctx, ids[0]); rec.Code == http.StatusOK {
+		t.Fatal("cancelled probe succeeded")
+	}
+	cancelled := manager.WarmupTrafficPacingSnapshot(ids[0])
+	if executor.sends != 0 || cancelled.PendingRequests == nil || *cancelled.PendingRequests != 0 || cancelled.Inflight == nil || *cancelled.Inflight != 0 || cancelled.RequestBalance == nil || *cancelled.RequestBalance != 2 {
+		t.Fatalf("cancelled funded probe consumed a reservation: %+v sends=%d", cancelled, executor.sends)
+	}
+	for _, id := range ids {
+		for range 2 {
+			rec := probe(context.Background(), id)
+			if rec.Code != http.StatusOK || executor.authID != id {
+				t.Fatalf("probe %s: status=%d selected=%s body=%s", id, rec.Code, executor.authID, rec.Body.String())
+			}
+			now = now.Add(time.Second)
+		}
+		snapshot := manager.WarmupTrafficPacingSnapshot(id)
+		if snapshot.Rolling24hRequests == nil || *snapshot.Rolling24hRequests != 2 || snapshot.ActiveBindingGroups == nil || *snapshot.ActiveBindingGroups != 1 {
+			t.Fatalf("repeated probes did not share one metered binding: %+v", snapshot)
+		}
+		if rec := probe(context.Background(), id); rec.Code != http.StatusTooManyRequests {
+			t.Fatalf("exhausted probe %s bypassed budget: %d %s", id, rec.Code, rec.Body.String())
+		}
+	}
+	if executor.sends != 4 {
+		t.Fatalf("unexpected actual sends: %d", executor.sends)
+	}
 }
 
 func TestTestAuthFileMessagePinsSelectedAuth(t *testing.T) {

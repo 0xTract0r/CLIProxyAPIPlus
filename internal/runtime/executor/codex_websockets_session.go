@@ -14,11 +14,291 @@ import (
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	log "github.com/sirupsen/logrus"
+	"github.com/tidwall/gjson"
 )
 
 type codexWebsocketSessionStore struct {
-	mu       sync.Mutex
-	sessions map[string]*codexWebsocketSession
+	mu            sync.Mutex
+	sessions      map[string]*codexWebsocketSession
+	leaseChanged  chan struct{}
+	extraByTarget map[string]int
+	extraCount    int
+	leaseSequence uint64
+}
+
+const codexWebsocketExtraPerTarget = 1
+const codexWebsocketExtraGlobal = 8
+
+var errCodexWebsocketSessionClosed = fmt.Errorf("codex websocket session closed")
+
+type codexWebsocketSessionLease struct {
+	once                sync.Once
+	store               *codexWebsocketSessionStore
+	session             *codexWebsocketSession
+	storeKey, targetKey string
+	extra               bool
+}
+
+func (s *codexWebsocketSessionStore) notifyLeaseChangedLocked() {
+	if s.leaseChanged != nil {
+		close(s.leaseChanged)
+	}
+	s.leaseChanged = make(chan struct{})
+}
+
+func (l *codexWebsocketSessionLease) release() {
+	if l == nil {
+		return
+	}
+	l.once.Do(func() {
+		// Return a permit only after its connection has been closed.
+		if l.extra {
+			closeCodexWebsocketSession(l.session, "concurrent_lease_released")
+		}
+		l.session.reqMu.Unlock()
+		l.store.mu.Lock()
+		if l.extra {
+			if l.store.sessions[l.storeKey] == l.session {
+				delete(l.store.sessions, l.storeKey)
+			}
+			l.store.extraCount--
+			l.store.extraByTarget[l.targetKey]--
+			if l.store.extraByTarget[l.targetKey] == 0 {
+				delete(l.store.extraByTarget, l.targetKey)
+			}
+		}
+		l.store.notifyLeaseChangedLocked()
+		l.store.mu.Unlock()
+	})
+}
+
+func codexFastIndependentRequest(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, body []byte, fast bool) bool {
+	independent, reason := codexFastIndependentRequestEligibility(ctx, req, opts, body, fast)
+	helps.LogWithRequestID(ctx).Infof("codex websocket lease eligibility independent=%t reason=%s", independent, reason)
+	return independent
+}
+
+func codexFastIndependentRequestEligibility(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, body []byte, fast bool) (bool, string) {
+	if !fast {
+		return false, "fast_disabled"
+	}
+	if executionSessionIDFromOptions(opts) != "" {
+		return false, "execution_session"
+	}
+	if !codexHTTPFallbackAllowed(ctx, req, opts, body) {
+		return false, "bound_or_incremental_request"
+	}
+	for _, payload := range [][]byte{req.Payload, opts.OriginalRequest, body} {
+		if gjson.GetBytes(payload, "multi_agent.enabled").Bool() {
+			return false, "active_multi_agent"
+		}
+		for _, key := range []string{"conversation", "conversation_id", "response_id", "stream_id"} {
+			if gjson.GetBytes(payload, key).Exists() {
+				return false, "connection_anchor"
+			}
+		}
+	}
+	input := gjson.GetBytes(body, "input")
+	if input.Type == gjson.String {
+		if strings.TrimSpace(input.String()) != "" {
+			return true, "complete_input"
+		}
+		return false, "input_shape"
+	}
+	if !input.IsArray() || len(input.Array()) == 0 {
+		return false, "input_shape"
+	}
+	pending := make(map[string]bool)
+	for _, item := range input.Array() {
+		switch item.Get("type").String() {
+		case "item_reference":
+			return false, "input_reference"
+		case "function_call", "custom_tool_call":
+			id := item.Get("call_id").String()
+			if id == "" || pending[id] {
+				return false, "tool_dependency"
+			}
+			pending[id] = true
+		case "function_call_output", "custom_tool_call_output":
+			id := item.Get("call_id").String()
+			if !pending[id] {
+				return false, "tool_dependency"
+			}
+			delete(pending, id)
+		case "message", "reasoning":
+		case "compaction":
+			if !codexHistoryNonemptyString(item.Get("encrypted_content")) {
+				return false, "compaction_shape"
+			}
+		case "agent_message":
+			if !codexIndependentAgentMessage(item) {
+				return false, "agent_message_shape"
+			}
+		case "additional_tools":
+			if item.Get("role").String() != "developer" || item.Get("role").Type != gjson.String || !codexIndependentToolDeclarations(item.Get("tools")) {
+				return false, "additional_tools_shape"
+			}
+		case "":
+			if !item.IsObject() || !item.Get("role").Exists() || !item.Get("content").Exists() {
+				return false, "input_shape"
+			}
+		default:
+			// Unverified tool/approval items may depend on state held by the base socket.
+			return false, "unknown_input_item"
+		}
+	}
+	if len(pending) != 0 {
+		return false, "tool_dependency"
+	}
+	return true, "complete_input"
+}
+
+func codexHistoryNonemptyString(value gjson.Result) bool {
+	return value.Type == gjson.String && strings.TrimSpace(value.String()) != ""
+}
+
+func codexIndependentAgentMessage(item gjson.Result) bool {
+	if !codexHistoryNonemptyString(item.Get("author")) || !codexHistoryNonemptyString(item.Get("recipient")) {
+		return false
+	}
+	content := item.Get("content")
+	if !content.IsArray() || len(content.Array()) == 0 {
+		return false
+	}
+	for _, part := range content.Array() {
+		switch part.Get("type").String() {
+		case "input_text":
+			if part.Get("text").Type != gjson.String {
+				return false
+			}
+		case "encrypted_content":
+			if !codexHistoryNonemptyString(part.Get("encrypted_content")) {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func codexIndependentToolDeclarations(tools gjson.Result) bool {
+	if !tools.IsArray() || len(tools.Array()) == 0 {
+		return false
+	}
+	for _, tool := range tools.Array() {
+		if !codexHistoryNonemptyString(tool.Get("name")) {
+			return false
+		}
+		if description := tool.Get("description"); description.Exists() && description.Type != gjson.String {
+			return false
+		}
+		if tool.Get("type").String() == "namespace" {
+			children := tool.Get("tools")
+			if !children.IsArray() || len(children.Array()) == 0 {
+				return false
+			}
+			for _, child := range children.Array() {
+				if !codexIndependentLeafToolDeclaration(child) {
+					return false
+				}
+			}
+		} else if !codexIndependentLeafToolDeclaration(tool) {
+			return false
+		}
+	}
+	return true
+}
+
+func codexIndependentLeafToolDeclaration(tool gjson.Result) bool {
+	if !codexHistoryNonemptyString(tool.Get("name")) {
+		return false
+	}
+	if description := tool.Get("description"); description.Exists() && description.Type != gjson.String {
+		return false
+	}
+	switch tool.Get("type").String() {
+	case "function":
+		return tool.Get("parameters").IsObject()
+	case "custom":
+		format := tool.Get("format")
+		switch format.Get("type").String() {
+		case "text":
+			return true
+		case "grammar":
+			return codexHistoryNonemptyString(format.Get("definition")) && (format.Get("syntax").String() == "lark" || format.Get("syntax").String() == "regex")
+		}
+	}
+	return false
+}
+
+func (e *CodexWebsocketsExecutor) acquireSessionLease(ctx context.Context, sessionID string, auth *cliproxyauth.Auth, wsURL string, independent bool) (*codexWebsocketSessionLease, error) {
+	base := e.getOrCreateSession(sessionID, auth, wsURL)
+	if base == nil {
+		return nil, nil
+	}
+	store := e.store
+	if store == nil {
+		store = globalCodexWebsocketSessionStore
+	}
+	proxy := codexWebsocketEffectiveProxyURL(e.cfg, auth)
+	baseKey := codexWebsocketSessionStoreKey(sessionID, auth, wsURL, proxy)
+	targetKey := codexWebsocketSessionStoreKey("fast-concurrent-target", auth, wsURL, proxy)
+	started := time.Now()
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		store.mu.Lock()
+		if store.leaseChanged == nil {
+			store.leaseChanged = make(chan struct{})
+		}
+		changed := store.leaseChanged // Capture before checking availability: no lost wakeups.
+		if store.sessions[baseKey] != base {
+			store.mu.Unlock()
+			return nil, errCodexWebsocketSessionClosed
+		}
+		if base.reqMu.TryLock() {
+			store.mu.Unlock()
+			lease := &codexWebsocketSessionLease{store: store, session: base}
+			if err := ctx.Err(); err != nil {
+				lease.release()
+				return nil, err
+			}
+			helps.LogWithRequestID(ctx).Infof("codex fast websocket lease mode=base wait_ms=%d", time.Since(started).Milliseconds())
+			return lease, nil
+		}
+		if independent && store.extraCount < codexWebsocketExtraGlobal && store.extraByTarget[targetKey] < codexWebsocketExtraPerTarget {
+			if store.extraByTarget == nil {
+				store.extraByTarget = make(map[string]int)
+			}
+			store.leaseSequence++
+			key := fmt.Sprintf("%s|extra:%d", baseKey, store.leaseSequence)
+			authID := ""
+			if auth != nil {
+				authID = auth.ID
+			}
+			sess := newCodexWebsocketSession(sessionID, authID, wsURL)
+			sess.reqMu.Lock()
+			store.sessions[key] = sess
+			store.extraCount++
+			store.extraByTarget[targetKey]++
+			store.mu.Unlock()
+			lease := &codexWebsocketSessionLease{store: store, session: sess, storeKey: key, targetKey: targetKey, extra: true}
+			if err := ctx.Err(); err != nil {
+				lease.release()
+				return nil, err
+			}
+			helps.LogWithRequestID(ctx).Infof("codex fast websocket lease mode=extra wait_ms=%d", time.Since(started).Milliseconds())
+			return lease, nil
+		}
+		store.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-changed:
+		}
+	}
 }
 
 var globalCodexWebsocketSessionStore = &codexWebsocketSessionStore{
@@ -27,6 +307,7 @@ var globalCodexWebsocketSessionStore = &codexWebsocketSessionStore{
 
 type websocketConnectionCloser struct {
 	conn *websocket.Conn
+	done chan struct{}
 	once sync.Once
 	err  error
 }
@@ -35,7 +316,7 @@ func newWebsocketConnectionCloser(conn *websocket.Conn) *websocketConnectionClos
 	if conn == nil {
 		return nil
 	}
-	return &websocketConnectionCloser{conn: conn}
+	return &websocketConnectionCloser{conn: conn, done: make(chan struct{})}
 }
 
 func (c *websocketConnectionCloser) Close() error {
@@ -43,6 +324,9 @@ func (c *websocketConnectionCloser) Close() error {
 		return nil
 	}
 	c.once.Do(func() {
+		if c.done != nil {
+			close(c.done)
+		}
 		c.err = c.conn.Close()
 	})
 	return c.err
@@ -58,6 +342,9 @@ type codexWebsocketSession struct {
 	connCloser      *websocketConnectionCloser
 	wsURL           string
 	authID          string
+	closed          bool
+	closedContext   context.Context
+	closeCancel     context.CancelFunc
 	lifecycleBindMu sync.Mutex
 	lifecycle       cliproxyexecutor.ExecutionLifecycle
 	lifecycleModel  string
@@ -79,11 +366,18 @@ type codexWebsocketSession struct {
 	upstreamDisconnectErr     error
 }
 
+func newCodexWebsocketSession(sessionID, authID, wsURL string) *codexWebsocketSession {
+	closedContext, closeCancel := context.WithCancel(context.Background())
+	return &codexWebsocketSession{sessionID: sessionID, authID: authID, wsURL: wsURL, closedContext: closedContext, closeCancel: closeCancel, upstreamDisconnectCh: make(chan error, 1)}
+}
+
 type codexWebsocketRead struct {
-	conn    *websocket.Conn
-	msgType int
-	payload []byte
-	err     error
+	conn         *websocket.Conn
+	msgType      int
+	payload      []byte
+	err          error
+	arrival      time.Time
+	readDuration time.Duration
 }
 
 func (s *codexWebsocketSession) setActive(conn *websocket.Conn, ch chan codexWebsocketRead) {
@@ -191,7 +485,19 @@ func (s *codexWebsocketSession) configureConn(conn *websocket.Conn) {
 		return
 	}
 	s.resetUpstreamDisconnectError(conn)
+	refreshActiveDeadline := func() error {
+		// Preserve idle-session reclamation: only an active turn may extend
+		// the read deadline on control traffic.
+		if ch, _ := s.activeForConn(conn); ch != nil {
+			return conn.SetReadDeadline(time.Now().Add(codexResponsesWebsocketIdleTimeout))
+		}
+		return nil
+	}
+	conn.SetPongHandler(func(string) error { return refreshActiveDeadline() })
 	conn.SetPingHandler(func(appData string) error {
+		if err := refreshActiveDeadline(); err != nil {
+			return err
+		}
 		s.writeMu.Lock()
 		defer s.writeMu.Unlock()
 		// Reply pongs from the same write lock to avoid concurrent writes.
@@ -470,10 +776,11 @@ func (e *CodexWebsocketsExecutor) getOrCreateSession(sessionID string, keyArgs .
 	if sess, ok := store.sessions[storeKey]; ok && sess != nil {
 		return sess
 	}
-	sess := &codexWebsocketSession{
-		sessionID:            sessionID,
-		upstreamDisconnectCh: make(chan error, 1),
+	authID := ""
+	if auth != nil {
+		authID = auth.ID
 	}
+	sess := newCodexWebsocketSession(sessionID, authID, wsURL)
 	store.sessions[storeKey] = sess
 	return sess
 }
@@ -504,9 +811,14 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *
 	}
 
 	sess.connMu.Lock()
+	if sess.closed {
+		sess.connMu.Unlock()
+		return nil, nil, nil, errCodexWebsocketSessionClosed
+	}
 	conn := sess.conn
 	closer := sess.connCloser
 	readerConn := sess.readerConn
+	closedContext := sess.closedContext
 	sess.connMu.Unlock()
 	if conn != nil {
 		if readerConn != conn {
@@ -519,12 +831,23 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *
 		return conn, closer, nil, nil
 	}
 
-	conn, closer, resp, errDial := e.dialCodexWebsocket(ctx, auth, wsURL, headers)
+	dialCtx, cancelDial := context.WithCancel(ctx)
+	defer cancelDial()
+	if closedContext != nil {
+		stopClose := context.AfterFunc(closedContext, cancelDial)
+		defer stopClose()
+	}
+	conn, closer, resp, errDial := e.dialCodexWebsocket(dialCtx, auth, wsURL, headers)
 	if errDial != nil {
 		return nil, closer, resp, errDial
 	}
 
 	sess.connMu.Lock()
+	if sess.closed {
+		sess.connMu.Unlock()
+		_ = closer.Close()
+		return nil, nil, resp, errCodexWebsocketSessionClosed
+	}
 	if sess.conn != nil {
 		previous := sess.conn
 		previousCloser := sess.connCloser
@@ -553,7 +876,10 @@ func (e *CodexWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession, 
 	}
 	for {
 		_ = conn.SetReadDeadline(time.Now().Add(codexResponsesWebsocketIdleTimeout))
+		readStarted := time.Now()
 		msgType, payload, errRead := conn.ReadMessage()
+		arrival := time.Now()
+		readDuration := arrival.Sub(readStarted)
 		if errRead != nil {
 			invalidate := func() {
 				e.invalidateUpstreamConn(sess, conn, "upstream_disconnected", errRead)
@@ -561,7 +887,7 @@ func (e *CodexWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession, 
 			invalidated := false
 			ch, done := sess.activeForConn(conn)
 			if ch != nil {
-				invalidated = sendTerminalWebsocketRead(ch, done, codexWebsocketRead{conn: conn, err: errRead}, invalidate)
+				invalidated = sendTerminalWebsocketRead(ch, done, codexWebsocketRead{conn: conn, err: errRead, arrival: arrival, readDuration: readDuration}, invalidate)
 				if sess.clearActive(conn, ch) {
 					close(ch)
 				}
@@ -581,7 +907,7 @@ func (e *CodexWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession, 
 				invalidated := false
 				ch, done := sess.activeForConn(conn)
 				if ch != nil {
-					invalidated = sendTerminalWebsocketRead(ch, done, codexWebsocketRead{conn: conn, err: errBinary}, invalidate)
+					invalidated = sendTerminalWebsocketRead(ch, done, codexWebsocketRead{conn: conn, err: errBinary, arrival: arrival, readDuration: readDuration}, invalidate)
 					if sess.clearActive(conn, ch) {
 						close(ch)
 					}
@@ -599,7 +925,7 @@ func (e *CodexWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession, 
 			continue
 		}
 		select {
-		case ch <- codexWebsocketRead{conn: conn, msgType: msgType, payload: payload}:
+		case ch <- codexWebsocketRead{conn: conn, msgType: msgType, payload: payload, arrival: arrival, readDuration: readDuration}:
 		case <-done:
 		}
 	}
@@ -682,6 +1008,7 @@ func (e *CodexWebsocketsExecutor) CloseExecutionSession(sessionID string) {
 		delete(store.sessions, key)
 		sessions = append(sessions, sess)
 	}
+	store.notifyLeaseChangedLocked()
 	store.mu.Unlock()
 
 	for i := range sessions {
@@ -706,6 +1033,7 @@ func (e *CodexWebsocketsExecutor) closeAllExecutionSessions(reason string) {
 			sessions = append(sessions, sess)
 		}
 	}
+	store.notifyLeaseChangedLocked()
 	store.mu.Unlock()
 
 	for i := range sessions {
@@ -727,6 +1055,10 @@ func closeCodexWebsocketSession(sess *codexWebsocketSession, reason string) {
 	}
 
 	sess.connMu.Lock()
+	sess.closed = true
+	if sess.closeCancel != nil {
+		sess.closeCancel()
+	}
 	conn := sess.conn
 	authID := sess.authID
 	wsURL := sess.wsURL
@@ -879,6 +1211,7 @@ func CloseCodexWebsocketSessionsForAuthID(authID string, reason string) {
 		delete(store.sessions, matches[i].sessionID)
 		toClose = append(toClose, current)
 	}
+	store.notifyLeaseChangedLocked()
 	store.mu.Unlock()
 
 	for i := range toClose {

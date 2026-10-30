@@ -106,6 +106,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	})
 	httpClient := helps.NewUtlsHTTPClient(ctx, e.cfg, auth, 0)
 	reporter.SetCodexFastContext(originalPayloadSource, upstreamBody, codexFastEnabled(auth, baseModel))
+	reporter.UseDecodedContentTelemetry()
 	httpClient = reporter.TrackHTTPClient(httpClient)
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
@@ -129,7 +130,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		err = newCodexStatusErr(httpResp.StatusCode, b, httpResp.Header)
 		return resp, err
 	}
-	data, errRead := io.ReadAll(httpResp.Body)
+	data, errRead := io.ReadAll(io.TeeReader(httpResp.Body, reporter.ContentEventObserver()))
 	upstreamData := applyCodexIdentityConfuseResponsePayload(data, identityState)
 	helps.AppendAPIResponseChunk(ctx, e.cfg, upstreamData)
 

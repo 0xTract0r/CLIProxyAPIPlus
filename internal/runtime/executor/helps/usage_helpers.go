@@ -43,7 +43,8 @@ type UsageReporter struct {
 	ttftSet      bool
 	once         sync.Once
 
-	decodedContentTelemetry bool
+	decodedContentTelemetry  bool
+	visibleContentIncomplete bool
 }
 
 type usageExecutor interface {

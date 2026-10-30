@@ -5,10 +5,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -25,6 +28,7 @@ import (
 const (
 	codexResponsesWebsocketBetaHeaderValue = "responses_websockets=2026-02-06"
 	codexResponsesWebsocketIdleTimeout     = 5 * time.Minute
+	codexResponsesWebsocketPingInterval    = 30 * time.Second
 	codexResponsesWebsocketHandshakeTO     = 30 * time.Second
 )
 
@@ -41,14 +45,141 @@ func (e *CodexWebsocketsExecutor) dialCodexWebsocket(ctx context.Context, auth *
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	// Gorilla does not interrupt the HTTP upgrade read on cancellation after
+	// dialing TCP. Keep ownership of that socket only until the handshake ends.
+	var dialMu sync.Mutex
+	var handshakeConn net.Conn
+	handshakeFinished := false
+	wrapDial := func(dial func(context.Context, string, string) (net.Conn, error)) func(context.Context, string, string) (net.Conn, error) {
+		return func(dialCtx context.Context, network, address string) (net.Conn, error) {
+			rawConn, errDial := dial(dialCtx, network, address)
+			if errDial != nil {
+				return nil, errDial
+			}
+			dialMu.Lock()
+			if ctx.Err() != nil {
+				dialMu.Unlock()
+				_ = rawConn.Close()
+				return nil, ctx.Err()
+			}
+			handshakeConn = rawConn
+			dialMu.Unlock()
+			return rawConn, nil
+		}
+	}
+	netDial := dialer.NetDialContext
+	if netDial == nil {
+		netDial = (&net.Dialer{}).DialContext
+	}
+	dialer.NetDialContext = wrapDial(netDial)
+	if dialer.NetDialTLSContext != nil {
+		dialer.NetDialTLSContext = wrapDial(dialer.NetDialTLSContext)
+	}
+	stopCancel := context.AfterFunc(ctx, func() {
+		dialMu.Lock()
+		defer dialMu.Unlock()
+		if !handshakeFinished && handshakeConn != nil {
+			_ = handshakeConn.Close()
+		}
+	})
 	conn, resp, err := dialer.DialContext(ctx, wsURL, headers)
+	stopCancel()
+	dialMu.Lock()
+	handshakeFinished = true
+	dialMu.Unlock()
+	if ctx.Err() != nil {
+		if conn != nil {
+			_ = conn.Close()
+			conn = nil
+		}
+		helps.LogWithRequestID(ctx).Info("codex websocket setup outcome=context_done")
+		return nil, nil, resp, ctx.Err()
+	}
+	if err != nil {
+		failureClass := codexWebsocketSetupFailureClass(err)
+		if resp != nil {
+			helps.LogWithRequestID(ctx).Infof("codex websocket setup outcome=upstream_rejection status=%d", resp.StatusCode)
+		} else if failureClass != "" {
+			// No WebSocket has been established and no response.create was sent.
+			// Reuse transient credential scheduling after the existing uTLS retry
+			// budget, without adding retries or replaying an active generation.
+			helps.LogWithRequestID(ctx).Infof("codex websocket setup outcome=transport_error class=%s status=503", failureClass)
+			err = codexWebsocketSetupError{cause: err}
+		} else {
+			helps.LogWithRequestID(ctx).Info("codex websocket setup outcome=failed class=other")
+		}
+	}
 	closer := newWebsocketConnectionCloser(conn)
 	if conn != nil {
 		// Avoid gorilla/websocket flate tail validation issues on some upstreams/Go versions.
 		// Negotiating permessage-deflate is fine; we just don't compress outbound messages.
 		conn.EnableWriteCompression(false)
+		conn.SetPingHandler(func(appData string) error {
+			if err := conn.SetReadDeadline(time.Now().Add(codexResponsesWebsocketIdleTimeout)); err != nil {
+				return err
+			}
+			return conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(10*time.Second))
+		})
+		conn.SetPongHandler(func(string) error {
+			return conn.SetReadDeadline(time.Now().Add(codexResponsesWebsocketIdleTimeout))
+		})
+		startCodexWebsocketHeartbeat(closer, codexResponsesWebsocketPingInterval)
 	}
 	return conn, closer, resp, err
+}
+
+type codexWebsocketSetupError struct{ cause error }
+
+func (codexWebsocketSetupError) Error() string {
+	return `{"error":{"message":"upstream websocket connection temporarily unavailable","type":"server_error","code":"upstream_connection_error"}}`
+}
+func (e codexWebsocketSetupError) Unwrap() error { return e.cause }
+func (codexWebsocketSetupError) StatusCode() int { return http.StatusServiceUnavailable }
+
+func codexWebsocketSetupFailureClass(err error) string {
+	if err == nil || errors.Is(err, context.Canceled) {
+		return ""
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		if strings.Contains(strings.ToLower(err.Error()), "socks") {
+			return "proxy_connect_eof"
+		}
+		return "eof"
+	}
+	var networkError net.Error
+	if errors.Is(err, context.DeadlineExceeded) || errors.As(err, &networkError) && networkError.Timeout() {
+		return "timeout"
+	}
+	if errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE) {
+		return "connection_reset"
+	}
+	if errors.Is(err, syscall.ECONNREFUSED) {
+		return "connection_refused"
+	}
+	return ""
+}
+
+// Control writes may run alongside the single data writer. Closing the owning
+// resource stops the heartbeat; sending a ping alone never refreshes liveness.
+func startCodexWebsocketHeartbeat(closer *websocketConnectionCloser, interval time.Duration) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-closer.done:
+				return
+			case <-ticker.C:
+				if err := closer.conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(10*time.Second)); err != nil {
+					_ = closer.Close()
+					return
+				}
+			}
+		}
+	}()
+	return done
 }
 
 func writeCodexWebsocketMessage(sess *codexWebsocketSession, conn *websocket.Conn, payload []byte) error {
@@ -87,6 +218,11 @@ type codexWebsocketMessageTooBigError struct {
 
 func (codexWebsocketMessageTooBigError) IsRequestScoped() bool {
 	return true
+}
+
+func isCodexWebsocketMessageTooBig(err error) bool {
+	var tooBig codexWebsocketMessageTooBigError
+	return errors.As(err, &tooBig)
 }
 
 func mapCodexWebsocketReadError(err error) error {
@@ -130,35 +266,49 @@ func buildCodexWebsocketRequestBody(body []byte) []byte {
 }
 
 func readCodexWebsocketMessage(ctx context.Context, sess *codexWebsocketSession, conn *websocket.Conn, readCh chan codexWebsocketRead) (int, []byte, error) {
+	event := readCodexWebsocketEvent(ctx, sess, conn, readCh)
+	return event.msgType, event.payload, event.err
+}
+
+func readCodexWebsocketEvent(ctx context.Context, sess *codexWebsocketSession, conn *websocket.Conn, readCh chan codexWebsocketRead) codexWebsocketRead {
 	if sess == nil {
 		if conn == nil {
-			return 0, nil, fmt.Errorf("codex websockets executor: websocket conn is nil")
+			return codexWebsocketRead{err: fmt.Errorf("codex websockets executor: websocket conn is nil")}
 		}
 		_ = conn.SetReadDeadline(time.Now().Add(codexResponsesWebsocketIdleTimeout))
+		// This connection belongs to one request. Interrupt ReadMessage when
+		// its downstream cancels instead of waiting for the liveness deadline.
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		stopCancel := context.AfterFunc(ctx, func() { _ = conn.Close() })
+		defer stopCancel()
+		started := time.Now()
 		msgType, payload, errRead := conn.ReadMessage()
-		return msgType, payload, errRead
+		arrival := time.Now()
+		if ctx.Err() != nil {
+			errRead = ctx.Err()
+		}
+		return codexWebsocketRead{conn: conn, msgType: msgType, payload: payload, err: errRead, arrival: arrival, readDuration: arrival.Sub(started)}
 	}
 	if conn == nil {
-		return 0, nil, fmt.Errorf("codex websockets executor: websocket conn is nil")
+		return codexWebsocketRead{err: fmt.Errorf("codex websockets executor: websocket conn is nil")}
 	}
 	if readCh == nil {
-		return 0, nil, fmt.Errorf("codex websockets executor: session read channel is nil")
+		return codexWebsocketRead{err: fmt.Errorf("codex websockets executor: session read channel is nil")}
 	}
 	for {
 		select {
 		case <-ctx.Done():
-			return 0, nil, ctx.Err()
+			return codexWebsocketRead{err: ctx.Err()}
 		case ev, ok := <-readCh:
 			if !ok {
-				return 0, nil, fmt.Errorf("codex websockets executor: session read channel closed")
+				return codexWebsocketRead{err: fmt.Errorf("codex websockets executor: session read channel closed")}
 			}
 			if ev.conn != conn {
 				continue
 			}
-			if ev.err != nil {
-				return 0, nil, ev.err
-			}
-			return ev.msgType, ev.payload, nil
+			return ev
 		}
 	}
 }
