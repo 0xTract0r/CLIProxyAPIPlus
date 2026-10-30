@@ -101,11 +101,15 @@ func (h *Handler) PatchAuthFileAccountScheduling(c *gin.Context) {
 	_, fpPresent := req["first_production_at"]
 	_, limitPresent := req["limit_overrides"]
 	_, temporaryPresent := req["temporary_limits"]
-	if (limitPresent || temporaryPresent) && authIndex == "" {
+	_, speedPresent := req["speed_profile"]
+	_, modePresent := req["warmup_mode"]
+	_, periodPresent := req["warmup_period_days"]
+	controlsPresent := speedPresent || modePresent || periodPresent
+	if (limitPresent || temporaryPresent || controlsPresent) && authIndex == "" {
 		c.JSON(400, gin.H{"error": "name and auth_index are required for limits"})
 		return
 	}
-	if !tierPresent && !ratePresent && !fpPresent && !limitPresent && !temporaryPresent {
+	if !tierPresent && !ratePresent && !fpPresent && !limitPresent && !temporaryPresent && !controlsPresent {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "at least one of tier_override, rate_scale or first_production_at is required"})
 		return
 	}
@@ -125,7 +129,7 @@ func (h *Handler) PatchAuthFileAccountScheduling(c *gin.Context) {
 		c.JSON(http.StatusConflict, gin.H{"error": errPluginVirtualAuth.Error()})
 		return
 	}
-	if (limitPresent || temporaryPresent) && coreauth.IsConfigAPIKeyAuth(targetAuth) {
+	if (limitPresent || temporaryPresent || controlsPresent) && coreauth.IsConfigAPIKeyAuth(targetAuth) {
 		c.JSON(409, gin.H{"error": "static configuration accounts do not support persistent limit overrides", "reason": "static_config_account"})
 		return
 	}

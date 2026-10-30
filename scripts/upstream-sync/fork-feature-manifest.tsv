@@ -365,3 +365,13 @@ scheduling-warmup-pacing	expiry-read-only-regression	symbol	^func TestAccountLim
 极速模型收益	fast-ws-execute-provenance	pattern	SetCodexFastContext\(	internal/runtime/executor/codex_websockets_execute.go
 极速模型收益	fast-http-stream-provenance	pattern	SetCodexFastContext\(	internal/runtime/executor/codex_executor_stream.go
 极速模型收益	fast-http-execute-provenance	pattern	SetCodexFastContext\(	internal/runtime/executor/codex_executor_execute.go
+
+# Per-account speed profiles, normalized warm-up periods and explicit maturity.
+scheduling-warmup-control	control-projection	symbol	^func AccountWarmupControlFor\(	sdk/cliproxy/auth/account_warmup_control.go
+scheduling-warmup-control	control-patch	symbol	^func ApplyAccountWarmupControlPatch\(	sdk/cliproxy/auth/account_warmup_control.go
+scheduling-warmup-control	management-projection	pattern	view\["warmup_control"\] = coreauth\.AccountWarmupControlFor	internal/api/handlers/management/auth_files_adaptive_scheduling.go
+scheduling-warmup-control	management-write	pattern	coreauth\.ApplyAccountWarmupControlPatch\(	internal/api/handlers/management/auth_files_limit_policy.go
+scheduling-warmup-control	daily-budget-admission	pattern	budget := accountRequestDailyBudget\(latest, now, cfg\)	sdk/cliproxy/auth/warmup_execution.go
+scheduling-warmup-control	manual-health-regression	symbol	^func TestAccountWarmupControlManualAutoHealth\(	sdk/cliproxy/auth/account_warmup_control_test.go
+scheduling-warmup-control	profile-stage-parity	symbol	^func TestAccountWarmupControlProfileStageParity\(	sdk/cliproxy/auth/account_warmup_control_test.go
+scheduling-warmup-control	real-file-reload	symbol	^func TestAccountSchedulingWarmupControlsPersistReload\(	internal/api/handlers/management/auth_files_warmup_control_test.go

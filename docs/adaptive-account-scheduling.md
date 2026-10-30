@@ -843,3 +843,42 @@ of 2026-09):
 | Management-API projection write site | `internal/api/handlers/management/auth_files.go` (~line 490) |
 | Legacy projection builder (`buildAdaptiveSchedulingView`) | `internal/api/handlers/management/auth_files_adaptive_scheduling.go` |
 | Projection dual-emit site | `internal/api/handlers/management/auth_files.go` |
+
+
+## Speed levels and per-account warm-up duration (2026-10-30)
+
+The account settings keep a compact summary. Both it and pacing details open the same
+Scheduling & limits editor. Common controls are Low/Medium/High/Extreme speed and
+automatic duration, custom days, or manual maturity. A compact live balance/recovery
+summary stays visible; numeric overrides, temporary settings, tier and rate scale are advanced.
+
+The server derives previews from the effective stage. Daily request budget and RPM
+multipliers are 0.5/1/1.5/2; RPM is rounded, concurrency rounds up within 1..4, capacity
+covers admission, and active groups never exceed 8. Health and upstream restrictions
+still apply. Read effective_limits for actual results; no throughput is guaranteed and
+new profiles do not additionally increase token budgets.
+
+Existing accounts retain their policy until a level is selected. Selecting a profile clears
+legacy per-account rate scale, fixed and temporary numeric overrides. An advanced numeric
+edit clears the profile. Increasing a level grants no credits and resets no usage. Mature
+accounts use existing mature limits. Duration supports 1..365 days without rewriting first
+production; manual maturity bypasses age progression while retaining health restrictions.
+Returning to automatic mode preserves history and budgets.
+
+These are account PATCH fields, not global YAML. Exact name and auth_index are required:
+
+```json
+{
+  "name": "account.json",
+  "auth_index": "exact-index",
+  "speed_profile": "medium",
+  "warmup_period_days": 30,
+  "warmup_mode": "auto"
+}
+```
+
+Profiles accept low/medium/high/extreme or null; null duration inherits the actual global
+curve; mode accepts auto/mature or null (automatic). Omission preserves a field. Speed
+cannot be mixed with legacy rate/numeric controls. GET/PATCH warmup_control returns the
+selected policy, effective duration and four server-derived previews. New subscription
+percentage guards and token budget calibration are deferred and must not appear enabled.

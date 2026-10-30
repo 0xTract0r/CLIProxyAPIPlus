@@ -15,6 +15,9 @@ func applyAccountSchedulingPatch(a *coreauth.Auth, cfg config.AccountSchedulingC
 	if providerKey(a) != "claude" || coreauth.IsPluginVirtualAuth(a) {
 		return errors.New("account scheduling target is not editable")
 	}
+	if err := coreauth.ApplyAccountWarmupControlPatch(a, req); err != nil {
+		return err
+	}
 	for _, key := range []string{"tier_override", "rate_scale", "first_production_at"} {
 		raw, present := req[key]
 		if !present {

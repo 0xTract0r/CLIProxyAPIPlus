@@ -115,14 +115,7 @@ const (
 // every other function in this package that takes a "now" (see
 // account_freshness.go's AccountAge/AccountAgeDays doc).
 func AccountWarmupStatusFor(a *Auth, now time.Time, cfg internalconfig.AccountSchedulingConfig) AccountWarmupStatus {
-	ageDays, hasAnchor := AccountAgeDays(a, now)
-	// ANCHOR-Q4 (design §10.2): clamp the age down into the health-allowed stage
-	// before resolving limits, so effective stage = min(age stage, health cap).
-	// A no-op unless the health gate is enabled AND this account carries a cap
-	// that actually lowers its stage (see effectiveWarmupAge) -- so this preserves
-	// pre-ANCHOR-Q4 behavior for a disabled gate / un-capped account exactly.
-	ageDays, hasAnchor = effectiveWarmupAge(a, cfg, ageDays, hasAnchor)
-	return AccountWarmupStageForAge(ageDays, hasAnchor, cfg.WarmupCurve, cfg.MatureLimits)
+	return accountWarmupBaseStatus(a, now, cfg)
 }
 
 // AccountWarmupStageForAge is the pure age -> warm-up-status mapping (design

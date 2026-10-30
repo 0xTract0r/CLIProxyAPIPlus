@@ -940,7 +940,7 @@ func (s *AdaptiveSelector) overDailyBudget(a *Auth, cfg internalconfig.AccountSc
 	// Scale the warm-up daily budget by the per-account rate multiplier (§8.3)
 	// so a fractional rate_scale tightens the budget too, matching the rpm /
 	// concurrency scaling. scaleLimitInt floors a positive budget at 1.
-	budget := scaleLimitInt(status.DailyBudget, AccountRateScale(a, cfg))
+	budget := accountRequestDailyBudget(a, now, cfg)
 	// Harden P2: pass the persisted rolling-window buckets from the (possibly
 	// stale) auth clone so a cold gate re-seeds this account's already-spent budget
 	// after a process restart instead of resetting it to 0 (fail-open fix). The

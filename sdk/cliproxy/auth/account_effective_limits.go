@@ -99,7 +99,7 @@ func AccountEffectiveLimits(a *Auth, now time.Time, cfg internalconfig.AccountSc
 		RPM:              int(math.Round(policy.Fields["rpm"].ceiling)),
 		Burst:            burst,
 		Concurrency:      int(policy.Fields["concurrency"].Effective),
-		DailyBudget:      scaleLimitInt(status.DailyBudget, scale),
+		DailyBudget:      accountRequestDailyBudget(a, now, cfg),
 		TokenDailyBudget: scaleLimitInt(resolveTokenDailyBudget(cfg, status), scale),
 		PacingApplies:    !status.Mature,
 	}

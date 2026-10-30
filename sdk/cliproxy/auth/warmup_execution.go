@@ -143,8 +143,7 @@ func (g *AccountConcurrencyGate) bindingInFlight(key string) bool {
 }
 
 func (s *AdaptiveSelector) pendingWarmupBudgetBusy(auth *Auth, cfg internalconfig.AccountSchedulingConfig, now time.Time) bool {
-	status := AccountWarmupStatusFor(auth, now, cfg)
-	budget := scaleLimitInt(status.DailyBudget, AccountRateScale(auth, cfg))
+	budget := accountRequestDailyBudget(auth, now, cfg)
 	if budget <= 0 {
 		return false
 	}
@@ -235,7 +234,7 @@ func (m *Manager) tryWarmupExecution(ctx context.Context, auth *Auth, model stri
 		return nil, true, warmupReselect(ctx, true)
 	}
 	limit := int(AccountLimitPolicyFor(latest, now, cfg).Fields["concurrency"].Effective)
-	budget := scaleLimitInt(status.DailyBudget, AccountRateScale(latest, cfg))
+	budget := accountRequestDailyBudget(latest, now, cfg)
 	wait := &warmupSelectionWait{selector: selector, key: lease.key, authID: auth.ID, revision: lease.revision, epoch: selector.servingEpoch, delay: 100 * time.Millisecond}
 	attachPacingWaitReadiness(ctx, wait, latest)
 	bindingKey := ""

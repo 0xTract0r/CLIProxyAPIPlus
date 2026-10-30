@@ -324,7 +324,10 @@ func (m *Manager) persist(ctx context.Context, auth *Auth) error {
 			policy := current.(*Auth)
 			_, fixed := accountSchedulingRawValue(policy.Metadata, "limit_overrides")
 			_, temporary := accountSchedulingRawValue(policy.Metadata, "temporary_limits")
-			if fixed || temporary {
+			_, profile := accountSchedulingRawValue(policy.Metadata, "speed_profile")
+			_, mode := accountSchedulingRawValue(policy.Metadata, "warmup_mode")
+			_, period := accountSchedulingRawValue(policy.Metadata, "warmup_period_days")
+			if fixed || temporary || profile || mode || period {
 				toSave = auth.Clone()
 				preserveAccountLimitPolicy(toSave, policy)
 			}

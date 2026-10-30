@@ -146,6 +146,7 @@ func (h *Handler) buildAccountSchedulingView(auth *coreauth.Auth) gin.H {
 	// show which accounts are throttled for a safety test.
 	view["rate_scale"] = coreauth.AccountRateScale(auth, scheduling)
 	view["limit_policy"] = coreauth.AccountLimitPolicyFor(auth, now, scheduling)
+	view["warmup_control"] = coreauth.AccountWarmupControlFor(auth, now, scheduling)
 	if coreauth.IsConfigAPIKeyAuth(auth) {
 		view["limit_policy"] = nil
 	}

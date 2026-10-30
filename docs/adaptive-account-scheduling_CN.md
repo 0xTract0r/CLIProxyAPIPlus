@@ -738,3 +738,36 @@ RPM/余额/日预算仅在可信恢复时间落入剩余期限时等待；并发
 | 管理 API 投影写入点 | `internal/api/handlers/management/auth_files.go`（约第 490 行） |
 | 旧名投影构建（`buildAdaptiveSchedulingView`） | `internal/api/handlers/management/auth_files_adaptive_scheduling.go` |
 | 投影 dual-emit 下发点 | `internal/api/handlers/management/auth_files.go` |
+
+
+## 四档速度与账号养号周期（2026-10-30）
+
+账号设置只留养号摘要，从配速或齿轮进入同一个“调度与上限”。默认只选低速、中速、
+高速、极高速，以及自动养号期/指定天数/手动成熟。编辑器顶部显示紧凑实时余额与恢复
+摘要；具体数字、临时覆盖、套餐和整体倍率保留在默认折叠的高级区。
+
+服务端按当前阶段派生四档推荐。请求日预算与RPM倍率依次为0.5/1/1.5/2；RPM取整，
+并发向上取整且1..4；容量至少覆盖接入门槛，活跃组最多8。实际结果仍受健康和上游
+限制，以服务端effective_limits为准，不是保证吞吐。新档位不额外放大token预算。
+
+现有账号不选档时保留旧设置。选择档位会清理旧账号倍率、固定和临时数值覆盖；高级
+自定义写入会清档位并显示自定义。提速不补送余额、不清用量；成熟号使用成熟上限。
+账号周期支持1..365天，不改写首投时间；手动成熟可直接退出年龄养号，已有健康限制
+仍可收紧。恢复自动保留真实历史，不能借此重置预算。
+
+以下字段是单账号PATCH，不是全局YAML；必须同时提交精确name和auth_index：
+
+```json
+{
+  "name": "account.json",
+  "auth_index": "exact-index",
+  "speed_profile": "medium",
+  "warmup_period_days": 30,
+  "warmup_mode": "auto"
+}
+```
+
+speed_profile可为low/medium/high/extreme或null；周期null继承实际全局曲线；
+warmup_mode可为auto/mature或null（自动）。缺省字段保持不变。速度字段不能与旧倍率/
+数值覆盖混写。GET/PATCH的warmup_control含当前选择、实际周期及四档服务端推荐。
+新增订阅百分比门禁和token硬预算标定不在本批范围，未实现/未启用仍需明确显示。

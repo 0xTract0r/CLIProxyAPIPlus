@@ -240,33 +240,11 @@ func AccountQuotaWeightFactor(a *Auth) float64 {
 // as a deliberate design choice open to recalibration, since design.md
 // itself does not pin an exact numeric formula for this specific axis.
 func AccountFreshnessWeightFactor(a *Auth, cfg internalconfig.AccountSchedulingConfig, now time.Time) float64 {
-	matureRPM := cfg.MatureLimits.RPMLimit
-
-	ageDays, ok := AccountAgeDays(a, now)
-	// ANCHOR-Q4 (design §10.2): apply the same health-cap clamp the grading view
-	// uses, so a distressed account's freshness weight drops in lock-step with its
-	// lowered effective stage instead of tracking calendar age. No-op when the gate
-	// is disabled or the account carries no restricting cap.
-	ageDays, ok = effectiveWarmupAge(a, cfg, ageDays, ok)
-	if !ok {
-		// No first-production anchor yet -> design §5.1's "cold" state (case 1
-		// in the doc). Weight it at the curve's FIRST (most-restrictive) stage's
-		// factor, matching the grading-side coldAccountWarmupStatus, rather than
-		// the old full-1.0 bootstrap that let a fresh high-tier credential
-		// dominate the pool. An empty curve has no first stage to be cold
-		// relative to -> fall through to mature (1), consistent with the
-		// anchored empty-curve path below.
-		if len(cfg.WarmupCurve) == 0 {
-			return 1
-		}
-		return warmupRPMFreshnessFactor(cfg.WarmupCurve[0].RPMLimit, matureRPM)
-	}
-
-	stage, matched := currentAccountWarmupStage(cfg.WarmupCurve, ageDays)
-	if !matched {
+	status := AccountWarmupStatusFor(a, now, cfg)
+	if status.Mature {
 		return 1
 	}
-	return warmupRPMFreshnessFactor(stage.RPMLimit, matureRPM)
+	return warmupRPMFreshnessFactor(status.RPMLimit, cfg.MatureLimits.RPMLimit)
 }
 
 // warmupRPMFreshnessFactor is the shared stage-freshness formula for the weight
@@ -326,6 +304,9 @@ func warmupRPMFreshnessFactor(stageRPM, matureRPM int) float64 {
 // swapped in for the selector's grading maturity without reconciling that
 // intentional no-anchor divergence.
 func AccountIsMature(a *Auth, cfg internalconfig.AccountSchedulingConfig, now time.Time) bool {
+	if accountManualMature(a) || accountWarmupPeriod(a) != nil {
+		return AccountWarmupStatusFor(a, now, cfg).Mature
+	}
 	ageDays, ok := AccountAgeDays(a, now)
 	// ANCHOR-Q4 (design §10.2): honor the health cap here too, so a health-demoted
 	// account is not reported "mature" on the weight side while the grading view

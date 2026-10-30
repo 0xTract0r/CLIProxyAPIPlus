@@ -113,13 +113,7 @@ func temporaryLimitsState(a *Auth, t *temporaryAccountLimits, now time.Time) (st
 // Input bounds constrain explicit edits only, never historical baseline limits.
 func AccountLimitPolicyFor(a *Auth, now time.Time, cfg internalconfig.AccountSchedulingConfig) AccountLimitPolicy {
 	status := AccountWarmupStatusFor(a, now, cfg)
-	scale := AccountRateScale(a, cfg)
-	baseline := map[string]float64{
-		"rpm":                 scaleLimitRPM(float64(status.RPMLimit), scale),
-		"concurrency":         float64(scaleLimitInt(status.ConcurrencyLimit, scale)),
-		"request_capacity":    float64(cfg.WarmupTrafficPacing.RequestBurst),
-		"max_active_bindings": float64(cfg.WarmupTrafficPacing.MaxActiveBindings),
-	}
+	baseline := accountLimitBaseline(a, now, cfg, status)
 	out := AccountLimitPolicy{Fields: make(map[string]AccountLimitField), TemporaryStatus: "none", RestrictedReasons: []string{}}
 	tmp := storedTemporaryLimits(a)
 	state, reason := temporaryLimitsState(a, tmp, now)
@@ -279,12 +273,21 @@ func preserveAccountLimitPolicy(a, existing *Auth) {
 	if a == nil || existing == nil {
 		return
 	}
-	for _, key := range []string{"limit_overrides", "temporary_limits"} {
+	for _, key := range []string{"limit_overrides", "temporary_limits", "speed_profile", "warmup_mode", "warmup_period_days"} {
 		if value, ok := accountSchedulingRawValue(existing.Clone().Metadata, key); ok {
 			if a.Metadata == nil {
 				a.Metadata = map[string]any{}
 			}
 			setAccountSchedulingValue(a.Metadata, key, value)
+		}
+	}
+	// New controls own the absence of old rate_scale too, preventing a stale
+	// refresh from reviving the multiplier cleared by profile selection.
+	if _, controlled := accountSchedulingRawValue(existing.Metadata, "speed_profile"); controlled {
+		if raw, ok := accountSchedulingRawValue(existing.Metadata, "rate_scale"); ok {
+			setAccountSchedulingValue(a.Metadata, "rate_scale", raw)
+		} else {
+			clearAccountSchedulingValue(a.Metadata, "rate_scale")
 		}
 	}
 	if tmp := storedTemporaryLimits(a); tmp != nil && existing.temporaryLimits != nil && tmp.ID == existing.temporaryLimits.id {
