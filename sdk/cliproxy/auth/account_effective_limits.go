@@ -82,6 +82,7 @@ type EffectiveLimits struct {
 func AccountEffectiveLimits(a *Auth, now time.Time, cfg internalconfig.AccountSchedulingConfig) EffectiveLimits {
 	status := AccountWarmupStatusFor(a, now, cfg)
 	scale := AccountRateScale(a, cfg)
+	policy := AccountLimitPolicyFor(a, now, cfg)
 
 	// Burst input branch mirrors rateLimitParams: the mature burst allowance for a
 	// mature account, otherwise the (tight) warming stage concurrency limit.
@@ -90,10 +91,14 @@ func AccountEffectiveLimits(a *Auth, now time.Time, cfg internalconfig.AccountSc
 		burstBase = cfg.MatureLimits.Burst
 	}
 
+	burst := scaleLimitInt(burstBase, scale)
+	if !status.Mature {
+		burst = int(policy.Fields["concurrency"].Effective)
+	}
 	return EffectiveLimits{
-		RPM:              scaleLimitRPMInt(status.RPMLimit, scale),
-		Burst:            scaleLimitInt(burstBase, scale),
-		Concurrency:      scaleLimitInt(status.ConcurrencyLimit, scale),
+		RPM:              int(math.Round(policy.Fields["rpm"].ceiling)),
+		Burst:            burst,
+		Concurrency:      int(policy.Fields["concurrency"].Effective),
 		DailyBudget:      scaleLimitInt(status.DailyBudget, scale),
 		TokenDailyBudget: scaleLimitInt(resolveTokenDailyBudget(cfg, status), scale),
 		PacingApplies:    !status.Mature,

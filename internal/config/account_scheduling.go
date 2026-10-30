@@ -203,9 +203,10 @@ type AccountWarmupStage struct {
 	// billable-token daily budget (rolling 24h), a token-dimension hygiene hard
 	// gate for warming accounts that fire large-token requests under a compliant
 	// request count (design §4 P3 / spec.md "token 额度卫生"). 0 means unbounded
-	// (no token gate) and is the safe default until real production token
-	// budgets are calibrated AND the billable-token counting sink is wired (that
-	// sink lives in internal/usage and is a separate slice). MUST be >= 0.
+	// (no token gate). The counting sink is wired through internal/usage;
+	// positive production budgets still require real-usage calibration. This
+	// local budget does not represent unlimited upstream subscription quota.
+	// MUST be >= 0.
 	TokenDailyBudget int `yaml:"token-daily-budget,omitempty" json:"token-daily-budget,omitempty"`
 }
 
@@ -380,8 +381,8 @@ func (c AccountSchedulingConfig) Validate() error {
 	if c.MatureLimits.TokenDailyBudget < 0 {
 		return fmt.Errorf("account-scheduling.mature-limits.token-daily-budget must not be negative")
 	}
-	if c.RateScale <= 0 {
-		return fmt.Errorf("account-scheduling.rate-scale must be positive")
+	if err := ValidateAccountRateScale(c.RateScale, c); err != nil {
+		return err
 	}
 	if c.AntiStreakLimit < 0 {
 		return fmt.Errorf("account-scheduling.anti-streak-limit must not be negative")

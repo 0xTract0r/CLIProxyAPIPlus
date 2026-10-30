@@ -860,6 +860,16 @@ func waitForCooldown(ctx context.Context, wait, maxWait time.Duration) error {
 	if wait <= 0 {
 		return nil
 	}
+	if state := warmupRequestFromContext(ctx); state != nil {
+		state.mu.Lock()
+		if state.admission != nil && !state.admission.started.IsZero() {
+			maxWait = min(maxWait, state.admission.deadline.Sub(state.now()))
+		}
+		state.mu.Unlock()
+		if maxWait < wait {
+			return localAdmissionError("wait_timeout", ctx)
+		}
+	}
 	timer := time.NewTimer(jitteredCooldownWait(wait, maxWait))
 	defer timer.Stop()
 	select {

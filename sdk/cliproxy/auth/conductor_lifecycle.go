@@ -97,6 +97,8 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	authClone := auth.Clone()
 	m.pacingMu.Lock()
 	m.mu.Lock()
+	preserveAccountLimitPolicy(authClone, m.auths[auth.ID])
+	auth = authClone.Clone()
 	m.auths[auth.ID] = authClone
 	m.mu.Unlock()
 	m.refreshWarmupPacingLocked()
@@ -139,6 +141,7 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	auth.Success = existing.Success
 	auth.Failed = existing.Failed
 	auth.recentRequests = existing.recentRequests
+	preserveAccountLimitPolicy(auth, existing)
 	if !existing.Disabled && existing.Status != StatusDisabled && !auth.Disabled && auth.Status != StatusDisabled {
 		if len(auth.ModelStates) == 0 && len(existing.ModelStates) > 0 {
 			auth.ModelStates = existing.ModelStates
@@ -187,6 +190,7 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 // Remove deletes an auth from runtime state without persisting.
 // Disk and token-store deletion must be handled by the caller.
 func (m *Manager) Remove(ctx context.Context, id string) {
+	defer notifyPacingAdmission()
 	if m == nil {
 		return
 	}
@@ -206,6 +210,7 @@ func (m *Manager) Remove(ctx context.Context, id string) {
 	}
 	provider := strings.TrimSpace(existing.Provider)
 	delete(m.auths, id)
+	m.persistedPolicies.Delete(id)
 	if m.modelPoolOffsets != nil {
 		delete(m.modelPoolOffsets, id)
 	}
@@ -305,6 +310,31 @@ func (m *Manager) persist(ctx context.Context, auth *Auth) error {
 	if auth.Metadata == nil {
 		return nil
 	}
-	_, err := m.store.Save(ctx, auth)
+	// Every writer shares the same storage boundary. A delayed token/header
+	// refresh must not overwrite a newer, successfully persisted operator patch.
+	m.policyPersistenceMu.Lock()
+	defer m.policyPersistenceMu.Unlock()
+	toSave := auth
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	explicit, _ := ctx.Value(accountPolicyWriteKey{}).(bool)
+	if !explicit {
+		if current, ok := m.persistedPolicies.Load(auth.ID); ok {
+			policy := current.(*Auth)
+			_, fixed := accountSchedulingRawValue(policy.Metadata, "limit_overrides")
+			_, temporary := accountSchedulingRawValue(policy.Metadata, "temporary_limits")
+			if fixed || temporary {
+				toSave = auth.Clone()
+				preserveAccountLimitPolicy(toSave, policy)
+			}
+		}
+	}
+	_, err := m.store.Save(ctx, toSave)
+	if err == nil {
+		policy := &Auth{Metadata: map[string]any{}}
+		preserveAccountLimitPolicy(policy, toSave)
+		m.persistedPolicies.Store(auth.ID, policy)
+	}
 	return err
 }

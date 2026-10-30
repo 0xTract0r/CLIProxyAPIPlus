@@ -119,7 +119,8 @@ type Auth struct {
 	QuarantinedAt time.Time `json:"quarantined_at,omitempty"`
 
 	// Runtime carries non-serialisable data used during execution (in-memory only).
-	Runtime any `json:"-"`
+	Runtime         any `json:"-"`
+	temporaryLimits *temporaryLimitRuntime
 
 	Success int64 `json:"-"`
 	Failed  int64 `json:"-"`

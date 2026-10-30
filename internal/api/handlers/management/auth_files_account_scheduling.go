@@ -9,7 +9,8 @@ package management
 
 import (
 	"encoding/json"
-	"fmt"
+	"errors"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"net/http"
 	"strings"
 	"time"
@@ -89,12 +90,22 @@ func (h *Handler) PatchAuthFileAccountScheduling(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
 		return
 	}
-	authIndex, _ := decodeAccountSchedulingStringField(req, "auth_index")
+	authIndex, indexOK := decodeAccountSchedulingStringField(req, "auth_index")
+	if _, present := req["auth_index"]; present && (!indexOK || authIndex == "") {
+		c.JSON(400, gin.H{"error": "auth_index must be a nonempty string"})
+		return
+	}
 
-	tierRaw, tierPresent := req["tier_override"]
-	rateRaw, ratePresent := req["rate_scale"]
-	fpRaw, fpPresent := req["first_production_at"]
-	if !tierPresent && !ratePresent && !fpPresent {
+	_, tierPresent := req["tier_override"]
+	_, ratePresent := req["rate_scale"]
+	_, fpPresent := req["first_production_at"]
+	_, limitPresent := req["limit_overrides"]
+	_, temporaryPresent := req["temporary_limits"]
+	if (limitPresent || temporaryPresent) && authIndex == "" {
+		c.JSON(400, gin.H{"error": "name and auth_index are required for limits"})
+		return
+	}
+	if !tierPresent && !ratePresent && !fpPresent && !limitPresent && !temporaryPresent {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "at least one of tier_override, rate_scale or first_production_at is required"})
 		return
 	}
@@ -103,7 +114,7 @@ func (h *Handler) PatchAuthFileAccountScheduling(c *gin.Context) {
 	// id/filename (+ optional auth_index) via lookupAuthFile, falling back to the
 	// display-name resolution used by the account-settings endpoint.
 	targetAuth, _ := h.lookupAuthFile(name, authIndex)
-	if targetAuth == nil {
+	if targetAuth == nil && authIndex == "" {
 		targetAuth = findAuthByName(h.authManager, name)
 	}
 	if targetAuth == nil {
@@ -112,6 +123,10 @@ func (h *Handler) PatchAuthFileAccountScheduling(c *gin.Context) {
 	}
 	if coreauth.IsPluginVirtualAuth(targetAuth) {
 		c.JSON(http.StatusConflict, gin.H{"error": errPluginVirtualAuth.Error()})
+		return
+	}
+	if (limitPresent || temporaryPresent) && coreauth.IsConfigAPIKeyAuth(targetAuth) {
+		c.JSON(409, gin.H{"error": "static configuration accounts do not support persistent limit overrides", "reason": "static_config_account"})
 		return
 	}
 
@@ -124,95 +139,29 @@ func (h *Handler) PatchAuthFileAccountScheduling(c *gin.Context) {
 		return
 	}
 
-	if targetAuth.Metadata == nil {
-		targetAuth.Metadata = make(map[string]any)
-	}
-
-	if tierPresent {
-		value, errDecode := decodeAuthFileFieldValue(tierRaw)
-		if errDecode != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid tier_override"})
-			return
+	updated, err := h.authManager.UpdateAccountScheduling(c.Request.Context(), targetAuth.ID, authIndex, func(a *coreauth.Auth, cfg config.AccountSchedulingConfig) error {
+		return applyAccountSchedulingPatch(a, cfg, req, time.Now())
+	})
+	if err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, coreauth.ErrAccountSchedulingNotFound) {
+			status = http.StatusNotFound
 		}
-		if isClearAccountSchedulingValue(value) {
-			targetAuth.ClearAccountTierOverride()
-		} else {
-			str, isStr := value.(string)
-			if !isStr {
-				c.JSON(http.StatusBadRequest, gin.H{"error": "tier_override must be a string"})
-				return
-			}
-			normalized, valid := coreauth.NormalizeTierOverride(targetAuth.Provider, str)
-			if !valid {
-				c.JSON(http.StatusBadRequest, gin.H{
-					"error":        fmt.Sprintf("invalid tier_override %q for provider %q", strings.TrimSpace(str), strings.TrimSpace(targetAuth.Provider)),
-					"legal_values": coreauth.LegalTierOverrideValues(targetAuth.Provider),
-				})
-				return
-			}
-			targetAuth.SetAccountTierOverride(normalized)
+		if errors.Is(err, coreauth.ErrAccountSchedulingPersist) {
+			status = http.StatusInternalServerError
 		}
-	}
-
-	if ratePresent {
-		value, errDecode := decodeAuthFileFieldValue(rateRaw)
-		if errDecode != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid rate_scale"})
-			return
+		body := gin.H{"error": err.Error()}
+		if err.Error() == "invalid tier_override for provider" {
+			body["legal_values"] = coreauth.LegalTierOverrideValues(targetAuth.Provider)
 		}
-		if isClearAccountSchedulingValue(value) {
-			targetAuth.ClearAccountRateScale()
-		} else {
-			scale, valid := coreauth.ParseRateScaleValue(value)
-			if !valid {
-				c.JSON(http.StatusBadRequest, gin.H{"error": "rate_scale must be a number greater than 0"})
-				return
-			}
-			targetAuth.SetAccountRateScale(scale)
-		}
-	}
-
-	if fpPresent {
-		value, errDecode := decodeAuthFileFieldValue(fpRaw)
-		if errDecode != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid first_production_at"})
-			return
-		}
-		if isClearAccountSchedulingValue(value) {
-			// Empty string / JSON null -> clear the operator override, handing the
-			// anchor back to the append-only auto-mint (ClearAccountFirstProductionAt).
-			targetAuth.ClearAccountFirstProductionAt()
-		} else {
-			str, isStr := value.(string)
-			if !isStr {
-				c.JSON(http.StatusBadRequest, gin.H{"error": "first_production_at must be an RFC3339 timestamp string"})
-				return
-			}
-			parsed, errParse := time.Parse(time.RFC3339, strings.TrimSpace(str))
-			if errParse != nil {
-				c.JSON(http.StatusBadRequest, gin.H{"error": "first_production_at must be a valid RFC3339 timestamp"})
-				return
-			}
-			// Fail-safe direction (design §8.5): a future anchor is meaningless
-			// (an account cannot be younger than "now") and is rejected. Any past
-			// date is accepted -- the operator owns backfilling only confirmed,
-			// genuinely-aged accounts (setting it too early = artificially mature).
-			if parsed.After(time.Now()) {
-				c.JSON(http.StatusBadRequest, gin.H{"error": "first_production_at must not be in the future"})
-				return
-			}
-			targetAuth.SetAccountFirstProductionAt(parsed)
-		}
-	}
-
-	targetAuth.UpdatedAt = time.Now()
-	if _, err := h.authManager.Update(c.Request.Context(), targetAuth); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to update auth: %v", err)})
+		c.JSON(status, body)
 		return
 	}
+	targetAuth = updated
 
 	c.JSON(http.StatusOK, gin.H{
 		"name":               authDisplayName(targetAuth),
+		"auth_index":         targetAuth.Index,
 		"account_scheduling": h.buildAccountSchedulingView(targetAuth),
 	})
 }

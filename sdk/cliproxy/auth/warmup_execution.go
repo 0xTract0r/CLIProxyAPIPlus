@@ -32,7 +32,7 @@ func warmupReselect(ctx context.Context, matureOnly bool) error {
 	state.suppressReserve = true
 	state.matureOnly = state.matureOnly || matureOnly
 	state.localReselects++
-	if state.localReselects > 4 {
+	if state.localReselects > 4 && (state.admission == nil || state.admission.pending == nil) {
 		return newWarmupBusyError()
 	}
 	return &warmupAdmissionReselect{}
@@ -89,11 +89,18 @@ func warmupMarkSent(ctx context.Context, slot *accountExecutionSlot) {
 
 // A successful reservation owns both counters until its final result is stored.
 // Rejection changes neither counter, unlike the legacy advisory Acquire method.
-func (g *AccountConcurrencyGate) reserveWarmup(authID string, concurrency, budget int, seed []DailyWindowBucket) bool {
+func (g *AccountConcurrencyGate) reserveWarmup(authID string, concurrency, budget int, seed []DailyWindowBucket, binding ...string) bool {
 	hour := g.currentHour()
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	seedRollingLocked(g.daily, authID, seed)
+	key := ""
+	if len(binding) > 0 {
+		key = binding[0]
+	}
+	if key != "" && g.bindings[key] > 0 {
+		return false
+	}
 	if (concurrency > 0 && g.inflight[authID] >= concurrency) || (budget > 0 && rollingCountLocked(g.daily, authID, hour)+g.pending[authID] >= budget) {
 		return false
 	}
@@ -102,12 +109,21 @@ func (g *AccountConcurrencyGate) reserveWarmup(authID string, concurrency, budge
 	}
 	g.inflight[authID]++
 	g.pending[authID]++
+	if key != "" {
+		if g.bindings == nil {
+			g.bindings = make(map[string]int)
+		}
+		g.bindings[key]++
+	}
 	return true
 }
 
-func (g *AccountConcurrencyGate) releaseWarmupReservation(authID string) {
+func (g *AccountConcurrencyGate) releaseWarmupReservation(authID string, binding ...string) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	if len(binding) > 0 && binding[0] != "" {
+		delete(g.bindings, binding[0])
+	}
 	if g.inflight[authID] <= 1 {
 		delete(g.inflight, authID)
 	} else {
@@ -118,6 +134,12 @@ func (g *AccountConcurrencyGate) releaseWarmupReservation(authID string) {
 	} else {
 		g.pending[authID]--
 	}
+}
+
+func (g *AccountConcurrencyGate) bindingInFlight(key string) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return key != "" && g.bindings[key] > 0
 }
 
 func (s *AdaptiveSelector) pendingWarmupBudgetBusy(auth *Auth, cfg internalconfig.AccountSchedulingConfig, now time.Time) bool {
@@ -140,11 +162,20 @@ func (m *Manager) admitWarmupExecution(ctx context.Context, auth *Auth, model st
 	first := true
 	err := runWarmupSelection(ctx, func(current context.Context) error {
 		if !first {
-			return warmupReselect(current, false)
+			state := warmupRequestFromContext(current)
+			state.mu.Lock()
+			configured := state.admission != nil
+			state.mu.Unlock()
+			if !configured {
+				return warmupReselect(current, false)
+			}
 		}
 		first = false
 		var err error
 		slot, target, err = m.tryWarmupExecution(current, auth, model, opts)
+		if err == nil {
+			releasePacingAdmission(current)
+		}
 		return err
 	})
 	return slot, target, err
@@ -174,6 +205,12 @@ func (m *Manager) tryWarmupExecution(ctx context.Context, auth *Auth, model stri
 	if status.Mature || !selector.adaptiveEligible(latest, cfg) {
 		return nil, false, nil
 	}
+	if cfg.WarmupTrafficPacing.Enabled {
+		activatePacingAdmission(ctx)
+		if pacingAdmissionExpired(ctx) {
+			return nil, true, localAdmissionError("wait_timeout", ctx)
+		}
+	}
 	var opts cliproxyexecutor.Options
 	if len(options) > 0 {
 		opts = options[0]
@@ -197,16 +234,26 @@ func (m *Manager) tryWarmupExecution(ctx context.Context, auth *Auth, model stri
 	if selector.overWarmupBudget(latest, cfg, now) {
 		return nil, true, warmupReselect(ctx, true)
 	}
-	limit := scaleLimitInt(status.ConcurrencyLimit, AccountRateScale(latest, cfg))
+	limit := int(AccountLimitPolicyFor(latest, now, cfg).Fields["concurrency"].Effective)
 	budget := scaleLimitInt(status.DailyBudget, AccountRateScale(latest, cfg))
 	wait := &warmupSelectionWait{selector: selector, key: lease.key, authID: auth.ID, revision: lease.revision, epoch: selector.servingEpoch, delay: 100 * time.Millisecond}
-	if !selector.gate.reserveWarmup(auth.ID, limit, budget, readDailyWindowBuckets(latest.Metadata, accountSchedulingDailyWindowKey)) {
+	attachPacingWaitReadiness(ctx, wait, latest)
+	bindingKey := ""
+	if cfg.WarmupTrafficPacing.Enabled {
+		bindingKey = lease.key
+		if !warmupRateChargeAvailable(ctx, auth.ID) && !pacingQueueTurn(ctx, selector, auth.ID, bindingKey) {
+			wait.reason = "queue_turn"
+			return nil, true, wait
+		}
+		wait.reason = "concurrency"
+	}
+	if !selector.gate.reserveWarmup(auth.ID, limit, budget, readDailyWindowBuckets(latest.Metadata, accountSchedulingDailyWindowKey), bindingKey) {
 		if matureOnly {
 			return nil, true, warmupReselect(ctx, true)
 		}
 		return nil, true, wait
 	}
-	slot := &accountExecutionSlot{gate: selector.gate, authID: auth.ID, target: true, countOnly: warmupCountPurpose(ctx), dailyBudget: budget, manager: m}
+	slot := &accountExecutionSlot{gate: selector.gate, authID: auth.ID, target: true, countOnly: warmupCountPurpose(ctx), dailyBudget: budget, manager: m, bindingKey: bindingKey}
 	if err := ctx.Err(); err != nil {
 		slot.release()
 		return nil, true, err
@@ -214,11 +261,22 @@ func (m *Manager) tryWarmupExecution(ctx context.Context, auth *Auth, model stri
 	if !warmupTakeRateCharge(ctx, auth.ID) {
 		rpm, burst := selector.rateLimitParams(latest, cfg, now)
 		if allowed, delay := selector.limiter.AllowOrDelay(auth.ID, rpm, burst); !allowed {
-			slot.release()
+			if cfg.WarmupTrafficPacing.Enabled {
+				// This local probe never obtained admission. Broadcasting its
+				// rollback makes RPM waiters repeatedly wake each other.
+				slot.releaseOnce.Do(func() {
+					slot.gate.releaseWarmupReservation(slot.authID, slot.bindingKey)
+				})
+			} else {
+				slot.release()
+			}
 			if matureOnly {
 				return nil, true, warmupReselect(ctx, true)
 			}
 			wait.delay = delay
+			if cfg.WarmupTrafficPacing.Enabled {
+				wait.reason = "rpm"
+			}
 			return nil, true, wait
 		}
 	}

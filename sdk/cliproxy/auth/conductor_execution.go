@@ -27,6 +27,8 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 	req, opts = cliproxysession.Enrich(req, opts)
 	ctx = contextWithSessionID(ctx, opts)
 	ctx = withWarmupRequestState(ctx, warmupPurposeServe)
+	configurePacingAdmission(ctx, m.accountSchedulingConfig().WarmupTrafficPacing, len(req.Payload)+len(opts.OriginalRequest))
+	defer releasePacingAdmission(ctx)
 	normalized := m.normalizeProviders(providers)
 	if len(normalized) == 0 {
 		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
@@ -49,7 +51,7 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 		}
 		lastErr = errExec
 		wait, shouldRetry := m.shouldRetryAfterError(errExec, attempt, normalized, retryModel, maxWait)
-		if !shouldRetry {
+		if !shouldRetry || !pacingRetryFits(ctx, wait) {
 			break
 		}
 		if errWait := waitForCooldown(ctx, wait, maxWait); errWait != nil {
@@ -74,6 +76,8 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 	req, opts = cliproxysession.Enrich(req, opts)
 	ctx = contextWithSessionID(ctx, opts)
 	ctx = withWarmupRequestState(ctx, warmupPurposeCount)
+	configurePacingAdmission(ctx, m.accountSchedulingConfig().WarmupTrafficPacing, len(req.Payload)+len(opts.OriginalRequest))
+	defer releasePacingAdmission(ctx)
 	normalized := m.normalizeProviders(providers)
 	if len(normalized) == 0 {
 		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
@@ -93,7 +97,7 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 		}
 		lastErr = errExec
 		wait, shouldRetry := m.shouldRetryAfterError(errExec, attempt, normalized, retryModel, maxWait)
-		if !shouldRetry {
+		if !shouldRetry || !pacingRetryFits(ctx, wait) {
 			break
 		}
 		if errWait := waitForCooldown(ctx, wait, maxWait); errWait != nil {
@@ -113,6 +117,8 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 	req, opts = cliproxysession.Enrich(req, opts)
 	ctx = contextWithSessionID(ctx, opts)
 	ctx = withWarmupRequestState(ctx, warmupPurposeServe)
+	configurePacingAdmission(ctx, m.accountSchedulingConfig().WarmupTrafficPacing, len(req.Payload)+len(opts.OriginalRequest))
+	defer releasePacingAdmission(ctx)
 	if m.HomeEnabled() {
 		if unlockSession := m.lockHomeWebsocketSession(ctx, opts); unlockSession != nil {
 			defer unlockSession()
@@ -137,7 +143,7 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 		}
 		lastErr = errStream
 		wait, shouldRetry := m.shouldRetryAfterError(errStream, attempt, normalized, retryModel, maxWait)
-		if !shouldRetry {
+		if !shouldRetry || !pacingRetryFits(ctx, wait) {
 			break
 		}
 		if errWait := waitForCooldown(ctx, wait, maxWait); errWait != nil {

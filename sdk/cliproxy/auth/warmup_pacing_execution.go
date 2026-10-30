@@ -99,22 +99,25 @@ func (g *pacingHTTPGate) current(ctx context.Context) (*AdaptiveSelector, *Auth,
 	return s, a, l, nil
 }
 
-func pacingWait(ctx context.Context, s *AdaptiveSelector, authID string, delay time.Duration) error {
+func pacingWait(ctx context.Context, s *AdaptiveSelector, authID string, delay time.Duration, reasons ...string) error {
 	lease := warmupBindingFromContext(ctx)
 	if matureOnly, _, _ := warmupSelectionPolicy(ctx); matureOnly {
 		return warmupReselect(ctx, true)
 	}
-	return &warmupSelectionWait{selector: s, key: lease.key, authID: authID, revision: lease.revision, epoch: lease.epoch, delay: delay}
+	reason := "concurrency"
+	if len(reasons) > 0 {
+		reason = reasons[0]
+	}
+	return &warmupSelectionWait{selector: s, key: lease.key, authID: authID, revision: lease.revision, epoch: lease.epoch, delay: delay, reason: reason}
 }
 
 func (g *pacingHTTPGate) Before(ctx context.Context, info cliproxyexecutor.HTTPAttemptInfo) (cliproxyexecutor.HTTPAttemptPermit, error) {
+	if pacingAdmissionExpired(ctx) {
+		return nil, localAdmissionError("wait_timeout", ctx)
+	}
 	var permit *pacingHTTPPermit
-	first := true
-	err := runWarmupSelection(ctx, func(ctx context.Context) error {
-		if !first {
-			return warmupReselect(ctx, false)
-		}
-		first = false
+	var observedAuth *Auth
+	err := func() error {
 		m := g.manager
 		m.pacingMu.Lock()
 		defer m.pacingMu.Unlock()
@@ -123,6 +126,7 @@ func (g *pacingHTTPGate) Before(ctx context.Context, info cliproxyexecutor.HTTPA
 		if err != nil {
 			return err
 		}
+		observedAuth = a
 		if !limits.Config.Enabled {
 			permit = &pacingHTTPPermit{gate: g}
 			return nil
@@ -147,7 +151,7 @@ func (g *pacingHTTPGate) Before(ctx context.Context, info cliproxyexecutor.HTTPA
 		if slot := warmupExecutionSlotFromContext(ctx); slot == nil || slot.pacingRateUsed.Load() {
 			rpm, burst := s.rateLimitParams(a, m.accountSchedulingConfig(), s.now())
 			if allowed, delay := s.limiter.AllowOrDelay(a.ID, rpm, burst); !allowed {
-				return pacingWait(ctx, s, a.ID, delay)
+				return pacingWait(ctx, s, a.ID, delay, "rpm")
 			}
 		}
 		lease, d, err := m.pacing.pacer.Reserve(a.ID, limits, request)
@@ -156,8 +160,8 @@ func (g *pacingHTTPGate) Before(ctx context.Context, info cliproxyexecutor.HTTPA
 		}
 		if !d.Allowed {
 			pacingLogDecision(ctx, a.ID, "denied", d)
-			if d.Reason == "rpm" || d.Reason == "concurrency" {
-				return pacingWait(ctx, s, a.ID, d.RetryAfter)
+			if pacingWaitEligible(d.Reason, d.RetryAfter, warmupWaitLimit) {
+				return pacingWait(ctx, s, a.ID, d.RetryAfter, d.Reason)
 			}
 			return warmupReselect(ctx, true)
 		}
@@ -166,7 +170,12 @@ func (g *pacingHTTPGate) Before(ctx context.Context, info cliproxyexecutor.HTTPA
 			permit.groupHash = pacingDigest(request.GroupID)[:12]
 		}
 		return nil
-	})
+	}()
+	var wait *warmupSelectionWait
+	if errors.As(err, &wait) {
+		attachPacingWaitReadiness(ctx, wait, observedAuth)
+		err = deferPacingAdmissionWait(ctx, wait)
+	}
 	// A typed nil pointer is a non-nil interface; rejected attempts own nothing
 	// for the HTTP helper to cancel, including wait/reselect and context errors.
 	if permit == nil {
@@ -176,6 +185,9 @@ func (g *pacingHTTPGate) Before(ctx context.Context, info cliproxyexecutor.HTTPA
 }
 
 func (p *pacingHTTPPermit) MarkSent(ctx context.Context) error {
+	if pacingAdmissionExpired(ctx) {
+		return localAdmissionError("wait_timeout", ctx)
+	}
 	if p == nil {
 		return errors.New("missing warmup HTTP attempt permit")
 	}
@@ -227,6 +239,7 @@ func (p *pacingHTTPPermit) MarkSent(ctx context.Context) error {
 }
 
 func (p *pacingHTTPPermit) CancelUnsent(context.Context) error {
+	defer notifyPacingAdmission()
 	if p == nil || p.lease == nil {
 		return nil
 	}
@@ -234,6 +247,7 @@ func (p *pacingHTTPPermit) CancelUnsent(context.Context) error {
 }
 
 func (p *pacingHTTPPermit) Finish(ctx context.Context, result cliproxyexecutor.HTTPAttemptResult) error {
+	defer notifyPacingAdmission()
 	if p == nil || p.lease == nil {
 		return nil
 	}
@@ -246,7 +260,7 @@ func (p *pacingHTTPPermit) Finish(ctx context.Context, result cliproxyexecutor.H
 }
 
 func pacingLogDecision(ctx context.Context, authID, event string, d WarmupPacingDecision) {
-	selectorLogEntry(ctx).WithFields(log.Fields{"auth_id": authID, "reason": d.Reason, "request_balance": d.Balance, "minute_attempts": d.MinuteRequests, "day_attempts": d.DayRequests, "in_flight": d.InFlight, "active_groups": d.ActiveGroups, "tokens": d.Tokens, "pending_tokens": d.PendingTokens, "retry_ms": d.RetryAfter.Milliseconds()}).Info("warmup-pacing-" + event)
+	selectorLogEntry(ctx).WithFields(log.Fields{"account_hash": pacingDigest(authID)[:12], "source": "local_admission", "reason": d.Reason, "request_balance": d.Balance, "minute_attempts": d.MinuteRequests, "day_attempts": d.DayRequests, "in_flight": d.InFlight, "active_groups": d.ActiveGroups, "tokens": d.Tokens, "pending_tokens": d.PendingTokens, "retry_ms": d.RetryAfter.Milliseconds()}).Info("warmup-pacing-" + event)
 }
 
 // A real previous failure wins over a local reselect wrapped by the SDK. The

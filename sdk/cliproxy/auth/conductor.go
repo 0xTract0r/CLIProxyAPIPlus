@@ -115,6 +115,8 @@ type Manager struct {
 	mu                        sync.RWMutex
 	configCooldownMu          sync.Mutex
 	pacingMu                  sync.Mutex
+	policyPersistenceMu       sync.Mutex
+	persistedPolicies         sync.Map
 	pacing                    *managerWarmupPacing
 	pacingCalls               map[*pacingOwnership]struct{}
 	auths                     map[string]*Auth

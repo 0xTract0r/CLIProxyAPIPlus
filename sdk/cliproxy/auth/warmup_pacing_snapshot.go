@@ -35,6 +35,10 @@ type WarmupTrafficPacingSnapshot struct {
 	Inflight                   *int     `json:"inflight"`
 	ConcurrencyLimit           *int     `json:"concurrency_limit"`
 	PendingRequests            *int     `json:"pending_requests"`
+	SentAttempts60s            *int     `json:"sent_attempts_60s"`
+	UnsentReservations         *int     `json:"unsent_reservations"`
+	RecoveredHolds             *int     `json:"recovered_holds"`
+	WaitingRequests            *int     `json:"waiting_requests"`
 	BlockingReasons            []string `json:"blocking_reasons"`
 }
 
@@ -45,6 +49,10 @@ func pacingSnapshotStatus(now time.Time, status, reason string) WarmupTrafficPac
 // Snapshot never calls load/prepare/commit: even cold or corrupt reads must not
 // populate/evict the account cache, poison faults, initialize or repair a ledger.
 func (p *WarmupPacer) Snapshot(account string) WarmupTrafficPacingSnapshot {
+	return p.snapshotWithPolicy(account, nil)
+}
+
+func (p *WarmupPacer) snapshotWithPolicy(account string, policy *WarmupPacingLimits) WarmupTrafficPacingSnapshot {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := p.now()
@@ -85,6 +93,16 @@ func (p *WarmupPacer) Snapshot(account string) WarmupTrafficPacingSnapshot {
 		return pacingSnapshotStatus(now, "error", "invalid_state")
 	}
 	s := clonePacingState(a.state)
+	// Only current editable ceilings change here. Accrue the historical interval
+	// using the ledger's refill rate, then clamp downward; never mint on a raise.
+	p.advance(a, &s, now.UnixNano())
+	if policy != nil {
+		s.Limits.RPM = policy.RPM
+		s.Limits.Concurrency = policy.Concurrency
+		s.Limits.Config.RequestBurst = policy.Config.RequestBurst
+		s.Limits.Config.MaxActiveBindings = policy.Config.MaxActiveBindings
+		s.Balance = math.Min(s.Balance, pacingAvailableCapacity(a, &s, 0))
+	}
 	l := s.Limits
 	view.RequestCapacity = &l.Config.RequestBurst
 	view.MinAdmissionRequests = &l.Config.MinAdmissionRequests
@@ -117,6 +135,19 @@ func (p *WarmupPacer) Snapshot(account string) WarmupTrafficPacingSnapshot {
 	view.ActiveBindingGroups, view.Inflight = &d.ActiveGroups, &d.InFlight
 	pending := pacingPendingSends(a, 0)
 	view.PendingRequests = &pending
+	view.UnsentReservations = &pending
+	sent, recovered := 0, 0
+	for id, r := range s.Records {
+		if r.At <= s.Last-int64(time.Minute) {
+			continue
+		}
+		if a.observedSent[id] {
+			sent++
+		} else if a.live[id] == nil {
+			recovered++
+		}
+	}
+	view.SentAttempts60s, view.RecoveredHolds = &sent, &recovered
 	if s.Balance+1e-9 < float64(l.Config.MinAdmissionRequests) {
 		view.BlockingReasons = append(view.BlockingReasons, "request_balance")
 	}
@@ -194,7 +225,19 @@ func (m *Manager) WarmupTrafficPacingSnapshot(account string) WarmupTrafficPacin
 		if state.fault != nil || state.pacer == nil {
 			return pacingSnapshotStatus(now, "error", "state_unavailable")
 		}
-		return state.pacer.Snapshot(account)
+		var current *WarmupPacingLimits
+		_, fixed := accountSchedulingRawValue(a.Metadata, "limit_overrides")
+		_, temporary := accountSchedulingRawValue(a.Metadata, "temporary_limits")
+		if fixed || temporary {
+			limits := pacingLimitsFor(s, a, cfg.AccountScheduling, now)
+			current = &limits
+		}
+		view := state.pacer.snapshotWithPolicy(account, current)
+		if view.Status == "active" {
+			waiting := sharedPacingAdmissionQueue.waiting(s, account)
+			view.WaitingRequests = &waiting
+		}
+		return view
 	}
 	// Recovery can observe a sidecar before the manager has initialized its
 	// cache. Do not use NewWarmupPacingFileStore: it calls MkdirAll.

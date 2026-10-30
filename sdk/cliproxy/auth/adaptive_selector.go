@@ -283,6 +283,7 @@ func (s *AdaptiveSelector) Pick(ctx context.Context, provider, model string, opt
 	}
 	available = preferCodexWebsocketAuths(ctx, provider, available)
 	cfg := s.scheduling()
+	configurePacingAdmission(ctx, cfg.WarmupTrafficPacing, len(opts.OriginalRequest))
 	countOnly := warmupServingEnabled(cfg) && warmupCountPurpose(ctx) && warmupServingClaudeRoute(provider, available)
 	if warmupServingEnabled(cfg) && !countOnly && warmupServingClaudeRoute(provider, available) {
 		if picked, handled, errServing := s.pickWithWarmupServing(ctx, provider, model, opts, auths, available, cfg, now); handled {
@@ -327,6 +328,9 @@ func (s *AdaptiveSelector) Pick(ctx context.Context, provider, model string, opt
 	// budget, deny with a retryable 429 instead of letting the fallback bypass the
 	// budget and hammer them. Returns nil (fall through to the fallback) whenever
 	// any non-over-budget account exists, so it never false-rejects a healthy pool.
+	if wait := s.availableAdmissionWait(ctx, available, cfg, now, ""); wait != nil {
+		return nil, wait
+	}
 	if gateErr := s.dailyBudgetHardGate(available, cfg, now); gateErr != nil {
 		selectorLogEntry(ctx).Warnf(
 			"adaptive-select: daily-budget-hardgate | every serving account is warming and over its daily budget, denying (retryable) provider=%s model=%s",
@@ -342,6 +346,9 @@ func (s *AdaptiveSelector) Pick(ctx context.Context, provider, model string, opt
 	// so a mature / under-headroom / non-adaptive alternative always routes
 	// normally (a mature account in the pool guarantees this returns nil, PROD-3b).
 	if gateErr := s.concurrencyHardGate(available, cfg, now); gateErr != nil {
+		if cfg.WarmupTrafficPacing.Enabled {
+			return nil, s.pacingUnavailableError(ctx, available, cfg, now)
+		}
 		selectorLogEntry(ctx).Warnf(
 			"adaptive-select: concurrency-hardgate | every serving account is warming and at its concurrency ceiling, denying (retryable) provider=%s model=%s",
 			provider, model,
@@ -356,7 +363,7 @@ func (s *AdaptiveSelector) Pick(ctx context.Context, provider, model string, opt
 	// serves that as a weighted overflow above. Serve via the fallback selector
 	// rather than deny -- the token bucket smooths, it never manufactures a 429.
 	if cfg.WarmupTrafficPacing.Enabled && warmupServingClaudeRoute(provider, available) {
-		return nil, newWarmupBusyError()
+		return nil, s.pacingUnavailableError(ctx, available, cfg, now)
 	}
 	picked, errFallback := s.fallback.Pick(ctx, provider, model, opts, auths)
 	if errFallback == nil {
@@ -534,7 +541,8 @@ func (s *AdaptiveSelector) resolveSticky(ctx context.Context, provider, model st
 	// fails boundServableForKeep and falls through to the full-pool reselection
 	// below, so we never pin the session to a 429-ing binding.
 	receiptReady := warmupRateChargeAvailable(ctx, bound.ID) && !s.overWarmupBudget(bound, cfg, now) && s.hasConcurrencyHeadroom(bound, cfg, now)
-	if receiptReady || s.boundServableForKeep(bound, cfg, now) {
+	queueReady := !cfg.WarmupTrafficPacing.Enabled || pacingQueueTurn(ctx, s, bound.ID, cacheKey)
+	if receiptReady || (queueReady && s.boundServableForKeep(bound, cfg, now)) {
 		warmupRecordRateCharge(ctx, bound.ID, true)
 		s.cache.Set(cacheKey, bound.ID)
 		return bound, "sticky-keep-warming-no-mature", nil
@@ -596,6 +604,9 @@ func (s *AdaptiveSelector) selectAndBind(ctx context.Context, provider, model st
 	// all-over-budget warming pool either. Deny (retryable) instead; the binding is
 	// left untouched so a later turn (with budget restored or a mature account
 	// back) can re-resolve. Only fires when NO non-over-budget account exists.
+	if wait := s.availableAdmissionWait(ctx, available, cfg, now, cacheKey); wait != nil {
+		return nil, "local-admission-wait", wait
+	}
 	if gateErr := s.dailyBudgetHardGate(available, cfg, now); gateErr != nil {
 		return nil, "rebind-daily-budget-denied", gateErr
 	}
@@ -604,10 +615,13 @@ func (s *AdaptiveSelector) selectAndBind(ctx context.Context, provider, model st
 	// an all-concurrency-full warming pool either. Only fires when NO compliant
 	// server exists.
 	if gateErr := s.concurrencyHardGate(available, cfg, now); gateErr != nil {
+		if cfg.WarmupTrafficPacing.Enabled {
+			return nil, "local-admission-denied", s.pacingUnavailableError(ctx, available, cfg, now)
+		}
 		return nil, "rebind-concurrency-denied", gateErr
 	}
 	if cfg.WarmupTrafficPacing.Enabled && warmupServingClaudeRoute(provider, available) {
-		return nil, "pacing-unavailable", newWarmupBusyError()
+		return nil, "pacing-unavailable", s.pacingUnavailableError(ctx, available, cfg, now)
 	}
 	picked, errPick := s.fallback.Pick(ctx, provider, model, opts, auths)
 	if errPick == nil && picked != nil {
@@ -809,8 +823,12 @@ func (s *AdaptiveSelector) rateLimitParams(a *Auth, cfg internalconfig.AccountSc
 	// at (warming or mature) without touching selection weight. rate_scale=1.0 is
 	// a no-op; a fractional scale is floored so a lone request is never wedged.
 	scale := AccountRateScale(a, cfg)
-	rpm = scaleLimitRPM(rpm, scale)
+	policy := AccountLimitPolicyFor(a, now, cfg)
+	rpm = policy.Fields["rpm"].Effective
 	burst = scaleLimitInt(burst, scale)
+	if !status.Mature {
+		burst = int(policy.Fields["concurrency"].Effective)
+	}
 	// Harden P3 quota-aware pacing: softly slow a still-WARMING account's rpm when
 	// it is out-pacing its fair share to reset (or when its quota burn sample is
 	// stale -- fail safe to the floor). Applied AFTER the stage/scale derivation so
@@ -818,11 +836,6 @@ func (s *AdaptiveSelector) rateLimitParams(a *Auth, cfg internalconfig.AccountSc
 	// burst). Mature accounts are deliberately untouched (无感): status.Mature short-
 	// circuits before the multiplier is even read, so the mature max_20x:5x:pro
 	// smoothing profile is byte-identical to before.
-	if rpm > 0 && !status.Mature {
-		if pace := s.pacingRPMMultiplier(a, now); pace < 1 {
-			rpm *= pace
-		}
-	}
 	if burst < 1 {
 		burst = 1
 	}
@@ -1046,6 +1059,10 @@ var pacingSnapshotStaleAfter = 15 * time.Minute
 // poll) is NOT throttled -- multiplier 1 -- so warm-up is never frozen for lack of
 // data.
 func (s *AdaptiveSelector) pacingRPMMultiplier(a *Auth, now time.Time) float64 {
+	return accountPacingRPMMultiplier(a, now)
+}
+
+func accountPacingRPMMultiplier(a *Auth, now time.Time) float64 {
 	st := ReadAccountBurnState(a)
 	if st.HasPrev && now.Sub(st.PrevAt) > pacingSnapshotStaleAfter {
 		return PacingFactorFloor
@@ -1184,11 +1201,10 @@ func (s *AdaptiveSelector) hasConcurrencyHeadroom(a *Auth, cfg internalconfig.Ac
 	if s.gate == nil || a == nil {
 		return true
 	}
-	limit := AccountWarmupStatusFor(a, now, cfg).ConcurrencyLimit
+	limit := int(AccountLimitPolicyFor(a, now, cfg).Fields["concurrency"].Effective)
 	// Scale the concurrency ceiling by the per-account rate multiplier (§8.3),
 	// consistent with the rpm/daily-budget scaling. scaleLimitInt preserves 0
 	// ("no ceiling configured") and floors a positive limit at 1.
-	limit = scaleLimitInt(limit, AccountRateScale(a, cfg))
 	if limit <= 0 {
 		return true
 	}

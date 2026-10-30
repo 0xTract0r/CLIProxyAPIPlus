@@ -145,6 +145,10 @@ func (h *Handler) buildAccountSchedulingView(auth *coreauth.Auth) gin.H {
 	// (account-scheduling.rate-scale), else 1.0. Surfaced so the frontend can
 	// show which accounts are throttled for a safety test.
 	view["rate_scale"] = coreauth.AccountRateScale(auth, scheduling)
+	view["limit_policy"] = coreauth.AccountLimitPolicyFor(auth, now, scheduling)
+	if coreauth.IsConfigAPIKeyAuth(auth) {
+		view["limit_policy"] = nil
+	}
 	warmup := coreauth.AccountWarmupStatusFor(auth, now, scheduling)
 	warmupView := gin.H{
 		"stage":             warmup.StageName,

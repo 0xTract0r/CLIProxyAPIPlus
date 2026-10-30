@@ -350,6 +350,12 @@ scheduling-warmup-pacing	read-only-snapshot	symbol	^func \(p \*WarmupPacer\) Sna
 scheduling-warmup-pacing	manager-snapshot	symbol	^func \(m \*Manager\) WarmupTrafficPacingSnapshot\(	sdk/cliproxy/auth/warmup_pacing_snapshot.go
 scheduling-warmup-pacing	management-snapshot	pattern	view\["warmup_traffic_pacing"\] = h\.authManager\.WarmupTrafficPacingSnapshot	internal/api/handlers/management/auth_files_adaptive_scheduling.go
 scheduling-warmup-pacing	read-only-regression	symbol	^func TestWarmupPacingManagerSnapshotReadOnly\(	sdk/cliproxy/auth/warmup_pacing_snapshot_test.go
+scheduling-warmup-pacing	admission-deadline	symbol	^func runPacingAdmissionSelection\(	sdk/cliproxy/auth/pacing_admission_wait.go
+scheduling-warmup-pacing	limit-policy	symbol	^func AccountLimitPolicyFor\(	sdk/cliproxy/auth/account_limit_policy.go
+scheduling-warmup-pacing	atomic-policy-save	symbol	^func \(m \*Manager\) UpdateAccountScheduling\(	sdk/cliproxy/auth/account_scheduling_update.go
+scheduling-warmup-pacing	narrow-query-route	pattern	mgmt\.GET\("/auth-files/warmup-pacing"	internal/api/server_management.go
+scheduling-warmup-pacing	thin-pool-wait-regression	symbol	^func TestPacingAdmissionTwoWarmingAccountsReleaseBeforeWait\(	sdk/cliproxy/auth/pacing_admission_wait_test.go
+scheduling-warmup-pacing	expiry-read-only-regression	symbol	^func TestAccountLimitPolicyExpiryReadOnlySnapshot\(	sdk/cliproxy/auth/account_limit_policy_test.go
 极速模型收益	fast-context-sdk	symbol	FastContext	sdk/cliproxy/usage/telemetry.go
 极速模型收益	fast-visible-telemetry	symbol	FirstVisibleContentMS	internal/runtime/executor/helps/usage_telemetry.go
 极速模型收益	fast-ws-stream-provenance	pattern	SetCodexFastContext\(	internal/runtime/executor/codex_websockets_stream.go

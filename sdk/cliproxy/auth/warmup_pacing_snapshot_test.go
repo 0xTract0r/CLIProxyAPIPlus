@@ -15,6 +15,30 @@ import (
 	"time"
 )
 
+func TestWarmupPacingSnapshotAttemptBreakdown(t *testing.T) {
+	p, store, now, l, r := pacingFixture(t)
+	pacingFill(t, p, now, l, r)
+	pacingSendFinish(t, p, l, r, 10)
+	pending := pacingReserve(t, p, l, r)
+	got := p.Snapshot("account")
+	if *got.SentAttempts60s != 1 || *got.UnsentReservations != 1 || *got.RecoveredHolds != 0 || *got.Rolling60sRequests != 2 {
+		t.Fatal("sent and unsent counts conflated", got)
+	}
+	restarted := NewWarmupPacer(store, func() time.Time { return *now })
+	got = restarted.Snapshot("account")
+	if *got.SentAttempts60s != 0 || *got.UnsentReservations != 0 || *got.RecoveredHolds != 2 || *got.Rolling60sRequests != 2 || len(restarted.accounts) != 0 {
+		t.Fatal("restart forged sent attempts or relaxed occupancy", got)
+	}
+	*now = now.Add(time.Minute)
+	got = p.Snapshot("account")
+	if *got.SentAttempts60s != 0 || *got.UnsentReservations != 1 || *got.Rolling60sRequests != 1 {
+		t.Fatal("60s boundary or pending reservation lost", got)
+	}
+	if pending.sent || pending.done {
+		t.Fatal("read changed reservation")
+	}
+}
+
 func TestWarmupPacingSnapshotReadOnlyRefill(t *testing.T) {
 	p, store, now, l, r := pacingFixture(t)
 	if got := p.Snapshot("account"); got.Status != "uninitialized" || got.RequestBalance != nil || len(p.accounts) != 0 || store.saves != 0 {
