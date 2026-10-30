@@ -655,24 +655,16 @@ How the cpamp account page renders the §2.5 projection fields for operators:
   accounts. Pacing retains runtime status and recent requests; duration and
   protection details expand on demand. Automatic account handling (global) in
   configuration controls cooldown, issue queues and disabling, not warm-up limits.
-- **Scenario-based editing**: the standalone editor starts with effective limits;
-  duration/protection, refill explanations and scenario suggestions are collapsed.
-  Expand Adjust for a usage scenario, review the changes, then apply.
-  Everyday warm-up clears the four
-  manual overrides and follows the stage baseline. Work with agents raises the
-  slot count to 2 only when lower, preserving send rate and concurrency. Short
-  parallel burst raises slots to 4 and concurrency to 2 only when lower. The two increase presets
-  never lower higher existing values or increase RPM, credit capacity or daily
-  budgets. The default duration is 15 minutes, with 5/15/30-minute and persistent
-  choices; individual number inputs are in Advanced. These are per-account
-  starting points, not throughput or upstream-safety guarantees. Unsupported
-  bounds or active health restrictions disable one-click increases. Retained
-  temporary fields share the new expiry; the server response is authoritative.
-  Tier, rate scale and first-production edits live in this editor's advanced area.
-  Unsaved basic settings block navigation. Leaving a scheduling draft requires
-  discard confirmation, and saving blocks exit. Limit-policy and legacy override
-  forms cannot be edited simultaneously, preventing a saved response from
-  discarding the other form's draft.
+- **Unified limit editing**: choose progression first, then the limit source. Each speed
+  card shows server-derived RPM, concurrency and daily requests. Custom numbers and
+  tier/first-production/legacy-rate maintenance share one draft and one save. The new
+  editor replaces the Everyday warm-up, Work with agents and Short parallel burst
+  scenario picker. See [speed levels and per-account duration](#speed-levels-and-per-account-warm-up-duration-2026-10-30)
+  for the complete flow and required core/CPAMP versions.
+  Replacing the temporary layer gives all retained temporary fields the new expiry;
+  the footer shows the old expiry and restart effect before save. Editing only a fixed
+  field does not renew an unchanged temporary layer. Leaving a dirty draft requires
+  discard confirmation, and saving blocks exit.
 - **Per-field limits**: `limit_policy.fields` reports baseline, fixed/temporary
   override, current effective value/source and server-owned input bounds. The
   existing scheduling PATCH accepts field-wise `limit_overrides` merges and a
