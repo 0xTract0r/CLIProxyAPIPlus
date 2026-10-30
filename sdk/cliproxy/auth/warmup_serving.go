@@ -301,6 +301,30 @@ func (s *AdaptiveSelector) pickWithWarmupServing(ctx context.Context, provider, 
 		}
 	}
 	borrow, borrowProof := warmupBorrowPolicy(ctx)
+	if cfg.WarmupTrafficPacing.Enabled && bound && entry.serving != nil && s.gate.bindingInFlight(bindingKey) {
+		boundAvailable := false
+		for _, candidate := range available {
+			if candidate == nil || candidate.ID != entry.authID {
+				continue
+			}
+			group := entry.serving.pacingGroup
+			if !entry.serving.pacingReliable {
+				group = ""
+			}
+			checkCtx := context.WithValue(ctx, pacingSelectionKey{}, WarmupPacingRequest{GroupID: group, BindingID: s.pacingMemberID(bindingKey, entry.serving.revision)})
+			if wait := s.admissionWaitFor(checkCtx, candidate, cfg, now, bindingKey, entry.serving.revision); wait != nil {
+				return nil, true, wait
+			}
+			// The previous stream may release between the outer binding check
+			// and the readiness probe. A nil wait must re-enter normal selection,
+			// which still enforces current budgets and atomic execution gates.
+			boundAvailable = true
+			break
+		}
+		if !boundAvailable {
+			return nil, true, localAdmissionError("account_unavailable", ctx)
+		}
+	}
 	if !borrow && bound && entry.serving != nil && entry.serving.protected && !retry {
 		for _, candidate := range available {
 			if candidate == nil || candidate.ID != entry.authID || s.isMature(candidate, cfg, now) || s.overWarmupBudget(candidate, cfg, now) {
@@ -319,17 +343,26 @@ func (s *AdaptiveSelector) pickWithWarmupServing(ctx context.Context, provider, 
 			}
 			sameWait := borrowProof != nil && borrowProof.selector == s && borrowProof.key == bindingKey && borrowProof.authID == entry.authID && borrowProof.revision == entry.serving.revision && borrowProof.epoch == s.servingEpoch
 			borrow = sameWait || s.gate.InFlight(candidate.ID) > 0
+			if cfg.WarmupTrafficPacing.Enabled {
+				borrow = sameWait || s.gate.bindingInFlight(bindingKey)
+			}
 			break
 		}
 	}
 	if borrow {
+		if cfg.WarmupTrafficPacing.Enabled && bound && entry.serving != nil && s.gate.bindingInFlight(bindingKey) {
+			return nil, true, &warmupSelectionWait{selector: s, key: bindingKey, authID: entry.authID, revision: entry.serving.revision, epoch: s.servingEpoch, reason: "binding_busy", ready: func() bool { return !s.gate.bindingInFlight(bindingKey) }}
+		}
 		// The original request owns this binding. Borrowed attempts must not
 		// renew its TTL, replace its summary, or commit a retry's selected auth.
-		warmupMarkBorrow(ctx)
 		picked, ok := s.pickFromCandidates(s.scoreCandidates(available, cfg, now, true), cfg, now)
 		if !ok {
+			if cfg.WarmupTrafficPacing.Enabled {
+				return nil, true, &warmupSelectionWait{selector: s, key: bindingKey, authID: entry.authID, revision: entry.serving.revision, epoch: s.servingEpoch, reason: "binding_busy", ready: func() bool { return !s.gate.bindingInFlight(bindingKey) }}
+			}
 			return nil, true, newWarmupBusyError()
 		}
+		warmupMarkBorrow(ctx)
 		s.logPick(ctx, "warmup-concurrent-borrow-mature", provider, model, primaryID, picked, cfg, now)
 		return picked, true, nil
 	}
@@ -388,6 +421,9 @@ func (s *AdaptiveSelector) pickWithWarmupServing(ctx context.Context, provider, 
 			rpm, burst := s.rateLimitParams(candidate, cfg, now)
 			allowed := warmupRateChargeAvailable(ctx, candidate.ID)
 			if !allowed {
+				if cfg.WarmupTrafficPacing.Enabled && !pacingQueueTurn(ctx, s, candidate.ID, bindingKey) {
+					continue
+				}
 				allowed, _ = s.limiter.AllowOrDelay(candidate.ID, rpm, burst)
 			}
 			if allowed {
@@ -428,9 +464,8 @@ func (s *AdaptiveSelector) pickWithWarmupServing(ctx context.Context, provider, 
 			}
 		}
 		if boundAuth != nil && cfg.WarmupTrafficPacing.Enabled && !s.pacingDecision(ctx, boundAuth, cfg, now).Allowed {
-			decision := s.pacingDecision(ctx, boundAuth, cfg, now)
-			if decision.Reason == "rpm" || decision.Reason == "concurrency" {
-				return nil, true, &warmupSelectionWait{selector: s, key: bindingKey, authID: boundAuth.ID, revision: state.revision, epoch: s.servingEpoch, delay: decision.RetryAfter}
+			if wait := s.admissionWaitFor(ctx, boundAuth, cfg, now, bindingKey, state.revision); wait != nil {
+				return nil, true, wait
 			}
 			picked, reason, err = s.pickPacingMatureHandoff(ctx, available, cfg, now)
 			state.reserved, state.protected, state.source = false, false, ""
@@ -438,11 +473,17 @@ func (s *AdaptiveSelector) pickWithWarmupServing(ctx context.Context, provider, 
 		}
 		if picked == nil && boundAuth != nil && state.protected && !s.isMature(boundAuth, cfg, now) && !s.overWarmupBudget(boundAuth, cfg, now) {
 			delay := 100 * time.Millisecond
+			waitReason := "concurrency"
 			if s.hasConcurrencyHeadroom(boundAuth, cfg, now) && !s.pendingWarmupBudgetBusy(boundAuth, cfg, now) {
 				rpm, burst := s.rateLimitParams(boundAuth, cfg, now)
 				allowed, next := warmupRateChargeAvailable(ctx, boundAuth.ID), time.Duration(0)
 				if !allowed {
-					allowed, next = s.limiter.AllowOrDelay(boundAuth.ID, rpm, burst)
+					if cfg.WarmupTrafficPacing.Enabled && !pacingQueueTurn(ctx, s, boundAuth.ID, bindingKey) {
+						waitReason = "queue_turn"
+					} else {
+						allowed, next = s.limiter.AllowOrDelay(boundAuth.ID, rpm, burst)
+						waitReason = "rpm"
+					}
 				}
 				if allowed {
 					picked, reason = boundAuth, "sticky-keep-warming-protected"
@@ -452,7 +493,12 @@ func (s *AdaptiveSelector) pickWithWarmupServing(ctx context.Context, provider, 
 				}
 			}
 			if picked == nil {
-				return nil, true, &warmupSelectionWait{selector: s, key: bindingKey, authID: boundAuth.ID, revision: state.revision, epoch: s.servingEpoch, delay: delay}
+				wait := &warmupSelectionWait{selector: s, key: bindingKey, authID: boundAuth.ID, revision: state.revision, epoch: s.servingEpoch, delay: delay}
+				if cfg.WarmupTrafficPacing.Enabled {
+					wait.reason = waitReason
+					attachPacingWaitReadiness(ctx, wait, boundAuth)
+				}
+				return nil, true, wait
 			}
 		}
 		if picked == nil && err == nil {

@@ -38,6 +38,8 @@ type warmupRequestState struct {
 	now                         func() time.Time
 	sleep                       func(context.Context, time.Duration) error
 	queue                       *warmupWaitQueue
+	admission                   *pacingAdmissionState
+	admissionSleep              func(context.Context, <-chan struct{}, time.Duration) error
 }
 
 func withWarmupRequestState(ctx context.Context, purpose warmupRequestPurpose) context.Context {
@@ -77,21 +79,37 @@ type warmupSelectionWait struct {
 	key, authID     string
 	revision, epoch uint64
 	delay           time.Duration
+	reason          string
+	ready           func() bool
 }
 
 func (*warmupSelectionWait) Error() string { return "warming binding temporarily busy" }
 
-type warmupBusyError struct{ cause *Error }
+type warmupBusyError struct {
+	cause *Error
+	local bool
+	delay time.Duration
+}
 
 func (e *warmupBusyError) Error() string   { return e.cause.Error() }
 func (e *warmupBusyError) StatusCode() int { return e.cause.StatusCode() }
 func (e *warmupBusyError) Unwrap() error   { return e.cause }
 
 func newWarmupBusyError() error {
-	return &warmupBusyError{&Error{Code: "warmup_busy", Message: "warming binding is busy; retry later", Retryable: true, HTTPStatus: http.StatusTooManyRequests}}
+	return &warmupBusyError{cause: &Error{Code: "warmup_busy", Message: "warming binding is busy; retry later", Retryable: true, HTTPStatus: http.StatusTooManyRequests}}
 }
 
-func (*warmupBusyError) RetryAfter() *time.Duration { d := time.Second; return &d }
+func (e *warmupBusyError) RetryAfter() *time.Duration {
+	if e.local {
+		if e.delay <= 0 {
+			return nil
+		}
+		d := e.delay
+		return &d
+	}
+	d := time.Second
+	return &d
+}
 
 type warmupWaitQueue struct {
 	mu       sync.Mutex
@@ -145,6 +163,12 @@ func (q *warmupWaitQueue) release(permit *warmupWaitPermit) {
 func runWarmupSelection(ctx context.Context, pick func(context.Context) error) error {
 	ctx = withWarmupRequestState(ctx, warmupPurposeServe)
 	state := warmupRequestFromContext(ctx)
+	state.mu.Lock()
+	admission := state.admission
+	state.mu.Unlock()
+	if admission != nil {
+		return runPacingAdmissionSelection(ctx, pick)
+	}
 	var held *warmupWaitPermit
 	logged, logAuth, outcome := false, "", "complete"
 	defer func() {

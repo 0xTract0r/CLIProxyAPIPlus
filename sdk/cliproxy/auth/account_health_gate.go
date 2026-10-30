@@ -319,19 +319,26 @@ func evaluateAccountHealthGate(auth *Auth, success bool, now time.Time, cfg inte
 	if auth == nil || !cfg.HealthGate.Enabled || !accountHealthGateApplies(auth) {
 		return
 	}
-	curve := cfg.WarmupCurve
+	rawAge, hasAnchor, timeline := accountWarmupTimeline(auth, now, cfg)
+	curve := timeline.WarmupCurve
 	if len(curve) == 0 {
 		return
 	}
+	manual := accountManualMature(auth)
+	if manual {
+		hasAnchor = true
+	}
 
-	rawAge, hasAnchor := AccountAgeDays(auth, now)
 	if !hasAnchor {
 		// Fix 3 (LOW): cold account (no anchor) -- read side pass-throughs it, so a
 		// cap/stamp here is dead metadata. Skip to avoid persistence churn.
 		return
 	}
 	ageIdx := ageWarmupStageIndex(curve, rawAge)
-	if ageIdx >= len(curve) {
+	if manual {
+		ageIdx = len(curve)
+	}
+	if ageIdx >= len(curve) && !manual {
 		// Fix 1 (HIGH): mature account -- out of the warmup-period scope. Never
 		// record a cap/stamp for it; the read side ignores any stale cap too.
 		return

@@ -18,6 +18,7 @@ func virtualWarmupWait(now *time.Time) (context.Context, *warmupRequestState) {
 	state := warmupRequestFromContext(ctx)
 	state.now = func() time.Time { return *now }
 	state.sleep = func(ctx context.Context, d time.Duration) error { *now = now.Add(d); return ctx.Err() }
+	state.admissionSleep = func(ctx context.Context, _ <-chan struct{}, d time.Duration) error { return state.sleep(ctx, d) }
 	state.queue = &warmupWaitQueue{}
 	return ctx, state
 }

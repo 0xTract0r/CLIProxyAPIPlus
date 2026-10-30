@@ -71,6 +71,7 @@ type AccountConcurrencyGate struct {
 	// bounded by the set of accounts with active traffic, not by history.
 	inflight map[string]int
 	pending  map[string]int
+	bindings map[string]int
 
 	// daily maps authID -> that account's rolling 24-hour REQUEST counter
 	// (harden-account-scheduling-limiter P2). It replaced the earlier single
@@ -602,6 +603,7 @@ type accountExecutionSlot struct {
 	countOnly      bool
 	dailyBudget    int
 	manager        *Manager
+	bindingKey     string
 }
 
 // beginAccountExecution reserves one in-flight concurrency slot for auth on the
@@ -633,11 +635,10 @@ func (m *Manager) beginAccountExecution(auth *Auth) (*accountExecutionSlot, bool
 	if auth.AccountTierBaseWeight(cfg.TierWeights) <= 0 {
 		return nil, true
 	}
-	limit := AccountWarmupStatusFor(auth, time.Now(), cfg).ConcurrencyLimit
+	limit := int(AccountLimitPolicyFor(auth, time.Now(), cfg).Fields["concurrency"].Effective)
 	// Scale the concurrency ceiling by the per-account rate multiplier (§8.3) so
 	// the execution-path acquire enforces the SAME scaled limit the selector's
 	// Pick-time hasConcurrencyHeadroom read avoids against (one source of truth).
-	limit = scaleLimitInt(limit, AccountRateScale(auth, cfg))
 	within := gate.Acquire(auth.ID, limit)
 	return &accountExecutionSlot{gate: gate, authID: auth.ID}, within
 }
@@ -653,10 +654,11 @@ func (s *accountExecutionSlot) release() {
 	}
 	s.releaseOnce.Do(func() {
 		if s.target {
-			s.gate.releaseWarmupReservation(s.authID)
+			s.gate.releaseWarmupReservation(s.authID, s.bindingKey)
 		} else {
 			s.gate.Release(s.authID)
 		}
+		notifyPacingAdmission()
 	})
 }
 

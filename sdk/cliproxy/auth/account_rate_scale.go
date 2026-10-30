@@ -32,7 +32,7 @@ func AccountRateScale(a *Auth, cfg internalconfig.AccountSchedulingConfig) float
 			}
 		}
 	}
-	if cfg.RateScale > 0 {
+	if finitePositive(cfg.RateScale) {
 		return cfg.RateScale
 	}
 	return 1.0
@@ -70,7 +70,7 @@ func parseRateScaleValue(raw any) (float64, bool) {
 }
 
 func positiveFloat(f float64) (float64, bool) {
-	if f > 0 {
+	if finitePositive(f) && f < float64(math.MaxInt) {
 		return f, true
 	}
 	return 0, false
@@ -118,6 +118,9 @@ func scaleLimitRPM(rpm, scale float64) float64 {
 	if rpm <= 0 {
 		return rpm
 	}
+	if rpm >= float64(math.MaxInt)/scale {
+		return float64(math.MaxInt - 1024)
+	}
 	return rpm * scale
 }
 
@@ -130,7 +133,11 @@ func scaleLimitInt(limit int, scale float64) int {
 	if limit <= 0 {
 		return limit
 	}
-	scaled := int(math.Round(float64(limit) * scale))
+	product := math.Round(float64(limit) * scale)
+	if product >= float64(math.MaxInt) {
+		return math.MaxInt
+	}
+	scaled := int(product)
 	if scaled < 1 {
 		scaled = 1
 	}

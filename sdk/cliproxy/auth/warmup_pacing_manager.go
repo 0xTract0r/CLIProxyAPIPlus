@@ -58,7 +58,10 @@ func pacingLimitsFor(s *AdaptiveSelector, a *Auth, cfg internalconfig.AccountSch
 	status := AccountWarmupStatusFor(a, now, cfg)
 	scale := AccountRateScale(a, cfg)
 	rpm, _ := s.rateLimitParams(a, cfg, now)
-	l := WarmupPacingLimits{Config: cfg.WarmupTrafficPacing, DailyRequests: scaleLimitInt(status.DailyBudget, scale), Concurrency: scaleLimitInt(status.ConcurrencyLimit, scale), DailyTokens: int64(scaleLimitInt(resolveTokenDailyBudget(cfg, status), scale))}
+	policy := AccountLimitPolicyFor(a, now, cfg)
+	l := WarmupPacingLimits{Config: cfg.WarmupTrafficPacing, DailyRequests: accountRequestDailyBudget(a, now, cfg), Concurrency: int(policy.Fields["concurrency"].Effective), DailyTokens: int64(scaleLimitInt(resolveTokenDailyBudget(cfg, status), scale))}
+	l.Config.RequestBurst = int(policy.Fields["request_capacity"].Effective)
+	l.Config.MaxActiveBindings = int(policy.Fields["max_active_bindings"].Effective)
 	if rpm > 0 {
 		l.RPM = max(1, int(math.Floor(rpm)))
 	}
@@ -77,6 +80,7 @@ func (m *Manager) refreshWarmupPacing() {
 }
 
 func (m *Manager) refreshWarmupPacingLocked() {
+	defer notifyPacingAdmission()
 	m.mu.RLock()
 	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
 	s, _ := m.selector.(*AdaptiveSelector)

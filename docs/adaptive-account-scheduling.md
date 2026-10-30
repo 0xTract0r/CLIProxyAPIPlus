@@ -595,13 +595,25 @@ How the cpamp account page renders the §2.5 projection fields for operators:
   credit and the ledger's `min_admission_requests`, rather than promising full
   admission. `status` is `active`, `disabled`, `uninitialized`, `error`, or
   `not_applicable`; inactive dynamic values are JSON `null`, never a guessed zero.
-  Older servers may omit the whole block. `observed_at` is the list-refresh
-  snapshot time; the browser does not run a local refill countdown.
+  Older servers may omit the whole block. The narrow read
+  `GET /v0/management/auth-files/warmup-pacing?name=…&auth_index=…` requires both
+  exact identifiers and returns 404 on mismatch, without header synchronization
+  or upstream probes. `observed_at` is the server observation time; the detail
+  view refreshes on opening and while visible, and a local countdown remains an
+  estimate that must be confirmed by another server snapshot.
   Details show balance/capacity, admission threshold, refill/hour and balance ETA,
   rolling 24-hour/60-second requests and limits, active independent groups/idle
   expiry, and in-flight/concurrency. `pending_requests` counts unsent reservations
-  already included in the request totals. Limits come from the actual ledger
-  policy, not a newly configured curve that has not yet been applied.
+  already included in the request totals. `sent_attempts_60s` counts observed
+  upstream attempts (including retries), `unsent_reservations` counts unsent
+  reservations, and `recovered_holds` separates recent restart-recovered records
+  whose send status is unknown. Their sum retains `rolling_60s_requests` occupancy;
+  none of these is a success count. `waiting_requests` is local queue occupancy,
+  distinct from execution slots and ledger `inflight` attempts.
+  Snapshots combine conservative ledger counters with current explicit/temporary
+  policy ceilings. Expiry can clamp the projected balance down without writing
+  the ledger; a higher capacity never grants credits or applies a new refill rate
+  retroactively. A read does not change reservations, windows or binding TTL.
   `admission_balance_eta_seconds` estimates only balance recovery; it is null
   when unsent reservations prevent reaching the threshold by waiting alone,
   or a clock rollback has suspended refill while the balance is insufficient.
@@ -610,6 +622,87 @@ How the cpamp account page renders the §2.5 projection fields for operators:
   pressure. Group/admission pressure refers to a new independent conversation;
   an empty list does not guarantee request-token, health or upstream admission.
   `reason` contains only a machine code, never raw storage errors or identities.
+- **Peak rate versus sustained refill**: pacing details and limit editing share
+  one conversion. A 500-request daily budget refills 20.833 credits/hour or
+  about 0.347/minute: one every 172.8 seconds (rounded up to 2m53s in the UI).
+  A 5 RPM ceiling limits sends in a rolling 60-second window; it does not refill
+  five credits each minute. Capacity 8 stores at most eight credits. A new or
+  inactive group must meet the actual admission threshold (for example, 4);
+  a still-active committed continuation normally needs one. Each send spends
+  only one credit, not the entire admission threshold. Empty-to-four takes a
+  theoretical 11m32s. The displayed balance ETA targets new-group admission,
+  not the continuation threshold, and is not a promise to wait that long.
+  RPM, concurrency, groups and budget gates must also pass. Waiting requires a
+  credible recovery within the shared deadline (30 seconds by default).
+  Raising peak RPM, capacity or group slots does not increase refill.
+- **Warm-up duration and protection state**: settings read the actual curve from
+  the existing `/config` response and combine it with first production and age.
+  The default 60 days is not hard-coded in the UI; missing config stays unknown,
+  and an unbounded final stage has no maturity date. Default boundaries are
+  0/7/14/30/45/60 days. Health can lower a stage within the curve but does not
+  extend it past the age-based endpoint. Maturity guarantees neither account
+  availability nor unlimited upstream quota. A zero token budget is shown as
+  “No local cap configured”, a missing value as unknown, and a positive value as
+  the configured limit. Accounting and pre-send estimates are already wired.
+  The 5h/7d percentages feed tightest-window weighting and warming-account
+  pacing; **there is no independent daily subscription-percentage hard cap**.
+  Production readback at 2026-09-23 22:01 Asia/Shanghai confirmed a 60-day curve,
+  AC-13 age 8 / AC-16 age 11, and 500 daily requests / zero token cap on both.
+  This local UI update does not enable or modify production protection settings.
+- **Entry ownership**: account settings show only a compact warm-up summary.
+  Its link and pacing details open the same standalone Scheduling & limits
+  editor, identified by account. Saving affects neither global rules nor other
+  accounts. Pacing retains runtime status and recent requests; duration and
+  protection details expand on demand. Automatic account handling (global) in
+  configuration controls cooldown, issue queues and disabling, not warm-up limits.
+- **Scenario-based editing**: the standalone editor starts with effective limits;
+  duration/protection, refill explanations and scenario suggestions are collapsed.
+  Expand Adjust for a usage scenario, review the changes, then apply.
+  Everyday warm-up clears the four
+  manual overrides and follows the stage baseline. Work with agents raises the
+  slot count to 2 only when lower, preserving send rate and concurrency. Short
+  parallel burst raises slots to 4 and concurrency to 2 only when lower. The two increase presets
+  never lower higher existing values or increase RPM, credit capacity or daily
+  budgets. The default duration is 15 minutes, with 5/15/30-minute and persistent
+  choices; individual number inputs are in Advanced. These are per-account
+  starting points, not throughput or upstream-safety guarantees. Unsupported
+  bounds or active health restrictions disable one-click increases. Retained
+  temporary fields share the new expiry; the server response is authoritative.
+  Tier, rate scale and first-production edits live in this editor's advanced area.
+  Unsaved basic settings block navigation. Leaving a scheduling draft requires
+  discard confirmation, and saving blocks exit. Limit-policy and legacy override
+  forms cannot be edited simultaneously, preventing a saved response from
+  discarding the other form's draft.
+- **Per-field limits**: `limit_policy.fields` reports baseline, fixed/temporary
+  override, current effective value/source and server-owned input bounds. The
+  existing scheduling PATCH accepts field-wise `limit_overrides` merges and a
+  replacing `temporary_limits` layer; new edits require both `name` and
+  `auth_index`. For OAuth/file-backed accounts the complete patch is validated,
+  persisted, then published atomically. Static `claude-api-key` config accounts
+  expose `limit_policy: null` and reject these new edits with HTTP 409 /
+  `static_config_account`; their existing tier/rate-scale controls are unchanged.
+
+```json
+{
+  "name": "account.json",
+  "auth_index": "exact-index",
+  "limit_overrides": {"rpm": 8, "concurrency": 2, "request_capacity": null},
+  "temporary_limits": {"duration_minutes": 15, "overrides": {"rpm": 10}}
+}
+```
+
+An omitted field stays unchanged. A per-field null inherits the baseline; whole
+`limit_overrides: null` clears all fixed fields. `temporary_limits: null` ends the
+temporary layer. Durations are 5/15/30 minutes; server bounds are RPM 1–60,
+concurrency 1–4, capacity from the admission threshold through 32, and groups 1–8.
+These edit bounds do not clamp an existing mature baseline, such as 135 RPM / 12
+concurrent. Temporary expiry inherits the *current* fixed/global policy. A
+process-local monotonic deadline and a latched expiry prevent clock rollback from
+extending or reviving it; same-instance refresh/watch reloads retain the proof,
+while restart expires it early (`restart_expired`). Health/pace restrictions still
+win over increases. Increasing RPM/capacity/groups never raises the daily budget,
+refills balance, resets windows or renews bindings; lowering the group ceiling
+preserves already committed groups while refusing new ones.
 - **"Manual" marker**: `tier_source = "override"`.
 - **Session counts**: `sessions_total` / `sessions_active` / `sessions_closed`.
 - **Decelerated state**: `in_distress = true` (with `warmup_health_stage_cap` /
@@ -648,6 +741,8 @@ A positive binding age still requires reserve, a positive migration budget and s
 
 A positive reserve adds opportunities for eligible new Claude sessions and reliably independent children. Warming accounts share the probability; it is not a request/token share or a finite-sample minimum. A qualified fresh selection with a mature fallback receives continuity protection whether it came from the reserve draw or ordinary weighting. Logs distinguish `reserve`, `weighted`, `migration`, and `inherited`; weighted selection is not counted as a reserve win.
 
+**The following wait bounds, table and temporary borrowing rules apply only to the legacy reserve path with reserve enabled and `warmup-traffic-pacing.enabled: false`.** With pacing enabled, [Warm-up traffic pacing](#warm-up-traffic-pacing) supplies the shared absolute deadline and configurable queue (default: four waiters per account, 32 globally). Overlapping requests on the same binding wait in order rather than immediately returning busy because no mature fallback exists.
+
 A protected child normally stays on its account. Temporary RPM, concurrency, or pending-request-budget pressure can wait outside scheduler locks, for at most **30 seconds accumulated across the logical request**, with one waiter per account and 64 per process. The caller's shorter deadline wins. Each wake-up rechecks current state; execution waiting returns through normal selection and preparation before sending, so stale credentials or model permissions are not reused.
 
 | Condition | Result |
@@ -661,7 +756,7 @@ A protected child normally stays on its account. Temporary RPM, concurrency, or 
 | Budget exhausted, disabled/quarantined/removed account, or real upstream failure | Apply safe failover; do not create another reserve draw |
 | Client cancels while waiting | Release the waiter; do not send a background model request |
 
-Borrowing handles only the overlapping request; the original execution/waiter and later serial turns retain their binding. It does not classify progress-description prompt text. A committed handover does not automatically bounce back when the warming token recovers. This avoids repeatedly rebuilding the same prompt cache. Existing proactive migration still needs its separately configured budget and eligibility below. The fixed wait bounds add no configuration fields.
+Borrowing handles only the overlapping request; the original execution/waiter and later serial turns retain their binding. It does not classify progress-description prompt text. A committed handover does not automatically bounce back when the warming token recovers. This avoids repeatedly rebuilding the same prompt cache. Existing proactive migration still needs its separately configured budget and eligibility below. The legacy reserve path's fixed wait bounds add no configuration fields.
 
 Fresh-child recognition requires a reliable parent, an independent first text task, and no fork or inherited-history evidence. The remaining messages may contain complete CLI tool catalogs, skill catalogs, and/or the exact `Today's date is YYYY-MM-DD.` notice. A catalog does **not** require a date. Complete known units may be reordered or packaged across text blocks/system messages; a heading and its entries must remain together. Auxiliary input is bounded to 128 KiB and eight messages/text blocks. Empty or duplicate catalogs, malformed dates, unknown independent paragraphs, split units, media and unknown blocks remain conservative.
 
@@ -695,11 +790,25 @@ account-scheduling:
     min-admission-requests: 4 # New independent conversation admission headroom
     max-active-bindings: 1 # Recently active independent groups per account
     active-binding-idle-seconds: 300 # Idle expiry in seconds, separate from prompt-cache TTL
+    admission-wait:
+      max-wait-seconds: 30 # 0 disables local waiting; valid range 0–60
+      max-pending-per-account: 4 # Positive, at most 16
+      max-pending-total: 32 # Positive, at most 128; >= per-account
 ```
 
 When enabled, integer limits must be positive and the admission minimum cannot exceed capacity. A new ledger starts at zero. Credits refill continuously at the effective daily request budget divided by 86400 seconds. At 200 requests/day, one credit takes 7.2 minutes, admission at four takes about 28.8 minutes, and eight idle credits take about 57.6 minutes. The service does not generate traffic to fill a quota.
 
-Admitted conversations prefer their current account, but every send still observes credit, rolling-60-second and rolling-24-hour budgets, concurrency and health. Temporary RPM/concurrency pressure uses the existing request-total 30-second wait. Overlap can borrow a mature account without replacing the primary binding. Long-term credit/budget/admission exhaustion uses a stable mature handoff; recovering one credit does not reclaim that conversation. Without an eligible fallback, return retryable capacity pressure.
+Admitted conversations prefer their current account, but every send still observes credit, rolling-60-second and rolling-24-hour budgets, concurrency and health. Actual warming admission shares one absolute wait deadline (30 seconds by default) across selection, executor admission and retries. It does not set a timeout on already started generation or affect unrelated providers/mature-only requests. Known RPM/balance/daily-budget recovery waits only when it fits the remaining deadline; concurrency, binding overlap and groups can wait for release. Unknown identity/usage, corrupt ledgers and unavailable accounts are not assumed recoverable by sleeping. Existing mature fallback remains available.
+
+Waiters hold no execution slot or unsent debit. The bounded queue keeps one ticket
+per request, with the configured account/global counts and a fixed 32 MiB retained
+request-input budget. Same-binding order and ready-waiter priority apply; all
+wakes revalidate real admission. Cancellation releases the ticket. Queue-full and
+wait-timeout errors remain local admission failures and do not downgrade upstream
+health. Logs identify `source=local_admission`, reason, hashed account reference,
+wait duration and queue depth using the existing request correlation. Partial YAML
+with only `max-wait-seconds: 0` retains the 4/32 queue defaults. These are source
+defaults, not a claim that a production deployment or setting change occurred.
 
 Fresh children use independent groups; reliable parent-affine fork/unknown children share the known parent group while still spending per-account allowance. Releasing one parent/child/alias membership does not free another active member. CountTokens consumes request/concurrency allowance without creating or renewing groups or stamping first production; input estimation is not generation usage.
 
@@ -728,7 +837,48 @@ of 2026-09):
 | Opt-in service reserve, child identity and migration | `sdk/cliproxy/auth/warmup_serving.go` |
 | Auxiliary notices and full-task fingerprints | `sdk/cliproxy/auth/warmup_serving_auxiliary.go`, `warmup_serving_task.go` |
 | Bounded waiting and execution admission/settlement | `sdk/cliproxy/auth/warmup_serving_wait.go`, `warmup_execution.go` |
+| Shared pacing deadline, bounded queue and override policy | `sdk/cliproxy/auth/pacing_admission_wait.go`, `account_limit_policy.go`, `account_scheduling_update.go` |
+| Narrow account pacing query and limit validation | `internal/api/handlers/management/auth_files_limit_policy.go` |
 | Per-account token bucket (`AccountRateLimiter`) | `sdk/cliproxy/auth/account_rate_limiter.go` |
 | Management-API projection write site | `internal/api/handlers/management/auth_files.go` (~line 490) |
 | Legacy projection builder (`buildAdaptiveSchedulingView`) | `internal/api/handlers/management/auth_files_adaptive_scheduling.go` |
 | Projection dual-emit site | `internal/api/handlers/management/auth_files.go` |
+
+
+## Speed levels and per-account warm-up duration (2026-10-30)
+
+The account settings keep a compact summary. Both it and pacing details open the same
+Scheduling & limits editor. Common controls are Low/Medium/High/Extreme speed and
+automatic duration, custom days, or manual maturity. A compact live balance/recovery
+summary stays visible; numeric overrides, temporary settings, tier and rate scale are advanced.
+
+The server derives previews from the effective stage. Daily request budget and RPM
+multipliers are 0.5/1/1.5/2; RPM is rounded, concurrency rounds up within 1..4, capacity
+covers admission, and active groups never exceed 8. Health and upstream restrictions
+still apply. Read effective_limits for actual results; no throughput is guaranteed and
+new profiles do not additionally increase token budgets.
+
+Existing accounts retain their policy until a level is selected. Selecting a profile clears
+legacy per-account rate scale, fixed and temporary numeric overrides. An advanced numeric
+edit clears the profile. Increasing a level grants no credits and resets no usage. Mature
+accounts use existing mature limits. Duration supports 1..365 days without rewriting first
+production; manual maturity bypasses age progression while retaining health restrictions.
+Returning to automatic mode preserves history and budgets.
+
+These are account PATCH fields, not global YAML. Exact name and auth_index are required:
+
+```json
+{
+  "name": "account.json",
+  "auth_index": "exact-index",
+  "speed_profile": "medium",
+  "warmup_period_days": 30,
+  "warmup_mode": "auto"
+}
+```
+
+Profiles accept low/medium/high/extreme or null; null duration inherits the actual global
+curve; mode accepts auto/mature or null (automatic). Omission preserves a field. Speed
+cannot be mixed with legacy rate/numeric controls. GET/PATCH warmup_control returns the
+selected policy, effective duration and four server-derived previews. New subscription
+percentage guards and token budget calibration are deferred and must not appear enabled.

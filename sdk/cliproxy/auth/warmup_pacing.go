@@ -90,9 +90,10 @@ type pacingState struct {
 }
 
 type pacingAccount struct {
-	state pacingState
-	live  map[uint64]*WarmupPacingAttempt
-	fault error
+	state        pacingState
+	live         map[uint64]*WarmupPacingAttempt
+	fault        error
+	observedSent map[uint64]bool
 }
 
 // WarmupPacer owns only pacing accounting, never auth snapshots or network I/O.
@@ -255,6 +256,11 @@ func (p *WarmupPacer) commit(a *pacingAccount, s pacingState) error {
 		return a.fault
 	}
 	a.state = s
+	for id := range a.observedSent {
+		if _, ok := s.Records[id]; !ok {
+			delete(a.observedSent, id)
+		}
+	}
 	return nil
 }
 
@@ -483,7 +489,7 @@ func (p *WarmupPacer) decision(a *pacingAccount, s pacingState, req WarmupPacing
 	if exclude != 0 {
 		r := s.Records[exclude]
 		group, binding = r.Group, r.Binding
-		if !req.CountOnly && d.ActiveGroups > s.Limits.Config.MaxActiveBindings {
+		if !req.CountOnly && d.ActiveGroups > s.Limits.Config.MaxActiveBindings && !pacingCommittedGroup(a, &s, group) {
 			return deny("active-groups", 0)
 		}
 	}
@@ -635,6 +641,10 @@ func (p *WarmupPacer) MarkSent(lease *WarmupPacingAttempt) error {
 		return err
 	}
 	lease.sent = true
+	if a.observedSent == nil {
+		a.observedSent = make(map[uint64]bool)
+	}
+	a.observedSent[lease.id] = true
 	return nil
 }
 
