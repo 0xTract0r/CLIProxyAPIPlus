@@ -375,3 +375,10 @@ scheduling-warmup-control	daily-budget-admission	pattern	budget := accountReques
 scheduling-warmup-control	manual-health-regression	symbol	^func TestAccountWarmupControlManualAutoHealth\(	sdk/cliproxy/auth/account_warmup_control_test.go
 scheduling-warmup-control	profile-stage-parity	symbol	^func TestAccountWarmupControlProfileStageParity\(	sdk/cliproxy/auth/account_warmup_control_test.go
 scheduling-warmup-control	real-file-reload	symbol	^func TestAccountSchedulingWarmupControlsPersistReload\(	internal/api/handlers/management/auth_files_warmup_control_test.go
+
+# Read-only policy preview for the unified account scheduling editor.
+scheduling-editor-preview	preview-route	pattern	mgmt\.POST\("/auth-files/account-scheduling/preview"	internal/api/server_management.go
+scheduling-editor-preview	preview-handler	symbol	^func \(h \*Handler\) PreviewAuthFileAccountScheduling\(	internal/api/handlers/management/auth_files_account_scheduling_preview.go
+scheduling-editor-preview	isolated-clone	symbol	^func \(a \*Auth\) CloneForSchedulingPreview\(	sdk/cliproxy/auth/account_scheduling_preview.go
+scheduling-editor-preview	read-only-regression	symbol	^func TestPreviewAccountSchedulingReadOnlyRuntimeAndFiles\(	internal/api/handlers/management/auth_files_account_scheduling_preview_test.go
+scheduling-editor-preview	expiry-isolation-regression	symbol	^func TestSchedulingPreviewCloneDoesNotLatchLiveTemporaryExpiry\(	sdk/cliproxy/auth/account_scheduling_preview_test.go

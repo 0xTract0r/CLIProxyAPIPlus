@@ -848,11 +848,20 @@ of 2026-09):
 ## Speed levels and per-account warm-up duration (2026-10-30)
 
 The account settings keep a compact summary. Both it and pacing details open the same
-Scheduling & limits editor. Common controls are Low/Medium/High/Extreme speed and
-automatic duration, custom days, or manual maturity. A compact live balance/recovery
-summary stays visible; numeric overrides, temporary settings, tier and rate scale are advanced.
+Scheduling & limits editor. The revised editor first selects age-based progression or manual
+maturity, then an inherited/custom duration, followed by presets or custom limits. Each preset
+shows server-provided RPM, concurrency and daily requests; mature accounts show their actual
+mature policy. Custom limits retain per-field inherited/fixed/temporary sources. Tier, first
+production and legacy rate scale remain in a maintenance disclosure, within the same draft
+and save action. There is no competing scenario picker or second save button. Live balance
+is separate from candidate limits; increasing a limit grants no credits. An authoritative save
+refreshes current values, and editing again immediately marks the draft unsaved.
 
-The server derives previews from the effective stage. Daily request budget and RPM
+This revision requires both preview-capable core and CPAMP and adds no configuration switch.
+Older core without the endpoint reports editing as unavailable. Source availability alone does
+not prove the running version has been updated.
+
+The server derives recommendations from the effective stage. Daily request budget and RPM
 multipliers are 0.5/1/1.5/2; RPM is rounded, concurrency rounds up within 1..4, capacity
 covers admission, and active groups never exceed 8. Health and upstream restrictions
 still apply. Read effective_limits for actual results; no throughput is guaranteed and
@@ -882,3 +891,21 @@ curve; mode accepts auto/mature or null (automatic). Omission preserves a field.
 cannot be mixed with legacy rate/numeric controls. GET/PATCH warmup_control returns the
 selected policy, effective duration and four server-derived previews. New subscription
 percentage guards and token budget calibration are deferred and must not appear enabled.
+
+### Read-only candidate preview
+
+Send the same sparse PATCH body to `POST /v0/management/auth-files/account-scheduling/preview`,
+or send only the exact `name` and `auth_index` to inspect current rules. The response has
+`preview: true`, candidate `account_scheduling`, and saved `current_account_scheduling`.
+These policy views deliberately omit live balance, usage and session counts. The endpoint
+uses the existing management authentication and Claude/plugin/static-account boundaries.
+It never persists or publishes auth, latches live temporary expiry, refreshes credentials, or
+contacts an upstream. Ordinary time-based refill is not a credit granted by preview.
+
+The editor uses the same sparse body for preview and save, rejects stale responses, and
+associates invalid fields with their allowed ranges. Leaving a preset can explicitly submit
+`speed_profile: null` even without numeric changes. Non-null profiles never mix with legacy
+rate or numeric fields. Returning to age-based progression retains a saved custom duration;
+only explicitly choosing the system period clears it. Untouched first-production timestamps
+retain their second precision, and every way of clearing one requires confirmation before
+save. The original atomic PATCH still revalidates and supplies the authoritative saved view.
