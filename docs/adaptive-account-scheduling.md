@@ -904,8 +904,10 @@ contacts an upstream. Ordinary time-based refill is not a credit granted by prev
 
 The editor uses the same sparse body for preview and save, rejects stale responses, and
 associates invalid fields with their allowed ranges. Leaving a preset can explicitly submit
-`speed_profile: null` even without numeric changes. Non-null profiles never mix with legacy
-rate or numeric fields. Returning to age-based progression retains a saved custom duration;
+`speed_profile: null` when no legacy field is being changed. Any speed_profile field,
+including null, cannot share a body with legacy rate or numeric controls. A numeric edit
+omits speed_profile: the server implicitly clears the old profile in the same atomic save.
+Returning to age-based progression retains a saved custom duration;
 only explicitly choosing the system period clears it. Untouched first-production timestamps
 retain their second precision, and every way of clearing one requires confirmation before
 save. The original atomic PATCH still revalidates and supplies the authoritative saved view.
