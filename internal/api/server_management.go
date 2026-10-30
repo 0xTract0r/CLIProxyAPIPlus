@@ -221,6 +221,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/auth-files/account-settings", s.mgmt.GetAuthFileAccountSettings)
 		mgmt.PATCH("/auth-files/account-settings", s.mgmt.PatchAuthFileAccountSettings)
 		mgmt.PATCH("/auth-files/account-scheduling", s.mgmt.PatchAuthFileAccountScheduling)
+		mgmt.POST("/auth-files/account-scheduling/preview", s.mgmt.PreviewAuthFileAccountScheduling)
 		mgmt.GET("/oauth-reauth-history", s.mgmt.ListOAuthReauthHistory)
 		mgmt.GET("/auth-status-history", s.mgmt.ListAuthStatusHistory)
 		mgmt.POST("/diagnostics/provider-tls-probe", s.mgmt.RunProviderTLSProbe)

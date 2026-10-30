@@ -37,10 +37,15 @@ var (
 // "born just now". Callers (the management UI, the farm-orchestrator
 // passthrough) can therefore distinguish "we don't know yet" from a real value.
 func (h *Handler) buildAccountSchedulingView(auth *coreauth.Auth) gin.H {
+	return h.buildAccountSchedulingViewAt(auth, time.Now())
+}
+
+// buildAccountSchedulingViewAt keeps a policy preview on one clock instant.
+// A handler without a manager/usage store never reads live pacing or sessions.
+func (h *Handler) buildAccountSchedulingViewAt(auth *coreauth.Auth, now time.Time) gin.H {
 	if auth == nil {
 		return nil
 	}
-	now := time.Now()
 	view := gin.H{}
 
 	// Fine-grained subscription tier, dispatched on provider. Claude's Max
