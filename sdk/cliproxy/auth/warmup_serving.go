@@ -302,6 +302,7 @@ func (s *AdaptiveSelector) pickWithWarmupServing(ctx context.Context, provider, 
 	}
 	borrow, borrowProof := warmupBorrowPolicy(ctx)
 	if cfg.WarmupTrafficPacing.Enabled && bound && entry.serving != nil && s.gate.bindingInFlight(bindingKey) {
+		boundAvailable := false
 		for _, candidate := range available {
 			if candidate == nil || candidate.ID != entry.authID {
 				continue
@@ -314,9 +315,15 @@ func (s *AdaptiveSelector) pickWithWarmupServing(ctx context.Context, provider, 
 			if wait := s.admissionWaitFor(checkCtx, candidate, cfg, now, bindingKey, entry.serving.revision); wait != nil {
 				return nil, true, wait
 			}
-			return nil, true, s.pacingUnavailableError(checkCtx, []*Auth{candidate}, cfg, now)
+			// The previous stream may release between the outer binding check
+			// and the readiness probe. A nil wait must re-enter normal selection,
+			// which still enforces current budgets and atomic execution gates.
+			boundAvailable = true
+			break
 		}
-		return nil, true, localAdmissionError("account_unavailable", ctx)
+		if !boundAvailable {
+			return nil, true, localAdmissionError("account_unavailable", ctx)
+		}
 	}
 	if !borrow && bound && entry.serving != nil && entry.serving.protected && !retry {
 		for _, candidate := range available {

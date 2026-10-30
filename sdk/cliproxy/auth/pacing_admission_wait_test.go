@@ -616,3 +616,51 @@ func TestPacingAdmissionSameBindingWaitsEvenWithMatureFallback(t *testing.T) {
 		t.Fatalf("same binding reordered: picked=%s waits=%d err=%v", picked, waits, err)
 	}
 }
+
+func TestPacingAdmissionBindingReleasedDuringReadinessProbe(t *testing.T) {
+	m, s, a, _, now, model := pacingExecutionFixture(t)
+	*now = now.Add(time.Hour)
+	opts := servingOptions("release-between-probes", "", "system", "Continue after the previous stream releases.")
+	req := cliproxyexecutor.Request{Model: model, Payload: opts.OriginalRequest}
+	ctx, _ := virtualWarmupWait(now)
+	if _, err := m.Execute(ctx, []string{"claude"}, req, opts); err != nil {
+		t.Fatal("could not establish the committed binding", err)
+	}
+	*now = now.Add(21 * time.Second)
+	key := "mixed::claude:release-between-probes::" + model
+	if _, ok := s.servingEntry(key, *now); !ok {
+		t.Fatal("committed binding missing")
+	}
+	if !s.gate.reserveWarmup(a.ID, 1, 200, nil, key) {
+		t.Fatal("could not hold the existing binding")
+	}
+	defer s.gate.releaseWarmupReservation(a.ID, key)
+
+	// PeekConfigured reads this clock after pickWithWarmupServing has observed
+	// bindingInFlight, but before admissionWaitFor rechecks readiness. Release
+	// synchronously here to cover the real stream-completion interleaving
+	// without scheduler timing, longer waits or different account ceilings.
+	pacer := s.pacer.Load()
+	previousClock := pacer.now
+	defer func() { pacer.now = previousClock }()
+	released := false
+	pacer.now = func() time.Time {
+		if !released {
+			if !s.gate.bindingInFlight(key) {
+				t.Fatal("fixture did not reach the busy-binding probe")
+			}
+			released = true
+			s.gate.releaseWarmupReservation(a.ID, key)
+		}
+		return *now
+	}
+	latest, _ := m.GetByID(a.ID)
+	ctx, _ = virtualWarmupWait(now)
+	picked, handled, err := s.pickWithWarmupServing(ctx, "mixed", model, opts, []*Auth{latest}, []*Auth{latest}, m.accountSchedulingConfig(), *now)
+	if !released || err != nil || !handled || picked == nil || picked.ID != a.ID {
+		t.Fatalf("released binding did not resume normal selection: released=%v handled=%v picked=%v err=%v", released, handled, picked, err)
+	}
+	if s.gate.InFlight(a.ID) != 0 || s.gate.bindingInFlight(key) {
+		t.Fatal("release probe leaked a reservation")
+	}
+}
