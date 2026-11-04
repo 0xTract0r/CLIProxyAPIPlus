@@ -175,8 +175,8 @@ func startCodexWebsocketHeartbeat(closer *websocketConnectionCloser, interval ti
 				return
 			case <-ticker.C:
 				if err := closer.conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(10*time.Second)); err != nil {
-					_ = closer.Close()
 					closer.liveness.ObserveControl("ping_write_error")
+					_ = closer.Close()
 					return
 				}
 				closer.liveness.ObserveControl("ping_sent")
