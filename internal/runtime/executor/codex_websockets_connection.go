@@ -115,12 +115,14 @@ func (e *CodexWebsocketsExecutor) dialCodexWebsocket(ctx context.Context, auth *
 		// Negotiating permessage-deflate is fine; we just don't compress outbound messages.
 		conn.EnableWriteCompression(false)
 		conn.SetPingHandler(func(appData string) error {
+			closer.liveness.ObserveControl("ping_received")
 			if err := conn.SetReadDeadline(time.Now().Add(codexResponsesWebsocketIdleTimeout)); err != nil {
 				return err
 			}
 			return conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(10*time.Second))
 		})
 		conn.SetPongHandler(func(string) error {
+			closer.liveness.ObserveControl("pong_received")
 			return conn.SetReadDeadline(time.Now().Add(codexResponsesWebsocketIdleTimeout))
 		})
 		startCodexWebsocketHeartbeat(closer, codexResponsesWebsocketPingInterval)
@@ -174,8 +176,10 @@ func startCodexWebsocketHeartbeat(closer *websocketConnectionCloser, interval ti
 			case <-ticker.C:
 				if err := closer.conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(10*time.Second)); err != nil {
 					_ = closer.Close()
+					closer.liveness.ObserveControl("ping_write_error")
 					return
 				}
+				closer.liveness.ObserveControl("ping_sent")
 			}
 		}
 	}()
@@ -225,9 +229,21 @@ func isCodexWebsocketMessageTooBig(err error) bool {
 	return errors.As(err, &tooBig)
 }
 
+// Preserve the transport cause while exposing an actionable, anonymous SSE error.
+type codexWebsocketReadTimeoutError struct{ cause error }
+
+func (e codexWebsocketReadTimeoutError) Error() string {
+	return `{"error":{"message":"upstream websocket read timed out before response.completed","type":"server_error","code":"upstream_read_timeout"}}`
+}
+func (e codexWebsocketReadTimeoutError) Unwrap() error { return e.cause }
+
 func mapCodexWebsocketReadError(err error) error {
 	if err == nil {
 		return nil
+	}
+	var networkErr net.Error
+	if errors.As(err, &networkErr) && networkErr.Timeout() {
+		return codexWebsocketReadTimeoutError{cause: err}
 	}
 	var closeErr *websocket.CloseError
 	if errors.As(err, &closeErr) && closeErr.Code == websocket.CloseMessageTooBig {

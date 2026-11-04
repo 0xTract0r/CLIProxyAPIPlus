@@ -29,6 +29,10 @@ func TestCodexStreamStagesRealWebsocket(t *testing.T) {
 				mainReceived := make(chan struct{})
 				allowFirst := make(chan struct{})
 				burstSent := make(chan struct{})
+				allowControls := make(chan struct{})
+				var controlsOnce sync.Once
+				releaseControls := func() { controlsOnce.Do(func() { close(allowControls) }) }
+				defer releaseControls()
 				releaseServer := make(chan struct{})
 				var firstOnce, serverOnce sync.Once
 				releaseFirst := func() { firstOnce.Do(func() { close(allowFirst) }) }
@@ -60,6 +64,9 @@ func TestCodexStreamStagesRealWebsocket(t *testing.T) {
 					close(mainReceived)
 					<-allowFirst
 					_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.created","response":{"id":"resp_main","status":"in_progress","output":[]}}`))
+					<-allowControls
+					_ = conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(time.Second))
+					_ = conn.WriteControl(websocket.PongMessage, nil, time.Now().Add(time.Second))
 					for i := 0; i < 64; i++ {
 						_ = conn.WriteJSON(map[string]any{"type": "response.reasoning_summary_text.delta", "delta": fmt.Sprintf("synthetic-%d", i)})
 					}
@@ -124,6 +131,7 @@ func TestCodexStreamStagesRealWebsocket(t *testing.T) {
 				case <-ctx.Done():
 					t.Fatal("first frame not delivered")
 				}
+				releaseControls()
 				select {
 				case <-burstSent:
 				case <-ctx.Done():
@@ -167,6 +175,9 @@ func TestCodexStreamStagesRealWebsocket(t *testing.T) {
 					t.Fatalf("acknowledged stream omitted timeline logging: %+v", v)
 				}
 				if mode == "completed" {
+					if v.Liveness.PingReceived != 1 || v.Liveness.PongReceived != 1 {
+						t.Fatalf("actual control frames not scoped to main request: %+v", v.Liveness)
+					}
 					if streamErr != nil || !strings.Contains(output.String(), "visible") || v.Frames != 67 || v.Timeline.Count != 67 {
 						t.Fatalf("dense stream changed: err=%v frames=%d timeline=%d", streamErr, v.Frames, v.Timeline.Count)
 					}
