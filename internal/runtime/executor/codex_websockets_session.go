@@ -306,10 +306,11 @@ var globalCodexWebsocketSessionStore = &codexWebsocketSessionStore{
 }
 
 type websocketConnectionCloser struct {
-	conn *websocket.Conn
-	done chan struct{}
-	once sync.Once
-	err  error
+	liveness helps.CodexStreamLiveness
+	conn     *websocket.Conn
+	done     chan struct{}
+	once     sync.Once
+	err      error
 }
 
 func newWebsocketConnectionCloser(conn *websocket.Conn) *websocketConnectionCloser {
@@ -485,6 +486,17 @@ func (s *codexWebsocketSession) configureConn(conn *websocket.Conn) {
 		return
 	}
 	s.resetUpstreamDisconnectError(conn)
+	s.connMu.Lock()
+	closer := s.connCloser
+	if s.conn != conn {
+		closer = nil
+	}
+	s.connMu.Unlock()
+	observeControl := func(kind string) {
+		if closer != nil {
+			closer.liveness.ObserveControl(kind)
+		}
+	}
 	refreshActiveDeadline := func() error {
 		// Preserve idle-session reclamation: only an active turn may extend
 		// the read deadline on control traffic.
@@ -493,8 +505,9 @@ func (s *codexWebsocketSession) configureConn(conn *websocket.Conn) {
 		}
 		return nil
 	}
-	conn.SetPongHandler(func(string) error { return refreshActiveDeadline() })
+	conn.SetPongHandler(func(string) error { observeControl("pong_received"); return refreshActiveDeadline() })
 	conn.SetPingHandler(func(appData string) error {
+		observeControl("ping_received")
 		if err := refreshActiveDeadline(); err != nil {
 			return err
 		}

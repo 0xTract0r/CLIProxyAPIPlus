@@ -88,6 +88,7 @@ func (h *BaseAPIHandler) ForwardStream(c *gin.Context, flusher http.Flusher, can
 	for {
 		select {
 		case <-c.Request.Context().Done():
+			stages.ObserveDownstreamCanceled()
 			cancel(c.Request.Context().Err())
 			return
 		case chunk, ok := <-data:
@@ -104,6 +105,7 @@ func (h *BaseAPIHandler) ForwardStream(c *gin.Context, flusher http.Flusher, can
 				}
 				if terminalErr != nil {
 					if opts.WriteTerminalError != nil {
+						stages.ObserveTerminalErrorAttempt()
 						write(func() { opts.WriteTerminalError(terminalErr) })
 					}
 					flush()
@@ -121,11 +123,13 @@ func (h *BaseAPIHandler) ForwardStream(c *gin.Context, flusher http.Flusher, can
 			flush()
 		case errMsg, ok := <-errs:
 			if !ok {
+				errs = nil
 				continue
 			}
 			if errMsg != nil {
 				terminalErr = errMsg
 				if opts.WriteTerminalError != nil {
+					stages.ObserveTerminalErrorAttempt()
 					write(func() { opts.WriteTerminalError(errMsg) })
 					flush()
 				}
@@ -139,6 +143,7 @@ func (h *BaseAPIHandler) ForwardStream(c *gin.Context, flusher http.Flusher, can
 		case <-keepAliveC:
 			write(writeKeepAlive)
 			flush()
+			stages.ObserveKeepAlive()
 		}
 	}
 }

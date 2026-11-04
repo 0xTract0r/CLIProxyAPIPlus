@@ -3,6 +3,7 @@ package executor
 import (
 	"context"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -185,5 +186,17 @@ func TestCodexWebsocketHeartbeatAndShutdown(t *testing.T) {
 				t.Fatal("heartbeat survived connection close")
 			}
 		})
+	}
+}
+
+func TestCodexWebsocketReadTimeoutHasExplicitStreamError(t *testing.T) {
+	cause := &net.DNSError{IsTimeout: true}
+	mapped := mapCodexWebsocketReadError(cause)
+	var status interface{ StatusCode() int }
+	if errors.As(mapped, &status) || !strings.Contains(mapped.Error(), `"code":"upstream_read_timeout"`) {
+		t.Fatalf("timeout must keep an explicit upstream error: %v", mapped)
+	}
+	if !errors.Is(mapped, cause) {
+		t.Fatal("timeout cause lost")
 	}
 }

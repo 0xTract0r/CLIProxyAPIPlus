@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -143,4 +144,51 @@ func TestCodexStreamStagesRetryUsesOneSummary(t *testing.T) {
 	if h.count() != 1 || s.Snapshot().MainAttempts != 2 {
 		t.Fatal("retry did not converge to one summary")
 	}
+}
+
+func TestCodexLivenessSeparatesControlDataAndReusedTurns(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		captureStageLogs(t)
+		var connection CodexStreamLiveness
+		connection.ObserveControl("pong_received") // Prewarm/idle traffic is excluded.
+		ctx, first := BeginCodexStreamStages(nil, nil)
+		StartCodexMainStream(ctx, time.Now(), nil)
+		stop := connection.Bind(first)
+		connection.ObserveControl("ping_sent")
+		time.Sleep(10 * time.Second)
+		if first.Snapshot().Liveness.UpstreamControlIdle != 10*time.Second {
+			t.Fatal("outbound ping counted as upstream activity")
+		}
+		connection.ObserveControl("pong_received")
+		connection.ObserveControl("ping_received")
+		time.Sleep(time.Second)
+		first.ObserveRead(time.Now(), time.Now(), time.Second, true)
+		v := first.Snapshot().Liveness
+		if v.PingSent != 1 || v.PongReceived != 1 || v.PingReceived != 1 || v.UpstreamControlIdle != time.Second || v.UpstreamDataIdle != 11*time.Second {
+			t.Fatalf("control/data liveness confused: %+v", v)
+		}
+		first.ObserveFlush(time.Now())
+		first.ObserveKeepAlive()
+		first.ObserveTerminalErrorAttempt()
+		first.ObserveDownstreamCanceled()
+		stop()
+		first.ExecutorDone("read_error")
+		first.HandlerDone()
+		frozen := first.Snapshot()
+		ctx2, second := BeginCodexStreamStages(nil, nil)
+		StartCodexMainStream(ctx2, time.Now(), nil)
+		stop2 := connection.Bind(second)
+		defer stop2()
+		stop() // A late cleanup from the first turn must not detach the second.
+		connection.ObserveControl("pong_received")
+		time.Sleep(time.Second)
+		if second.Snapshot().Liveness.PongReceived != 1 || first.Snapshot() != frozen {
+			t.Fatal("pooled connection mixed turns or mutated finished evidence")
+		}
+		if frozen.Liveness.KeepAlives != 1 || frozen.Liveness.TerminalErrorAttempts != 1 || !frozen.Liveness.DownstreamCanceled || frozen.Liveness.DownstreamFlushIdle != 0 {
+			t.Fatal("downstream evidence missing")
+		}
+		second.ExecutorDone("completed")
+		second.HandlerDone()
+	})
 }

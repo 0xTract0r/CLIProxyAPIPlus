@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -96,4 +97,23 @@ func TestForwardStreamStagesWriteFlushAndCancel(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestForwardStreamClosedErrorsSleepsUntilData(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		c, _ := gin.CreateTestContext(httptest.NewRecorder())
+		c.Request = httptest.NewRequest("POST", "/v1/responses", nil)
+		data := make(chan []byte)
+		errs := make(chan *interfaces.ErrorMessage)
+		close(errs)
+		done := make(chan struct{})
+		go func() {
+			(&BaseAPIHandler{}).ForwardStream(c, c.Writer, func(error) {}, data, errs, StreamForwardOptions{})
+			close(done)
+		}()
+		// A closed error channel must leave the forwarder blocked, not spinning.
+		synctest.Wait()
+		close(data)
+		<-done
+	})
 }

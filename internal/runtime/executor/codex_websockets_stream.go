@@ -352,8 +352,13 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	}
 
 	stages := helps.StartCodexMainStream(ctx, time.Now(), e.cfg)
+	stopLiveness := func() {}
+	if closer != nil {
+		stopLiveness = closer.liveness.Bind(stages)
+	}
 	defer func() {
 		if !streamOwnsConnection {
+			stopLiveness()
 			reason := "read_error"
 			if ctx.Err() != nil {
 				reason = "context_done"
@@ -402,6 +407,8 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		defer close(out)
 		defer func() { stages.ExecutorDone(terminateReason) }()
 		defer func() {
+			// Detach before releasing the lease: the next turn may already be waiting.
+			stopLiveness()
 			if stopFallbackCancel != nil {
 				stopFallbackCancel()
 			}
