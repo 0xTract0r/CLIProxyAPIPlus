@@ -7,6 +7,8 @@ import (
 	"strings"
 	"time"
 
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -274,6 +276,7 @@ func newCodexStatusErr(statusCode int, body []byte, headers ...http.Header) stat
 	if !isCodexWebsocketConnectionPressure(body) && (isCodexModelCapacityError(body) || isCodexUsageLimitError(body)) {
 		errCode = http.StatusTooManyRequests
 	}
+	explicitUsageLimit := isCodexUsageLimitError(body) || isUsageLimitBody(body)
 	body = classifyCodexStatusError(errCode, body)
 	err := statusErr{code: errCode, msg: string(body)}
 	now := time.Now()
@@ -282,12 +285,32 @@ func newCodexStatusErr(statusCode int, body []byte, headers ...http.Header) stat
 	// "usage_limit_reached". Header is only consulted for 429s; non-429 statuses keep
 	// the body-only behavior so rotation cools an exhausted credential for its real
 	// reset window (fork anti-burn).
-	if retryAfter := codexRateLimitRetryAfterFromHeaders(respHeaders, now); retryAfter != nil && errCode == http.StatusTooManyRequests {
+	if retryAfter := codexHeaderRetryAfterFor429(respHeaders, explicitUsageLimit, now); retryAfter != nil && errCode == http.StatusTooManyRequests {
 		err.retryAfter = retryAfter
 	} else if retryAfter := parseCodexRetryAfter(errCode, body, now); retryAfter != nil {
 		err.retryAfter = retryAfter
 	}
 	return err
+}
+
+// codexHeaderRetryAfterFor429 picks the header-derived retry-after for a Codex 429.
+// When the account reports usable credits (cliproxyauth.CodexCreditsUsable) and the
+// body is NOT an explicit usage-limit rejection, an exhausted main X-Codex window is
+// not a plan-quota signal: the upstream is serving this account from credits, so
+// this 429 is a capacity / TPM blip. Only the X-Codex-Bengalfox buckets (not covered
+// by credits) are then considered; with none exhausted it returns nil and the
+// caller falls back to the transient 429 handling instead of parking a
+// credit-backed account until the weekly reset. An explicit usage-limit 429, or a
+// response without usable credits, keeps the full header behavior unchanged.
+func codexHeaderRetryAfterFor429(headers http.Header, explicitUsageLimit bool, now time.Time) *time.Duration {
+	if explicitUsageLimit || !cliproxyauth.CodexCreditsUsable(headers) {
+		return codexRateLimitRetryAfterFromHeaders(headers, now)
+	}
+	if mainWindow := codexRateLimitRetryAfterForPrefixes(headers, now, "X-Codex"); mainWindow != nil {
+		log.WithField("reset_in", mainWindow.Round(time.Second)).
+			Debug("codex 429 with exhausted window but credits available and no usage-limit body; treat as transient")
+	}
+	return codexRateLimitRetryAfterForPrefixes(headers, now, "X-Codex-Bengalfox")
 }
 
 func classifyCodexStatusError(statusCode int, body []byte) []byte {

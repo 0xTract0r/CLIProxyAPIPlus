@@ -87,6 +87,29 @@ func TestQuotaRetryAfterFromHeaders_CreditsAware(t *testing.T) {
 		}
 	})
 
+	t.Run("bengalfox exhausted with usable credits still cools", func(t *testing.T) {
+		headers := http.Header{}
+		headers.Set("X-Codex-Primary-Used-Percent", "40")
+		headers.Set("X-Codex-Bengalfox-Primary-Used-Percent", "100")
+		headers.Set("X-Codex-Bengalfox-Primary-Reset-At", strconv.FormatInt(resetAt.Unix(), 10))
+		headers = withCodexCredits(headers, "True", "59897.48", "False")
+		got := quotaRetryAfterFromHeaders("codex", headers, now)
+		if got == nil || *got != resetAt.Sub(now) {
+			t.Fatalf("quotaRetryAfterFromHeaders() = %v, want %v (credits do not cover the Bengalfox bucket)", got, resetAt.Sub(now))
+		}
+	})
+
+	t.Run("main and bengalfox exhausted with credits keeps only the bengalfox reset", func(t *testing.T) {
+		bengalfoxReset := now.Add(3 * time.Hour)
+		headers := withCodexCredits(exhaustedCodexHeaders(resetAt), "True", "59897.48", "False")
+		headers.Set("X-Codex-Bengalfox-Secondary-Used-Percent", "100")
+		headers.Set("X-Codex-Bengalfox-Secondary-Reset-At", strconv.FormatInt(bengalfoxReset.Unix(), 10))
+		got := quotaRetryAfterFromHeaders("codex", headers, now)
+		if got == nil || *got != bengalfoxReset.Sub(now) {
+			t.Fatalf("quotaRetryAfterFromHeaders() = %v, want %v (main bucket exempted, bengalfox kept)", got, bengalfoxReset.Sub(now))
+		}
+	})
+
 	t.Run("exhausted with zero balance still cools", func(t *testing.T) {
 		headers := withCodexCredits(exhaustedCodexHeaders(resetAt), "True", "0", "False")
 		if got := quotaRetryAfterFromHeaders("codex", headers, now); got == nil {

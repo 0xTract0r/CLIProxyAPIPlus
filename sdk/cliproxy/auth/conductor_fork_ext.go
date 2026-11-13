@@ -146,13 +146,17 @@ const (
 // false so every caller keeps its pre-credits behavior (fail-safe: an ambiguous
 // response still cools the account exactly as before).
 //
-// It is consulted only for SUCCESSFUL responses (the proactive cooldown below and
-// the real-time selection overlay in account_quota.go). An upstream 429
-// usage_limit_reached is still cooled normally (codex_executor_terminal.go,
-// usage_limit_retry.go, MarkResult's 429 branch) and deliberately ignores these
-// headers: a hard upstream rejection proves the credit path is not usable for
-// this account (e.g. third-party credit use is not enabled), so that path is the
-// backstop whenever these headers turn out to be optimistic.
+// Scope: credits are only known to cover the main X-Codex buckets. An exhausted
+// X-Codex-Bengalfox bucket is never exempted (no evidence credits apply to it).
+//
+// Callers: the success-path proactive cooldown below, the real-time selection
+// overlay in account_quota.go, and (via CodexCreditsUsable) the executor's 429
+// classification in codex_executor_terminal.go. On a 429 the credit exemption only
+// applies when the body is NOT an explicit usage-limit rejection; a 429
+// usage_limit_reached still cools to the window reset regardless of these headers,
+// because a hard upstream rejection proves the credit path is not usable for this
+// account (e.g. third-party credit use is not enabled). That is the backstop
+// whenever these headers turn out to be optimistic.
 func codexCreditsUsable(headers http.Header) bool {
 	if len(headers) == 0 {
 		return false
@@ -174,6 +178,12 @@ func codexCreditsUsable(headers http.Header) bool {
 	return balance > 0
 }
 
+// CodexCreditsUsable exposes codexCreditsUsable to the Codex executor so its 429
+// classification shares the exact same credit predicate (single source of truth).
+func CodexCreditsUsable(headers http.Header) bool {
+	return codexCreditsUsable(headers)
+}
+
 // codexHeaderTrue reports whether a Codex boolean header value is "true",
 // case-insensitively and ignoring surrounding whitespace.
 func codexHeaderTrue(raw string) bool {
@@ -189,12 +199,14 @@ func codexHeaderTrue(raw string) bool {
 // TestManager_ExecuteSuccessCodexExhaustedHeaderCoolsAuth (+ ExecuteCount).
 //
 // Credits exception: when the same response reports usable account credits
-// (codexCreditsUsable) it returns nil and does not cool the account. The upstream
-// keeps serving such an account from its credit balance, so cooling it until the
-// plan window resets (up to ~7 days for the weekly window) would locally 429 an
-// account the upstream is still accepting. If the credit path is in fact not
-// usable, the upstream answers 429 usage_limit_reached and the regular 429
-// cooldown applies. Guarded by codex_credits_cooldown_test.go.
+// (codexCreditsUsable), an exhausted MAIN X-Codex bucket does not cool the
+// account. The upstream keeps serving such an account from its credit balance, so
+// cooling it until the plan window resets (up to ~7 days for the weekly window)
+// would locally 429 an account the upstream is still accepting. An exhausted
+// X-Codex-Bengalfox bucket still cools as before (credits are not known to cover
+// it). If the credit path is in fact not usable, the upstream answers 429
+// usage_limit_reached and the executor's 429 path still cools to the window reset
+// (see codexCreditsUsable). Guarded by codex_credits_cooldown_test.go.
 func quotaRetryAfterFromHeaders(provider string, headers http.Header, now time.Time) *time.Duration {
 	if !strings.EqualFold(strings.TrimSpace(provider), "codex") || len(headers) == 0 {
 		return nil
@@ -202,31 +214,40 @@ func quotaRetryAfterFromHeaders(provider string, headers http.Header, now time.T
 	if now.IsZero() {
 		now = time.Now()
 	}
-	var latest time.Time
-	for _, prefix := range []string{"X-Codex", "X-Codex-Bengalfox"} {
-		if quotaHeaderPercentExhausted(headers.Get(prefix + "-Primary-Used-Percent")) {
-			if resetAt := quotaHeaderResetTime(headers, prefix+"-Primary", now); resetAt.After(latest) {
-				latest = resetAt
-			}
-		}
-		if quotaHeaderPercentExhausted(headers.Get(prefix + "-Secondary-Used-Percent")) {
-			if resetAt := quotaHeaderResetTime(headers, prefix+"-Secondary", now); resetAt.After(latest) {
-				latest = resetAt
-			}
-		}
+	latestMain := quotaHeaderLatestExhaustedReset(headers, "X-Codex", now)
+	latestBengalfox := quotaHeaderLatestExhaustedReset(headers, "X-Codex-Bengalfox", now)
+	if latestMain.After(now) && codexCreditsUsable(headers) {
+		// Debug only: this fires on every credit-backed response once a window is
+		// exhausted. No auth identifier is logged (auth IDs may embed an email).
+		log.WithField("reset_in", latestMain.Sub(now).Round(time.Second)).
+			Debug("codex quota window exhausted but credits available; skip proactive cooldown")
+		latestMain = time.Time{}
+	}
+	latest := latestMain
+	if latestBengalfox.After(latest) {
+		latest = latestBengalfox
 	}
 	if latest.IsZero() || !latest.After(now) {
 		return nil
 	}
-	if codexCreditsUsable(headers) {
-		// Debug only: this fires on every credit-backed response once a window is
-		// exhausted. No auth identifier is logged (auth IDs may embed an email).
-		log.WithField("reset_in", latest.Sub(now).Round(time.Second)).
-			Debug("codex quota window exhausted but credits available; skip proactive cooldown")
-		return nil
-	}
 	retryAfter := latest.Sub(now)
 	return &retryAfter
+}
+
+// quotaHeaderLatestExhaustedReset returns the latest reset among prefix's
+// Primary/Secondary windows that report used-percent >= 100, or zero when none is
+// exhausted with a usable future reset.
+func quotaHeaderLatestExhaustedReset(headers http.Header, prefix string, now time.Time) time.Time {
+	var latest time.Time
+	for _, window := range []string{"-Primary", "-Secondary"} {
+		if !quotaHeaderPercentExhausted(headers.Get(prefix + window + "-Used-Percent")) {
+			continue
+		}
+		if resetAt := quotaHeaderResetTime(headers, prefix+window, now); resetAt.After(latest) {
+			latest = resetAt
+		}
+	}
+	return latest
 }
 
 func quotaHeaderPercentExhausted(raw string) bool {
