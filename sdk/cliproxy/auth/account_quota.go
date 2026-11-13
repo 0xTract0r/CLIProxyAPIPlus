@@ -731,8 +731,18 @@ func parseClaudeRealtimeWindows(headers http.Header, now time.Time) map[string]*
 // reset headers onto the same overlay so Codex selection benefits from the live
 // signal symmetrically (harden P1b). It reuses the header names the existing
 // codex proactive-cooldown path already relies on (see conductor_fork_ext.go).
+//
+// Credits exception: when the response also reports usable account credits
+// (codexCreditsUsable) an exhausted window is marked "allowed" instead of
+// "rejected", because the upstream keeps serving the account from its credit
+// balance. Utilization stays the real upstream value (100) so observability is
+// unchanged; only the rejection status is withheld. Without credits the behavior
+// is unchanged. Note Codex currently scores 0 adaptive weight regardless
+// (AccountTierBaseWeight, design §8.2) and is served by the round-robin fallback,
+// so this overlay does not gate Codex selection today.
 func parseCodexRealtimeWindows(headers http.Header, now time.Time) map[string]*realtimeWindowParse {
 	acc := make(map[string]*realtimeWindowParse)
+	creditsUsable := codexCreditsUsable(headers)
 	for _, bucket := range []struct {
 		name   string
 		prefix string
@@ -750,7 +760,13 @@ func parseCodexRealtimeWindows(headers http.Header, now time.Time) map[string]*r
 		}
 		entry := &realtimeWindowParse{Name: bucket.name, UtilizationPercent: used, hasUtil: true}
 		if used >= 100 {
-			entry.Status = "rejected"
+			if creditsUsable {
+				// Explicit "allowed" (not empty) so the overlay merge overwrites a
+				// "rejected" left by an earlier credit-less reading of this window.
+				entry.Status = "allowed"
+			} else {
+				entry.Status = "rejected"
+			}
 		}
 		entry.ResetAt = quotaHeaderResetTime(headers, bucket.prefix, now)
 		acc[bucket.name] = entry
