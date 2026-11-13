@@ -146,11 +146,13 @@ func retryAfterFromNaturalLanguage(body []byte, now time.Time) *time.Duration {
 // credits handling is intentionally NOT symmetric. On a success response, usable
 // credits (X-Codex-Credits-*) always exempt the main X-Codex buckets, because the
 // upstream just proved it is serving the account from credits. On a 429 the
-// caller (newCodexStatusErr) exempts them only when the body is not an explicit
-// usage-limit rejection: a usage-limit 429 means the upstream refused the credit
-// path for this account, so it must still cool to the window reset (the backstop
-// for optimistic credit headers), while a capacity / TPM 429 on a credit-backed
-// account is transient and must not park it for days. The X-Codex-Bengalfox
+// caller (newCodexStatusErr) exempts them only when the response carries no
+// explicit limit signal (codexExplicitLimitSignal: a usage-limit body, an
+// error.type "rate_limit_reached" body, or an X-Codex-Rate-Limit-Reached-Type
+// header). Such a signal means the upstream refused the credit path for this
+// account, so it must still cool to the window reset (the backstop for optimistic
+// credit headers), while a capacity / TPM 429 on a credit-backed account is
+// transient and must not park it for days. The X-Codex-Bengalfox
 // buckets are never exempted on either path.
 func codexRateLimitRetryAfterFromHeaders(headers http.Header, now time.Time) *time.Duration {
 	return codexRateLimitRetryAfterForPrefixes(headers, now, codexRateLimitHeaderPrefixes...)

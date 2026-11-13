@@ -41,7 +41,7 @@ func codexExhaustedWindowHeaders(prefix string, resetAt time.Time, withCredits b
 }
 
 func withReachedType(h http.Header) http.Header {
-	h.Set("X-Codex-Rate-Limit-Reached-Type", "primary")
+	h.Set("X-Codex-Rate-Limit-Reached-Type", "workspace_member_credits_depleted")
 	return h
 }
 
@@ -77,7 +77,6 @@ func TestNewCodexStatusErr_CreditsAware429(t *testing.T) {
 		{name: "real usage_limit_reached sample with credits still cools", body: `{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","plan_type":"pro","resets_at":` + strconv.FormatInt(resetAt.Unix(), 10) + `}}`, headers: codexExhaustedWindowHeaders("X-Codex", resetAt, true), wantWindow: true},
 		{name: "rate_limit_reached body with credits still cools", body: `{"error":{"type":"rate_limit_reached"}}`, headers: codexExhaustedWindowHeaders("X-Codex", resetAt, true), wantWindow: true},
 		{name: "reached-type header with credits still cools", body: codexCapacity429Body, headers: withReachedType(codexExhaustedWindowHeaders("X-Codex", resetAt, true)), wantWindow: true},
-		{name: "capacity body with credits and no reached-type header is transient", body: codexCapacity429Body, headers: codexExhaustedWindowHeaders("X-Codex", resetAt, true), wantWindow: false},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

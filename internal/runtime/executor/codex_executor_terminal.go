@@ -349,7 +349,7 @@ func codexHeaderRetryAfterFor429(headers http.Header, explicitLimit bool, now ti
 	}
 	if mainWindow := codexRateLimitRetryAfterForPrefixes(headers, now, "X-Codex"); mainWindow != nil {
 		log.WithField("reset_in", mainWindow.Round(time.Second)).
-			Debug("codex 429 with exhausted window but credits available and no usage-limit body; treat as transient")
+			Debug("codex 429 with exhausted window but credits available and no explicit limit signal; treat as transient")
 	}
 	return codexRateLimitRetryAfterForPrefixes(headers, now, "X-Codex-Bengalfox")
 }
