@@ -137,11 +137,35 @@ func retryAfterFromNaturalLanguage(body []byte, now time.Time) *time.Duration {
 // (used-percent >= 100). Codex surfaces sustained 5h/weekly plan limits via these
 // headers (and a body type like "rate_limit_reached") that isUsageLimitBody does
 // not match, so the 429 path would otherwise fall back to the 1-minute transient
-// cooldown and keep re-selecting an exhausted credential. Mirrors the success-path
-// logic in quotaRetryAfterFromHeaders (sdk/cliproxy/auth/conductor.go); keep the two
-// in sync. Returns nil when no window is exhausted (e.g. TPM bursts / model capacity),
-// preserving fast transient recovery.
+// cooldown and keep re-selecting an exhausted credential. Returns nil when no
+// window is exhausted (e.g. TPM bursts / model capacity), preserving fast
+// transient recovery.
+//
+// Relation to the success path (quotaRetryAfterFromHeaders in
+// sdk/cliproxy/auth/conductor_fork_ext.go): the header parsing is the same, but the
+// credits handling is intentionally NOT symmetric. On a success response, usable
+// credits (X-Codex-Credits-*) always exempt the main X-Codex buckets, because the
+// upstream just proved it is serving the account from credits. On a 429 the
+// caller (newCodexStatusErr) exempts them only when the response carries no
+// explicit limit signal (codexExplicitLimitSignal: a usage-limit body, an
+// error.type "rate_limit_reached" body, or an X-Codex-Rate-Limit-Reached-Type
+// header). Such a signal means the upstream refused the credit path for this
+// account, so it must still cool to the window reset (the backstop for optimistic
+// credit headers), while a capacity / TPM 429 on a credit-backed account is
+// transient and must not park it for days. The X-Codex-Bengalfox
+// buckets are never exempted on either path.
 func codexRateLimitRetryAfterFromHeaders(headers http.Header, now time.Time) *time.Duration {
+	return codexRateLimitRetryAfterForPrefixes(headers, now, codexRateLimitHeaderPrefixes...)
+}
+
+// codexRateLimitHeaderPrefixes are the Codex quota header families: the main
+// X-Codex buckets (which account credits cover) and the X-Codex-Bengalfox buckets
+// (which credits are not known to cover).
+var codexRateLimitHeaderPrefixes = []string{"X-Codex", "X-Codex-Bengalfox"}
+
+// codexRateLimitRetryAfterForPrefixes is codexRateLimitRetryAfterFromHeaders
+// restricted to the given header prefixes.
+func codexRateLimitRetryAfterForPrefixes(headers http.Header, now time.Time, prefixes ...string) *time.Duration {
 	if len(headers) == 0 {
 		return nil
 	}
@@ -149,7 +173,7 @@ func codexRateLimitRetryAfterFromHeaders(headers http.Header, now time.Time) *ti
 		now = time.Now()
 	}
 	var latest time.Time
-	for _, prefix := range []string{"X-Codex", "X-Codex-Bengalfox"} {
+	for _, prefix := range prefixes {
 		for _, window := range []string{"Primary", "Secondary"} {
 			if !codexRateLimitPercentExhausted(headers.Get(prefix + "-" + window + "-Used-Percent")) {
 				continue

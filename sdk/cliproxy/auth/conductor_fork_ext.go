@@ -2,12 +2,14 @@ package auth
 
 import (
 	"context"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	log "github.com/sirupsen/logrus"
 )
 
 // This file carries fork-only Manager behavior that upstream v7.2.101 does not
@@ -122,6 +124,72 @@ func (m *Manager) IncrementCyberPolicyCount(ctx context.Context, authID string) 
 	return newCount, now, nil
 }
 
+// Codex credit headers. Once a plan window is exhausted the upstream keeps
+// serving the account by drawing down its credit balance server-side (the client
+// sends no extra parameter), and every response advertises that state here.
+const (
+	codexCreditsHasCreditsHeader = "X-Codex-Credits-Has-Credits"
+	codexCreditsBalanceHeader    = "X-Codex-Credits-Balance"
+	codexCreditsUnlimitedHeader  = "X-Codex-Credits-Unlimited"
+)
+
+// codexCreditsUsable reports whether a Codex response's credit headers say the
+// account can keep being served after its plan quota window is exhausted. In that
+// state the upstream bills the overflow to the account's credits, so a
+// used-percent of 100 on an otherwise successful response does NOT mean the
+// account is about to start rejecting requests.
+//
+// It returns true only when X-Codex-Credits-Has-Credits is "true" (matched
+// case-insensitively; the upstream sends "True"/"False") AND either
+// X-Codex-Credits-Unlimited is "true" or X-Codex-Credits-Balance parses as a
+// finite number > 0. A missing, unparseable, zero or negative signal returns
+// false so every caller keeps its pre-credits behavior (fail-safe: an ambiguous
+// response still cools the account exactly as before).
+//
+// Scope: credits are only known to cover the main X-Codex buckets. An exhausted
+// X-Codex-Bengalfox bucket is never exempted (no evidence credits apply to it).
+//
+// Callers: the success-path proactive cooldown below, the real-time selection
+// overlay in account_quota.go, and (via CodexCreditsUsable) the executor's 429
+// classification in codex_executor_terminal.go. On a 429 the credit exemption only
+// applies when the body is NOT an explicit usage-limit rejection; a 429
+// usage_limit_reached still cools to the window reset regardless of these headers,
+// because a hard upstream rejection proves the credit path is not usable for this
+// account (e.g. third-party credit use is not enabled). That is the backstop
+// whenever these headers turn out to be optimistic.
+func codexCreditsUsable(headers http.Header) bool {
+	if len(headers) == 0 {
+		return false
+	}
+	if !codexHeaderTrue(headers.Get(codexCreditsHasCreditsHeader)) {
+		return false
+	}
+	if codexHeaderTrue(headers.Get(codexCreditsUnlimitedHeader)) {
+		return true
+	}
+	raw := strings.TrimSpace(headers.Get(codexCreditsBalanceHeader))
+	if raw == "" {
+		return false
+	}
+	balance, err := strconv.ParseFloat(raw, 64)
+	if err != nil || math.IsNaN(balance) || math.IsInf(balance, 0) {
+		return false
+	}
+	return balance > 0
+}
+
+// CodexCreditsUsable exposes codexCreditsUsable to the Codex executor so its 429
+// classification shares the exact same credit predicate (single source of truth).
+func CodexCreditsUsable(headers http.Header) bool {
+	return codexCreditsUsable(headers)
+}
+
+// codexHeaderTrue reports whether a Codex boolean header value is "true",
+// case-insensitively and ignoring surrounding whitespace.
+func codexHeaderTrue(raw string) bool {
+	return strings.EqualFold(strings.TrimSpace(raw), "true")
+}
+
 // quotaRetryAfterFromHeaders inspects codex quota headers on a response and, when
 // the primary or secondary usage bucket is already exhausted (>=100%), returns
 // the retry-after until the soonest reset. This lets a "successful" codex
@@ -129,6 +197,16 @@ func (m *Manager) IncrementCyberPolicyCount(ctx context.Context, authID string) 
 // before it starts returning 429s. Fork-only codex quota-rotation capability;
 // upstream v7.2.101 does not parse these headers. Guarded by scheduler_test.go
 // TestManager_ExecuteSuccessCodexExhaustedHeaderCoolsAuth (+ ExecuteCount).
+//
+// Credits exception: when the same response reports usable account credits
+// (codexCreditsUsable), an exhausted MAIN X-Codex bucket does not cool the
+// account. The upstream keeps serving such an account from its credit balance, so
+// cooling it until the plan window resets (up to ~7 days for the weekly window)
+// would locally 429 an account the upstream is still accepting. An exhausted
+// X-Codex-Bengalfox bucket still cools as before (credits are not known to cover
+// it). If the credit path is in fact not usable, the upstream answers 429
+// usage_limit_reached and the executor's 429 path still cools to the window reset
+// (see codexCreditsUsable). Guarded by codex_credits_cooldown_test.go.
 func quotaRetryAfterFromHeaders(provider string, headers http.Header, now time.Time) *time.Duration {
 	if !strings.EqualFold(strings.TrimSpace(provider), "codex") || len(headers) == 0 {
 		return nil
@@ -136,24 +214,40 @@ func quotaRetryAfterFromHeaders(provider string, headers http.Header, now time.T
 	if now.IsZero() {
 		now = time.Now()
 	}
-	var latest time.Time
-	for _, prefix := range []string{"X-Codex", "X-Codex-Bengalfox"} {
-		if quotaHeaderPercentExhausted(headers.Get(prefix + "-Primary-Used-Percent")) {
-			if resetAt := quotaHeaderResetTime(headers, prefix+"-Primary", now); resetAt.After(latest) {
-				latest = resetAt
-			}
-		}
-		if quotaHeaderPercentExhausted(headers.Get(prefix + "-Secondary-Used-Percent")) {
-			if resetAt := quotaHeaderResetTime(headers, prefix+"-Secondary", now); resetAt.After(latest) {
-				latest = resetAt
-			}
-		}
+	latestMain := quotaHeaderLatestExhaustedReset(headers, "X-Codex", now)
+	latestBengalfox := quotaHeaderLatestExhaustedReset(headers, "X-Codex-Bengalfox", now)
+	if latestMain.After(now) && codexCreditsUsable(headers) {
+		// Debug only: this fires on every credit-backed response once a window is
+		// exhausted. No auth identifier is logged (auth IDs may embed an email).
+		log.WithField("reset_in", latestMain.Sub(now).Round(time.Second)).
+			Debug("codex quota window exhausted but credits available; skip proactive cooldown")
+		latestMain = time.Time{}
+	}
+	latest := latestMain
+	if latestBengalfox.After(latest) {
+		latest = latestBengalfox
 	}
 	if latest.IsZero() || !latest.After(now) {
 		return nil
 	}
 	retryAfter := latest.Sub(now)
 	return &retryAfter
+}
+
+// quotaHeaderLatestExhaustedReset returns the latest reset among prefix's
+// Primary/Secondary windows that report used-percent >= 100, or zero when none is
+// exhausted with a usable future reset.
+func quotaHeaderLatestExhaustedReset(headers http.Header, prefix string, now time.Time) time.Time {
+	var latest time.Time
+	for _, window := range []string{"-Primary", "-Secondary"} {
+		if !quotaHeaderPercentExhausted(headers.Get(prefix + window + "-Used-Percent")) {
+			continue
+		}
+		if resetAt := quotaHeaderResetTime(headers, prefix+window, now); resetAt.After(latest) {
+			latest = resetAt
+		}
+	}
+	return latest
 }
 
 func quotaHeaderPercentExhausted(raw string) bool {

@@ -382,3 +382,16 @@ scheduling-editor-preview	preview-handler	symbol	^func \(h \*Handler\) PreviewAu
 scheduling-editor-preview	isolated-clone	symbol	^func \(a \*Auth\) CloneForSchedulingPreview\(	sdk/cliproxy/auth/account_scheduling_preview.go
 scheduling-editor-preview	read-only-regression	symbol	^func TestPreviewAccountSchedulingReadOnlyRuntimeAndFiles\(	internal/api/handlers/management/auth_files_account_scheduling_preview_test.go
 scheduling-editor-preview	expiry-isolation-regression	symbol	^func TestSchedulingPreviewCloneDoesNotLatchLiveTemporaryExpiry\(	sdk/cliproxy/auth/account_scheduling_preview_test.go
+
+# Codex credits-aware proactive cooldown: an exhausted plan window with usable
+# account credits must not cool the account (upstream bills credits server-side).
+codex-credits-cooldown	codexCreditsUsable	symbol	^func codexCreditsUsable\(	sdk/cliproxy/auth/conductor_fork_ext.go
+codex-credits-cooldown	credits-skip-proactive-cooldown	pattern	latestMain\.After\(now\) && codexCreditsUsable\(headers\)	sdk/cliproxy/auth/conductor_fork_ext.go
+codex-credits-cooldown	credits-skip-realtime-reject	pattern	creditsUsable := codexCreditsUsable\(headers\)	sdk/cliproxy/auth/account_quota.go
+codex-credits-cooldown	no-cool-regression	symbol	^func TestManager_ExecuteSuccessCodexExhaustedHeaderWithCreditsDoesNotCool\(	sdk/cliproxy/auth/codex_credits_cooldown_test.go
+codex-credits-cooldown	CodexCreditsUsable-export	symbol	^func CodexCreditsUsable\(	sdk/cliproxy/auth/conductor_fork_ext.go
+codex-credits-cooldown	credits-aware-429-classifier	symbol	^func codexHeaderRetryAfterFor429\(	internal/runtime/executor/codex_executor_terminal.go
+codex-credits-cooldown	credits-aware-429-wiring	pattern	codexHeaderRetryAfterFor429\(respHeaders, explicitLimit, now\)	internal/runtime/executor/codex_executor_terminal.go
+codex-credits-cooldown	credits-aware-429-regression	symbol	^func TestCodexExecutor_Capacity429WithCredits_NoMultiDayCooldown\(	internal/runtime/executor/codex_executor_429_credits_test.go
+codex-credits-cooldown	explicit-limit-backstop	pattern	if explicitLimit \|\| !cliproxyauth\.CodexCreditsUsable\(headers\) \{	internal/runtime/executor/codex_executor_terminal.go
+codex-credits-cooldown	credits-aware-429-unit-regression	symbol	^func TestNewCodexStatusErr_CreditsAware429\(	internal/runtime/executor/codex_executor_429_credits_test.go
