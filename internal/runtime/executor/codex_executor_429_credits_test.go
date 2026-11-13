@@ -40,6 +40,22 @@ func codexExhaustedWindowHeaders(prefix string, resetAt time.Time, withCredits b
 	return h
 }
 
+func withReachedType(h http.Header) http.Header {
+	h.Set("X-Codex-Rate-Limit-Reached-Type", "primary")
+	return h
+}
+
+// TestNewCodexStatusErr_CreditsHeadersIgnoredOutside429 pins that the credits /
+// header-window logic only runs for 429s: a 5xx carrying exhausted + credit
+// headers gets no header-derived retry-after.
+func TestNewCodexStatusErr_CreditsHeadersIgnoredOutside429(t *testing.T) {
+	headers := codexExhaustedWindowHeaders("X-Codex", time.Now().Add(5*24*time.Hour), true)
+	err := newCodexStatusErr(http.StatusInternalServerError, []byte(`{"error":{"message":"boom"}}`), headers)
+	if got := err.RetryAfter(); got != nil {
+		t.Fatalf("RetryAfter() = %s, want nil for a non-429 status", *got)
+	}
+}
+
 func TestNewCodexStatusErr_CreditsAware429(t *testing.T) {
 	window := 5 * 24 * time.Hour
 	resetAt := time.Now().Add(window)
@@ -58,6 +74,10 @@ func TestNewCodexStatusErr_CreditsAware429(t *testing.T) {
 		{name: "capacity 429 without credits keeps old window cooldown", body: codexCapacity429Body, headers: codexExhaustedWindowHeaders("X-Codex", resetAt, false), wantWindow: true},
 		{name: "rate_limit 429 without credits keeps old window cooldown", body: codexRateLimit429Body, headers: codexExhaustedWindowHeaders("X-Codex", resetAt, false), wantWindow: true},
 		{name: "bengalfox exhausted with credits still cools", body: codexCapacity429Body, headers: codexExhaustedWindowHeaders("X-Codex-Bengalfox", resetAt, true), wantWindow: true},
+		{name: "real usage_limit_reached sample with credits still cools", body: `{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","plan_type":"pro","resets_at":` + strconv.FormatInt(resetAt.Unix(), 10) + `}}`, headers: codexExhaustedWindowHeaders("X-Codex", resetAt, true), wantWindow: true},
+		{name: "rate_limit_reached body with credits still cools", body: `{"error":{"type":"rate_limit_reached"}}`, headers: codexExhaustedWindowHeaders("X-Codex", resetAt, true), wantWindow: true},
+		{name: "reached-type header with credits still cools", body: codexCapacity429Body, headers: withReachedType(codexExhaustedWindowHeaders("X-Codex", resetAt, true)), wantWindow: true},
+		{name: "capacity body with credits and no reached-type header is transient", body: codexCapacity429Body, headers: codexExhaustedWindowHeaders("X-Codex", resetAt, true), wantWindow: false},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

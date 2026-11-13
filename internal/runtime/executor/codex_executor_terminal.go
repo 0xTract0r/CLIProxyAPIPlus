@@ -276,7 +276,7 @@ func newCodexStatusErr(statusCode int, body []byte, headers ...http.Header) stat
 	if !isCodexWebsocketConnectionPressure(body) && (isCodexModelCapacityError(body) || isCodexUsageLimitError(body)) {
 		errCode = http.StatusTooManyRequests
 	}
-	explicitUsageLimit := isCodexUsageLimitError(body) || isUsageLimitBody(body)
+	explicitLimit := codexExplicitLimitSignal(body, respHeaders)
 	body = classifyCodexStatusError(errCode, body)
 	err := statusErr{code: errCode, msg: string(body)}
 	now := time.Now()
@@ -285,25 +285,66 @@ func newCodexStatusErr(statusCode int, body []byte, headers ...http.Header) stat
 	// "usage_limit_reached". Header is only consulted for 429s; non-429 statuses keep
 	// the body-only behavior so rotation cools an exhausted credential for its real
 	// reset window (fork anti-burn).
-	if retryAfter := codexHeaderRetryAfterFor429(respHeaders, explicitUsageLimit, now); retryAfter != nil && errCode == http.StatusTooManyRequests {
-		err.retryAfter = retryAfter
+	var headerRetryAfter *time.Duration
+	if errCode == http.StatusTooManyRequests {
+		headerRetryAfter = codexHeaderRetryAfterFor429(respHeaders, explicitLimit, now)
+	}
+	if headerRetryAfter != nil {
+		err.retryAfter = headerRetryAfter
 	} else if retryAfter := parseCodexRetryAfter(errCode, body, now); retryAfter != nil {
 		err.retryAfter = retryAfter
 	}
 	return err
 }
 
-// codexHeaderRetryAfterFor429 picks the header-derived retry-after for a Codex 429.
-// When the account reports usable credits (cliproxyauth.CodexCreditsUsable) and the
-// body is NOT an explicit usage-limit rejection, an exhausted main X-Codex window is
-// not a plan-quota signal: the upstream is serving this account from credits, so
-// this 429 is a capacity / TPM blip. Only the X-Codex-Bengalfox buckets (not covered
-// by credits) are then considered; with none exhausted it returns nil and the
-// caller falls back to the transient 429 handling instead of parking a
-// credit-backed account until the weekly reset. An explicit usage-limit 429, or a
-// response without usable credits, keeps the full header behavior unchanged.
-func codexHeaderRetryAfterFor429(headers http.Header, explicitUsageLimit bool, now time.Time) *time.Duration {
-	if explicitUsageLimit || !cliproxyauth.CodexCreditsUsable(headers) {
+// codexRateLimitReachedTypeHeader is set by the Codex upstream when a request hit
+// an account limit (codex-rs api_bridge reads it); its presence is an explicit
+// limit signal independent of the body.
+const codexRateLimitReachedTypeHeader = "X-Codex-Rate-Limit-Reached-Type"
+
+// codexExplicitLimitSignal reports whether a Codex error response explicitly says
+// the account hit its plan limit, as opposed to a capacity / TPM blip. It covers:
+//   - a usage-limit body (usage_limit_reached, "usage limit", quota exceeded, ...);
+//   - error.type "rate_limit_reached": Codex reports sustained 5h / weekly plan
+//     limits with this body type, which isUsageLimitBody does not match (the case
+//     daba9a77 fixed so an exhausted account is not re-picked every minute);
+//   - a non-empty X-Codex-Rate-Limit-Reached-Type response header.
+//
+// Any of these keeps the full window-reset cooldown even when the credit headers
+// look usable, so optimistic credit headers cannot re-open the pool collapse.
+func codexExplicitLimitSignal(body []byte, headers http.Header) bool {
+	if isCodexUsageLimitError(body) || isUsageLimitBody(body) || isCodexRateLimitReachedError(body) {
+		return true
+	}
+	return strings.TrimSpace(headers.Get(codexRateLimitReachedTypeHeader)) != ""
+}
+
+// isCodexRateLimitReachedError reports whether the body's error type is
+// "rate_limit_reached" (case-insensitive), the Codex plan-limit body variant.
+func isCodexRateLimitReachedError(body []byte) bool {
+	if len(body) == 0 {
+		return false
+	}
+	for _, path := range []string{"error.type", "type"} {
+		if strings.EqualFold(strings.TrimSpace(gjson.GetBytes(body, path).String()), "rate_limit_reached") {
+			return true
+		}
+	}
+	return false
+}
+
+// codexHeaderRetryAfterFor429 picks the header-derived retry-after for a Codex 429
+// (callers must only invoke it for 429s). When the account reports usable credits
+// (cliproxyauth.CodexCreditsUsable) and the response carries NO explicit limit
+// signal (codexExplicitLimitSignal), an exhausted main X-Codex window is not a
+// plan-quota signal: the upstream is serving this account from credits, so this
+// 429 is a capacity / TPM blip. Only the X-Codex-Bengalfox buckets (not covered by
+// credits) are then considered; with none exhausted it returns nil and the caller
+// falls back to the transient 429 handling instead of parking a credit-backed
+// account until the weekly reset. An explicit limit signal, or a response without
+// usable credits, keeps the full header behavior unchanged.
+func codexHeaderRetryAfterFor429(headers http.Header, explicitLimit bool, now time.Time) *time.Duration {
+	if explicitLimit || !cliproxyauth.CodexCreditsUsable(headers) {
 		return codexRateLimitRetryAfterFromHeaders(headers, now)
 	}
 	if mainWindow := codexRateLimitRetryAfterForPrefixes(headers, now, "X-Codex"); mainWindow != nil {

@@ -391,5 +391,7 @@ codex-credits-cooldown	credits-skip-realtime-reject	pattern	creditsUsable := cod
 codex-credits-cooldown	no-cool-regression	symbol	^func TestManager_ExecuteSuccessCodexExhaustedHeaderWithCreditsDoesNotCool\(	sdk/cliproxy/auth/codex_credits_cooldown_test.go
 codex-credits-cooldown	CodexCreditsUsable-export	symbol	^func CodexCreditsUsable\(	sdk/cliproxy/auth/conductor_fork_ext.go
 codex-credits-cooldown	credits-aware-429-classifier	symbol	^func codexHeaderRetryAfterFor429\(	internal/runtime/executor/codex_executor_terminal.go
-codex-credits-cooldown	credits-aware-429-wiring	pattern	codexHeaderRetryAfterFor429\(respHeaders, explicitUsageLimit, now\)	internal/runtime/executor/codex_executor_terminal.go
+codex-credits-cooldown	credits-aware-429-wiring	pattern	codexHeaderRetryAfterFor429\(respHeaders, explicitLimit, now\)	internal/runtime/executor/codex_executor_terminal.go
 codex-credits-cooldown	credits-aware-429-regression	symbol	^func TestCodexExecutor_Capacity429WithCredits_NoMultiDayCooldown\(	internal/runtime/executor/codex_executor_429_credits_test.go
+codex-credits-cooldown	explicit-limit-backstop	pattern	if explicitLimit \|\| !cliproxyauth\.CodexCreditsUsable\(headers\) \{	internal/runtime/executor/codex_executor_terminal.go
+codex-credits-cooldown	credits-aware-429-unit-regression	symbol	^func TestNewCodexStatusErr_CreditsAware429\(	internal/runtime/executor/codex_executor_429_credits_test.go
