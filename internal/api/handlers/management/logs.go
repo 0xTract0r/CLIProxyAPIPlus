@@ -238,7 +238,7 @@ func (h *Handler) GetRequestErrorLogs(c *gin.Context) {
 			continue
 		}
 		name := entry.Name()
-		if !strings.HasPrefix(name, "error-") || !strings.HasSuffix(name, ".log") {
+		if !strings.HasPrefix(name, "error-") || !(strings.HasSuffix(name, ".log") || strings.HasSuffix(name, ".log.gz")) {
 			continue
 		}
 		info, errInfo := entry.Info()
@@ -423,7 +423,7 @@ func (h *Handler) DownloadRequestErrorLog(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid log file name"})
 		return
 	}
-	if !strings.HasPrefix(name, "error-") || !strings.HasSuffix(name, ".log") {
+	if !strings.HasPrefix(name, "error-") || !(strings.HasSuffix(name, ".log") || strings.HasSuffix(name, ".log.gz")) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "log file not found"})
 		return
 	}
@@ -454,6 +454,10 @@ func (h *Handler) DownloadRequestErrorLog(c *gin.Context) {
 		return
 	}
 
+	if strings.HasSuffix(name, ".gz") {
+		h.serveGzipRequestLog(c, fullPath, name)
+		return
+	}
 	c.FileAttachment(fullPath, name)
 }
 

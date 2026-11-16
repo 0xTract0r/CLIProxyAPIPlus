@@ -2,7 +2,7 @@ package logging
 
 import (
 	"bytes"
-	"fmt"
+	"io"
 	"os"
 	"time"
 
@@ -219,20 +219,7 @@ func (w *FileStreamingLogWriter) Close() error {
 		return nil
 	}
 
-	logFile, errOpen := os.OpenFile(w.logFilePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
-	if errOpen != nil {
-		w.cleanupTempFiles()
-		return fmt.Errorf("failed to create log file: %w", errOpen)
-	}
-
-	writeErr := w.writeFinalLog(logFile)
-	if errClose := logFile.Close(); errClose != nil {
-		log.WithError(errClose).Warn("failed to close request log file")
-		if writeErr == nil {
-			writeErr = errClose
-		}
-	}
-
+	writeErr := writeCompressedRequestLog(w.logFilePath, w.writeFinalLog)
 	w.cleanupTempFiles()
 	return writeErr
 }
@@ -273,7 +260,7 @@ func (w *FileStreamingLogWriter) asyncWriter() {
 	w.responseBodyFile = nil
 }
 
-func (w *FileStreamingLogWriter) writeFinalLog(logFile *os.File) error {
+func (w *FileStreamingLogWriter) writeFinalLog(logFile io.Writer) error {
 	if errWrite := writeRequestInfoWithBody(logFile, w.url, w.method, w.requestHeaders, nil, w.requestBodyPath, w.timestamp, "http", inferUpstreamTransport(w.apiRequest, w.apiRequestSource, w.apiResponse, w.apiResponseSource, w.apiWebsocketTimeline, nil, nil), true); errWrite != nil {
 		return errWrite
 	}
