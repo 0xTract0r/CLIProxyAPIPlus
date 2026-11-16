@@ -751,6 +751,72 @@ func TestGetRequestLogByIDServesGzipCompressedLog(t *testing.T) {
 	}
 }
 
+func TestRequestLogWriterToManagementGzipRoundTrip(t *testing.T) {
+	for _, enabled := range []bool{true, false} {
+		t.Run(strconv.FormatBool(enabled), func(t *testing.T) {
+			dir := t.TempDir()
+			logger := logging.NewFileRequestLogger(enabled, dir, "", 3)
+			const requestID = "written-gzip"
+			err := logger.LogRequestWithOptions("/v1/responses", http.MethodPost, nil,
+				[]byte("original request body"), http.StatusBadGateway, nil,
+				[]byte("original response body"), nil, nil, nil, nil, nil,
+				!enabled, requestID, time.Now(), time.Now())
+			if err != nil {
+				t.Fatal(err)
+			}
+			entries, err := os.ReadDir(dir)
+			if err != nil || len(entries) != 1 || !strings.HasSuffix(entries[0].Name(), ".log.gz") {
+				t.Fatalf("unexpected final files: %v %v", entries, err)
+			}
+			h := newLogsTestHandler(dir, enabled)
+			rec := performGetRequestLogByID(t, h, requestID)
+			if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "original request body") || !strings.Contains(rec.Body.String(), "original response body") {
+				t.Fatalf("gzip writer/reader roundtrip failed: %d %s", rec.Code, rec.Body.String())
+			}
+			if enabled {
+				return
+			}
+			name := entries[0].Name()
+			legacy := "error-legacy.log"
+			if err := os.WriteFile(filepath.Join(dir, legacy), []byte("legacy plain error"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			list := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(list)
+			c.Request = httptest.NewRequest(http.MethodGet, "/request-error-logs", nil)
+			h.GetRequestErrorLogs(c)
+			var response struct {
+				Files []struct {
+					Name string `json:"name"`
+				} `json:"files"`
+			}
+			if err := json.Unmarshal(list.Body.Bytes(), &response); err != nil {
+				t.Fatal(err)
+			}
+			if list.Code != http.StatusOK || len(response.Files) != 2 {
+				t.Fatalf("mixed formats not listed: %d %s", list.Code, list.Body.String())
+			}
+			for _, fileName := range []string{name, legacy} {
+				download := httptest.NewRecorder()
+				c, _ := gin.CreateTestContext(download)
+				c.Request = httptest.NewRequest(http.MethodGet, "/request-error-logs/"+fileName, nil)
+				c.Params = gin.Params{{Key: "name", Value: fileName}}
+				h.DownloadRequestErrorLog(c)
+				if download.Code != http.StatusOK {
+					t.Fatalf("download %s: %d", fileName, download.Code)
+				}
+				if fileName == legacy {
+					if download.Body.String() != "legacy plain error" {
+						t.Fatal("legacy download changed")
+					}
+				} else if download.Body.String() != rec.Body.String() || strings.Contains(download.Header().Get("Content-Disposition"), ".gz") {
+					t.Fatal("compressed error download did not return original plain content")
+				}
+			}
+		})
+	}
+}
+
 func TestGetRequestLogByIDPrefersPlainOverGzip(t *testing.T) {
 	dir := t.TempDir()
 	requestID := "req-both-1"

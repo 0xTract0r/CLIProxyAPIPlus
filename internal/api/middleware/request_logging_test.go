@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"io"
 	"net/http"
@@ -238,7 +239,7 @@ func TestRequestLoggingMiddlewareCapturesLargeErrorRequestAndDeferredAPIRequest(
 	}
 	var logPath string
 	for _, entry := range entries {
-		if strings.HasPrefix(entry.Name(), "error-") && strings.HasSuffix(entry.Name(), ".log") {
+		if strings.HasPrefix(entry.Name(), "error-") && strings.HasSuffix(entry.Name(), ".log.gz") {
 			logPath = logsDir + string(os.PathSeparator) + entry.Name()
 			break
 		}
@@ -246,9 +247,19 @@ func TestRequestLoggingMiddlewareCapturesLargeErrorRequestAndDeferredAPIRequest(
 	if logPath == "" {
 		t.Fatal("forced error log was not created")
 	}
-	content, errReadLog := os.ReadFile(logPath)
+	file, errOpen := os.Open(logPath)
+	if errOpen != nil {
+		t.Fatal(errOpen)
+	}
+	defer func() { _ = file.Close() }()
+	gz, errGzip := gzip.NewReader(file)
+	if errGzip != nil {
+		t.Fatal(errGzip)
+	}
+	defer func() { _ = gz.Close() }()
+	content, errReadLog := io.ReadAll(gz)
 	if errReadLog != nil {
-		t.Fatalf("read error log: %v", errReadLog)
+		t.Fatalf("read compressed error log: %v", errReadLog)
 	}
 	if !bytes.Contains(content, payload) {
 		t.Fatal("error log does not contain the complete large request body")
