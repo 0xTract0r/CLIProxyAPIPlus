@@ -2,6 +2,7 @@ package logging
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"fmt"
 	"io"
@@ -134,40 +135,31 @@ func (l *FileRequestLogger) logRequestWithSources(url, method string, requestHea
 		responseToWrite = response
 	}
 
-	logFile, errOpen := os.OpenFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
-	if errOpen != nil {
-		return fmt.Errorf("failed to create log file: %w", errOpen)
-	}
-
-	writeErr := l.writeNonStreamingLog(
-		logFile,
-		url,
-		method,
-		requestHeaders,
-		body,
-		requestBodyPath,
-		websocketTimeline,
-		websocketTimelineSource,
-		apiRequest,
-		apiRequestSource,
-		apiResponse,
-		apiResponseSource,
-		apiWebsocketTimeline,
-		apiWebsocketTimelineSource,
-		apiResponseErrors,
-		statusCode,
-		responseHeaders,
-		responseToWrite,
-		decompressErr,
-		requestTimestamp,
-		apiResponseTimestamp,
-	)
-	if errClose := logFile.Close(); errClose != nil {
-		log.WithError(errClose).Warn("failed to close request log file")
-		if writeErr == nil {
-			return errClose
-		}
-	}
+	writeErr := writeCompressedRequestLog(filePath, func(logFile io.Writer) error {
+		return l.writeNonStreamingLog(
+			logFile,
+			url,
+			method,
+			requestHeaders,
+			body,
+			requestBodyPath,
+			websocketTimeline,
+			websocketTimelineSource,
+			apiRequest,
+			apiRequestSource,
+			apiResponse,
+			apiResponseSource,
+			apiWebsocketTimeline,
+			apiWebsocketTimelineSource,
+			apiResponseErrors,
+			statusCode,
+			responseHeaders,
+			responseToWrite,
+			decompressErr,
+			requestTimestamp,
+			apiResponseTimestamp,
+		)
+	})
 	if writeErr != nil {
 		return fmt.Errorf("failed to write log file: %w", writeErr)
 	}
@@ -178,6 +170,42 @@ func (l *FileRequestLogger) logRequestWithSources(url, method string, requestHea
 		}
 	}
 
+	return nil
+}
+
+// writeCompressedRequestLog publishes a complete gzip log without first writing
+// an uncompressed final file. Readers never see an unfinished gzip stream.
+func writeCompressedRequestLog(plainPath string, write func(io.Writer) error) error {
+	file, errCreate := os.CreateTemp(filepath.Dir(plainPath), ".request-log-*.tmp")
+	if errCreate != nil {
+		return fmt.Errorf("create compressed request log: %w", errCreate)
+	}
+	tempPath := file.Name()
+	defer func() { _ = os.Remove(tempPath) }()
+	if errMode := file.Chmod(0o644); errMode != nil {
+		_ = file.Close()
+		return errMode
+	}
+	gz, errGzip := gzip.NewWriterLevel(file, gzip.BestSpeed)
+	if errGzip != nil {
+		_ = file.Close()
+		return errGzip
+	}
+	errWrite := write(gz)
+	errGzipClose := gz.Close()
+	errFileClose := file.Close()
+	if errWrite != nil {
+		return errWrite
+	}
+	if errGzipClose != nil {
+		return fmt.Errorf("finish compressed request log: %w", errGzipClose)
+	}
+	if errFileClose != nil {
+		return fmt.Errorf("close compressed request log: %w", errFileClose)
+	}
+	if errRename := os.Rename(tempPath, plainPath+".gz"); errRename != nil {
+		return fmt.Errorf("publish compressed request log: %w", errRename)
+	}
 	return nil
 }
 
@@ -369,7 +397,7 @@ func (l *FileRequestLogger) cleanupOldErrorLogs() error {
 			continue
 		}
 		name := entry.Name()
-		if !strings.HasPrefix(name, "error-") || !strings.HasSuffix(name, ".log") {
+		if !strings.HasPrefix(name, "error-") || !(strings.HasSuffix(name, ".log") || strings.HasSuffix(name, ".log.gz")) {
 			continue
 		}
 		info, errInfo := entry.Info()
