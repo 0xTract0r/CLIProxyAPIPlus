@@ -3,7 +3,6 @@ package management
 import (
 	"bufio"
 	"bytes"
-	"compress/gzip"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
@@ -21,7 +20,6 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
-	log "github.com/sirupsen/logrus"
 )
 
 const (
@@ -216,46 +214,22 @@ func (h *Handler) GetRequestErrorLogs(c *gin.Context) {
 		return
 	}
 
-	entries, err := os.ReadDir(dir)
+	files, archiveUnavailable, err := h.requestErrorLogs()
 	if err != nil {
-		if os.IsNotExist(err) {
-			c.JSON(http.StatusOK, gin.H{"files": []any{}})
-			return
-		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to list request error logs: %v", err)})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list request error logs"})
 		return
 	}
-
-	type errorLog struct {
-		Name     string `json:"name"`
-		Size     int64  `json:"size"`
-		Modified int64  `json:"modified"`
+	if archiveUnavailable && len(files) == 0 {
+		c.Header("Retry-After", "5")
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "request log archive temporarily unavailable"})
+		return
 	}
-
-	files := make([]errorLog, 0, len(entries))
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-		name := entry.Name()
-		if !strings.HasPrefix(name, "error-") || !(strings.HasSuffix(name, ".log") || strings.HasSuffix(name, ".log.gz")) {
-			continue
-		}
-		info, errInfo := entry.Info()
-		if errInfo != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to read log info for %s: %v", name, errInfo)})
-			return
-		}
-		files = append(files, errorLog{
-			Name:     name,
-			Size:     info.Size(),
-			Modified: info.ModTime().Unix(),
-		})
-	}
-
 	sort.Slice(files, func(i, j int) bool { return files[i].Modified > files[j].Modified })
-
-	c.JSON(http.StatusOK, gin.H{"files": files})
+	response := gin.H{"files": files}
+	if archiveUnavailable {
+		response["archive_unavailable"] = true
+	}
+	c.JSON(http.StatusOK, response)
 }
 
 // GetRequestLogByID finds and downloads a request log file by its request ID.
@@ -289,116 +263,7 @@ func (h *Handler) GetRequestLogByID(c *gin.Context) {
 		return
 	}
 
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			c.JSON(http.StatusNotFound, gin.H{"error": "log directory not found"})
-			return
-		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to list log directory: %v", err)})
-		return
-	}
-
-	suffix := "-" + requestID + ".log"
-	suffixGz := "-" + requestID + ".log.gz"
-	var matchedFile string
-	var matchedGz string
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-		name := entry.Name()
-		if strings.HasSuffix(name, suffix) {
-			matchedFile = name
-			break
-		}
-		if matchedGz == "" && strings.HasSuffix(name, suffixGz) {
-			matchedGz = name
-		}
-	}
-
-	// Retention may compress older request logs into "-{id}.log.gz". Prefer an
-	// uncompressed hit; only fall back to the gzip archive when no plain file exists.
-	isGzip := false
-	matchedName := matchedFile
-	if matchedName == "" && matchedGz != "" {
-		matchedName = matchedGz
-		isGzip = true
-	}
-
-	if matchedName == "" {
-		c.JSON(http.StatusNotFound, gin.H{"error": "log file not found for the given request ID"})
-		return
-	}
-
-	dirAbs, errAbs := filepath.Abs(dir)
-	if errAbs != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to resolve log directory: %v", errAbs)})
-		return
-	}
-	fullPath := filepath.Clean(filepath.Join(dirAbs, matchedName))
-	prefix := dirAbs + string(os.PathSeparator)
-	if !strings.HasPrefix(fullPath, prefix) {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid log file path"})
-		return
-	}
-
-	info, errStat := os.Stat(fullPath)
-	if errStat != nil {
-		if os.IsNotExist(errStat) {
-			c.JSON(http.StatusNotFound, gin.H{"error": "log file not found"})
-			return
-		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to read log file: %v", errStat)})
-		return
-	}
-	if info.IsDir() {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid log file"})
-		return
-	}
-
-	if !isGzip {
-		c.FileAttachment(fullPath, matchedName)
-		return
-	}
-
-	h.serveGzipRequestLog(c, fullPath, matchedName)
-}
-
-// serveGzipRequestLog decompresses a retention-compressed request log ("-{id}.log.gz")
-// and streams the plain-text content back to the client. It never buffers the full
-// file in memory since historical logs can reach several hundred KB.
-func (h *Handler) serveGzipRequestLog(c *gin.Context, fullPath, gzName string) {
-	file, errOpen := os.Open(fullPath)
-	if errOpen != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to open log file: %v", errOpen)})
-		return
-	}
-	defer func() {
-		if errClose := file.Close(); errClose != nil {
-			log.Errorf("failed to close request log file %s: %v", fullPath, errClose)
-		}
-	}()
-
-	gzReader, errGz := gzip.NewReader(file)
-	if errGz != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to decompress log file: %v", errGz)})
-		return
-	}
-	defer func() {
-		if errClose := gzReader.Close(); errClose != nil {
-			log.Errorf("failed to close gzip reader for %s: %v", fullPath, errClose)
-		}
-	}()
-
-	plainName := strings.TrimSuffix(gzName, ".gz")
-	c.Header("Content-Type", "text/plain; charset=utf-8")
-	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=%q", plainName))
-	c.Status(http.StatusOK)
-	if _, errCopy := io.Copy(c.Writer, gzReader); errCopy != nil {
-		// Response headers/status are already flushed; only log the failure.
-		log.Errorf("failed to stream decompressed request log %s: %v", fullPath, errCopy)
-	}
+	h.serveRequestLog(c, requestID, "")
 }
 
 // DownloadRequestErrorLog downloads a specific error request log file by name.
@@ -428,37 +293,7 @@ func (h *Handler) DownloadRequestErrorLog(c *gin.Context) {
 		return
 	}
 
-	dirAbs, errAbs := filepath.Abs(dir)
-	if errAbs != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to resolve log directory: %v", errAbs)})
-		return
-	}
-	fullPath := filepath.Clean(filepath.Join(dirAbs, name))
-	prefix := dirAbs + string(os.PathSeparator)
-	if !strings.HasPrefix(fullPath, prefix) {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid log file path"})
-		return
-	}
-
-	info, errStat := os.Stat(fullPath)
-	if errStat != nil {
-		if os.IsNotExist(errStat) {
-			c.JSON(http.StatusNotFound, gin.H{"error": "log file not found"})
-			return
-		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to read log file: %v", errStat)})
-		return
-	}
-	if info.IsDir() {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid log file"})
-		return
-	}
-
-	if strings.HasSuffix(name, ".gz") {
-		h.serveGzipRequestLog(c, fullPath, name)
-		return
-	}
-	c.FileAttachment(fullPath, name)
+	h.serveRequestLog(c, "", name)
 }
 
 func (h *Handler) logDirectory() string {

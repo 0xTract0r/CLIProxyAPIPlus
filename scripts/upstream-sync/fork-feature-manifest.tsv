@@ -389,3 +389,8 @@ codex-credits-cooldown	codexCreditsUsable	symbol	^func codexCreditsUsable\(	sdk/
 codex-credits-cooldown	credits-skip-proactive-cooldown	pattern	if codexCreditsUsable\(headers\) \{	sdk/cliproxy/auth/conductor_fork_ext.go
 codex-credits-cooldown	credits-skip-realtime-reject	pattern	creditsUsable := codexCreditsUsable\(headers\)	sdk/cliproxy/auth/account_quota.go
 codex-credits-cooldown	no-cool-regression	symbol	^func TestManager_ExecuteSuccessCodexExhaustedHeaderWithCreditsDoesNotCool\(	sdk/cliproxy/auth/codex_credits_cooldown_test.go
+
+# Local-first request-log NAS archive reader (disabled unless explicitly configured).
+request-log-archive	reader-env	pattern	REQUEST_LOG_ARCHIVE_DIR	internal/api/handlers/management/handler.go
+request-log-archive	local-first-reader	symbol	^func \(h \*Handler\) openRequestLog\(	internal/api/handlers/management/request_log_archive.go
+request-log-archive	reader-regression	symbol	^func TestRequestLogArchiveReadAndLocalPriority\(	internal/api/handlers/management/request_log_archive_test.go
