@@ -395,3 +395,8 @@ codex-credits-cooldown	credits-aware-429-wiring	pattern	codexHeaderRetryAfterFor
 codex-credits-cooldown	credits-aware-429-regression	symbol	^func TestCodexExecutor_Capacity429WithCredits_NoMultiDayCooldown\(	internal/runtime/executor/codex_executor_429_credits_test.go
 codex-credits-cooldown	explicit-limit-backstop	pattern	if explicitLimit \|\| !cliproxyauth\.CodexCreditsUsable\(headers\) \{	internal/runtime/executor/codex_executor_terminal.go
 codex-credits-cooldown	credits-aware-429-unit-regression	symbol	^func TestNewCodexStatusErr_CreditsAware429\(	internal/runtime/executor/codex_executor_429_credits_test.go
+
+# Local-first request-log NAS archive reader (disabled unless explicitly configured).
+request-log-archive	reader-env	pattern	REQUEST_LOG_ARCHIVE_DIR	internal/api/handlers/management/handler.go
+request-log-archive	local-first-reader	symbol	^func \(h \*Handler\) openRequestLog\(	internal/api/handlers/management/request_log_archive.go
+request-log-archive	reader-regression	symbol	^func TestRequestLogArchiveReadAndLocalPriority\(	internal/api/handlers/management/request_log_archive_test.go
