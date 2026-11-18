@@ -294,6 +294,72 @@ func TestLoadCodexClientModelTemplatesRefreshesOnRevision(t *testing.T) {
 	}
 }
 
+func TestCodexClientModelsResponse_NonTemplateModelsSupportedInAPI(t *testing.T) {
+	codexClientModelTemplatesMu.Lock()
+	previousLoaded := codexClientModelTemplatesLoaded
+	previousRevision := codexClientModelTemplatesRevision
+	previousTemplates := codexClientModelTemplates
+	previousDefault := codexClientDefaultTemplate
+	previousErr := codexClientModelTemplatesErr
+	codexClientModelTemplatesLoaded = false
+	codexClientModelTemplatesMu.Unlock()
+	t.Cleanup(func() {
+		codexClientModelTemplatesMu.Lock()
+		codexClientModelTemplatesLoaded = previousLoaded
+		codexClientModelTemplatesRevision = previousRevision
+		codexClientModelTemplates = previousTemplates
+		codexClientDefaultTemplate = previousDefault
+		codexClientModelTemplatesErr = previousErr
+		codexClientModelTemplatesMu.Unlock()
+	})
+
+	// Simulate the upstream remote catalog marking the default template as not
+	// supported in API mode. Pin the snapshot to the live registry revision so
+	// BuildResponse uses this cached snapshot instead of reloading.
+	_, revision := registry.GetCodexClientModelsSnapshot()
+	snapshot := []byte(`{"models":[
+		{"slug":"gpt-5.5","display_name":"GPT-5.5","visibility":"list","supported_in_api":false},
+		{"slug":"gpt-5.4","display_name":"GPT-5.4","visibility":"list","supported_in_api":false}
+	]}`)
+	_, defaultTemplate, err := loadCodexClientModelTemplatesSnapshot(snapshot, revision)
+	if err != nil || defaultTemplate == nil {
+		t.Fatalf("load snapshot: default=%#v err=%v", defaultTemplate, err)
+	}
+	if got, ok := defaultTemplate["supported_in_api"].(bool); !ok || got {
+		t.Fatalf("default template supported_in_api = %#v, want injected false", defaultTemplate["supported_in_api"])
+	}
+
+	response := BuildResponse([]map[string]any{
+		{"id": "claude-sonnet-4-6"},
+		{"id": "gpt-5.4"},
+	}, nil, false)
+	models, ok := response["models"].([]map[string]any)
+	if !ok {
+		t.Fatalf("response models = %#v, want []map[string]any", response["models"])
+	}
+
+	bySlug := make(map[string]map[string]any, len(models))
+	for _, model := range models {
+		bySlug[stringModelValue(model, "slug")] = model
+	}
+
+	claude := bySlug["claude-sonnet-4-6"]
+	if claude == nil {
+		t.Fatalf("expected synthesized entry for claude-sonnet-4-6, got %#v", models)
+	}
+	if got, ok := claude["supported_in_api"].(bool); !ok || !got {
+		t.Fatalf("claude-sonnet-4-6 supported_in_api = %#v, want true", claude["supported_in_api"])
+	}
+
+	templateEntry := bySlug["gpt-5.4"]
+	if templateEntry == nil {
+		t.Fatalf("expected template entry for gpt-5.4, got %#v", models)
+	}
+	if got, ok := templateEntry["supported_in_api"].(bool); !ok || got {
+		t.Fatalf("gpt-5.4 supported_in_api = %#v, want template value false", templateEntry["supported_in_api"])
+	}
+}
+
 func TestApplyCodexClientModelMetadataPreservesMultiAgentVersionWhenDisabled(t *testing.T) {
 	entry := map[string]any{"multi_agent_version": "v1"}
 	model := map[string]any{"id": "custom-model"}

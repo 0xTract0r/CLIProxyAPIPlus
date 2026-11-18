@@ -244,6 +244,12 @@ func applyCodexClientModelMetadata(entry map[string]any, id string, model map[st
 	}
 
 	entry["slug"] = id
+	// Non-template models (claude-*, grok-*, ...) are served by CLIProxyAPI through
+	// its API surface, so they must be selectable in API-key mode. The default
+	// template is cloned from the upstream remote catalog, whose gpt-5.5 entry may
+	// carry supported_in_api=false; inheriting that makes Codex Desktop hide every
+	// synthesized model from its picker. Template-matched entries keep their value.
+	entry["supported_in_api"] = true
 	entry["display_name"] = displayName
 	entry["description"] = description
 	entry["prefer_websockets"] = false
