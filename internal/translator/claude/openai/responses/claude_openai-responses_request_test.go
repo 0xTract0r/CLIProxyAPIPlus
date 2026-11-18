@@ -284,6 +284,114 @@ func TestConvertOpenAIResponsesRequestToClaude_DropsApplyPatchCustomTool(t *test
 	}
 }
 
+func TestConvertOpenAIResponsesRequestToClaude_NormalizesRootToolSchemaUnion(t *testing.T) {
+	raw := []byte(`{
+		"model":"claude-test",
+		"input":[{"role":"user","content":[{"type":"input_text","text":"hi"}]}],
+		"tools":[{
+			"type":"function",
+			"name":"lookup",
+			"parameters":{
+				"type":"object",
+				"properties":{"query":{"type":"string"},"id":{"type":"string"}},
+				"oneOf":[{"required":["query"]},{"required":["id"]}]
+			}
+		}]
+	}`)
+
+	out := ConvertOpenAIResponsesRequestToClaude("claude-test", raw, false)
+	schema := gjson.GetBytes(out, "tools.0.input_schema")
+
+	if got := schema.Get("type").String(); got != "object" {
+		t.Fatalf("input_schema.type = %q, want object. Output: %s", got, string(out))
+	}
+	if schema.Get("oneOf").Exists() {
+		t.Fatalf("input_schema should not contain root oneOf. Output: %s", string(out))
+	}
+	if !schema.Get("properties.query").Exists() || !schema.Get("properties.id").Exists() {
+		t.Fatalf("input_schema should preserve query and id properties. Output: %s", string(out))
+	}
+	if schema.Get("required").Exists() {
+		t.Fatalf("input_schema should not merge alternative required fields. Output: %s", string(out))
+	}
+}
+
+// Regression for Codex Desktop: namespace child tools (e.g. mcp__cua_repl.js) send
+// parameters with a root-level oneOf, which Anthropic rejects with HTTP 400
+// ("input_schema does not support oneOf, allOf, or anyOf at the top level").
+func TestConvertOpenAIResponsesRequestToClaude_NamespaceToolRootUnionSchemaFlattened(t *testing.T) {
+	raw := []byte(`{
+		"model":"claude-test",
+		"input":[{"role":"user","content":[{"type":"input_text","text":"hi"}]}],
+		"tools":[{
+			"type":"namespace",
+			"name":"mcp__cua_repl",
+			"tools":[
+				{
+					"type":"function",
+					"name":"js",
+					"parameters":{
+						"type":"object",
+						"properties":{"code":{"type":"string"}},
+						"oneOf":[
+							{"type":"object","required":["code"]},
+							{"type":"object","properties":{"title":{"type":"string"}}}
+						]
+					}
+				},
+				{
+					"type":"function",
+					"name":"automation_update",
+					"parameters":{
+						"oneOf":[
+							{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]},
+							{"type":"object","properties":{"name":{"type":"string"}}}
+						]
+					}
+				}
+			]
+		}]
+	}`)
+
+	out := ConvertOpenAIResponsesRequestToClaude("claude-test", raw, false)
+	tools := gjson.GetBytes(out, "tools")
+	if got := len(tools.Array()); got != 2 {
+		t.Fatalf("tools length = %d, want 2. Output: %s", got, string(out))
+	}
+
+	tools.ForEach(func(_, tool gjson.Result) bool {
+		schema := tool.Get("input_schema")
+		for _, union := range []string{"oneOf", "anyOf", "allOf"} {
+			if schema.Get(union).Exists() {
+				t.Fatalf("tool %q input_schema should not contain root %s. Output: %s", tool.Get("name").String(), union, string(out))
+			}
+		}
+		if got := schema.Get("type").String(); got != "object" {
+			t.Fatalf("tool %q input_schema.type = %q, want object. Output: %s", tool.Get("name").String(), got, string(out))
+		}
+		return true
+	})
+
+	jsSchema := gjson.GetBytes(out, `tools.#(name=="mcp__cua_repl__js").input_schema`)
+	if !jsSchema.Exists() {
+		t.Fatalf("missing mcp__cua_repl__js tool. Output: %s", string(out))
+	}
+	if got := jsSchema.Get("properties.code.type").String(); got != "string" {
+		t.Fatalf("js input_schema should preserve properties.code, got type %q. Output: %s", got, string(out))
+	}
+	if !jsSchema.Get("properties.title").Exists() {
+		t.Fatalf("js input_schema should merge branch property title. Output: %s", string(out))
+	}
+
+	updateSchema := gjson.GetBytes(out, `tools.#(name=="mcp__cua_repl__automation_update").input_schema`)
+	if !updateSchema.Exists() {
+		t.Fatalf("missing mcp__cua_repl__automation_update tool. Output: %s", string(out))
+	}
+	if !updateSchema.Get("properties.id").Exists() || !updateSchema.Get("properties.name").Exists() {
+		t.Fatalf("union-only input_schema should merge branch properties. Output: %s", string(out))
+	}
+}
+
 func testClaudeResponsesThinkingSignature(t *testing.T) (string, string) {
 	t.Helper()
 	channelBlock := []byte{}
