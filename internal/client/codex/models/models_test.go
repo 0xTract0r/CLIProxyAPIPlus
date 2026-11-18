@@ -315,7 +315,7 @@ func TestCodexClientModelsResponse_NonTemplateModelsSupportedInAPI(t *testing.T)
 
 	// Simulate the upstream remote catalog marking the default template as not
 	// supported in API mode. Pin the snapshot to the live registry revision so
-	// buildCodexClientModels uses this cached snapshot instead of reloading.
+	// BuildResponse uses this cached snapshot instead of reloading.
 	_, revision := registry.GetCodexClientModelsSnapshot()
 	snapshot := []byte(`{"models":[
 		{"slug":"gpt-5.5","display_name":"GPT-5.5","visibility":"list","supported_in_api":false},
@@ -329,10 +329,14 @@ func TestCodexClientModelsResponse_NonTemplateModelsSupportedInAPI(t *testing.T)
 		t.Fatalf("default template supported_in_api = %#v, want injected false", defaultTemplate["supported_in_api"])
 	}
 
-	models := buildCodexClientModels([]map[string]any{
+	response := BuildResponse([]map[string]any{
 		{"id": "claude-sonnet-4-6"},
 		{"id": "gpt-5.4"},
 	}, nil, false)
+	models, ok := response["models"].([]map[string]any)
+	if !ok {
+		t.Fatalf("response models = %#v, want []map[string]any", response["models"])
+	}
 
 	bySlug := make(map[string]map[string]any, len(models))
 	for _, model := range models {
