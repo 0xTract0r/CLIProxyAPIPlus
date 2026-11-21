@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -29,29 +30,45 @@ func matchProvider(provider string, targets []string) (string, bool) {
 }
 
 func (w *Watcher) start(ctx context.Context) error {
+	initialFile, initialErr := os.Stat(w.configPath)
 	if errAddConfig := w.watcher.Add(w.configPath); errAddConfig != nil {
 		log.Errorf("failed to watch config file %s: %v", w.configPath, errAddConfig)
 		return errAddConfig
 	}
 	configParent := filepath.Dir(w.configPath)
-	// A rename drops the inode watch; the directory watch persists across replacements.
-	if err := w.watcher.Add(configParent); err != nil {
-		return fmt.Errorf("watch config parent %s: %w", configParent, err)
+	realConfig, resolveErr := filepath.EvalSymlinks(w.configPath)
+	watchParent := func(parent string) error {
+		err := w.watcher.Add(parent)
+		if err == nil {
+			return nil
+		}
+		if runtime.GOOS == "linux" && errors.Is(err, syscall.EACCES) && initialErr == nil &&
+			initialFile.Mode().IsRegular() && resolveErr == nil {
+			currentPath, pathErr := filepath.EvalSymlinks(w.configPath)
+			currentFile, statErr := os.Stat(w.configPath)
+			if pathErr == nil && statErr == nil && currentPath == realConfig && os.SameFile(initialFile, currentFile) {
+				log.WithError(err).WithField("parent", parent).Warn("config parent watch unavailable; watching in-place config changes")
+				return nil
+			}
+		}
+		return fmt.Errorf("watch config parent %s: %w", parent, err)
 	}
-	if realConfig, err := filepath.EvalSymlinks(w.configPath); err == nil &&
-		!w.sameNormalizedAuthPath(filepath.Dir(realConfig), configParent) {
-		if err := w.watcher.Add(filepath.Dir(realConfig)); err != nil {
-			return fmt.Errorf("watch resolved config parent %s: %w", realConfig, err)
+	// A rename drops the inode watch; directory watches persist across replacements.
+	if err := watchParent(configParent); err != nil {
+		return err
+	}
+	if resolveErr == nil && !w.sameNormalizedAuthPath(filepath.Dir(realConfig), configParent) {
+		if err := watchParent(filepath.Dir(realConfig)); err != nil {
+			return err
 		}
 	}
-	log.Debugf("watching config file and parent: %s", w.configPath)
 
 	w.watchMu.Lock()
 	authDir := w.currentAuthDir()
 	if errAddAuthDir := w.watcher.Add(authDir); errAddAuthDir != nil {
 		w.watchMu.Unlock()
 		log.Errorf("failed to watch auth directory %s: %v", authDir, errAddAuthDir)
-		return errAddAuthDir
+		return fmt.Errorf("watch auth directory %s: %w", authDir, errAddAuthDir)
 	}
 	w.started = true
 	w.watchedAuthDir = authDir

@@ -28,6 +28,7 @@ if [[ -z "$fixture" ]]; then
 fi
 
 export CONFIG_TWO_SAVES_BIND_FIXTURE="$fixture"
+export ROLLBACK_BIND_FIXTURE="$fixture"
 mountpoint -q -- "$fixture"
 test -f "$fixture" && test -w "$fixture"
 
@@ -52,14 +53,21 @@ tests=(
   TestReconcileConfigSavePreservesNamedReaderAndDeniesOwningGroup
   TestReconcileConfigSaveDoesNotInheritNewAccessACL
   TestConfigReplacementPreservesMountSemantics
+  TestRollupActualWatcherRepeatedSaves
+  TestSearchableConfigParent
 )
 pattern="$(IFS='|'; echo "${tests[*]}")"
-go test -mod=readonly -race -count=1 -json ./internal/config -run "^($pattern)$" |
+go test -mod=readonly -race -count=1 -p 1 -json ./internal/config ./internal/watcher -run "^($pattern)$" |
   tee "$scratch/go-test.jsonl"
 
 python3 - "$scratch/go-test.jsonl" "${tests[@]}" \
   TestConfigReplacementPreservesMountSemantics/directory \
-  TestConfigReplacementPreservesMountSemantics/single_file_bind <<'PY'
+  TestConfigReplacementPreservesMountSemantics/single_file_bind \
+  TestRollupActualWatcherRepeatedSaves/directory-default \
+  TestRollupActualWatcherRepeatedSaves/directory-opt-in \
+  TestRollupActualWatcherRepeatedSaves/single-bind-opt-in \
+  TestSearchableConfigParent/file-fallback \
+  TestSearchableConfigParent/symlink-resolved-parent <<'PY'
 import json
 import sys
 
