@@ -7,7 +7,8 @@ import (
 	"strings"
 )
 
-// RemoveDurable commits storage deletion under the sorted ID and persist locks.
+// RemoveDurable excludes store reloads even when no IDs are registered.
+// It commits storage deletion under the sorted ID and persist locks.
 // Callers deleting a source file must reserve the path before enumerating IDs.
 // The commit callback must not mutate records protected by those gates.
 func (m *Manager) RemoveDurable(ctx context.Context, ids []string, commit func() error) error {
@@ -21,7 +22,7 @@ func (m *Manager) RemoveDurable(ctx context.Context, ids []string, commit func()
 		return err
 	}
 	ids = normalizeRemoveIDs(ids)
-	if m == nil || len(ids) == 0 {
+	if m == nil {
 		return commit()
 	}
 	release, err := m.lockAuthMutationsContext(ctx, ids)
