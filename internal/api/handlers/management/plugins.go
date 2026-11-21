@@ -1,10 +1,15 @@
 package management
 
 import (
+	"crypto/sha256"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"os"
+	"path/filepath"
+	"reflect"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -256,26 +261,11 @@ func (h *Handler) PatchPluginEnabled(c *gin.Context) {
 		return
 	}
 
-	h.mu.Lock()
-	ensurePluginConfigMap(h.cfg)
-	item := h.cfg.Plugins.Configs[id]
-	node := pluginConfigNode(item)
-	setYAMLMappingValue(node, "enabled", boolYAMLNode(*body.Enabled))
-	updated, errConfig := pluginInstanceConfigFromNode(node)
-	if errConfig != nil {
-		h.mu.Unlock()
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_config", "message": errConfig.Error()})
-		return
-	}
-	h.cfg.Plugins.Configs[id] = updated
-	cfgSnapshot, okSnapshot := h.saveConfigAndSnapshotLocked(c)
-	h.mu.Unlock()
-	if !okSnapshot {
-		return
-	}
-
-	h.reloadConfigAfterManagementSaveAsync(c.Request.Context(), cfgSnapshot)
-	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+	h.updatePluginConfig(c, id, func(item config.PluginInstanceConfig) (*yaml.Node, bool) {
+		node := pluginConfigNode(item)
+		setYAMLMappingValue(node, "enabled", boolYAMLNode(*body.Enabled))
+		return node, true
+	})
 }
 
 // PutPluginConfig replaces plugins.configs.<id> with the request object.
@@ -293,17 +283,9 @@ func (h *Handler) PutPluginConfig(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_body", "message": errNode.Error()})
 		return
 	}
-	updated, errConfig := pluginInstanceConfigFromNode(node)
-	if errConfig != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_config", "message": errConfig.Error()})
-		return
-	}
-
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	ensurePluginConfigMap(h.cfg)
-	h.cfg.Plugins.Configs[id] = updated
-	h.persistLocked(c)
+	h.updatePluginConfig(c, id, func(config.PluginInstanceConfig) (*yaml.Node, bool) {
+		return node, true
+	})
 }
 
 // PatchPluginConfig shallow-merges plugins.configs.<id> with the request object.
@@ -317,35 +299,65 @@ func (h *Handler) PatchPluginConfig(c *gin.Context) {
 		return
 	}
 
+	h.updatePluginConfig(c, id, func(item config.PluginInstanceConfig) (*yaml.Node, bool) {
+		node := pluginConfigNode(item)
+		keys := make([]string, 0, len(body))
+		for key := range body {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			value := body[key]
+			if value == nil {
+				deleteYAMLMappingKey(node, key)
+				continue
+			}
+			valueNode, errNode := yamlNodeFromJSONValue(value)
+			if errNode != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_body", "message": errNode.Error()})
+				return nil, false
+			}
+			setYAMLMappingValue(node, key, valueNode)
+		}
+		return node, true
+	})
+}
+
+func (h *Handler) updatePluginConfig(c *gin.Context, id string, update func(config.PluginInstanceConfig) (*yaml.Node, bool)) {
+	if h == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "config unavailable"})
+		return
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	ensurePluginConfigMap(h.cfg)
-	node := pluginConfigNode(h.cfg.Plugins.Configs[id])
-	keys := make([]string, 0, len(body))
-	for key := range body {
-		keys = append(keys, key)
+	if h.cfg == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "config unavailable"})
+		return
 	}
-	sort.Strings(keys)
-	for _, key := range keys {
-		value := body[key]
-		if value == nil {
-			deleteYAMLMappingKey(node, key)
-			continue
-		}
-		valueNode, errNode := yamlNodeFromJSONValue(value)
-		if errNode != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_body", "message": errNode.Error()})
-			return
-		}
-		setYAMLMappingValue(node, key, valueNode)
+	next := h.cfg.CloneForRuntime()
+	next.NormalizePluginsConfig()
+	node, ok := update(next.Plugins.Configs[id])
+	if !ok {
+		return
 	}
 	updated, errConfig := pluginInstanceConfigFromNode(node)
 	if errConfig != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_config", "message": errConfig.Error()})
 		return
 	}
-	h.cfg.Plugins.Configs[id] = updated
-	h.persistLocked(c)
+	next.Plugins.Configs[id] = updated
+	if errSave := config.SaveConfigPreserveComments(h.configFilePath, next, c.GetBool(ConfigV8ContextKey)); errSave != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to save config: %v", errSave)})
+		return
+	}
+	// Publish the normalized plugin block without replacing the shared config.
+	h.cfg.Plugins = next.Plugins
+	if !maps.Equal(h.cfg.OAuthOnlyFields, next.OAuthOnlyFields) {
+		h.cfg.OAuthOnlyFields = next.OAuthOnlyFields
+	}
+	snapshot := h.reloadSnapshotConfigLocked()
+	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+	h.reloadConfigAfterManagementSaveAsync(c.Request.Context(), snapshot)
 }
 
 // DeletePlugin removes the selected local plugin file and its saved config.
@@ -360,22 +372,25 @@ func (h *Handler) DeletePlugin(c *gin.Context) {
 	}
 
 	h.mu.Lock()
+	defer h.mu.Unlock()
 	if h.cfg == nil {
-		h.mu.Unlock()
 		c.JSON(http.StatusNotFound, gin.H{"error": "plugin_not_found", "message": "plugin not found"})
 		return
 	}
-	pluginsDir := normalizedPluginsDir(h.cfg.Plugins.Dir)
-	item, configured := h.cfg.Plugins.Configs[id]
-	host := h.pluginHost
-	h.mu.Unlock()
-
-	resolvedPluginsDir, errResolvePluginsDir := config.ResolvePluginsDir(pluginsDir)
-	if errResolvePluginsDir != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "plugin_directory_invalid", "message": errResolvePluginsDir.Error()})
+	cfg, host := h.cfg, h.pluginHost
+	pluginsDir, errResolve := config.ResolvePluginsDir(normalizedPluginsDir(cfg.Plugins.Dir))
+	if errResolve != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "plugin_directory_invalid", "message": errResolve.Error()})
 		return
 	}
-	pluginsDir = resolvedPluginsDir
+	if directory, err := pendingPluginDelete(pluginsDir, id); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "plugin_delete_recovery_check_failed"})
+		return
+	} else if directory != "" {
+		c.JSON(http.StatusConflict, gin.H{"error": "plugin_delete_recovery_pending", "recovery_directory": directory})
+		return
+	}
+	item, configured := cfg.Plugins.Configs[id]
 	var desiredVersions map[string]string
 	if configured {
 		desiredVersions = pluginStoreDesiredVersions(map[string]config.PluginInstanceConfig{id: item})
@@ -390,53 +405,157 @@ func (h *Handler) DeletePlugin(c *gin.Context) {
 		return
 	}
 
-	if pluginBusy(host, id) && (host == nil || !host.UnloadPlugin(id)) && pluginBusy(host, id) {
-		c.JSON(http.StatusConflict, gin.H{
-			"error":            "plugin_delete_requires_restart",
-			"message":          "loaded plugin cannot be deleted while the server is running",
-			"restart_required": true,
-		})
-		return
+	unloaded := false
+	if pluginBusy(host, id) {
+		// Do not hold the management lock while the host waits on plugin calls.
+		originalDir := cfg.Plugins.Dir
+		var originalFile os.FileInfo
+		if path != "" {
+			var errStat error
+			originalFile, errStat = os.Lstat(path)
+			if errStat != nil {
+				c.JSON(http.StatusConflict, gin.H{"error": "plugin_delete_target_changed", "message": "plugin file changed before unloading"})
+				return
+			}
+		}
+		h.mu.Unlock()
+		unloaded = host.UnloadPlugin(id)
+		h.mu.Lock()
+		if pluginBusy(host, id) {
+			c.JSON(http.StatusConflict, gin.H{
+				"error": "plugin_delete_requires_restart", "message": "loaded plugin cannot be deleted while the server is running", "restart_required": true,
+			})
+			return
+		}
+		if directory, err := pendingPluginDelete(pluginsDir, id); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "plugin_delete_recovery_check_failed", "restart_required": unloaded})
+			return
+		} else if directory != "" {
+			c.JSON(http.StatusConflict, gin.H{"error": "plugin_delete_recovery_pending", "recovery_directory": directory, "restart_required": unloaded})
+			return
+		}
+		current, stillConfigured := cfg.Plugins.Configs[id]
+		currentPath, errSelect := pluginFilePath(pluginsDir, id, desiredVersions)
+		fileChanged := false
+		if originalFile != nil {
+			currentFile, errStat := os.Lstat(path)
+			fileChanged = errStat != nil || !os.SameFile(originalFile, currentFile) ||
+				originalFile.Size() != currentFile.Size() || originalFile.ModTime() != currentFile.ModTime()
+		}
+		if fileChanged || h.cfg != cfg || h.pluginHost != host || cfg.Plugins.Dir != originalDir ||
+			configured != stillConfigured || !reflect.DeepEqual(item, current) || errSelect != nil || path != currentPath {
+			c.JSON(http.StatusConflict, gin.H{"error": "plugin_delete_target_changed", "message": "plugin configuration changed while unloading", "restart_required": unloaded})
+			return
+		}
 	}
 
 	fileDeleted := false
+	var staged string
 	if path != "" {
-		if errRemove := os.Remove(path); errRemove != nil {
-			if !errors.Is(errRemove, os.ErrNotExist) {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "plugin_delete_failed", "message": errRemove.Error()})
+		var errFile error
+		if configured {
+			staged, errFile = stagePluginDelete(path, id)
+		} else {
+			errFile = os.Remove(path)
+			fileDeleted = errFile == nil
+		}
+		if errFile != nil && !errors.Is(errFile, os.ErrNotExist) {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "plugin_delete_failed", "message": errFile.Error(), "restart_required": unloaded})
+			return
+		}
+	}
+
+	if configured {
+		next := cfg.CloneForRuntime()
+		delete(next.Plugins.Configs, id)
+		if errSave := config.SaveConfigPreserveComments(h.configFilePath, next, c.GetBool(ConfigV8ContextKey)); errSave != nil {
+			if staged != "" {
+				if errRestore := os.Link(staged, path); errRestore != nil {
+					c.JSON(http.StatusInternalServerError, gin.H{
+						"error": "plugin_delete_restore_failed", "message": "configuration was not saved and the original file could not be restored",
+						"path": htmlsanitize.String(path), "recovery_directory": htmlsanitize.String(filepath.Base(filepath.Dir(staged))), "restart_required": unloaded,
+					})
+					return
+				}
+				if errCleanup := removeStagedPlugin(staged); errCleanup != nil {
+					c.JSON(http.StatusInternalServerError, gin.H{
+						"error": "plugin_delete_cleanup_failed", "message": "original file was restored but its recovery copy could not be removed",
+						"path": htmlsanitize.String(path), "recovery_directory": htmlsanitize.String(filepath.Base(filepath.Dir(staged))), "restart_required": unloaded,
+					})
+					return
+				}
+			}
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"error": "config_save_failed", "message": fmt.Sprintf("plugin configuration was not saved: %s", errSave),
+				"file_deleted": false, "path": htmlsanitize.String(path), "restart_required": unloaded,
+			})
+			return
+		}
+
+		cfg.Plugins.Configs = next.Plugins.Configs
+		if !maps.Equal(cfg.OAuthOnlyFields, next.OAuthOnlyFields) {
+			cfg.OAuthOnlyFields = next.OAuthOnlyFields
+		}
+		if staged != "" {
+			if errCleanup := removeStagedPlugin(staged); errCleanup != nil {
+				h.reloadConfigAfterManagementSaveAsync(c.Request.Context(), h.reloadSnapshotConfigLocked())
+				c.JSON(http.StatusInternalServerError, gin.H{
+					"error": "plugin_delete_cleanup_failed", "message": "configuration was removed but the staged file could not be cleaned up",
+					"path": htmlsanitize.String(path), "recovery_directory": htmlsanitize.String(filepath.Base(filepath.Dir(staged))), "configured_removed": true,
+				})
 				return
 			}
-		} else {
 			fileDeleted = true
 		}
 	}
 
-	h.mu.Lock()
-	delete(h.cfg.Plugins.Configs, id)
-	if configured {
-		if errSave := config.SaveConfigPreserveComments(h.configFilePath, h.cfg, c.GetBool(ConfigV8ContextKey)); errSave != nil {
-			h.mu.Unlock()
-			c.JSON(http.StatusInternalServerError, gin.H{
-				"error":        "config_save_failed",
-				"message":      fmt.Sprintf("plugin deleted but saving config failed: %s", errSave.Error()),
-				"file_deleted": fileDeleted,
-				"path":         path,
-			})
-			return
+	h.reloadConfigAfterManagementSaveAsync(c.Request.Context(), h.reloadSnapshotConfigLocked())
+	c.JSON(http.StatusOK, gin.H{
+		"status": "deleted", "id": htmlsanitize.String(id), "path": htmlsanitize.String(path),
+		"file_deleted": fileDeleted, "configured_removed": configured, "restart_required": false,
+	})
+}
+
+// stagePluginDelete moves the file aside on the same filesystem and outside plugin discovery.
+func pluginDeleteRecoveryName(id string) string {
+	return fmt.Sprintf(".plugin-delete-%x", sha256.Sum256([]byte(id)))
+}
+
+func pendingPluginDelete(root, id string) (string, error) {
+	name := pluginDeleteRecoveryName(id)
+	// Match the discovery locations, even if the original path is absent
+	// or discovery now selects a different version.
+	for _, dir := range []string{filepath.Join(root, runtime.GOOS, runtime.GOARCH), root} {
+		_, err := os.Lstat(filepath.Join(dir, name))
+		if err == nil {
+			return name, nil
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return "", err
 		}
 	}
-	cfgSnapshot := h.reloadSnapshotConfigLocked()
-	h.mu.Unlock()
+	return "", nil
+}
 
-	h.reloadConfigAfterManagementSaveAsync(c.Request.Context(), cfgSnapshot)
-	c.JSON(http.StatusOK, gin.H{
-		"status":             "deleted",
-		"id":                 htmlsanitize.String(id),
-		"path":               htmlsanitize.String(path),
-		"file_deleted":       fileDeleted,
-		"configured_removed": configured,
-		"restart_required":   false,
-	})
+func stagePluginDelete(path, id string) (string, error) {
+	dir := filepath.Join(filepath.Dir(path), pluginDeleteRecoveryName(id))
+	if err := os.Mkdir(dir, 0700); err != nil {
+		return "", fmt.Errorf("create plugin recovery directory: %w", err)
+	}
+	staged := filepath.Join(dir, filepath.Base(path))
+	if err := os.Rename(path, staged); err != nil {
+		_ = os.Remove(dir)
+		return "", err
+	}
+	return staged, nil
+}
+
+func removeStagedPlugin(path string) error {
+	if err := os.Remove(path); err != nil {
+		return err
+	}
+	// A remaining recovery directory must be reported before a later retry.
+	return os.Remove(filepath.Dir(path))
 }
 
 func normalizedPluginsDir(dir string) string {
