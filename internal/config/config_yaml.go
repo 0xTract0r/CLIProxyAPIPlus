@@ -14,6 +14,17 @@ import (
 // Existing v8 documents are saved in the latest layout. Successful migration
 // also synchronizes cfg's OAuth scope for runtime snapshots.
 func SaveConfigPreserveComments(configFile string, cfg *Config, migrateV8 ...bool) error {
+	_, err := saveConfigPreserveComments(configFile, cfg, false, migrateV8...)
+	return err
+}
+
+// SaveConfigPreserveCommentsWithSourceHash returns the hash of the committed snapshot.
+func SaveConfigPreserveCommentsWithSourceHash(configFile string, cfg *Config, migrateV8 ...bool) (string, error) {
+	return saveConfigPreserveComments(configFile, cfg, true, migrateV8...)
+}
+
+func saveConfigPreserveComments(configFile string, cfg *Config, includeHash bool, migrateV8 ...bool) (string, error) {
+	var sourceHash string
 	var migrated *Config
 	var commented []ArchivedV8Section
 	err := withConfigFile(configFile, configWrite, func(file *lockedConfigFile) error {
@@ -21,21 +32,25 @@ func SaveConfigPreserveComments(configFile string, cfg *Config, migrateV8 ...boo
 		if errRender != nil {
 			return errRender
 		}
-		if _, errWrite := file.replace(data); errWrite != nil {
+		committed, errWrite := file.replace(data)
+		if errWrite != nil {
 			return errWrite
+		}
+		if includeHash {
+			sourceHash = committed.SourceHash()
 		}
 		migrated, commented = cfgAfter, sections
 		return nil
 	})
 	if err != nil {
-		return err
+		return "", err
 	}
 	WarnUnrecognizedV8Sections(commented)
 	if migrated != nil {
 		// Keep runtime-only values intact and publish scope only after the write succeeds.
 		cfg.OAuthOnlyFields = migrated.OAuthOnlyFields
 	}
-	return nil
+	return sourceHash, nil
 }
 
 func renderConfigSave(data []byte, persistCfg *Config, migrating bool) ([]byte, *Config, []ArchivedV8Section, error) {

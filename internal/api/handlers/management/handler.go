@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"fmt"
+	"maps"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -511,6 +512,27 @@ func (h *Handler) persistLocked(c *gin.Context) bool {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to save config: %v", err)})
 		return false
 	}
+	h.finishConfigSaveLocked(c)
+	return true
+}
+
+// persistProviderListLocked publishes only the selected list and save metadata.
+// Keep the config pointer stable for scalar readers. The caller holds h.mu.
+func persistProviderListLocked[T any](h *Handler, c *gin.Context, candidate *config.Config, live *[]T, staged []T) {
+	sourceHash, err := config.SaveConfigPreserveCommentsWithSourceHash(h.configFilePath, candidate, c.GetBool(ConfigV8ContextKey))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save config"})
+		return
+	}
+	*live = staged
+	h.cfg.SourceHash = sourceHash
+	if !maps.Equal(h.cfg.OAuthOnlyFields, candidate.OAuthOnlyFields) {
+		h.cfg.OAuthOnlyFields = candidate.OAuthOnlyFields
+	}
+	h.finishConfigSaveLocked(c)
+}
+
+func (h *Handler) finishConfigSaveLocked(c *gin.Context) {
 	snapshot := h.reloadSnapshotConfigLocked()
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
 	var reqCtx context.Context
@@ -518,7 +540,6 @@ func (h *Handler) persistLocked(c *gin.Context) bool {
 		reqCtx = c.Request.Context()
 	}
 	h.reloadConfigAfterManagementSaveAsync(reqCtx, snapshot)
-	return true
 }
 
 // Helper methods for simple types. The setter and the save run under h.mu, so a
