@@ -193,7 +193,7 @@ func (h *Handler) PutGeminiKeys(c *gin.Context) {
 	candidate := h.cfg.CloneForRuntime()
 	candidate.GeminiKey = append([]config.GeminiKey(nil), arr...)
 	candidate.SanitizeGeminiKeys()
-	h.persistProviderConfigLocked(c, candidate)
+	persistProviderListLocked(h, c, candidate, &h.cfg.GeminiKey, candidate.GeminiKey)
 }
 func (h *Handler) PatchGeminiKey(c *gin.Context) {
 	type geminiKeyPatch struct {
@@ -297,12 +297,12 @@ func (h *Handler) PatchGeminiKey(c *gin.Context) {
 	if entry.APIKey == "" && entry.BaseURL == "" {
 		candidate.GeminiKey = append(candidate.GeminiKey[:targetIndex], candidate.GeminiKey[targetIndex+1:]...)
 		candidate.SanitizeGeminiKeys()
-		h.persistProviderConfigLocked(c, candidate)
+		persistProviderListLocked(h, c, candidate, &h.cfg.GeminiKey, candidate.GeminiKey)
 		return
 	}
 	candidate.GeminiKey[targetIndex] = entry
 	candidate.SanitizeGeminiKeys()
-	h.persistProviderConfigLocked(c, candidate)
+	persistProviderListLocked(h, c, candidate, &h.cfg.GeminiKey, candidate.GeminiKey)
 }
 
 func (h *Handler) DeleteGeminiKey(c *gin.Context) {
@@ -330,7 +330,7 @@ func (h *Handler) DeleteGeminiKey(c *gin.Context) {
 			}
 			candidate.GeminiKey = append(candidate.GeminiKey[:matchIndex], candidate.GeminiKey[matchIndex+1:]...)
 			candidate.SanitizeGeminiKeys()
-			h.persistProviderConfigLocked(c, candidate)
+			persistProviderListLocked(h, c, candidate, &h.cfg.GeminiKey, candidate.GeminiKey)
 			return
 		}
 
@@ -354,7 +354,7 @@ func (h *Handler) DeleteGeminiKey(c *gin.Context) {
 		}
 		candidate.GeminiKey = append(candidate.GeminiKey[:matchIndex], candidate.GeminiKey[matchIndex+1:]...)
 		candidate.SanitizeGeminiKeys()
-		h.persistProviderConfigLocked(c, candidate)
+		persistProviderListLocked(h, c, candidate, &h.cfg.GeminiKey, candidate.GeminiKey)
 		return
 	}
 	if idxStr := c.Query("index"); idxStr != "" {
@@ -362,7 +362,7 @@ func (h *Handler) DeleteGeminiKey(c *gin.Context) {
 		if _, err := fmt.Sscanf(idxStr, "%d", &idx); err == nil && idx >= 0 && idx < len(candidate.GeminiKey) {
 			candidate.GeminiKey = append(candidate.GeminiKey[:idx], candidate.GeminiKey[idx+1:]...)
 			candidate.SanitizeGeminiKeys()
-			h.persistProviderConfigLocked(c, candidate)
+			persistProviderListLocked(h, c, candidate, &h.cfg.GeminiKey, candidate.GeminiKey)
 			return
 		}
 	}
@@ -402,7 +402,7 @@ func (h *Handler) PutInteractionsKeys(c *gin.Context) {
 	candidate := h.cfg.CloneForRuntime()
 	candidate.InteractionsKey = append([]config.GeminiKey(nil), arr...)
 	candidate.SanitizeInteractionsKeys()
-	h.persistProviderConfigLocked(c, candidate)
+	persistProviderListLocked(h, c, candidate, &h.cfg.InteractionsKey, candidate.InteractionsKey)
 }
 func (h *Handler) PatchInteractionsKey(c *gin.Context) {
 	type geminiKeyPatch struct {
@@ -507,12 +507,12 @@ func (h *Handler) PatchInteractionsKey(c *gin.Context) {
 	if entry.APIKey == "" && entry.BaseURL == "" {
 		candidate.InteractionsKey = append(candidate.InteractionsKey[:targetIndex], candidate.InteractionsKey[targetIndex+1:]...)
 		candidate.SanitizeInteractionsKeys()
-		h.persistProviderConfigLocked(c, candidate)
+		persistProviderListLocked(h, c, candidate, &h.cfg.InteractionsKey, candidate.InteractionsKey)
 		return
 	}
 	candidate.InteractionsKey[targetIndex] = entry
 	candidate.SanitizeInteractionsKeys()
-	h.persistProviderConfigLocked(c, candidate)
+	persistProviderListLocked(h, c, candidate, &h.cfg.InteractionsKey, candidate.InteractionsKey)
 }
 
 func (h *Handler) DeleteInteractionsKey(c *gin.Context) {
@@ -540,7 +540,7 @@ func (h *Handler) DeleteInteractionsKey(c *gin.Context) {
 			}
 			candidate.InteractionsKey = append(candidate.InteractionsKey[:matchIndex], candidate.InteractionsKey[matchIndex+1:]...)
 			candidate.SanitizeInteractionsKeys()
-			h.persistProviderConfigLocked(c, candidate)
+			persistProviderListLocked(h, c, candidate, &h.cfg.InteractionsKey, candidate.InteractionsKey)
 			return
 		}
 
@@ -564,7 +564,7 @@ func (h *Handler) DeleteInteractionsKey(c *gin.Context) {
 		}
 		candidate.InteractionsKey = append(candidate.InteractionsKey[:matchIndex], candidate.InteractionsKey[matchIndex+1:]...)
 		candidate.SanitizeInteractionsKeys()
-		h.persistProviderConfigLocked(c, candidate)
+		persistProviderListLocked(h, c, candidate, &h.cfg.InteractionsKey, candidate.InteractionsKey)
 		return
 	}
 	if idxStr := c.Query("index"); idxStr != "" {
@@ -573,7 +573,7 @@ func (h *Handler) DeleteInteractionsKey(c *gin.Context) {
 		if errScan == nil && idx >= 0 && idx < len(candidate.InteractionsKey) {
 			candidate.InteractionsKey = append(candidate.InteractionsKey[:idx], candidate.InteractionsKey[idx+1:]...)
 			candidate.SanitizeInteractionsKeys()
-			h.persistProviderConfigLocked(c, candidate)
+			persistProviderListLocked(h, c, candidate, &h.cfg.InteractionsKey, candidate.InteractionsKey)
 			return
 		}
 	}
@@ -902,7 +902,7 @@ func (h *Handler) PutOpenAICompat(c *gin.Context) {
 	candidate := h.cfg.CloneForRuntime()
 	candidate.OpenAICompatibility = filtered
 	candidate.SanitizeOpenAICompatibility()
-	h.persistProviderConfigLocked(c, candidate)
+	persistProviderListLocked(h, c, candidate, &h.cfg.OpenAICompatibility, candidate.OpenAICompatibility)
 }
 func (h *Handler) PatchOpenAICompat(c *gin.Context) {
 	type openAICompatPatch struct {
@@ -974,7 +974,7 @@ func (h *Handler) PatchOpenAICompat(c *gin.Context) {
 		if trimmed == "" {
 			candidate.OpenAICompatibility = append(candidate.OpenAICompatibility[:targetIndex], candidate.OpenAICompatibility[targetIndex+1:]...)
 			candidate.SanitizeOpenAICompatibility()
-			h.persistProviderConfigLocked(c, candidate)
+			persistProviderListLocked(h, c, candidate, &h.cfg.OpenAICompatibility, candidate.OpenAICompatibility)
 			return
 		}
 		entry.BaseURL = trimmed
@@ -1003,7 +1003,7 @@ func (h *Handler) PatchOpenAICompat(c *gin.Context) {
 	normalizeOpenAICompatibilityEntry(&entry)
 	candidate.OpenAICompatibility[targetIndex] = entry
 	candidate.SanitizeOpenAICompatibility()
-	h.persistProviderConfigLocked(c, candidate)
+	persistProviderListLocked(h, c, candidate, &h.cfg.OpenAICompatibility, candidate.OpenAICompatibility)
 }
 
 func (h *Handler) DeleteOpenAICompat(c *gin.Context) {
@@ -1019,7 +1019,7 @@ func (h *Handler) DeleteOpenAICompat(c *gin.Context) {
 		}
 		candidate.OpenAICompatibility = out
 		candidate.SanitizeOpenAICompatibility()
-		h.persistProviderConfigLocked(c, candidate)
+		persistProviderListLocked(h, c, candidate, &h.cfg.OpenAICompatibility, candidate.OpenAICompatibility)
 		return
 	}
 	if idxStr := c.Query("index"); idxStr != "" {
@@ -1028,7 +1028,7 @@ func (h *Handler) DeleteOpenAICompat(c *gin.Context) {
 		if err == nil && idx >= 0 && idx < len(candidate.OpenAICompatibility) {
 			candidate.OpenAICompatibility = append(candidate.OpenAICompatibility[:idx], candidate.OpenAICompatibility[idx+1:]...)
 			candidate.SanitizeOpenAICompatibility()
-			h.persistProviderConfigLocked(c, candidate)
+			persistProviderListLocked(h, c, candidate, &h.cfg.OpenAICompatibility, candidate.OpenAICompatibility)
 			return
 		}
 	}
@@ -1071,7 +1071,7 @@ func (h *Handler) PutVertexCompatKeys(c *gin.Context) {
 	candidate := h.cfg.CloneForRuntime()
 	candidate.VertexCompatAPIKey = append([]config.VertexCompatKey(nil), arr...)
 	candidate.SanitizeVertexCompatKeys()
-	h.persistProviderConfigLocked(c, candidate)
+	persistProviderListLocked(h, c, candidate, &h.cfg.VertexCompatAPIKey, candidate.VertexCompatAPIKey)
 }
 func (h *Handler) PatchVertexCompatKey(c *gin.Context) {
 	type vertexCompatPatch struct {
@@ -1126,7 +1126,7 @@ func (h *Handler) PatchVertexCompatKey(c *gin.Context) {
 		if trimmed == "" {
 			candidate.VertexCompatAPIKey = append(candidate.VertexCompatAPIKey[:targetIndex], candidate.VertexCompatAPIKey[targetIndex+1:]...)
 			candidate.SanitizeVertexCompatKeys()
-			h.persistProviderConfigLocked(c, candidate)
+			persistProviderListLocked(h, c, candidate, &h.cfg.VertexCompatAPIKey, candidate.VertexCompatAPIKey)
 			return
 		}
 		entry.APIKey = trimmed
@@ -1169,7 +1169,7 @@ func (h *Handler) PatchVertexCompatKey(c *gin.Context) {
 	normalizeVertexCompatKey(&entry)
 	candidate.VertexCompatAPIKey[targetIndex] = entry
 	candidate.SanitizeVertexCompatKeys()
-	h.persistProviderConfigLocked(c, candidate)
+	persistProviderListLocked(h, c, candidate, &h.cfg.VertexCompatAPIKey, candidate.VertexCompatAPIKey)
 }
 
 func (h *Handler) DeleteVertexCompatKey(c *gin.Context) {
@@ -1188,7 +1188,7 @@ func (h *Handler) DeleteVertexCompatKey(c *gin.Context) {
 			}
 			candidate.VertexCompatAPIKey = out
 			candidate.SanitizeVertexCompatKeys()
-			h.persistProviderConfigLocked(c, candidate)
+			persistProviderListLocked(h, c, candidate, &h.cfg.VertexCompatAPIKey, candidate.VertexCompatAPIKey)
 			return
 		}
 
@@ -1210,7 +1210,7 @@ func (h *Handler) DeleteVertexCompatKey(c *gin.Context) {
 			candidate.VertexCompatAPIKey = append(candidate.VertexCompatAPIKey[:matchIndex], candidate.VertexCompatAPIKey[matchIndex+1:]...)
 		}
 		candidate.SanitizeVertexCompatKeys()
-		h.persistProviderConfigLocked(c, candidate)
+		persistProviderListLocked(h, c, candidate, &h.cfg.VertexCompatAPIKey, candidate.VertexCompatAPIKey)
 		return
 	}
 	if idxStr := c.Query("index"); idxStr != "" {
@@ -1219,7 +1219,7 @@ func (h *Handler) DeleteVertexCompatKey(c *gin.Context) {
 		if errScan == nil && idx >= 0 && idx < len(candidate.VertexCompatAPIKey) {
 			candidate.VertexCompatAPIKey = append(candidate.VertexCompatAPIKey[:idx], candidate.VertexCompatAPIKey[idx+1:]...)
 			candidate.SanitizeVertexCompatKeys()
-			h.persistProviderConfigLocked(c, candidate)
+			persistProviderListLocked(h, c, candidate, &h.cfg.VertexCompatAPIKey, candidate.VertexCompatAPIKey)
 			return
 		}
 	}
@@ -1763,7 +1763,7 @@ func (h *Handler) PutXAIKeys(c *gin.Context) {
 	candidate := h.cfg.CloneForRuntime()
 	candidate.XAIKey = filtered
 	candidate.SanitizeXAIKeys()
-	h.persistProviderConfigLocked(c, candidate)
+	persistProviderListLocked(h, c, candidate, &h.cfg.XAIKey, candidate.XAIKey)
 }
 
 func (h *Handler) PatchXAIKey(c *gin.Context) {
@@ -1836,7 +1836,7 @@ func (h *Handler) PatchXAIKey(c *gin.Context) {
 		if trimmed == "" {
 			candidate.XAIKey = append(candidate.XAIKey[:targetIndex], candidate.XAIKey[targetIndex+1:]...)
 			candidate.SanitizeXAIKeys()
-			h.persistProviderConfigLocked(c, candidate)
+			persistProviderListLocked(h, c, candidate, &h.cfg.XAIKey, candidate.XAIKey)
 			return
 		}
 		entry.BaseURL = trimmed
@@ -1868,7 +1868,7 @@ func (h *Handler) PatchXAIKey(c *gin.Context) {
 	normalizeCodexKey(&entry)
 	candidate.XAIKey[targetIndex] = entry
 	candidate.SanitizeXAIKeys()
-	h.persistProviderConfigLocked(c, candidate)
+	persistProviderListLocked(h, c, candidate, &h.cfg.XAIKey, candidate.XAIKey)
 }
 
 func (h *Handler) DeleteXAIKey(c *gin.Context) {
@@ -1887,7 +1887,7 @@ func (h *Handler) DeleteXAIKey(c *gin.Context) {
 			}
 			candidate.XAIKey = out
 			candidate.SanitizeXAIKeys()
-			h.persistProviderConfigLocked(c, candidate)
+			persistProviderListLocked(h, c, candidate, &h.cfg.XAIKey, candidate.XAIKey)
 			return
 		}
 
@@ -1909,7 +1909,7 @@ func (h *Handler) DeleteXAIKey(c *gin.Context) {
 			candidate.XAIKey = append(candidate.XAIKey[:matchIndex], candidate.XAIKey[matchIndex+1:]...)
 		}
 		candidate.SanitizeXAIKeys()
-		h.persistProviderConfigLocked(c, candidate)
+		persistProviderListLocked(h, c, candidate, &h.cfg.XAIKey, candidate.XAIKey)
 		return
 	}
 	if idxStr := c.Query("index"); idxStr != "" {
@@ -1918,7 +1918,7 @@ func (h *Handler) DeleteXAIKey(c *gin.Context) {
 		if errScan == nil && idx >= 0 && idx < len(candidate.XAIKey) {
 			candidate.XAIKey = append(candidate.XAIKey[:idx], candidate.XAIKey[idx+1:]...)
 			candidate.SanitizeXAIKeys()
-			h.persistProviderConfigLocked(c, candidate)
+			persistProviderListLocked(h, c, candidate, &h.cfg.XAIKey, candidate.XAIKey)
 			return
 		}
 	}
@@ -1964,7 +1964,7 @@ func (h *Handler) PutMetaKeys(c *gin.Context) {
 	candidate := h.cfg.CloneForRuntime()
 	candidate.MetaKey = filtered
 	candidate.SanitizeMetaKeys()
-	h.persistProviderConfigLocked(c, candidate)
+	persistProviderListLocked(h, c, candidate, &h.cfg.MetaKey, candidate.MetaKey)
 }
 
 func (h *Handler) PatchMetaKey(c *gin.Context) {
@@ -2062,7 +2062,7 @@ func (h *Handler) PatchMetaKey(c *gin.Context) {
 	normalizeCodexKey(&entry)
 	candidate.MetaKey[targetIndex] = entry
 	candidate.SanitizeMetaKeys()
-	h.persistProviderConfigLocked(c, candidate)
+	persistProviderListLocked(h, c, candidate, &h.cfg.MetaKey, candidate.MetaKey)
 }
 
 func (h *Handler) DeleteMetaKey(c *gin.Context) {
@@ -2081,7 +2081,7 @@ func (h *Handler) DeleteMetaKey(c *gin.Context) {
 			}
 			candidate.MetaKey = out
 			candidate.SanitizeMetaKeys()
-			h.persistProviderConfigLocked(c, candidate)
+			persistProviderListLocked(h, c, candidate, &h.cfg.MetaKey, candidate.MetaKey)
 			return
 		}
 
@@ -2103,7 +2103,7 @@ func (h *Handler) DeleteMetaKey(c *gin.Context) {
 			candidate.MetaKey = append(candidate.MetaKey[:matchIndex], candidate.MetaKey[matchIndex+1:]...)
 		}
 		candidate.SanitizeMetaKeys()
-		h.persistProviderConfigLocked(c, candidate)
+		persistProviderListLocked(h, c, candidate, &h.cfg.MetaKey, candidate.MetaKey)
 		return
 	}
 	if idxStr := c.Query("index"); idxStr != "" {
@@ -2112,7 +2112,7 @@ func (h *Handler) DeleteMetaKey(c *gin.Context) {
 		if errScan == nil && idx >= 0 && idx < len(candidate.MetaKey) {
 			candidate.MetaKey = append(candidate.MetaKey[:idx], candidate.MetaKey[idx+1:]...)
 			candidate.SanitizeMetaKeys()
-			h.persistProviderConfigLocked(c, candidate)
+			persistProviderListLocked(h, c, candidate, &h.cfg.MetaKey, candidate.MetaKey)
 			return
 		}
 	}

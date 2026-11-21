@@ -35,8 +35,8 @@ jobs:
         env:
           GIN_MODE: release
         run: >-
-          go test -mod=readonly -race -count=1 ./internal/api
-          -run '^TestRegisteredProviderListsCommitBeforeVisibility$'
+          go test -mod=readonly -race -count=1 ./internal/api ./internal/api/handlers/management
+          -run '^(TestRegisteredProviderListsCommitBeforeVisibility|TestProviderReviewConcurrentScalarReader|TestProviderReviewReloadReceivesCommittedConfigWithoutHoldingHandlerLock)$'
       - name: Verify plugin configuration saves
         env:
           GIN_MODE: release

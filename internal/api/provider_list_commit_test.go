@@ -39,12 +39,12 @@ func TestRegisteredProviderListsCommitBeforeVisibility(t *testing.T) {
 					s.registerManagementRoutes()
 					return s
 				}
-				send := func(server *Server, verb, query string, body any) (*httptest.ResponseRecorder, error) {
+				send := func(server *Server, verb, endpoint string, body any) (*httptest.ResponseRecorder, error) {
 					raw, err := json.Marshal(body)
 					if err != nil {
 						return nil, err
 					}
-					req := httptest.NewRequest(verb, "/v0/management/"+provider+query, bytes.NewReader(raw))
+					req := httptest.NewRequest(verb, "/v0/management/"+endpoint, bytes.NewReader(raw))
 					req.RemoteAddr = "127.0.0.1:10000"
 					req.Header.Set("X-Management-Key", admin)
 					req.Header.Set("Content-Type", "application/json")
@@ -54,7 +54,7 @@ func TestRegisteredProviderListsCommitBeforeVisibility(t *testing.T) {
 				}
 				call := func(server *Server, verb, query string, body any, status int) []byte {
 					t.Helper()
-					rec, err := send(server, verb, query, body)
+					rec, err := send(server, verb, provider+query, body)
 					if err != nil {
 						t.Fatal(err)
 					}
@@ -63,28 +63,50 @@ func TestRegisteredProviderListsCommitBeforeVisibility(t *testing.T) {
 					}
 					return rec.Body.Bytes()
 				}
+				const a = "https://first.example.invalid/v1"
+				const b = "https://sentinel.example.invalid/v1"
+				const next = "https://updated.example.invalid/v1"
+				const right = "https://parallel-second.example.invalid/v1"
+				type fixtureKey struct {
+					APIKey string `json:"api-key"`
+				}
 				urls := func(server *Server) []string {
 					t.Helper()
 					var out map[string][]struct {
-						BaseURL string `json:"base-url"`
+						Name          string       `json:"name"`
+						APIKey        string       `json:"api-key"`
+						APIKeyEntries []fixtureKey `json:"api-key-entries"`
+						BaseURL       string       `json:"base-url"`
 					}
 					if err := json.Unmarshal(call(server, "GET", "", nil, 200), &out); err != nil {
 						t.Fatal(err)
 					}
 					var got []string
 					for _, v := range out[provider] {
+						id := "first"
+						if v.BaseURL == b || v.BaseURL == right {
+							id = "sentinel"
+						}
+						wantKey := "synthetic-" + id
+						if provider == "openai-compatibility" {
+							if v.Name != id || len(v.APIKeyEntries) != 1 || v.APIKeyEntries[0].APIKey != wantKey {
+								t.Fatal("unexpected compatibility provider or nested key for target")
+							}
+						} else if v.APIKey != wantKey {
+							t.Fatal("unexpected credential for target")
+						}
 						got = append(got, v.BaseURL)
 					}
 					return got
 				}
-				const a = "https://first.example.invalid/v1"
-				const b = "https://sentinel.example.invalid/v1"
-				const next = "https://updated.example.invalid/v1"
-				row := func(id, url string) map[string]string {
-					return map[string]string{"name": id, "api-key": "synthetic-" + id, "base-url": url}
+				row := func(id, url string) map[string]any {
+					if provider == "openai-compatibility" {
+						return map[string]any{"name": id, "base-url": url, "api-key-entries": []fixtureKey{{APIKey: "synthetic-" + id}}}
+					}
+					return map[string]any{"api-key": "synthetic-" + id, "base-url": url}
 				}
 				server := open()
-				initial := []map[string]string{row("first", a), row("sentinel", b)}
+				initial := []map[string]any{row("first", a), row("sentinel", b)}
 				call(server, "PUT", "", initial, 200)
 				if got := urls(server); !slices.Equal(got, []string{a, b}) {
 					t.Fatalf("initial read returned %d entries with unexpected targets", len(got))
@@ -94,7 +116,7 @@ func TestRegisteredProviderListsCommitBeforeVisibility(t *testing.T) {
 				expected := []string{next, b}
 				switch method {
 				case "PUT":
-					body = []map[string]string{row("first", next), row("sentinel", b)}
+					body = []map[string]any{row("first", next), row("sentinel", b)}
 				case "PATCH":
 					body = map[string]any{"index": 0, "value": map[string]string{"base-url": next}}
 				case "DELETE":
@@ -141,11 +163,11 @@ func TestRegisteredProviderListsCommitBeforeVisibility(t *testing.T) {
 				}
 				if provider == "gemini-api-key" && method == http.MethodPatch {
 					const left = "https://parallel-first.example.invalid/v1"
-					const right = "https://parallel-second.example.invalid/v1"
 					var writers sync.WaitGroup
+
 					for index, target := range []string{left, right} {
 						writers.Go(func() {
-							rec, err := send(server, http.MethodPatch, "", map[string]any{
+							rec, err := send(server, http.MethodPatch, provider, map[string]any{
 								"index": index, "value": map[string]string{"base-url": target},
 							})
 							if err != nil {

@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"fmt"
+	"maps"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -515,14 +516,19 @@ func (h *Handler) persistLocked(c *gin.Context) bool {
 	return true
 }
 
-// persistProviderConfigLocked commits a private copy before replacing the
-// handler's published configuration. Callers must hold h.mu.
-func (h *Handler) persistProviderConfigLocked(c *gin.Context, candidate *config.Config) {
-	if err := config.SaveConfigPreserveComments(h.configFilePath, candidate, c.GetBool(ConfigV8ContextKey)); err != nil {
+// persistProviderListLocked publishes only the selected list and save metadata.
+// Keep the config pointer stable for scalar readers. The caller holds h.mu.
+func persistProviderListLocked[T any](h *Handler, c *gin.Context, candidate *config.Config, live *[]T, staged []T) {
+	sourceHash, err := config.SaveConfigPreserveCommentsWithSourceHash(h.configFilePath, candidate, c.GetBool(ConfigV8ContextKey))
+	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save config"})
 		return
 	}
-	h.cfg = candidate
+	*live = staged
+	h.cfg.SourceHash = sourceHash
+	if !maps.Equal(h.cfg.OAuthOnlyFields, candidate.OAuthOnlyFields) {
+		h.cfg.OAuthOnlyFields = candidate.OAuthOnlyFields
+	}
 	h.finishConfigSaveLocked(c)
 }
 
