@@ -443,6 +443,9 @@ func (f *lockedConfigFile) replace(data []byte) (*ConfigFileSnapshot, error) {
 	if errValidate := ValidateConfigSave(current, data); errValidate != nil {
 		return nil, errValidate
 	}
+	if errIntegrity := checkConfigWriteIntegrity(f.file); errIntegrity != nil {
+		return nil, errIntegrity
+	}
 	if committed, errDirectory := f.replaceDirectoryFile(data); committed != nil || errDirectory != nil {
 		return committed, errDirectory
 	}

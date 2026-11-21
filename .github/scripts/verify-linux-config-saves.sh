@@ -48,6 +48,7 @@ tests=(
   TestConfigSaveCASInodeFailure
   TestConfigSaveCASDirectorySyncFailure
   TestConfigSaveCASPreservesExternalMarker
+  TestConfigIntegrityAttributePolicy
   TestReconcileConfigSavePreservesNamedReaderAndDeniesOwningGroup
   TestReconcileConfigSaveDoesNotInheritNewAccessACL
   TestConfigReplacementPreservesMountSemantics

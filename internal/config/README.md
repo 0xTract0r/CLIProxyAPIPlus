@@ -128,3 +128,5 @@ directory owned by the process account, with no group or other write bits.
 Rooted uploads, symlink paths, hard links, visible file attributes, single-file
 mounts and directories that cannot be written retain the existing inode.
 A failure while preparing a replacement is returned without committing it.
+
+Linux saves reject changes to files carrying visible capability or integrity attributes (`security.capability`, `security.ima`, or `security.evm`). An in-place write could clear those attributes.

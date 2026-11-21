@@ -162,6 +162,40 @@ func (f *lockedConfigFile) replaceDirectoryFile(data []byte) (*ConfigFileSnapsho
 	return &ConfigFileSnapshot{info: next, data: bytes.Clone(data)}, nil
 }
 
+// Linux can invalidate security metadata on a content change even when the
+// original inode is retained. Check the locked descriptor before either save.
+func checkConfigWriteIntegrity(file *os.File) error {
+	fd := int(file.Fd())
+	return checkConfigIntegrityAttributes(func(names []byte) (int, error) {
+		return unix.Flistxattr(fd, names)
+	})
+}
+
+func checkConfigIntegrityAttributes(list func([]byte) (int, error)) error {
+	size, err := list(nil)
+	if errors.Is(err, unix.EOPNOTSUPP) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspect configuration integrity attributes: %w", err)
+	}
+	if size == 0 {
+		return nil
+	}
+	names := make([]byte, size)
+	n, err := list(names)
+	if err != nil {
+		return fmt.Errorf("read configuration integrity attributes: %w", err)
+	}
+	for _, name := range bytes.Split(names[:n], []byte{0}) {
+		switch string(name) {
+		case "security.capability", "security.ima", "security.evm":
+			return fmt.Errorf("cannot safely preserve configuration integrity attribute %s", name)
+		}
+	}
+	return nil
+}
+
 func configDirectoryHasXattrs(file *os.File) (bool, error) {
 	size, err := unix.Flistxattr(int(file.Fd()), nil)
 	if errors.Is(err, unix.EOPNOTSUPP) {
