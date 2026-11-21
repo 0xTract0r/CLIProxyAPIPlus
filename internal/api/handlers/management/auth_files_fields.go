@@ -116,7 +116,7 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 			return
 		}
 		h.reloadConfigAfterManagementSave(ctx, cfgSnapshot)
-		if store := h.tokenStoreWithBaseDir(); store != nil {
+		if store := h.tokenStoreForConfig(cfgSnapshot.cfg); store != nil {
 			_ = store.Delete(ctx, targetAuth.ID)
 		}
 		c.JSON(http.StatusOK, gin.H{

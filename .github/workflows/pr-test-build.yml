@@ -35,8 +35,8 @@ jobs:
         env:
           GIN_MODE: release
         run: >-
-          go test -mod=readonly -race -count=1 ./internal/api ./sdk/auth ./sdk/cliproxy
-          -run '^(TestOrdinaryVertexImportDefaultStoreIsolation|TestOrdinaryFileStoreViewsShareRootWriteLock|TestIndependentManagerSaveDirectoryIsPerCall|TestOrdinaryManagerLoginPreservesDefaultFileDirectory|TestOrdinaryBuilderLocalStoreDirectoryIsolation)$'
+          go test -mod=readonly -race -count=1 ./internal/api ./internal/api/handlers/management ./sdk/auth ./sdk/cliproxy
+          -run '^(TestOrdinaryConfigToggleCleanupUsesCommittedDirectory|TestOrdinaryVertexImportDefaultStoreIsolation|TestOrdinaryFileStoreViewsShareRootWriteLock|TestIndependentManagerSaveDirectoryIsPerCall|TestOrdinaryManagerLoginPreservesDefaultFileDirectory|TestOrdinaryBuilderLocalStoreDirectoryIsolation)$'
       - name: Verify provider lists commit before publication
         env:
           GIN_MODE: release
