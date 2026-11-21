@@ -33,6 +33,12 @@ jobs:
         run: >-
           go test -mod=readonly -race -count=1 ./internal/config
           -run '^(TestSaveConfigPreservesBytesOnFileSizeLimit|TestConfigInodeRecoveryAfterPartialWrite|TestConfigReplacementDoesNotFallbackOnPermissionFailure|TestConfigInodeRecoverySerializesCommit|TestConfigHardLinksShareSuccessfulSaves|TestConfigCommittedOnDirectorySyncWarning|TestConfigSavePreservesNamedReaderAndDeniesOwningGroup|TestConfigSaveDoesNotInheritNewAccessACL|TestConfigSaveXattrsPreservesExistingLabel)$'
+      - name: Verify plugin configuration saves
+        env:
+          GIN_MODE: release
+        run: >-
+          go test -mod=readonly -race -count=1 ./internal/api ./internal/api/handlers/management
+          -run '^(TestPluginConfigWritePreservesLastSavedValue|TestPluginConfigWritesRejectUnavailableConfig|TestPatchPluginEnabled(UpdatesOnlyPluginConfig|ReloadSnapshotRawImmutability)|TestPutPluginConfigReplacesPluginConfig|TestPatchPluginConfigMergesAndDeletesFields|TestConfigReloadGenerationSkipsOlderSnapshot|TestPluginDeleteLocalRecovery|TestDeletePlugin(RejectsUnresolvedPluginsDir|ReturnsNotFoundForUnknownPlugin|UsesConfiguredStoreVersionWhenFilesCoexist|RemovesDiscoveredFileAndConfig))$'
       - name: Build
         run: |
           go build -o test-output ./cmd/server
