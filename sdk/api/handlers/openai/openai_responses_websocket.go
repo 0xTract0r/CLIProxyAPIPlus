@@ -53,7 +53,9 @@ func init() {
 	responsesWebsocketCompressionEnabled.Store(true)
 }
 
-// SetResponsesWebsocketCompressionEnabled controls compression for future upgrades.
+// SetResponsesWebsocketCompressionEnabled sets the default for future upgrades
+// handled directly by ResponsesWebsocket. Servers with an explicit configuration
+// use ResponsesWebsocketWithCompression instead.
 func SetResponsesWebsocketCompressionEnabled(enabled bool) {
 	responsesWebsocketCompressionEnabled.Store(enabled)
 }
@@ -454,8 +456,13 @@ func (h *OpenAIResponsesAPIHandler) authenticateResponsesWebsocketTurn(c *gin.Co
 // response events back as JSON websocket text messages. `response.interrupt`
 // is forwarded to the current Codex upstream socket without starting a new turn.
 func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
+	h.ResponsesWebsocketWithCompression(c, responsesWebsocketCompressionEnabled.Load())
+}
+
+// ResponsesWebsocketWithCompression selects compression for this new connection.
+func (h *OpenAIResponsesAPIHandler) ResponsesWebsocketWithCompression(c *gin.Context, enabled bool) {
 	upgrader := responsesWebsocketUpgrader
-	upgrader.EnableCompression = responsesWebsocketCompressionEnabled.Load()
+	upgrader.EnableCompression = enabled
 	conn, err := upgrader.Upgrade(c.Writer, c.Request, websocketUpgradeHeaders(c.Request))
 	if err != nil {
 		return
