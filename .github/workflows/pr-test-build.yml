@@ -29,14 +29,8 @@ jobs:
         run: >-
           go test -mod=readonly -race -count=1 ./internal/api/handlers/management
           -run '^(TestHandlerSnapshotOwnsConfigAndPluginYAML|TestHandlerSnapshotGetConfigDuringSetConfig|TestHandlerSnapshotCatalogDuringPluginHostSwap|TestAPIKeyListConcurrentPersistence)$'
-      - name: Validate Linux configuration write recovery
-        run: >-
-          go test -mod=readonly -race -count=1 ./internal/config
-          -run '^(TestSaveConfigPreservesBytesOnFileSizeLimit|TestConfigInodeRecoveryAfterPartialWrite|TestConfigReplacementDoesNotFallbackOnPermissionFailure|TestConfigInodeRecoverySerializesCommit|TestConfigHardLinksShareSuccessfulSaves|TestConfigCommittedOnDirectorySyncWarning|TestConfigSavePreservesNamedReaderAndDeniesOwningGroup|TestConfigSaveDoesNotInheritNewAccessACL|TestConfigSaveXattrsPreservesExistingLabel)$'
-      - name: Verify concurrent directory saves and file permissions
-        run: >-
-          go test -mod=readonly -race -count=1 ./internal/config
-          -run '^(TestDirectorySaveLinux(Handoff|NonreplaceableFile|VersionedSnapshot|DefaultACL|UnopenableParent|ReadOnlyPreservesSnapshot)|TestConfigSaveCASInodeFailure|TestConfigSaveCASDirectorySyncFailure|TestConfigSaveCASPreservesExternalMarker|TestReconcileConfigSave(PreservesNamedReaderAndDeniesOwningGroup|DoesNotInheritNewAccessACL))$'
+      - name: Validate Linux configuration saves, recovery and permissions
+        run: bash .github/scripts/verify-linux-config-saves.sh
       - name: Verify plugin configuration saves
         env:
           GIN_MODE: release

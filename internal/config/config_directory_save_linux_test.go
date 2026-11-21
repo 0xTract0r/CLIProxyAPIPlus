@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -399,5 +400,69 @@ func TestDirectorySaveLinuxReadOnlyPreservesSnapshot(t *testing.T) {
 	after, err := ReadConfigFileSnapshot(path)
 	if err != nil || !os.SameFile(before.info, after.info) || after.info.Mode().Perm() != 0400 || !bytes.Equal(raw, after.data) {
 		t.Fatalf("readonly CAS changed inode, mode or data: %v", err)
+	}
+}
+
+// Test each commit against the immediately previous snapshot, including after a
+// shrinking save. The mounted fixture is supplied by the Linux integration run.
+func TestConfigReplacementPreservesMountSemantics(t *testing.T) {
+	t.Setenv(linuxDirectorySaveEnv, "1")
+	t.Run("directory", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		if err := os.WriteFile(path, []byte("port: 18317\n# initial comment\n"), 0640); err != nil {
+			t.Fatal(err)
+		}
+		testTwoConfigSaves(t, path, false)
+	})
+	t.Run("single file bind", func(t *testing.T) {
+		path := os.Getenv("CONFIG_TWO_SAVES_BIND_FIXTURE")
+		if path == "" {
+			t.Skip("requires the isolated Linux single-file bind fixture")
+		}
+		file, err := os.Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer file.Close()
+		parent, err := os.Open(filepath.Dir(path))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer parent.Close()
+		if sameConfigMount(file, parent) {
+			t.Fatal("fixture is not a single-file bind")
+		}
+		testTwoConfigSaves(t, path, true)
+	})
+}
+
+func testTwoConfigSaves(t *testing.T, path string, preserveInode bool) {
+	t.Helper()
+	before, err := ReadConfigFileSnapshot(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := before.info.Sys().(*syscall.Stat_t)
+	for step, replacement := range [][]byte{[]byte("port: 9001\n"), []byte("port: 9002\n# growth from prior\n")} {
+		if (step == 0 && len(replacement) >= len(before.data)) ||
+			(step == 1 && len(replacement) <= len(before.data)) {
+			t.Fatal("fixture must exercise truncation followed by growth")
+		}
+		committed, err := WriteConfigFileCAS(path, before, replacement)
+		if err != nil {
+			t.Fatal(err)
+		}
+		after, err := ReadConfigFileSnapshot(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		metadata := after.info.Sys().(*syscall.Stat_t)
+		if os.SameFile(before.info, after.info) != preserveInode ||
+			!os.SameFile(committed.info, after.info) ||
+			metadata.Uid != original.Uid || metadata.Gid != original.Gid ||
+			metadata.Mode != original.Mode || !bytes.Equal(after.data, replacement) {
+			t.Fatalf("commit changed expected inode policy, metadata or contents: %q", replacement)
+		}
+		before = after
 	}
 }
