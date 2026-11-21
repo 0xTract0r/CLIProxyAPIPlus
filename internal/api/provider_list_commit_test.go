@@ -184,6 +184,9 @@ func TestRegisteredProviderListsCommitBeforeVisibility(t *testing.T) {
 						}
 					}
 				}
+				server.mgmt.SetConfig(nil)
+				call(server, method, query, body, http.StatusServiceUnavailable)
+
 			})
 		}
 	}

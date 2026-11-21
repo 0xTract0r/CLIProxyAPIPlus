@@ -3,6 +3,7 @@ package management
 import (
 	"bytes"
 	"fmt"
+	"net/http"
 	"slices"
 	"strings"
 
@@ -162,6 +163,15 @@ func (h *Handler) DeleteAPIKeys(c *gin.Context) {
 	h.deleteFromStringList(c, func() *[]string { return &h.cfg.APIKeys })
 }
 
+// providerConfigDraftLocked requires h.mu and responds if no config is loaded.
+func (h *Handler) providerConfigDraftLocked(c *gin.Context) *config.Config {
+	if h.cfg == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "config unavailable"})
+		return nil
+	}
+	return h.cfg.CloneForRuntime()
+}
+
 // gemini-api-key: []GeminiKey
 func (h *Handler) GetGeminiKeys(c *gin.Context) {
 	c.JSON(200, gin.H{"gemini-api-key": h.geminiKeysWithAuthIndex()})
@@ -190,7 +200,10 @@ func (h *Handler) PutGeminiKeys(c *gin.Context) {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	candidate := h.cfg.CloneForRuntime()
+	candidate := h.providerConfigDraftLocked(c)
+	if candidate == nil {
+		return
+	}
 	candidate.GeminiKey = append([]config.GeminiKey(nil), arr...)
 	candidate.SanitizeGeminiKeys()
 	persistProviderListLocked(h, c, candidate, &h.cfg.GeminiKey, candidate.GeminiKey)
@@ -221,7 +234,10 @@ func (h *Handler) PatchGeminiKey(c *gin.Context) {
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	candidate := h.cfg.CloneForRuntime()
+	candidate := h.providerConfigDraftLocked(c)
+	if candidate == nil {
+		return
+	}
 	targetIndex := -1
 	if body.Index != nil && *body.Index >= 0 && *body.Index < len(candidate.GeminiKey) {
 		targetIndex = *body.Index
@@ -308,7 +324,10 @@ func (h *Handler) PatchGeminiKey(c *gin.Context) {
 func (h *Handler) DeleteGeminiKey(c *gin.Context) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	candidate := h.cfg.CloneForRuntime()
+	candidate := h.providerConfigDraftLocked(c)
+	if candidate == nil {
+		return
+	}
 	if val := strings.TrimSpace(c.Query("api-key")); val != "" {
 		if baseRaw, okBase := c.GetQuery("base-url"); okBase {
 			base := strings.TrimSpace(baseRaw)
@@ -399,7 +418,10 @@ func (h *Handler) PutInteractionsKeys(c *gin.Context) {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	candidate := h.cfg.CloneForRuntime()
+	candidate := h.providerConfigDraftLocked(c)
+	if candidate == nil {
+		return
+	}
 	candidate.InteractionsKey = append([]config.GeminiKey(nil), arr...)
 	candidate.SanitizeInteractionsKeys()
 	persistProviderListLocked(h, c, candidate, &h.cfg.InteractionsKey, candidate.InteractionsKey)
@@ -431,7 +453,10 @@ func (h *Handler) PatchInteractionsKey(c *gin.Context) {
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	candidate := h.cfg.CloneForRuntime()
+	candidate := h.providerConfigDraftLocked(c)
+	if candidate == nil {
+		return
+	}
 	targetIndex := -1
 	if body.Index != nil && *body.Index >= 0 && *body.Index < len(candidate.InteractionsKey) {
 		targetIndex = *body.Index
@@ -518,7 +543,10 @@ func (h *Handler) PatchInteractionsKey(c *gin.Context) {
 func (h *Handler) DeleteInteractionsKey(c *gin.Context) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	candidate := h.cfg.CloneForRuntime()
+	candidate := h.providerConfigDraftLocked(c)
+	if candidate == nil {
+		return
+	}
 	if val := strings.TrimSpace(c.Query("api-key")); val != "" {
 		if baseRaw, okBase := c.GetQuery("base-url"); okBase {
 			base := strings.TrimSpace(baseRaw)
@@ -899,7 +927,10 @@ func (h *Handler) PutOpenAICompat(c *gin.Context) {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	candidate := h.cfg.CloneForRuntime()
+	candidate := h.providerConfigDraftLocked(c)
+	if candidate == nil {
+		return
+	}
 	candidate.OpenAICompatibility = filtered
 	candidate.SanitizeOpenAICompatibility()
 	persistProviderListLocked(h, c, candidate, &h.cfg.OpenAICompatibility, candidate.OpenAICompatibility)
@@ -931,7 +962,10 @@ func (h *Handler) PatchOpenAICompat(c *gin.Context) {
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	candidate := h.cfg.CloneForRuntime()
+	candidate := h.providerConfigDraftLocked(c)
+	if candidate == nil {
+		return
+	}
 	targetIndex := -1
 	if body.Index != nil && *body.Index >= 0 && *body.Index < len(candidate.OpenAICompatibility) {
 		targetIndex = *body.Index
@@ -1009,7 +1043,10 @@ func (h *Handler) PatchOpenAICompat(c *gin.Context) {
 func (h *Handler) DeleteOpenAICompat(c *gin.Context) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	candidate := h.cfg.CloneForRuntime()
+	candidate := h.providerConfigDraftLocked(c)
+	if candidate == nil {
+		return
+	}
 	if name := c.Query("name"); name != "" {
 		out := make([]config.OpenAICompatibility, 0, len(candidate.OpenAICompatibility))
 		for _, v := range candidate.OpenAICompatibility {
@@ -1068,7 +1105,10 @@ func (h *Handler) PutVertexCompatKeys(c *gin.Context) {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	candidate := h.cfg.CloneForRuntime()
+	candidate := h.providerConfigDraftLocked(c)
+	if candidate == nil {
+		return
+	}
 	candidate.VertexCompatAPIKey = append([]config.VertexCompatKey(nil), arr...)
 	candidate.SanitizeVertexCompatKeys()
 	persistProviderListLocked(h, c, candidate, &h.cfg.VertexCompatAPIKey, candidate.VertexCompatAPIKey)
@@ -1099,7 +1139,10 @@ func (h *Handler) PatchVertexCompatKey(c *gin.Context) {
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	candidate := h.cfg.CloneForRuntime()
+	candidate := h.providerConfigDraftLocked(c)
+	if candidate == nil {
+		return
+	}
 	targetIndex := -1
 	if body.Index != nil && *body.Index >= 0 && *body.Index < len(candidate.VertexCompatAPIKey) {
 		targetIndex = *body.Index
@@ -1175,7 +1218,10 @@ func (h *Handler) PatchVertexCompatKey(c *gin.Context) {
 func (h *Handler) DeleteVertexCompatKey(c *gin.Context) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	candidate := h.cfg.CloneForRuntime()
+	candidate := h.providerConfigDraftLocked(c)
+	if candidate == nil {
+		return
+	}
 	if val := strings.TrimSpace(c.Query("api-key")); val != "" {
 		if baseRaw, okBase := c.GetQuery("base-url"); okBase {
 			base := strings.TrimSpace(baseRaw)
@@ -1760,7 +1806,10 @@ func (h *Handler) PutXAIKeys(c *gin.Context) {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	candidate := h.cfg.CloneForRuntime()
+	candidate := h.providerConfigDraftLocked(c)
+	if candidate == nil {
+		return
+	}
 	candidate.XAIKey = filtered
 	candidate.SanitizeXAIKeys()
 	persistProviderListLocked(h, c, candidate, &h.cfg.XAIKey, candidate.XAIKey)
@@ -1794,7 +1843,10 @@ func (h *Handler) PatchXAIKey(c *gin.Context) {
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	candidate := h.cfg.CloneForRuntime()
+	candidate := h.providerConfigDraftLocked(c)
+	if candidate == nil {
+		return
+	}
 	targetIndex := -1
 	if body.Index != nil && *body.Index >= 0 && *body.Index < len(candidate.XAIKey) {
 		targetIndex = *body.Index
@@ -1874,7 +1926,10 @@ func (h *Handler) PatchXAIKey(c *gin.Context) {
 func (h *Handler) DeleteXAIKey(c *gin.Context) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	candidate := h.cfg.CloneForRuntime()
+	candidate := h.providerConfigDraftLocked(c)
+	if candidate == nil {
+		return
+	}
 	if val := strings.TrimSpace(c.Query("api-key")); val != "" {
 		if baseRaw, okBase := c.GetQuery("base-url"); okBase {
 			base := strings.TrimSpace(baseRaw)
@@ -1961,7 +2016,10 @@ func (h *Handler) PutMetaKeys(c *gin.Context) {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	candidate := h.cfg.CloneForRuntime()
+	candidate := h.providerConfigDraftLocked(c)
+	if candidate == nil {
+		return
+	}
 	candidate.MetaKey = filtered
 	candidate.SanitizeMetaKeys()
 	persistProviderListLocked(h, c, candidate, &h.cfg.MetaKey, candidate.MetaKey)
@@ -1994,7 +2052,10 @@ func (h *Handler) PatchMetaKey(c *gin.Context) {
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	candidate := h.cfg.CloneForRuntime()
+	candidate := h.providerConfigDraftLocked(c)
+	if candidate == nil {
+		return
+	}
 	targetIndex := -1
 	if body.Index != nil && *body.Index >= 0 && *body.Index < len(candidate.MetaKey) {
 		targetIndex = *body.Index
@@ -2068,7 +2129,10 @@ func (h *Handler) PatchMetaKey(c *gin.Context) {
 func (h *Handler) DeleteMetaKey(c *gin.Context) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	candidate := h.cfg.CloneForRuntime()
+	candidate := h.providerConfigDraftLocked(c)
+	if candidate == nil {
+		return
+	}
 	if val := strings.TrimSpace(c.Query("api-key")); val != "" {
 		if baseRaw, okBase := c.GetQuery("base-url"); okBase {
 			base := strings.TrimSpace(baseRaw)
