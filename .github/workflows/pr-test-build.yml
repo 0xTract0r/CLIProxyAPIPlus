@@ -19,6 +19,12 @@ jobs:
           cache: true
       - name: Refresh models catalog
         run: bash .github/scripts/refresh-model-catalogs.sh
+      - name: Verify plugin configuration saves
+        env:
+          GIN_MODE: release
+        run: >-
+          go test -mod=readonly -race -count=1 ./internal/api ./internal/api/handlers/management
+          -run '^(TestPluginConfigWritePreservesLastSavedValue|TestPluginConfigWritesRejectUnavailableConfig|TestPatchPluginEnabled(UpdatesOnlyPluginConfig|ReloadSnapshotRawImmutability)|TestPutPluginConfigReplacesPluginConfig|TestPatchPluginConfigMergesAndDeletesFields|TestConfigReloadGenerationSkipsOlderSnapshot)$'
       - name: Build
         run: |
           go build -o test-output ./cmd/server
