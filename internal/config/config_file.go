@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+
+	log "github.com/sirupsen/logrus"
 )
 
 // ErrConfigFileChanged indicates that a path no longer refers to the inode or
@@ -48,14 +50,21 @@ func ReadConfigFileSnapshot(path string) (snapshot *ConfigFileSnapshot, err erro
 }
 
 func readConfigFileSnapshot(location configFileLocation) (snapshot *ConfigFileSnapshot, err error) {
-	err = location.withFile(configRead, func(f *lockedConfigFile) error {
-		snapshot = f.snapshot
-		return nil
-	})
+	// Only this side-effect-free reader can reopen on a changed path. In
+	// particular, withFile never replays a caller's CAS or startup callback.
+	for attempt := 0; attempt < configReadAttempts(); attempt++ {
+		err = location.withFile(configRead, func(f *lockedConfigFile) error {
+			snapshot = f.snapshot
+			return nil
+		})
+		if snapshot != nil || !errors.Is(err, ErrConfigFileChanged) {
+			break
+		}
+	}
 	return snapshot, err
 }
 
-// WriteConfigFileCAS replaces an existing file in place under an exclusive lock.
+// WriteConfigFileCAS replaces an existing file under an exclusive lock.
 // It compares both the identity and ALL bytes with expected and never retries on
 // conflict. The returned snapshot reflects the committed bytes; it is safe to
 // use for a response ETag without reopening the file. It guards against
@@ -156,6 +165,7 @@ type lockedConfigFile struct {
 	file       *os.File
 	snapshot   *ConfigFileSnapshot
 	writeError error
+	published  *os.File
 }
 
 // WithConfigFileOpenGate serializes raw filesystem scans with in-process config
@@ -195,6 +205,20 @@ func ApplyRootedConfigFileCAS(root *os.Root, path string, expected *ConfigFileSn
 type configFileLocation struct {
 	root *os.Root
 	path string
+	io   configSaveIO
+}
+
+// Zero-valued operations use the real filesystem. Overrides are scoped to one save.
+type configSaveIO struct {
+	writeAt func(*os.File, []byte, int64) (int, error)
+	sync    func(*os.File) error
+}
+
+func (ops configSaveIO) syncFile(file *os.File) error {
+	if ops.sync != nil {
+		return ops.sync(file)
+	}
+	return file.Sync()
 }
 
 func (l configFileLocation) parents(create bool) error {
@@ -313,6 +337,7 @@ func (location configFileLocation) withFile(mode configFileMode, use func(*locke
 		return &os.PathError{Op: "read config", Path: path, Err: errors.New("config must be a regular file")}
 	}
 	var file *os.File
+	var f *lockedConfigFile
 	var writeError error
 	if mode != configRead {
 		file, writeError = location.open(mode)
@@ -327,8 +352,21 @@ func (location configFileLocation) withFile(mode configFileMode, use func(*locke
 		}
 	}
 	defer func() {
+		if f != nil && f.published != nil {
+			// The replacement descriptor stays exclusively locked through the
+			// callback that delivers the committed snapshot.
+			if errClose := f.published.Close(); errClose != nil {
+				log.WithError(errClose).Warn("config committed but closing replacement failed")
+			}
+		}
+	}()
+	defer func() {
 		if errClose := file.Close(); errClose != nil {
-			err = errors.Join(err, errClose)
+			if f != nil && f.published != nil {
+				log.WithError(errClose).Warn("config committed but closing predecessor failed")
+			} else {
+				err = errors.Join(err, errClose)
+			}
 		}
 	}()
 	opened, errStat := file.Stat()
@@ -343,10 +381,14 @@ func (location configFileLocation) withFile(mode configFileMode, use func(*locke
 	}
 	defer func() {
 		if errUnlock := unlockConfigFile(file); errUnlock != nil {
-			err = errors.Join(err, fmt.Errorf("unlock config file: %w", errUnlock))
+			if f != nil && f.published != nil {
+				log.WithError(errUnlock).Warn("config committed but unlocking predecessor failed")
+			} else {
+				err = errors.Join(err, fmt.Errorf("unlock config file: %w", errUnlock))
+			}
 		}
 	}()
-	f := &lockedConfigFile{location: location, file: file, snapshot: &ConfigFileSnapshot{info: opened}, writeError: writeError}
+	f = &lockedConfigFile{location: location, file: file, snapshot: &ConfigFileSnapshot{info: opened}, writeError: writeError}
 	if errSame := f.checkPath(); errSame != nil {
 		return errSame
 	}
@@ -357,6 +399,7 @@ func (location configFileLocation) withFile(mode configFileMode, use func(*locke
 	if errSame := f.checkPath(); errSame != nil {
 		return errSame
 	}
+
 	return use(f)
 }
 
@@ -400,7 +443,16 @@ func (f *lockedConfigFile) replace(data []byte) (*ConfigFileSnapshot, error) {
 	if errValidate := ValidateConfigSave(current, data); errValidate != nil {
 		return nil, errValidate
 	}
-	if errWrite := replaceConfigContents(f.file, current, data, f.checkPath); errWrite != nil {
+	if errIntegrity := checkConfigWriteIntegrity(f.file); errIntegrity != nil {
+		return nil, errIntegrity
+	}
+	if committed, errDirectory := f.replaceDirectoryFile(data); committed != nil || errDirectory != nil {
+		return committed, errDirectory
+	}
+	if errPreflight := preflightConfigReplacement(f.file, int64(len(current)), int64(len(data))); errPreflight != nil {
+		return nil, errPreflight
+	}
+	if errWrite := f.location.io.replaceContents(f.file, current, data, f.checkPath); errWrite != nil {
 		return nil, errWrite
 	}
 	retirePersistedServerID(f.snapshot.info, data)
@@ -408,8 +460,12 @@ func (f *lockedConfigFile) replace(data []byte) (*ConfigFileSnapshot, error) {
 }
 
 func replaceConfigContents(file *os.File, original, replacement []byte, check func() error) error {
-	if errWrite := overwriteConfigFile(file, replacement, check); errWrite != nil {
-		if errRestore := overwriteConfigFile(file, original, nil); errRestore != nil {
+	return (configSaveIO{}).replaceContents(file, original, replacement, check)
+}
+
+func (ops configSaveIO) replaceContents(file *os.File, original, replacement []byte, check func() error) error {
+	if errWrite := ops.overwrite(file, replacement, check); errWrite != nil {
+		if errRestore := ops.overwrite(file, original, nil); errRestore != nil {
 			return errors.Join(errWrite, fmt.Errorf("restore config file snapshot: %w", errRestore))
 		}
 		return errWrite
@@ -418,13 +474,25 @@ func replaceConfigContents(file *os.File, original, replacement []byte, check fu
 }
 
 func overwriteConfigFile(file *os.File, data []byte, check func() error) error {
-	if _, errWrite := file.WriteAt(data, 0); errWrite != nil {
+	return (configSaveIO{}).overwrite(file, data, check)
+}
+
+func (ops configSaveIO) overwrite(file *os.File, data []byte, check func() error) error {
+	writeAt := (*os.File).WriteAt
+	if ops.writeAt != nil {
+		writeAt = ops.writeAt
+	}
+	n, errWrite := writeAt(file, data, 0)
+	if errWrite != nil {
 		return errWrite
+	}
+	if n != len(data) {
+		return io.ErrShortWrite
 	}
 	if errTruncate := file.Truncate(int64(len(data))); errTruncate != nil {
 		return errTruncate
 	}
-	if errSync := file.Sync(); errSync != nil {
+	if errSync := ops.syncFile(file); errSync != nil {
 		return errSync
 	}
 	if check != nil {

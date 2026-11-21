@@ -327,11 +327,13 @@ func mergeNodePreserve(dst, src *yaml.Node, path ...[]string) {
 			dst.Content = dst.Content[:len(src.Content)]
 		}
 	case yaml.ScalarNode, yaml.AliasNode:
-		// For scalars, update Tag and Value but keep Style from dst to preserve quoting
+		// Keep existing quoting only when the scalar keeps its YAML type.
+		if src.Kind == yaml.ScalarNode && (dst.Kind != yaml.ScalarNode || dst.ShortTag() != src.ShortTag()) {
+			dst.Style = src.Style
+		}
 		dst.Kind = src.Kind
 		dst.Tag = src.Tag
 		dst.Value = src.Value
-		// Keep dst.Style as-is intentionally
 	case 0:
 		// Unknown/empty kind; do nothing
 	default:

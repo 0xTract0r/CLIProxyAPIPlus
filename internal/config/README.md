@@ -111,3 +111,22 @@ Git performs startup rewrites only after synchronizing and verifies the actual
 candidate commit blob before publishing. A rejected startup candidate never
 touches the working config. The runtime config's source hash identifies the
 exact winning bytes, not a re-read of a potentially edited file.
+
+### Linux directory replacement
+
+The default config save retains the existing inode. To enable atomic replacement
+for eligible ordinary files, set `CPA_CONFIG_LINUX_ATOMIC_REPLACE=1` on Linux.
+Enable this only after every cooperating configuration reader has been updated.
+A reader running the previous implementation can return a transient config-file
+changed error if it opened the old inode just before replacement. Current
+snapshot readers retry a changed path up to three total attempts. A stale
+compare-and-swap write still requires the caller to read a fresh snapshot and
+rebuild its edit.
+
+Ordinary replacement requires a local filesystem and a directly named file in a
+directory owned by the process account, with no group or other write bits.
+Rooted uploads, symlink paths, hard links, visible file attributes, single-file
+mounts and directories that cannot be written retain the existing inode.
+A failure while preparing a replacement is returned without committing it.
+
+Linux saves reject changes to files carrying visible capability or integrity attributes (`security.capability`, `security.ima`, or `security.evm`). An in-place write could clear those attributes.

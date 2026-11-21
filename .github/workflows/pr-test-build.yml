@@ -19,6 +19,29 @@ jobs:
           cache: true
       - name: Refresh models catalog
         run: bash .github/scripts/refresh-model-catalogs.sh
+      - name: Test YAML persistence and downstream WebSocket negotiation
+        env:
+          TZ: UTC
+        run: >-
+          go test -mod=readonly -race -count=1 ./internal/config ./internal/api
+          -run '^(TestMergePreservesScalarValueTypesAndPresentation|TestManagementQuotedRequestLogPersistsTypedBoolean|TestDownstreamWebsocketCompressionInstancesAndReload)$'
+      - name: Verify management reads during configuration reload
+        run: >-
+          go test -mod=readonly -race -count=1 ./internal/api/handlers/management
+          -run '^(TestHandlerSnapshotOwnsConfigAndPluginYAML|TestHandlerSnapshotGetConfigDuringSetConfig|TestHandlerSnapshotCatalogDuringPluginHostSwap|TestAPIKeyListConcurrentPersistence)$'
+      - name: Validate Linux configuration saves, recovery and permissions
+        run: bash .github/scripts/verify-linux-config-saves.sh
+      - name: Verify plugin configuration saves
+        env:
+          GIN_MODE: release
+        run: >-
+          go test -mod=readonly -race -count=1 ./internal/api ./internal/api/handlers/management
+          -run '^(TestPluginConfigWritePreservesLastSavedValue|TestPluginConfigWritesRejectUnavailableConfig|TestPatchPluginEnabled(UpdatesOnlyPluginConfig|ReloadSnapshotRawImmutability)|TestPutPluginConfigReplacesPluginConfig|TestPatchPluginConfigMergesAndDeletesFields|TestConfigReloadGenerationSkipsOlderSnapshot|TestPluginDeleteLocalRecovery|TestDeletePlugin(RejectsUnresolvedPluginsDir|ReturnsNotFoundForUnknownPlugin|UsesConfiguredStoreVersionWhenFilesCoexist|RemovesDiscoveredFileAndConfig))$'
+      - name: Verify durable removal and file registration
+        run: >-
+          go test -mod=readonly -race -count=1 -timeout=2m
+          ./internal/api/handlers/management ./sdk/cliproxy/auth ./sdk/cliproxy
+          -run '^(TestFileFence.*|TestDurableLocalRemoval.*|TestRemoveIfRetiresAfterCanceledRequestAndPersistenceWait|TestRegistered.*Local.*|TestLocalV8DeleteRegistryCleanupFollowsRegistrationEpoch|TestUnregisteredLocalFileThroughGinDelete|TestObservedLocalDeleteRejectsReplacementAndCancel|TestLocalGinDeleteKeepsReplacementWhileWaiting|TestLocalGinDeleteWaitsForSDKManagerLoad|TestWatcherRestoresFirstRegistrationAfterFileRemoval|TestHandleAuthUpdatesDiscardedSnapshotTriggersWatcherReread|TestHandleAuthUpdatesFileSnapshotKeepsCooldown|TestRuntimeAuthSyncHook_(DelayedPersistedSnapshotCannotUndoDisable|DiscardedLoginCacheCannotUndoDisableOnReload))$'
       - name: Build
         run: |
           go build -o test-output ./cmd/server

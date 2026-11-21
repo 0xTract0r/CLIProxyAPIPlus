@@ -25,17 +25,12 @@ const (
 )
 
 func (h *Handler) GetConfig(c *gin.Context) {
-	if h == nil {
-		c.JSON(200, gin.H{})
+	snapshot := h.configSnapshot()
+	if snapshot == nil {
+		c.JSON(http.StatusOK, gin.H{})
 		return
 	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.cfg == nil {
-		c.JSON(200, gin.H{})
-		return
-	}
-	c.JSON(200, new(*h.cfg))
+	c.JSON(http.StatusOK, snapshot)
 }
 
 type releaseInfo struct {
