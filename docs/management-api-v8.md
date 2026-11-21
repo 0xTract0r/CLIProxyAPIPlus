@@ -160,6 +160,25 @@ retain the corresponding business operation's fields.
 | `/plugins/store/<id>/install` | POST | Install or update a plugin. |
 | `/plugins/<id>/quota` | GET, POST, DELETE | Read, fetch, or reset plugin quota. |
 
+### Deleting a local plugin
+
+Both `DELETE /v8/management/plugins/<id>` and the v0 equivalent select the
+configured plugin version when present. If there is a file and a saved plugin
+configuration, the file is staged in a private recovery directory beside the
+original. The management handler publishes the configuration change after the
+YAML save succeeds. A save failure attempts to restore the file without
+overwriting any replacement.
+
+A response with `restart_required: true` can mean the runtime was unloaded
+before a later step failed. A `409 plugin_delete_recovery_pending` means a
+previous deletion left a recovery directory for this plugin. Leave both files
+in place and consult the saved YAML and the reported `recovery_directory`
+before resolving it. Check the original path and selected version, retain
+copies of the files that are still needed, and verify the result before
+retrying. A recovery or cleanup failure reports its own error. An interrupted
+process may require this same manual reconciliation. Late disk write failures
+may affect the YAML itself.
+
 ## OAuth
 
 The login URL is shared by all providers. Set the required `provider` query
