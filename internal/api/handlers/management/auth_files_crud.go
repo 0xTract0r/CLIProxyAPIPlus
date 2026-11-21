@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"mime/multipart"
 	"net/http"
 	"os"
@@ -24,6 +25,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/watcher/synthesizer"
+	sdkauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
 )
@@ -212,7 +214,7 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 		return
 	}
 	if len(names) == 1 {
-		if _, status, errDelete := h.deleteAuthFileByName(ctx, names[0]); errDelete != nil {
+		if _, status, errDelete := h.deleteAuthFileByName(ctx, names[0], true); errDelete != nil {
 			c.JSON(status, gin.H{"error": errDelete.Error()})
 			return
 		}
@@ -223,7 +225,7 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 	deletedFiles := make([]string, 0, len(names))
 	failed := make([]gin.H, 0)
 	for _, name := range names {
-		deletedName, _, errDelete := h.deleteAuthFileByName(ctx, name)
+		deletedName, _, errDelete := h.deleteAuthFileByName(ctx, name, false)
 		if errDelete != nil {
 			failed = append(failed, gin.H{"name": name, "error": errDelete.Error()})
 			continue
@@ -528,13 +530,14 @@ func uniqueAuthFileNames(names []string) []string {
 	return out
 }
 
-func (h *Handler) deleteAuthFileByName(ctx context.Context, name string) (string, int, error) {
+func (h *Handler) deleteAuthFileByName(ctx context.Context, name string, protectLocalSingle bool) (string, int, error) {
 	name = strings.TrimSpace(name)
 	if isUnsafeAuthFileName(name) {
 		return "", http.StatusBadRequest, fmt.Errorf("invalid name")
 	}
 
-	targetPath := filepath.Join(h.currentHandlerAuthDir(), filepath.Base(name))
+	authDir := h.currentHandlerAuthDir()
+	targetPath := filepath.Join(authDir, filepath.Base(name))
 	targetID := ""
 	if targetAuth := h.findAuthForDelete(name); targetAuth != nil {
 		if !isPluginVirtualSourceDelete(name, targetAuth) {
@@ -554,6 +557,34 @@ func (h *Handler) deleteAuthFileByName(ctx context.Context, name string) (string
 	if isV8AuthFileMutation(ctx) {
 		resolvedTargetPath = canonicalV8AuthFilePath(targetPath)
 	}
+	var observation os.FileInfo
+	store := h.tokenStore
+	if store == nil {
+		store = sdkauth.GetTokenStore()
+	}
+	if _, local := store.(*sdkauth.FileTokenStore); local && protectLocalSingle && authDir != "" {
+		if !sameV8AuthFilePath(targetPath, filepath.Join(authDir, filepath.Base(name))) {
+			return filepath.Base(name), http.StatusConflict, coreauth.ErrFileRemovalBusy
+		}
+		var errObserve error
+		observation, errObserve = os.Lstat(targetPath)
+		switch {
+		case os.IsNotExist(errObserve):
+			return filepath.Base(name), http.StatusNotFound, errAuthFileNotFound
+		case errObserve != nil:
+			return filepath.Base(name), http.StatusInternalServerError, errors.New("failed to inspect auth file")
+		case !observation.Mode().IsRegular():
+			return filepath.Base(name), http.StatusConflict, errors.New("auth file is not a regular file")
+		}
+	}
+	if observation != nil {
+		expected := h.localDeleteIDs(targetPath)
+		if (targetID == "" && len(expected) != 0) || (targetID != "" && expected[targetID] == 0) {
+			return filepath.Base(name), http.StatusConflict, coreauth.ErrFileRemovalBusy
+		}
+		status, err := h.deleteObservedLocalAuth(ctx, authDir, targetPath, observation, expected)
+		return filepath.Base(name), status, err
+	}
 	release := h.beginSIWCFileMutation(ctx, targetPath)
 	defer release()
 	if errRemove := os.Remove(targetPath); errRemove != nil {
@@ -571,6 +602,82 @@ func (h *Handler) deleteAuthFileByName(ctx context.Context, name string) (string
 		h.removeAuthsForPath(ctx, targetPath, targetID)
 	}
 	return filepath.Base(name), http.StatusOK, nil
+}
+
+// localDeleteIDs ties membership to both the observed source and runtime epoch.
+func (h *Handler) localDeleteIDs(path string) map[string]uint64 {
+	ids := make(map[string]uint64)
+	canonical := canonicalV8AuthFilePath(path)
+	for _, item := range h.authManager.List() {
+		if h.authMatchesV8SourcePath(item, path, canonical) {
+			ids[item.ID] = item.RegistrationEpoch
+		}
+	}
+	return ids
+}
+
+func (h *Handler) deleteObservedLocalAuth(ctx context.Context, authDir, path string, observed os.FileInfo, expected map[string]uint64) (int, error) {
+	finish, err := h.authManager.BeginFileRemoval(path)
+	if err != nil {
+		if errors.Is(err, coreauth.ErrFileRemovalBusy) {
+			return http.StatusConflict, err
+		}
+		return http.StatusInternalServerError, errors.New("failed to reserve auth file")
+	}
+	defer finish()
+	release := h.beginSIWCFileMutation(ctx, path)
+	defer release()
+
+	ids := make([]string, 0, len(expected))
+	for id := range expected {
+		ids = append(ids, id)
+	}
+	errChanged := errors.New("auth file changed before deletion")
+	var modelEpochs map[string]uint64
+	err = h.authManager.RemoveDurable(ctx, ids, func() error {
+		if !sameAuthFilePath(authDir, h.currentHandlerAuthDir()) || !maps.Equal(expected, h.localDeleteIDs(path)) {
+			return coreauth.ErrFileRemovalBusy
+		}
+		info, err := os.Lstat(path)
+		if err != nil {
+			return err
+		}
+		if !info.Mode().IsRegular() || !os.SameFile(info, observed) ||
+			info.Size() != observed.Size() || !info.ModTime().Equal(observed.ModTime()) {
+			return errChanged
+		}
+		if err := os.Remove(path); err != nil {
+			return err
+		}
+		if isV8AuthFileMutation(ctx) && len(ids) > 0 {
+			// Model publication uses the same ID mutation gates. Capture the
+			// epochs before those gates release and allow new registrations.
+			modelRegistry := registry.GetGlobalRegistry()
+			modelEpochs = make(map[string]uint64, len(ids))
+			for _, id := range ids {
+				modelEpochs[id] = modelRegistry.ClientRegistrationEpoch(id)
+			}
+		}
+		return nil
+	})
+	switch {
+	case err == nil:
+		if len(modelEpochs) > 0 {
+			modelRegistry := registry.GetGlobalRegistry()
+			for id, epoch := range modelEpochs {
+				modelRegistry.UnregisterClientIfEpochCurrent(id, epoch, func() bool { return true })
+			}
+		}
+		return http.StatusOK, nil
+	case errors.Is(err, coreauth.ErrFileRemovalBusy), errors.Is(err, errChanged):
+		return http.StatusConflict, err
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return http.StatusRequestTimeout, errors.New("auth file deletion canceled")
+	case os.IsNotExist(err):
+		return http.StatusNotFound, errAuthFileNotFound
+	default:
+		return http.StatusInternalServerError, errors.New("failed to remove auth file")
+	}
 }
 
 func isPluginVirtualSourceDelete(name string, auth *coreauth.Auth) bool {

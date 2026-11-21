@@ -160,6 +160,10 @@ retain the corresponding business operation's fields.
 | `/plugins/store/<id>/install` | POST | Install or update a plugin. |
 | `/plugins/<id>/quota` | GET, POST, DELETE | Read, fetch, or reset plugin quota. |
 
+### Deleting one local credential file
+
+For an explicit single filename in the default local file store, the v0 and v8 management APIs coordinate file removal with registration and pending saves. If the observed file or its registered members change while deletion is waiting, the API can return HTTP 409. Read the current file list and confirm the intended record before retrying. A failed storage commit preserves the existing runtime records. A later registration can use the same ID for a new credential.
+
 ## OAuth
 
 The login URL is shared by all providers. Set the required `provider` query

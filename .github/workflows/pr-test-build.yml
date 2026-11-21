@@ -19,6 +19,11 @@ jobs:
           cache: true
       - name: Refresh models catalog
         run: bash .github/scripts/refresh-model-catalogs.sh
+      - name: Verify durable removal and file registration
+        run: >-
+          go test -mod=readonly -race -count=1 -timeout=2m
+          ./internal/api/handlers/management ./sdk/cliproxy/auth ./sdk/cliproxy
+          -run '^(TestFileFence.*|TestDurableLocalRemoval.*|TestRemoveIfRetiresAfterCanceledRequestAndPersistenceWait|TestRegistered.*Local.*|TestLocalV8DeleteRegistryCleanupFollowsRegistrationEpoch|TestUnregisteredLocalFileThroughGinDelete|TestObservedLocalDeleteRejectsReplacementAndCancel|TestLocalGinDeleteKeepsReplacementWhileWaiting|TestWatcherRestoresFirstRegistrationAfterFileRemoval|TestHandleAuthUpdatesDiscardedSnapshotTriggersWatcherReread|TestHandleAuthUpdatesFileSnapshotKeepsCooldown|TestRuntimeAuthSyncHook_(DelayedPersistedSnapshotCannotUndoDisable|DiscardedLoginCacheCannotUndoDisableOnReload))$'
       - name: Build
         run: |
           go build -o test-output ./cmd/server
