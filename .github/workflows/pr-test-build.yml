@@ -31,6 +31,12 @@ jobs:
           -run '^(TestHandlerSnapshotOwnsConfigAndPluginYAML|TestHandlerSnapshotGetConfigDuringSetConfig|TestHandlerSnapshotCatalogDuringPluginHostSwap|TestAPIKeyListConcurrentPersistence)$'
       - name: Validate Linux configuration saves, recovery and permissions
         run: bash .github/scripts/verify-linux-config-saves.sh
+      - name: Verify provider lists commit before publication
+        env:
+          GIN_MODE: release
+        run: >-
+          go test -mod=readonly -race -count=1 ./internal/api
+          -run '^TestRegisteredProviderListsCommitBeforeVisibility$'
       - name: Verify plugin configuration saves
         env:
           GIN_MODE: release

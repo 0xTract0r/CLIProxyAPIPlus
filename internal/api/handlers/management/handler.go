@@ -511,6 +511,22 @@ func (h *Handler) persistLocked(c *gin.Context) bool {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to save config: %v", err)})
 		return false
 	}
+	h.finishConfigSaveLocked(c)
+	return true
+}
+
+// persistProviderConfigLocked commits a private copy before replacing the
+// handler's published configuration. Callers must hold h.mu.
+func (h *Handler) persistProviderConfigLocked(c *gin.Context, candidate *config.Config) {
+	if err := config.SaveConfigPreserveComments(h.configFilePath, candidate, c.GetBool(ConfigV8ContextKey)); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save config"})
+		return
+	}
+	h.cfg = candidate
+	h.finishConfigSaveLocked(c)
+}
+
+func (h *Handler) finishConfigSaveLocked(c *gin.Context) {
 	snapshot := h.reloadSnapshotConfigLocked()
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
 	var reqCtx context.Context
@@ -518,7 +534,6 @@ func (h *Handler) persistLocked(c *gin.Context) bool {
 		reqCtx = c.Request.Context()
 	}
 	h.reloadConfigAfterManagementSaveAsync(reqCtx, snapshot)
-	return true
 }
 
 // Helper methods for simple types. The setter and the save run under h.mu, so a

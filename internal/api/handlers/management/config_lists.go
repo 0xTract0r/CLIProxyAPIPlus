@@ -190,9 +190,10 @@ func (h *Handler) PutGeminiKeys(c *gin.Context) {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.cfg.GeminiKey = append([]config.GeminiKey(nil), arr...)
-	h.cfg.SanitizeGeminiKeys()
-	h.persistLocked(c)
+	candidate := h.cfg.CloneForRuntime()
+	candidate.GeminiKey = append([]config.GeminiKey(nil), arr...)
+	candidate.SanitizeGeminiKeys()
+	h.persistProviderConfigLocked(c, candidate)
 }
 func (h *Handler) PatchGeminiKey(c *gin.Context) {
 	type geminiKeyPatch struct {
@@ -220,8 +221,9 @@ func (h *Handler) PatchGeminiKey(c *gin.Context) {
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	candidate := h.cfg.CloneForRuntime()
 	targetIndex := -1
-	if body.Index != nil && *body.Index >= 0 && *body.Index < len(h.cfg.GeminiKey) {
+	if body.Index != nil && *body.Index >= 0 && *body.Index < len(candidate.GeminiKey) {
 		targetIndex = *body.Index
 	}
 	if targetIndex == -1 && body.Match != nil {
@@ -230,11 +232,11 @@ func (h *Handler) PatchGeminiKey(c *gin.Context) {
 			baseRaw, hasBase := c.GetQuery("base-url")
 			base := strings.TrimSpace(baseRaw)
 			matches := make([]int, 0, 1)
-			for i := range h.cfg.GeminiKey {
-				if strings.TrimSpace(h.cfg.GeminiKey[i].APIKey) != match {
+			for i := range candidate.GeminiKey {
+				if strings.TrimSpace(candidate.GeminiKey[i].APIKey) != match {
 					continue
 				}
-				if hasBase && strings.TrimSpace(h.cfg.GeminiKey[i].BaseURL) != base {
+				if hasBase && strings.TrimSpace(candidate.GeminiKey[i].BaseURL) != base {
 					continue
 				}
 				matches = append(matches, i)
@@ -253,7 +255,7 @@ func (h *Handler) PatchGeminiKey(c *gin.Context) {
 		return
 	}
 
-	entry := h.cfg.GeminiKey[targetIndex]
+	entry := candidate.GeminiKey[targetIndex]
 	if body.Value.APIKey != nil {
 		entry.APIKey = strings.TrimSpace(*body.Value.APIKey)
 	}
@@ -293,26 +295,27 @@ func (h *Handler) PatchGeminiKey(c *gin.Context) {
 		entry.RequestScopedErrors = append([]config.RequestScopedErrorRule(nil), *body.Value.RequestScopedErrors...)
 	}
 	if entry.APIKey == "" && entry.BaseURL == "" {
-		h.cfg.GeminiKey = append(h.cfg.GeminiKey[:targetIndex], h.cfg.GeminiKey[targetIndex+1:]...)
-		h.cfg.SanitizeGeminiKeys()
-		h.persistLocked(c)
+		candidate.GeminiKey = append(candidate.GeminiKey[:targetIndex], candidate.GeminiKey[targetIndex+1:]...)
+		candidate.SanitizeGeminiKeys()
+		h.persistProviderConfigLocked(c, candidate)
 		return
 	}
-	h.cfg.GeminiKey[targetIndex] = entry
-	h.cfg.SanitizeGeminiKeys()
-	h.persistLocked(c)
+	candidate.GeminiKey[targetIndex] = entry
+	candidate.SanitizeGeminiKeys()
+	h.persistProviderConfigLocked(c, candidate)
 }
 
 func (h *Handler) DeleteGeminiKey(c *gin.Context) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	candidate := h.cfg.CloneForRuntime()
 	if val := strings.TrimSpace(c.Query("api-key")); val != "" {
 		if baseRaw, okBase := c.GetQuery("base-url"); okBase {
 			base := strings.TrimSpace(baseRaw)
 			matchIndex := -1
 			matchCount := 0
-			for i := range h.cfg.GeminiKey {
-				if strings.TrimSpace(h.cfg.GeminiKey[i].APIKey) == val && strings.TrimSpace(h.cfg.GeminiKey[i].BaseURL) == base {
+			for i := range candidate.GeminiKey {
+				if strings.TrimSpace(candidate.GeminiKey[i].APIKey) == val && strings.TrimSpace(candidate.GeminiKey[i].BaseURL) == base {
 					matchIndex = i
 					matchCount++
 				}
@@ -325,16 +328,16 @@ func (h *Handler) DeleteGeminiKey(c *gin.Context) {
 				c.JSON(400, gin.H{"error": "multiple items match; index is required"})
 				return
 			}
-			h.cfg.GeminiKey = append(h.cfg.GeminiKey[:matchIndex], h.cfg.GeminiKey[matchIndex+1:]...)
-			h.cfg.SanitizeGeminiKeys()
-			h.persistLocked(c)
+			candidate.GeminiKey = append(candidate.GeminiKey[:matchIndex], candidate.GeminiKey[matchIndex+1:]...)
+			candidate.SanitizeGeminiKeys()
+			h.persistProviderConfigLocked(c, candidate)
 			return
 		}
 
 		matchIndex := -1
 		matchCount := 0
-		for i := range h.cfg.GeminiKey {
-			if strings.TrimSpace(h.cfg.GeminiKey[i].APIKey) == val {
+		for i := range candidate.GeminiKey {
+			if strings.TrimSpace(candidate.GeminiKey[i].APIKey) == val {
 				matchCount++
 				if matchIndex == -1 {
 					matchIndex = i
@@ -349,17 +352,17 @@ func (h *Handler) DeleteGeminiKey(c *gin.Context) {
 			c.JSON(400, gin.H{"error": "multiple items match api-key; base-url is required"})
 			return
 		}
-		h.cfg.GeminiKey = append(h.cfg.GeminiKey[:matchIndex], h.cfg.GeminiKey[matchIndex+1:]...)
-		h.cfg.SanitizeGeminiKeys()
-		h.persistLocked(c)
+		candidate.GeminiKey = append(candidate.GeminiKey[:matchIndex], candidate.GeminiKey[matchIndex+1:]...)
+		candidate.SanitizeGeminiKeys()
+		h.persistProviderConfigLocked(c, candidate)
 		return
 	}
 	if idxStr := c.Query("index"); idxStr != "" {
 		var idx int
-		if _, err := fmt.Sscanf(idxStr, "%d", &idx); err == nil && idx >= 0 && idx < len(h.cfg.GeminiKey) {
-			h.cfg.GeminiKey = append(h.cfg.GeminiKey[:idx], h.cfg.GeminiKey[idx+1:]...)
-			h.cfg.SanitizeGeminiKeys()
-			h.persistLocked(c)
+		if _, err := fmt.Sscanf(idxStr, "%d", &idx); err == nil && idx >= 0 && idx < len(candidate.GeminiKey) {
+			candidate.GeminiKey = append(candidate.GeminiKey[:idx], candidate.GeminiKey[idx+1:]...)
+			candidate.SanitizeGeminiKeys()
+			h.persistProviderConfigLocked(c, candidate)
 			return
 		}
 	}
@@ -396,9 +399,10 @@ func (h *Handler) PutInteractionsKeys(c *gin.Context) {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.cfg.InteractionsKey = append([]config.GeminiKey(nil), arr...)
-	h.cfg.SanitizeInteractionsKeys()
-	h.persistLocked(c)
+	candidate := h.cfg.CloneForRuntime()
+	candidate.InteractionsKey = append([]config.GeminiKey(nil), arr...)
+	candidate.SanitizeInteractionsKeys()
+	h.persistProviderConfigLocked(c, candidate)
 }
 func (h *Handler) PatchInteractionsKey(c *gin.Context) {
 	type geminiKeyPatch struct {
@@ -427,8 +431,9 @@ func (h *Handler) PatchInteractionsKey(c *gin.Context) {
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	candidate := h.cfg.CloneForRuntime()
 	targetIndex := -1
-	if body.Index != nil && *body.Index >= 0 && *body.Index < len(h.cfg.InteractionsKey) {
+	if body.Index != nil && *body.Index >= 0 && *body.Index < len(candidate.InteractionsKey) {
 		targetIndex = *body.Index
 	}
 	if targetIndex == -1 && body.Match != nil {
@@ -437,11 +442,11 @@ func (h *Handler) PatchInteractionsKey(c *gin.Context) {
 			baseRaw, hasBase := c.GetQuery("base-url")
 			base := strings.TrimSpace(baseRaw)
 			matches := make([]int, 0, 1)
-			for i := range h.cfg.InteractionsKey {
-				if strings.TrimSpace(h.cfg.InteractionsKey[i].APIKey) != match {
+			for i := range candidate.InteractionsKey {
+				if strings.TrimSpace(candidate.InteractionsKey[i].APIKey) != match {
 					continue
 				}
-				if hasBase && strings.TrimSpace(h.cfg.InteractionsKey[i].BaseURL) != base {
+				if hasBase && strings.TrimSpace(candidate.InteractionsKey[i].BaseURL) != base {
 					continue
 				}
 				matches = append(matches, i)
@@ -460,7 +465,7 @@ func (h *Handler) PatchInteractionsKey(c *gin.Context) {
 		return
 	}
 
-	entry := h.cfg.InteractionsKey[targetIndex]
+	entry := candidate.InteractionsKey[targetIndex]
 	if body.Value.APIKey != nil {
 		entry.APIKey = strings.TrimSpace(*body.Value.APIKey)
 	}
@@ -500,26 +505,27 @@ func (h *Handler) PatchInteractionsKey(c *gin.Context) {
 		entry.RequestScopedErrors = append([]config.RequestScopedErrorRule(nil), *body.Value.RequestScopedErrors...)
 	}
 	if entry.APIKey == "" && entry.BaseURL == "" {
-		h.cfg.InteractionsKey = append(h.cfg.InteractionsKey[:targetIndex], h.cfg.InteractionsKey[targetIndex+1:]...)
-		h.cfg.SanitizeInteractionsKeys()
-		h.persistLocked(c)
+		candidate.InteractionsKey = append(candidate.InteractionsKey[:targetIndex], candidate.InteractionsKey[targetIndex+1:]...)
+		candidate.SanitizeInteractionsKeys()
+		h.persistProviderConfigLocked(c, candidate)
 		return
 	}
-	h.cfg.InteractionsKey[targetIndex] = entry
-	h.cfg.SanitizeInteractionsKeys()
-	h.persistLocked(c)
+	candidate.InteractionsKey[targetIndex] = entry
+	candidate.SanitizeInteractionsKeys()
+	h.persistProviderConfigLocked(c, candidate)
 }
 
 func (h *Handler) DeleteInteractionsKey(c *gin.Context) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	candidate := h.cfg.CloneForRuntime()
 	if val := strings.TrimSpace(c.Query("api-key")); val != "" {
 		if baseRaw, okBase := c.GetQuery("base-url"); okBase {
 			base := strings.TrimSpace(baseRaw)
 			matchIndex := -1
 			matchCount := 0
-			for i := range h.cfg.InteractionsKey {
-				if strings.TrimSpace(h.cfg.InteractionsKey[i].APIKey) == val && strings.TrimSpace(h.cfg.InteractionsKey[i].BaseURL) == base {
+			for i := range candidate.InteractionsKey {
+				if strings.TrimSpace(candidate.InteractionsKey[i].APIKey) == val && strings.TrimSpace(candidate.InteractionsKey[i].BaseURL) == base {
 					matchIndex = i
 					matchCount++
 				}
@@ -532,16 +538,16 @@ func (h *Handler) DeleteInteractionsKey(c *gin.Context) {
 				c.JSON(400, gin.H{"error": "multiple items match; index is required"})
 				return
 			}
-			h.cfg.InteractionsKey = append(h.cfg.InteractionsKey[:matchIndex], h.cfg.InteractionsKey[matchIndex+1:]...)
-			h.cfg.SanitizeInteractionsKeys()
-			h.persistLocked(c)
+			candidate.InteractionsKey = append(candidate.InteractionsKey[:matchIndex], candidate.InteractionsKey[matchIndex+1:]...)
+			candidate.SanitizeInteractionsKeys()
+			h.persistProviderConfigLocked(c, candidate)
 			return
 		}
 
 		matchIndex := -1
 		matchCount := 0
-		for i := range h.cfg.InteractionsKey {
-			if strings.TrimSpace(h.cfg.InteractionsKey[i].APIKey) == val {
+		for i := range candidate.InteractionsKey {
+			if strings.TrimSpace(candidate.InteractionsKey[i].APIKey) == val {
 				matchCount++
 				if matchIndex == -1 {
 					matchIndex = i
@@ -556,18 +562,18 @@ func (h *Handler) DeleteInteractionsKey(c *gin.Context) {
 			c.JSON(400, gin.H{"error": "multiple items match api-key; base-url is required"})
 			return
 		}
-		h.cfg.InteractionsKey = append(h.cfg.InteractionsKey[:matchIndex], h.cfg.InteractionsKey[matchIndex+1:]...)
-		h.cfg.SanitizeInteractionsKeys()
-		h.persistLocked(c)
+		candidate.InteractionsKey = append(candidate.InteractionsKey[:matchIndex], candidate.InteractionsKey[matchIndex+1:]...)
+		candidate.SanitizeInteractionsKeys()
+		h.persistProviderConfigLocked(c, candidate)
 		return
 	}
 	if idxStr := c.Query("index"); idxStr != "" {
 		var idx int
 		_, errScan := fmt.Sscanf(idxStr, "%d", &idx)
-		if errScan == nil && idx >= 0 && idx < len(h.cfg.InteractionsKey) {
-			h.cfg.InteractionsKey = append(h.cfg.InteractionsKey[:idx], h.cfg.InteractionsKey[idx+1:]...)
-			h.cfg.SanitizeInteractionsKeys()
-			h.persistLocked(c)
+		if errScan == nil && idx >= 0 && idx < len(candidate.InteractionsKey) {
+			candidate.InteractionsKey = append(candidate.InteractionsKey[:idx], candidate.InteractionsKey[idx+1:]...)
+			candidate.SanitizeInteractionsKeys()
+			h.persistProviderConfigLocked(c, candidate)
 			return
 		}
 	}
@@ -893,9 +899,10 @@ func (h *Handler) PutOpenAICompat(c *gin.Context) {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.cfg.OpenAICompatibility = filtered
-	h.cfg.SanitizeOpenAICompatibility()
-	h.persistLocked(c)
+	candidate := h.cfg.CloneForRuntime()
+	candidate.OpenAICompatibility = filtered
+	candidate.SanitizeOpenAICompatibility()
+	h.persistProviderConfigLocked(c, candidate)
 }
 func (h *Handler) PatchOpenAICompat(c *gin.Context) {
 	type openAICompatPatch struct {
@@ -924,14 +931,15 @@ func (h *Handler) PatchOpenAICompat(c *gin.Context) {
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	candidate := h.cfg.CloneForRuntime()
 	targetIndex := -1
-	if body.Index != nil && *body.Index >= 0 && *body.Index < len(h.cfg.OpenAICompatibility) {
+	if body.Index != nil && *body.Index >= 0 && *body.Index < len(candidate.OpenAICompatibility) {
 		targetIndex = *body.Index
 	}
 	if targetIndex == -1 && body.Name != nil {
 		match := strings.TrimSpace(*body.Name)
-		for i := range h.cfg.OpenAICompatibility {
-			if h.cfg.OpenAICompatibility[i].Name == match {
+		for i := range candidate.OpenAICompatibility {
+			if candidate.OpenAICompatibility[i].Name == match {
 				targetIndex = i
 				break
 			}
@@ -942,7 +950,7 @@ func (h *Handler) PatchOpenAICompat(c *gin.Context) {
 		return
 	}
 
-	entry := h.cfg.OpenAICompatibility[targetIndex]
+	entry := candidate.OpenAICompatibility[targetIndex]
 	if body.Value.Name != nil {
 		entry.Name = strings.TrimSpace(*body.Value.Name)
 	}
@@ -964,9 +972,9 @@ func (h *Handler) PatchOpenAICompat(c *gin.Context) {
 	if body.Value.BaseURL != nil {
 		trimmed := strings.TrimSpace(*body.Value.BaseURL)
 		if trimmed == "" {
-			h.cfg.OpenAICompatibility = append(h.cfg.OpenAICompatibility[:targetIndex], h.cfg.OpenAICompatibility[targetIndex+1:]...)
-			h.cfg.SanitizeOpenAICompatibility()
-			h.persistLocked(c)
+			candidate.OpenAICompatibility = append(candidate.OpenAICompatibility[:targetIndex], candidate.OpenAICompatibility[targetIndex+1:]...)
+			candidate.SanitizeOpenAICompatibility()
+			h.persistProviderConfigLocked(c, candidate)
 			return
 		}
 		entry.BaseURL = trimmed
@@ -993,33 +1001,34 @@ func (h *Handler) PatchOpenAICompat(c *gin.Context) {
 		entry.RequestScopedErrors = append([]config.RequestScopedErrorRule(nil), *body.Value.RequestScopedErrors...)
 	}
 	normalizeOpenAICompatibilityEntry(&entry)
-	h.cfg.OpenAICompatibility[targetIndex] = entry
-	h.cfg.SanitizeOpenAICompatibility()
-	h.persistLocked(c)
+	candidate.OpenAICompatibility[targetIndex] = entry
+	candidate.SanitizeOpenAICompatibility()
+	h.persistProviderConfigLocked(c, candidate)
 }
 
 func (h *Handler) DeleteOpenAICompat(c *gin.Context) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	candidate := h.cfg.CloneForRuntime()
 	if name := c.Query("name"); name != "" {
-		out := make([]config.OpenAICompatibility, 0, len(h.cfg.OpenAICompatibility))
-		for _, v := range h.cfg.OpenAICompatibility {
+		out := make([]config.OpenAICompatibility, 0, len(candidate.OpenAICompatibility))
+		for _, v := range candidate.OpenAICompatibility {
 			if v.Name != name {
 				out = append(out, v)
 			}
 		}
-		h.cfg.OpenAICompatibility = out
-		h.cfg.SanitizeOpenAICompatibility()
-		h.persistLocked(c)
+		candidate.OpenAICompatibility = out
+		candidate.SanitizeOpenAICompatibility()
+		h.persistProviderConfigLocked(c, candidate)
 		return
 	}
 	if idxStr := c.Query("index"); idxStr != "" {
 		var idx int
 		_, err := fmt.Sscanf(idxStr, "%d", &idx)
-		if err == nil && idx >= 0 && idx < len(h.cfg.OpenAICompatibility) {
-			h.cfg.OpenAICompatibility = append(h.cfg.OpenAICompatibility[:idx], h.cfg.OpenAICompatibility[idx+1:]...)
-			h.cfg.SanitizeOpenAICompatibility()
-			h.persistLocked(c)
+		if err == nil && idx >= 0 && idx < len(candidate.OpenAICompatibility) {
+			candidate.OpenAICompatibility = append(candidate.OpenAICompatibility[:idx], candidate.OpenAICompatibility[idx+1:]...)
+			candidate.SanitizeOpenAICompatibility()
+			h.persistProviderConfigLocked(c, candidate)
 			return
 		}
 	}
@@ -1059,9 +1068,10 @@ func (h *Handler) PutVertexCompatKeys(c *gin.Context) {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.cfg.VertexCompatAPIKey = append([]config.VertexCompatKey(nil), arr...)
-	h.cfg.SanitizeVertexCompatKeys()
-	h.persistLocked(c)
+	candidate := h.cfg.CloneForRuntime()
+	candidate.VertexCompatAPIKey = append([]config.VertexCompatKey(nil), arr...)
+	candidate.SanitizeVertexCompatKeys()
+	h.persistProviderConfigLocked(c, candidate)
 }
 func (h *Handler) PatchVertexCompatKey(c *gin.Context) {
 	type vertexCompatPatch struct {
@@ -1089,15 +1099,16 @@ func (h *Handler) PatchVertexCompatKey(c *gin.Context) {
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	candidate := h.cfg.CloneForRuntime()
 	targetIndex := -1
-	if body.Index != nil && *body.Index >= 0 && *body.Index < len(h.cfg.VertexCompatAPIKey) {
+	if body.Index != nil && *body.Index >= 0 && *body.Index < len(candidate.VertexCompatAPIKey) {
 		targetIndex = *body.Index
 	}
 	if targetIndex == -1 && body.Match != nil {
 		match := strings.TrimSpace(*body.Match)
 		if match != "" {
-			for i := range h.cfg.VertexCompatAPIKey {
-				if h.cfg.VertexCompatAPIKey[i].APIKey == match {
+			for i := range candidate.VertexCompatAPIKey {
+				if candidate.VertexCompatAPIKey[i].APIKey == match {
 					targetIndex = i
 					break
 				}
@@ -1109,13 +1120,13 @@ func (h *Handler) PatchVertexCompatKey(c *gin.Context) {
 		return
 	}
 
-	entry := h.cfg.VertexCompatAPIKey[targetIndex]
+	entry := candidate.VertexCompatAPIKey[targetIndex]
 	if body.Value.APIKey != nil {
 		trimmed := strings.TrimSpace(*body.Value.APIKey)
 		if trimmed == "" {
-			h.cfg.VertexCompatAPIKey = append(h.cfg.VertexCompatAPIKey[:targetIndex], h.cfg.VertexCompatAPIKey[targetIndex+1:]...)
-			h.cfg.SanitizeVertexCompatKeys()
-			h.persistLocked(c)
+			candidate.VertexCompatAPIKey = append(candidate.VertexCompatAPIKey[:targetIndex], candidate.VertexCompatAPIKey[targetIndex+1:]...)
+			candidate.SanitizeVertexCompatKeys()
+			h.persistProviderConfigLocked(c, candidate)
 			return
 		}
 		entry.APIKey = trimmed
@@ -1156,34 +1167,35 @@ func (h *Handler) PatchVertexCompatKey(c *gin.Context) {
 		entry.RequestRetry = body.Value.RequestRetry
 	}
 	normalizeVertexCompatKey(&entry)
-	h.cfg.VertexCompatAPIKey[targetIndex] = entry
-	h.cfg.SanitizeVertexCompatKeys()
-	h.persistLocked(c)
+	candidate.VertexCompatAPIKey[targetIndex] = entry
+	candidate.SanitizeVertexCompatKeys()
+	h.persistProviderConfigLocked(c, candidate)
 }
 
 func (h *Handler) DeleteVertexCompatKey(c *gin.Context) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	candidate := h.cfg.CloneForRuntime()
 	if val := strings.TrimSpace(c.Query("api-key")); val != "" {
 		if baseRaw, okBase := c.GetQuery("base-url"); okBase {
 			base := strings.TrimSpace(baseRaw)
-			out := make([]config.VertexCompatKey, 0, len(h.cfg.VertexCompatAPIKey))
-			for _, v := range h.cfg.VertexCompatAPIKey {
+			out := make([]config.VertexCompatKey, 0, len(candidate.VertexCompatAPIKey))
+			for _, v := range candidate.VertexCompatAPIKey {
 				if strings.TrimSpace(v.APIKey) == val && strings.TrimSpace(v.BaseURL) == base {
 					continue
 				}
 				out = append(out, v)
 			}
-			h.cfg.VertexCompatAPIKey = out
-			h.cfg.SanitizeVertexCompatKeys()
-			h.persistLocked(c)
+			candidate.VertexCompatAPIKey = out
+			candidate.SanitizeVertexCompatKeys()
+			h.persistProviderConfigLocked(c, candidate)
 			return
 		}
 
 		matchIndex := -1
 		matchCount := 0
-		for i := range h.cfg.VertexCompatAPIKey {
-			if strings.TrimSpace(h.cfg.VertexCompatAPIKey[i].APIKey) == val {
+		for i := range candidate.VertexCompatAPIKey {
+			if strings.TrimSpace(candidate.VertexCompatAPIKey[i].APIKey) == val {
 				matchCount++
 				if matchIndex == -1 {
 					matchIndex = i
@@ -1195,19 +1207,19 @@ func (h *Handler) DeleteVertexCompatKey(c *gin.Context) {
 			return
 		}
 		if matchIndex != -1 {
-			h.cfg.VertexCompatAPIKey = append(h.cfg.VertexCompatAPIKey[:matchIndex], h.cfg.VertexCompatAPIKey[matchIndex+1:]...)
+			candidate.VertexCompatAPIKey = append(candidate.VertexCompatAPIKey[:matchIndex], candidate.VertexCompatAPIKey[matchIndex+1:]...)
 		}
-		h.cfg.SanitizeVertexCompatKeys()
-		h.persistLocked(c)
+		candidate.SanitizeVertexCompatKeys()
+		h.persistProviderConfigLocked(c, candidate)
 		return
 	}
 	if idxStr := c.Query("index"); idxStr != "" {
 		var idx int
 		_, errScan := fmt.Sscanf(idxStr, "%d", &idx)
-		if errScan == nil && idx >= 0 && idx < len(h.cfg.VertexCompatAPIKey) {
-			h.cfg.VertexCompatAPIKey = append(h.cfg.VertexCompatAPIKey[:idx], h.cfg.VertexCompatAPIKey[idx+1:]...)
-			h.cfg.SanitizeVertexCompatKeys()
-			h.persistLocked(c)
+		if errScan == nil && idx >= 0 && idx < len(candidate.VertexCompatAPIKey) {
+			candidate.VertexCompatAPIKey = append(candidate.VertexCompatAPIKey[:idx], candidate.VertexCompatAPIKey[idx+1:]...)
+			candidate.SanitizeVertexCompatKeys()
+			h.persistProviderConfigLocked(c, candidate)
 			return
 		}
 	}
@@ -1748,9 +1760,10 @@ func (h *Handler) PutXAIKeys(c *gin.Context) {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.cfg.XAIKey = filtered
-	h.cfg.SanitizeXAIKeys()
-	h.persistLocked(c)
+	candidate := h.cfg.CloneForRuntime()
+	candidate.XAIKey = filtered
+	candidate.SanitizeXAIKeys()
+	h.persistProviderConfigLocked(c, candidate)
 }
 
 func (h *Handler) PatchXAIKey(c *gin.Context) {
@@ -1781,14 +1794,15 @@ func (h *Handler) PatchXAIKey(c *gin.Context) {
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	candidate := h.cfg.CloneForRuntime()
 	targetIndex := -1
-	if body.Index != nil && *body.Index >= 0 && *body.Index < len(h.cfg.XAIKey) {
+	if body.Index != nil && *body.Index >= 0 && *body.Index < len(candidate.XAIKey) {
 		targetIndex = *body.Index
 	}
 	if targetIndex == -1 && body.Match != nil {
 		match := strings.TrimSpace(*body.Match)
-		for i := range h.cfg.XAIKey {
-			if h.cfg.XAIKey[i].APIKey == match {
+		for i := range candidate.XAIKey {
+			if candidate.XAIKey[i].APIKey == match {
 				targetIndex = i
 				break
 			}
@@ -1799,7 +1813,7 @@ func (h *Handler) PatchXAIKey(c *gin.Context) {
 		return
 	}
 
-	entry := h.cfg.XAIKey[targetIndex]
+	entry := candidate.XAIKey[targetIndex]
 	if body.Value.APIKey != nil {
 		entry.APIKey = strings.TrimSpace(*body.Value.APIKey)
 	}
@@ -1820,9 +1834,9 @@ func (h *Handler) PatchXAIKey(c *gin.Context) {
 	if body.Value.BaseURL != nil {
 		trimmed := strings.TrimSpace(*body.Value.BaseURL)
 		if trimmed == "" {
-			h.cfg.XAIKey = append(h.cfg.XAIKey[:targetIndex], h.cfg.XAIKey[targetIndex+1:]...)
-			h.cfg.SanitizeXAIKeys()
-			h.persistLocked(c)
+			candidate.XAIKey = append(candidate.XAIKey[:targetIndex], candidate.XAIKey[targetIndex+1:]...)
+			candidate.SanitizeXAIKeys()
+			h.persistProviderConfigLocked(c, candidate)
 			return
 		}
 		entry.BaseURL = trimmed
@@ -1852,34 +1866,35 @@ func (h *Handler) PatchXAIKey(c *gin.Context) {
 		entry.RequestScopedErrors = append([]config.RequestScopedErrorRule(nil), *body.Value.RequestScopedErrors...)
 	}
 	normalizeCodexKey(&entry)
-	h.cfg.XAIKey[targetIndex] = entry
-	h.cfg.SanitizeXAIKeys()
-	h.persistLocked(c)
+	candidate.XAIKey[targetIndex] = entry
+	candidate.SanitizeXAIKeys()
+	h.persistProviderConfigLocked(c, candidate)
 }
 
 func (h *Handler) DeleteXAIKey(c *gin.Context) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	candidate := h.cfg.CloneForRuntime()
 	if val := strings.TrimSpace(c.Query("api-key")); val != "" {
 		if baseRaw, okBase := c.GetQuery("base-url"); okBase {
 			base := strings.TrimSpace(baseRaw)
-			out := make([]config.XAIKey, 0, len(h.cfg.XAIKey))
-			for _, entry := range h.cfg.XAIKey {
+			out := make([]config.XAIKey, 0, len(candidate.XAIKey))
+			for _, entry := range candidate.XAIKey {
 				if strings.TrimSpace(entry.APIKey) == val && strings.TrimSpace(entry.BaseURL) == base {
 					continue
 				}
 				out = append(out, entry)
 			}
-			h.cfg.XAIKey = out
-			h.cfg.SanitizeXAIKeys()
-			h.persistLocked(c)
+			candidate.XAIKey = out
+			candidate.SanitizeXAIKeys()
+			h.persistProviderConfigLocked(c, candidate)
 			return
 		}
 
 		matchIndex := -1
 		matchCount := 0
-		for i := range h.cfg.XAIKey {
-			if strings.TrimSpace(h.cfg.XAIKey[i].APIKey) == val {
+		for i := range candidate.XAIKey {
+			if strings.TrimSpace(candidate.XAIKey[i].APIKey) == val {
 				matchCount++
 				if matchIndex == -1 {
 					matchIndex = i
@@ -1891,19 +1906,19 @@ func (h *Handler) DeleteXAIKey(c *gin.Context) {
 			return
 		}
 		if matchIndex != -1 {
-			h.cfg.XAIKey = append(h.cfg.XAIKey[:matchIndex], h.cfg.XAIKey[matchIndex+1:]...)
+			candidate.XAIKey = append(candidate.XAIKey[:matchIndex], candidate.XAIKey[matchIndex+1:]...)
 		}
-		h.cfg.SanitizeXAIKeys()
-		h.persistLocked(c)
+		candidate.SanitizeXAIKeys()
+		h.persistProviderConfigLocked(c, candidate)
 		return
 	}
 	if idxStr := c.Query("index"); idxStr != "" {
 		var idx int
 		_, errScan := fmt.Sscanf(idxStr, "%d", &idx)
-		if errScan == nil && idx >= 0 && idx < len(h.cfg.XAIKey) {
-			h.cfg.XAIKey = append(h.cfg.XAIKey[:idx], h.cfg.XAIKey[idx+1:]...)
-			h.cfg.SanitizeXAIKeys()
-			h.persistLocked(c)
+		if errScan == nil && idx >= 0 && idx < len(candidate.XAIKey) {
+			candidate.XAIKey = append(candidate.XAIKey[:idx], candidate.XAIKey[idx+1:]...)
+			candidate.SanitizeXAIKeys()
+			h.persistProviderConfigLocked(c, candidate)
 			return
 		}
 	}
@@ -1946,9 +1961,10 @@ func (h *Handler) PutMetaKeys(c *gin.Context) {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.cfg.MetaKey = filtered
-	h.cfg.SanitizeMetaKeys()
-	h.persistLocked(c)
+	candidate := h.cfg.CloneForRuntime()
+	candidate.MetaKey = filtered
+	candidate.SanitizeMetaKeys()
+	h.persistProviderConfigLocked(c, candidate)
 }
 
 func (h *Handler) PatchMetaKey(c *gin.Context) {
@@ -1978,14 +1994,15 @@ func (h *Handler) PatchMetaKey(c *gin.Context) {
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	candidate := h.cfg.CloneForRuntime()
 	targetIndex := -1
-	if body.Index != nil && *body.Index >= 0 && *body.Index < len(h.cfg.MetaKey) {
+	if body.Index != nil && *body.Index >= 0 && *body.Index < len(candidate.MetaKey) {
 		targetIndex = *body.Index
 	}
 	if targetIndex == -1 && body.Match != nil {
 		match := strings.TrimSpace(*body.Match)
-		for i := range h.cfg.MetaKey {
-			if h.cfg.MetaKey[i].APIKey == match {
+		for i := range candidate.MetaKey {
+			if candidate.MetaKey[i].APIKey == match {
 				targetIndex = i
 				break
 			}
@@ -1996,7 +2013,7 @@ func (h *Handler) PatchMetaKey(c *gin.Context) {
 		return
 	}
 
-	entry := h.cfg.MetaKey[targetIndex]
+	entry := candidate.MetaKey[targetIndex]
 	if body.Value.APIKey != nil {
 		entry.APIKey = strings.TrimSpace(*body.Value.APIKey)
 	}
@@ -2043,34 +2060,35 @@ func (h *Handler) PatchMetaKey(c *gin.Context) {
 		entry.RequestScopedErrors = append([]config.RequestScopedErrorRule(nil), *body.Value.RequestScopedErrors...)
 	}
 	normalizeCodexKey(&entry)
-	h.cfg.MetaKey[targetIndex] = entry
-	h.cfg.SanitizeMetaKeys()
-	h.persistLocked(c)
+	candidate.MetaKey[targetIndex] = entry
+	candidate.SanitizeMetaKeys()
+	h.persistProviderConfigLocked(c, candidate)
 }
 
 func (h *Handler) DeleteMetaKey(c *gin.Context) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	candidate := h.cfg.CloneForRuntime()
 	if val := strings.TrimSpace(c.Query("api-key")); val != "" {
 		if baseRaw, okBase := c.GetQuery("base-url"); okBase {
 			base := strings.TrimSpace(baseRaw)
-			out := make([]config.MetaKey, 0, len(h.cfg.MetaKey))
-			for _, entry := range h.cfg.MetaKey {
+			out := make([]config.MetaKey, 0, len(candidate.MetaKey))
+			for _, entry := range candidate.MetaKey {
 				if strings.TrimSpace(entry.APIKey) == val && strings.TrimSpace(entry.BaseURL) == base {
 					continue
 				}
 				out = append(out, entry)
 			}
-			h.cfg.MetaKey = out
-			h.cfg.SanitizeMetaKeys()
-			h.persistLocked(c)
+			candidate.MetaKey = out
+			candidate.SanitizeMetaKeys()
+			h.persistProviderConfigLocked(c, candidate)
 			return
 		}
 
 		matchIndex := -1
 		matchCount := 0
-		for i := range h.cfg.MetaKey {
-			if strings.TrimSpace(h.cfg.MetaKey[i].APIKey) == val {
+		for i := range candidate.MetaKey {
+			if strings.TrimSpace(candidate.MetaKey[i].APIKey) == val {
 				matchCount++
 				if matchIndex == -1 {
 					matchIndex = i
@@ -2082,19 +2100,19 @@ func (h *Handler) DeleteMetaKey(c *gin.Context) {
 			return
 		}
 		if matchIndex != -1 {
-			h.cfg.MetaKey = append(h.cfg.MetaKey[:matchIndex], h.cfg.MetaKey[matchIndex+1:]...)
+			candidate.MetaKey = append(candidate.MetaKey[:matchIndex], candidate.MetaKey[matchIndex+1:]...)
 		}
-		h.cfg.SanitizeMetaKeys()
-		h.persistLocked(c)
+		candidate.SanitizeMetaKeys()
+		h.persistProviderConfigLocked(c, candidate)
 		return
 	}
 	if idxStr := c.Query("index"); idxStr != "" {
 		var idx int
 		_, errScan := fmt.Sscanf(idxStr, "%d", &idx)
-		if errScan == nil && idx >= 0 && idx < len(h.cfg.MetaKey) {
-			h.cfg.MetaKey = append(h.cfg.MetaKey[:idx], h.cfg.MetaKey[idx+1:]...)
-			h.cfg.SanitizeMetaKeys()
-			h.persistLocked(c)
+		if errScan == nil && idx >= 0 && idx < len(candidate.MetaKey) {
+			candidate.MetaKey = append(candidate.MetaKey[:idx], candidate.MetaKey[idx+1:]...)
+			candidate.SanitizeMetaKeys()
+			h.persistProviderConfigLocked(c, candidate)
 			return
 		}
 	}
