@@ -28,7 +28,7 @@ jobs:
       - name: Verify management reads during configuration reload
         run: >-
           go test -mod=readonly -race -count=1 ./internal/api/handlers/management
-          -run '^(TestHandlerSnapshotOwnsConfigAndPluginYAML|TestHandlerSnapshotGetConfigDuringSetConfig|TestHandlerSnapshotCatalogDuringPluginHostSwap)$'
+          -run '^(TestHandlerSnapshotOwnsConfigAndPluginYAML|TestHandlerSnapshotGetConfigDuringSetConfig|TestHandlerSnapshotCatalogDuringPluginHostSwap|TestAPIKeyListConcurrentPersistence)$'
       - name: Build
         run: |
           go build -o test-output ./cmd/server
