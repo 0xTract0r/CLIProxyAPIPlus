@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -36,10 +37,41 @@ func writeConfigYAML(path string, data []byte) error {
 	// A positive mount-ID boundary at an existing regular file identifies
 	// a file mount, even if its parent is read-only. Do not fall back for
 	// generic rename failures such as permissions or a read-only filesystem.
-	if info.Sys().(*syscall.Stat_t).Nlink > 1 || isConfigFileMount(original, parent) {
+	hasMetadata, err := configInodeHasMetadata(original)
+	if err != nil {
+		return err
+	}
+	if hasMetadata || info.Sys().(*syscall.Stat_t).Nlink > 1 || isConfigFileMount(original, parent) {
 		return writeConfigYAMLInPlace(target, info, data)
 	}
 	return replaceConfigYAML(target, parent, info, data, (*os.File).Sync)
+}
+
+const configAccessACL = "system.posix_acl_access"
+
+// The mode alone cannot describe an ACL, and renaming a new inode would
+// discard other extended attributes too. Keep existing metadata on its inode.
+func configInodeHasMetadata(file *os.File) (bool, error) {
+	fd := int(file.Fd())
+	size, err := unix.Flistxattr(fd, nil)
+	if errors.Is(err, unix.EOPNOTSUPP) {
+		return false, nil
+	}
+	if err != nil || size == 0 {
+		return false, err
+	}
+	names := make([]byte, size)
+	n, err := unix.Flistxattr(fd, names)
+	if err != nil {
+		return false, err
+	}
+	for _, name := range bytes.Split(names[:n], []byte{0}) {
+		switch string(name) {
+		case "security.capability", "security.ima", "security.evm":
+			return false, fmt.Errorf("cannot safely preserve configuration integrity attribute %s", name)
+		}
+	}
+	return n != 0, nil
 }
 
 func isConfigFileMount(original *os.File, parent string) bool {
@@ -63,6 +95,12 @@ func replaceConfigYAML(target, parent string, original os.FileInfo, data []byte,
 	}
 	defer os.Remove(tmp.Name())
 	defer tmp.Close()
+	// CreateTemp may inherit a directory's default ACL. Removing it before
+	// chmod prevents group mode bits from enabling inherited named entries.
+	if err := unix.Fremovexattr(int(tmp.Fd()), configAccessACL); err != nil &&
+		!errors.Is(err, unix.ENODATA) && !errors.Is(err, unix.EOPNOTSUPP) {
+		return fmt.Errorf("remove inherited configuration ACL: %w", err)
+	}
 
 	want := original.Sys().(*syscall.Stat_t)
 	current, err := tmp.Stat()
@@ -87,12 +125,24 @@ func replaceConfigYAML(target, parent string, original os.FileInfo, data []byte,
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	current, err = os.Stat(target)
+	currentFile, err := os.Open(target)
+	if err != nil {
+		return err
+	}
+	defer currentFile.Close()
+	current, err = currentFile.Stat()
 	if err != nil {
 		return err
 	}
 	if !os.SameFile(current, original) || current.Sys().(*syscall.Stat_t).Nlink > 1 {
 		return fmt.Errorf("config file or its hard links changed during save: %s", target)
+	}
+	hasMetadata, err := configInodeHasMetadata(currentFile)
+	if err != nil {
+		return err
+	}
+	if hasMetadata {
+		return fmt.Errorf("config access metadata changed during save: %s", target)
 	}
 	if err := os.Rename(tmp.Name(), target); err != nil {
 		return err

@@ -32,7 +32,7 @@ jobs:
       - name: Validate Linux configuration write recovery
         run: >-
           go test -mod=readonly -race -count=1 ./internal/config
-          -run '^(TestSaveConfigPreservesBytesOnFileSizeLimit|TestConfigInodeRecoveryAfterPartialWrite|TestConfigReplacementDoesNotFallbackOnPermissionFailure|TestConfigInodeRecoverySerializesCommit|TestConfigHardLinksShareSuccessfulSaves|TestConfigCommittedOnDirectorySyncWarning)$'
+          -run '^(TestSaveConfigPreservesBytesOnFileSizeLimit|TestConfigInodeRecoveryAfterPartialWrite|TestConfigReplacementDoesNotFallbackOnPermissionFailure|TestConfigInodeRecoverySerializesCommit|TestConfigHardLinksShareSuccessfulSaves|TestConfigCommittedOnDirectorySyncWarning|TestConfigSavePreservesNamedReaderAndDeniesOwningGroup|TestConfigSaveDoesNotInheritNewAccessACL|TestConfigSaveXattrsPreservesExistingLabel)$'
       - name: Build
         run: |
           go build -o test-output ./cmd/server
