@@ -76,14 +76,12 @@ func (m *Manager) Login(ctx context.Context, provider string, cfg *config.Config
 		return nil, "", fmt.Errorf("cliproxy auth: authenticator %s returned nil record", provider)
 	}
 
-	if m.store == nil {
+	store := m.storeForConfig(cfg)
+	if store == nil {
 		return record, "", nil
 	}
 
 	if cfg != nil {
-		if dirSetter, ok := m.store.(interface{ SetBaseDir(string) }); ok {
-			dirSetter.SetBaseDir(cfg.AuthDir)
-		}
 		if strings.TrimSpace(cfg.AuthDir) != "" {
 			targetFile := record.FileName
 			if targetFile == "" {
@@ -100,14 +98,14 @@ func (m *Manager) Login(ctx context.Context, provider string, cfg *config.Config
 			}
 		}
 	}
-	legacyClaudeCredential, errLegacy := claudeauth.FindMatchingLegacyCredential(ctx, m.store, record)
+	legacyClaudeCredential, errLegacy := claudeauth.FindMatchingLegacyCredential(ctx, store, record)
 	if errLegacy != nil {
 		return record, "", errLegacy
 	}
 	if legacyClaudeCredential != nil {
 		coreauth.MergeExistingAuthMetadata(record, legacyClaudeCredential.Metadata)
 	}
-	legacyXAICredential, errLegacyXAI := xaiauth.FindMatchingLegacyCredential(ctx, m.store, record)
+	legacyXAICredential, errLegacyXAI := xaiauth.FindMatchingLegacyCredential(ctx, store, record)
 	if errLegacyXAI != nil {
 		return record, "", errLegacyXAI
 	}
@@ -124,7 +122,7 @@ func (m *Manager) Login(ctx context.Context, provider string, cfg *config.Config
 		// every built-in backend (file, git, Postgres, object) exposes the
 		// SetBaseDir capability, so unknown stores keep the ordinary
 		// migration instead of risking a rename they cannot honor.
-		if _, isFileNameStore := m.store.(interface{ SetBaseDir(string) }); !isFileNameStore {
+		if _, isFileNameStore := store.(interface{ SetBaseDir(string) }); !isFileNameStore {
 			adoptXAICredential = false
 		} else if disabled, hasDisabled := record.Metadata["disabled"].(bool); hasDisabled && disabled {
 			// The destination file deliberately disables this credential; renaming
@@ -141,7 +139,7 @@ func (m *Manager) Login(ctx context.Context, provider string, cfg *config.Config
 	}
 	applyLoginProxyToRecord(record, loginProxyURL)
 
-	savedPath, err := m.store.Save(coreauth.WithAuthCreationIntent(ctx), record)
+	savedPath, err := store.Save(coreauth.WithAuthCreationIntent(ctx), record)
 	if err != nil {
 		return record, "", err
 	}
@@ -153,7 +151,7 @@ func (m *Manager) Login(ctx context.Context, provider string, cfg *config.Config
 		if legacyID == "" {
 			legacyID = strings.TrimSpace(legacyClaudeCredential.FileName)
 		}
-		if errDelete := m.store.Delete(ctx, legacyID); errDelete != nil {
+		if errDelete := store.Delete(ctx, legacyID); errDelete != nil {
 			return record, savedPath, fmt.Errorf("cliproxy auth: canonical Claude credential saved but legacy credential cleanup failed: %w", errDelete)
 		}
 	}
@@ -165,7 +163,7 @@ func (m *Manager) Login(ctx context.Context, provider string, cfg *config.Config
 		if legacyID == "" {
 			legacyID = strings.TrimSpace(legacyXAICredential.FileName)
 		}
-		if errDelete := m.store.Delete(ctx, legacyID); errDelete != nil {
+		if errDelete := store.Delete(ctx, legacyID); errDelete != nil {
 			return record, savedPath, fmt.Errorf("cliproxy auth: canonical xAI credential saved but legacy credential cleanup failed: %w", errDelete)
 		}
 	}
@@ -234,4 +232,26 @@ func adoptLegacyXAIFileName(record, legacy *coreauth.Auth) {
 			delete(record.Attributes, key)
 		}
 	}
+}
+
+// SaveAuth persists an auth record directly without going through the login flow.
+func (m *Manager) SaveAuth(record *coreauth.Auth, cfg *config.Config) (string, error) {
+	store := m.storeForConfig(cfg)
+	if store == nil {
+		return "", fmt.Errorf("no store configured")
+	}
+	return store.Save(context.Background(), record)
+}
+
+func (m *Manager) storeForConfig(cfg *config.Config) coreauth.Store {
+	store := m.store
+	if cfg != nil {
+		if files, ok := store.(*FileTokenStore); ok {
+			return files.WithBaseDir(cfg.AuthDir)
+		}
+		if dirSetter, ok := store.(interface{ SetBaseDir(string) }); ok {
+			dirSetter.SetBaseDir(cfg.AuthDir)
+		}
+	}
+	return store
 }

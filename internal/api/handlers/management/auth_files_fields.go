@@ -19,6 +19,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/codex"
 	xaiauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/xai"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/credentialweight"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/watcher/synthesizer"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth"
@@ -115,8 +116,8 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 			return
 		}
 		h.reloadConfigAfterManagementSave(ctx, cfgSnapshot)
-		if h.tokenStore != nil {
-			_ = h.tokenStore.Delete(ctx, targetAuth.ID)
+		if store := h.tokenStoreWithBaseDir(); store != nil {
+			_ = store.Delete(ctx, targetAuth.ID)
 		}
 		c.JSON(http.StatusOK, gin.H{
 			"status":           "ok",
@@ -937,15 +938,21 @@ func (h *Handler) deleteTokenRecord(ctx context.Context, path string) error {
 }
 
 func (h *Handler) tokenStoreWithBaseDir() coreauth.Store {
+	return h.tokenStoreForConfig(h.configSnapshot())
+}
+
+func (h *Handler) tokenStoreForConfig(cfg *config.Config) coreauth.Store {
 	if h == nil {
 		return nil
 	}
 	store := h.tokenStore
 	if store == nil {
 		store = sdkAuth.GetTokenStore()
-		h.tokenStore = store
 	}
-	if cfg := h.configSnapshot(); cfg != nil {
+	if cfg != nil {
+		if files, ok := store.(*sdkAuth.FileTokenStore); ok {
+			return files.WithBaseDir(cfg.AuthDir)
+		}
 		if dirSetter, ok := store.(interface{ SetBaseDir(string) }); ok {
 			dirSetter.SetBaseDir(cfg.AuthDir)
 		}
@@ -953,13 +960,13 @@ func (h *Handler) tokenStoreWithBaseDir() coreauth.Store {
 	return store
 }
 
-func (h *Handler) mergeExistingAuthFileMetadata(record *coreauth.Auth) {
+func (h *Handler) mergeExistingAuthFileMetadata(record *coreauth.Auth, cfg *config.Config) {
 	if h == nil || record == nil {
 		return
 	}
 	var existingMap map[string]any
 
-	if cfg := h.configSnapshot(); cfg != nil && strings.TrimSpace(cfg.AuthDir) != "" {
+	if cfg != nil && strings.TrimSpace(cfg.AuthDir) != "" {
 		fullPath := ""
 		if record.Attributes != nil {
 			fullPath = strings.TrimSpace(record.Attributes[coreauth.AttributePath])
@@ -1016,11 +1023,15 @@ func isTargetedOAuthSave(ctx context.Context) bool {
 }
 
 func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (string, error) {
+	return h.saveTokenRecordWithConfig(ctx, record, h.configSnapshot())
+}
+
+func (h *Handler) saveTokenRecordWithConfig(ctx context.Context, record *coreauth.Auth, cfg *config.Config) (string, error) {
 	if record == nil {
 		return "", fmt.Errorf("token record is nil")
 	}
-	h.mergeExistingAuthFileMetadata(record)
-	store := h.tokenStoreWithBaseDir()
+	h.mergeExistingAuthFileMetadata(record, cfg)
+	store := h.tokenStoreForConfig(cfg)
 	if store == nil {
 		return "", fmt.Errorf("token store unavailable")
 	}
@@ -1105,7 +1116,6 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 	if h.postAuthPersistHook != nil {
 		persistedRecord := record
 		if data, errRead := os.ReadFile(savedPath); errRead == nil && len(data) > 0 {
-			cfg := h.configSnapshot()
 			authDir := filepath.Dir(savedPath)
 			if cfg != nil && strings.TrimSpace(cfg.AuthDir) != "" {
 				authDir = cfg.AuthDir

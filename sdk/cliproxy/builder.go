@@ -298,8 +298,12 @@ func (b *Builder) Build() (*Service, error) {
 	var appliedRoutingState *routingRuntimeState
 	if coreManager == nil {
 		tokenStore := sdkAuth.GetTokenStore()
-		if dirSetter, ok := tokenStore.(interface{ SetBaseDir(string) }); ok && b.cfg != nil {
-			dirSetter.SetBaseDir(b.cfg.AuthDir)
+		if b.cfg != nil {
+			if files, ok := tokenStore.(*sdkAuth.FileTokenStore); ok {
+				tokenStore = files.WithBaseDir(b.cfg.AuthDir)
+			} else if dirSetter, ok := tokenStore.(interface{ SetBaseDir(string) }); ok {
+				dirSetter.SetBaseDir(b.cfg.AuthDir)
+			}
 		}
 		if cooldownStateStore == nil {
 			if provider, ok := tokenStore.(coreauth.CooldownStateStoreProvider); ok {

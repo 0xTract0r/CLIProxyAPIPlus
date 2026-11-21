@@ -53,15 +53,32 @@ func currentPluginAuthParser() PluginAuthParser {
 
 // FileTokenStore persists token records and auth metadata using the filesystem as backing storage.
 type FileTokenStore struct {
-	mu      sync.Mutex
-	dirLock sync.RWMutex
-	baseDir string
+	mu            sync.Mutex
+	sharedWriteMu *sync.Mutex
+	dirLock       sync.RWMutex
+	baseDir       string
 }
 
 // NewFileTokenStore creates a token store that saves credentials to disk through the
 // TokenStorage implementation embedded in the token record.
 func NewFileTokenStore() *FileTokenStore {
 	return &FileTokenStore{}
+}
+
+// WithBaseDir returns a directory view of this store. Views share the
+// original store's write lock, but changing a view's directory is local to it.
+func (s *FileTokenStore) WithBaseDir(dir string) *FileTokenStore {
+	return &FileTokenStore{
+		baseDir:       strings.TrimSpace(dir),
+		sharedWriteMu: s.writeMutex(),
+	}
+}
+
+func (s *FileTokenStore) writeMutex() *sync.Mutex {
+	if s.sharedWriteMu != nil {
+		return s.sharedWriteMu
+	}
+	return &s.mu
 }
 
 // SetBaseDir updates the default directory used for auth JSON persistence when no explicit path is provided.
@@ -98,8 +115,9 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 		}
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	writeMu := s.writeMutex()
+	writeMu.Lock()
+	defer writeMu.Unlock()
 
 	if err = os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return "", fmt.Errorf("auth filestore: create dir failed: %w", err)
