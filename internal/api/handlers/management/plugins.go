@@ -3,6 +3,7 @@ package management
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"os"
 	"sort"
@@ -256,26 +257,11 @@ func (h *Handler) PatchPluginEnabled(c *gin.Context) {
 		return
 	}
 
-	h.mu.Lock()
-	ensurePluginConfigMap(h.cfg)
-	item := h.cfg.Plugins.Configs[id]
-	node := pluginConfigNode(item)
-	setYAMLMappingValue(node, "enabled", boolYAMLNode(*body.Enabled))
-	updated, errConfig := pluginInstanceConfigFromNode(node)
-	if errConfig != nil {
-		h.mu.Unlock()
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_config", "message": errConfig.Error()})
-		return
-	}
-	h.cfg.Plugins.Configs[id] = updated
-	cfgSnapshot, okSnapshot := h.saveConfigAndSnapshotLocked(c)
-	h.mu.Unlock()
-	if !okSnapshot {
-		return
-	}
-
-	h.reloadConfigAfterManagementSaveAsync(c.Request.Context(), cfgSnapshot)
-	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+	h.updatePluginConfig(c, id, func(item config.PluginInstanceConfig) (*yaml.Node, bool) {
+		node := pluginConfigNode(item)
+		setYAMLMappingValue(node, "enabled", boolYAMLNode(*body.Enabled))
+		return node, true
+	})
 }
 
 // PutPluginConfig replaces plugins.configs.<id> with the request object.
@@ -293,17 +279,9 @@ func (h *Handler) PutPluginConfig(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_body", "message": errNode.Error()})
 		return
 	}
-	updated, errConfig := pluginInstanceConfigFromNode(node)
-	if errConfig != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_config", "message": errConfig.Error()})
-		return
-	}
-
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	ensurePluginConfigMap(h.cfg)
-	h.cfg.Plugins.Configs[id] = updated
-	h.persistLocked(c)
+	h.updatePluginConfig(c, id, func(config.PluginInstanceConfig) (*yaml.Node, bool) {
+		return node, true
+	})
 }
 
 // PatchPluginConfig shallow-merges plugins.configs.<id> with the request object.
@@ -317,35 +295,65 @@ func (h *Handler) PatchPluginConfig(c *gin.Context) {
 		return
 	}
 
+	h.updatePluginConfig(c, id, func(item config.PluginInstanceConfig) (*yaml.Node, bool) {
+		node := pluginConfigNode(item)
+		keys := make([]string, 0, len(body))
+		for key := range body {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			value := body[key]
+			if value == nil {
+				deleteYAMLMappingKey(node, key)
+				continue
+			}
+			valueNode, errNode := yamlNodeFromJSONValue(value)
+			if errNode != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_body", "message": errNode.Error()})
+				return nil, false
+			}
+			setYAMLMappingValue(node, key, valueNode)
+		}
+		return node, true
+	})
+}
+
+func (h *Handler) updatePluginConfig(c *gin.Context, id string, update func(config.PluginInstanceConfig) (*yaml.Node, bool)) {
+	if h == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "config unavailable"})
+		return
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	ensurePluginConfigMap(h.cfg)
-	node := pluginConfigNode(h.cfg.Plugins.Configs[id])
-	keys := make([]string, 0, len(body))
-	for key := range body {
-		keys = append(keys, key)
+	if h.cfg == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "config unavailable"})
+		return
 	}
-	sort.Strings(keys)
-	for _, key := range keys {
-		value := body[key]
-		if value == nil {
-			deleteYAMLMappingKey(node, key)
-			continue
-		}
-		valueNode, errNode := yamlNodeFromJSONValue(value)
-		if errNode != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_body", "message": errNode.Error()})
-			return
-		}
-		setYAMLMappingValue(node, key, valueNode)
+	next := h.cfg.CloneForRuntime()
+	next.NormalizePluginsConfig()
+	node, ok := update(next.Plugins.Configs[id])
+	if !ok {
+		return
 	}
 	updated, errConfig := pluginInstanceConfigFromNode(node)
 	if errConfig != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_config", "message": errConfig.Error()})
 		return
 	}
-	h.cfg.Plugins.Configs[id] = updated
-	h.persistLocked(c)
+	next.Plugins.Configs[id] = updated
+	if errSave := config.SaveConfigPreserveComments(h.configFilePath, next, c.GetBool(ConfigV8ContextKey)); errSave != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to save config: %v", errSave)})
+		return
+	}
+	// Publish the normalized plugin block without replacing the shared config.
+	h.cfg.Plugins = next.Plugins
+	if !maps.Equal(h.cfg.OAuthOnlyFields, next.OAuthOnlyFields) {
+		h.cfg.OAuthOnlyFields = next.OAuthOnlyFields
+	}
+	snapshot := h.reloadSnapshotConfigLocked()
+	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+	h.reloadConfigAfterManagementSaveAsync(c.Request.Context(), snapshot)
 }
 
 // DeletePlugin removes the selected local plugin file and its saved config.
