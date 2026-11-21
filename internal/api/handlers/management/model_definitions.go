@@ -6,7 +6,6 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 )
 
@@ -86,13 +85,7 @@ func (h *Handler) GetStaticModelDefinitions(c *gin.Context) {
 }
 
 func (h *Handler) pluginModelDefinitionsByChannel(channel string) []*registry.ModelInfo {
-	var host *pluginhost.Host
-	if h != nil {
-		h.mu.Lock()
-		host = h.pluginHost
-		h.mu.Unlock()
-	}
-	if host != nil {
+	if host := h.pluginHostSnapshot(); host != nil {
 		if models := host.ModelsForProvider(channel); len(models) > 0 {
 			return models
 		}

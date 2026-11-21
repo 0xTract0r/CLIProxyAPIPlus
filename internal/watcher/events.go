@@ -6,6 +6,8 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -31,7 +33,18 @@ func (w *Watcher) start(ctx context.Context) error {
 		log.Errorf("failed to watch config file %s: %v", w.configPath, errAddConfig)
 		return errAddConfig
 	}
-	log.Debugf("watching config file: %s", w.configPath)
+	configParent := filepath.Dir(w.configPath)
+	// A rename drops the inode watch; the directory watch persists across replacements.
+	if err := w.watcher.Add(configParent); err != nil {
+		return fmt.Errorf("watch config parent %s: %w", configParent, err)
+	}
+	if realConfig, err := filepath.EvalSymlinks(w.configPath); err == nil &&
+		!w.sameNormalizedAuthPath(filepath.Dir(realConfig), configParent) {
+		if err := w.watcher.Add(filepath.Dir(realConfig)); err != nil {
+			return fmt.Errorf("watch resolved config parent %s: %w", realConfig, err)
+		}
+	}
+	log.Debugf("watching config file and parent: %s", w.configPath)
 
 	w.watchMu.Lock()
 	authDir := w.currentAuthDir()
@@ -51,6 +64,14 @@ func (w *Watcher) start(ctx context.Context) error {
 	return nil
 }
 
+func (w *Watcher) isConfigParent(path string) bool {
+	if w.sameNormalizedAuthPath(path, filepath.Dir(w.configPath)) {
+		return true
+	}
+	resolved, err := filepath.EvalSymlinks(w.configPath)
+	return err == nil && w.sameNormalizedAuthPath(path, filepath.Dir(resolved))
+}
+
 func (w *Watcher) syncAuthDirWatch() {
 	if w == nil || w.watcher == nil || w.stopped.Load() {
 		return
@@ -65,7 +86,7 @@ func (w *Watcher) syncAuthDirWatch() {
 	if oldWatched == target {
 		return
 	}
-	if oldWatched != "" && !w.sameNormalizedAuthPath(oldWatched, w.configPath) && !w.sameNormalizedAuthPath(oldWatched, target) {
+	if oldWatched != "" && !w.sameNormalizedAuthPath(oldWatched, w.configPath) && !w.isConfigParent(oldWatched) && !w.sameNormalizedAuthPath(oldWatched, target) {
 		if errRemove := w.watcher.Remove(oldWatched); errRemove != nil {
 			log.Debugf("failed to remove previous auth directory watch %s: %v", oldWatched, errRemove)
 		}
@@ -111,8 +132,14 @@ func (w *Watcher) handleEvent(event fsnotify.Event) {
 	configOps := fsnotify.Write | fsnotify.Create | fsnotify.Rename
 	normalizedName := w.normalizeAuthPath(event.Name)
 	normalizedConfigPath := w.normalizeAuthPath(w.configPath)
+	isConfigPath := normalizedName == normalizedConfigPath
+	if !isConfigPath && event.Op&configOps != 0 {
+		if resolved, err := filepath.EvalSymlinks(w.configPath); err == nil {
+			isConfigPath = normalizedName == w.normalizeAuthPath(resolved)
+		}
+	}
 	normalizedAuthDir := w.normalizeAuthPath(w.currentAuthDir())
-	isConfigEvent := normalizedName == normalizedConfigPath && event.Op&configOps != 0
+	isConfigEvent := isConfigPath && event.Op&configOps != 0
 	authOps := fsnotify.Create | fsnotify.Write | fsnotify.Remove | fsnotify.Rename
 	isAuthJSON := filepath.Dir(normalizedName) == normalizedAuthDir && strings.HasSuffix(normalizedName, ".json") && event.Op&authOps != 0
 	if !isConfigEvent && !isAuthJSON {
@@ -126,6 +153,12 @@ func (w *Watcher) handleEvent(event fsnotify.Event) {
 	// Handle config file changes
 	if isConfigEvent {
 		log.Debugf("config file change details - operation: %s, timestamp: %s", event.Op.String(), now.Format("2006-01-02 15:04:05.000"))
+		if event.Op&(fsnotify.Create|fsnotify.Rename) != 0 {
+			// Best effort: a following Create event retries if the path was briefly absent.
+			if err := w.watcher.Add(w.configPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+				log.Debugf("failed to reattach config watch %s: %v", w.configPath, err)
+			}
+		}
 		w.scheduleConfigReload()
 		return
 	}

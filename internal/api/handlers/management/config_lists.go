@@ -3,6 +3,7 @@ package management
 import (
 	"bytes"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/MoeForge/moego/json"
@@ -47,8 +48,16 @@ func rejectInvalidFingerprintProfile(c *gin.Context, field, profile string) bool
 	return false
 }
 
-// Generic helpers for list[string]
-func (h *Handler) putStringList(c *gin.Context, set func([]string), after func()) {
+// persistStringListLocked preserves the current list if the configuration write fails.
+func (h *Handler) persistStringListLocked(c *gin.Context, target *[]string, next []string) {
+	previous := *target
+	*target = next
+	if !h.persistLocked(c) {
+		*target = previous
+	}
+}
+
+func (h *Handler) putStringList(c *gin.Context, targetOf func() *[]string) {
 	data, err := c.GetRawData()
 	if err != nil {
 		c.JSON(400, gin.H{"error": "failed to read body"})
@@ -67,16 +76,12 @@ func (h *Handler) putStringList(c *gin.Context, set func([]string), after func()
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	set(arr)
-	if after != nil {
-		after()
-	}
-	h.persistLocked(c)
+	h.persistStringListLocked(c, targetOf(), append([]string(nil), arr...))
 }
 
 // patchStringList resolves the list through targetOf under h.mu, so it edits the
 // current config instead of one a reload has replaced.
-func (h *Handler) patchStringList(c *gin.Context, targetOf func() *[]string, after func()) {
+func (h *Handler) patchStringList(c *gin.Context, targetOf func() *[]string) {
 	var body struct {
 		Old   *string `json:"old"`
 		New   *string `json:"new"`
@@ -91,29 +96,22 @@ func (h *Handler) patchStringList(c *gin.Context, targetOf func() *[]string, aft
 	defer h.mu.Unlock()
 	target := targetOf()
 	if body.Index != nil && body.Value != nil && *body.Index >= 0 && *body.Index < len(*target) {
-		(*target)[*body.Index] = *body.Value
-		if after != nil {
-			after()
-		}
-		h.persistLocked(c)
+		next := slices.Clone(*target)
+		next[*body.Index] = *body.Value
+		h.persistStringListLocked(c, target, next)
 		return
 	}
 	if body.Old != nil && body.New != nil {
 		for i := range *target {
 			if (*target)[i] == *body.Old {
-				(*target)[i] = *body.New
-				if after != nil {
-					after()
-				}
-				h.persistLocked(c)
+				next := slices.Clone(*target)
+				next[i] = *body.New
+				h.persistStringListLocked(c, target, next)
 				return
 			}
 		}
-		*target = append(*target, *body.New)
-		if after != nil {
-			after()
-		}
-		h.persistLocked(c)
+		next := append(slices.Clone(*target), *body.New)
+		h.persistStringListLocked(c, target, next)
 		return
 	}
 	c.JSON(400, gin.H{"error": "missing fields"})
@@ -121,7 +119,7 @@ func (h *Handler) patchStringList(c *gin.Context, targetOf func() *[]string, aft
 
 // deleteFromStringList resolves the list through targetOf under h.mu, so it edits
 // the current config instead of one a reload has replaced.
-func (h *Handler) deleteFromStringList(c *gin.Context, targetOf func() *[]string, after func()) {
+func (h *Handler) deleteFromStringList(c *gin.Context, targetOf func() *[]string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	target := targetOf()
@@ -129,11 +127,8 @@ func (h *Handler) deleteFromStringList(c *gin.Context, targetOf func() *[]string
 		var idx int
 		_, err := fmt.Sscanf(idxStr, "%d", &idx)
 		if err == nil && idx >= 0 && idx < len(*target) {
-			*target = append((*target)[:idx], (*target)[idx+1:]...)
-			if after != nil {
-				after()
-			}
-			h.persistLocked(c)
+			next := slices.Delete(slices.Clone(*target), idx, idx+1)
+			h.persistStringListLocked(c, target, next)
 			return
 		}
 	}
@@ -144,28 +139,27 @@ func (h *Handler) deleteFromStringList(c *gin.Context, targetOf func() *[]string
 				out = append(out, v)
 			}
 		}
-		*target = out
-		if after != nil {
-			after()
-		}
-		h.persistLocked(c)
+		h.persistStringListLocked(c, target, out)
 		return
 	}
 	c.JSON(400, gin.H{"error": "missing index or value"})
 }
 
 // api-keys
-func (h *Handler) GetAPIKeys(c *gin.Context) { c.JSON(200, gin.H{"api-keys": h.cfg.APIKeys}) }
+func (h *Handler) GetAPIKeys(c *gin.Context) {
+	h.mu.Lock()
+	keys := slices.Clone(h.cfg.APIKeys)
+	h.mu.Unlock()
+	c.JSON(200, gin.H{"api-keys": keys})
+}
 func (h *Handler) PutAPIKeys(c *gin.Context) {
-	h.putStringList(c, func(v []string) {
-		h.cfg.APIKeys = append([]string(nil), v...)
-	}, nil)
+	h.putStringList(c, func() *[]string { return &h.cfg.APIKeys })
 }
 func (h *Handler) PatchAPIKeys(c *gin.Context) {
-	h.patchStringList(c, func() *[]string { return &h.cfg.APIKeys }, func() {})
+	h.patchStringList(c, func() *[]string { return &h.cfg.APIKeys })
 }
 func (h *Handler) DeleteAPIKeys(c *gin.Context) {
-	h.deleteFromStringList(c, func() *[]string { return &h.cfg.APIKeys }, func() {})
+	h.deleteFromStringList(c, func() *[]string { return &h.cfg.APIKeys })
 }
 
 // gemini-api-key: []GeminiKey
