@@ -17,8 +17,8 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - name: Refresh models catalog
-        run: bash .github/scripts/refresh-model-catalogs.sh
+      - name: Verify embedded model catalogs
+        run: bash .github/scripts/verify-embedded-model-catalogs.sh
       - name: Test YAML persistence and downstream WebSocket negotiation
         env:
           TZ: UTC

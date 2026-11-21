@@ -131,9 +131,9 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
-      - name: Refresh models catalog
+      - name: Verify embedded model catalogs
         shell: bash
-        run: bash .github/scripts/refresh-model-catalogs.sh
+        run: bash .github/scripts/verify-embedded-model-catalogs.sh
       - name: Fetch tags
         shell: bash
         run: git fetch --force --tags
@@ -258,9 +258,9 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
-      - name: Refresh models catalog
+      - name: Verify embedded model catalogs
         shell: bash
-        run: bash .github/scripts/refresh-model-catalogs.sh
+        run: bash .github/scripts/verify-embedded-model-catalogs.sh
       - name: Fetch tags
         shell: bash
         run: git fetch --force --tags
@@ -390,9 +390,9 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
-      - name: Refresh models catalog
+      - name: Verify embedded model catalogs
         shell: bash
-        run: bash .github/scripts/refresh-model-catalogs.sh
+        run: bash .github/scripts/verify-embedded-model-catalogs.sh
       - name: Fetch tags
         shell: bash
         run: git fetch --force --tags
@@ -518,8 +518,8 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
-      - name: Refresh models catalog
-        run: bash .github/scripts/refresh-model-catalogs.sh
+      - name: Verify embedded model catalogs
+        run: bash .github/scripts/verify-embedded-model-catalogs.sh
       - name: Fetch tags
         run: git fetch --force --tags
       - uses: actions/cache@v4
