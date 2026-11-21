@@ -167,6 +167,17 @@ func (m *Manager) lockAuthMutationWithPersistCancel(ctx context.Context, id stri
 	if errAcquire := m.authLoadGate.Acquire(ctx, 1); errAcquire != nil {
 		return nil, errAcquire
 	}
+	release, err := m.lockCredentialUnderLoad(ctx, id, persistCancel)
+	if err != nil {
+		m.authLoadGate.Release(1)
+		return nil, err
+	}
+	var once sync.Once
+	return func() { once.Do(func() { release(); m.authLoadGate.Release(1) }) }, nil
+}
+
+// lockCredentialUnderLoad requires a slot in authLoadGate.
+func (m *Manager) lockCredentialUnderLoad(ctx context.Context, id string, persistCancel context.CancelFunc) (func(), error) {
 	value, _ := m.authMutationLocks.LoadOrStore(id, make(chan struct{}, 1))
 	gate := value.(chan struct{})
 	state := m.metadataPersistPreempt(id)
@@ -189,11 +200,9 @@ func (m *Manager) lockAuthMutationWithPersistCancel(ctx context.Context, id stri
 		// Cancellation may race with the gate becoming available.
 		if errContext := ctx.Err(); errContext != nil {
 			<-gate
-			m.authLoadGate.Release(1)
 			return nil, errContext
 		}
 	case <-ctx.Done():
-		m.authLoadGate.Release(1)
 		return nil, ctx.Err()
 	}
 	if persistCancel != nil {
@@ -215,9 +224,38 @@ func (m *Manager) lockAuthMutationWithPersistCancel(ctx context.Context, id stri
 				state.mu.Unlock()
 			}
 			<-gate
-			m.authLoadGate.Release(1)
 		})
 	}, nil
+}
+
+// Acquire one reload slot for the whole group. Taking one slot per member
+// could deadlock with a reload queued between two members of a shared file.
+func (m *Manager) lockAuthMutationsContext(ctx context.Context, sortedIDs []string) (func(), error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := m.authLoadGate.Acquire(ctx, 1); err != nil {
+		return nil, err
+	}
+	releases := make([]func(), 0, len(sortedIDs))
+	var once sync.Once
+	releaseAll := func() {
+		once.Do(func() {
+			for i := len(releases) - 1; i >= 0; i-- {
+				releases[i]()
+			}
+			m.authLoadGate.Release(1)
+		})
+	}
+	for _, id := range sortedIDs {
+		release, err := m.lockCredentialUnderLoad(ctx, id, nil)
+		if err != nil {
+			releaseAll()
+			return nil, err
+		}
+		releases = append(releases, release)
+	}
+	return releaseAll, nil
 }
 
 // persistLocked requires m.mu and the credential mutation gate. Never pass a

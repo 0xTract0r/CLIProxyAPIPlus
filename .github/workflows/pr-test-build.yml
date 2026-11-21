@@ -39,6 +39,11 @@ jobs:
         run: >-
           go test -mod=readonly -race -count=1 ./internal/api ./internal/api/handlers/management
           -run '^(TestPluginConfigWritePreservesLastSavedValue|TestPluginConfigWritesRejectUnavailableConfig|TestPatchPluginEnabled(UpdatesOnlyPluginConfig|ReloadSnapshotRawImmutability)|TestPutPluginConfigReplacesPluginConfig|TestPatchPluginConfigMergesAndDeletesFields|TestConfigReloadGenerationSkipsOlderSnapshot|TestPluginDeleteLocalRecovery|TestDeletePlugin(RejectsUnresolvedPluginsDir|ReturnsNotFoundForUnknownPlugin|UsesConfiguredStoreVersionWhenFilesCoexist|RemovesDiscoveredFileAndConfig))$'
+      - name: Verify durable removal and file registration
+        run: >-
+          go test -mod=readonly -race -count=1 -timeout=2m
+          ./internal/api/handlers/management ./sdk/cliproxy/auth ./sdk/cliproxy
+          -run '^(TestFileFence.*|TestDurableLocalRemoval.*|TestRemoveIfRetiresAfterCanceledRequestAndPersistenceWait|TestRegistered.*Local.*|TestLocalV8DeleteRegistryCleanupFollowsRegistrationEpoch|TestUnregisteredLocalFileThroughGinDelete|TestObservedLocalDeleteRejectsReplacementAndCancel|TestLocalGinDeleteKeepsReplacementWhileWaiting|TestWatcherRestoresFirstRegistrationAfterFileRemoval|TestHandleAuthUpdatesDiscardedSnapshotTriggersWatcherReread|TestHandleAuthUpdatesFileSnapshotKeepsCooldown|TestRuntimeAuthSyncHook_(DelayedPersistedSnapshotCannotUndoDisable|DiscardedLoginCacheCannotUndoDisableOnReload))$'
       - name: Build
         run: |
           go build -o test-output ./cmd/server

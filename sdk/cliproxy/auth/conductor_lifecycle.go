@@ -6,7 +6,6 @@ import (
 	"math"
 	"reflect"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -183,11 +182,19 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	if auth.ID == "" {
 		auth.ID = uuid.NewString()
 	}
+	finishSource, errSource := m.beginFileRegistration(auth)
+	if errSource != nil {
+		return nil, errSource
+	}
+	defer finishSource()
 	releaseMutation, errMutation := m.lockAuthMutationContext(ctx, auth.ID)
 	if errMutation != nil {
 		return nil, errMutation
 	}
 	defer releaseMutation()
+	if auth.HasFileSnapshot() && !auth.FileSnapshotMatchesDisk() {
+		return nil, ErrStaleRegistrationSnapshot
+	}
 	now := time.Now()
 	if auth.Generation == 0 {
 		auth.Generation = 1
@@ -256,6 +263,7 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	}
 	m.mu.Unlock()
 	releaseMutation()
+	finishSource()
 	if !shouldDeferAPIKeyModelAliasRebuild(ctx) {
 		m.rebuildAPIKeyModelAliasFromRuntimeConfig()
 	}
@@ -458,6 +466,16 @@ func (m *Manager) updateInternalLocked(ctx context.Context, base, auth *Auth, mo
 	if auth.RegistrationEpoch != 0 && auth.RegistrationEpoch < m.authEpochs[auth.ID] {
 		m.mu.Unlock()
 		return nil, false, false, fmt.Errorf("update auth %s: stale registration epoch %d < %d", auth.ID, auth.RegistrationEpoch, m.authEpochs[auth.ID])
+	}
+	if mode == updateModeReplace {
+		if paths := changedFilePaths(existing, auth); len(paths) > 0 {
+			finishSource, errSource := m.reserveFilePathsLocked(paths)
+			if errSource != nil {
+				m.mu.Unlock()
+				return nil, false, false, errSource
+			}
+			defer finishSource()
+		}
 	}
 	if auth.RegistrationEpoch >= m.authEpochs[auth.ID] {
 		m.authEpochs[auth.ID] = auth.RegistrationEpoch
@@ -809,11 +827,30 @@ func (m *Manager) RemoveIf(ctx context.Context, id string, predicate func(*Auth)
 		}
 	}
 
+	persist := m.persistenceLock(id)
+	// Legacy callers can reach removal after committing storage, even if the request was canceled.
+	if err := persist.lock(context.Background()); err != nil {
+		return false
+	}
 	m.mu.Lock()
+	epoch, after := m.retireAuthLocked(ctx, id)
+	persist.markRetired(epoch)
+	m.mu.Unlock()
+	persist.unlock()
+	releaseMutation()
+	if after == nil {
+		return false
+	}
+	after()
+	return true
+}
+
+// retireAuthLocked requires the credential mutation gate and m.mu. Side effects
+// may re-enter the manager and are called after releasing mutation gates.
+func (m *Manager) retireAuthLocked(ctx context.Context, id string) (uint64, func()) {
 	existing := m.auths[id]
 	if existing == nil {
-		m.mu.Unlock()
-		return false
+		return m.authEpochs[id], nil
 	}
 	provider := strings.TrimSpace(existing.Provider)
 	delete(m.auths, id)
@@ -838,31 +875,29 @@ func (m *Manager) RemoveIf(ctx context.Context, id string, predicate func(*Auth)
 	}
 	m.authEpochs[id]++
 	tombstoneEpoch := m.authEpochs[id]
-	m.mu.Unlock()
-	m.forgetWeightedAuthUpTo(id, tombstoneEpoch, ^uint64(0))
-	releaseMutation()
+	return tombstoneEpoch, func() {
+		m.forgetWeightedAuthUpTo(id, tombstoneEpoch, ^uint64(0))
+		if !shouldDeferAPIKeyModelAliasRebuild(ctx) {
+			m.rebuildAPIKeyModelAliasFromRuntimeConfig()
+		}
+		if m.scheduler != nil {
+			m.scheduler.RecordRemovalTombstone(id, tombstoneEpoch)
+		}
+		m.structuralEpoch.Add(1)
+		m.queueRefreshUnschedule(id)
+		m.invalidateSessionAffinity(id)
 
-	if !shouldDeferAPIKeyModelAliasRebuild(ctx) {
-		m.rebuildAPIKeyModelAliasFromRuntimeConfig()
-	}
-	if m.scheduler != nil {
-		m.scheduler.RecordRemovalTombstone(id, tombstoneEpoch)
-	}
-	m.structuralEpoch.Add(1)
-	m.queueRefreshUnschedule(id)
-	m.invalidateSessionAffinity(id)
-
-	if provider != "" {
-		if exec, ok := m.Executor(provider); ok && exec != nil {
-			if authCloser, okAuthCloser := exec.(AuthExecutionSessionCloser); okAuthCloser && authCloser != nil {
-				authCloser.CloseAuthExecutionSessions(id)
-			} else if closer, okCloser := exec.(ExecutionSessionCloser); okCloser {
-				closer.CloseExecutionSession(CloseAllExecutionSessionsID)
+		if provider != "" {
+			if exec, ok := m.Executor(provider); ok && exec != nil {
+				if authCloser, okAuthCloser := exec.(AuthExecutionSessionCloser); okAuthCloser && authCloser != nil {
+					authCloser.CloseAuthExecutionSessions(id)
+				} else if closer, okCloser := exec.(ExecutionSessionCloser); okCloser {
+					closer.CloseExecutionSession(CloseAllExecutionSessionsID)
+				}
 			}
 		}
+		m.persistCooldownStates(context.Background())
 	}
-	m.persistCooldownStates(context.Background())
-	return true
 }
 
 func (m *Manager) invalidateSessionAffinity(authID string) {
@@ -988,9 +1023,41 @@ func (m *Manager) Load(ctx context.Context) error {
 }
 
 type authPersistLock struct {
-	mu             sync.Mutex
+	gate           chan struct{}
 	lastEpoch      uint64
 	lastGeneration uint64
+}
+
+func (m *Manager) persistenceLock(id string) *authPersistLock {
+	if lock, ok := m.persistLocks.Load(id); ok {
+		return lock.(*authPersistLock)
+	}
+	lock, _ := m.persistLocks.LoadOrStore(id, &authPersistLock{gate: make(chan struct{}, 1)})
+	return lock.(*authPersistLock)
+}
+
+func (l *authPersistLock) lock(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case l.gate <- struct{}{}:
+		if err := ctx.Err(); err != nil {
+			l.unlock()
+			return err
+		}
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (l *authPersistLock) unlock() { <-l.gate }
+
+func (l *authPersistLock) markRetired(epoch uint64) {
+	if epoch > 0 && epoch >= l.lastEpoch {
+		l.lastEpoch, l.lastGeneration = epoch, math.MaxUint64
+	}
 }
 
 func (m *Manager) persist(ctx context.Context, auth *Auth) error {
@@ -1019,27 +1086,16 @@ func (m *Manager) persist(ctx context.Context, auth *Auth) error {
 		return nil
 	}
 
-	lockVal, _ := m.persistLocks.LoadOrStore(auth.ID, &authPersistLock{})
-	pLock, _ := lockVal.(*authPersistLock)
-	if pLock != nil {
-		pLock.mu.Lock()
-		defer pLock.mu.Unlock()
-		if auth.RegistrationEpoch < pLock.lastEpoch || (auth.RegistrationEpoch == pLock.lastEpoch && auth.Generation < pLock.lastGeneration) {
-			return nil
-		}
-		pLock.lastEpoch = auth.RegistrationEpoch
-		pLock.lastGeneration = auth.Generation
-		if shouldSkipPersist(ctx) {
-			return nil
-		}
-		releaseFg, errWait := m.beginForegroundStoreSave(ctx)
-		if errWait != nil {
-			return errWait
-		}
-		defer releaseFg()
-		_, err := store.Save(ctx, auth)
+	pLock := m.persistenceLock(auth.ID)
+	if err := pLock.lock(ctx); err != nil {
 		return err
 	}
+	defer pLock.unlock()
+	if auth.RegistrationEpoch < pLock.lastEpoch || (auth.RegistrationEpoch == pLock.lastEpoch && auth.Generation < pLock.lastGeneration) {
+		return nil
+	}
+	pLock.lastEpoch = auth.RegistrationEpoch
+	pLock.lastGeneration = auth.Generation
 
 	if shouldSkipPersist(ctx) {
 		return nil

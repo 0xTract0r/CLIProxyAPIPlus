@@ -250,3 +250,71 @@ func runDelayedLoginAfterDisable(t *testing.T, reload string) {
 		t.Fatalf("reload republished the discarded login snapshot over the disable: status=%s token=%v", got.Status, got.Metadata["access_token"])
 	}
 }
+
+func TestWatcherRestoresFirstRegistrationAfterFileRemoval(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(configPath, []byte("auth-dir: "+dir+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &internalconfig.Config{AuthDir: dir}
+	manager := coreauth.NewManager(nil, nil, nil)
+	s, err := NewBuilder().WithConfig(cfg).WithConfigPath(configPath).WithCoreAuthManager(manager).Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, err := defaultWatcherFactory(configPath, dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.watcher = w
+	w.SetConfig(cfg)
+	events := make(chan watcher.AuthUpdate, 16)
+	w.SetAuthUpdateQueue(events)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := w.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer w.Stop()
+	const id = "source.json"
+	path := filepath.Join(dir, id)
+	finish, err := manager.BeginFileRemoval(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.BeginFileRemoval(path); err == nil {
+		t.Fatal("overlapping delete accepted")
+	}
+	if err := os.WriteFile(path, []byte(`{"type":"claude","email":"fixture@example.invalid","note":"replacement"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	next := func() *coreauth.Auth {
+		t.Helper()
+		timer := time.NewTimer(5 * time.Second)
+		defer timer.Stop()
+		for {
+			select {
+			case ev := <-events:
+				if ev.Auth != nil && ev.ID == id && ev.Auth.HasFileSnapshot() {
+					return ev.Auth
+				}
+			case <-timer.C:
+				t.Fatal("watcher did not emit bound source snapshot")
+			}
+		}
+	}
+	first := next()
+	if got := s.prepareCoreAuthForModelRegistration(coreauth.WithSkipPersist(ctx), first); got != nil {
+		t.Fatal("published during active source deletion")
+	}
+	if _, ok := manager.GetByID(id); ok {
+		t.Fatal("unexpected registration during deletion")
+	}
+	finish()
+	replayed := next()
+	got := s.prepareCoreAuthForModelRegistration(coreauth.WithSkipPersist(ctx), replayed)
+	if got == nil || got.ID != id || got.Metadata["note"] != "replacement" {
+		t.Fatal("real watcher did not restore replacement")
+	}
+}

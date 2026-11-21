@@ -2,6 +2,7 @@ package cliproxy
 
 import (
 	"context"
+	"errors"
 	"os"
 	"runtime"
 	"strings"
@@ -416,6 +417,7 @@ func (s *Service) prepareCoreAuthForModelRegistration(ctx context.Context, auth 
 	if s == nil || s.coreManager == nil || auth == nil || auth.ID == "" {
 		return nil
 	}
+	observation := auth
 	auth = auth.Clone()
 	s.ensureExecutorsForAuthWithContext(ctx, auth, false)
 
@@ -450,6 +452,12 @@ func (s *Service) prepareCoreAuthForModelRegistration(ctx context.Context, auth 
 		op = "update"
 		var updated *coreauth.Auth
 		updated, err = s.coreManager.Update(ctx, auth)
+		if err == nil && updated == nil && observation.HasFileSnapshot() {
+			if w := s.currentWatcher(); w != nil {
+				w.RereadDiscardedFileSnapshot(observation)
+			}
+			return nil
+		}
 		if err == nil && updated != nil {
 			if auth.HasFileSnapshot() || updated.Generation == existing.Generation {
 				log.Debugf("skipping stale auth update for %s: incoming snapshot did not advance generation (gen=%d)", auth.ID, existing.Generation)
@@ -467,6 +475,24 @@ func (s *Service) prepareCoreAuthForModelRegistration(ctx context.Context, auth 
 		registered, err = s.coreManager.Register(ctx, auth)
 		if err == nil && registered != nil {
 			auth = registered
+		}
+	}
+	// A delayed file observation can outlive both the path and its first registration.
+	if observation.HasFileSnapshot() {
+		var removing *coreauth.FileRemovalInProgressError
+		if errors.As(err, &removing) {
+			removing.AfterRemoval(observation, func() {
+				if w := s.currentWatcher(); w != nil {
+					w.RereadDiscardedFileSnapshot(observation)
+				}
+			})
+			return nil
+		}
+		if errors.Is(err, coreauth.ErrStaleRegistrationSnapshot) {
+			if w := s.currentWatcher(); w != nil {
+				w.RereadDiscardedFileSnapshot(observation)
+			}
+			return nil
 		}
 	}
 	if err != nil {
