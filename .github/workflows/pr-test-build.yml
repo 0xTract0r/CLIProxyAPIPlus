@@ -25,6 +25,10 @@ jobs:
         run: >-
           go test -mod=readonly -race -count=1 ./internal/config ./internal/api
           -run '^(TestMergePreservesScalarValueTypesAndPresentation|TestManagementQuotedRequestLogPersistsTypedBoolean|TestDownstreamWebsocketCompressionInstancesAndReload)$'
+      - name: Verify management reads during configuration reload
+        run: >-
+          go test -mod=readonly -race -count=1 ./internal/api/handlers/management
+          -run '^(TestHandlerSnapshotOwnsConfigAndPluginYAML|TestHandlerSnapshotGetConfigDuringSetConfig|TestHandlerSnapshotCatalogDuringPluginHostSwap)$'
       - name: Build
         run: |
           go build -o test-output ./cmd/server
