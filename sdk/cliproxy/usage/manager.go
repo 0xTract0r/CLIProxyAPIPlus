@@ -630,6 +630,21 @@ type Plugin interface {
 	HandleUsage(ctx context.Context, record Record)
 }
 
+type requestObserverKey struct{}
+
+// WithRequestObserver adds an observer for the current request. It is called
+// synchronously on publish so the serving instance can flush its history after
+// its HTTP handlers return. Default plugins keep their existing async delivery.
+func WithRequestObserver(ctx context.Context, observer Plugin) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if observer == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, requestObserverKey{}, observer)
+}
+
 type queueItem struct {
 	ctx    context.Context
 	record Record
@@ -769,6 +784,11 @@ func (m *Manager) Publish(ctx context.Context, record Record) {
 		}
 	}
 	ctx = WithCapturedIdentity(ctx, record.APIKey, record.AccessProvider, record.IsNativeKey)
+	// The HTTP instance owns this observer's lifetime independently of the
+	// process-wide dispatcher shared by SDK services.
+	if observer, ok := ctx.Value(requestObserverKey{}).(Plugin); ok {
+		safeInvoke(observer, ctx, record)
+	}
 	// ensure worker is running even if Start was not called explicitly
 	m.Start(context.Background())
 	m.mu.Lock()

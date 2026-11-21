@@ -48,6 +48,13 @@ jobs:
           go test -mod=readonly -race -count=1 -timeout=2m
           ./internal/api/handlers/management ./sdk/cliproxy/auth ./sdk/cliproxy
           -run '^(TestFileFence.*|TestDurableLocalRemoval.*|TestRemoveIfRetiresAfterCanceledRequestAndPersistenceWait|TestRegistered.*Local.*|TestLocalV8DeleteRegistryCleanupFollowsRegistrationEpoch|TestUnregisteredLocalFileThroughGinDelete|TestObservedLocalDeleteRejectsReplacementAndCancel|TestLocalGinDeleteKeepsReplacementWhileWaiting|TestLocalGinDeleteWaitsForSDKManagerLoad|TestWatcherRestoresFirstRegistrationAfterFileRemoval|TestHandleAuthUpdatesDiscardedSnapshotTriggersWatcherReread|TestHandleAuthUpdatesFileSnapshotKeepsCooldown|TestRuntimeAuthSyncHook_(DelayedPersistedSnapshotCannotUndoDisable|DiscardedLoginCacheCannotUndoDisableOnReload))$'
+      - name: Test ordinary usage history and management writes
+        env:
+          GIN_MODE: release
+        run: |
+          go test -mod=readonly -race -count=1 -timeout=2m ./internal/usage
+          go test -mod=readonly -race -count=1 -timeout=2m ./internal/api/handlers/management -run '^Test(GetUsageQueue|GetUsageStatistics|ExportUsageStatistics)'
+          go test -mod=readonly -race -count=1 -timeout=2m ./internal/api -run '^Test(CombinedOrdinaryUsage|RegisteredPricingWriteFailure|UsageImportValidity|UsageInstanceColdStart|UsageSDKChatAttribution|UsageRecorderConfiguration|UsageKnownKeyConfiguration|UsageDeferredShutdown|UsageImportWriteFailure)'
       - name: Build
         run: |
           go build -o test-output ./cmd/server

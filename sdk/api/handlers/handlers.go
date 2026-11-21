@@ -519,6 +519,9 @@ func setGenerateMetadata(meta map[string]any, rawJSON []byte) {
 type BaseAPIHandler struct {
 	runtimeMu sync.RWMutex
 
+	// UsageObserver is bound to this handler before serving any requests.
+	UsageObserver coreusage.Plugin
+
 	// AuthManager manages auth lifecycle and execution in the new architecture.
 	AuthManager *coreauth.Manager
 
@@ -754,6 +757,9 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 	}
 	newCtx = context.WithValue(newCtx, "gin", c)
 	newCtx = coreusage.CaptureIdentity(newCtx)
+	if h != nil && h.UsageObserver != nil {
+		newCtx = coreusage.WithRequestObserver(newCtx, h.UsageObserver)
+	}
 	newCtx = coreauth.WithCodexClientRequest(newCtx, coreauth.IsCodexClientRequest(newCtx))
 	newCtx = context.WithValue(newCtx, "handler", handler)
 	return newCtx, func(params ...interface{}) {

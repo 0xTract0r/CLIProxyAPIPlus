@@ -28,6 +28,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/managementasset"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/redisqueue"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/usage"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/wstunnel"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v8/sdk/access"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
@@ -88,6 +89,10 @@ type Server struct {
 
 	// management handler
 	mgmt *managementHandlers.Handler
+
+	usageRequestsMu sync.Mutex
+	usageRequests   int
+	usageStopping   bool
 
 	// pluginHost owns dynamic plugin Management API route dispatch.
 	pluginHost *pluginhost.Host
@@ -248,6 +253,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	applyClaudeToolSearchConfig(cfg)
 	// Initialize management handler
 	s.mgmt = managementHandlers.NewHandler(cfg, configFilePath, authManager)
+	s.handlers.UsageObserver = s.mgmt.UsageStatistics()
 	s.mgmt.SetPluginHost(optionState.pluginHost)
 	s.mgmt.SetConfigReloadHook(optionState.configReloadHook)
 	if optionState.localPassword != "" {
@@ -294,7 +300,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	// Create HTTP server
 	s.server = &http.Server{
 		Addr:              fmt.Sprintf("%s:%d", cfg.Host, cfg.Port),
-		Handler:           wrapUnconsumedRequestBodyHandler(engine),
+		Handler:           s.trackUsageRequests(wrapUnconsumedRequestBodyHandler(engine)),
 		ReadHeaderTimeout: muxSniffDeadline,
 	}
 
@@ -509,10 +515,69 @@ func (s *Server) Stop(ctx context.Context) error {
 	if s.tunnelHub != nil {
 		s.tunnelHub.Close()
 	}
+	errFlush := s.stopUsageRequests()
 	if errCloseServer != nil {
-		return fmt.Errorf("failed to shutdown HTTP server: %v", errCloseServer)
+		errCloseServer = fmt.Errorf("failed to shutdown HTTP server: %w", errCloseServer)
+	}
+	if err := errors.Join(errCloseServer, errFlush); err != nil {
+		return err
 	}
 
 	log.Debug("API server stopped")
+	return nil
+}
+
+// UsageStatistics returns the instance-owned store for request usage collection.
+func (s *Server) UsageStatistics() *usage.RequestStatistics {
+	if s == nil {
+		return nil
+	}
+	return s.mgmt.UsageStatistics()
+}
+
+func (s *Server) trackUsageRequests(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.usageRequestsMu.Lock()
+		if s.usageStopping {
+			s.usageRequestsMu.Unlock()
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		s.usageRequests++
+		s.usageRequestsMu.Unlock()
+		defer func() {
+			s.usageRequestsMu.Lock()
+			s.usageRequests--
+			flush := s.usageStopping && s.usageRequests == 0
+			s.usageRequestsMu.Unlock()
+			if flush {
+				if err := s.flushUsage(); err != nil {
+					log.WithError(err).Warn("usage: deferred shutdown save failed")
+				}
+			}
+		}()
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (s *Server) stopUsageRequests() error {
+	s.usageRequestsMu.Lock()
+	if s.usageStopping {
+		s.usageRequestsMu.Unlock()
+		return nil
+	}
+	s.usageStopping = true
+	pending := s.usageRequests
+	s.usageRequestsMu.Unlock()
+	if pending != 0 {
+		return nil // Immediate close: the last request to unwind owns the final save.
+	}
+	return s.flushUsage()
+}
+
+func (s *Server) flushUsage() error {
+	if err := s.UsageStatistics().Close(); err != nil {
+		return fmt.Errorf("persist usage history at shutdown: %w", err)
+	}
 	return nil
 }

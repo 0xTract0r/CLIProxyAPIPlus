@@ -1678,8 +1678,16 @@ func TestManagementUsageRequiresManagementAuthAndPopsArray(t *testing.T) {
 	legacyReq.Header.Set("Authorization", "Bearer test-management-key")
 	legacyRR := httptest.NewRecorder()
 	server.engine.ServeHTTP(legacyRR, legacyReq)
-	if legacyRR.Code != http.StatusNotFound {
-		t.Fatalf("legacy usage status = %d, want %d body=%s", legacyRR.Code, http.StatusNotFound, legacyRR.Body.String())
+	if legacyRR.Code != http.StatusOK {
+		t.Fatalf("legacy usage status = %d, want %d body=%s", legacyRR.Code, http.StatusOK, legacyRR.Body.String())
+	}
+	var legacy struct {
+		Usage *struct {
+			TotalRequests int `json:"total_requests"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(legacyRR.Body.Bytes(), &legacy); err != nil || legacy.Usage == nil || legacy.Usage.TotalRequests != 0 {
+		t.Fatalf("legacy read must return its independent summary: %v body=%s", err, legacyRR.Body.String())
 	}
 
 	authReq := httptest.NewRequest(http.MethodGet, "/v0/management/usage-queue?count=2", nil)

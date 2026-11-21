@@ -19,6 +19,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginstore"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/usage"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
@@ -38,6 +39,8 @@ const attemptMaxIdleTime = 2 * time.Hour
 
 // Handler aggregates config reference, persistence path and helpers.
 type Handler struct {
+	usageStats              *usage.RequestStatistics
+	usageHistoryUnavailable bool
 	cfg                     *config.Config
 	configFilePath          string
 	mu                      sync.Mutex
@@ -78,15 +81,35 @@ func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Man
 	envSecret, _ := os.LookupEnv("MANAGEMENT_PASSWORD")
 	envSecret = strings.TrimSpace(envSecret)
 
-	h := &Handler{
-		cfg:                 cfg.CloneForRuntime(),
-		configFilePath:      configFilePath,
-		failedAttempts:      make(map[string]*attemptInfo),
-		authManager:         manager,
-		tokenStore:          sdkAuth.GetTokenStore(),
-		allowRemoteOverride: envSecret != "",
-		envSecret:           envSecret,
+	catalog := usage.NewPricingCatalogManager()
+	stats := usage.NewRequestStatisticsWithCatalog(catalog)
+	var historyUnavailable bool
+	if cfg != nil {
+		stats.SetKnownUsageAPIKeys(cfg.APIKeys)
 	}
+	if strings.TrimSpace(configFilePath) != "" {
+		dir := filepath.Dir(configFilePath)
+		if err := catalog.SetPersistencePath(filepath.Join(dir, ".usage-pricing-catalog.json")); err != nil {
+			log.WithError(err).Warn("usage: pricing catalog could not be restored; keeping pricing in memory")
+		}
+		if err := stats.SetPersistencePath(filepath.Join(dir, ".usage-statistics.json")); err != nil {
+			historyUnavailable = true
+			log.WithError(err).Warn("usage: history could not be restored; keeping history in memory")
+		}
+	}
+
+	h := &Handler{
+		usageStats:              stats,
+		usageHistoryUnavailable: historyUnavailable,
+		cfg:                     cfg.CloneForRuntime(),
+		configFilePath:          configFilePath,
+		failedAttempts:          make(map[string]*attemptInfo),
+		authManager:             manager,
+		tokenStore:              sdkAuth.GetTokenStore(),
+		allowRemoteOverride:     envSecret != "",
+		envSecret:               envSecret,
+	}
+	h.usageStats.SetRecordingEnabled(cfg != nil && cfg.UsageStatisticsEnabled)
 	h.startAttemptCleanup()
 	return h
 }
@@ -145,6 +168,10 @@ func (h *Handler) SetConfig(cfg *config.Config) {
 		prevSecretHash = h.cfg.RemoteManagement.SecretKey
 	}
 	h.cfg = cloned
+	if cloned != nil {
+		h.usageStats.SetKnownUsageAPIKeys(cloned.APIKeys)
+	}
+	h.usageStats.SetRecordingEnabled(cloned != nil && cloned.UsageStatisticsEnabled)
 	nextSecretHash := ""
 	if cloned != nil {
 		nextSecretHash = cloned.RemoteManagement.SecretKey
@@ -253,6 +280,7 @@ func (h *Handler) reloadSnapshotConfigLocked() configReloadSnapshot {
 	if h == nil || h.cfg == nil {
 		return configReloadSnapshot{}
 	}
+	h.usageStats.SetKnownUsageAPIKeys(h.cfg.APIKeys)
 	h.reloadGeneration++
 	return configReloadSnapshot{
 		cfg:        h.cfg.CloneForRuntime(),
@@ -584,4 +612,15 @@ func (h *Handler) updateStringField(c *gin.Context, set func(string)) {
 	defer h.mu.Unlock()
 	set(*body.Value)
 	h.persistLocked(c)
+}
+
+// SetUsageStatistics sets an isolated store before serving management routes.
+func (h *Handler) SetUsageStatistics(stats *usage.RequestStatistics) { h.usageStats = stats }
+
+// UsageStatistics returns the instance-owned store used by the management routes.
+func (h *Handler) UsageStatistics() *usage.RequestStatistics {
+	if h == nil {
+		return nil
+	}
+	return h.usageStats
 }
