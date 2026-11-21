@@ -54,7 +54,8 @@ func TestPluginDeleteLocalRecovery(t *testing.T) {
 					}
 				}
 				configPath := filepath.Join(dir, "config.yaml")
-				yaml := "plugins:\n  enabled: false\n  dir: " + filepath.Dir(filepath.Dir(pluginDir)) + "\n"
+				// Seed a persisted server ID so startup does not rewrite the deletion fixture.
+				yaml := "server:\n  server-id: 736ff53b-6a46-4200-aa6f-8f6b9d322cb8\nplugins:\n  enabled: false\n  dir: " + filepath.Dir(filepath.Dir(pluginDir)) + "\n"
 				if hasConfig {
 					yaml += "  configs:\n    " + id + ":\n      enabled: false\n      store: {version: '0.1.0'}\n"
 				}

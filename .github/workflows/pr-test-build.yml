@@ -33,6 +33,10 @@ jobs:
         run: >-
           go test -mod=readonly -race -count=1 ./internal/config
           -run '^(TestSaveConfigPreservesBytesOnFileSizeLimit|TestConfigInodeRecoveryAfterPartialWrite|TestConfigReplacementDoesNotFallbackOnPermissionFailure|TestConfigInodeRecoverySerializesCommit|TestConfigHardLinksShareSuccessfulSaves|TestConfigCommittedOnDirectorySyncWarning|TestConfigSavePreservesNamedReaderAndDeniesOwningGroup|TestConfigSaveDoesNotInheritNewAccessACL|TestConfigSaveXattrsPreservesExistingLabel)$'
+      - name: Verify concurrent directory saves and file permissions
+        run: >-
+          go test -mod=readonly -race -count=1 ./internal/config
+          -run '^(TestDirectorySaveLinux(Handoff|NonreplaceableFile|VersionedSnapshot|DefaultACL|UnopenableParent|ReadOnlyPreservesSnapshot)|TestConfigSaveCASInodeFailure|TestConfigSaveCASDirectorySyncFailure|TestConfigSaveCASPreservesExternalMarker|TestReconcileConfigSave(PreservesNamedReaderAndDeniesOwningGroup|DoesNotInheritNewAccessACL))$'
       - name: Verify plugin configuration saves
         env:
           GIN_MODE: release
@@ -48,3 +52,11 @@ jobs:
         run: |
           go build -o test-output ./cmd/server
           rm -f test-output
+      - name: Cross-build for Solaris
+        env:
+          GOOS: solaris
+          GOARCH: amd64
+          CGO_ENABLED: 0
+        run: |
+          go build -o test-output-solaris ./cmd/server
+          rm -f test-output-solaris
