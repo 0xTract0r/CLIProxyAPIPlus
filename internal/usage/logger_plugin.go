@@ -65,10 +65,11 @@ type RequestStatistics struct {
 
 	statisticsData
 
-	persistMu       sync.Mutex // serialize restore, snapshot capture, and publication
-	persistPath     string
-	persistRevision snapshotRevision // guarded by persistMu
-	persistLineage  uint64           // guarded by persistMu
+	persistMu            sync.Mutex // serialize restore, snapshot capture, and publication
+	persistPath          string
+	persistRevision      snapshotRevision // guarded by persistMu
+	persistLineage       uint64           // guarded by persistMu
+	persistRestoreFailed bool             // guarded by persistMu
 
 	knownUsageKeyBuckets map[string]struct{}
 

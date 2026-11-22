@@ -73,6 +73,12 @@ jobs:
         run: >-
           go test -mod=readonly -race -count=1 ./internal/api ./internal/api/handlers/management
           -run '^(TestPluginConfigWritePreservesLastSavedValue|TestPluginConfigWritesRejectUnavailableConfig|TestPatchPluginEnabled(UpdatesOnlyPluginConfig|ReloadSnapshotRawImmutability)|TestPutPluginConfigReplacesPluginConfig|TestPatchPluginConfigMergesAndDeletesFields|TestConfigReloadGenerationSkipsOlderSnapshot|TestPluginDeleteLocalRecovery|TestDeletePlugin(RejectsUnresolvedPluginsDir|ReturnsNotFoundForUnknownPlugin|UsesConfiguredStoreVersionWhenFilesCoexist|RemovesDiscoveredFileAndConfig))$'
+      - name: Verify preserved production prices and recovery after corrupt usage history
+        env:
+          GIN_MODE: release
+        run: |
+          go test -v -mod=readonly -race -count=1 -timeout=2m ./internal/usage -run '^Test(GPT55BuiltinPricingAndAliases|NormalizeCanonicalModelIDKeepsVariantsSeparate|ParseOpenAIPricingHTMLVariantDoesNotOverwriteCanonical|PricingCatalogPersistenceRebuildsGPT55Alias|PricingSnapshotOmitsZeroPersistenceTimes|PricingAutoRefreshDelayUsesInitialJitterWhenEmpty)$'
+          go test -v -mod=readonly -race -count=1 -timeout=2m ./internal/api/handlers/management -run '^TestUsageImportRejectsCorruptInitialHistoryAndRecovers$'
       - name: Verify durable removal and file registration
         run: >-
           go test -mod=readonly -race -count=1 -timeout=2m

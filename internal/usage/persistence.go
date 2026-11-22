@@ -81,7 +81,13 @@ func (s *RequestStatistics) SetPersistencePath(path string) error {
 	s.persistMu.Lock()
 	defer s.persistMu.Unlock()
 	if err := s.loadFromPath(cleaned); err != nil {
+		if cleaned != "" && s.persistencePath() == "" {
+			s.persistRestoreFailed = true
+		}
 		return err
+	}
+	if cleaned != "" {
+		s.persistRestoreFailed = false
 	}
 	s.mu.Lock()
 	s.persistPath = cleaned
@@ -107,6 +113,9 @@ var ErrUsageImportInvalid = errors.New("invalid usage import")
 func (s *RequestStatistics) ImportAndSave(snapshot StatisticsSnapshot) (MergeResult, error) {
 	s.persistMu.Lock()
 	defer s.persistMu.Unlock()
+	if s.persistRestoreFailed {
+		return MergeResult{}, ErrUsageSnapshotChanged
+	}
 	var result MergeResult
 	err := s.commitUsageSnapshot(s.persistencePath(), func(candidate *RequestStatistics) error {
 		var err error
