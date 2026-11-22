@@ -2,17 +2,20 @@ package logging
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
+	"crypto/rand"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
 
-	"github.com/MoeForge/moego/regexp"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
 	log "github.com/sirupsen/logrus"
 )
@@ -115,7 +118,7 @@ func (l *FileRequestLogger) logRequestWithSources(url, method string, requestHea
 
 	// Generate filename with request ID
 	filename := l.generateFilename(url, requestID)
-	if (force && !l.enabled) || (statusCode >= 400 && statusCode != 499) {
+	if (force && !l.enabled) || (statusCode >= http.StatusBadRequest && statusCode != 499) {
 		filename = l.generateErrorFilename(url, requestID)
 	}
 
@@ -137,40 +140,35 @@ func (l *FileRequestLogger) logRequestWithSources(url, method string, requestHea
 		responseToWrite = response
 	}
 
-	logFile, _, errOpen := createUniqueLogFile(l.logsDir, filename)
-	if errOpen != nil {
-		return fmt.Errorf("failed to create log file: %w", errOpen)
+	if requestTimestamp.IsZero() {
+		requestTimestamp = time.Now()
 	}
-
-	writeErr := l.writeNonStreamingLog(
-		logFile,
-		url,
-		method,
-		requestHeaders,
-		body,
-		requestBodyPath,
-		websocketTimeline,
-		websocketTimelineSource,
-		apiRequest,
-		apiRequestSource,
-		apiResponse,
-		apiResponseSource,
-		apiWebsocketTimeline,
-		apiWebsocketTimelineSource,
-		apiResponseErrors,
-		statusCode,
-		responseHeaders,
-		responseToWrite,
-		decompressErr,
-		requestTimestamp,
-		apiResponseTimestamp,
-	)
-	if errClose := logFile.Close(); errClose != nil {
-		log.WithError(errClose).Warn("failed to close request log file")
-		if writeErr == nil {
-			return errClose
-		}
-	}
+	location := DisplayLocation()
+	writeErr := writeCompressedRequestLog(filepath.Join(l.logsDir, filename), func(logFile io.Writer) error {
+		return l.writeNonStreamingLog(
+			logFile,
+			url,
+			method,
+			requestHeaders,
+			body,
+			requestBodyPath,
+			websocketTimeline,
+			websocketTimelineSource,
+			apiRequest,
+			apiRequestSource,
+			apiResponse,
+			apiResponseSource,
+			apiWebsocketTimeline,
+			apiWebsocketTimelineSource,
+			apiResponseErrors,
+			statusCode,
+			responseHeaders,
+			responseToWrite,
+			decompressErr,
+			requestTimestamp.In(location),
+			apiResponseTimestamp.In(location),
+		)
+	})
 	if writeErr != nil {
 		return fmt.Errorf("failed to write log file: %w", writeErr)
 	}
@@ -182,6 +180,57 @@ func (l *FileRequestLogger) logRequestWithSources(url, method string, requestHea
 	}
 
 	return nil
+}
+
+// writeCompressedRequestLog publishes a complete gzip log without first writing
+// an uncompressed final file. Readers never see an unfinished gzip stream.
+func writeCompressedRequestLog(plainPath string, write func(io.Writer) error) error {
+	tempPath := filepath.Join(filepath.Dir(plainPath), ".request-log-"+rand.Text()+".tmp")
+	file, errCreate := os.OpenFile(tempPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	if errCreate != nil {
+		return fmt.Errorf("create compressed request log: %w", errCreate)
+	}
+	defer func() { _ = os.Remove(tempPath) }()
+	gz, errGzip := gzip.NewWriterLevel(file, gzip.BestSpeed)
+	if errGzip != nil {
+		_ = file.Close()
+		return errGzip
+	}
+	errWrite := write(gz)
+	errGzipClose := gz.Close()
+	errFileClose := file.Close()
+	if errWrite != nil {
+		return errWrite
+	}
+	if errGzipClose != nil {
+		return fmt.Errorf("finish compressed request log: %w", errGzipClose)
+	}
+	if errFileClose != nil {
+		return fmt.Errorf("close compressed request log: %w", errFileClose)
+	}
+	ext := filepath.Ext(plainPath)
+	base := strings.TrimSuffix(plainPath, ext)
+	prefix, id := base, ""
+	if i := strings.LastIndex(filepath.Base(base), "-"); i >= 0 {
+		pos := len(base) - len(filepath.Base(base)) + i
+		prefix, id = base[:pos], base[pos:]
+	}
+	for seq := 0; seq <= 1000; seq++ {
+		target := plainPath + ".gz"
+		if seq > 0 {
+			target = fmt.Sprintf("%s_%d%s%s.gz", prefix, seq, id, ext)
+		}
+		if err := os.Link(tempPath, target); err != nil {
+			if os.IsExist(err) {
+				if info, statErr := os.Lstat(target); statErr == nil && info.Mode().IsRegular() {
+					continue
+				}
+			}
+			return fmt.Errorf("publish compressed request log: %w", err)
+		}
+		return nil
+	}
+	return fmt.Errorf("too many conflicting log files for %s", plainPath)
 }
 
 // LogStreamingRequest initiates logging for a streaming request.
@@ -299,28 +348,29 @@ func (l *FileRequestLogger) generateFilename(url string, requestID ...string) st
 	sanitized := l.sanitizeForFilename(path)
 
 	// Add timestamp
-	timestamp := time.Now().Format("2006-01-02T150405")
+	// 人看的 per-request 抓包日志文件名时间戳，统一用显示时区（默认 UTC+8）。
+	// 该格式（2006-01-02T150405，无分隔）仅作人看的可排序标签，全仓无任何代码反向
+	// 解析它（lumberjack 轮转文件名走 2006-01-02T15-04-05 另一套，不受影响），
+	// 因此切到 displayLoc 不存在读侧错位。出站时间字段不经过这里。
+	timestamp := time.Now().In(DisplayLocation()).Format("2006-01-02T150405")
 
 	// Use request ID if provided, otherwise use sequential ID
 	var idPart string
 	if len(requestID) > 0 && requestID[0] != "" {
-		idPart = ShortRequestID(requestID[0])
+		idPart = l.sanitizeForFilename(ShortRequestID(requestID[0]))
 	} else {
 		id := requestLogID.Add(1)
 		idPart = fmt.Sprintf("%d", id)
 	}
 
-	// Defense in depth: the sanitizer already removes both separators, but the
-	// final component must never be able to climb out of the log directory.
-	name := fmt.Sprintf("%s-%s-%s.log", sanitized, timestamp, idPart)
-	return filepath.Base(name)
+	return filepath.Base(fmt.Sprintf("%s-%s-%s.log", sanitized, timestamp, idPart))
 }
 
 // createUniqueLogFile atomically opens a unique log file within dir. If a file with filename already exists,
 // it avoids overwriting by injecting an incrementing sequence number before the trailing request ID component.
 func createUniqueLogFile(dir, filename string) (*os.File, string, error) {
-	if filename == "" || filename == "." || filename == ".." || strings.ContainsAny(filename, `/\`) || strings.Contains(filename, "..") || filepath.Base(filename) != filename {
-		return nil, "", fmt.Errorf("invalid log filename: %q", filename)
+	if filename == "" || strings.ContainsAny(filename, `/\`) || strings.Contains(filename, "..") || filename == "." || filepath.Base(filename) != filename {
+		return nil, "", fmt.Errorf("invalid log filename")
 	}
 	ext := filepath.Ext(filename)
 	base := strings.TrimSuffix(filename, ext)
@@ -363,27 +413,15 @@ func createUniqueLogFile(dir, filename string) (*os.File, string, error) {
 // Returns:
 //   - string: A sanitized filename
 func (l *FileRequestLogger) sanitizeForFilename(path string) string {
-	// Replace slashes with hyphens. Both separators are replaced because Windows
-	// treats "\\" as a path separator too: leaving it in place let a crafted
-	// request path escape the log directory via filepath.Join.
-	sanitized := strings.ReplaceAll(path, "/", "-")
-	sanitized = strings.ReplaceAll(sanitized, "\\", "-")
+	// Replace slashes with hyphens
+	sanitized := strings.NewReplacer("/", "-", "\\", "-").Replace(path)
 
 	// Replace colons with hyphens
 	sanitized = strings.ReplaceAll(sanitized, ":", "-")
 
-	// Replace other problematic characters with hyphens
 	sanitized = sanitizeFilenameInvalidCharsPattern.ReplaceAllString(sanitized, "-")
-
-	// Never let a parent-directory sequence survive.
-	for strings.Contains(sanitized, "..") {
-		sanitized = strings.ReplaceAll(sanitized, "..", "-")
-	}
-
-	// Remove multiple consecutive hyphens
+	sanitized = strings.ReplaceAll(sanitized, "..", "-")
 	sanitized = sanitizeFilenameMultiHyphenPattern.ReplaceAllString(sanitized, "-")
-
-	// Remove leading/trailing hyphens and dots
 	sanitized = strings.Trim(sanitized, "-.")
 
 	// Handle empty result
@@ -416,7 +454,7 @@ func (l *FileRequestLogger) cleanupOldErrorLogs() error {
 			continue
 		}
 		name := entry.Name()
-		if !strings.HasPrefix(name, "error-") || !strings.HasSuffix(name, ".log") {
+		if !strings.HasPrefix(name, "error-") || !(strings.HasSuffix(name, ".log") || strings.HasSuffix(name, ".log.gz")) {
 			continue
 		}
 		info, errInfo := entry.Info()

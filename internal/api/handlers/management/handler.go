@@ -56,6 +56,7 @@ type Handler struct {
 	allowRemoteOverride     bool
 	envSecret               string
 	logDir                  string
+	requestLogArchiveDir    string
 	postAuthHook            coreauth.PostAuthHook
 	postAuthPersistHook     coreauth.PostAuthHook
 	pluginHost              *pluginhost.Host
@@ -80,6 +81,14 @@ type configReloadSnapshot struct {
 func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Manager) *Handler {
 	envSecret, _ := os.LookupEnv("MANAGEMENT_PASSWORD")
 	envSecret = strings.TrimSpace(envSecret)
+	archiveDir := strings.TrimSpace(os.Getenv("REQUEST_LOG_ARCHIVE_DIR"))
+	if archiveDir != "" && !filepath.IsAbs(archiveDir) {
+		log.Warn("ignoring relative REQUEST_LOG_ARCHIVE_DIR")
+		archiveDir = ""
+	}
+	if archiveDir != "" {
+		archiveDir = filepath.Clean(archiveDir)
+	}
 
 	catalog := usage.NewPricingCatalogManager()
 	stats := usage.NewRequestStatisticsWithCatalog(catalog)
@@ -108,6 +117,7 @@ func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Man
 		tokenStore:              sdkAuth.GetTokenStore(),
 		allowRemoteOverride:     envSecret != "",
 		envSecret:               envSecret,
+		requestLogArchiveDir:    archiveDir,
 	}
 	h.usageStats.SetRecordingEnabled(cfg != nil && cfg.UsageStatisticsEnabled)
 	h.startAttemptCleanup()

@@ -215,46 +215,22 @@ func (h *Handler) GetRequestErrorLogs(c *gin.Context) {
 		return
 	}
 
-	entries, err := os.ReadDir(dir)
+	files, archiveUnavailable, err := h.requestErrorLogs()
 	if err != nil {
-		if os.IsNotExist(err) {
-			c.JSON(http.StatusOK, gin.H{"files": []any{}})
-			return
-		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to list request error logs: %v", err)})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list request error logs"})
 		return
 	}
-
-	type errorLog struct {
-		Name     string `json:"name"`
-		Size     int64  `json:"size"`
-		Modified int64  `json:"modified"`
+	if archiveUnavailable && len(files) == 0 {
+		c.Header("Retry-After", "5")
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "request log archive temporarily unavailable"})
+		return
 	}
-
-	files := make([]errorLog, 0, len(entries))
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-		name := entry.Name()
-		if !strings.HasPrefix(name, "error-") || !strings.HasSuffix(name, ".log") {
-			continue
-		}
-		info, errInfo := entry.Info()
-		if errInfo != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to read log info for %s: %v", name, errInfo)})
-			return
-		}
-		files = append(files, errorLog{
-			Name:     name,
-			Size:     info.Size(),
-			Modified: info.ModTime().Unix(),
-		})
-	}
-
 	sort.Slice(files, func(i, j int) bool { return files[i].Modified > files[j].Modified })
-
-	c.JSON(http.StatusOK, gin.H{"files": files})
+	response := gin.H{"files": files}
+	if archiveUnavailable {
+		response["archive_unavailable"] = true
+	}
+	c.JSON(http.StatusOK, response)
 }
 
 // GetRequestLogByID finds and downloads a request log file by its request ID.
@@ -288,71 +264,7 @@ func (h *Handler) GetRequestLogByID(c *gin.Context) {
 		return
 	}
 
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			c.JSON(http.StatusNotFound, gin.H{"error": "log directory not found"})
-			return
-		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to list log directory: %v", err)})
-		return
-	}
-
-	suffix := "-" + logging.ShortRequestID(requestID) + ".log"
-	var matchedFile string
-	var latestModTime time.Time
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-		name := entry.Name()
-		if strings.HasSuffix(name, suffix) {
-			info, errInfo := entry.Info()
-			if errInfo != nil {
-				if matchedFile == "" {
-					matchedFile = name
-				}
-				continue
-			}
-			if matchedFile == "" || logFileIsNewer(name, info.ModTime(), matchedFile, latestModTime) {
-				matchedFile = name
-				latestModTime = info.ModTime()
-			}
-		}
-	}
-
-	if matchedFile == "" {
-		c.JSON(http.StatusNotFound, gin.H{"error": "log file not found for the given request ID"})
-		return
-	}
-
-	dirAbs, errAbs := filepath.Abs(dir)
-	if errAbs != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to resolve log directory: %v", errAbs)})
-		return
-	}
-	fullPath := filepath.Clean(filepath.Join(dirAbs, matchedFile))
-	prefix := dirAbs + string(os.PathSeparator)
-	if !strings.HasPrefix(fullPath, prefix) {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid log file path"})
-		return
-	}
-
-	info, errStat := os.Stat(fullPath)
-	if errStat != nil {
-		if os.IsNotExist(errStat) {
-			c.JSON(http.StatusNotFound, gin.H{"error": "log file not found"})
-			return
-		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to read log file: %v", errStat)})
-		return
-	}
-	if info.IsDir() {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid log file"})
-		return
-	}
-
-	c.FileAttachment(fullPath, matchedFile)
+	h.serveRequestLog(c, requestID, "")
 }
 
 type logFileMeta struct {
@@ -362,14 +274,8 @@ type logFileMeta struct {
 	hasTime bool
 }
 
-func parseLogMetadata(filename string) logFileMeta {
-	ext := filepath.Ext(filename)
-	base := strings.TrimSuffix(filename, ext)
-	lastHyphen := strings.LastIndex(base, "-")
-	if lastHyphen <= 0 {
-		return logFileMeta{prefix: base}
-	}
-	beforeID := base[:lastHyphen]
+func parseLogMetadata(filename, requestID string) logFileMeta {
+	beforeID := strings.TrimSuffix(filename, "-"+requestID+".log")
 
 	seq := 0
 	beforeSeq := beforeID
@@ -406,21 +312,25 @@ func parseLogMetadata(filename string) logFileMeta {
 // logFileIsNewer determines whether candidate should take precedence over current.
 // It compares file modification times, and on ties, compares the embedded timestamp
 // and collision sequence for matching prefixes.
-func logFileIsNewer(candidateName string, candidateMod time.Time, currentName string, currentMod time.Time) bool {
+func logFileIsNewer(candidateName string, candidateMod time.Time, candMeta logFileMeta, currentName string, currentMod time.Time, currMeta logFileMeta) bool {
 	if candidateMod.After(currentMod) {
 		return true
 	}
 	if candidateMod.Before(currentMod) {
 		return false
 	}
-	candMeta := parseLogMetadata(candidateName)
-	currMeta := parseLogMetadata(currentName)
 
-	if candMeta.hasTime && currMeta.hasTime {
+	if candMeta.hasTime != currMeta.hasTime {
+		return candMeta.hasTime
+	}
+	if candMeta.hasTime {
 		if !candMeta.time.Equal(currMeta.time) {
 			return candMeta.time.After(currMeta.time)
 		}
-		if candMeta.prefix == currMeta.prefix && candMeta.seq != currMeta.seq {
+		if candMeta.prefix != currMeta.prefix {
+			return candMeta.prefix > currMeta.prefix
+		}
+		if candMeta.seq != currMeta.seq {
 			return candMeta.seq > currMeta.seq
 		}
 	}
@@ -449,38 +359,12 @@ func (h *Handler) DownloadRequestErrorLog(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid log file name"})
 		return
 	}
-	if !strings.HasPrefix(name, "error-") || !strings.HasSuffix(name, ".log") {
+	if !strings.HasPrefix(name, "error-") || !(strings.HasSuffix(name, ".log") || strings.HasSuffix(name, ".log.gz")) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "log file not found"})
 		return
 	}
 
-	dirAbs, errAbs := filepath.Abs(dir)
-	if errAbs != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to resolve log directory: %v", errAbs)})
-		return
-	}
-	fullPath := filepath.Clean(filepath.Join(dirAbs, name))
-	prefix := dirAbs + string(os.PathSeparator)
-	if !strings.HasPrefix(fullPath, prefix) {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid log file path"})
-		return
-	}
-
-	info, errStat := os.Stat(fullPath)
-	if errStat != nil {
-		if os.IsNotExist(errStat) {
-			c.JSON(http.StatusNotFound, gin.H{"error": "log file not found"})
-			return
-		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to read log file: %v", errStat)})
-		return
-	}
-	if info.IsDir() {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid log file"})
-		return
-	}
-
-	c.FileAttachment(fullPath, name)
+	h.serveRequestLog(c, "", name)
 }
 
 func (h *Handler) logDirectory() string {
@@ -1319,8 +1203,12 @@ func parseTimestamp(line string) int64 {
 	if len(line) < 19 {
 		return 0
 	}
+	// 日志行前缀形如 `[2026-06-19 13:02:35 +08:00] ...`，前 19 字符是
+	// `2006-01-02 15:04:05`，其后的 ` +08:00` 时区后缀仅给人看，不进入 candidate。
 	candidate := line[:19]
-	t, err := time.ParseInLocation("2006-01-02 15:04:05", candidate, time.Local)
+	// 关键耦合：日志行前缀时间由 logging.LogFormatter 用 displayLoc（默认 UTC+8）写出，
+	// 这里必须用同一个 displayLoc 解析，否则后台日志查询的时间会按本机时区错位。
+	t, err := time.ParseInLocation("2006-01-02 15:04:05", candidate, logging.DisplayLocation())
 	if err != nil {
 		return 0
 	}

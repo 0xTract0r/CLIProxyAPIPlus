@@ -79,6 +79,12 @@ jobs:
           go test -mod=readonly -race -count=1 -timeout=2m ./internal/usage
           go test -mod=readonly -race -count=1 -timeout=2m ./internal/api/handlers/management -run '^Test(GetUsageQueue|GetUsageStatistics|ExportUsageStatistics)'
           go test -mod=readonly -race -count=1 -timeout=2m ./internal/api -run '^Test(CombinedOrdinaryUsage|RegisteredPricingWriteFailure|UsageImportValidity|UsageInstanceColdStart|UsageSDKChatAttribution|UsageRecorderConfiguration|UsageKnownKeyConfiguration|UsageDeferredShutdown|UsageImportWriteFailure)'
+      - name: Test retained request logs and release lookups
+        env:
+          TZ: UTC
+        run: |
+          go test -mod=readonly -race -count=1 -timeout=3m ./internal/managementasset ./internal/logging
+          go test -mod=readonly -race -count=1 -timeout=3m ./internal/api ./internal/api/handlers/management ./internal/api/middleware ./internal/config -run '^(Test(GetLatestVersionUsesCanonicalUpstream|GetLogs|GetRequestLogByID|RegisteredRequestLogArchiveRoutes|LoggingDisplayTimezoneFromConfig|RequestLogWriterToManagementGzipRoundTrip|RequestLogManagementRouteRequiresLocalAuthentication|RequestLogArchive|ArchivedErrorLogs|ParseTimestampOnRealFormatterLine|RequestLoggingMiddleware_StreamingResponsesUpstreamSections|DefaultRequestLoggerFactory_UsesResolvedLogDirectory))'
       - name: Build
         run: |
           go build -o test-output ./cmd/server
