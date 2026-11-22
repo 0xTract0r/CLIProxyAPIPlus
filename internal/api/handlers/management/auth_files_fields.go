@@ -128,11 +128,15 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 		return
 	}
 
-	updatedAuth, committed, errModify := h.authManager.Modify(ctx, targetAuth.ID, targetAuth.RegistrationEpoch, func(current *coreauth.Auth) error {
+	updatedAuth, committed, errModify := h.authManager.ModifyPersisted(ctx, targetAuth.ID, targetAuth.RegistrationEpoch, func(current *coreauth.Auth) error {
 		applyAuthDisabledState(current, *req.Disabled)
 		return nil
 	})
 	if errModify != nil {
+		if errors.Is(errModify, coreauth.ErrCredentialFileRemoved) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "auth file not found"})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to update auth: %v", errModify)})
 		return
 	}
@@ -334,10 +338,14 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 		return
 	}
 
-	updatedAuth, committed, errModify := h.authManager.Modify(ctx, targetAuth.ID, targetAuth.RegistrationEpoch, func(current *coreauth.Auth) error {
+	updatedAuth, committed, errModify := h.authManager.ModifyPersisted(ctx, targetAuth.ID, targetAuth.RegistrationEpoch, func(current *coreauth.Auth) error {
 		return applyAuthFileFieldsPatch(current, req, requestRetryPatch)
 	})
 	if errModify != nil {
+		if errors.Is(errModify, coreauth.ErrCredentialFileRemoved) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "auth file not found"})
+			return
+		}
 		var patchErr *authFileFieldPatchError
 		if errors.As(errModify, &patchErr) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": patchErr.message})

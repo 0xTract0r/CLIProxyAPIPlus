@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -109,8 +110,12 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 	// Runtime updates must not recreate a disabled credential whose source file
 	// was deliberately removed. Login and migration callers explicitly mark the
 	// save when creating a missing disabled credential is intentional.
-	if auth.Disabled && !cliproxyauth.HasAuthCreationIntent(ctx) {
+	explicitEdit := cliproxyauth.IsExplicitCredentialEdit(ctx)
+	if explicitEdit || (auth.Disabled && !cliproxyauth.HasAuthCreationIntent(ctx)) {
 		if _, statErr := os.Stat(path); os.IsNotExist(statErr) {
+			if explicitEdit {
+				return "", cliproxyauth.ErrCredentialFileRemoved
+			}
 			return "", nil
 		}
 	}
@@ -151,27 +156,8 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 			if errMarshal != nil {
 				return "", fmt.Errorf("auth filestore: marshal metadata failed: %w", errMarshal)
 			}
-			if existing, errRead := os.ReadFile(path); errRead == nil {
-				if jsonEqual(existing, raw) {
-					break
-				}
-				file, errOpen := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0o600)
-				if errOpen != nil {
-					return "", fmt.Errorf("auth filestore: open existing failed: %w", errOpen)
-				}
-				if _, errWrite := file.Write(raw); errWrite != nil {
-					_ = file.Close()
-					return "", fmt.Errorf("auth filestore: write existing failed: %w", errWrite)
-				}
-				if errClose := file.Close(); errClose != nil {
-					return "", fmt.Errorf("auth filestore: close existing failed: %w", errClose)
-				}
-			} else if os.IsNotExist(errRead) {
-				if errWrite := os.WriteFile(path, raw, 0o600); errWrite != nil {
-					return "", fmt.Errorf("auth filestore: write file failed: %w", errWrite)
-				}
-			} else {
-				return "", fmt.Errorf("auth filestore: read existing failed: %w", errRead)
+			if errWrite := saveOrdinaryAuthJSON(path, raw, explicitEdit); errWrite != nil {
+				return "", errWrite
 			}
 		default:
 			return "", fmt.Errorf("auth filestore: nothing to persist for %s", auth.ID)
@@ -192,6 +178,179 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 	return path, nil
 }
 
+// ordinaryAuthWrites serializes the read, backup, and replacement across
+// separately constructed stores. Entries are retired after the last waiter.
+var ordinaryAuthWrites = struct {
+	sync.Mutex
+	paths map[string]*ordinaryAuthWrite
+}{paths: make(map[string]*ordinaryAuthWrite)}
+
+type ordinaryAuthWrite struct {
+	mu    sync.Mutex
+	users int
+}
+
+func lockOrdinaryAuthWrite(path string) func() {
+	ordinaryAuthWrites.Lock()
+	write := ordinaryAuthWrites.paths[path]
+	if write == nil {
+		write = &ordinaryAuthWrite{}
+		ordinaryAuthWrites.paths[path] = write
+	}
+	write.users++
+	ordinaryAuthWrites.Unlock()
+	write.mu.Lock()
+	return func() {
+		write.mu.Unlock()
+		ordinaryAuthWrites.Lock()
+		write.users--
+		if write.users == 0 {
+			delete(ordinaryAuthWrites.paths, path)
+		}
+		ordinaryAuthWrites.Unlock()
+	}
+}
+
+func saveOrdinaryAuthJSON(path string, raw []byte, requireExisting bool) error {
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return err
+	}
+	if info, errLstat := os.Lstat(absolute); errLstat == nil && info.Mode()&os.ModeSymlink != 0 {
+		resolved, errResolve := filepath.EvalSymlinks(absolute)
+		if errResolve != nil {
+			return fmt.Errorf("auth filestore: resolve existing link: %w", errResolve)
+		}
+
+		absolute = resolved
+	} else if parent, errParent := filepath.EvalSymlinks(filepath.Dir(absolute)); errParent == nil {
+		absolute = filepath.Join(parent, filepath.Base(absolute))
+	}
+	unlock := lockOrdinaryAuthWrite(absolute)
+	defer unlock()
+
+	existing, errRead := os.ReadFile(absolute)
+	if errRead == nil {
+		if jsonEqual(existing, raw) {
+			return nil
+		}
+		// The prior in-place writer required write access to the existing
+		// file. Check that permission without truncating before replacement.
+		file, errOpen := os.OpenFile(absolute, os.O_WRONLY, 0)
+		if errOpen != nil {
+			return fmt.Errorf("auth filestore: open existing failed: %w", errOpen)
+		}
+		if errClose := file.Close(); errClose != nil {
+			return fmt.Errorf("auth filestore: close existing failed: %w", errClose)
+		}
+	} else if !os.IsNotExist(errRead) {
+		return fmt.Errorf("auth filestore: read existing failed: %w", errRead)
+	} else if requireExisting {
+		return cliproxyauth.ErrCredentialFileRemoved
+	}
+	var snapshot string
+	if errWrite := writeFileAtomicBeforeRename(absolute, raw, 0o600, func() {
+		snapshot = snapshotAuthFileHistory(absolute, existing)
+	}); errWrite != nil {
+		if snapshot != "" {
+			_ = os.Remove(snapshot)
+		}
+		return fmt.Errorf("auth filestore: write file failed: %w", errWrite)
+	}
+	if snapshot != "" {
+		pruneAuthFileHistory(filepath.Dir(snapshot), filepath.Base(absolute))
+	}
+	return nil
+}
+
+const authFileHistoryDirName = ".history"
+
+// authFileHistoryKeep 是每个凭证文件保留的最近快照数。
+const authFileHistoryKeep = 7
+const authFileHistoryTimestamp = "20060102T150405.000000000"
+
+// snapshotAuthFileHistory 在覆盖前把现有非空文件复制到 0700 历史目录；
+// 尽力而为，失败不阻断持久化。调用方必须已持有该路径的普通写锁。
+func snapshotAuthFileHistory(path string, data []byte) string {
+	if len(data) == 0 {
+		return ""
+	}
+	baseName := filepath.Base(path)
+	historyDir := filepath.Join(filepath.Dir(path), authFileHistoryDirName)
+	if errMk := os.MkdirAll(historyDir, 0o700); errMk != nil {
+		return ""
+	}
+	info, errStat := os.Lstat(historyDir)
+	if errStat != nil || !info.IsDir() || info.Mode().Perm()&0o077 != 0 {
+		return ""
+	}
+	snapshotName := fmt.Sprintf("%s.%s.bak", baseName, time.Now().UTC().Format(authFileHistoryTimestamp))
+	snapshot := filepath.Join(historyDir, snapshotName)
+	if errWrite := writeFileAtomic(snapshot, data, 0o600); errWrite != nil {
+		return ""
+	}
+	return snapshot
+}
+
+// pruneAuthFileHistory 仅保留 baseName 最近 authFileHistoryKeep 份快照。
+func pruneAuthFileHistory(historyDir, baseName string) {
+	entries, err := os.ReadDir(historyDir)
+	if err != nil {
+		return
+	}
+	prefix := baseName + "."
+	snapshots := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		name := entry.Name()
+		if !entry.IsDir() && strings.HasPrefix(name, prefix) && strings.HasSuffix(name, ".bak") {
+			stamp := strings.TrimSuffix(strings.TrimPrefix(name, prefix), ".bak")
+			if _, err := time.Parse(authFileHistoryTimestamp, stamp); err == nil {
+				snapshots = append(snapshots, name)
+			}
+		}
+	}
+	if len(snapshots) <= authFileHistoryKeep {
+		return
+	}
+	sort.Strings(snapshots)
+	for _, name := range snapshots[:len(snapshots)-authFileHistoryKeep] {
+		_ = os.Remove(filepath.Join(historyDir, name))
+	}
+}
+
+// writeFileAtomic 在同目录写临时文件、fsync 后 rename 覆盖，失败时旧内容保持完整。
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	return writeFileAtomicBeforeRename(path, data, perm, nil)
+}
+
+func writeFileAtomicBeforeRename(path string, data []byte, perm os.FileMode, beforeRename func()) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer func() { _ = os.Remove(tmpName) }()
+	if err = tmp.Chmod(perm); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err = tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err = tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err = tmp.Close(); err != nil {
+		return err
+	}
+	if beforeRename != nil {
+		beforeRename()
+	}
+	return os.Rename(tmpName, path)
+}
+
 // List enumerates all auth JSON files under the configured directory.
 func (s *FileTokenStore) List(ctx context.Context) ([]*cliproxyauth.Auth, error) {
 	dir := s.baseDirSnapshot()
@@ -204,6 +363,9 @@ func (s *FileTokenStore) List(ctx context.Context) ([]*cliproxyauth.Auth, error)
 			return walkErr
 		}
 		if d.IsDir() {
+			if path != dir && d.Name() == authFileHistoryDirName {
+				return fs.SkipDir
+			}
 			return nil
 		}
 		if !strings.HasSuffix(strings.ToLower(d.Name()), ".json") {

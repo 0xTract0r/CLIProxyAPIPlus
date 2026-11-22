@@ -37,6 +37,12 @@ jobs:
         run: >-
           go test -mod=readonly -race -count=1 ./internal/api ./internal/api/handlers/management ./sdk/auth ./sdk/cliproxy
           -run '^(TestOrdinaryConfigToggleCleanupUsesCommittedDirectory|TestOrdinaryVertexImportDefaultStoreIsolation|TestOrdinaryFileStoreViewsShareRootWriteLock|TestIndependentManagerSaveDirectoryIsPerCall|TestOrdinaryManagerLoginPreservesDefaultFileDirectory|TestOrdinaryBuilderLocalStoreDirectoryIsolation)$'
+      - name: Verify credential edits on storage failure and file removal
+        env:
+          GIN_MODE: release
+        run: >-
+          go test -mod=readonly -race -count=1 ./internal/api ./sdk/auth
+          -run '^(TestIndependentOrdinaryCredential(FieldsPersistence|MissingFile)|TestOrdinaryFileStore(HistoryConcurrentViews|CannotReplaceWithoutDirectoryWriteAccess|HistoryIsPrivateAndOutsideList)|TestFileTokenStore_Save_(RollingWholeFileSnapshots|NoSnapshotWhenNoPriorFile))$'
       - name: Test local credential directory reload and late notifications
         env:
           GIN_MODE: release
