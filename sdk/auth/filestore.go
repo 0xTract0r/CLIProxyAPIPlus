@@ -163,6 +163,9 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 		}
 		switch {
 		case auth.Storage != nil:
+			if xaiPath == "" {
+				snapshotOrdinaryTokenStorageFile(path)
+			}
 			if auth.Metadata == nil {
 				auth.Metadata = make(map[string]any)
 			}
@@ -324,6 +327,30 @@ func saveOrdinaryAuthJSONLocked(path, absolute string, raw []byte, requireExisti
 		pruneAuthFileHistory(filepath.Dir(snapshot), filepath.Base(absolute))
 	}
 	return nil
+}
+
+// snapshotOrdinaryTokenStorageFile keeps the prior file even when the storage
+// provider returns an error after writing. The callback receives the original
+// path and runs outside this shared path lock.
+func snapshotOrdinaryTokenStorageFile(path string) {
+	target, err := ordinaryAuthWritePath(path)
+	if err != nil {
+		return
+	}
+	unlock := lockOrdinaryAuthWrite(target)
+	defer unlock()
+
+	info, err := os.Stat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Size() == 0 {
+		return
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	if snapshot := snapshotAuthFileHistory(path, data); snapshot != "" {
+		pruneAuthFileHistory(filepath.Dir(snapshot), filepath.Base(path))
+	}
 }
 
 const authFileHistoryDirName = ".history"
