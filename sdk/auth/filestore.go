@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -212,23 +213,38 @@ func lockOrdinaryAuthWrite(path string) func() {
 }
 
 func saveOrdinaryAuthJSON(path string, raw []byte, requireExisting bool) error {
-	absolute, err := filepath.Abs(path)
+	absolute, err := ordinaryAuthWritePath(path)
 	if err != nil {
 		return err
-	}
-	if info, errLstat := os.Lstat(absolute); errLstat == nil && info.Mode()&os.ModeSymlink != 0 {
-		resolved, errResolve := filepath.EvalSymlinks(absolute)
-		if errResolve != nil {
-			return fmt.Errorf("auth filestore: resolve existing link: %w", errResolve)
-		}
-
-		absolute = resolved
-	} else if parent, errParent := filepath.EvalSymlinks(filepath.Dir(absolute)); errParent == nil {
-		absolute = filepath.Join(parent, filepath.Base(absolute))
 	}
 	unlock := lockOrdinaryAuthWrite(absolute)
 	defer unlock()
 
+	// The logical entry may be unlinked while waiting for its target's lock.
+	entry, errEntry := os.Lstat(path)
+	if os.IsNotExist(errEntry) {
+		if requireExisting {
+			return cliproxyauth.ErrCredentialFileRemoved
+		}
+	} else if errEntry != nil {
+		return errEntry
+	} else if entry.Mode()&os.ModeSymlink != 0 {
+		if _, errTarget := os.Stat(path); errTarget != nil {
+			if requireExisting && os.IsNotExist(errTarget) {
+				return cliproxyauth.ErrCredentialFileRemoved
+			}
+			return fmt.Errorf("auth filestore: resolve existing link: %w", errTarget)
+		}
+	}
+	current, err := ordinaryAuthWritePath(path)
+	if err != nil {
+		return err
+	}
+	if current != absolute {
+		return cliproxyauth.ErrFileRemovalBusy
+	}
+
+	var metadata *ordinaryCredentialMetadataGuard
 	existing, errRead := os.ReadFile(absolute)
 	if errRead == nil {
 		if jsonEqual(existing, raw) {
@@ -240,7 +256,16 @@ func saveOrdinaryAuthJSON(path string, raw []byte, requireExisting bool) error {
 		if errOpen != nil {
 			return fmt.Errorf("auth filestore: open existing failed: %w", errOpen)
 		}
-		if errClose := file.Close(); errClose != nil {
+		if requireExisting {
+			metadata, err = guardOrdinaryCredentialMetadata(file, absolute)
+			if err != nil {
+				_ = file.Close()
+				return err
+			}
+		}
+		if metadata != nil {
+			defer file.Close()
+		} else if errClose := file.Close(); errClose != nil {
 			return fmt.Errorf("auth filestore: close existing failed: %w", errClose)
 		}
 	} else if !os.IsNotExist(errRead) {
@@ -249,7 +274,7 @@ func saveOrdinaryAuthJSON(path string, raw []byte, requireExisting bool) error {
 		return cliproxyauth.ErrCredentialFileRemoved
 	}
 	var snapshot string
-	if errWrite := writeFileAtomicBeforeRename(absolute, raw, 0o600, func() {
+	if errWrite := writeFileAtomicWithMetadata(absolute, raw, 0o600, metadata, func() {
 		snapshot = snapshotAuthFileHistory(absolute, existing)
 	}); errWrite != nil {
 		if snapshot != "" {
@@ -324,19 +349,42 @@ func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 }
 
 func writeFileAtomicBeforeRename(path string, data []byte, perm os.FileMode, beforeRename func()) error {
+	return writeFileAtomicWithMetadata(path, data, perm, nil, beforeRename)
+}
+
+// ErrUnsafeCredentialMetadata reports that the underlying file metadata
+// cannot safely be retained during an explicit credential edit.
+var ErrUnsafeCredentialMetadata = errors.New("credential file metadata cannot be safely preserved")
+
+type ordinaryCredentialMetadataGuard struct {
+	checkTemporary func(*os.File) error
+	setMetadata    func(*os.File) error
+	checkTarget    func() error
+}
+
+func writeFileAtomicWithMetadata(path string, data []byte, perm os.FileMode, metadata *ordinaryCredentialMetadataGuard, beforeRename func()) error {
 	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-*")
 	if err != nil {
 		return err
 	}
 	tmpName := tmp.Name()
 	defer func() { _ = os.Remove(tmpName) }()
-	if err = tmp.Chmod(perm); err != nil {
-		_ = tmp.Close()
+	defer tmp.Close()
+	if metadata != nil {
+		if err = metadata.checkTemporary(tmp); err != nil {
+			return err
+		}
+	} else if err = tmp.Chmod(perm); err != nil {
 		return err
 	}
 	if _, err = tmp.Write(data); err != nil {
 		_ = tmp.Close()
 		return err
+	}
+	if metadata != nil {
+		if err = metadata.setMetadata(tmp); err != nil {
+			return err
+		}
 	}
 	if err = tmp.Sync(); err != nil {
 		_ = tmp.Close()
@@ -347,6 +395,11 @@ func writeFileAtomicBeforeRename(path string, data []byte, perm os.FileMode, bef
 	}
 	if beforeRename != nil {
 		beforeRename()
+	}
+	if metadata != nil {
+		if err = metadata.checkTarget(); err != nil {
+			return err
+		}
 	}
 	return os.Rename(tmpName, path)
 }
@@ -386,6 +439,48 @@ func (s *FileTokenStore) List(ctx context.Context) ([]*cliproxyauth.Auth, error)
 	return entries, nil
 }
 
+func ordinaryAuthWritePath(path string) (string, error) {
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	if resolved, err := filepath.EvalSymlinks(absolute); err == nil {
+		return resolved, nil
+	}
+	if parent, err := filepath.EvalSymlinks(filepath.Dir(absolute)); err == nil {
+		absolute = filepath.Join(parent, filepath.Base(absolute))
+	}
+	return absolute, nil
+}
+
+// WithExistingAuthFile serializes an unlink with credential writes to the same
+// normalized path. The callback gets the latest directory entry and must act
+// on the original path, so removing a symbolic link leaves its target intact.
+func WithExistingAuthFile(path string, remove func(os.FileInfo) error) error {
+	// Avoid creating a missing credential directory just to lock a no-op.
+	if _, err := os.Lstat(path); err != nil {
+		return err
+	}
+	target, err := ordinaryAuthWritePath(path)
+	if err != nil {
+		return err
+	}
+	unlock := lockOrdinaryAuthWrite(target)
+	defer unlock()
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	current, err := ordinaryAuthWritePath(path)
+	if err != nil {
+		return err
+	}
+	if current != target {
+		return cliproxyauth.ErrFileRemovalBusy
+	}
+	return remove(info)
+}
+
 // Delete removes the auth file.
 func (s *FileTokenStore) Delete(ctx context.Context, id string) error {
 	id = strings.TrimSpace(id)
@@ -396,7 +491,10 @@ func (s *FileTokenStore) Delete(ctx context.Context, id string) error {
 	if err != nil {
 		return err
 	}
-	if err = os.Remove(path); err != nil && !os.IsNotExist(err) {
+	err = WithExistingAuthFile(path, func(os.FileInfo) error {
+		return os.Remove(path)
+	})
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("auth filestore: delete failed: %w", err)
 	}
 	return nil

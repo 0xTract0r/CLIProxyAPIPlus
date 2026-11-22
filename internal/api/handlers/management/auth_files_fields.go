@@ -133,8 +133,7 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 		return nil
 	})
 	if errModify != nil {
-		if errors.Is(errModify, coreauth.ErrCredentialFileRemoved) {
-			c.JSON(http.StatusNotFound, gin.H{"error": "auth file not found"})
+		if writeAuthFileStorageConflict(c, errModify) {
 			return
 		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to update auth: %v", errModify)})
@@ -198,6 +197,20 @@ func (h *Handler) patchPluginVirtualSourceStatus(ctx context.Context, targetAuth
 		hookAuths = append(hookAuths, updated)
 	}
 	return hookAuths, nil
+}
+
+func writeAuthFileStorageConflict(c *gin.Context, err error) bool {
+	switch {
+	case errors.Is(err, coreauth.ErrCredentialFileRemoved):
+		c.JSON(http.StatusNotFound, gin.H{"error": "auth file not found"})
+	case errors.Is(err, sdkAuth.ErrUnsafeCredentialMetadata):
+		c.JSON(http.StatusConflict, gin.H{"error": "cannot preserve the file's existing permissions, ownership or links"})
+	case errors.Is(err, coreauth.ErrFileRemovalBusy):
+		c.JSON(http.StatusConflict, gin.H{"error": "credential file changed during the edit"})
+	default:
+		return false
+	}
+	return true
 }
 
 func (h *Handler) invokePostAuthPersistHooks(ctx context.Context, auths []*coreauth.Auth) error {
@@ -342,8 +355,7 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 		return applyAuthFileFieldsPatch(current, req, requestRetryPatch)
 	})
 	if errModify != nil {
-		if errors.Is(errModify, coreauth.ErrCredentialFileRemoved) {
-			c.JSON(http.StatusNotFound, gin.H{"error": "auth file not found"})
+		if writeAuthFileStorageConflict(c, errModify) {
 			return
 		}
 		var patchErr *authFileFieldPatchError

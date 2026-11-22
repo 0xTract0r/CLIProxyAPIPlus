@@ -42,7 +42,7 @@ jobs:
           GIN_MODE: release
         run: >-
           go test -mod=readonly -race -count=1 ./internal/api ./sdk/auth
-          -run '^(TestIndependentOrdinaryCredential(FieldsPersistence|MissingFile)|TestOrdinaryFileStore(HistoryConcurrentViews|CannotReplaceWithoutDirectoryWriteAccess|HistoryIsPrivateAndOutsideList)|TestFileTokenStore_Save_(RollingWholeFileSnapshots|NoSnapshotWhenNoPriorFile))$'
+          -run '^(TestIndependentOrdinaryCredential(FieldsPersistence|MissingFile)|TestOrdinaryCredentialEditPreservesLinkedFile|TestOrdinaryCredentialDeleteUsesFileStoreLock|TestOrdinaryFileTokenStoreDelete(SharesCanonicalWriteLock|UnlinksLeafAndRejectsWaiter)|TestOrdinaryFileStore(HistoryConcurrentViews|CannotReplaceWithoutDirectoryWriteAccess|HistoryIsPrivateAndOutsideList|ExplicitEditMetadata)|TestFileTokenStore_Save_(RollingWholeFileSnapshots|NoSnapshotWhenNoPriorFile))$'
       - name: Test local credential directory reload and late notifications
         env:
           GIN_MODE: release
