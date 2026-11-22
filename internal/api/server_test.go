@@ -1678,8 +1678,16 @@ func TestManagementUsageRequiresManagementAuthAndPopsArray(t *testing.T) {
 	legacyReq.Header.Set("Authorization", "Bearer test-management-key")
 	legacyRR := httptest.NewRecorder()
 	server.engine.ServeHTTP(legacyRR, legacyReq)
-	if legacyRR.Code != http.StatusNotFound {
-		t.Fatalf("legacy usage status = %d, want %d body=%s", legacyRR.Code, http.StatusNotFound, legacyRR.Body.String())
+	if legacyRR.Code != http.StatusOK {
+		t.Fatalf("legacy usage status = %d, want %d body=%s", legacyRR.Code, http.StatusOK, legacyRR.Body.String())
+	}
+	var legacy struct {
+		Usage *struct {
+			TotalRequests int `json:"total_requests"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(legacyRR.Body.Bytes(), &legacy); err != nil || legacy.Usage == nil || legacy.Usage.TotalRequests != 0 {
+		t.Fatalf("legacy read must return its independent summary: %v body=%s", err, legacyRR.Body.String())
 	}
 
 	authReq := httptest.NewRequest(http.MethodGet, "/v0/management/usage-queue?count=2", nil)
@@ -2733,7 +2741,7 @@ func TestDefaultRequestLoggerFactory_UsesResolvedLogDirectory(t *testing.T) {
 	}
 	foundErrorLogInAuthDir := false
 	for _, entry := range authEntries {
-		if strings.HasPrefix(entry.Name(), "error-") && strings.HasSuffix(entry.Name(), ".log") {
+		if strings.HasPrefix(entry.Name(), "error-") && strings.HasSuffix(entry.Name(), ".log.gz") {
 			foundErrorLogInAuthDir = true
 			break
 		}
@@ -2748,7 +2756,7 @@ func TestDefaultRequestLoggerFactory_UsesResolvedLogDirectory(t *testing.T) {
 		t.Fatalf("failed to inspect config logs dir %s: %v", configLogsDir, errReadConfigDir)
 	}
 	for _, entry := range configEntries {
-		if strings.HasPrefix(entry.Name(), "error-") && strings.HasSuffix(entry.Name(), ".log") {
+		if strings.HasPrefix(entry.Name(), "error-") && strings.HasSuffix(entry.Name(), ".log.gz") {
 			t.Fatalf("unexpected forced error log in config dir %s", configLogsDir)
 		}
 	}
@@ -3223,7 +3231,7 @@ func TestServerResponsesStreamingRequestLogCapturesUpstreamSections(t *testing.T
 	}
 	var logPath string
 	for _, entry := range entries {
-		if strings.HasPrefix(entry.Name(), "v1-responses-") && strings.HasSuffix(entry.Name(), ".log") {
+		if strings.HasPrefix(entry.Name(), "v1-responses-") && strings.HasSuffix(entry.Name(), ".log.gz") {
 			logPath = filepath.Join(logsDir, entry.Name())
 			break
 		}
@@ -3231,7 +3239,7 @@ func TestServerResponsesStreamingRequestLogCapturesUpstreamSections(t *testing.T
 	if logPath == "" {
 		t.Fatal("streaming request log was not created in logs dir")
 	}
-	content, errReadLog := os.ReadFile(logPath)
+	content, errReadLog := readGzipRequestLogFixture(logPath)
 	if errReadLog != nil {
 		t.Fatalf("read log file: %v", errReadLog)
 	}
@@ -3341,7 +3349,7 @@ func TestServerCodexAPIKeyResponsesStreamingRequestLog(t *testing.T) {
 	}
 	var logPath string
 	for _, entry := range entries {
-		if strings.HasPrefix(entry.Name(), "v1-responses-") && strings.HasSuffix(entry.Name(), ".log") {
+		if strings.HasPrefix(entry.Name(), "v1-responses-") && strings.HasSuffix(entry.Name(), ".log.gz") {
 			logPath = filepath.Join(logsDir, entry.Name())
 			break
 		}
@@ -3349,7 +3357,7 @@ func TestServerCodexAPIKeyResponsesStreamingRequestLog(t *testing.T) {
 	if logPath == "" {
 		t.Fatal("streaming request log was not created in logs dir")
 	}
-	content, errReadLog := os.ReadFile(logPath)
+	content, errReadLog := readGzipRequestLogFixture(logPath)
 	if errReadLog != nil {
 		t.Fatalf("read log file: %v", errReadLog)
 	}
@@ -4064,7 +4072,7 @@ func testServerResponsesWebsocketReauthorizesEachTurn(t *testing.T, requestLog b
 			if strings.HasSuffix(entry.Name(), ".tmp") || strings.HasPrefix(entry.Name(), "request-log-parts-") {
 				t.Errorf("request log temporary entry remains after handler completion: %s", entry.Name())
 			}
-			if strings.HasSuffix(entry.Name(), ".log") {
+			if strings.HasSuffix(entry.Name(), ".log.gz") {
 				logCount++
 			}
 		}

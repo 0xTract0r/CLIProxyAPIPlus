@@ -19,6 +19,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginstore"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/usage"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
@@ -38,6 +39,8 @@ const attemptMaxIdleTime = 2 * time.Hour
 
 // Handler aggregates config reference, persistence path and helpers.
 type Handler struct {
+	usageStats              *usage.RequestStatistics
+	usageHistoryUnavailable bool
 	cfg                     *config.Config
 	configFilePath          string
 	mu                      sync.Mutex
@@ -53,6 +56,7 @@ type Handler struct {
 	allowRemoteOverride     bool
 	envSecret               string
 	logDir                  string
+	requestLogArchiveDir    string
 	postAuthHook            coreauth.PostAuthHook
 	postAuthPersistHook     coreauth.PostAuthHook
 	pluginHost              *pluginhost.Host
@@ -77,16 +81,45 @@ type configReloadSnapshot struct {
 func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Manager) *Handler {
 	envSecret, _ := os.LookupEnv("MANAGEMENT_PASSWORD")
 	envSecret = strings.TrimSpace(envSecret)
+	archiveDir := strings.TrimSpace(os.Getenv("REQUEST_LOG_ARCHIVE_DIR"))
+	if archiveDir != "" && !filepath.IsAbs(archiveDir) {
+		log.Warn("ignoring relative REQUEST_LOG_ARCHIVE_DIR")
+		archiveDir = ""
+	}
+	if archiveDir != "" {
+		archiveDir = filepath.Clean(archiveDir)
+	}
+
+	catalog := usage.NewPricingCatalogManager()
+	stats := usage.NewRequestStatisticsWithCatalog(catalog)
+	var historyUnavailable bool
+	if cfg != nil {
+		stats.SetKnownUsageAPIKeys(cfg.APIKeys)
+	}
+	if strings.TrimSpace(configFilePath) != "" {
+		dir := filepath.Dir(configFilePath)
+		if err := catalog.SetPersistencePath(filepath.Join(dir, ".usage-pricing-catalog.json")); err != nil {
+			log.WithError(err).Warn("usage: pricing catalog could not be restored; keeping pricing in memory")
+		}
+		if err := stats.SetPersistencePath(filepath.Join(dir, ".usage-statistics.json")); err != nil {
+			historyUnavailable = true
+			log.WithError(err).Warn("usage: history could not be restored; keeping history in memory")
+		}
+	}
 
 	h := &Handler{
-		cfg:                 cfg.CloneForRuntime(),
-		configFilePath:      configFilePath,
-		failedAttempts:      make(map[string]*attemptInfo),
-		authManager:         manager,
-		tokenStore:          sdkAuth.GetTokenStore(),
-		allowRemoteOverride: envSecret != "",
-		envSecret:           envSecret,
+		usageStats:              stats,
+		usageHistoryUnavailable: historyUnavailable,
+		cfg:                     cfg.CloneForRuntime(),
+		configFilePath:          configFilePath,
+		failedAttempts:          make(map[string]*attemptInfo),
+		authManager:             manager,
+		tokenStore:              sdkAuth.GetTokenStore(),
+		allowRemoteOverride:     envSecret != "",
+		envSecret:               envSecret,
+		requestLogArchiveDir:    archiveDir,
 	}
+	h.usageStats.SetRecordingEnabled(cfg != nil && cfg.UsageStatisticsEnabled)
 	h.startAttemptCleanup()
 	return h
 }
@@ -145,6 +178,10 @@ func (h *Handler) SetConfig(cfg *config.Config) {
 		prevSecretHash = h.cfg.RemoteManagement.SecretKey
 	}
 	h.cfg = cloned
+	if cloned != nil {
+		h.usageStats.SetKnownUsageAPIKeys(cloned.APIKeys)
+	}
+	h.usageStats.SetRecordingEnabled(cloned != nil && cloned.UsageStatisticsEnabled)
 	nextSecretHash := ""
 	if cloned != nil {
 		nextSecretHash = cloned.RemoteManagement.SecretKey
@@ -253,6 +290,7 @@ func (h *Handler) reloadSnapshotConfigLocked() configReloadSnapshot {
 	if h == nil || h.cfg == nil {
 		return configReloadSnapshot{}
 	}
+	h.usageStats.SetKnownUsageAPIKeys(h.cfg.APIKeys)
 	h.reloadGeneration++
 	return configReloadSnapshot{
 		cfg:        h.cfg.CloneForRuntime(),
@@ -516,9 +554,9 @@ func (h *Handler) persistLocked(c *gin.Context) bool {
 	return true
 }
 
-// persistProviderListLocked publishes only the selected list and save metadata.
+// persistProviderFieldLocked publishes only the selected field and save metadata.
 // Keep the config pointer stable for scalar readers. The caller holds h.mu.
-func persistProviderListLocked[T any](h *Handler, c *gin.Context, candidate *config.Config, live *[]T, staged []T) {
+func persistProviderFieldLocked[T any](h *Handler, c *gin.Context, candidate *config.Config, live *T, staged T) {
 	sourceHash, err := config.SaveConfigPreserveCommentsWithSourceHash(h.configFilePath, candidate, c.GetBool(ConfigV8ContextKey))
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save config"})
@@ -584,4 +622,15 @@ func (h *Handler) updateStringField(c *gin.Context, set func(string)) {
 	defer h.mu.Unlock()
 	set(*body.Value)
 	h.persistLocked(c)
+}
+
+// SetUsageStatistics sets an isolated store before serving management routes.
+func (h *Handler) SetUsageStatistics(stats *usage.RequestStatistics) { h.usageStats = stats }
+
+// UsageStatistics returns the instance-owned store used by the management routes.
+func (h *Handler) UsageStatistics() *usage.RequestStatistics {
+	if h == nil {
+		return nil
+	}
+	return h.usageStats
 }

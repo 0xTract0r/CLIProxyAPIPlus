@@ -209,10 +209,32 @@ func (h *Handler) PutDebug(c *gin.Context) { h.updateBoolField(c, func(v bool) {
 
 // UsageStatisticsEnabled
 func (h *Handler) GetUsageStatisticsEnabled(c *gin.Context) {
-	c.JSON(200, gin.H{"usage-statistics-enabled": h.cfg.UsageStatisticsEnabled})
+	h.mu.Lock()
+	enabled := h.cfg != nil && h.cfg.UsageStatisticsEnabled
+	h.mu.Unlock()
+	c.JSON(http.StatusOK, gin.H{"usage-statistics-enabled": enabled})
 }
 func (h *Handler) PutUsageStatisticsEnabled(c *gin.Context) {
-	h.updateBoolField(c, func(v bool) { h.cfg.UsageStatisticsEnabled = v })
+	var body struct {
+		Value *bool `json:"value"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil || body.Value == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.cfg == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "config unavailable"})
+		return
+	}
+	previous := h.cfg.UsageStatisticsEnabled
+	h.cfg.UsageStatisticsEnabled = *body.Value
+	if !h.persistLocked(c) {
+		h.cfg.UsageStatisticsEnabled = previous
+		return
+	}
+	h.usageStats.SetRecordingEnabled(*body.Value)
 }
 
 // UsageStatisticsEnabled

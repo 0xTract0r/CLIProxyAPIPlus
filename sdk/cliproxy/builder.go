@@ -293,13 +293,19 @@ func (b *Builder) Build() (*Service, error) {
 	}
 	accessManager.SetProviders(sdkaccess.RegisteredProviders())
 
+	var localStore *sdkAuth.FileTokenStore
 	coreManager := b.coreManager
 	cooldownStateStore := b.cooldownStateStore
 	var appliedRoutingState *routingRuntimeState
 	if coreManager == nil {
 		tokenStore := sdkAuth.GetTokenStore()
-		if dirSetter, ok := tokenStore.(interface{ SetBaseDir(string) }); ok && b.cfg != nil {
-			dirSetter.SetBaseDir(b.cfg.AuthDir)
+		if b.cfg != nil {
+			if files, ok := tokenStore.(*sdkAuth.FileTokenStore); ok {
+				localStore = files.WithBaseDir(b.cfg.AuthDir)
+				tokenStore = localStore
+			} else if dirSetter, ok := tokenStore.(interface{ SetBaseDir(string) }); ok {
+				dirSetter.SetBaseDir(b.cfg.AuthDir)
+			}
 		}
 		if cooldownStateStore == nil {
 			if provider, ok := tokenStore.(coreauth.CooldownStateStoreProvider); ok {
@@ -334,6 +340,7 @@ func (b *Builder) Build() (*Service, error) {
 		authManager:           authManager,
 		accessManager:         accessManager,
 		coreManager:           coreManager,
+		localStoreRoot:        localStore,
 		cooldownStateStore:    cooldownStateStore,
 		pluginHost:            pluginHost,
 		discoveryManager:      newDiscoveryAdvertiserManager(),
@@ -374,6 +381,12 @@ func (s *Service) runtimeAuthSyncHook() coreauth.PostAuthHook {
 			ID:     auth.ID,
 			Auth:   auth,
 		}
+		update.PublicationFence = s.persistedFilePublicationFence(auth)
+		release, eligible := update.PublicationFence.Begin()
+		if !eligible {
+			return nil
+		}
+		release()
 		if watcher := s.currentWatcher(); watcher != nil {
 			_, rev := watcher.DispatchPersistedAuthUpdateWithRevision(&update)
 			if rev > 0 {

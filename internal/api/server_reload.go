@@ -98,6 +98,10 @@ func (s *Server) UpdateClientsContext(ctx context.Context, cfg *config.Config) b
 		}
 	}
 
+	if oldCfg == nil || oldCfg.LoggingDisplayTimezoneOffsetHours != cfg.LoggingDisplayTimezoneOffsetHours {
+		logging.ApplyDisplayTimezone(cfg)
+	}
+
 	if oldCfg == nil || oldCfg.UsageStatisticsEnabled != cfg.UsageStatisticsEnabled {
 		redisqueue.SetUsageStatisticsEnabled(cfg.UsageStatisticsEnabled)
 	}

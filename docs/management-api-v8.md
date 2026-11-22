@@ -371,3 +371,13 @@ accepts legacy, new, or mixed layouts, normalizing v8 documents on save.
 
 Plugin OAuth uses the shared v8 login endpoint. Other plugin-defined HTTP
 extensions retain their declared `/v0/management` routes.
+
+### Local usage history on v0
+
+Authenticated clients can read `GET /v0/management/usage`, page through history with `GET /v0/management/usage/export`, or restore records with `POST /v0/management/usage/import`. The live view supports `include_details=false`. For paged exports, pass the returned `next_since` unchanged to the next request. Records sharing the boundary timestamp travel together.
+
+Pricing uses `GET /v0/management/usage/pricing`, `POST /v0/management/usage/pricing/refresh`, and `PUT` or `DELETE /v0/management/usage/pricing/overrides/:model`. Ordinary chat usage is attributed to its serving instance. Turning off recording keeps existing history readable. The existing usage queue has its own consumption semantics.
+
+The configuration directory holds `.usage-statistics.json` and `.usage-pricing-catalog.json`. Use separate directories for independent instances. Snapshot restore accepts complete historical formats and leaves an invalid original in place. The import API accepts valid partial exports. External replacement of a bound history file requires recovery before another import.
+
+New client keys use stable opaque identifiers. Treat older exports as sensitive. Their source labels may contain a retired key that is absent from the current configuration. A sanitized copy is required when sharing historical records with a test environment.

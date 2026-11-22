@@ -12,6 +12,7 @@ import (
 	"github.com/gin-gonic/gin"
 	managementHandlers "github.com/router-for-me/CLIProxyAPI/v8/internal/api/handlers/management"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/api/middleware"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/buildinfo"
 	codexlive "github.com/router-for-me/CLIProxyAPI/v8/internal/client/codex/live"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/home"
@@ -480,6 +481,18 @@ func corsAllowHeadersValue(req *http.Request) string {
 		}
 	}
 	return strings.Join(allowed, ", ")
+}
+
+// buildInfoHeadersMiddleware attaches CLIProxyAPIPlus build-info headers
+// (X-CPA-VERSION / X-CPA-COMMIT / X-CPA-BUILD-DATE) to every response so that
+// clients and proof endpoints can identify the running build. Fork-only.
+func buildInfoHeadersMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Header("X-CPA-VERSION", buildinfo.Version)
+		c.Header("X-CPA-COMMIT", buildinfo.Commit)
+		c.Header("X-CPA-BUILD-DATE", buildinfo.BuildDate)
+		c.Next()
+	}
 }
 
 // AuthMiddleware returns a Gin middleware handler that authenticates requests

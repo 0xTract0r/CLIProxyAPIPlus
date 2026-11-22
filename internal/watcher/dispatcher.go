@@ -112,6 +112,11 @@ func (w *Watcher) dispatchPersistedAuthUpdateWithRevision(update *AuthUpdate) (b
 	}
 	clone := update.Auth.Clone()
 	w.clientsMutex.Lock()
+	release, eligible := update.PublicationFence.Begin()
+	if !eligible {
+		w.clientsMutex.Unlock()
+		return false, 0
+	}
 	if w.fileAuthsByPath == nil {
 		w.fileAuthsByPath = make(map[string]map[string]*coreauth.Auth)
 	}
@@ -138,6 +143,7 @@ func (w *Watcher) dispatchPersistedAuthUpdateWithRevision(update *AuthUpdate) (b
 	}
 	w.persistedAuthRevisions[clone.ID] = rev
 	update.revision = rev
+	release()
 	w.clientsMutex.Unlock()
 	if w.getAuthQueue() == nil {
 		return false, rev

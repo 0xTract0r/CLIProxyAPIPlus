@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -1187,4 +1188,44 @@ func TestResponsesSSEPayloadErrorMessage_ImageGenerationUserErrorMapsToBadReques
 			t.Fatalf("expected remediation guidance in error message, got %q", errMsg.Error.Error())
 		}
 	}
+}
+
+func TestForwardResponsesStreamWaitsForCompletedAfterErrorsClose(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		h := NewOpenAIResponsesAPIHandler(handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, nil))
+		rec := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(rec)
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+
+		data := make(chan []byte)
+		errs := make(chan *interfaces.ErrorMessage)
+		close(errs)
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			h.forwardResponsesStream(c, c.Writer, func(error) {}, data, errs, &responsesSSEFramer{})
+		}()
+		synctest.Wait()
+
+		tail := []byte("event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-late-fixture\",\"status\":\"completed\"}}\n\n")
+		select {
+		case data <- tail:
+		case <-done:
+			t.Fatal("forwarder stopped before the delayed event")
+		case <-time.After(time.Second):
+			t.Fatal("forwarder did not accept the delayed event")
+		}
+		close(data)
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("forwarder did not finish after the data channel closed")
+		}
+
+		body := rec.Body.String()
+		if rec.Code != http.StatusOK || strings.Count(body, "event: response.completed\n") != 1 ||
+			!strings.Contains(body, "resp-late-fixture") || strings.Contains(body, "event: response.failed") || strings.Contains(body, "event: error") {
+			t.Fatalf("status %d, unexpected SSE body: %q", rec.Code, body)
+		}
+	})
 }

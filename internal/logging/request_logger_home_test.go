@@ -215,10 +215,7 @@ func TestFileRequestLogger_LogRequestWithSourcesWritesLocalLogAndCleansParts(t *
 	if logPath == "" {
 		t.Fatal("expected local request log file")
 	}
-	raw, errReadLog := os.ReadFile(logPath)
-	if errReadLog != nil {
-		t.Fatalf("read log file: %v", errReadLog)
-	}
+	raw := readCompressedRequestLog(t, logPath)
 	if !bytes.Contains(raw, []byte("=== WEBSOCKET TIMELINE ===")) {
 		t.Fatalf("websocket timeline section missing: %s", string(raw))
 	}
@@ -565,7 +562,7 @@ func TestFileRequestLogger_UsesShortRequestIDForLocalAndFullForHome(t *testing.T
 		t.Fatalf("expected 1 log file, got %d", len(entries))
 	}
 	filename := entries[0].Name()
-	expectedSuffix := "-" + expectedShortID + ".log"
+	expectedSuffix := "-" + expectedShortID + ".log.gz"
 	if !strings.HasSuffix(filename, expectedSuffix) {
 		t.Fatalf("filename %q does not have expected suffix %q", filename, expectedSuffix)
 	}

@@ -1,6 +1,24 @@
 package auth
 
-import "context"
+import (
+	"context"
+	"errors"
+)
+
+// ErrCredentialFileRemoved identifies a file that disappeared before an explicit edit.
+var ErrCredentialFileRemoved = errors.New("credential file no longer exists")
+
+type checkedStoreWriteKey struct{}
+
+// IsExplicitCredentialEdit lets file stores distinguish editing an existing
+// credential from registration, including during a delayed watcher event.
+func IsExplicitCredentialEdit(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	checked, _ := ctx.Value(checkedStoreWriteKey{}).(bool)
+	return checked
+}
 
 type skipPersistContextKey struct{}
 type deferAPIKeyModelAliasRebuildContextKey struct{}

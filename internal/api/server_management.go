@@ -90,6 +90,13 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PATCH("/api-keys", s.mgmt.PatchAPIKeys)
 		mgmt.DELETE("/api-keys", s.mgmt.DeleteAPIKeys)
 		mgmt.GET("/api-key-usage", s.mgmt.GetAPIKeyUsage)
+		mgmt.GET("/usage", s.mgmt.GetUsageStatistics)
+		mgmt.GET("/usage/export", s.mgmt.ExportUsageStatistics)
+		mgmt.POST("/usage/import", s.mgmt.ImportUsageStatistics)
+		mgmt.GET("/usage/pricing", s.mgmt.GetUsagePricing)
+		mgmt.POST("/usage/pricing/refresh", s.mgmt.RefreshUsagePricing)
+		mgmt.PUT("/usage/pricing/overrides/:model", s.mgmt.PutUsagePricingOverride)
+		mgmt.DELETE("/usage/pricing/overrides/:model", s.mgmt.DeleteUsagePricingOverride)
 		mgmt.GET("/usage-queue", s.mgmt.GetUsageQueue)
 
 		mgmt.GET("/gemini-api-key", s.mgmt.GetGeminiKeys)

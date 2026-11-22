@@ -6,7 +6,6 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -87,11 +86,11 @@ func TestLocalErrorsAreSeparateFromUpstreamResponses(t *testing.T) {
 					if errFinalize := wrapper.Finalize(c); errFinalize != nil {
 						t.Fatal(errFinalize)
 					}
-					paths, errGlob := filepath.Glob(filepath.Join(logsDir, "*.log"))
+					paths, errGlob := filepath.Glob(filepath.Join(logsDir, "*.log.gz"))
 					if errGlob != nil || len(paths) != 1 {
 						t.Fatalf("log files = %v, error = %v", paths, errGlob)
 					}
-					data, errRead := os.ReadFile(paths[0])
+					data, errRead := readGzipRequestLogFixture(paths[0])
 					if errRead != nil {
 						t.Fatal(errRead)
 					}
@@ -159,7 +158,7 @@ func TestLocalDiagnosticsDoNotChangeRecoveredRequestStatus(t *testing.T) {
 				if recorder.Code != http.StatusOK || strings.Contains(recorder.Body.String(), "disconnected") {
 					t.Fatalf("diagnostics changed client response: %d %s", recorder.Code, recorder.Body.String())
 				}
-				paths, errGlob := filepath.Glob(filepath.Join(logsDir, "*.log"))
+				paths, errGlob := filepath.Glob(filepath.Join(logsDir, "*.log.gz"))
 				if errGlob != nil {
 					t.Fatal(errGlob)
 				}
@@ -172,7 +171,7 @@ func TestLocalDiagnosticsDoNotChangeRecoveredRequestStatus(t *testing.T) {
 				if len(paths) != 1 || strings.HasPrefix(filepath.Base(paths[0]), "error-") {
 					t.Fatalf("recovered request misclassified: %v", paths)
 				}
-				data, errRead := os.ReadFile(paths[0])
+				data, errRead := readGzipRequestLogFixture(paths[0])
 				if errRead != nil {
 					t.Fatal(errRead)
 				}

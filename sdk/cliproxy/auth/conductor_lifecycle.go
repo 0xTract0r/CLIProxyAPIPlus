@@ -256,9 +256,15 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 			updateAggregatedAvailability(auth, now)
 		}
 	}
+	releasePublication, eligible := authPublicationFence(ctx).Begin()
+	if !eligible {
+		m.mu.Unlock()
+		return nil, ErrAuthPublicationOutOfScope
+	}
 	auth.ClearFileSnapshot()
 	authClone := auth.Clone()
 	m.auths[auth.ID] = authClone
+	releasePublication()
 	m.notifyAuthChangeLocked(auth.ID)
 	// Snapshot before unlocking: MarkResult mutates the published auth in place.
 	var schedulerSnapshot *Auth
@@ -316,11 +322,27 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	return m.updateInternal(ctx, nil, auth, updateModeReplace)
 }
 
+type storeWriteError struct{ cause error }
+
+func (e *storeWriteError) Error() string { return "credential changes could not be saved" }
+func (e *storeWriteError) Unwrap() error { return e.cause }
+
+// ModifyPersisted applies an explicit edit. If the configured store rejects the
+// write, it returns that error and leaves the previous registration published.
+// Runtime-only entries retain their existing storage policy.
+func (m *Manager) ModifyPersisted(ctx context.Context, id string, expectedEpoch uint64, edit func(*Auth) error) (*Auth, bool, error) {
+	return m.modify(ctx, id, expectedEpoch, edit, true)
+}
+
 // Modify loads the latest auth for id while holding the per-auth mutation gate,
 // applies edit to a clone of that auth, and commits the result through the
 // standard persistence and publication path. It returns (nil, false, nil) if
 // the auth is not present when the gate is acquired.
 func (m *Manager) Modify(ctx context.Context, id string, expectedEpoch uint64, edit func(*Auth) error) (*Auth, bool, error) {
+	return m.modify(ctx, id, expectedEpoch, edit, false)
+}
+
+func (m *Manager) modify(ctx context.Context, id string, expectedEpoch uint64, edit func(*Auth) error, checkWrite bool) (*Auth, bool, error) {
 	id = strings.TrimSpace(id)
 	if m == nil || id == "" || edit == nil {
 		return nil, false, nil
@@ -346,6 +368,9 @@ func (m *Manager) Modify(ctx context.Context, id string, expectedEpoch uint64, e
 	if current == nil {
 		return nil, false, nil
 	}
+	if expectedEpoch != 0 && expectedEpoch > currentEpoch && checkWrite {
+		return nil, false, fmt.Errorf("registration epoch %d is newer than current epoch %d", expectedEpoch, currentEpoch)
+	}
 	if expectedEpoch != 0 && expectedEpoch < currentEpoch {
 		return nil, false, fmt.Errorf("update auth %s: stale registration epoch %d < %d", id, expectedEpoch, currentEpoch)
 	}
@@ -355,7 +380,11 @@ func (m *Manager) Modify(ctx context.Context, id string, expectedEpoch uint64, e
 	if expectedEpoch != 0 {
 		current.RegistrationEpoch = expectedEpoch
 	}
-	committedAuth, didCommit, persistCooldown, errUpdate := m.updateInternalLocked(ctx, nil, current, updateModeReplace)
+	writeCtx := ctx
+	if checkWrite {
+		writeCtx = context.WithValue(WithoutSkipPersist(ctx), checkedStoreWriteKey{}, true)
+	}
+	committedAuth, didCommit, persistCooldown, errUpdate := m.updateInternalLocked(writeCtx, nil, current, updateModeReplace)
 	releaseMutation()
 	if errUpdate == nil && didCommit && committedAuth != nil {
 		m.finishAuthUpdate(ctx, committedAuth, persistCooldown)
@@ -762,6 +791,10 @@ func (m *Manager) updateInternalLockedWithOptions(ctx context.Context, base, aut
 	refreshPatchBeforeSave := auth.CodexRefreshPatch
 	persistMetaMint := (mode == updateModePrepare || mode == updateModeRefresh) && strings.EqualFold(strings.TrimSpace(auth.Provider), "meta")
 	if errPersist := m.persistLocked(ctx, auth); errPersist != nil {
+		if IsExplicitCredentialEdit(ctx) {
+			m.mu.Unlock()
+			return nil, false, baseSuperseded, false, &storeWriteError{cause: errPersist}
+		}
 		// A minted Meta key must reach the store before requests can use it.
 		if persistMetaMint {
 			m.mu.Unlock()
@@ -822,9 +855,15 @@ func (m *Manager) updateInternalLockedWithOptions(ctx context.Context, base, aut
 	if existing.Generation >= auth.Generation {
 		auth.Generation = existing.Generation + 1
 	}
+	releasePublication, eligible := authPublicationFence(ctx).Begin()
+	if !eligible {
+		m.mu.Unlock()
+		return nil, false, false, false, ErrAuthPublicationOutOfScope
+	}
 	auth.ClearFileSnapshot()
 	authClone := auth.Clone()
 	m.auths[auth.ID] = authClone
+	releasePublication()
 	m.notifyAuthChangeLocked(auth.ID)
 	// Snapshot before unlocking: MarkResult mutates the published auth in place.
 	var schedulerSnapshot *Auth
@@ -985,6 +1024,18 @@ func (m *Manager) forgetWeightedAuthUpTo(authID string, maxEpoch, maxGen uint64)
 	}
 }
 
+// WithLocalStoreRebind excludes Load and persistence during an internal
+// binding change. The callback may install the new store once it accepts the
+// configuration generation, and must not reenter Manager mutation methods.
+func (m *Manager) WithLocalStoreRebind(ctx context.Context, next Store, accept func(install func())) error {
+	if err := m.authLoadGate.Acquire(ctx, math.MaxInt64); err != nil {
+		return err
+	}
+	defer m.authLoadGate.Release(math.MaxInt64)
+	accept(func() { m.SetStore(next) })
+	return nil
+}
+
 // Load resets manager state from the backing store.
 func (m *Manager) Load(ctx context.Context) error {
 	// Exclude complete Save/publication transactions, including new registrations
@@ -1120,7 +1171,7 @@ func (l *authPersistLock) markRetired(epoch uint64) {
 	}
 }
 
-func (m *Manager) persist(ctx context.Context, auth *Auth) error {
+func (m *Manager) persist(ctx context.Context, auth *Auth) (persistErr error) {
 	m.mu.RLock()
 	store := m.store
 	m.mu.RUnlock()
@@ -1152,7 +1203,19 @@ func (m *Manager) persist(ctx context.Context, auth *Auth) error {
 	}
 	defer pLock.unlock()
 	if auth.RegistrationEpoch < pLock.lastEpoch || (auth.RegistrationEpoch == pLock.lastEpoch && auth.Generation < pLock.lastGeneration) {
+		if IsExplicitCredentialEdit(ctx) {
+			return fmt.Errorf("credential write was superseded")
+		}
 		return nil
+	}
+	if IsExplicitCredentialEdit(ctx) {
+		// A failed management edit must not supersede the last durable version.
+		epoch, generation := pLock.lastEpoch, pLock.lastGeneration
+		defer func() {
+			if persistErr != nil {
+				pLock.lastEpoch, pLock.lastGeneration = epoch, generation
+			}
+		}()
 	}
 	pLock.lastEpoch = auth.RegistrationEpoch
 	pLock.lastGeneration = auth.Generation

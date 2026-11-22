@@ -32,7 +32,8 @@ type Service struct {
 	cfg *config.Config
 
 	// cfgMu protects concurrent access to the configuration.
-	cfgMu sync.RWMutex
+	cfgMu             sync.RWMutex
+	authDirGeneration uint64 // protected by cfgMu
 
 	// configUpdateMu serializes config updates across watcher + home.
 	configUpdateMu sync.Mutex
@@ -114,6 +115,10 @@ type Service struct {
 
 	// coreManager handles core authentication and execution.
 	coreManager *coreauth.Manager
+	// localStoreRoot identifies the Builder-owned file-store family.
+	localStoreRoot *sdkAuth.FileTokenStore
+	// localStoreRequest is guarded by configUpdateMu.
+	localStoreRequest uint64
 
 	// copilotCatalogs owns provider-local discovery; protected by cfgMu.
 	copilotCatalogs *copilotCatalogRefresher

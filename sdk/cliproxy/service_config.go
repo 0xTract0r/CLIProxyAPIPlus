@@ -2,6 +2,9 @@ package cliproxy
 
 import (
 	"context"
+	"errors"
+	"io"
+	"os"
 	"strings"
 	"time"
 
@@ -134,7 +137,7 @@ func newRoutingSelectorWithExisting(state routingRuntimeState, existing coreauth
 }
 
 func (s *Service) applyConfigUpdateWithAuthSynthesis(ctx context.Context, newCfg *config.Config, synthesizeConfigAuths bool) bool {
-	commit := s.commitConfigUpdate(newCfg)
+	commit := s.commitConfigUpdateContext(ctx, newCfg)
 	if commit.cfg == nil {
 		return false
 	}
@@ -145,21 +148,71 @@ func (s *Service) applyConfigUpdateWithAuthSynthesis(ctx context.Context, newCfg
 // may block on plugins, storage, or networking is deliberately deferred. Catalog
 // source generations change here so an older commit cannot restart stale readers.
 func (s *Service) commitConfigUpdate(newCfg *config.Config) configCommit {
+	return s.commitConfigUpdateContext(context.Background(), newCfg)
+}
+
+func (s *Service) commitConfigUpdateContext(ctx context.Context, newCfg *config.Config) configCommit {
 	if s == nil {
 		return configCommit{}
 	}
-
-	s.configUpdateMu.Lock()
-	defer s.configUpdateMu.Unlock()
-
-	if newCfg == nil {
-		s.cfgMu.RLock()
-		newCfg = s.cfg
-		s.cfgMu.RUnlock()
+	if ctx == nil {
+		ctx = context.Background()
 	}
+	s.configUpdateMu.Lock()
+	current := s.currentConfig()
 	if newCfg == nil {
+		newCfg = current
+	}
+	if newCfg == nil || ctx.Err() != nil {
+		s.configUpdateMu.Unlock()
 		return configCommit{}
 	}
+	nextDir := newCfg.AuthDir
+	if s.localStoreRoot == nil || current != nil && current.AuthDir == nextDir {
+		s.localStoreRequest++
+		defer s.configUpdateMu.Unlock()
+		return s.commitConfigUpdateLocked(newCfg, nil)
+	}
+	s.localStoreRequest++
+	request := s.localStoreRequest
+	s.configUpdateMu.Unlock()
+
+	dir, err := os.Open(nextDir)
+	if err != nil {
+		log.WithError(err).Warn("rejected credential directory change")
+		return configCommit{}
+	}
+	defer dir.Close()
+	if _, err := dir.Readdirnames(1); err != nil && !errors.Is(err, io.EOF) {
+		log.WithError(err).Warn("rejected unreadable credential directory")
+		return configCommit{}
+	}
+	opened, err := dir.Stat()
+	if err != nil {
+		return configCommit{}
+	}
+	nextStore := s.localStoreRoot.WithBaseDir(nextDir)
+	var commit configCommit
+	err = s.coreManager.WithLocalStoreRebind(ctx, nextStore, func(install func()) {
+		s.configUpdateMu.Lock()
+		defer s.configUpdateMu.Unlock()
+		if s.localStoreRequest != request || ctx.Err() != nil {
+			return
+		}
+		latest, err := os.Stat(nextDir)
+		if err != nil || !os.SameFile(opened, latest) {
+			log.Warn("rejected credential directory replaced during configuration update")
+			return
+		}
+		commit = s.commitConfigUpdateLocked(newCfg, install)
+	})
+	if err != nil {
+		log.WithError(err).Warn("could not rebind local credential store")
+	}
+	return commit
+}
+
+func (s *Service) commitConfigUpdateLocked(newCfg *config.Config, install func()) configCommit {
 	if errValidate := newCfg.ValidateCredentialWeights(); errValidate != nil {
 		log.WithError(errValidate).Warn("rejected config update with invalid credential weights")
 		return configCommit{}
@@ -172,7 +225,13 @@ func (s *Service) commitConfigUpdate(newCfg *config.Config) configCommit {
 	// Clone before assigning the generation: callers may still hold the input snapshot.
 	newCfg = newCfg.CloneForRuntime()
 	helps.AdvanceProxyPoolGeneration(s.proxyPoolPublisher, newCfg)
+	if install != nil {
+		install()
+	}
 	s.cfgMu.Lock()
+	if s.cfg == nil || s.cfg.AuthDir != newCfg.AuthDir {
+		s.authDirGeneration++
+	}
 	s.cfg = newCfg
 	s.cfgMu.Unlock()
 	s.cancelStaleAntigravityProbes("")

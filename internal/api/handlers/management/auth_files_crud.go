@@ -181,11 +181,14 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 				}
 				release := h.beginSIWCFileMutation(ctx, full)
 				defer release()
-				if errRemove := os.Remove(full); errRemove != nil {
+				localFile, errRemove := h.unlinkAuthFileOnDisk(full)
+				if errRemove != nil {
 					return nil
 				}
-				if errDel := h.deleteTokenRecord(ctx, full); errDel != nil {
-					return errDel
+				if !localFile {
+					if errDel := h.deleteTokenRecord(ctx, full); errDel != nil {
+						return errDel
+					}
 				}
 				deleted++
 				if v8Mode {
@@ -587,14 +590,20 @@ func (h *Handler) deleteAuthFileByName(ctx context.Context, name string, protect
 	}
 	release := h.beginSIWCFileMutation(ctx, targetPath)
 	defer release()
-	if errRemove := os.Remove(targetPath); errRemove != nil {
+	localFile, errRemove := h.unlinkAuthFileOnDisk(targetPath)
+	if errRemove != nil {
 		if os.IsNotExist(errRemove) {
 			return filepath.Base(name), http.StatusNotFound, errAuthFileNotFound
 		}
+		if errors.Is(errRemove, coreauth.ErrFileRemovalBusy) {
+			return filepath.Base(name), http.StatusConflict, errRemove
+		}
 		return filepath.Base(name), http.StatusInternalServerError, fmt.Errorf("failed to remove file: %w", errRemove)
 	}
-	if errDeleteRecord := h.deleteTokenRecord(ctx, targetPath); errDeleteRecord != nil {
-		return filepath.Base(name), http.StatusInternalServerError, errDeleteRecord
+	if !localFile {
+		if errDeleteRecord := h.deleteTokenRecord(ctx, targetPath); errDeleteRecord != nil {
+			return filepath.Base(name), http.StatusInternalServerError, errDeleteRecord
+		}
 	}
 	if isV8AuthFileMutation(ctx) {
 		h.reconcileRemovedV8SourceAuths(ctx, targetPath, resolvedTargetPath, targetID)
@@ -602,6 +611,20 @@ func (h *Handler) deleteAuthFileByName(ctx context.Context, name string, protect
 		h.removeAuthsForPath(ctx, targetPath, targetID)
 	}
 	return filepath.Base(name), http.StatusOK, nil
+}
+
+// A local file store has no independent record to delete after the unlink.
+func (h *Handler) unlinkAuthFileOnDisk(path string) (local bool, err error) {
+	store := h.tokenStore
+	if store == nil {
+		store = sdkauth.GetTokenStore()
+	}
+	if _, local = store.(*sdkauth.FileTokenStore); local {
+		return true, sdkauth.WithExistingAuthFile(path, func(os.FileInfo) error {
+			return os.Remove(path)
+		})
+	}
+	return false, os.Remove(path)
 }
 
 // localDeleteIDs ties membership to both the observed source and runtime epoch.
@@ -635,19 +658,18 @@ func (h *Handler) deleteObservedLocalAuth(ctx context.Context, authDir, path str
 	errChanged := errors.New("auth file changed before deletion")
 	var modelEpochs map[string]uint64
 	err = h.authManager.RemoveDurable(ctx, ids, func() error {
-		if !sameAuthFilePath(authDir, h.currentHandlerAuthDir()) || !maps.Equal(expected, h.localDeleteIDs(path)) {
-			return coreauth.ErrFileRemovalBusy
-		}
-		info, err := os.Lstat(path)
-		if err != nil {
-			return err
-		}
-		if !info.Mode().IsRegular() || !os.SameFile(info, observed) ||
-			info.Size() != observed.Size() || !info.ModTime().Equal(observed.ModTime()) {
-			return errChanged
-		}
-		if err := os.Remove(path); err != nil {
-			return err
+		errUnlink := sdkauth.WithExistingAuthFile(path, func(info os.FileInfo) error {
+			if !sameAuthFilePath(authDir, h.currentHandlerAuthDir()) || !maps.Equal(expected, h.localDeleteIDs(path)) {
+				return coreauth.ErrFileRemovalBusy
+			}
+			if !info.Mode().IsRegular() || !os.SameFile(info, observed) ||
+				info.Size() != observed.Size() || !info.ModTime().Equal(observed.ModTime()) {
+				return errChanged
+			}
+			return os.Remove(path)
+		})
+		if errUnlink != nil {
+			return errUnlink
 		}
 		if isV8AuthFileMutation(ctx) && len(ids) > 0 {
 			// Model publication uses the same ID mutation gates. Capture the

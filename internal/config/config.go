@@ -85,6 +85,9 @@ type Config struct {
 	// LoggingToFile controls whether application logs are written to rotating files or stdout.
 	LoggingToFile bool `yaml:"logging-to-file" json:"logging-to-file"`
 
+	// LoggingDisplayTimezoneOffsetHours controls the fixed offset for local log display.
+	LoggingDisplayTimezoneOffsetHours int `yaml:"logging-display-timezone-offset-hours" json:"logging-display-timezone-offset-hours"`
+
 	// LogsMaxTotalSizeMB limits the total size (in MB) of log files under the logs directory.
 	// When exceeded, the oldest log files are deleted until within the limit. Set to 0 to disable.
 	LogsMaxTotalSizeMB int `yaml:"logs-max-total-size-mb" json:"logs-max-total-size-mb"`

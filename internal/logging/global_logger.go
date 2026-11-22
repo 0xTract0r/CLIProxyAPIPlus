@@ -97,7 +97,7 @@ func (m *LogFormatter) Format(entry *log.Entry) ([]byte, error) {
 		buffer = &bytes.Buffer{}
 	}
 
-	timestamp := entry.Time.Format("2006-01-02 15:04:05")
+	timestamp := entry.Time.In(DisplayLocation()).Format("2006-01-02 15:04:05 -07:00")
 	message := strings.TrimRight(entry.Message, "\r\n")
 
 	reqID := "--------"
@@ -241,6 +241,7 @@ func ConfigureLogOutput(cfg *config.Config) error {
 		log.SetOutput(os.Stdout)
 	}
 
+	ApplyDisplayTimezone(cfg)
 	configureLogDirCleanerLocked(logDir, cfg.LogsMaxTotalSizeMB, protectedPath)
 	return nil
 }

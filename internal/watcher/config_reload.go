@@ -4,13 +4,11 @@ package watcher
 
 import (
 	"reflect"
-	"strings"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/watcher/diff"
-	"gopkg.in/yaml.v3"
 
 	log "github.com/sirupsen/logrus"
 )
@@ -99,32 +97,20 @@ func (w *Watcher) reloadConfig() bool {
 		return false
 	}
 
-	resolvedNewAuthDir := ""
-	if w.mirroredAuthDir != "" {
-		newConfig.AuthDir = w.mirroredAuthDir
-		resolvedNewAuthDir = w.mirroredAuthDir
-	} else {
-		if resolvedAuthDir, errResolveAuthDir := util.ResolveAuthDir(newConfig.AuthDir); errResolveAuthDir != nil {
-			log.Errorf("failed to resolve auth directory from config: %v", errResolveAuthDir)
-		} else {
-			newConfig.AuthDir = resolvedAuthDir
-			resolvedNewAuthDir = resolvedAuthDir
+	resolvedNewAuthDir := w.mirroredAuthDir
+	if resolvedNewAuthDir == "" {
+		var err error
+		resolvedNewAuthDir, err = util.ResolveAuthDir(newConfig.AuthDir)
+		if err != nil {
+			log.WithError(err).Warn("keeping previous watcher configuration")
+			return false
 		}
 	}
-
-	w.authRescanMu.Lock()
-	w.clientsMutex.Lock()
-	var oldConfig *config.Config
-	_ = yaml.Unmarshal(w.oldConfigYaml, &oldConfig)
-	prevAuthDir := w.authDir
-	w.oldConfigYaml, _ = yaml.Marshal(newConfig)
-	w.config = newConfig
-	if strings.TrimSpace(resolvedNewAuthDir) != "" {
-		w.authDir = resolvedNewAuthDir
+	oldConfig, authDirChanged, err := w.installConfig(newConfig, resolvedNewAuthDir)
+	if err != nil {
+		log.WithError(err).Warn("keeping previous watcher configuration")
+		return false
 	}
-	curAuthDir := w.authDir
-	w.clientsMutex.Unlock()
-	w.authRescanMu.Unlock()
 
 	var affectedOAuthProviders []string
 	if oldConfig != nil {
@@ -148,10 +134,7 @@ func (w *Watcher) reloadConfig() bool {
 		}
 	}
 
-	authDirChanged := oldConfig == nil || oldConfig.AuthDir != newConfig.AuthDir || prevAuthDir != curAuthDir
-	if authDirChanged {
-		w.syncAuthDirWatch()
-	}
+	authDirChanged = oldConfig == nil || authDirChanged
 	retryConfigChanged := oldConfig != nil && (oldConfig.RequestRetry != newConfig.RequestRetry || oldConfig.MaxRetryInterval != newConfig.MaxRetryInterval || oldConfig.MaxRetryCredentials != newConfig.MaxRetryCredentials)
 	forceAuthRefresh := oldConfig != nil && (oldConfig.ForceModelPrefix != newConfig.ForceModelPrefix || !reflect.DeepEqual(oldConfig.OAuthModelAlias, newConfig.OAuthModelAlias) || !reflect.DeepEqual(oldConfig.OAuthSettings, newConfig.OAuthSettings) || retryConfigChanged)
 

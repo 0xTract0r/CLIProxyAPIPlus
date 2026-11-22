@@ -38,6 +38,7 @@ type Watcher struct {
 	watchMu                    sync.Mutex
 	started                    bool
 	watchedAuthDir             string
+	watchedAuthPath            string // Physical path registered with fsnotify; guarded by watchMu.
 	config                     *config.Config
 	clientsMutex               sync.RWMutex
 	authRescanMu               sync.Mutex
@@ -86,11 +87,12 @@ const (
 
 // AuthUpdate describes an incremental change to auth configuration.
 type AuthUpdate struct {
-	Action      AuthUpdateAction
-	ID          string
-	Auth        *coreauth.Auth
-	revision    uint64 // Watcher-local ordering, independent of runtime auth generations.
-	fileRemoval bool   // The source file was removed, not just an ID from its content.
+	PublicationFence *coreauth.AuthPublicationFence
+	Action           AuthUpdateAction
+	ID               string
+	Auth             *coreauth.Auth
+	revision         uint64 // Watcher-local ordering, independent of runtime auth generations.
+	fileRemoval      bool   // The source file was removed, not just an ID from its content.
 }
 
 // IsFileRemoval reports whether this delete was observed as a whole-file removal.
@@ -173,24 +175,55 @@ func (w *Watcher) Stop() error {
 // SetConfig updates the current configuration
 func (w *Watcher) SetConfig(cfg *config.Config) {
 	cloned := cfg.CloneForRuntime()
-	w.clientsMutex.Lock()
+	target := ""
 	if cloned != nil {
-		if w.mirroredAuthDir != "" {
-			cloned.AuthDir = w.mirroredAuthDir
-			w.authDir = w.mirroredAuthDir
-		} else if trimmedAuthDir := strings.TrimSpace(cloned.AuthDir); trimmedAuthDir != "" {
-			if resolvedAuthDir, errResolveAuthDir := util.ResolveAuthDir(trimmedAuthDir); errResolveAuthDir == nil && resolvedAuthDir != "" {
-				cloned.AuthDir = resolvedAuthDir
-				w.authDir = resolvedAuthDir
-			} else if w.authDir == "" {
-				w.authDir = trimmedAuthDir
+		target = w.mirroredAuthDir
+		if target == "" && strings.TrimSpace(cloned.AuthDir) != "" {
+			var err error
+			target, err = util.ResolveAuthDir(strings.TrimSpace(cloned.AuthDir))
+			if err != nil {
+				log.WithError(err).Warn("keeping previous watcher configuration")
+				return
 			}
 		}
 	}
-	w.config = cloned
-	w.oldConfigYaml, _ = yaml.Marshal(cloned)
-	w.clientsMutex.Unlock()
-	w.syncAuthDirWatch()
+	if _, _, err := w.installConfig(cloned, target); err != nil {
+		log.WithError(err).Warn("keeping previous watcher configuration")
+	}
+}
+
+// installConfig publishes the next config only after its new subscription is ready.
+// The rescan lock excludes incremental processing while the two roots overlap.
+func (w *Watcher) installConfig(cfg *config.Config, target string) (*config.Config, bool, error) {
+	w.authRescanMu.Lock()
+	defer w.authRescanMu.Unlock()
+	w.watchMu.Lock()
+	defer w.watchMu.Unlock()
+	w.clientsMutex.Lock()
+	defer w.clientsMutex.Unlock()
+
+	previousDir := w.currentAuthDirLocked()
+	if target == "" || w.sameNormalizedAuthPath(previousDir, target) {
+		target = previousDir
+	}
+	changed := target != previousDir
+	watchPath, err := w.prepareAuthDirWatchLocked(target)
+	if err != nil {
+		return nil, false, err
+	}
+
+	var previous *config.Config
+	_ = yaml.Unmarshal(w.oldConfigYaml, &previous)
+	if cfg != nil && target != "" {
+		cfg.AuthDir = target
+	}
+	w.authDir = target
+	w.config = cfg
+	w.oldConfigYaml, _ = yaml.Marshal(cfg)
+	if watchPath != "" {
+		w.finishAuthDirWatchLocked(target, watchPath)
+	}
+	return previous, changed, nil
 }
 
 func (w *Watcher) currentAuthDirLocked() string {
@@ -226,7 +259,15 @@ func (w *Watcher) isPathInAuthDir(path, authDir string) bool {
 	if normalizedPath == "" || normalizedDir == "" {
 		return false
 	}
-	return w.sameNormalizedAuthPath(filepath.Dir(normalizedPath), normalizedDir)
+	parent := filepath.Dir(normalizedPath)
+	if w.sameNormalizedAuthPath(parent, normalizedDir) {
+		return true
+	}
+	// Compare directories, since a remove event's file may already be gone.
+	// fsnotify may report the resolved parent of a watched directory alias.
+	realParent, parentErr := filepath.EvalSymlinks(parent)
+	realDir, dirErr := filepath.EvalSymlinks(normalizedDir)
+	return parentErr == nil && dirErr == nil && w.sameNormalizedAuthPath(realParent, realDir)
 }
 
 func (w *Watcher) isPathInCurrentAuthDirLocked(path string) bool {

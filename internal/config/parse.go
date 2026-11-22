@@ -43,8 +43,14 @@ type startupConfig struct {
 	docs []*yaml.Node
 }
 
+// DefaultLoggingDisplayTimezoneOffsetHours is the UTC offset for local log display.
+const DefaultLoggingDisplayTimezoneOffsetHours = 8
+
 func standbyConfig() *Config {
-	cfg := &Config{CredentialInFlight: DefaultCredentialInFlightConfig()}
+	cfg := &Config{
+		CredentialInFlight:                DefaultCredentialInFlightConfig(),
+		LoggingDisplayTimezoneOffsetHours: DefaultLoggingDisplayTimezoneOffsetHours,
+	}
 	cfg.NormalizePluginsConfig()
 	cfg.NormalizeClaudeConfig()
 	return cfg
@@ -65,6 +71,7 @@ func validateStartupConfig(data []byte, optional bool) (*startupConfig, error) {
 	// Keep defaults aligned with LoadConfigOptional.
 	cfg.Host = "" // Default empty: binds to all interfaces (IPv4 + IPv6)
 	cfg.LoggingToFile = false
+	cfg.LoggingDisplayTimezoneOffsetHours = DefaultLoggingDisplayTimezoneOffsetHours
 	cfg.LogsMaxTotalSizeMB = 0
 	cfg.ErrorLogsMaxFiles = 10
 	cfg.UsageStatisticsEnabled = false
@@ -128,6 +135,10 @@ func validateStartupConfig(data []byte, optional bool) (*startupConfig, error) {
 	}
 
 	cfg.KVStore.Path = strings.TrimSpace(cfg.KVStore.Path)
+
+	if cfg.LoggingDisplayTimezoneOffsetHours < -12 || cfg.LoggingDisplayTimezoneOffsetHours > 14 {
+		cfg.LoggingDisplayTimezoneOffsetHours = DefaultLoggingDisplayTimezoneOffsetHours
+	}
 
 	if cfg.LogsMaxTotalSizeMB < 0 {
 		cfg.LogsMaxTotalSizeMB = 0

@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -123,21 +122,17 @@ func TestResponseDiagnosticsInFileAndHomeLogs(t *testing.T) {
 					}
 					logText = payload.RequestLog
 				} else {
-					paths, errGlob := filepath.Glob(filepath.Join(logsDir, "*.log"))
+					paths, errGlob := filepath.Glob(filepath.Join(logsDir, "*.log.gz"))
 					if errGlob != nil || len(paths) != 1 {
 						t.Fatalf("logs = %v, error = %v", paths, errGlob)
 					}
-					data, errRead := os.ReadFile(paths[0])
-					if errRead != nil {
-						t.Fatal(errRead)
-					}
-					logText = string(data)
+					logText = string(readCompressedRequestLog(t, paths[0]))
 				}
 				before, response, found := strings.Cut(logText, "=== RESPONSE ===\n")
 				if !found || !strings.Contains(response, "Status: 502\nError: unexpected EOF\n\nHeaders:\n") || !strings.Contains(response, "\nBody:\n"+string(body)) {
 					t.Fatalf("downstream response missing diagnostics or body:\n%s", logText)
 				}
-				if strings.Contains(before, "unexpected EOF") || strings.Count(before, "=== API ERROR RESPONSE ===") != 1 || !strings.Contains(before, "existing API error") || !strings.Contains(before, string(upstream)) {
+				if strings.Contains(before, "unexpected EOF") || strings.Count(before, "=== API ERROR RESPONSE ===") != 1 || strings.Contains(before, "existing API error") != (home || !streaming) || !strings.Contains(before, string(upstream)) {
 					t.Fatalf("diagnostics modified upstream sections:\n%s", logText)
 				}
 				if strings.Contains(logText, "DECOMPRESSION ERROR") {

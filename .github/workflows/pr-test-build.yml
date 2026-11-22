@@ -17,8 +17,8 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - name: Refresh models catalog
-        run: bash .github/scripts/refresh-model-catalogs.sh
+      - name: Verify embedded model catalogs
+        run: bash .github/scripts/verify-embedded-model-catalogs.sh
       - name: Test YAML persistence and downstream WebSocket negotiation
         env:
           TZ: UTC
@@ -31,6 +31,36 @@ jobs:
           -run '^(TestHandlerSnapshotOwnsConfigAndPluginYAML|TestHandlerSnapshotGetConfigDuringSetConfig|TestHandlerSnapshotCatalogDuringPluginHostSwap|TestAPIKeyListConcurrentPersistence)$'
       - name: Validate Linux configuration saves, recovery and permissions
         run: bash .github/scripts/verify-linux-config-saves.sh
+      - name: Verify per-instance local credential storage
+        env:
+          GIN_MODE: release
+        run: >-
+          go test -mod=readonly -race -count=1 ./internal/api ./internal/api/handlers/management ./sdk/auth ./sdk/cliproxy
+          -run '^(TestOrdinaryConfigToggleCleanupUsesCommittedDirectory|TestOrdinaryVertexImportDefaultStoreIsolation|TestOrdinaryFileStoreViewsShareRootWriteLock|TestIndependentManagerSaveDirectoryIsPerCall|TestOrdinaryManagerLoginPreservesDefaultFileDirectory|TestOrdinaryBuilderLocalStoreDirectoryIsolation)$'
+      - name: Verify credential discovery and model lookup
+        run: |
+          go test -v -mod=readonly -race -count=1 -timeout=2m ./sdk/auth ./internal/util -run '^(TestFileTokenStoreListExcludesIncidentArchives|TestFileTokenStore_Save_DisabledStatusRoundTrips|TestGetProviderNameFallsBackToClaudePrefix|TestGetProviderNameDoesNotGuessGeminiPrefixedClaudeAliases|TestMaskSensitiveQueryMasksValue|TestMaskSensitiveHeaderValueMasksCookiesAndSecrets)$'
+      - name: Verify ordinary release headers and custom writer recovery
+        run: |
+          go test -v -mod=readonly -race -count=1 -timeout=2m ./internal/api ./sdk/auth -run '^(TestBuildInfoHeadersOnOrdinaryRoutes|TestOrdinaryTokenStorageKeepsRecoveryCopy|TestOrdinaryTokenStorageHistoryBestEffort)$'
+      - name: Verify credential edits on storage failure and file removal
+        env:
+          GIN_MODE: release
+        run: >-
+          go test -mod=readonly -race -count=1 ./internal/api ./sdk/auth
+          -run '^(TestIndependentOrdinaryCredential(FieldsPersistence|MissingFile)|TestOrdinaryCredentialEditPreservesLinkedFile|TestOrdinaryCredentialDeleteUsesFileStoreLock|TestOrdinaryFileTokenStoreDelete(SharesCanonicalWriteLock|UnlinksLeafAndRejectsWaiter)|TestOrdinaryFileStore(HistoryConcurrentViews|CannotReplaceWithoutDirectoryWriteAccess|HistoryIsPrivateAndOutsideList|ExplicitEditMetadata)|TestFileTokenStore_Save_(RollingWholeFileSnapshots|NoSnapshotWhenNoPriorFile))$'
+      - name: Verify ordinary xAI credential migration and concurrent edits
+        env:
+          GIN_MODE: release
+        run: >-
+          go test -mod=readonly -race -count=1 -timeout=2m ./sdk/auth ./internal/api/handlers/management
+          -run '^(TestIndependentXAI.*|TestOrdinaryXAICustomStoreSameFileMetadata|TestXAILocalLogin.*|TestManagerLogin_(MigratesMatchingLegacyXAICredential|ReloginKeepsCanonicalXAICredential|SubjectOnlyReloginKeepsEmailCredential)|TestSaveTokenRecord_(MigratesMatchingLegacyXAICredential|SubjectOnlyReloginKeepsEmailCredential))$'
+      - name: Test local credential directory reload and late notifications
+        env:
+          GIN_MODE: release
+        run: >-
+          go test -mod=readonly -race -count=1 -timeout=2m ./internal/watcher ./sdk/cliproxy
+          -run '^(TestReferenceWatcherRejectedDirectoryPreservesActiveSubscription|TestIndependentVertexRealWatcherDirectorySwitch|TestIndependentVertexServiceInjectedStore|TestIndependentLocalStoreAcceptedGeneration|TestIndependentLocalStoreExternalManagerUnchanged|TestOrdinaryPersistedDirectoryFence|TestOrdinaryAcceptedDirectoryAliasSource)$'
       - name: Verify provider lists commit before publication
         env:
           GIN_MODE: release
@@ -43,11 +73,34 @@ jobs:
         run: >-
           go test -mod=readonly -race -count=1 ./internal/api ./internal/api/handlers/management
           -run '^(TestPluginConfigWritePreservesLastSavedValue|TestPluginConfigWritesRejectUnavailableConfig|TestPatchPluginEnabled(UpdatesOnlyPluginConfig|ReloadSnapshotRawImmutability)|TestPutPluginConfigReplacesPluginConfig|TestPatchPluginConfigMergesAndDeletesFields|TestConfigReloadGenerationSkipsOlderSnapshot|TestPluginDeleteLocalRecovery|TestDeletePlugin(RejectsUnresolvedPluginsDir|ReturnsNotFoundForUnknownPlugin|UsesConfiguredStoreVersionWhenFilesCoexist|RemovesDiscoveredFileAndConfig))$'
+      - name: Verify preserved production prices and recovery after corrupt usage history
+        env:
+          GIN_MODE: release
+        run: |
+          go test -v -mod=readonly -race -count=1 -timeout=2m ./internal/usage -run '^Test(GPT55BuiltinPricingAndAliases|NormalizeCanonicalModelIDKeepsVariantsSeparate|ParseOpenAIPricingHTMLVariantDoesNotOverwriteCanonical|PricingCatalogPersistenceRebuildsGPT55Alias|PricingSnapshotOmitsZeroPersistenceTimes|PricingAutoRefreshDelayUsesInitialJitterWhenEmpty)$'
+          go test -v -mod=readonly -race -count=1 -timeout=2m ./internal/api/handlers/management -run '^TestUsageImportRejectsCorruptInitialHistoryAndRecovers$'
       - name: Verify durable removal and file registration
         run: >-
           go test -mod=readonly -race -count=1 -timeout=2m
           ./internal/api/handlers/management ./sdk/cliproxy/auth ./sdk/cliproxy
           -run '^(TestFileFence.*|TestDurableLocalRemoval.*|TestRemoveIfRetiresAfterCanceledRequestAndPersistenceWait|TestRegistered.*Local.*|TestLocalV8DeleteRegistryCleanupFollowsRegistrationEpoch|TestUnregisteredLocalFileThroughGinDelete|TestObservedLocalDeleteRejectsReplacementAndCancel|TestLocalGinDeleteKeepsReplacementWhileWaiting|TestLocalGinDeleteWaitsForSDKManagerLoad|TestWatcherRestoresFirstRegistrationAfterFileRemoval|TestHandleAuthUpdatesDiscardedSnapshotTriggersWatcherReread|TestHandleAuthUpdatesFileSnapshotKeepsCooldown|TestRuntimeAuthSyncHook_(DelayedPersistedSnapshotCannotUndoDisable|DiscardedLoginCacheCannotUndoDisableOnReload))$'
+      - name: Test ordinary usage history and management writes
+        env:
+          GIN_MODE: release
+        run: |
+          go test -mod=readonly -race -count=1 -timeout=2m ./internal/usage
+          go test -mod=readonly -race -count=1 -timeout=2m ./internal/api/handlers/management -run '^Test(GetUsageQueue|GetUsageStatistics|ExportUsageStatistics)'
+          go test -mod=readonly -race -count=1 -timeout=2m ./internal/api -run '^Test(CombinedOrdinaryUsage|RegisteredPricingWriteFailure|UsageImportValidity|UsageInstanceColdStart|UsageSDKChatAttribution|UsageRecorderConfiguration|UsageKnownKeyConfiguration|UsageDeferredShutdown|UsageImportWriteFailure)'
+      - name: Test retained request logs and management writes
+        env:
+          TZ: UTC
+        run: |
+          go test -mod=readonly -race -count=1 -timeout=3m ./internal/managementasset ./internal/logging
+          go test -v -mod=readonly -race -count=1 -timeout=3m ./internal/api ./internal/api/handlers/management ./internal/api/middleware ./internal/config -run '^(Test(GetLatestVersionUsesCanonicalUpstream|GetLogs|GetRequestLogByID|RequestLogWriterKeepsLegacyCollisionDistinctFromGzip|RegisteredOAuthModelAliasCommitsBeforeVisibility|RegisteredRequestLogArchiveRoutes|LoggingDisplayTimezoneFromConfig|RequestLogWriterToManagementGzipRoundTrip|RequestLogManagementRouteRequiresLocalAuthentication|RequestLogArchive|ArchivedErrorLogs|ParseTimestampOnRealFormatterLine|RequestLoggingMiddleware_StreamingResponsesUpstreamSections|DefaultRequestLoggerFactory_UsesResolvedLogDirectory))'
+      - name: Verify retained configuration and streaming contracts
+        run: |
+          go test -v -mod=readonly -race -count=1 -timeout=45s ./internal/config -run '^Test(DisableImageGenerationMode_Unmarshal(JSON|YAML)|LoadConfigOptional_DisableImageGenerationDefaultsToOff)$'
+          go test -v -mod=readonly -race -count=1 -timeout=45s ./sdk/api/handlers/openai -run '^Test(ForwardResponsesStreamWaitsForCompletedAfterErrorsClose|ForwardResponsesStreamDoesNotAppendFailureAfterTerminalEvent|ResponsesHandlerAcceptsMultilineDataAcrossExecutorChunks)$'
       - name: Build
         run: |
           go build -o test-output ./cmd/server
