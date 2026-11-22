@@ -59,3 +59,17 @@ func TestMaskSensitiveHeaderValueMasksCookiesAndSecrets(t *testing.T) {
 		t.Fatalf("MaskSensitiveHeaderValue(X-Request-Id) = %q, want unchanged", got)
 	}
 }
+
+func TestGetProviderNameFallsBackToClaudePrefix(t *testing.T) {
+	providers := util.GetProviderName("claude-opus-4-7")
+	if len(providers) != 1 || providers[0] != "claude" {
+		t.Fatalf("expected claude fallback for claude-opus-4-7, got %v", providers)
+	}
+}
+
+func TestGetProviderNameDoesNotGuessGeminiPrefixedClaudeAliases(t *testing.T) {
+	providers := util.GetProviderName("gemini-claude-opus-4-7-thinking")
+	if len(providers) != 0 {
+		t.Fatalf("expected no heuristic provider for gemini-prefixed alias without registry entry, got %v", providers)
+	}
+}

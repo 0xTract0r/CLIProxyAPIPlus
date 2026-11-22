@@ -125,3 +125,66 @@ func TestFileTokenStore_Save_DisabledStorageBackedRuntimeDoesNotRecreateMissingF
 		t.Fatalf("removed credential was recreated or stat failed: %v", errStat)
 	}
 }
+
+// TestFileTokenStore_Save_DisabledStatusRoundTrips is a real (no
+// WithSkipPersist involved -- store.Save/List are called directly) disk
+// round-trip covering the regression where readAuthFiles's disabled/
+// auto-quarantined switch's `case disabled:` branch was left with no
+// status assignment, so a disabled credential silently read back as
+// StatusActive after a process restart even though its persisted
+// Metadata["disabled"] was still true. The test above only asserts the
+// on-disk metadata; it never asserts the List()-restored Auth.Status,
+// which is what the selector/conductor actually gate on (see
+// selector.go's isAuthBlockedForModel and conductor_selection.go).
+func TestFileTokenStore_Save_DisabledStatusRoundTrips(t *testing.T) {
+	ctx := context.Background()
+	baseDir := t.TempDir()
+	path := filepath.Join(baseDir, "disabled-status.json")
+
+	// Save() deliberately no-ops for a Disabled auth whose file does not yet
+	// exist (see the os.IsNotExist guard in Save()), mirroring the real
+	// applyAuthDisabledState flow where an operator disables an
+	// already-persisted credential rather than creating a brand new one.
+	if err := os.WriteFile(path, []byte(`{"type":"claude"}`), 0o600); err != nil {
+		t.Fatalf("seed auth file: %v", err)
+	}
+
+	auth := &cliproxyauth.Auth{
+		ID:       "disabled-status.json",
+		Provider: "claude",
+		FileName: "disabled-status.json",
+		Disabled: true,
+		Status:   cliproxyauth.StatusDisabled,
+		Metadata: map[string]any{
+			"type":     "claude",
+			"disabled": true,
+		},
+	}
+
+	store := NewFileTokenStore()
+	store.SetBaseDir(baseDir)
+	if _, err := store.Save(ctx, auth); err != nil {
+		t.Fatalf("Save() error: %v", err)
+	}
+
+	// A brand new store instance re-reading the same directory simulates a
+	// process restart: nothing from the in-memory Auth struct survives,
+	// only whatever was actually written to disk.
+	reloaded := NewFileTokenStore()
+	reloaded.SetBaseDir(baseDir)
+	auths, err := reloaded.List(ctx)
+	if err != nil {
+		t.Fatalf("List() error: %v", err)
+	}
+	if len(auths) != 1 {
+		t.Fatalf("List() len = %d, want 1", len(auths))
+	}
+	got := auths[0]
+
+	if !got.Disabled {
+		t.Fatalf("Disabled = false after restart round-trip, want true")
+	}
+	if got.Status != cliproxyauth.StatusDisabled {
+		t.Fatalf("Status = %q after restart round-trip, want %q (selector/conductor gate on Status, not just the Disabled flag)", got.Status, cliproxyauth.StatusDisabled)
+	}
+}

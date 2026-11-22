@@ -37,6 +37,9 @@ jobs:
         run: >-
           go test -mod=readonly -race -count=1 ./internal/api ./internal/api/handlers/management ./sdk/auth ./sdk/cliproxy
           -run '^(TestOrdinaryConfigToggleCleanupUsesCommittedDirectory|TestOrdinaryVertexImportDefaultStoreIsolation|TestOrdinaryFileStoreViewsShareRootWriteLock|TestIndependentManagerSaveDirectoryIsPerCall|TestOrdinaryManagerLoginPreservesDefaultFileDirectory|TestOrdinaryBuilderLocalStoreDirectoryIsolation)$'
+      - name: Verify credential discovery and model lookup
+        run: |
+          go test -v -mod=readonly -race -count=1 -timeout=2m ./sdk/auth ./internal/util -run '^(TestFileTokenStoreListExcludesIncidentArchives|TestFileTokenStore_Save_DisabledStatusRoundTrips|TestGetProviderNameFallsBackToClaudePrefix|TestGetProviderNameDoesNotGuessGeminiPrefixedClaudeAliases|TestMaskSensitiveQueryMasksValue|TestMaskSensitiveHeaderValueMasksCookiesAndSecrets)$'
       - name: Verify credential edits on storage failure and file removal
         env:
           GIN_MODE: release
