@@ -137,6 +137,62 @@ func readExternalXAIExistingMetadata(cfg *config.Config, record *cliproxyauth.Au
 	return metadata
 }
 
+// xaiStorageWritePath keeps a configured targeted-relogin link intact. The
+// caller owns the lock for lockedPath; ordinary migration still rejects links.
+func (s *FileTokenStore) xaiStorageWritePath(auth *cliproxyauth.Auth, logical, lockedPath string) (string, error) {
+	if _, ok := auth.Storage.(*xai.TokenStorage); !ok {
+		return logical, nil
+	}
+	current, err := ordinaryAuthWritePath(logical)
+	if err != nil || current != lockedPath {
+		return "", cliproxyauth.ErrFileRemovalBusy
+	}
+	info, err := os.Lstat(logical)
+	if errors.Is(err, os.ErrNotExist) {
+		return logical, nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		return logical, nil
+	}
+	base := s.baseDirSnapshot()
+	if base == "" {
+		return "", fmt.Errorf("cannot verify the credential link directory")
+	}
+	root, err := filepath.Abs(base)
+	if err != nil {
+		return "", err
+	}
+	root, err = filepath.EvalSymlinks(root)
+	if err != nil {
+		return "", err
+	}
+	logicalDir, err := filepath.Abs(filepath.Dir(logical))
+	if err != nil {
+		return "", err
+	}
+	logicalDir, err = filepath.EvalSymlinks(logicalDir)
+	if err != nil {
+		return "", err
+	}
+	for _, path := range []string{filepath.Join(logicalDir, filepath.Base(logical)), lockedPath} {
+		rel, err := filepath.Rel(root, path)
+		if err != nil || !filepath.IsLocal(rel) {
+			return "", fmt.Errorf("credential link lies outside the configured credential directory")
+		}
+	}
+	prior, err := xaiLoginDestination(lockedPath, auth.Metadata)
+	if err != nil {
+		return "", err
+	}
+	if prior == nil {
+		return "", cliproxyauth.ErrCredentialFileRemoved
+	}
+	return lockedPath, nil
+}
+
 // PrepareXAILogin prepares ordinary local xAI persistence. Unknown storage
 // layouts cannot safely authorize deletion and are left to the store.
 func PrepareXAILogin(ctx context.Context, store cliproxyauth.Store, record *cliproxyauth.Auth) (*XAILoginPersistence, error) {

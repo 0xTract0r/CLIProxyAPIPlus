@@ -222,3 +222,47 @@ func TestXAILocalLoginKeepsReplacedPredecessor(t *testing.T) {
 		t.Fatalf("saved destination lost: %v", err)
 	}
 }
+
+func TestXAILocalLoginTargetedPreservesSameDirectoryLink(t *testing.T) {
+	cfg := &config.Config{AuthDir: t.TempDir()}
+	targetPath := filepath.Join(cfg.AuthDir, "physical.json")
+	linkPath := filepath.Join(cfg.AuthDir, "custom-linked.json")
+	writeXAIStorageFixture(t, targetPath, "review@example.invalid", "review-sub")
+	if err := os.Symlink(targetPath, linkPath); err != nil {
+		t.Fatal(err)
+	}
+	h := NewHandler(cfg, "", nil)
+	h.tokenStore = sdkauth.NewFileTokenStore()
+	record := syntheticXAIRecord("review@example.invalid", "review-sub", "new")
+	target := oauthRecoveryTarget{
+		AuthID:    "custom-linked.json",
+		FileName:  "custom-linked.json",
+		Path:      linkPath,
+		Provider:  "xai",
+		Email:     "review@example.invalid",
+		AccountID: "review-sub",
+	}
+	if !applyOAuthRecoveryTargetToRecord(target, record) {
+		t.Fatal("synthetic target did not match")
+	}
+	saved, err := h.saveTokenRecordWithConfig(withTargetedOAuthSave(context.Background()), record, cfg)
+	if err != nil || saved != linkPath {
+		t.Fatalf("targeted save = (%q, %v), want (%q, nil)", saved, err, linkPath)
+	}
+	info, err := os.Lstat(linkPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(targetPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var targetData map[string]any
+	if err := json.Unmarshal(data, &targetData); err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 || targetData["access_token"] != "new" {
+		t.Fatalf("after successful save: link preserved=%v; physical target refreshed=%v",
+			info.Mode()&os.ModeSymlink != 0, targetData["access_token"] == "new")
+	}
+}

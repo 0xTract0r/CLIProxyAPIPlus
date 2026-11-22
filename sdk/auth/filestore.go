@@ -170,7 +170,14 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 			if setter, ok := auth.Storage.(metadataSetter); ok {
 				setter.SetMetadata(auth.Metadata)
 			}
-			if err = auth.Storage.SaveTokenToFile(path); err != nil {
+			writePath := path
+			if xaiPath != "" && xaiPlan == nil {
+				writePath, err = s.xaiStorageWritePath(auth, path, xaiPath)
+				if err != nil {
+					return "", err
+				}
+			}
+			if err = auth.Storage.SaveTokenToFile(writePath); err != nil {
 				return "", err
 			}
 		case auth.Metadata != nil:
