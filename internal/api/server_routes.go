@@ -159,6 +159,8 @@ func (s *Server) setupRoutes() {
 		v1beta.GET("/models/*action", s.geminiGetHandler(geminiHandlers))
 	}
 
+	s.registerAmpModelRoutes(openaiHandlers, claudeCodeHandlers, geminiHandlers)
+
 	// Root endpoint
 	s.engine.GET("/", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
@@ -649,6 +651,38 @@ func isAnthropicModelsRequest(c *gin.Context) bool {
 	return strings.HasPrefix(c.GetHeader("User-Agent"), "claude-cli")
 }
 
+// registerAmpModelRoutes exposes the read-only model catalog paths used by Amp.
+func (s *Server) registerAmpModelRoutes(openaiHandler *openai.OpenAIAPIHandler, claudeHandler *claude.ClaudeCodeAPIHandler, geminiHandler *gemini.GeminiAPIHandler) {
+	providers := s.engine.Group("/api/provider/:provider", AuthMiddleware(s.accessManager))
+	geminiModels := s.geminiModelsHandler(geminiHandler)
+	list := func(c *gin.Context) {
+		provider := strings.ToLower(c.Param("provider"))
+		if provider == "google" {
+			geminiModels(c)
+			return
+		}
+		isClaude := provider == "anthropic"
+		if cfg := s.getConfig(); cfg != nil && cfg.Home.Enabled {
+			if _, requested := c.Request.URL.Query()["client_version"]; requested && !isClaude {
+				s.handleHomeCodexClientModels(c, c.Query("client_version"))
+			} else {
+				s.handleHomeModelsForFormat(c, isClaude)
+			}
+			return
+		}
+		if isClaude {
+			claudeHandler.ClaudeModels(c)
+			return
+		}
+		openaiHandler.OpenAIModels(c)
+	}
+
+	providers.GET("/models", list)
+	providers.GET("/v1/models", list)
+	providers.GET("/v1beta/models", geminiModels)
+	providers.GET("/v1beta/models/*action", s.geminiGetHandler(geminiHandler))
+}
+
 // unifiedModelsHandler creates a unified handler for the /v1/models endpoint
 // that routes to different handlers based on the request.
 // Anthropic API requests (Anthropic-Version header, or a claude-cli User-Agent)
@@ -1090,12 +1124,14 @@ type homeModelEntry struct {
 }
 
 func (s *Server) handleHomeModels(c *gin.Context) {
+	s.handleHomeModelsForFormat(c, isAnthropicModelsRequest(c))
+}
+
+func (s *Server) handleHomeModelsForFormat(c *gin.Context, isClaude bool) {
 	entries, ok := s.loadHomeModelEntries(c)
 	if !ok {
 		return
 	}
-
-	isClaude := isAnthropicModelsRequest(c)
 
 	if isClaude {
 		cfg := s.getConfig()
