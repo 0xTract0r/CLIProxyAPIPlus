@@ -1248,3 +1248,114 @@ func TestRequestLogManagementRouteRequiresLocalAuthentication(t *testing.T) {
 		})
 	}
 }
+
+func TestRequestLogWriterKeepsLegacyCollisionDistinctFromGzip(t *testing.T) {
+	dir := t.TempDir()
+	const id = "abcd1234"
+	const legacy = "old uncompressed request"
+	const layout = "2006-01-02T150405"
+	const writes = 4
+	started := time.Now().In(logging.DisplayLocation()).Truncate(time.Second)
+	oldTime := time.Unix(100, 0)
+	tieTime := oldTime.Add(time.Hour)
+	setTime := func(name string, when time.Time) {
+		t.Helper()
+		if err := os.Chtimes(filepath.Join(dir, name), when, when); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Reserve the writer's wall-clock window, including second boundaries.
+	for second := -2; second <= 30; second++ {
+		prefix := "v1-responses-" + started.Add(time.Duration(second)*time.Second).Format(layout)
+		name := prefix + "-" + id + ".log"
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(legacy), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		setTime(name, oldTime)
+		if err := os.Symlink("missing-legacy-target", filepath.Join(dir, prefix+"_1-"+id+".log")); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	logger := logging.NewFileRequestLogger(true, dir, "", 0)
+	start, results := make(chan struct{}), make(chan error, writes)
+	for i := 0; i < writes; i++ {
+		go func() {
+			<-start
+			marker := "new request #" + strconv.Itoa(i)
+			results <- logger.LogRequest("/v1/responses", http.MethodPost, nil, []byte(marker),
+				http.StatusOK, nil, []byte("ok"), nil, nil, nil, nil, nil, id, started, started)
+		}()
+	}
+	close(start)
+	for i := 0; i < writes; i++ {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	h := newLogsTestHandler(dir, true)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	bodies := make(map[string]string, writes)
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasSuffix(name, ".log.gz") {
+			continue
+		}
+		meta := parseLogMetadata(strings.TrimSuffix(name, ".gz"), id)
+		if !meta.hasTime || meta.seq < 2 {
+			t.Fatalf("new record reused a reserved plain or symlink name: %s", name)
+		}
+		prefix := "v1-responses-" + meta.time.Format(layout)
+		plainName := prefix + "-" + id + ".log"
+		plain, err := os.ReadFile(filepath.Join(dir, plainName))
+		if err != nil || string(plain) != legacy {
+			t.Fatalf("same-second legacy record changed: %s (%v)", plainName, err)
+		}
+		link := filepath.Join(dir, prefix+"_1-"+id+".log")
+		if target, err := os.Readlink(link); err != nil || target != "missing-legacy-target" {
+			t.Fatalf("reserved symbolic link changed: %s (%v)", link, err)
+		}
+		rec := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(rec)
+		c.Request = httptest.NewRequest(http.MethodGet, "/fixture", nil)
+		h.serveRequestLog(c, "", name)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("cannot read published gzip %s: %d %s", name, rec.Code, rec.Body)
+		}
+		names = append(names, name)
+		bodies[name] = rec.Body.String()
+		setTime(name, tieTime)
+		setTime(plainName, tieTime)
+	}
+	if len(names) != writes {
+		t.Fatalf("published %d files, want %d", len(names), writes)
+	}
+	for i := 0; i < writes; i++ {
+		marker := "new request #" + strconv.Itoa(i)
+		found := 0
+		for _, body := range bodies {
+			if strings.Contains(body, marker) {
+				found++
+			}
+		}
+		if found != 1 {
+			t.Fatalf("expected one published copy of %q, got %d", marker, found)
+		}
+	}
+	expectLatest := func(want string) {
+		t.Helper()
+		rec := performGetRequestLogByID(t, h, id)
+		if rec.Code != http.StatusOK || rec.Body.String() != bodies[want] {
+			t.Fatalf("latest log for %s: %d, %q", want, rec.Code, rec.Body)
+		}
+	}
+	// ReadDir sorts names; for this fixture all sequence numbers are one digit.
+	expectLatest(names[len(names)-1])
+	setTime(names[0], tieTime.Add(time.Second))
+	expectLatest(names[0])
+}

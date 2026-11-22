@@ -216,10 +216,17 @@ func writeCompressedRequestLog(plainPath string, write func(io.Writer) error) er
 		prefix, id = base[:pos], base[pos:]
 	}
 	for seq := 0; seq <= 1000; seq++ {
-		target := plainPath + ".gz"
+		logicalPath := plainPath
 		if seq > 0 {
-			target = fmt.Sprintf("%s_%d%s%s.gz", prefix, seq, id, ext)
+			logicalPath = fmt.Sprintf("%s_%d%s%s", prefix, seq, id, ext)
 		}
+		// Plain and gzip versions of the same logical name are read as one log.
+		if _, err := os.Lstat(logicalPath); err == nil {
+			continue
+		} else if !os.IsNotExist(err) {
+			return fmt.Errorf("inspect request log name: %w", err)
+		}
+		target := logicalPath + ".gz"
 		if err := os.Link(tempPath, target); err != nil {
 			if os.IsExist(err) {
 				if info, statErr := os.Lstat(target); statErr == nil && info.Mode().IsRegular() {
