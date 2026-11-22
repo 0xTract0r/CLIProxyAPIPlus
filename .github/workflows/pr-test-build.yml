@@ -79,12 +79,12 @@ jobs:
           go test -mod=readonly -race -count=1 -timeout=2m ./internal/usage
           go test -mod=readonly -race -count=1 -timeout=2m ./internal/api/handlers/management -run '^Test(GetUsageQueue|GetUsageStatistics|ExportUsageStatistics)'
           go test -mod=readonly -race -count=1 -timeout=2m ./internal/api -run '^Test(CombinedOrdinaryUsage|RegisteredPricingWriteFailure|UsageImportValidity|UsageInstanceColdStart|UsageSDKChatAttribution|UsageRecorderConfiguration|UsageKnownKeyConfiguration|UsageDeferredShutdown|UsageImportWriteFailure)'
-      - name: Test retained request logs and release lookups
+      - name: Test retained request logs and management writes
         env:
           TZ: UTC
         run: |
           go test -mod=readonly -race -count=1 -timeout=3m ./internal/managementasset ./internal/logging
-          go test -v -mod=readonly -race -count=1 -timeout=3m ./internal/api ./internal/api/handlers/management ./internal/api/middleware ./internal/config -run '^(Test(GetLatestVersionUsesCanonicalUpstream|GetLogs|GetRequestLogByID|RequestLogWriterKeepsLegacyCollisionDistinctFromGzip|RegisteredRequestLogArchiveRoutes|LoggingDisplayTimezoneFromConfig|RequestLogWriterToManagementGzipRoundTrip|RequestLogManagementRouteRequiresLocalAuthentication|RequestLogArchive|ArchivedErrorLogs|ParseTimestampOnRealFormatterLine|RequestLoggingMiddleware_StreamingResponsesUpstreamSections|DefaultRequestLoggerFactory_UsesResolvedLogDirectory))'
+          go test -v -mod=readonly -race -count=1 -timeout=3m ./internal/api ./internal/api/handlers/management ./internal/api/middleware ./internal/config -run '^(Test(GetLatestVersionUsesCanonicalUpstream|GetLogs|GetRequestLogByID|RequestLogWriterKeepsLegacyCollisionDistinctFromGzip|RegisteredOAuthModelAliasCommitsBeforeVisibility|RegisteredRequestLogArchiveRoutes|LoggingDisplayTimezoneFromConfig|RequestLogWriterToManagementGzipRoundTrip|RequestLogManagementRouteRequiresLocalAuthentication|RequestLogArchive|ArchivedErrorLogs|ParseTimestampOnRealFormatterLine|RequestLoggingMiddleware_StreamingResponsesUpstreamSections|DefaultRequestLoggerFactory_UsesResolvedLogDirectory))'
       - name: Verify retained configuration and streaming contracts
         run: |
           go test -v -mod=readonly -race -count=1 -timeout=45s ./internal/config -run '^Test(DisableImageGenerationMode_Unmarshal(JSON|YAML)|LoadConfigOptional_DisableImageGenerationDefaultsToOff)$'
