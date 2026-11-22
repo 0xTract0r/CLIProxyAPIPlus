@@ -184,6 +184,62 @@ func codexQuotaSnapshotCooldown(auth *Auth, now time.Time) (time.Time, bool) {
 	return reset, !reset.IsZero()
 }
 
+// claudeQuotaSnapshotCooldown applies shared limits to every model and named
+// family limits only to that family. Unknown future windows must not become
+// account-wide exclusions. Enabled extra usage preserves overflow unless its
+// reported budget is exhausted; this never enables billing upstream.
+func claudeQuotaSnapshotCooldown(auth *Auth, model string, now time.Time) (time.Time, bool) {
+	if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), "claude") {
+		return time.Time{}, false
+	}
+	if claudeSnapshotCreditsUsable(auth) {
+		return time.Time{}, false
+	}
+	quota, ok := ParseAccountQuotaUtilization(auth)
+	if !ok {
+		return time.Time{}, false
+	}
+	model = strings.ToLower(canonicalModelKey(model))
+	var reset time.Time
+	for name, window := range quota.Windows {
+		applies := false
+		switch name {
+		case "five_hour", "seven_day", "seven_day_oauth_apps":
+			applies = true
+		case "seven_day_opus", "seven_day_sonnet", "seven_day_haiku":
+			applies = strings.Contains(model, strings.TrimPrefix(name, "seven_day_"))
+		}
+		if applies && window.UtilizationPercent >= 100 && window.ResetsAt.After(now) && window.ResetsAt.After(reset) {
+			reset = window.ResetsAt
+		}
+	}
+	return reset, !reset.IsZero()
+}
+
+func claudeSnapshotCreditsUsable(auth *Auth) bool {
+	if !auth.ClaudeUsageCreditsEnabled() {
+		return false
+	}
+	snapshot, _ := metadataObject(auth.Metadata[accountQuotaSnapshotMetadataKey])
+	usage, _ := metadataObject(snapshot[accountQuotaUsageKey])
+	extra, ok := metadataObject(usage["extra_usage"])
+	if !ok {
+		extra, _ = metadataObject(usage["extraUsage"])
+	}
+	if used, ok := accountQuotaNumericValue(extra["utilization"]); ok && used >= 100 {
+		return false
+	}
+	if limit, ok := accountQuotaNumericValue(extra["monthly_limit"]); ok && !math.IsNaN(limit) && !math.IsInf(limit, 0) {
+		if limit <= 0 {
+			return false
+		}
+		if used, ok := accountQuotaNumericValue(extra["used_credits"]); ok && used >= limit {
+			return false
+		}
+	}
+	return true
+}
+
 // parseAccountQuotaWindows scans every top-level entry of a quota_snapshot
 // usage object and treats any entry that is itself an object carrying a
 // numeric "utilization" field as a usage window. This deliberately does not
@@ -196,7 +252,7 @@ func parseAccountQuotaWindows(usage map[string]any) map[string]AccountQuotaWindo
 			continue
 		}
 		utilization, ok := accountQuotaNumericValue(obj[accountQuotaUtilizationKey])
-		if !ok {
+		if !ok || math.IsNaN(utilization) || math.IsInf(utilization, 0) {
 			// Not a usage-window object (e.g. "extra_usage": {"is_enabled": false}).
 			continue
 		}
