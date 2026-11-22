@@ -454,7 +454,7 @@ func (s *FileTokenStore) List(ctx context.Context) ([]*cliproxyauth.Auth, error)
 			return walkErr
 		}
 		if d.IsDir() {
-			if path != dir && d.Name() == authFileHistoryDirName {
+			if path != dir && (d.Name() == authFileHistoryDirName || strings.EqualFold(d.Name(), "incident-archives")) {
 				return fs.SkipDir
 			}
 			return nil
