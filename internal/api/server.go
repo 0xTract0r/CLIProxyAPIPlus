@@ -204,6 +204,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	// Add middleware
 	engine.Use(logging.GinLogrusLogger())
 	engine.Use(logging.CPATraceIDMiddleware())
+	engine.Use(buildInfoHeadersMiddleware())
 	engine.Use(s.maxRequestBodyBytesMiddleware())
 
 	// Add request logging middleware before recovery and extra middleware so that
