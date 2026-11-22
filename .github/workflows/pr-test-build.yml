@@ -48,7 +48,7 @@ jobs:
           GIN_MODE: release
         run: >-
           go test -mod=readonly -race -count=1 -timeout=2m ./sdk/auth ./internal/api/handlers/management
-          -run '^(TestIndependentXAI.*|TestXAILocalLogin.*|TestManagerLogin_(MigratesMatchingLegacyXAICredential|ReloginKeepsCanonicalXAICredential|SubjectOnlyReloginKeepsEmailCredential)|TestSaveTokenRecord_(MigratesMatchingLegacyXAICredential|SubjectOnlyReloginKeepsEmailCredential))$'
+          -run '^(TestIndependentXAI.*|TestOrdinaryXAICustomStoreSameFileMetadata|TestXAILocalLogin.*|TestManagerLogin_(MigratesMatchingLegacyXAICredential|ReloginKeepsCanonicalXAICredential|SubjectOnlyReloginKeepsEmailCredential)|TestSaveTokenRecord_(MigratesMatchingLegacyXAICredential|SubjectOnlyReloginKeepsEmailCredential))$'
       - name: Test local credential directory reload and late notifications
         env:
           GIN_MODE: release

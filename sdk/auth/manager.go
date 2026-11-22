@@ -80,7 +80,7 @@ func (m *Manager) Login(ctx context.Context, provider string, cfg *config.Config
 		return record, "", nil
 	}
 
-	xaiSave, err := PrepareXAILogin(ctx, store, record)
+	xaiSave, err := PrepareXAILoginForConfig(ctx, store, record, cfg)
 	if err != nil {
 		return record, "", err
 	}

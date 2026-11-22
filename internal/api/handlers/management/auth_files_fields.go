@@ -1056,7 +1056,7 @@ func (h *Handler) saveTokenRecordWithConfig(ctx context.Context, record *coreaut
 	var xaiSave *sdkAuth.XAILoginPersistence
 	if !isTargetedOAuthSave(ctx) {
 		var err error
-		xaiSave, err = sdkAuth.PrepareXAILogin(ctx, store, record)
+		xaiSave, err = sdkAuth.PrepareXAILoginForConfig(ctx, store, record, cfg)
 		if err != nil {
 			return "", err
 		}

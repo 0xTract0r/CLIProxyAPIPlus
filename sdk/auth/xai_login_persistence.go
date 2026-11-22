@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/xai"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
@@ -104,9 +105,47 @@ func xaiLoginDestination(path string, incoming map[string]any) (*xaiFileSnapshot
 	return existing, nil
 }
 
+func readExternalXAIExistingMetadata(cfg *config.Config, record *cliproxyauth.Auth) map[string]any {
+	if cfg == nil || strings.TrimSpace(cfg.AuthDir) == "" {
+		return nil
+	}
+	name := strings.TrimSpace(record.FileName)
+	if name == "" {
+		name = strings.TrimSpace(record.ID)
+	}
+	if filepath.Base(name) != name || !strings.HasSuffix(strings.ToLower(name), ".json") {
+		return nil
+	}
+	target := filepath.Join(cfg.AuthDir, name)
+	if explicit := strings.TrimSpace(record.Attributes[cliproxyauth.AttributePath]); explicit != "" {
+		configuredPath, errTarget := filepath.Abs(target)
+		explicitPath, errExplicit := filepath.Abs(explicit)
+		if errTarget != nil || errExplicit != nil || explicitPath != configuredPath {
+			return nil
+		}
+	}
+	existing, err := xaiLoginDestination(target, record.Metadata)
+	if err != nil || existing == nil {
+		return nil
+	}
+	metadata := make(map[string]any, 2)
+	for _, key := range []string{"note", "disabled"} {
+		if value, ok := existing.metadata[key]; ok {
+			metadata[key] = value
+		}
+	}
+	return metadata
+}
+
 // PrepareXAILogin prepares ordinary local xAI persistence. Unknown storage
 // layouts cannot safely authorize deletion and are left to the store.
 func PrepareXAILogin(ctx context.Context, store cliproxyauth.Store, record *cliproxyauth.Auth) (*XAILoginPersistence, error) {
+	return PrepareXAILoginForConfig(ctx, store, record, nil)
+}
+
+// PrepareXAILoginForConfig also inherits operator metadata from the verified
+// destination in the configured auth directory when using an external store.
+func PrepareXAILoginForConfig(ctx context.Context, store cliproxyauth.Store, record *cliproxyauth.Auth, cfg *config.Config) (*XAILoginPersistence, error) {
 	if record == nil || !strings.EqualFold(record.Provider, "xai") {
 		return nil, nil
 	}
@@ -115,6 +154,7 @@ func PrepareXAILogin(ctx context.Context, store cliproxyauth.Store, record *clip
 	if !ok {
 		// Arbitrary stores define their own save consistency and may allow a
 		// write even when enumeration is unavailable. Do not migrate there.
+		plan.PriorMetadata = readExternalXAIExistingMetadata(cfg, record)
 		return plan, nil
 	}
 	path, err := local.resolveAuthPath(record)
