@@ -85,6 +85,10 @@ jobs:
         run: |
           go test -mod=readonly -race -count=1 -timeout=3m ./internal/managementasset ./internal/logging
           go test -v -mod=readonly -race -count=1 -timeout=3m ./internal/api ./internal/api/handlers/management ./internal/api/middleware ./internal/config -run '^(Test(GetLatestVersionUsesCanonicalUpstream|GetLogs|GetRequestLogByID|RequestLogWriterKeepsLegacyCollisionDistinctFromGzip|RegisteredRequestLogArchiveRoutes|LoggingDisplayTimezoneFromConfig|RequestLogWriterToManagementGzipRoundTrip|RequestLogManagementRouteRequiresLocalAuthentication|RequestLogArchive|ArchivedErrorLogs|ParseTimestampOnRealFormatterLine|RequestLoggingMiddleware_StreamingResponsesUpstreamSections|DefaultRequestLoggerFactory_UsesResolvedLogDirectory))'
+      - name: Verify retained configuration and streaming contracts
+        run: |
+          go test -v -mod=readonly -race -count=1 -timeout=45s ./internal/config -run '^Test(DisableImageGenerationMode_Unmarshal(JSON|YAML)|LoadConfigOptional_DisableImageGenerationDefaultsToOff)$'
+          go test -v -mod=readonly -race -count=1 -timeout=45s ./sdk/api/handlers/openai -run '^Test(ForwardResponsesStreamWaitsForCompletedAfterErrorsClose|ForwardResponsesStreamDoesNotAppendFailureAfterTerminalEvent|ResponsesHandlerAcceptsMultilineDataAcrossExecutorChunks)$'
       - name: Build
         run: |
           go build -o test-output ./cmd/server

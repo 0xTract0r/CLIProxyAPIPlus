@@ -1,6 +1,8 @@
 package config
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/MoeForge/moego/json"
@@ -92,5 +94,25 @@ func TestDisableImageGenerationMode_UnmarshalJSON(t *testing.T) {
 		if v != DisableImageGenerationPassthrough {
 			t.Fatalf("passthrough => %v, want %v", v, DisableImageGenerationPassthrough)
 		}
+	}
+}
+
+// When disable-image-generation is omitted, the default is Off (inject), matching
+// upstream — image generation is enabled by default. Free-tier/spark auths are still
+// skipped at injection time, and /v1/images independently rejects free auths.
+func TestLoadConfigOptional_DisableImageGenerationDefaultsToOff(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(configPath, []byte("debug: false\n"), 0o600); err != nil {
+		t.Fatalf("failed to write config: %v", err)
+	}
+
+	cfg, err := LoadConfigOptional(configPath, false)
+	if err != nil {
+		t.Fatalf("LoadConfigOptional() error = %v", err)
+	}
+
+	if cfg.DisableImageGeneration != DisableImageGenerationOff {
+		t.Fatalf("default DisableImageGeneration = %v, want %v (Off)", cfg.DisableImageGeneration, DisableImageGenerationOff)
 	}
 }
