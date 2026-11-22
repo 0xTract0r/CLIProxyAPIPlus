@@ -43,6 +43,12 @@ jobs:
         run: >-
           go test -mod=readonly -race -count=1 ./internal/api ./sdk/auth
           -run '^(TestIndependentOrdinaryCredential(FieldsPersistence|MissingFile)|TestOrdinaryCredentialEditPreservesLinkedFile|TestOrdinaryCredentialDeleteUsesFileStoreLock|TestOrdinaryFileTokenStoreDelete(SharesCanonicalWriteLock|UnlinksLeafAndRejectsWaiter)|TestOrdinaryFileStore(HistoryConcurrentViews|CannotReplaceWithoutDirectoryWriteAccess|HistoryIsPrivateAndOutsideList|ExplicitEditMetadata)|TestFileTokenStore_Save_(RollingWholeFileSnapshots|NoSnapshotWhenNoPriorFile))$'
+      - name: Verify ordinary xAI credential migration and concurrent edits
+        env:
+          GIN_MODE: release
+        run: >-
+          go test -mod=readonly -race -count=1 -timeout=2m ./sdk/auth ./internal/api/handlers/management
+          -run '^(TestIndependentXAI.*|TestXAILocalLogin.*|TestManagerLogin_(MigratesMatchingLegacyXAICredential|ReloginKeepsCanonicalXAICredential|SubjectOnlyReloginKeepsEmailCredential)|TestSaveTokenRecord_(MigratesMatchingLegacyXAICredential|SubjectOnlyReloginKeepsEmailCredential))$'
       - name: Test local credential directory reload and late notifications
         env:
           GIN_MODE: release

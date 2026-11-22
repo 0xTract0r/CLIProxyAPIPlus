@@ -139,6 +139,28 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 			return "", errCodex
 		}
 	} else {
+		var xaiPlan *XAILoginPersistence
+		if ctx != nil {
+			xaiPlan, _ = ctx.Value(xaiLoginPlanKey{}).(*XAILoginPersistence)
+		}
+		xaiPath := ""
+		if strings.EqualFold(auth.Provider, "xai") && (auth.Storage != nil || xaiPlan != nil) {
+			xaiPath, err = ordinaryAuthWritePath(path)
+			if err != nil {
+				return "", err
+			}
+			unlock := lockOrdinaryAuthWrite(xaiPath)
+			defer unlock()
+			if xaiPlan != nil {
+				existing, err := xaiLoginDestination(path, auth.Metadata)
+				if err != nil {
+					return "", err
+				}
+				if err := xaiPlan.verifyLocked(xaiPath, existing); err != nil {
+					return "", err
+				}
+			}
+		}
 		switch {
 		case auth.Storage != nil:
 			if auth.Metadata == nil {
@@ -157,7 +179,13 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 			if errMarshal != nil {
 				return "", fmt.Errorf("auth filestore: marshal metadata failed: %w", errMarshal)
 			}
-			if errWrite := saveOrdinaryAuthJSON(path, raw, explicitEdit); errWrite != nil {
+			save := saveOrdinaryAuthJSON
+			if xaiPath != "" {
+				save = func(path string, data []byte, requireExisting bool) error {
+					return saveOrdinaryAuthJSONLocked(path, xaiPath, data, requireExisting)
+				}
+			}
+			if errWrite := save(path, raw, explicitEdit); errWrite != nil {
 				return "", errWrite
 			}
 		default:
@@ -219,7 +247,10 @@ func saveOrdinaryAuthJSON(path string, raw []byte, requireExisting bool) error {
 	}
 	unlock := lockOrdinaryAuthWrite(absolute)
 	defer unlock()
+	return saveOrdinaryAuthJSONLocked(path, absolute, raw, requireExisting)
+}
 
+func saveOrdinaryAuthJSONLocked(path, absolute string, raw []byte, requireExisting bool) error {
 	// The logical entry may be unlinked while waiting for its target's lock.
 	entry, errEntry := os.Lstat(path)
 	if os.IsNotExist(errEntry) {
