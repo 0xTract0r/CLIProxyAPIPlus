@@ -33,20 +33,121 @@ const (
 	httpUserAgent                = "CLIProxyAPI-management-updater"
 	managementSyncMinInterval    = 30 * time.Second
 	updateCheckInterval          = 3 * time.Hour
-	maxAssetDownloadSize         = 50 << 20 // 10 MB safety limit for management asset downloads
+	releaseRateLimitCooldown     = time.Hour
+	maxAssetDownloadSize         = 50 << 20 // 50 MB safety limit for management asset downloads
 )
 
 // ManagementFileName exposes the control panel asset filename.
 const ManagementFileName = managementAssetName
 
 var (
-	lastUpdateCheckMu   sync.Mutex
-	lastUpdateCheckTime time.Time
-	currentConfigPtr    atomic.Pointer[config.Config]
-	schedulerOnce       sync.Once
-	schedulerConfigPath atomic.Value
-	sfGroup             singleflight.Group
+	lastUpdateCheckMu    sync.Mutex
+	lastUpdateCheckTime  time.Time
+	currentConfigPtr     atomic.Pointer[config.Config]
+	schedulerOnce        sync.Once
+	schedulerConfigPath  atomic.Value
+	sfGroup              singleflight.Group
+	releaseCooldownMu    sync.Mutex
+	releaseCooldownUntil time.Time
 )
+
+type releaseRequestError struct {
+	StatusCode     int
+	Body           string
+	RetryAfter     time.Duration
+	RateLimitReset time.Time
+}
+
+func (e *releaseRequestError) Error() string {
+	if e == nil {
+		return ""
+	}
+	return fmt.Sprintf("unexpected release status %d: %s", e.StatusCode, e.Body)
+}
+
+func (e *releaseRequestError) isRateLimited() bool {
+	if e == nil {
+		return false
+	}
+	if e.StatusCode == http.StatusTooManyRequests {
+		return true
+	}
+	if e.StatusCode != http.StatusForbidden {
+		return false
+	}
+	body := strings.ToLower(e.Body)
+	return strings.Contains(body, "rate limit") || strings.Contains(body, "rate_limited") || e.RetryAfter > 0 || !e.RateLimitReset.IsZero()
+}
+
+func activeReleaseCooldown(now time.Time) (time.Time, bool) {
+	releaseCooldownMu.Lock()
+	defer releaseCooldownMu.Unlock()
+	if releaseCooldownUntil.After(now) {
+		return releaseCooldownUntil, true
+	}
+	return time.Time{}, false
+}
+
+func setReleaseCooldown(until time.Time) bool {
+	if until.IsZero() {
+		return false
+	}
+	releaseCooldownMu.Lock()
+	defer releaseCooldownMu.Unlock()
+	if !until.After(releaseCooldownUntil) {
+		return false
+	}
+	releaseCooldownUntil = until
+	return true
+}
+
+func clearReleaseCooldown() {
+	releaseCooldownMu.Lock()
+	defer releaseCooldownMu.Unlock()
+	releaseCooldownUntil = time.Time{}
+}
+
+func releaseCooldownFromError(now time.Time, err error) (time.Time, bool) {
+	var requestErr *releaseRequestError
+	if !errors.As(err, &requestErr) || !requestErr.isRateLimited() {
+		return time.Time{}, false
+	}
+
+	switch {
+	case !requestErr.RateLimitReset.IsZero() && requestErr.RateLimitReset.After(now):
+		return requestErr.RateLimitReset.Add(5 * time.Second), true
+	case requestErr.RetryAfter > 0:
+		return now.Add(requestErr.RetryAfter), true
+	default:
+		return now.Add(releaseRateLimitCooldown), true
+	}
+}
+
+func parseRetryAfter(value string, now time.Time) time.Duration {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+	if seconds, err := time.ParseDuration(value + "s"); err == nil && seconds > 0 {
+		return seconds
+	}
+	if retryAt, err := http.ParseTime(value); err == nil && retryAt.After(now) {
+		return retryAt.Sub(now)
+	}
+	return 0
+}
+
+func parseRateLimitReset(value string) time.Time {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return time.Time{}
+	}
+	seconds, err := time.ParseDuration(value + "s")
+	if err != nil || seconds <= 0 {
+		return time.Time{}
+	}
+	return time.Unix(int64(seconds/time.Second), 0)
+}
 
 // SetCurrentConfig stores the latest configuration snapshot for management asset decisions.
 func SetCurrentConfig(cfg *config.Config) {
@@ -226,6 +327,16 @@ func EnsureLatestManagementHTML(ctx context.Context, staticDir string, proxyURL 
 			}
 		}
 
+		if !localFileMissing {
+			if cooldownUntil, blocked := activeReleaseCooldown(now); blocked {
+				log.Debugf(
+					"management asset release check skipped due to rate-limit cooldown until %s",
+					cooldownUntil.UTC().Format(time.RFC3339),
+				)
+				return nil, nil
+			}
+		}
+
 		if errMkdirAll := os.MkdirAll(staticDir, 0o755); errMkdirAll != nil {
 			log.WithError(errMkdirAll).Warn("failed to prepare static directory for management asset")
 			return nil, nil
@@ -244,6 +355,14 @@ func EnsureLatestManagementHTML(ctx context.Context, staticDir string, proxyURL 
 
 		asset, remoteHash, err := fetchLatestAsset(ctx, client, releaseURL)
 		if err != nil {
+			if cooldownUntil, blocked := releaseCooldownFromError(now, err); blocked {
+				if setReleaseCooldown(cooldownUntil) {
+					log.WithError(err).Warnf(
+						"management asset release check rate limited, backing off until %s",
+						cooldownUntil.UTC().Format(time.RFC3339),
+					)
+				}
+			}
 			if localFileMissing {
 				log.WithError(err).Warn("failed to fetch latest management release information, trying fallback page")
 				if ensureFallbackManagementHTML(ctx, client, localPath) {
@@ -254,6 +373,7 @@ func EnsureLatestManagementHTML(ctx context.Context, staticDir string, proxyURL 
 			log.WithError(err).Warn("failed to fetch latest management release information")
 			return nil, nil
 		}
+		clearReleaseCooldown()
 
 		if remoteHash != "" && localHash != "" && strings.EqualFold(remoteHash, localHash) {
 			log.Debug("management asset is already up to date")
@@ -306,6 +426,7 @@ func ensureFallbackManagementHTML(ctx context.Context, client *http.Client, loca
 		return false
 	}
 
+	log.Warnf("management asset downloaded from fallback URL without digest verification (hash=%s)", downloadedHash)
 	log.Infof("management asset updated from fallback page successfully (hash=%s)", downloadedHash)
 	return true
 }
@@ -347,19 +468,43 @@ func fetchLatestAsset(ctx context.Context, client *http.Client, releaseURL strin
 		releaseURL = defaultManagementReleaseURL
 	}
 
-	headers := map[string]string{
-		"Accept":     "application/vnd.github+json",
-		"User-Agent": httpUserAgent,
-	}
-	if token := githubauth.TokenForURL(releaseURL); token != "" {
-		headers["Authorization"] = "Bearer " + token
-	}
-
-	data, err := httpfetch.GetBytes(ctx, client, releaseURL, headers, 0)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, releaseURL, nil)
 	if err != nil {
-		return nil, "", fmt.Errorf("fetch release: %w", err)
+		return nil, "", fmt.Errorf("create release request: %w", err)
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("User-Agent", httpUserAgent)
+	if token := githubauth.TokenForURL(releaseURL); token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
 	}
 
+	// Read the release headers so a rejected check can honor GitHub's retry time.
+	if client == nil {
+		client = http.DefaultClient
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, "", fmt.Errorf("execute release request: %w", err)
+	}
+	defer func() {
+		_ = resp.Body.Close()
+	}()
+
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		now := time.Now()
+		return nil, "", &releaseRequestError{
+			StatusCode:     resp.StatusCode,
+			Body:           strings.TrimSpace(string(body)),
+			RetryAfter:     parseRetryAfter(resp.Header.Get("Retry-After"), now),
+			RateLimitReset: parseRateLimitReset(resp.Header.Get("X-RateLimit-Reset")),
+		}
+	}
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, "", fmt.Errorf("read release response: %w", err)
+	}
 	var release releaseResponse
 	if err = json.Unmarshal(data, &release); err != nil {
 		return nil, "", fmt.Errorf("decode release response: %w", err)
