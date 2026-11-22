@@ -256,9 +256,15 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 			updateAggregatedAvailability(auth, now)
 		}
 	}
+	releasePublication, eligible := authPublicationFence(ctx).Begin()
+	if !eligible {
+		m.mu.Unlock()
+		return nil, ErrAuthPublicationOutOfScope
+	}
 	auth.ClearFileSnapshot()
 	authClone := auth.Clone()
 	m.auths[auth.ID] = authClone
+	releasePublication()
 	m.notifyAuthChangeLocked(auth.ID)
 	// Snapshot before unlocking: MarkResult mutates the published auth in place.
 	var schedulerSnapshot *Auth
@@ -822,9 +828,15 @@ func (m *Manager) updateInternalLockedWithOptions(ctx context.Context, base, aut
 	if existing.Generation >= auth.Generation {
 		auth.Generation = existing.Generation + 1
 	}
+	releasePublication, eligible := authPublicationFence(ctx).Begin()
+	if !eligible {
+		m.mu.Unlock()
+		return nil, false, false, false, ErrAuthPublicationOutOfScope
+	}
 	auth.ClearFileSnapshot()
 	authClone := auth.Clone()
 	m.auths[auth.ID] = authClone
+	releasePublication()
 	m.notifyAuthChangeLocked(auth.ID)
 	// Snapshot before unlocking: MarkResult mutates the published auth in place.
 	var schedulerSnapshot *Auth
@@ -983,6 +995,18 @@ func (m *Manager) forgetWeightedAuthUpTo(authID string, maxEpoch, maxGen uint64)
 	if forgetter, ok := sel.(interface{ ForgetAuth(string) }); ok && forgetter != nil {
 		forgetter.ForgetAuth(authID)
 	}
+}
+
+// WithLocalStoreRebind excludes Load and persistence during an internal
+// binding change. The callback may install the new store once it accepts the
+// configuration generation, and must not reenter Manager mutation methods.
+func (m *Manager) WithLocalStoreRebind(ctx context.Context, next Store, accept func(install func())) error {
+	if err := m.authLoadGate.Acquire(ctx, math.MaxInt64); err != nil {
+		return err
+	}
+	defer m.authLoadGate.Release(math.MaxInt64)
+	accept(func() { m.SetStore(next) })
+	return nil
 }
 
 // Load resets manager state from the backing store.

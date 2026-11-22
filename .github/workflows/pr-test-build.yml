@@ -37,6 +37,12 @@ jobs:
         run: >-
           go test -mod=readonly -race -count=1 ./internal/api ./internal/api/handlers/management ./sdk/auth ./sdk/cliproxy
           -run '^(TestOrdinaryConfigToggleCleanupUsesCommittedDirectory|TestOrdinaryVertexImportDefaultStoreIsolation|TestOrdinaryFileStoreViewsShareRootWriteLock|TestIndependentManagerSaveDirectoryIsPerCall|TestOrdinaryManagerLoginPreservesDefaultFileDirectory|TestOrdinaryBuilderLocalStoreDirectoryIsolation)$'
+      - name: Test local credential directory reload and late notifications
+        env:
+          GIN_MODE: release
+        run: >-
+          go test -mod=readonly -race -count=1 -timeout=2m ./internal/watcher ./sdk/cliproxy
+          -run '^(TestReferenceWatcherRejectedDirectoryPreservesActiveSubscription|TestIndependentVertexRealWatcherDirectorySwitch|TestIndependentVertexServiceInjectedStore|TestIndependentLocalStoreAcceptedGeneration|TestIndependentLocalStoreExternalManagerUnchanged|TestOrdinaryPersistedDirectoryFence|TestOrdinaryAcceptedDirectoryAliasSource)$'
       - name: Verify provider lists commit before publication
         env:
           GIN_MODE: release

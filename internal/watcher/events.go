@@ -65,13 +65,18 @@ func (w *Watcher) start(ctx context.Context) error {
 
 	w.watchMu.Lock()
 	authDir := w.currentAuthDir()
-	if errAddAuthDir := w.watcher.Add(authDir); errAddAuthDir != nil {
+	watchPath, err := physicalAuthWatchPath(authDir)
+	if err == nil {
+		err = w.watcher.Add(watchPath)
+	}
+	if err != nil {
 		w.watchMu.Unlock()
-		log.Errorf("failed to watch auth directory %s: %v", authDir, errAddAuthDir)
-		return fmt.Errorf("watch auth directory %s: %w", authDir, errAddAuthDir)
+		log.Errorf("failed to watch auth directory %s: %v", authDir, err)
+		return fmt.Errorf("watch auth directory %s: %w", authDir, err)
 	}
 	w.started = true
 	w.watchedAuthDir = authDir
+	w.watchedAuthPath = watchPath
 	w.watchMu.Unlock()
 	log.Debugf("watching auth directory: %s", authDir)
 
@@ -89,39 +94,51 @@ func (w *Watcher) isConfigParent(path string) bool {
 	return err == nil && w.sameNormalizedAuthPath(path, filepath.Dir(resolved))
 }
 
-func (w *Watcher) syncAuthDirWatch() {
-	if w == nil || w.watcher == nil || w.stopped.Load() {
-		return
+func physicalAuthWatchPath(target string) (string, error) {
+	realPath, err := filepath.EvalSymlinks(target)
+	if err != nil {
+		return "", err
 	}
-	w.watchMu.Lock()
-	defer w.watchMu.Unlock()
-	if !w.started || w.stopped.Load() {
-		return
+	return filepath.Abs(realPath)
+}
+
+// The caller holds watchMu. Keep the old subscription until publication.
+func (w *Watcher) prepareAuthDirWatchLocked(target string) (string, error) {
+	if !w.started || target == w.watchedAuthDir || w.sameNormalizedAuthPath(w.watchedAuthDir, target) {
+		return "", nil
 	}
-	target := strings.TrimSpace(w.currentAuthDir())
-	oldWatched := strings.TrimSpace(w.watchedAuthDir)
-	if oldWatched == target {
-		return
+	if w.stopped.Load() {
+		return "", fmt.Errorf("auth watcher is stopped")
 	}
-	if oldWatched != "" && !w.sameNormalizedAuthPath(oldWatched, w.configPath) && !w.isConfigParent(oldWatched) && !w.sameNormalizedAuthPath(oldWatched, target) {
-		if errRemove := w.watcher.Remove(oldWatched); errRemove != nil {
-			log.Debugf("failed to remove previous auth directory watch %s: %v", oldWatched, errRemove)
+	if _, err := os.ReadDir(target); err != nil {
+		return "", fmt.Errorf("read auth directory %s: %w", target, err)
+	}
+	// A readable directory may still prohibit opening its children.
+	if _, err := os.Stat(target + string(os.PathSeparator) + "."); err != nil {
+		return "", fmt.Errorf("search auth directory %s: %w", target, err)
+	}
+	watchPath, err := physicalAuthWatchPath(target)
+	if err != nil {
+		return "", fmt.Errorf("resolve auth directory %s: %w", target, err)
+	}
+	// Different spellings of the same directory share the native subscription.
+	if !w.sameNormalizedAuthPath(w.watchedAuthPath, watchPath) {
+		if err := w.watcher.Add(watchPath); err != nil {
+			return "", fmt.Errorf("watch auth directory %s: %w", target, err)
 		}
-		w.watchedAuthDir = ""
 	}
-	if target == "" {
-		w.watchedAuthDir = ""
-		return
-	}
-	if w.watchedAuthDir != "" && w.sameNormalizedAuthPath(w.watchedAuthDir, target) {
-		w.watchedAuthDir = target
-		return
-	}
-	if errAdd := w.watcher.Add(target); errAdd != nil {
-		log.Errorf("failed to watch auth directory %s: %v", target, errAdd)
-		return
-	}
+	return watchPath, nil
+}
+
+func (w *Watcher) finishAuthDirWatchLocked(target, watchPath string) {
+	old := w.watchedAuthPath
 	w.watchedAuthDir = target
+	w.watchedAuthPath = watchPath
+	if old != "" && !w.sameNormalizedAuthPath(old, watchPath) && !w.sameNormalizedAuthPath(old, w.configPath) && !w.isConfigParent(old) {
+		if err := w.watcher.Remove(old); err != nil {
+			log.Debugf("failed to remove previous auth directory watch %s: %v", old, err)
+		}
+	}
 	log.Debugf("watching auth directory: %s", target)
 }
 
@@ -155,10 +172,10 @@ func (w *Watcher) handleEvent(event fsnotify.Event) {
 			isConfigPath = normalizedName == w.normalizeAuthPath(resolved)
 		}
 	}
-	normalizedAuthDir := w.normalizeAuthPath(w.currentAuthDir())
+	authDir := w.currentAuthDir()
 	isConfigEvent := isConfigPath && event.Op&configOps != 0
 	authOps := fsnotify.Create | fsnotify.Write | fsnotify.Remove | fsnotify.Rename
-	isAuthJSON := filepath.Dir(normalizedName) == normalizedAuthDir && strings.HasSuffix(normalizedName, ".json") && event.Op&authOps != 0
+	isAuthJSON := event.Op&authOps != 0 && strings.HasSuffix(normalizedName, ".json") && w.isPathInAuthDir(normalizedName, authDir)
 	if !isConfigEvent && !isAuthJSON {
 		// Ignore unrelated files (e.g., cookie snapshots *.cookie) and other noise.
 		return
@@ -183,9 +200,13 @@ func (w *Watcher) handleEvent(event fsnotify.Event) {
 	// Handle auth directory changes incrementally (.json only)
 	w.authRescanMu.Lock()
 	defer w.authRescanMu.Unlock()
-	if !w.isPathInAuthDir(normalizedName, w.currentAuthDir()) {
+	authDir = w.currentAuthDir()
+	if !w.isPathInAuthDir(normalizedName, authDir) {
 		return
 	}
+	// Use the configured path for the same IDs and cache keys as full scans.
+	event.Name = filepath.Join(authDir, filepath.Base(event.Name))
+	normalizedName = w.normalizeAuthPath(event.Name)
 	w.observeAuthFile(event.Name)
 
 	if event.Op&(fsnotify.Remove|fsnotify.Rename) != 0 {

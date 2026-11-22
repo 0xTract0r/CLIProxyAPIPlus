@@ -103,6 +103,16 @@ func (s *Service) handleAuthUpdates(ctx context.Context, updates []watcher.AuthU
 	if s == nil {
 		return
 	}
+	// Source classification can consult plugin capabilities. Do it before
+	// locking auth updates, because a capability callback can reenter Service.
+	scoped := make([]watcher.AuthUpdate, 0, len(updates))
+	for _, update := range updates {
+		if update.PublicationFence == nil && update.Auth.HasFileSnapshot() {
+			update.PublicationFence = s.persistedFilePublicationFence(update.Auth)
+		}
+		scoped = append(scoped, update)
+	}
+	updates = scoped
 	// Keep this path limited to the targeted auths. Global plugin rebuilds and
 	// in-flight Antigravity probes can hold authUpdateMu for minutes and stall
 	// Management API PATCH responses.
@@ -123,6 +133,11 @@ func (s *Service) handleAuthUpdates(ctx context.Context, updates []watcher.AuthU
 	startedRegs := make([]authRegistrationWait, 0)
 	startedWaitByID := make(map[string]authRegistrationWait)
 	for _, update := range updates {
+		release, eligible := update.PublicationFence.Begin()
+		if !eligible {
+			continue
+		}
+		release()
 		id := authUpdateID(update)
 		if id == "" {
 			filtered = append(filtered, update)
@@ -176,7 +191,8 @@ func (s *Service) handleAuthUpdates(ctx context.Context, updates []watcher.AuthU
 			if update.Auth == nil || update.Auth.ID == "" {
 				continue
 			}
-			auth := s.prepareCoreAuthForModelRegistration(registrationCtx, update.Auth)
+			ctx := coreauth.WithAuthPublicationFence(registrationCtx, update.PublicationFence)
+			auth := s.prepareCoreAuthForModelRegistration(ctx, update.Auth)
 			if auth == nil {
 				continue
 			}
@@ -452,6 +468,9 @@ func (s *Service) prepareCoreAuthForModelRegistration(ctx context.Context, auth 
 		op = "update"
 		var updated *coreauth.Auth
 		updated, err = s.coreManager.Update(ctx, auth)
+		if errors.Is(err, coreauth.ErrAuthPublicationOutOfScope) {
+			return nil
+		}
 		if err == nil && updated == nil && observation.HasFileSnapshot() {
 			if w := s.currentWatcher(); w != nil {
 				w.RereadDiscardedFileSnapshot(observation)
@@ -473,6 +492,9 @@ func (s *Service) prepareCoreAuthForModelRegistration(ctx context.Context, auth 
 	} else {
 		var registered *coreauth.Auth
 		registered, err = s.coreManager.Register(ctx, auth)
+		if errors.Is(err, coreauth.ErrAuthPublicationOutOfScope) {
+			return nil
+		}
 		if err == nil && registered != nil {
 			auth = registered
 		}
