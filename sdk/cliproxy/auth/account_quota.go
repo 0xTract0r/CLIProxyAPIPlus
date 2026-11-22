@@ -2,6 +2,7 @@ package auth
 
 import (
 	"encoding/json"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -40,17 +41,10 @@ import (
 // change, and it naturally skips non-window sibling objects like
 // "extra_usage" (no "utilization" key) without special-casing them by name.
 //
-// Unconfirmed: Codex's quota_snapshot.usage (the raw
-// https://chatgpt.com/backend-api/wham/usage response body) has not been
-// captured against a real production Codex account in this repo, and
-// community reverse-engineering (see gaps in the handoff for this slice)
-// suggests it nests windows under "rate_limit.primary_window" /
-// "secondary_window" using a "percent_left" field, not a top-level
-// "utilization" field -- so the generic parser below will most likely find
-// zero windows for a Codex auth today and correctly report "unknown"
-// (ok=false) rather than silently misreading percent_left as utilization%.
-// See the gaps note returned by this slice for what Phase 1 / a follow-up
-// needs to close this (design.md O4).
+// Codex /backend-api/wham/usage nests its shared plan windows under
+// rate_limit.primary_window / secondary_window, with used_percent (0-100)
+// and reset_at (Unix seconds). Separate code-review and additional model
+// limits do not describe the shared serving pool and are not parsed here.
 const (
 	accountQuotaSnapshotMetadataKey = "quota_snapshot"
 	accountQuotaUsageKey            = "usage"
@@ -129,8 +123,65 @@ func ParseAccountQuotaUtilization(auth *Auth) (AccountQuotaUtilization, bool) {
 	}
 
 	windows := parseAccountQuotaWindows(usage)
+	if result.Provider == "codex" {
+		windows = parseCodexQuotaWindows(usage)
+	}
 	result.Windows = windows
 	return result, len(windows) > 0
+}
+
+func parseCodexQuotaWindows(usage map[string]any) map[string]AccountQuotaWindow {
+	windows := make(map[string]AccountQuotaWindow)
+	limits, _ := metadataObject(usage["rate_limit"])
+	for _, key := range []string{"primary_window", "secondary_window"} {
+		window, ok := metadataObject(limits[key])
+		if !ok {
+			continue
+		}
+		used, ok := accountQuotaNumericValue(window["used_percent"])
+		if !ok || math.IsNaN(used) || math.IsInf(used, 0) {
+			continue
+		}
+		reset, _ := parseTimeValue(window["reset_at"])
+		name := "codex_" + strings.TrimSuffix(key, "_window")
+		windows[name] = AccountQuotaWindow{
+			Name: name, UtilizationPercent: clampUtilizationPercent(used), ResetsAt: reset,
+		}
+	}
+	return windows
+}
+
+// codexQuotaSnapshotCooldown skips an exhausted shared plan before any model
+// or session selection. It never disables the credential or its refresh loop.
+// Expired/unknown resets cannot pin an account indefinitely; normal serving
+// feedback still handles those cases. Multiple exhausted windows must all reset.
+func codexQuotaSnapshotCooldown(auth *Auth, now time.Time) (time.Time, bool) {
+	if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+		return time.Time{}, false
+	}
+	snapshot, _ := metadataObject(auth.Metadata[accountQuotaSnapshotMetadataKey])
+	usage, _ := metadataObject(snapshot[accountQuotaUsageKey])
+	limits, _ := metadataObject(usage["rate_limit"])
+	allowed, hasAllowed := limits["allowed"].(bool)
+	reached, _ := limits["limit_reached"].(bool)
+	// Preserve Codex's existing credit overflow semantics, but never override
+	// an explicit upstream refusal with a possibly stale credit balance.
+	if !(hasAllowed && !allowed) && !reached {
+		credits, _ := metadataObject(usage["credits"])
+		hasCredits, _ := credits["has_credits"].(bool)
+		unlimited, _ := credits["unlimited"].(bool)
+		balance, _ := accountQuotaNumericValue(credits["balance"])
+		if hasCredits && (unlimited || (balance > 0 && !math.IsInf(balance, 0))) {
+			return time.Time{}, false
+		}
+	}
+	var reset time.Time
+	for _, window := range parseCodexQuotaWindows(usage) {
+		if window.UtilizationPercent >= 100 && window.ResetsAt.After(now) && window.ResetsAt.After(reset) {
+			reset = window.ResetsAt
+		}
+	}
+	return reset, !reset.IsZero()
 }
 
 // parseAccountQuotaWindows scans every top-level entry of a quota_snapshot

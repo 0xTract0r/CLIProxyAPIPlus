@@ -357,6 +357,9 @@ func isAuthBlockedForModelOpts(auth *Auth, model string, now time.Time, honorDia
 	if auth.Disabled || auth.Status == StatusDisabled || auth.AutoQuarantined || isReauthRequiredMetadata(auth.Metadata) {
 		return true, blockReasonDisabled, time.Time{}
 	}
+	if reset, exhausted := codexQuotaSnapshotCooldown(auth, now); exhausted {
+		return true, blockReasonCooldown, reset
+	}
 	// Fork supply-atomicity fail-closed gate (P2-A1): checked here, isomorphic to
 	// the disabled/quarantine/reauth locks above and after them, so an
 	// operator-disabled or quarantined account still reports its own terminal

@@ -242,13 +242,24 @@ The account's fine-grained subscription tier.
 
 Structured per-quota-window utilization.
 
+Codex reads shared plan windows from `quota_snapshot.usage.rate_limit`:
+`primary_window` / `secondary_window` map to `codex_primary` / `codex_secondary`,
+using `used_percent` and Unix `reset_at`. Code-review and additional model limits
+are separate and do not block the shared pool. Across routing strategies and session
+bindings, an account with any shared window at 100% and a future reset is skipped
+until all exhausted windows reset, or a refreshed snapshot reports headroom. The
+credential stays enabled and continues its normal refresh lifecycle. Usable paid
+credits allow overflow unless the upstream explicitly reports `allowed=false` or
+`limit_reached=true`. Missing or expired reset times do not cause a permanent lock;
+normal serving-error cooldowns still apply. This behavior requires no new config.
+
 The whole field is `null` when the account has no usable `quota_snapshot.usage` snapshot
 (never probed / probe failed / this provider does not poll quota) — it must never be read
 as "0% used".
 
 | Field | Type | Meaning |
 | --- | --- | --- |
-| `windows` | object | Keys are the upstream's original window names (e.g. `five_hour` / `seven_day` / `seven_day_sonnet`). |
+| `windows` | object | Claude uses upstream names (e.g. `five_hour` / `seven_day` / `seven_day_sonnet`); Codex uses `codex_primary` / `codex_secondary`. |
 | `windows.<w>.utilization_percent` | number, 0-100 | The upstream's utilization percentage as-is, clamped to `[0,100]`. |
 | `windows.<w>.headroom` | number, 0-1 | `1 - utilization_percent/100`, clamped to `[0,1]`. |
 | `windows.<w>.resets_at` | string, RFC3339 UTC, optional | Reset time for that window; absent when the upstream gives no parseable timestamp. |
