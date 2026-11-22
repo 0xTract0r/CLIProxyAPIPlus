@@ -2,6 +2,8 @@ package management
 
 import (
 	"net/http"
+	"net/url"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -31,10 +33,11 @@ func (h *Handler) RefreshModelDefinitions(c *gin.Context) {
 	}
 
 	result, errRefresh := registry.RefreshModelCatalogsWithPolicy(c.Request.Context(), sources, home)
+	result = publicCatalogRefreshResult(result)
 	if errRefresh != nil {
 		c.JSON(http.StatusBadGateway, gin.H{
 			"ok":                false,
-			"error":             errRefresh.Error(),
+			"error":             "one or more model catalogs could not be refreshed",
 			"catalog":           result.Catalog,
 			"codex_catalog":     result.CodexCatalog,
 			"devin_catalog":     result.DevinCatalog,
@@ -55,6 +58,40 @@ func (h *Handler) RefreshModelDefinitions(c *gin.Context) {
 		"catalogs":          result.Catalogs,
 		"changed_providers": result.ChangedProviders,
 	})
+}
+
+// Configured remote sources may be signed URLs. Report their locations
+// without credentials, query parameters, or fragments.
+func publicCatalogSource(source string) string {
+	if source == "" || filepath.IsAbs(source) || source == "embed" || source == "disabled" {
+		return source
+	}
+	u, err := url.Parse(source)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return ""
+	}
+	u.User = nil
+	u.RawQuery = ""
+	u.ForceQuery = false
+	u.Fragment = ""
+	u.RawFragment = ""
+	return u.String()
+}
+
+func publicCatalogRefreshResult(result registry.CatalogRefreshResult) registry.CatalogRefreshResult {
+	result.Catalog = publicCatalogSource(result.Catalog)
+	result.CodexCatalog = publicCatalogSource(result.CodexCatalog)
+	result.DevinCatalog = publicCatalogSource(result.DevinCatalog)
+	result.Sources = registry.CatalogSources{Catalog: result.Catalog, CodexCatalog: result.CodexCatalog, DevinCatalog: result.DevinCatalog}
+	for name, status := range result.Catalogs {
+		status.Source = publicCatalogSource(status.Source)
+		// Transport and parser errors can contain the original URL or payload.
+		if status.Error != "" {
+			status.Error = "catalog refresh failed"
+		}
+		result.Catalogs[name] = status
+	}
+	return result
 }
 
 // GetStaticModelDefinitions returns static model metadata for a given channel.
