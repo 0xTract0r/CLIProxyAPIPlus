@@ -50,14 +50,18 @@ func TestRegisteredOAuthModelAliasCommitsBeforeVisibility(t *testing.T) {
 				server.registerManagementRoutes()
 				return server
 			}
-			call := func(server *Server, method, route, body string, status int) []byte {
-				t.Helper()
+			send := func(server *Server, method, route, body string) *httptest.ResponseRecorder {
 				request := httptest.NewRequest(method, route, strings.NewReader(body))
 				request.RemoteAddr = "127.0.0.1:10000"
 				request.Header.Set("X-Management-Key", admin)
 				request.Header.Set("Content-Type", "application/json")
 				rec := httptest.NewRecorder()
 				server.engine.ServeHTTP(rec, request)
+				return rec
+			}
+			call := func(server *Server, method, route, body string, status int) []byte {
+				t.Helper()
+				rec := send(server, method, route, body)
 				if rec.Code != status {
 					t.Fatalf("%s %s: status %d, want %d: %s", method, route, rec.Code, status, rec.Body)
 				}
@@ -108,6 +112,33 @@ func TestRegisteredOAuthModelAliasCommitsBeforeVisibility(t *testing.T) {
 			must(err)
 			if !reflect.DeepEqual(cfg.OAuthModelAlias, want) {
 				t.Fatalf("cold alias readback = %#v, want %#v", cfg.OAuthModelAlias, want)
+			}
+
+			if tc.name == "patch replace" {
+				start := make(chan struct{})
+				statuses := make(chan int, 3)
+				for _, channel := range []string{"alpha", "beta"} {
+					go func(channel string) {
+						<-start
+						body := `{"channel":"` + channel + `","aliases":` + replacement + `}`
+						statuses <- send(server, "PATCH", v0, body).Code
+					}(channel)
+				}
+				go func() {
+					<-start
+					statuses <- send(server, "GET", v0, "").Code
+				}()
+				close(start)
+				for i := 0; i < 3; i++ {
+					if code := <-statuses; code != 200 {
+						t.Errorf("concurrent alias operation returned %d", code)
+					}
+				}
+				want["alpha"] = want["codex"]
+				want["beta"] = want["codex"]
+				read(server, v0, want)
+				read(server, v8, want)
+				read(open(), v0, want)
 			}
 		})
 	}

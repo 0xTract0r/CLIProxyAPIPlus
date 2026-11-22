@@ -554,9 +554,9 @@ func (h *Handler) persistLocked(c *gin.Context) bool {
 	return true
 }
 
-// persistProviderListLocked publishes only the selected list and save metadata.
+// persistProviderFieldLocked publishes only the selected field and save metadata.
 // Keep the config pointer stable for scalar readers. The caller holds h.mu.
-func persistProviderListLocked[T any](h *Handler, c *gin.Context, candidate *config.Config, live *[]T, staged []T) {
+func persistProviderFieldLocked[T any](h *Handler, c *gin.Context, candidate *config.Config, live *T, staged T) {
 	sourceHash, err := config.SaveConfigPreserveCommentsWithSourceHash(h.configFilePath, candidate, c.GetBool(ConfigV8ContextKey))
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save config"})
