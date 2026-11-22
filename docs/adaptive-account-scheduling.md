@@ -242,6 +242,16 @@ The account's fine-grained subscription tier.
 
 Structured per-quota-window utilization.
 
+Claude's `five_hour`, `seven_day`, and `seven_day_oauth_apps` windows apply across
+models. `seven_day_opus`, `seven_day_sonnet`, and `seven_day_haiku` apply only to
+requests naming that family; unknown future windows are not treated as global
+limits. An applicable window at 100% with a future reset temporarily excludes the
+account before rotation or session affinity; all exhausted applicable windows must
+reset before it re-enters. Enabled extra usage preserves overflow unless its
+reported utilization or monthly budget is exhausted. The selector never enables
+extra billing or disables credential refresh. Missing/expired reset times fall
+back to normal serving-error cooldowns.
+
 Codex reads shared plan windows from `quota_snapshot.usage.rate_limit`:
 `primary_window` / `secondary_window` map to `codex_primary` / `codex_secondary`,
 using `used_percent` and Unix `reset_at`. Code-review and additional model limits

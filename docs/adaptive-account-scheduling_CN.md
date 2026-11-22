@@ -225,6 +225,13 @@ weight = tier 基础容量权重 x (1 - 额度利用率) x 新鲜度系数
 
 结构化的按额度窗口利用率。
 
+Claude 的 `five_hour`、`seven_day`、`seven_day_oauth_apps` 约束所有模型；
+`seven_day_opus`、`seven_day_sonnet`、`seven_day_haiku` 只约束名称包含对应家族的请求，
+未知未来窗口不扩大为全账号限制。适用窗口已用100%且尚未重置时，在轮询或会话亲和前
+暂时排除账号，所有已耗尽的适用窗口重置后恢复。已开启额外用量且其已报告利用率/月预算
+尚未耗尽时保留超额通道；调度不会开启额外付费，也不会停止凭证刷新。缺失/过期重置时间
+仍交给原有请求失败冷却处理。
+
 Codex 从 `quota_snapshot.usage.rate_limit` 读取共享套餐额度：
 `primary_window` / `secondary_window` 映射为 `codex_primary` / `codex_secondary`，
 读取 `used_percent` 和 Unix 时间 `reset_at`。代码审查与附加模型额度不用于阻断共享账号池。
