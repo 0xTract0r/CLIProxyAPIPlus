@@ -791,3 +791,189 @@ func TestRefreshAuthFileStatusKeepsPreExpiryRefreshTokenReusedUsable(t *testing.
 		t.Fatalf("status = %q, want %q", events[0].Status, coreauth.StatusActive)
 	}
 }
+
+// TestRefreshAuthFileStatusPersistsRotationWhenLastRefreshInFuture reproduces the
+// GPT-PH-02 refresh_token_reused incident: the host clock once jumped ~8h ahead,
+// so a successful refresh stamped last_refresh / expired in the future. After the
+// clock was pulled back, refresh-status really rotated the refresh token upstream
+// (invalidating the old one), but the old wall-clock supersede check treated the
+// result as "already superseded" and silently dropped it; the next refresh then
+// reused the dead token on disk and got 401 refresh_token_reused. The rotated
+// token must be kept by token identity, both in memory and in the store.
+func TestRefreshAuthFileStatusPersistsRotationWhenLastRefreshInFuture(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	futureRefresh := time.Now().Add(8 * time.Hour)
+
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	manager.RegisterExecutor(&refreshStatusExecutor{
+		provider: "codex",
+		refresh: func(ctx context.Context, auth *coreauth.Auth) (*coreauth.Auth, error) {
+			if auth.Metadata == nil {
+				auth.Metadata = make(map[string]any)
+			}
+			refreshedAt := time.Now()
+			auth.Metadata["refresh_token"] = "rt-B"
+			auth.Metadata["access_token"] = "at-B"
+			auth.Metadata["last_refresh"] = refreshedAt.Format(time.RFC3339)
+			auth.Metadata["expired"] = refreshedAt.Add(time.Hour).Format(time.RFC3339)
+			return auth, nil
+		},
+	})
+
+	record := &coreauth.Auth{ProxyURL: "http://test-proxy:8080",
+		ID:            "codex-clock-jump.json",
+		FileName:      "codex-clock-jump.json",
+		Provider:      "codex",
+		Status:        coreauth.StatusError,
+		StatusMessage: "unexpected EOF",
+		Unavailable:   true,
+		Attributes: map[string]string{
+			"path": "/tmp/codex-clock-jump.json",
+		},
+		Metadata: map[string]any{
+			"type":          "codex",
+			"email":         "clock@example.com",
+			"refresh_token": "rt-A",
+			"access_token":  "at-A",
+			// Future timestamps written while the host clock ran ahead.
+			"last_refresh": futureRefresh.Format(time.RFC3339),
+			"expired":      futureRefresh.Add(time.Hour).Format(time.RFC3339),
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("register auth record: %v", errRegister)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPost, "/v0/management/auth-files/refresh-status", strings.NewReader(`{"name":"codex-clock-jump.json"}`))
+	req.Header.Set("Content-Type", "application/json")
+	ctx.Request = req
+	h.RefreshAuthFileStatus(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+
+	updated, ok := manager.GetByID("codex-clock-jump.json")
+	if !ok || updated == nil {
+		t.Fatalf("expected refreshed auth record")
+	}
+	if got := updated.Metadata["refresh_token"]; got != "rt-B" {
+		t.Fatalf("in-memory refresh_token = %q, want rotated rt-B (rotation must not be discarded)", got)
+	}
+	if got := updated.Metadata["access_token"]; got != "at-B" {
+		t.Fatalf("in-memory access_token = %q, want at-B", got)
+	}
+	if updated.Status != coreauth.StatusActive {
+		t.Fatalf("status = %q, want active", updated.Status)
+	}
+
+	store.mu.Lock()
+	persisted := store.items["codex-clock-jump.json"]
+	store.mu.Unlock()
+	if persisted == nil {
+		t.Fatalf("expected rotated auth to be persisted to store")
+	}
+	if got := persisted.Metadata["refresh_token"]; got != "rt-B" {
+		t.Fatalf("persisted refresh_token = %q, want rotated rt-B", got)
+	}
+	if got := persisted.Metadata["access_token"]; got != "at-B" {
+		t.Fatalf("persisted access_token = %q, want at-B", got)
+	}
+}
+
+// TestRefreshAuthFileStatusSkipsWriteWhenLatestAlreadyRotated locks the other side
+// of the token-identity check: when another writer replaced the credential with
+// RT=C while this refresh was in flight, the refresh result must not overwrite C.
+func TestRefreshAuthFileStatusSkipsWriteWhenLatestAlreadyRotated(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	manager.RegisterExecutor(&refreshStatusExecutor{
+		provider: "codex",
+		refresh: func(ctx context.Context, auth *coreauth.Auth) (*coreauth.Auth, error) {
+			// Another writer (e.g. a re-auth) swaps in RT=C mid-refresh.
+			latest, ok := manager.GetByID(auth.ID)
+			if !ok || latest == nil {
+				return nil, &coreauth.Error{Code: "missing", Message: "auth missing"}
+			}
+			if latest.Metadata == nil {
+				latest.Metadata = make(map[string]any)
+			}
+			latest.Metadata["refresh_token"] = "rt-C"
+			latest.Metadata["access_token"] = "at-C"
+			if _, errUpdate := manager.Update(ctx, latest); errUpdate != nil {
+				return nil, errUpdate
+			}
+
+			if auth.Metadata == nil {
+				auth.Metadata = make(map[string]any)
+			}
+			auth.Metadata["refresh_token"] = "rt-B"
+			auth.Metadata["access_token"] = "at-B"
+			auth.Metadata["last_refresh"] = time.Now().Format(time.RFC3339)
+			return auth, nil
+		},
+	})
+
+	record := &coreauth.Auth{ProxyURL: "http://test-proxy:8080",
+		ID:       "codex-rotated.json",
+		FileName: "codex-rotated.json",
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"path": "/tmp/codex-rotated.json",
+		},
+		Metadata: map[string]any{
+			"type":          "codex",
+			"email":         "rotated@example.com",
+			"refresh_token": "rt-A",
+			"access_token":  "at-A",
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("register auth record: %v", errRegister)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPost, "/v0/management/auth-files/refresh-status", strings.NewReader(`{"name":"codex-rotated.json"}`))
+	req.Header.Set("Content-Type", "application/json")
+	ctx.Request = req
+	h.RefreshAuthFileStatus(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+
+	updated, ok := manager.GetByID("codex-rotated.json")
+	if !ok || updated == nil {
+		t.Fatalf("expected auth record")
+	}
+	if got := updated.Metadata["refresh_token"]; got != "rt-C" {
+		t.Fatalf("in-memory refresh_token = %q, want concurrent rt-C kept", got)
+	}
+	if got := updated.Metadata["access_token"]; got != "at-C" {
+		t.Fatalf("in-memory access_token = %q, want concurrent at-C kept", got)
+	}
+
+	store.mu.Lock()
+	persisted := store.items["codex-rotated.json"]
+	store.mu.Unlock()
+	if persisted == nil {
+		t.Fatalf("expected persisted auth record")
+	}
+	if got := persisted.Metadata["refresh_token"]; got != "rt-C" {
+		t.Fatalf("persisted refresh_token = %q, want concurrent rt-C kept", got)
+	}
+}

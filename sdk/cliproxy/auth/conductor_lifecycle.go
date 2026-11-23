@@ -150,8 +150,10 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	// Guard against a stale write-back rolling token state backwards: if a
 	// refresh advanced the stored tokens after the caller cloned this auth,
 	// keep the newer token-owned fields while still applying the caller's
-	// non-token metadata changes.
-	if preserveNewerTokenOwnedFields(auth, existing) {
+	// non-token metadata changes. Writes carrying a successful upstream refresh
+	// result skip this guard: the rotated token is authoritative, and local
+	// timestamps on the stored record may be future-dated after a clock jump.
+	if !isRefreshResultWrite(ctx) && preserveNewerTokenOwnedFields(auth, existing) {
 		logEntryWithRequestID(ctx).WithField("auth_id", auth.ID).Warn("auth update carried stale token-owned fields; preserved newer stored token state")
 	}
 	// Guard against a stale write-back silently rolling back the automatic

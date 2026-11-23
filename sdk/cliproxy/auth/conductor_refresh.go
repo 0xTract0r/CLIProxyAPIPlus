@@ -510,6 +510,8 @@ func (m *Manager) refreshAuthForRequest(ctx context.Context, id, failedAccessTok
 	}
 
 	cloned := auth.Clone()
+	// Snapshot token material before Refresh: executors mutate cloned in place.
+	tokensBefore := tokenMaterialSnapshot(cloned)
 	updated, err := exec.Refresh(ctx, cloned)
 	if err != nil && errors.Is(err, context.Canceled) {
 		log.Debugf("refresh canceled for %s, %s", auth.Provider, auth.ID)
@@ -622,7 +624,19 @@ func (m *Manager) refreshAuthForRequest(ctx context.Context, id, failedAccessTok
 		// the token endpoint and rewrite the auth file every minute.
 		updated.NextRefreshAfter = now.Add(antiThrashRefreshBackoff(updated, now))
 	}
-	saved, errUpdate := m.Update(ctx, updated)
+	writeCtx := ctx
+	m.mu.RLock()
+	storedRefreshToken := authMetadataString(m.auths[id], "refresh_token")
+	m.mu.RUnlock()
+	if tokenMaterialSnapshot(updated) != tokensBefore && storedRefreshToken == tokensBefore[0] {
+		// The upstream refresh issued new token material for the credential that
+		// is still stored; the stored record's local timestamps (possibly
+		// future-dated after a clock jump) must not roll it back. A no-op
+		// refresh, or a credential another writer replaced mid-refresh, keeps the
+		// normal stale write-back guard.
+		writeCtx = WithRefreshResultWrite(ctx)
+	}
+	saved, errUpdate := m.Update(writeCtx, updated)
 	for _, model := range modelsToResume {
 		registry.GetGlobalRegistry().ResumeClientModel(id, model)
 	}
