@@ -117,6 +117,22 @@ fork路由-管理端点	logs-compress-after-days	route	/logs-compress-after-days
 反关联-内建OAuth代理接线	kimi绑账号代理	pattern	NewKimiAuth\(h\.configForOAuthSetup\(setup\)	internal/api/handlers/management/auth_files_provider_oauth.go
 反关联-内建OAuth代理接线	proxy写落库record	pattern	applyOAuthAccountSetupToRecord\(record, setup\)	internal/api/handlers/management/auth_files_provider_oauth.go
 
+# === 卡片重新认证「按目标账号代理换 token + fail-closed + 官方 uTLS」接线调用点(9) ===
+# 回归背景(fix-oauth-egress-anticorr):同一次 c8132e1d 覆盖也丢了 claude 卡片重新认证的
+#   auth_name 接线(helper 留在 auth_files_anticorr.go 成了死代码,只 grep 符号定义仍"存活"),
+#   卡片重新认证因此回退全局代理/直连;codex 换 token 走 Go 默认 TLS(JA3 03117a8e)。
+#   这里同样钉【调用点】:handler 里的目标解析、重试/同账号兜底、record 继承、fail-closed
+#   检查,以及 oauthIdentityHTTPClient 里的 uTLS 构造。行为由 oauth_reauth_egress_test.go 守护。
+反关联-卡片重认证代理	claude解析目标账号	pattern	resolveOAuthReauthTarget\(c, "claude"\)	internal/api/handlers/management/auth_files_provider_oauth.go
+反关联-卡片重认证代理	codex解析目标账号	pattern	resolveOAuthReauthTarget\(c, "codex"\)	internal/api/handlers/management/auth_files_provider_oauth.go
+反关联-卡片重认证代理	无代理入口fail-closed	pattern	checkOAuthStartEgress\(setup\)	internal/api/handlers/management/auth_files_provider_oauth.go
+反关联-卡片重认证代理	claude换token重试	pattern	exchangeClaudeOAuthWithRetry\(exchangeCtx, anthropicAuth	internal/api/handlers/management/auth_files_provider_oauth.go
+反关联-卡片重认证代理	claude同账号代理兜底	pattern	newClaudeOAuthAccountProxyFallbackAuth\(targetAuth\)	internal/api/handlers/management/auth_files_provider_oauth.go
+反关联-卡片重认证代理	claude继承目标record	pattern	buildClaudeOAuthTokenRecord\(targetAuth, tokenStorage\)	internal/api/handlers/management/auth_files_provider_oauth.go
+反关联-卡片重认证代理	目标代理空/非法拒绝	pattern	oauthEgressProxyBlockReason\(authProxyURL\(target\)\)	internal/api/handlers/management/oauth_reauth_egress.go
+反关联-卡片重认证代理	换token官方uTLS分流	pattern	oauthAccountExchangeBaseClient\(auth, profileID, timeout\)	internal/api/handlers/management/oauth_account_setup.go
+反关联-卡片重认证代理	codex换token走codex-rs	pattern	NewOAuthRefreshUtlsHTTPClient\(proxyURL, profileID, timeout\)	internal/api/handlers/management/oauth_account_setup.go
+
 # === fork 自定义模块/反关联支撑文件存在性(19) ===
 fork文件-amp模块	internal/api/modules/amp/	file	-	internal/api/modules/amp
 fork文件-反关联支撑	provider_tls_probe.go(helps)	file	-	internal/runtime/executor/helps/provider_tls_probe.go
