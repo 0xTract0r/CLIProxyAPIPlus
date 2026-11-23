@@ -92,6 +92,52 @@ func TestCodexQuotaSnapshot_CooldownBoundaries(t *testing.T) {
 			codexSnapshotUsage(a)["credits"] = map[string]any{"has_credits": true, "balance": "5"}
 			codexSnapshotUsage(a)["rate_limit"].(map[string]any)["allowed"] = false
 		}, true},
+		// Explicit upstream allow signals (both present as booleans) take
+		// precedence over used_percent. This only lifts the proactive snapshot
+		// filter; the passive cooldown from exhausted success response headers
+		// is a separate layer outside this change, covered by
+		// TestManager_ExecuteSuccessCodexExhaustedHeaderCoolsAuth and
+		// TestManager_StreamSuccessCodexExhaustedHeaderCoolsAuth.
+		{"upstream explicitly allows", func(a *Auth) {
+			limits := codexSnapshotUsage(a)["rate_limit"].(map[string]any)
+			limits["allowed"], limits["limit_reached"] = true, false
+		}, false},
+		{"upstream explicitly allows without credits", func(a *Auth) {
+			codexSnapshotUsage(a)["credits"] = map[string]any{"has_credits": false, "unlimited": false, "balance": "0"}
+			limits := codexSnapshotUsage(a)["rate_limit"].(map[string]any)
+			limits["allowed"], limits["limit_reached"] = true, false
+		}, false},
+		{"upstream explicitly allows exhausted secondary", func(a *Auth) {
+			limits := codexSnapshotUsage(a)["rate_limit"].(map[string]any)
+			limits["secondary_window"] = map[string]any{"used_percent": 100.0, "reset_at": float64(reset.Unix())}
+			limits["allowed"], limits["limit_reached"] = true, false
+		}, false},
+		{"upstream denies", func(a *Auth) {
+			limits := codexSnapshotUsage(a)["rate_limit"].(map[string]any)
+			limits["allowed"], limits["limit_reached"] = false, false
+		}, true},
+		{"upstream limit reached", func(a *Auth) {
+			limits := codexSnapshotUsage(a)["rate_limit"].(map[string]any)
+			limits["allowed"], limits["limit_reached"] = true, true
+		}, true},
+		{"allow signals missing", func(a *Auth) {
+			limits := codexSnapshotUsage(a)["rate_limit"].(map[string]any)
+			delete(limits, "allowed")
+			delete(limits, "limit_reached")
+		}, true},
+		{"only allowed present", func(a *Auth) { codexSnapshotUsage(a)["rate_limit"].(map[string]any)["allowed"] = true }, true},
+		{"only limit_reached present", func(a *Auth) {
+			codexSnapshotUsage(a)["rate_limit"].(map[string]any)["limit_reached"] = false
+		}, true},
+		{"non-boolean allow signals", func(a *Auth) {
+			limits := codexSnapshotUsage(a)["rate_limit"].(map[string]any)
+			limits["allowed"], limits["limit_reached"] = "true", "false"
+		}, true},
+		{"limit reached without exhausted window", func(a *Auth) {
+			limits := codexSnapshotUsage(a)["rate_limit"].(map[string]any)
+			limits["primary_window"].(map[string]any)["used_percent"] = 80.0
+			limits["limit_reached"] = true
+		}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			a := codexSnapshotAuth("codex-boundary", 100, reset)
