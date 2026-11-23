@@ -517,6 +517,13 @@ func TestRequestAnthropicTokenReauthFallbackStaysOnTargetProxy(t *testing.T) {
 	if capture.target != "api.anthropic.com:443" {
 		t.Fatalf("fallback CONNECT = %q, want api.anthropic.com:443", capture.target)
 	}
+	// Let the exchange goroutine finish (the fake proxy never completes TLS, so
+	// it ends in a session error) before the test returns; otherwise it would
+	// outlive the test and race with tests that swap the global session store.
+	status, completed := waitOAuthSessionSettled(t, state)
+	if completed {
+		t.Fatalf("fallback exchange unexpectedly completed: status=%q", status)
+	}
 	if got := globalSentinel.connects(); len(got) != 0 {
 		t.Fatalf("fallback dialed the global proxy: %v", got)
 	}

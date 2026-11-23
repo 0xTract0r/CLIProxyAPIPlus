@@ -3472,10 +3472,7 @@ func (h *Handler) RequestGeminiCLIToken(c *gin.Context) {
 				SetOAuthSessionError(state, "OAuth flow timed out")
 				return
 			}
-			if data, errR := os.ReadFile(waitFile); errR == nil {
-				var m map[string]string
-				_ = json.Unmarshal(data, &m)
-				_ = os.Remove(waitFile)
+			if m, okRead := readOAuthCallbackFile(waitFile); okRead {
 				if errStr := m["error"]; errStr != "" {
 					log.Errorf("Authentication failed: %s", errStr)
 					SetOAuthSessionError(state, "Authentication failed")
@@ -3749,10 +3746,7 @@ func (h *Handler) RequestGitLabToken(c *gin.Context) {
 				SetOAuthSessionError(state, "Timeout waiting for OAuth callback")
 				return
 			}
-			if data, errRead := os.ReadFile(waitFile); errRead == nil {
-				var payload map[string]string
-				_ = json.Unmarshal(data, &payload)
-				_ = os.Remove(waitFile)
+			if payload, okRead := readOAuthCallbackFile(waitFile); okRead {
 				if errStr := strings.TrimSpace(payload["error"]); errStr != "" {
 					SetOAuthSessionError(state, errStr)
 					return
@@ -4638,10 +4632,7 @@ func (h *Handler) RequestKiroToken(c *gin.Context) {
 					SetOAuthSessionError(state, "OAuth flow timed out")
 					return
 				}
-				if data, errRead := os.ReadFile(waitFile); errRead == nil {
-					var m map[string]string
-					_ = json.Unmarshal(data, &m)
-					_ = os.Remove(waitFile)
+				if m, okRead := readOAuthCallbackFile(waitFile); okRead {
 					if errStr := m["error"]; errStr != "" {
 						log.Errorf("Authentication failed: %s", errStr)
 						SetOAuthSessionError(state, "Authentication failed")
