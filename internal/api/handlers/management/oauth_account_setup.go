@@ -243,8 +243,17 @@ func oauthAccountExchangeBaseClient(auth *coreauth.Auth, profileID string, timeo
 		}
 		return client
 	}
+	if oauthExchangeTransportForTest != nil {
+		return &http.Client{Transport: oauthExchangeTransportForTest(auth), Timeout: timeout}
+	}
 	return runtimehelps.NewOAuthRefreshUtlsHTTPClient(proxyURL, profileID, timeout)
 }
+
+// oauthExchangeTransportForTest, when non-nil, replaces the account-scoped
+// token exchange transport AFTER the proxy fail-closed check. It is a test seam
+// only (handler tests cannot complete a real TLS exchange) and is always nil in
+// production.
+var oauthExchangeTransportForTest func(auth *coreauth.Auth) http.RoundTripper
 
 func utilSetProxyForOAuth(cfg *config.Config, client *http.Client) *http.Client {
 	if cfg == nil {
