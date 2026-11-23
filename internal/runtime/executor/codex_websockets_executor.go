@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 
@@ -78,6 +79,15 @@ func (e *CodexAutoExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.
 		return nil, fmt.Errorf("codex auto executor: http executor is nil")
 	}
 	return e.httpExec.HttpRequest(ctx, auth, req)
+}
+
+// ManagedIdentityHeaders delegates to the HTTP codex executor so management
+// requests present the same managed identity as serving.
+func (e *CodexAutoExecutor) ManagedIdentityHeaders(target *url.URL, auth *cliproxyauth.Auth) http.Header {
+	if e == nil || e.httpExec == nil {
+		return nil
+	}
+	return e.httpExec.ManagedIdentityHeaders(target, auth)
 }
 
 func (e *CodexAutoExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {

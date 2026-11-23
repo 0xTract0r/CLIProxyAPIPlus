@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -360,4 +361,34 @@ func (e *ClaudeExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Aut
 	ctx = helps.WithRuntimeTransportHostFromRequest(ctx, httpReq)
 	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
 	return doClaudeHTTPWithTransportRetry(ctx, httpClient, httpReq)
+}
+
+// ManagedIdentityHeaders returns the account's serving-managed client identity
+// headers for a sessionless management request (the management api-call proxy
+// used by dashboard quota lookups) aimed at target. It runs the exact header
+// path the background quota snapshot lookups use (PrepareRequest) on a clean
+// probe request, so caller-supplied headers can never seed the device-profile
+// observation, and it fills the legacy device User-Agent the way serving does
+// when device-profile stabilization is off. The probe is forced to https because
+// the managed Anthropic protocol header set is gated on the first-party https
+// base and real egress to the protected host is always https. Business headers
+// (credentials, content negotiation, beta flags) are stripped: the caller owns
+// them. Returns nil when no identity can be derived.
+func (e *ClaudeExecutor) ManagedIdentityHeaders(target *url.URL, auth *cliproxyauth.Auth) http.Header {
+	if e == nil || target == nil || auth == nil {
+		return nil
+	}
+	probeURL := *target
+	probeURL.Scheme = "https"
+	probe, errProbe := http.NewRequestWithContext(context.Background(), http.MethodGet, probeURL.String(), nil)
+	if errProbe != nil {
+		return nil
+	}
+	if errPrepare := e.PrepareRequest(probe, auth); errPrepare != nil {
+		return nil
+	}
+	if !helps.ClaudeDeviceProfileStabilizationEnabled(e.cfg) {
+		helps.ApplyClaudeLegacyDeviceHeaders(probe, nil, e.cfg)
+	}
+	return helps.ManagementIdentityHeaders(probe.Header)
 }

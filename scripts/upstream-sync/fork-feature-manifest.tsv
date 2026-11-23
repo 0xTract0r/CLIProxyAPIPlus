@@ -136,6 +136,21 @@ fork路由-管理端点	logs-compress-after-days	route	/logs-compress-after-days
 反关联-卡片重认证代理	codex校验登录账号=目标	pattern	verifyCodexReauthIdentity\(targetAuth	internal/api/handlers/management/auth_files_provider_oauth.go
 反关联-卡片重认证代理	codex继承目标账号设置	pattern	inheritReauthAccountSettings\(record, targetAuth\)	internal/api/handlers/management/auth_files_provider_oauth.go
 
+# === 管理端 api-call「套账号托管身份头 + 账号代理 fail-closed」接线调用点(7) ===
+# 背景(fix-oauth-egress-anticorr 漏洞4 / 清单 A6):cpamp 额度查询经 POST /v0/management/api-call
+#   代发到 api.anthropic.com / chatgpt.com,原先原样转发前端 header(claude 出站是 claude-cli TLS
+#   配 Go 默认 UA;codex 是前端写死的 codex_cli_rs/0.76.0),且账号代理为空时直连。
+#   这里钉 APICall handler 里的 fail-closed 检查与托管身份头覆盖调用点,以及 claude/codex
+#   executor 复用 serving 头构造(PrepareRequest / applyCodexHeaders)的接线。
+#   行为由 api_call_managed_identity_test.go 守护。
+反关联-管理端api-call	账号代理空/非法fail-closed	pattern	h\.apiCallAccountProxyBlockReason\(auth\); reason != ""	internal/api/handlers/management/api_tools.go
+反关联-管理端api-call	取账号托管身份头	pattern	h\.apiCallManagedIdentityHeaders\(provider, parsedURL, auth\)	internal/api/handlers/management/api_tools.go
+反关联-管理端api-call	托管身份头覆盖前端同名头	pattern	applyAPICallManagedIdentity\(req\.Header, identity\)	internal/api/handlers/management/api_tools.go
+反关联-管理端api-call	账号代理不回退全局	pattern	return oauthEgressProxyBlockReason\(accountProxy\)	internal/api/handlers/management/api_call_managed_identity.go
+反关联-管理端api-call	claude托管头复用serving构造	pattern	e\.PrepareRequest\(probe, auth\)	internal/runtime/executor/claude_executor.go
+反关联-管理端api-call	codex托管头复用serving构造	pattern	applyCodexHeaders\(probe, auth, "", false, e\.cfg\)	internal/runtime/executor/codex_executor_request.go
+反关联-管理端api-call	codex auto委派托管头	pattern	e\.httpExec\.ManagedIdentityHeaders\(target, auth\)	internal/runtime/executor/codex_websockets_executor.go
+
 # === fork 自定义模块/反关联支撑文件存在性(19) ===
 fork文件-amp模块	internal/api/modules/amp/	file	-	internal/api/modules/amp
 fork文件-反关联支撑	provider_tls_probe.go(helps)	file	-	internal/runtime/executor/helps/provider_tls_probe.go
