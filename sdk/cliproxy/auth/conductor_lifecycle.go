@@ -182,7 +182,9 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	}
 	m.queueRefreshReschedule(auth.ID)
 	_ = m.persist(ctx, auth)
-	m.hook.OnAuthUpdated(ctx, auth.Clone())
+	// The refresh-result marker only covers this write; nested hook writes must
+	// keep the stale write-back guard.
+	m.hook.OnAuthUpdated(withoutRefreshResultWrite(ctx), auth.Clone())
 	if clearedCooldown {
 		m.persistCooldownStates(ctx)
 	}

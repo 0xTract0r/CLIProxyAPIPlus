@@ -21,6 +21,16 @@ func WithRefreshResultWrite(ctx context.Context) context.Context {
 	return context.WithValue(ctx, refreshResultWriteContextKey{}, true)
 }
 
+// withoutRefreshResultWrite clears the refresh-result marker so it only applies
+// to the Update that carries the refresh result, never to nested writes made by
+// lifecycle hooks (e.g. plugin model registration calling Update again).
+func withoutRefreshResultWrite(ctx context.Context) context.Context {
+	if !isRefreshResultWrite(ctx) {
+		return ctx
+	}
+	return context.WithValue(ctx, refreshResultWriteContextKey{}, false)
+}
+
 func isRefreshResultWrite(ctx context.Context) bool {
 	if ctx == nil {
 		return false

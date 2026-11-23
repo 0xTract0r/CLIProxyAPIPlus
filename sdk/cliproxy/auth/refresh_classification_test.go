@@ -502,3 +502,87 @@ func TestManagerUpdate_RefreshResultOverridesFutureStampedTokens(t *testing.T) {
 		}
 	})
 }
+
+// refreshMarkerCapturingHook records whether the refresh-result marker leaks into
+// the context handed to lifecycle hooks.
+type refreshMarkerCapturingHook struct {
+	NoopHook
+	calls       int
+	markerSeen  bool
+	nestedWrite func(ctx context.Context)
+}
+
+func (h *refreshMarkerCapturingHook) OnAuthUpdated(ctx context.Context, _ *Auth) {
+	h.calls++
+	if isRefreshResultWrite(ctx) {
+		h.markerSeen = true
+	}
+	if h.nestedWrite != nil {
+		nested := h.nestedWrite
+		h.nestedWrite = nil
+		nested(ctx)
+	}
+}
+
+// TestManagerUpdate_RefreshResultMarkerDoesNotLeakIntoHooks ensures the
+// refresh-result marker only bypasses the guard for the refresh write itself:
+// a nested Update issued from OnAuthUpdated (as plugin model registration does)
+// must still be protected by the stale write-back guard.
+func TestManagerUpdate_RefreshResultMarkerDoesNotLeakIntoHooks(t *testing.T) {
+	ctx := context.Background()
+	future := time.Now().Add(8 * time.Hour)
+	hook := &refreshMarkerCapturingHook{}
+	manager := NewManager(&captureStore{}, nil, hook)
+	stored := &Auth{
+		ID:       "codex-hook",
+		Provider: "codex",
+		Metadata: map[string]any{
+			"refresh_token": "RT_A",
+			"access_token":  "AT_A",
+			"last_refresh":  future.Format(time.RFC3339),
+		},
+	}
+	if _, err := manager.Register(ctx, stored); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	rotated := &Auth{
+		ID:       "codex-hook",
+		Provider: "codex",
+		Metadata: map[string]any{
+			"refresh_token": "RT_B",
+			"access_token":  "AT_B",
+			"last_refresh":  future.Add(time.Hour).Format(time.RFC3339),
+		},
+	}
+	hook.nestedWrite = func(hookCtx context.Context) {
+		// A stale nested write-back carrying older token state.
+		stale := &Auth{
+			ID:       "codex-hook",
+			Provider: "codex",
+			Metadata: map[string]any{
+				"refresh_token": "RT_OLD",
+				"access_token":  "AT_OLD",
+				"last_refresh":  time.Now().Format(time.RFC3339),
+			},
+		}
+		if _, err := manager.Update(hookCtx, stale); err != nil {
+			t.Errorf("nested update: %v", err)
+		}
+	}
+	if _, err := manager.Update(WithRefreshResultWrite(ctx), rotated); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if hook.calls == 0 {
+		t.Fatal("OnAuthUpdated was not called")
+	}
+	if hook.markerSeen {
+		t.Fatal("refresh-result marker leaked into OnAuthUpdated context")
+	}
+	got, ok := manager.GetByID("codex-hook")
+	if !ok || got == nil {
+		t.Fatal("auth missing after update")
+	}
+	if rt, _ := got.Metadata["refresh_token"].(string); rt != "RT_B" {
+		t.Fatalf("refresh_token = %q, want RT_B (nested hook write must not bypass the guard)", rt)
+	}
+}

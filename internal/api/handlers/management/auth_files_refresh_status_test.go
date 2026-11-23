@@ -977,3 +977,202 @@ func TestRefreshAuthFileStatusSkipsWriteWhenLatestAlreadyRotated(t *testing.T) {
 		t.Fatalf("persisted refresh_token = %q, want concurrent rt-C kept", got)
 	}
 }
+
+// runRefreshStatusForTest registers record, swaps in a codex executor with the
+// given refresh func, and invokes the refresh-status handler once.
+func runRefreshStatusForTest(t *testing.T, record *coreauth.Auth, refresh func(manager *coreauth.Manager) func(ctx context.Context, auth *coreauth.Auth) (*coreauth.Auth, error)) *coreauth.Manager {
+	t.Helper()
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	manager.RegisterExecutor(&refreshStatusExecutor{provider: "codex", refresh: refresh(manager)})
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("register auth record: %v", errRegister)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	body := `{"name":"` + record.FileName + `"}`
+	req := httptest.NewRequest(http.MethodPost, "/v0/management/auth-files/refresh-status", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	ctx.Request = req
+	h.RefreshAuthFileStatus(ctx)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+	return manager
+}
+
+func newRefreshStatusFailureRecord(id string, metadata map[string]any) *coreauth.Auth {
+	meta := map[string]any{"type": "codex", "email": "failure@example.com"}
+	for key, value := range metadata {
+		meta[key] = value
+	}
+	return &coreauth.Auth{ProxyURL: "http://test-proxy:8080",
+		ID:       id,
+		FileName: id,
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"path": "/tmp/" + id,
+		},
+		Metadata: meta,
+	}
+}
+
+// TestRefreshAuthFileStatusFailureKeepsConcurrentAccessTokenRefresh locks the
+// failure-path rule for providers that do not rotate refresh tokens: when another
+// writer refreshed the access token (same refresh token) while this refresh
+// failed, the failure must not overwrite that newer state.
+func TestRefreshAuthFileStatusFailureKeepsConcurrentAccessTokenRefresh(t *testing.T) {
+	record := newRefreshStatusFailureRecord("codex-at-only.json", map[string]any{
+		"refresh_token": "rt-same",
+		"access_token":  "at-old",
+	})
+	manager := runRefreshStatusForTest(t, record, func(manager *coreauth.Manager) func(ctx context.Context, auth *coreauth.Auth) (*coreauth.Auth, error) {
+		return func(ctx context.Context, auth *coreauth.Auth) (*coreauth.Auth, error) {
+			latest, ok := manager.GetByID(auth.ID)
+			if !ok || latest == nil {
+				return nil, &coreauth.Error{Code: "missing", Message: "auth missing"}
+			}
+			latest.Metadata["access_token"] = "at-new"
+			latest.Status = coreauth.StatusActive
+			latest.StatusMessage = ""
+			latest.Unavailable = false
+			if _, errUpdate := manager.Update(ctx, latest); errUpdate != nil {
+				return nil, errUpdate
+			}
+			return nil, &coreauth.Error{Code: "refresh_failed", Message: "connection reset", Retryable: true}
+		}
+	})
+
+	updated, ok := manager.GetByID("codex-at-only.json")
+	if !ok || updated == nil {
+		t.Fatalf("expected auth record")
+	}
+	if got := updated.Metadata["access_token"]; got != "at-new" {
+		t.Fatalf("access_token = %q, want concurrent at-new kept", got)
+	}
+	if updated.Status != coreauth.StatusActive || updated.Unavailable {
+		t.Fatalf("status = %q unavailable=%v, want active/available (stale failure must not overwrite)", updated.Status, updated.Unavailable)
+	}
+	if updated.LastError != nil {
+		t.Fatalf("LastError = %+v, want nil (stale failure must not be recorded)", updated.LastError)
+	}
+}
+
+// TestRefreshAuthFileStatusFailureRecordedWhenTokensUnchanged is the other side:
+// with refresh and access tokens unchanged, the failure must be recorded.
+func TestRefreshAuthFileStatusFailureRecordedWhenTokensUnchanged(t *testing.T) {
+	record := newRefreshStatusFailureRecord("codex-unchanged.json", map[string]any{
+		"refresh_token": "rt-same",
+		"access_token":  "at-same",
+	})
+	manager := runRefreshStatusForTest(t, record, func(*coreauth.Manager) func(ctx context.Context, auth *coreauth.Auth) (*coreauth.Auth, error) {
+		return func(ctx context.Context, auth *coreauth.Auth) (*coreauth.Auth, error) {
+			return nil, &coreauth.Error{Code: "refresh_failed", Message: "connection reset", Retryable: true}
+		}
+	})
+
+	updated, ok := manager.GetByID("codex-unchanged.json")
+	if !ok || updated == nil {
+		t.Fatalf("expected auth record")
+	}
+	if updated.Status != coreauth.StatusError || !updated.Unavailable {
+		t.Fatalf("status = %q unavailable=%v, want error/unavailable", updated.Status, updated.Unavailable)
+	}
+	if updated.StatusMessage != "connection reset" {
+		t.Fatalf("status message = %q, want connection reset", updated.StatusMessage)
+	}
+	if updated.LastError == nil || updated.LastError.Message != "connection reset" {
+		t.Fatalf("LastError = %+v, want recorded failure", updated.LastError)
+	}
+	if updated.NextRefreshAfter.IsZero() {
+		t.Fatal("NextRefreshAfter is zero, want failure backoff")
+	}
+}
+
+// TestRefreshAuthFileStatusRecordsReuseFailureWhenLastRefreshInFuture covers the
+// incident shape on the failure path: a future-dated last_refresh (host clock
+// jump) must not make a refresh_token_reused failure look superseded and get
+// swallowed; the credential must be locked as reauth_required.
+func TestRefreshAuthFileStatusRecordsReuseFailureWhenLastRefreshInFuture(t *testing.T) {
+	future := time.Now().Add(8 * time.Hour)
+	record := newRefreshStatusFailureRecord("codex-future-reuse.json", map[string]any{
+		"refresh_token": "old-refresh-token",
+		"access_token":  "old-access-token",
+		"last_refresh":  future.Format(time.RFC3339),
+		"expired":       future.Add(time.Hour).Format(time.RFC3339),
+	})
+	record.LastRefreshedAt = future
+	manager := runRefreshStatusForTest(t, record, func(*coreauth.Manager) func(ctx context.Context, auth *coreauth.Auth) (*coreauth.Auth, error) {
+		return func(ctx context.Context, auth *coreauth.Auth) (*coreauth.Auth, error) {
+			return nil, &coreauth.Error{
+				Code:       "refresh_token_reused",
+				Message:    "token refresh failed: old-refresh-token refresh_token_reused",
+				Retryable:  false,
+				HTTPStatus: http.StatusUnauthorized,
+			}
+		}
+	})
+
+	updated, ok := manager.GetByID("codex-future-reuse.json")
+	if !ok || updated == nil {
+		t.Fatalf("expected auth record")
+	}
+	if !updated.RefreshDisabled() {
+		t.Fatal("RefreshDisabled() = false, want true after refresh_token_reused")
+	}
+	if updated.Status != coreauth.StatusError || updated.StatusMessage != "reauth_required" {
+		t.Fatalf("status = %q/%q, want error/reauth_required", updated.Status, updated.StatusMessage)
+	}
+	if got, _ := updated.Metadata["refresh_status"].(string); got != "reauth_required" {
+		t.Fatalf("refresh_status = %q, want reauth_required", got)
+	}
+	if updated.LastError == nil || updated.LastError.Code != "reauth_required" {
+		t.Fatalf("LastError = %+v, want reauth_required", updated.LastError)
+	}
+}
+
+// TestRefreshSupersedeTimestampFallback locks the timestamp fallback used for
+// credentials without a refresh token: future-dated timestamps beyond the clock
+// skew bound are untrustworthy and must not mark an attempt superseded.
+func TestRefreshSupersedeTimestampFallback(t *testing.T) {
+	now := time.Now()
+	attemptStartedAt := now.Add(-2 * time.Second)
+	cases := []struct {
+		name        string
+		lastRefresh time.Time
+		useField    bool
+		want        bool
+	}{
+		{name: "metadata future beyond skew is untrusted", lastRefresh: now.Add(8 * time.Hour), want: false},
+		{name: "field future beyond skew is untrusted", lastRefresh: now.Add(8 * time.Hour), useField: true, want: false},
+		{name: "metadata just after attempt start is superseded", lastRefresh: attemptStartedAt.Add(time.Second), want: true},
+		{name: "field just after attempt start is superseded", lastRefresh: attemptStartedAt.Add(time.Second), useField: true, want: true},
+		{name: "metadata within skew bound is superseded", lastRefresh: now.Add(refreshSupersedeMaxClockSkew - time.Second), want: true},
+		{name: "metadata before attempt start is not superseded", lastRefresh: attemptStartedAt.Add(-time.Minute), want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			latest := &coreauth.Auth{ID: "no-rt", Metadata: map[string]any{"type": "codex", "access_token": "at"}}
+			if tc.useField {
+				latest.LastRefreshedAt = tc.lastRefresh
+			} else {
+				latest.Metadata["last_refresh"] = tc.lastRefresh.Format(time.RFC3339Nano)
+			}
+			if got := refreshedAfterAttempt(latest, attemptStartedAt, now); got != tc.want {
+				t.Fatalf("refreshedAfterAttempt = %v, want %v", got, tc.want)
+			}
+			if got := refreshSuccessSuperseded(latest, "", attemptStartedAt, now); got != tc.want {
+				t.Fatalf("refreshSuccessSuperseded(no RT) = %v, want %v", got, tc.want)
+			}
+			if got := refreshFailureSuperseded(latest, authTokenMaterialSnapshot{}, attemptStartedAt, now); got != tc.want {
+				t.Fatalf("refreshFailureSuperseded(no RT) = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
