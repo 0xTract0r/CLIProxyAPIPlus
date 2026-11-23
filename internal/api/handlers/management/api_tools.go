@@ -194,6 +194,17 @@ func (h *Handler) APICall(c *gin.Context) {
 		return
 	}
 
+	// Account egress fail-closed gate (fix-oauth-egress-anticorr A6): a claude /
+	// codex api-call carries the account token, so it must leave through the
+	// account's own proxy. An empty or malformed account proxy is rejected before
+	// any token is resolved or connection dialed; the core global proxy and a
+	// direct connection are never used as a fallback for these accounts.
+	if reason := h.apiCallAccountProxyBlockReason(auth); reason != "" {
+		helps.LogAccountEgressBlocked(reason, auth.ID, apiCallEgressSite)
+		c.JSON(http.StatusBadRequest, gin.H{"error": "account has no usable proxy_url (" + reason + "): refusing api-call to prevent direct egress"})
+		return
+	}
+
 	reqHeaders := body.Header
 	if reqHeaders == nil {
 		reqHeaders = map[string]string{}
@@ -257,6 +268,28 @@ func (h *Handler) APICall(c *gin.Context) {
 	}
 	if hostOverride != "" {
 		req.Host = hostOverride
+	}
+
+	// Managed identity alignment (fix-oauth-egress-anticorr A6): a claude / codex
+	// api-call to the provider's protected upstream presents the account's
+	// serving-managed client identity (User-Agent and the rest of the serving
+	// identity set), overriding any caller-supplied value such as a
+	// dashboard-hardcoded codex UA. Business headers (Authorization,
+	// Content-Type, anthropic-beta, ...) keep the caller's values. When the
+	// identity cannot be derived the request is refused rather than sent with a
+	// Go-default or caller-chosen UA under the provider's TLS fingerprint.
+	if provider := apiCallIdentityProviderKey(auth); provider != "" && apiCallTargetsManagedIdentityHost(provider, parsedURL, hostOverride) {
+		identity := h.apiCallManagedIdentityHeaders(provider, parsedURL, auth)
+		if len(identity) == 0 {
+			log.WithFields(log.Fields{
+				"event":    "api_call_identity_unavailable",
+				"provider": provider,
+				"host":     parsedURL.Hostname(),
+			}).Warn("management APICall refused: managed identity headers unavailable")
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "managed identity unavailable for account: refusing api-call"})
+			return
+		}
+		applyAPICallManagedIdentity(req.Header, identity)
 	}
 
 	httpClient := &http.Client{

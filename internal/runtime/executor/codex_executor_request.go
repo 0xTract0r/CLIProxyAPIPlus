@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 
@@ -74,6 +75,26 @@ func (e *CodexExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth
 	}
 	httpClient := helps.NewUtlsHTTPClient(ctx, e.cfg, auth, 0)
 	return httpClient.Do(httpReq)
+}
+
+// ManagedIdentityHeaders returns the account's serving-managed codex client
+// identity headers (User-Agent, Originator, profile-specific client headers)
+// for a sessionless management request aimed at target. It reuses the serving
+// header builder (applyCodexHeaders) on a clean probe request without an
+// inbound gin context, so the per-account client profile / version high-water
+// decides the identity and caller-supplied headers cannot override it. Business
+// and per-conversation headers are stripped: the caller owns them. Returns nil
+// when no identity can be derived.
+func (e *CodexExecutor) ManagedIdentityHeaders(target *url.URL, auth *cliproxyauth.Auth) http.Header {
+	if e == nil || target == nil || auth == nil {
+		return nil
+	}
+	probe, errProbe := http.NewRequestWithContext(context.Background(), http.MethodGet, target.String(), nil)
+	if errProbe != nil {
+		return nil
+	}
+	applyCodexHeaders(probe, auth, "", false, e.cfg)
+	return helps.ManagementIdentityHeaders(probe.Header)
 }
 
 type codexIdentityConfuseState struct {
