@@ -92,6 +92,52 @@ func TestCodexQuotaSnapshot_CooldownBoundaries(t *testing.T) {
 			codexSnapshotUsage(a)["credits"] = map[string]any{"has_credits": true, "balance": "5"}
 			codexSnapshotUsage(a)["rate_limit"].(map[string]any)["allowed"] = false
 		}, true},
+		// Explicit upstream allow signals (both present as booleans) take
+		// precedence over used_percent. This only lifts the proactive snapshot
+		// filter; the passive cooldown from exhausted success response headers
+		// is a separate layer outside this change, covered by
+		// TestManager_ExecuteSuccessCodexExhaustedHeaderCoolsAuth and
+		// TestManager_StreamSuccessCodexExhaustedHeaderCoolsAuth.
+		{"upstream explicitly allows", func(a *Auth) {
+			limits := codexSnapshotUsage(a)["rate_limit"].(map[string]any)
+			limits["allowed"], limits["limit_reached"] = true, false
+		}, false},
+		{"upstream explicitly allows without credits", func(a *Auth) {
+			codexSnapshotUsage(a)["credits"] = map[string]any{"has_credits": false, "unlimited": false, "balance": "0"}
+			limits := codexSnapshotUsage(a)["rate_limit"].(map[string]any)
+			limits["allowed"], limits["limit_reached"] = true, false
+		}, false},
+		{"upstream explicitly allows exhausted secondary", func(a *Auth) {
+			limits := codexSnapshotUsage(a)["rate_limit"].(map[string]any)
+			limits["secondary_window"] = map[string]any{"used_percent": 100.0, "reset_at": float64(reset.Unix())}
+			limits["allowed"], limits["limit_reached"] = true, false
+		}, false},
+		{"upstream denies", func(a *Auth) {
+			limits := codexSnapshotUsage(a)["rate_limit"].(map[string]any)
+			limits["allowed"], limits["limit_reached"] = false, false
+		}, true},
+		{"upstream limit reached", func(a *Auth) {
+			limits := codexSnapshotUsage(a)["rate_limit"].(map[string]any)
+			limits["allowed"], limits["limit_reached"] = true, true
+		}, true},
+		{"allow signals missing", func(a *Auth) {
+			limits := codexSnapshotUsage(a)["rate_limit"].(map[string]any)
+			delete(limits, "allowed")
+			delete(limits, "limit_reached")
+		}, true},
+		{"only allowed present", func(a *Auth) { codexSnapshotUsage(a)["rate_limit"].(map[string]any)["allowed"] = true }, true},
+		{"only limit_reached present", func(a *Auth) {
+			codexSnapshotUsage(a)["rate_limit"].(map[string]any)["limit_reached"] = false
+		}, true},
+		{"non-boolean allow signals", func(a *Auth) {
+			limits := codexSnapshotUsage(a)["rate_limit"].(map[string]any)
+			limits["allowed"], limits["limit_reached"] = "true", "false"
+		}, true},
+		{"limit reached without exhausted window", func(a *Auth) {
+			limits := codexSnapshotUsage(a)["rate_limit"].(map[string]any)
+			limits["primary_window"].(map[string]any)["used_percent"] = 80.0
+			limits["limit_reached"] = true
+		}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			a := codexSnapshotAuth("codex-boundary", 100, reset)
@@ -194,5 +240,45 @@ func TestCodexQuotaSnapshot_AllExhaustedReturnsCooldown(t *testing.T) {
 	cooldown, ok := err.(*modelCooldownError)
 	if !ok || cooldown.StatusCode() != http.StatusTooManyRequests || cooldown.Headers().Get("Retry-After") == "" {
 		t.Fatalf("expected retryable cooldown, got %T %v", err, err)
+	}
+}
+
+// An explicit upstream allow in the snapshot only lifts the proactive filter; an
+// exhausted success response header must still cool the account passively.
+func TestCodexQuotaSnapshot_ExplicitAllowStillCoolsOnExhaustedHeader(t *testing.T) {
+	t.Parallel()
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	manager.scheduler.setGlobalProxyConfigured(true)
+	model := "gpt-5.5"
+	allowedID, readyID := "codex-snapshot-allowed-header-exhausted", "codex-snapshot-allowed-ready"
+	registerSchedulerModels(t, "codex", model, allowedID, readyID)
+	manager.executors["codex"] = quotaHeaderExecutor{headers: exhaustedCodexHeaders(time.Now().Add(2 * time.Hour))}
+	allowedAuth := codexSnapshotAuth(allowedID, 100, time.Now().Add(72*time.Hour))
+	limits := codexSnapshotUsage(allowedAuth)["rate_limit"].(map[string]any)
+	limits["allowed"], limits["limit_reached"] = true, false
+	for _, auth := range []*Auth{allowedAuth, codexSnapshotAuth(readyID, 10, time.Now().Add(72*time.Hour))} {
+		if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+			t.Fatalf("Register(%s) error = %v", auth.ID, errRegister)
+		}
+	}
+	if blocked, reason, _ := isAuthBlockedForModel(allowedAuth, model, time.Now()); blocked {
+		t.Fatalf("snapshot allow must keep account selectable, reason=%v", reason)
+	}
+	metadata := map[string]any{cliproxyexecutor.PinnedAuthMetadataKey: allowedID}
+	if _, errExec := manager.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{Metadata: metadata}); errExec != nil {
+		t.Fatalf("Execute() error = %v", errExec)
+	}
+	got, ok := manager.GetByID(allowedID)
+	if !ok || got == nil {
+		t.Fatalf("GetByID(%s) missing", allowedID)
+	}
+	if state := got.ModelStates[model]; state == nil || !state.Quota.Exceeded {
+		t.Fatalf("exhausted success header must cool the explicitly allowed account: %#v", state)
+	}
+	for i := 0; i < 4; i++ {
+		picked, errPick := manager.scheduler.pickSingle(context.Background(), "codex", model, cliproxyexecutor.Options{}, nil)
+		if errPick != nil || picked == nil || picked.ID != readyID {
+			t.Fatalf("pickSingle() = %v err=%v, want %s", picked, errPick, readyID)
+		}
 	}
 }

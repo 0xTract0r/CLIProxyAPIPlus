@@ -260,7 +260,11 @@ bindings, an account with any shared window at 100% and a future reset is skippe
 until all exhausted windows reset, or a refreshed snapshot reports headroom. The
 credential stays enabled and continues its normal refresh lifecycle. Usable paid
 credits allow overflow unless the upstream explicitly reports `allowed=false` or
-`limit_reached=true`. Missing or expired reset times do not cause a permanent lock;
+`limit_reached=true`. When the snapshot explicitly allows serving (`allowed=true` and
+`limit_reached=false`, both booleans), the upstream signal wins and the account is
+not skipped in advance; if either field is missing or non-boolean, the 100% rule
+still applies. Passive cooldowns (real 429s, or success response headers reporting
+used>=100) are unaffected. Missing or expired reset times do not cause a permanent lock;
 normal serving-error cooldowns still apply. This behavior requires no new config.
 
 The whole field is `null` when the account has no usable `quota_snapshot.usage` snapshot

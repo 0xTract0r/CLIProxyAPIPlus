@@ -155,6 +155,9 @@ func parseCodexQuotaWindows(usage map[string]any) map[string]AccountQuotaWindow 
 // or session selection. It never disables the credential or its refresh loop.
 // Expired/unknown resets cannot pin an account indefinitely; normal serving
 // feedback still handles those cases. Multiple exhausted windows must all reset.
+// An explicit upstream allow (allowed=true and limit_reached=false, both present
+// as booleans) wins over used_percent; missing or non-boolean signals fall back
+// to the used_percent rule.
 func codexQuotaSnapshotCooldown(auth *Auth, now time.Time) (time.Time, bool) {
 	if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
 		return time.Time{}, false
@@ -163,7 +166,13 @@ func codexQuotaSnapshotCooldown(auth *Auth, now time.Time) (time.Time, bool) {
 	usage, _ := metadataObject(snapshot[accountQuotaUsageKey])
 	limits, _ := metadataObject(usage["rate_limit"])
 	allowed, hasAllowed := limits["allowed"].(bool)
-	reached, _ := limits["limit_reached"].(bool)
+	reached, hasReached := limits["limit_reached"].(bool)
+	// Upstream explicitly still serves this plan (e.g. used_percent=100 with
+	// allowed=true and no credits). A real 429 is still handled by the passive
+	// serving cooldown path, so do not pre-emptively skip the account here.
+	if hasAllowed && allowed && hasReached && !reached {
+		return time.Time{}, false
+	}
 	// Preserve Codex's existing credit overflow semantics, but never override
 	// an explicit upstream refusal with a possibly stale credit balance.
 	if !(hasAllowed && !allowed) && !reached {
