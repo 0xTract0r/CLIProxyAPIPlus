@@ -242,3 +242,43 @@ func TestCodexQuotaSnapshot_AllExhaustedReturnsCooldown(t *testing.T) {
 		t.Fatalf("expected retryable cooldown, got %T %v", err, err)
 	}
 }
+
+// An explicit upstream allow in the snapshot only lifts the proactive filter; an
+// exhausted success response header must still cool the account passively.
+func TestCodexQuotaSnapshot_ExplicitAllowStillCoolsOnExhaustedHeader(t *testing.T) {
+	t.Parallel()
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	manager.scheduler.setGlobalProxyConfigured(true)
+	model := "gpt-5.5"
+	allowedID, readyID := "codex-snapshot-allowed-header-exhausted", "codex-snapshot-allowed-ready"
+	registerSchedulerModels(t, "codex", model, allowedID, readyID)
+	manager.executors["codex"] = quotaHeaderExecutor{headers: exhaustedCodexHeaders(time.Now().Add(2 * time.Hour))}
+	allowedAuth := codexSnapshotAuth(allowedID, 100, time.Now().Add(72*time.Hour))
+	limits := codexSnapshotUsage(allowedAuth)["rate_limit"].(map[string]any)
+	limits["allowed"], limits["limit_reached"] = true, false
+	for _, auth := range []*Auth{allowedAuth, codexSnapshotAuth(readyID, 10, time.Now().Add(72*time.Hour))} {
+		if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+			t.Fatalf("Register(%s) error = %v", auth.ID, errRegister)
+		}
+	}
+	if blocked, reason, _ := isAuthBlockedForModel(allowedAuth, model, time.Now()); blocked {
+		t.Fatalf("snapshot allow must keep account selectable, reason=%v", reason)
+	}
+	metadata := map[string]any{cliproxyexecutor.PinnedAuthMetadataKey: allowedID}
+	if _, errExec := manager.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{Metadata: metadata}); errExec != nil {
+		t.Fatalf("Execute() error = %v", errExec)
+	}
+	got, ok := manager.GetByID(allowedID)
+	if !ok || got == nil {
+		t.Fatalf("GetByID(%s) missing", allowedID)
+	}
+	if state := got.ModelStates[model]; state == nil || !state.Quota.Exceeded {
+		t.Fatalf("exhausted success header must cool the explicitly allowed account: %#v", state)
+	}
+	for i := 0; i < 4; i++ {
+		picked, errPick := manager.scheduler.pickSingle(context.Background(), "codex", model, cliproxyexecutor.Options{}, nil)
+		if errPick != nil || picked == nil || picked.ID != readyID {
+			t.Fatalf("pickSingle() = %v err=%v, want %s", picked, errPick, readyID)
+		}
+	}
+}
