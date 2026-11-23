@@ -330,6 +330,34 @@ func TestRequestCodexTokenReauthRejectsDifferentAccount(t *testing.T) {
 	}
 }
 
+// pinRuntimeIdentityCreatedAt gives the target a realistic (derived) runtime
+// identity state, as a long-lived account would have, and pins its created_at
+// to a known historical value in both the file and the manager.
+func pinRuntimeIdentityCreatedAt(t *testing.T, fx *identityFixture, name, createdAt string) {
+	t.Helper()
+	auth, ok := fx.manager.GetByID(name)
+	if !ok {
+		t.Fatalf("auth %s not registered", name)
+	}
+	synced := fx.h.syncAuthManagedHeaderState(context.Background(), auth)
+	stored := readAccountSettingsMetadata(synced, fx.h.cfg)
+	if stored.RuntimeIdentityState == nil || stored.RuntimeIdentityState.Current == nil {
+		t.Fatalf("auth %s has no derived runtime identity state", name)
+	}
+	stored.RuntimeIdentityState.Current.CreatedAt = createdAt
+	synced.Metadata["account_settings"] = stored
+	raw, err := json.MarshalIndent(synced.Metadata, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal pinned %s: %v", name, err)
+	}
+	if err = os.WriteFile(filepath.Join(fx.authDir, name), raw, 0o600); err != nil {
+		t.Fatalf("write pinned %s: %v", name, err)
+	}
+	if _, err = fx.manager.Update(context.Background(), synced); err != nil {
+		t.Fatalf("update pinned %s: %v", name, err)
+	}
+}
+
 func savedCredential(t *testing.T, authDir, name string) map[string]any {
 	t.Helper()
 	raw, err := os.ReadFile(filepath.Join(authDir, name))
@@ -344,12 +372,13 @@ func savedCredential(t *testing.T, authDir, name string) map[string]any {
 }
 
 // TestRequestAnthropicTokenReauthSameAccountPreservesIdentity: a matching card
-// re-auth rewrites the target's file in place with the new tokens while keeping
-// its proxy_url, note, managed_header_seed and device id.
+// re-auth rewrites the target's file IN PLACE (even when it does not use the
+// canonical claude-<email>.json name) with the new tokens while keeping its
+// proxy_url, note, managed_header_seed and device id.
 func TestRequestAnthropicTokenReauthSameAccountPreservesIdentity(t *testing.T) {
 	useFakeTokenEndpoint(t, func(*http.Request) []byte { return claudeTokenResponse("Target@Example.test") })
 	fx := newIdentityFixture(t, "claude", claudeTargetMeta("target@example.test"), claudeTargetMeta("other@example.test"),
-		"claude-target@example.test.json", "claude-other@example.test.json")
+		"claude-card-target.json", "claude-other@example.test.json")
 	state := startCardReauth(t, fx, "/anthropic-auth-url", "anthropic")
 	if status, completed := waitOAuthSessionSettled(t, state); !completed {
 		t.Fatalf("same-account re-auth did not complete: status=%q", status)
@@ -406,6 +435,7 @@ func TestRequestCodexTokenReauthSameAccountPreservesSettings(t *testing.T) {
 		"refresh_token": "old-refresh-other", "proxy_url": "http://127.0.0.1:9"}
 	fx := newIdentityFixture(t, "codex", targetMeta, otherMeta,
 		"codex-target@example.test-plus.json", "codex-other@example.test-pro.json")
+	pinRuntimeIdentityCreatedAt(t, fx, fx.target, identityTargetCreated)
 	state := startCardReauth(t, fx, "/codex-auth-url", "codex")
 	status, completed := waitOAuthSessionSettled(t, state)
 	if !completed {

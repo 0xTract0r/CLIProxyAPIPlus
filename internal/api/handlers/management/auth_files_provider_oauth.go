@@ -220,8 +220,20 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 		}
 		log.WithFields(log.Fields{
 			"state": safeState,
-			"email": tokenStorageEmailForLog(bundle),
+			"email": maskEmailForLog(tokenStorageEmailForLog(bundle)),
 		}).Info("Claude OAuth token exchange completed")
+
+		// A card re-auth may only write the target's credential file when the
+		// browser login was the target account; otherwise nothing is persisted
+		// and no in-memory auth is touched.
+		if errIdentity := verifyClaudeReauthIdentity(targetAuth, tokenStorageEmailForLog(bundle)); errIdentity != nil {
+			log.WithFields(log.Fields{
+				"state":     safeState,
+				"auth_name": safeAuthNameForLog(targetAuthName),
+			}).Warnf("Claude OAuth re-auth rejected: %v", errIdentity)
+			SetOAuthSessionError(state, errIdentity.Error())
+			return
+		}
 
 		// Create token storage. A re-auth keeps the target's ID, file name,
 		// proxy_url, note and scheduling metadata.
@@ -261,7 +273,7 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 	// Fork (fix-oauth-egress-anticorr): a card re-auth (auth_name) exchanges the
 	// code through the TARGET account's proxy and identity; a missing target or a
 	// target without a usable proxy is rejected before any outbound connection.
-	targetAuth, _, errTarget := h.resolveOAuthReauthTarget(c, "codex")
+	targetAuth, targetAuthName, errTarget := h.resolveOAuthReauthTarget(c, "codex")
 	if errTarget != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": errTarget.Error()})
 		return
@@ -394,12 +406,30 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 		claims, _ := codex.ParseJWTToken(bundle.TokenData.IDToken)
 		planType := ""
 		hashAccountID := ""
+		loginAccountID := ""
+		loginEmail := strings.TrimSpace(bundle.TokenData.Email)
 		if claims != nil {
 			planType = strings.TrimSpace(claims.CodexAuthInfo.ChatgptPlanType)
-			if accountID := claims.GetAccountID(); accountID != "" {
-				digest := sha256.Sum256([]byte(accountID))
+			loginAccountID = strings.TrimSpace(claims.GetAccountID())
+			if loginEmail == "" {
+				loginEmail = strings.TrimSpace(claims.GetUserEmail())
+			}
+			if loginAccountID != "" {
+				digest := sha256.Sum256([]byte(loginAccountID))
 				hashAccountID = hex.EncodeToString(digest[:])[:8]
 			}
+		}
+
+		// A card re-auth may only persist when the browser login was the target
+		// ChatGPT account; otherwise the other account's file would inherit the
+		// target's proxy and managed-header seed. Nothing is written on mismatch.
+		if errIdentity := verifyCodexReauthIdentity(targetAuth, loginAccountID, loginEmail); errIdentity != nil {
+			log.WithFields(log.Fields{
+				"state":     maskOAuthStateForLog(state),
+				"auth_name": safeAuthNameForLog(targetAuthName),
+			}).Warnf("Codex OAuth re-auth rejected: %v", errIdentity)
+			SetOAuthSessionError(state, errIdentity.Error())
+			return
 		}
 
 		// Create token storage and persist
@@ -424,8 +454,14 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 				record.ProxyURL = proxyURL
 				record.Metadata["proxy_url"] = proxyURL
 			}
+			// Keep the target's operator settings and runtime identity instead of
+			// regenerating account_settings for an existing account.
+			inheritReauthAccountSettings(record, targetAuth)
 		}
 		h.applyOAuthAccountSetupToRecord(record, setup)
+		if targetAuth != nil {
+			h.preserveReauthRuntimeIdentityCreatedAt(record, targetAuth)
+		}
 		if errGuard := guardOAuthSessionPendingForSave(state, "codex"); errGuard != nil {
 			return
 		}
