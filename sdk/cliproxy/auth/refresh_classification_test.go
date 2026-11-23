@@ -340,3 +340,249 @@ func TestManagerUpdate_DoesNotRollBackTokensFromStaleWriteback(t *testing.T) {
 		t.Fatalf("quota_refresh_status = %q, want ok (non-token write must apply)", qs)
 	}
 }
+
+// rotatingRefreshExecutor simulates a successful upstream refresh that rotates the
+// refresh token and stamps the current (real) time.
+type rotatingRefreshExecutor struct {
+	schedulerProviderTestExecutor
+	beforeReturn func()
+}
+
+func (e *rotatingRefreshExecutor) Refresh(ctx context.Context, auth *Auth) (*Auth, error) {
+	if e.beforeReturn != nil {
+		e.beforeReturn()
+	}
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	now := time.Now()
+	auth.Metadata["refresh_token"] = "RT_B"
+	auth.Metadata["access_token"] = "AT_B"
+	auth.Metadata["last_refresh"] = now.Format(time.RFC3339)
+	auth.Metadata["expired"] = now.Add(time.Hour).Format(time.RFC3339)
+	return auth, nil
+}
+
+// TestManagerUpdate_RefreshResultOverridesFutureStampedTokens covers the clock-jump
+// incident: the stored credential carries future-dated token timestamps (written
+// while the host clock ran ~8h ahead). A write that carries a freshly rotated token
+// from a successful upstream refresh must replace it, because the rotation already
+// invalidated the stored refresh token upstream. Writes without the refresh-result
+// marker keep the original rollback-guard semantics.
+func TestManagerUpdate_RefreshResultOverridesFutureStampedTokens(t *testing.T) {
+	future := time.Now().Add(8 * time.Hour)
+	newStored := func() *Auth {
+		return &Auth{
+			ID:       "codex-future",
+			Provider: "codex",
+			Metadata: map[string]any{
+				"refresh_token": "RT_A",
+				"access_token":  "AT_A",
+				"last_refresh":  future.Format(time.RFC3339),
+				"expired":       future.Add(time.Hour).Format(time.RFC3339),
+			},
+		}
+	}
+	newRotated := func() *Auth {
+		now := time.Now()
+		return &Auth{
+			ID:       "codex-future",
+			Provider: "codex",
+			Metadata: map[string]any{
+				"refresh_token": "RT_B",
+				"access_token":  "AT_B",
+				"last_refresh":  now.Format(time.RFC3339),
+				"expired":       now.Add(time.Hour).Format(time.RFC3339),
+			},
+		}
+	}
+
+	t.Run("refresh result write replaces future-stamped tokens", func(t *testing.T) {
+		ctx := context.Background()
+		store := &captureStore{}
+		manager := NewManager(store, nil, nil)
+		if _, err := manager.Register(ctx, newStored()); err != nil {
+			t.Fatalf("register: %v", err)
+		}
+		if _, err := manager.Update(WithRefreshResultWrite(ctx), newRotated()); err != nil {
+			t.Fatalf("update: %v", err)
+		}
+		got, ok := manager.GetByID("codex-future")
+		if !ok || got == nil {
+			t.Fatal("auth missing after update")
+		}
+		if rt, _ := got.Metadata["refresh_token"].(string); rt != "RT_B" {
+			t.Fatalf("in-memory refresh_token = %q, want rotated RT_B", rt)
+		}
+		if at, _ := got.Metadata["access_token"].(string); at != "AT_B" {
+			t.Fatalf("in-memory access_token = %q, want rotated AT_B", at)
+		}
+		persisted := store.last()
+		if persisted == nil {
+			t.Fatal("expected refreshed auth to be persisted")
+		}
+		if rt, _ := persisted.Metadata["refresh_token"].(string); rt != "RT_B" {
+			t.Fatalf("persisted refresh_token = %q, want rotated RT_B", rt)
+		}
+	})
+
+	t.Run("conductor refresh persists rotation over future-stamped tokens", func(t *testing.T) {
+		ctx := context.Background()
+		store := &captureStore{}
+		manager := NewManager(store, nil, nil)
+		manager.RegisterExecutor(&rotatingRefreshExecutor{
+			schedulerProviderTestExecutor: schedulerProviderTestExecutor{provider: "codex"},
+		})
+		if _, err := manager.Register(ctx, newStored()); err != nil {
+			t.Fatalf("register: %v", err)
+		}
+		manager.refreshAuth(ctx, "codex-future")
+		got, ok := manager.GetByID("codex-future")
+		if !ok || got == nil {
+			t.Fatal("auth missing after refresh")
+		}
+		if rt, _ := got.Metadata["refresh_token"].(string); rt != "RT_B" {
+			t.Fatalf("in-memory refresh_token = %q, want rotated RT_B", rt)
+		}
+		persisted := store.last()
+		if persisted == nil {
+			t.Fatal("expected refreshed auth to be persisted")
+		}
+		if rt, _ := persisted.Metadata["refresh_token"].(string); rt != "RT_B" {
+			t.Fatalf("persisted refresh_token = %q, want rotated RT_B", rt)
+		}
+	})
+
+	t.Run("conductor refresh keeps guard when credential replaced mid-refresh", func(t *testing.T) {
+		ctx := context.Background()
+		store := &captureStore{}
+		manager := NewManager(store, nil, nil)
+		manager.RegisterExecutor(&rotatingRefreshExecutor{
+			schedulerProviderTestExecutor: schedulerProviderTestExecutor{provider: "codex"},
+			beforeReturn: func() {
+				// Another writer (e.g. a re-auth) stores RT_C mid-refresh.
+				replaced := newStored()
+				replaced.Metadata["refresh_token"] = "RT_C"
+				replaced.Metadata["access_token"] = "AT_C"
+				replaced.Metadata["expired"] = future.Add(2 * time.Hour).Format(time.RFC3339)
+				if _, err := manager.Update(ctx, replaced); err != nil {
+					t.Errorf("mid-refresh update: %v", err)
+				}
+			},
+		})
+		if _, err := manager.Register(ctx, newStored()); err != nil {
+			t.Fatalf("register: %v", err)
+		}
+		manager.refreshAuth(ctx, "codex-future")
+		got, ok := manager.GetByID("codex-future")
+		if !ok || got == nil {
+			t.Fatal("auth missing after refresh")
+		}
+		if rt, _ := got.Metadata["refresh_token"].(string); rt != "RT_C" {
+			t.Fatalf("refresh_token = %q, want RT_C (guard must still protect a credential replaced mid-refresh)", rt)
+		}
+	})
+
+	t.Run("unmarked write keeps rollback guard", func(t *testing.T) {
+		ctx := context.Background()
+		store := &captureStore{}
+		manager := NewManager(store, nil, nil)
+		if _, err := manager.Register(ctx, newStored()); err != nil {
+			t.Fatalf("register: %v", err)
+		}
+		if _, err := manager.Update(ctx, newRotated()); err != nil {
+			t.Fatalf("update: %v", err)
+		}
+		got, ok := manager.GetByID("codex-future")
+		if !ok || got == nil {
+			t.Fatal("auth missing after update")
+		}
+		if rt, _ := got.Metadata["refresh_token"].(string); rt != "RT_A" {
+			t.Fatalf("refresh_token = %q, want RT_A (unmarked write keeps guard semantics)", rt)
+		}
+	})
+}
+
+// refreshMarkerCapturingHook records whether the refresh-result marker leaks into
+// the context handed to lifecycle hooks.
+type refreshMarkerCapturingHook struct {
+	NoopHook
+	calls       int
+	markerSeen  bool
+	nestedWrite func(ctx context.Context)
+}
+
+func (h *refreshMarkerCapturingHook) OnAuthUpdated(ctx context.Context, _ *Auth) {
+	h.calls++
+	if isRefreshResultWrite(ctx) {
+		h.markerSeen = true
+	}
+	if h.nestedWrite != nil {
+		nested := h.nestedWrite
+		h.nestedWrite = nil
+		nested(ctx)
+	}
+}
+
+// TestManagerUpdate_RefreshResultMarkerDoesNotLeakIntoHooks ensures the
+// refresh-result marker only bypasses the guard for the refresh write itself:
+// a nested Update issued from OnAuthUpdated (as plugin model registration does)
+// must still be protected by the stale write-back guard.
+func TestManagerUpdate_RefreshResultMarkerDoesNotLeakIntoHooks(t *testing.T) {
+	ctx := context.Background()
+	future := time.Now().Add(8 * time.Hour)
+	hook := &refreshMarkerCapturingHook{}
+	manager := NewManager(&captureStore{}, nil, hook)
+	stored := &Auth{
+		ID:       "codex-hook",
+		Provider: "codex",
+		Metadata: map[string]any{
+			"refresh_token": "RT_A",
+			"access_token":  "AT_A",
+			"last_refresh":  future.Format(time.RFC3339),
+		},
+	}
+	if _, err := manager.Register(ctx, stored); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	rotated := &Auth{
+		ID:       "codex-hook",
+		Provider: "codex",
+		Metadata: map[string]any{
+			"refresh_token": "RT_B",
+			"access_token":  "AT_B",
+			"last_refresh":  future.Add(time.Hour).Format(time.RFC3339),
+		},
+	}
+	hook.nestedWrite = func(hookCtx context.Context) {
+		// A stale nested write-back carrying older token state.
+		stale := &Auth{
+			ID:       "codex-hook",
+			Provider: "codex",
+			Metadata: map[string]any{
+				"refresh_token": "RT_OLD",
+				"access_token":  "AT_OLD",
+				"last_refresh":  time.Now().Format(time.RFC3339),
+			},
+		}
+		if _, err := manager.Update(hookCtx, stale); err != nil {
+			t.Errorf("nested update: %v", err)
+		}
+	}
+	if _, err := manager.Update(WithRefreshResultWrite(ctx), rotated); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if hook.calls == 0 {
+		t.Fatal("OnAuthUpdated was not called")
+	}
+	if hook.markerSeen {
+		t.Fatal("refresh-result marker leaked into OnAuthUpdated context")
+	}
+	got, ok := manager.GetByID("codex-hook")
+	if !ok || got == nil {
+		t.Fatal("auth missing after update")
+	}
+	if rt, _ := got.Metadata["refresh_token"].(string); rt != "RT_B" {
+		t.Fatalf("refresh_token = %q, want RT_B (nested hook write must not bypass the guard)", rt)
+	}
+}

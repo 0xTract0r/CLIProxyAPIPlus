@@ -1287,6 +1287,17 @@ func hasTokenMaterial(a *Auth) bool {
 	return false
 }
 
+// tokenMaterialSnapshot returns a comparable snapshot of the OAuth token
+// material (refresh/access/id token). It is only compared, never logged.
+func tokenMaterialSnapshot(a *Auth) [4]string {
+	return [4]string{
+		authMetadataString(a, "refresh_token"),
+		authMetadataString(a, "access_token"),
+		authMetadataString(a, "id_token"),
+		authMetadataString(a, "token"),
+	}
+}
+
 // preserveNewerTokenOwnedFields guards against a stale write-back rolling token
 // state backwards. It only acts when BOTH the existing in-memory record and the
 // incoming update carry token material and the existing one is strictly newer

@@ -2055,6 +2055,7 @@ func (h *Handler) refreshAuthStatus(ctx context.Context, current *coreauth.Auth)
 	candidate := current.Clone()
 	attemptStartedAt := now
 	attemptRefreshToken := authRefreshTokenValue(candidate)
+	attemptTokens := authTokenMaterial(candidate)
 	updated, errRefresh := exec.Refresh(ctx, candidate)
 	if updated == nil {
 		updated = candidate
@@ -2071,7 +2072,7 @@ func (h *Handler) refreshAuthStatus(ctx context.Context, current *coreauth.Auth)
 			latest = current.Clone()
 		}
 		preserveAuthIdentity(latest, current)
-		if refreshAttemptSuperseded(latest, attemptRefreshToken, attemptStartedAt) {
+		if refreshFailureSuperseded(latest, attemptTokens, attemptStartedAt, time.Now()) {
 			return latest, nil
 		}
 		if coreauth.IsRefreshTokenReuseError(errRefresh) {
@@ -2104,7 +2105,14 @@ func (h *Handler) refreshAuthStatus(ctx context.Context, current *coreauth.Auth)
 	}
 
 	latest := h.latestAuthSnapshot(current)
-	if refreshAttemptSuperseded(latest, attemptRefreshToken, attemptStartedAt) {
+	if refreshSuccessSuperseded(latest, attemptRefreshToken, attemptStartedAt, time.Now()) {
+		// The refresh succeeded but another writer already replaced the
+		// credential; keep theirs. Log identifiers only, never token values.
+		log.WithFields(log.Fields{
+			"auth_id":   current.ID,
+			"auth_file": current.FileName,
+			"provider":  current.Provider,
+		}).Warn("refresh-status: refresh result superseded by a newer credential; result not persisted")
 		return latest, nil
 	}
 
@@ -2147,7 +2155,14 @@ func (h *Handler) refreshAuthStatus(ctx context.Context, current *coreauth.Auth)
 		updated.Unavailable = false
 	}
 
-	return h.authManager.Update(ctx, updated)
+	writeCtx := ctx
+	if authTokenMaterial(updated) != attemptTokens {
+		// The upstream refresh issued new token material (a rotation already
+		// invalidated the previous refresh token), so the stored record's local
+		// timestamps must not roll it back.
+		writeCtx = coreauth.WithRefreshResultWrite(ctx)
+	}
+	return h.authManager.Update(writeCtx, updated)
 }
 
 func (h *Handler) latestAuthSnapshot(current *coreauth.Auth) *coreauth.Auth {
@@ -2179,22 +2194,87 @@ func authRefreshTokenValue(auth *coreauth.Auth) string {
 	return ""
 }
 
-func refreshAttemptSuperseded(latest *coreauth.Auth, attemptedRefreshToken string, attemptStartedAt time.Time) bool {
+// refreshSupersedeMaxClockSkew bounds how far in the future a stored refresh
+// timestamp may be before it is treated as untrustworthy (e.g. written while the
+// host clock ran ahead) by the timestamp-based supersede fallback.
+const refreshSupersedeMaxClockSkew = 5 * time.Minute
+
+// authTokenMaterialSnapshot is a comparable snapshot of an auth's OAuth token
+// material. It is only compared, never logged.
+type authTokenMaterialSnapshot struct {
+	refreshToken string
+	accessToken  string
+	idToken      string
+}
+
+func authTokenMaterial(auth *coreauth.Auth) authTokenMaterialSnapshot {
+	if auth == nil || auth.Metadata == nil {
+		return authTokenMaterialSnapshot{}
+	}
+	value := func(key string) string {
+		if token, ok := auth.Metadata[key].(string); ok {
+			return strings.TrimSpace(token)
+		}
+		return ""
+	}
+	return authTokenMaterialSnapshot{
+		refreshToken: value("refresh_token"),
+		accessToken:  value("access_token"),
+		idToken:      value("id_token"),
+	}
+}
+
+// refreshSuccessSuperseded reports whether a successful refresh result must be
+// dropped because another writer already replaced the credential. It decides by
+// token identity: wall-clock timestamps are not trusted, because a host clock
+// jump can leave a future-dated last_refresh that would otherwise make a real
+// rotation look superseded and silently discard the only valid refresh token.
+func refreshSuccessSuperseded(latest *coreauth.Auth, attemptedRefreshToken string, attemptStartedAt, now time.Time) bool {
 	if latest == nil {
 		return false
 	}
-	latestRefreshToken := authRefreshTokenValue(latest)
-	if attemptedRefreshToken != "" && latestRefreshToken != "" && latestRefreshToken != attemptedRefreshToken {
-		return true
+	if attemptedRefreshToken != "" {
+		latestRefreshToken := authRefreshTokenValue(latest)
+		return latestRefreshToken != "" && latestRefreshToken != attemptedRefreshToken
 	}
-	if attemptStartedAt.IsZero() {
+	return refreshedAfterAttempt(latest, attemptStartedAt, now)
+}
+
+// refreshFailureSuperseded reports whether a failed refresh is stale because
+// another writer already refreshed or replaced the credential, in which case the
+// failure must not overwrite the newer state. A changed refresh token means a
+// rotation or re-auth; a changed access token with the same refresh token covers
+// providers that do not rotate refresh tokens.
+func refreshFailureSuperseded(latest *coreauth.Auth, attempt authTokenMaterialSnapshot, attemptStartedAt, now time.Time) bool {
+	if latest == nil {
 		return false
 	}
-	if !latest.LastRefreshedAt.IsZero() && latest.LastRefreshedAt.After(attemptStartedAt) {
+	if attempt.refreshToken != "" {
+		current := authTokenMaterial(latest)
+		if current.refreshToken != "" && current.refreshToken != attempt.refreshToken {
+			return true
+		}
+		return current.accessToken != "" && current.accessToken != attempt.accessToken
+	}
+	return refreshedAfterAttempt(latest, attemptStartedAt, now)
+}
+
+// refreshedAfterAttempt is the timestamp fallback for credentials without a
+// refresh token. Timestamps later than now+refreshSupersedeMaxClockSkew are
+// ignored as untrustworthy.
+func refreshedAfterAttempt(latest *coreauth.Auth, attemptStartedAt, now time.Time) bool {
+	if latest == nil || attemptStartedAt.IsZero() {
+		return false
+	}
+	limit := now.Add(refreshSupersedeMaxClockSkew)
+	trusted := func(ts time.Time) bool {
+		return !ts.IsZero() && ts.After(attemptStartedAt) && !ts.After(limit)
+	}
+	if trusted(latest.LastRefreshedAt) {
 		return true
 	}
 	if latest.Metadata != nil {
-		if refreshedAt, ok := extractLastRefreshTimestamp(latest.Metadata); ok && refreshedAt.After(attemptStartedAt) {
+		if refreshedAt, ok := extractLastRefreshTimestamp(latest.Metadata); ok && trusted(refreshedAt) {
 			return true
 		}
 	}
