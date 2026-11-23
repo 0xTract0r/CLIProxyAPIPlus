@@ -182,7 +182,16 @@ func (h *Handler) oauthIdentityHTTPClient(ctx context.Context, host string, auth
 	if host != "" {
 		transportCtx = runtimehelps.WithRuntimeTransportHost(transportCtx, host)
 	}
-	client := runtimehelps.NewProxyAwareHTTPClient(transportCtx, h.cfg, auth, timeout)
+	// Fork (fix-oauth-egress-anticorr): claude / codex token exchanges always use
+	// the strict official-client uTLS ClientHello over the account's own proxy.
+	// The runtime transport profile path would emit the Go default ClientHello
+	// for codex (JA3 03117a8e) and for CLI-native claude profiles.
+	var client *http.Client
+	if profileID := oauthExchangeClientHelloProfile(auth); profileID != "" {
+		client = oauthAccountExchangeBaseClient(auth, profileID, timeout)
+	} else {
+		client = runtimehelps.NewProxyAwareHTTPClient(transportCtx, h.cfg, auth, timeout)
+	}
 	headers := coreauth.ExtractCustomHeadersFromMetadata(auth.Metadata)
 	if len(headers) == 0 {
 		headers = map[string]string{}
@@ -204,6 +213,47 @@ func (h *Handler) oauthIdentityHTTPClient(ctx context.Context, host string, auth
 		Timeout: client.Timeout,
 	}
 }
+
+// oauthExchangeClientHelloProfile returns the official client ClientHello
+// profile an account-scoped OAuth token exchange must present, or "" for
+// providers that keep the runtime transport profile path.
+func oauthExchangeClientHelloProfile(auth *coreauth.Auth) string {
+	switch providerKey(auth) {
+	case "claude":
+		return runtimehelps.ClaudeCLIClientHelloProfileID
+	case "codex":
+		return runtimehelps.CodexRustlsClientHelloProfileID
+	default:
+		return ""
+	}
+}
+
+// oauthAccountExchangeBaseClient builds the strict (no-downgrade) uTLS client
+// for an account-scoped claude / codex token exchange over the account's own
+// proxy. It is the same construction the OAuth refresh path uses, so exchange
+// and refresh present one fingerprint per account. An empty or invalid account
+// proxy yields a blocking transport (zero network I/O) instead of a global or
+// direct fallback.
+func oauthAccountExchangeBaseClient(auth *coreauth.Auth, profileID string, timeout time.Duration) *http.Client {
+	proxyURL := authProxyURL(auth)
+	if oauthEgressProxyBlockReason(proxyURL) != "" {
+		client := &http.Client{Transport: proxyutil.BlockingRoundTripper()}
+		if timeout > 0 {
+			client.Timeout = timeout
+		}
+		return client
+	}
+	if oauthExchangeTransportForTest != nil {
+		return &http.Client{Transport: oauthExchangeTransportForTest(auth), Timeout: timeout}
+	}
+	return runtimehelps.NewOAuthRefreshUtlsHTTPClient(proxyURL, profileID, timeout)
+}
+
+// oauthExchangeTransportForTest, when non-nil, replaces the account-scoped
+// token exchange transport AFTER the proxy fail-closed check. It is a test seam
+// only (handler tests cannot complete a real TLS exchange) and is always nil in
+// production.
+var oauthExchangeTransportForTest func(auth *coreauth.Auth) http.RoundTripper
 
 func utilSetProxyForOAuth(cfg *config.Config, client *http.Client) *http.Client {
 	if cfg == nil {

@@ -56,7 +56,11 @@ func TestRequestCodexTokenCompletionKeepsConcurrentSessionPending(t *testing.T) 
 	}()
 
 	authDir := filepath.Join(t.TempDir(), "auths")
-	handler := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, nil)
+	cfg := &config.Config{AuthDir: authDir}
+	// A no-parameter OAuth start now requires a usable global proxy-url
+	// (fail-closed egress). The fake codex service never dials it.
+	cfg.SDKConfig.ProxyURL = "http://127.0.0.1:9"
+	handler := NewHandlerWithoutConfigFilePath(cfg, nil)
 	router := gin.New()
 	router.GET("/codex-auth-url", handler.RequestCodexToken)
 

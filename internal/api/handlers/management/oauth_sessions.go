@@ -576,10 +576,60 @@ func writeOAuthCallbackFile(authDir, canonicalProvider, state, code, errorMessag
 	if err != nil {
 		return "", fmt.Errorf("marshal oauth callback payload: %w", err)
 	}
-	if err := os.WriteFile(filePath, data, 0o600); err != nil {
+	if err := writeOAuthCallbackFileAtomic(filePath, data); err != nil {
 		return "", fmt.Errorf("write oauth callback file: %w", err)
 	}
 	return filePath, nil
+}
+
+// writeOAuthCallbackFileAtomic writes data to a temp file in the same
+// directory and renames it over path, so a polling OAuth handler never reads a
+// partially written callback file. The temp name (<file>.tmp-<random>) never
+// matches the exact callback path the handlers poll, nor the *.json auth-file
+// watcher filter.
+func writeOAuthCallbackFileAtomic(path string, data []byte) (errWrite error) {
+	tmp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer func() {
+		if errWrite != nil {
+			_ = tmp.Close()
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if err = tmp.Chmod(0o600); err != nil {
+		return err
+	}
+	if _, err = tmp.Write(data); err != nil {
+		return err
+	}
+	if err = tmp.Sync(); err != nil {
+		return err
+	}
+	if err = tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, path)
+}
+
+// readOAuthCallbackFile returns the parsed callback payload and removes the
+// file. A missing file or a payload that is not (yet) valid JSON reports
+// ok=false and leaves the file in place, so the poller waits for the next tick
+// instead of consuming a partial write as an empty payload and failing the
+// session with a state mismatch.
+func readOAuthCallbackFile(path string) (map[string]string, bool) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, false
+	}
+	var payload map[string]string
+	if err = json.Unmarshal(data, &payload); err != nil {
+		return nil, false
+	}
+	_ = os.Remove(path)
+	return payload, true
 }
 
 func WriteOAuthCallbackFileForPendingSession(authDir, provider, state, code, errorMessage string) (string, error) {

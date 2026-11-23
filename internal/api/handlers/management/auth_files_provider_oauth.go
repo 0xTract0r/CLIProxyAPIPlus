@@ -4,11 +4,9 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
-	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -39,10 +37,27 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 
 	fmt.Println("Initializing Claude authentication...")
 
-	// 解析可选的账号级 setup（note / proxy_url）；proxy_url 非法直接 400。
+	// Fork (fix-oauth-egress-anticorr): a card re-auth (auth_name) exchanges the
+	// code through the TARGET account's proxy and identity. A missing target or a
+	// target without a usable proxy is rejected here, before any session or
+	// outbound connection exists.
+	targetAuth, targetAuthName, errTarget := h.resolveOAuthReauthTarget(c, "claude")
+	if errTarget != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errTarget.Error()})
+		return
+	}
+
+	// Parse the optional account setup (note / proxy_url); an invalid proxy_url is a 400.
 	setup, errSetup := parseOAuthAccountSetupFromRequest(c)
 	if errSetup != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": errSetup.Error()})
+		return
+	}
+	if targetAuth != nil {
+		// A re-auth keeps the target's own proxy / note; setup fields are ignored.
+		setup = nil
+	} else if errEgress := h.checkOAuthStartEgress(setup); errEgress != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errEgress.Error()})
 		return
 	}
 
@@ -62,11 +77,17 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 		return
 	}
 
-	// Initialize Claude auth service. 新账号 setup 先合成一份临时账号身份，OAuth token
-	// 交换就绑定这台账号自己的代理/运行时画像，不会静默回退到核心全局代理；setup 为空时
-	// exchangeAuth 为 nil，newClaudeOAuthAuth 退回 claude.NewClaudeAuth(h.cfg)，行为不变。
-	exchangeAuth := h.prepareOAuthSetupRuntimeAuth("claude", setup)
+	// Initialize Claude auth service. A re-auth binds the exchange to the target
+	// account; a new-account setup synthesizes a temporary account identity so the
+	// exchange uses that account's own proxy. Neither falls back to the core global
+	// proxy. Only a request with neither (already gated on a usable global proxy
+	// above) uses claude.NewClaudeAuth(h.cfg).
+	exchangeAuth := targetAuth
+	if exchangeAuth == nil && setup != nil {
+		exchangeAuth = h.prepareOAuthSetupRuntimeAuth("claude", setup)
+	}
 	anthropicAuth := h.newClaudeOAuthAuth(ctx, exchangeAuth)
+	oauthTransportSummary := h.claudeOAuthTransportSummary(exchangeAuth)
 
 	// Generate authorization URL (then override redirect_uri to reuse server port)
 	authURL, state, err := anthropicAuth.GenerateAuthURL(state, pkceCodes)
@@ -112,11 +133,7 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 					SetOAuthSessionError(state, "Timeout waiting for OAuth callback")
 					return nil, fmt.Errorf("timeout waiting for OAuth callback")
 				}
-				data, errRead := os.ReadFile(path)
-				if errRead == nil {
-					var m map[string]string
-					_ = json.Unmarshal(data, &m)
-					_ = os.Remove(path)
+				if m, okRead := readOAuthCallbackFile(path); okRead {
 					return m, nil
 				}
 				time.Sleep(500 * time.Millisecond)
@@ -151,25 +168,73 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 		rawCode := resultMap["code"]
 		code := strings.Split(rawCode, "#")[0]
 
-		// Exchange code for tokens using internal auth service
-		bundle, errExchange := anthropicAuth.ExchangeCodeForTokens(ctx, code, state, pkceCodes)
+		// Exchange code for tokens. The exchange is bounded and retried on
+		// transient proxy/network errors; remote Management Center users paste the
+		// callback URL manually, so a stuck proxy would otherwise hang the UI.
+		safeState := maskOAuthStateForLog(state)
+		log.WithFields(log.Fields{
+			"state":             safeState,
+			"auth_name":         safeAuthNameForLog(targetAuthName),
+			"proxy_source":      oauthTransportSummary["proxy_source"],
+			"transport_profile": oauthTransportSummary["transport_profile"],
+			"tls_profile":       oauthTransportSummary["tls_profile"],
+		}).Info("Claude OAuth callback received; starting token exchange")
+		exchangeCtx, exchangeCancel := context.WithTimeout(ctx, anthropicOAuthExchangeTimeout)
+		if !SetOAuthSessionCancel(state, exchangeCancel) {
+			exchangeCancel()
+			return
+		}
+		bundle, errExchange := exchangeClaudeOAuthWithRetry(exchangeCtx, anthropicAuth, code, state, pkceCodes, safeState, targetAuthName)
+		if errExchange != nil && targetAuth != nil && isRetriableClaudeOAuthExchangeError(errExchange) {
+			// Last resort for a re-auth: the plain claude-cli OAuth client over the
+			// SAME account proxy (never the global proxy, never direct).
+			if fallbackAuth := h.newClaudeOAuthAccountProxyFallbackAuth(targetAuth); fallbackAuth != nil {
+				log.WithFields(log.Fields{
+					"state":        safeState,
+					"auth_name":    safeAuthNameForLog(targetAuthName),
+					"proxy_source": "account",
+				}).Warn("Claude OAuth exchange failed before an upstream response; retrying with the standard OAuth client over the same account proxy")
+				bundle, errExchange = exchangeClaudeOAuthWithRetry(exchangeCtx, fallbackAuth, code, state, pkceCodes, safeState, targetAuthName)
+			}
+		}
+		exchangeCtxErr := exchangeCtx.Err()
+		exchangeCancel()
 		if errExchange != nil {
 			authErr := claude.NewAuthenticationError(claude.ErrCodeExchangeFailed, errExchange)
 			log.Errorf("Failed to exchange authorization code for tokens: %v", authErr)
-			SetOAuthSessionError(state, "Failed to exchange authorization code for tokens")
+			switch {
+			case errors.Is(errExchange, context.DeadlineExceeded) || errors.Is(exchangeCtxErr, context.DeadlineExceeded):
+				SetOAuthSessionError(state, fmt.Sprintf("Claude OAuth token exchange timed out after %s", anthropicOAuthExchangeTimeout))
+			case errors.Is(errExchange, context.Canceled) || errors.Is(exchangeCtxErr, context.Canceled):
+				SetOAuthSessionError(state, "Claude OAuth token exchange was cancelled")
+			default:
+				SetOAuthSessionError(state, oauthSessionErrorWithCause("Failed to exchange authorization code for tokens", errExchange))
+			}
+			return
+		}
+		log.WithFields(log.Fields{
+			"state": safeState,
+			"email": maskEmailForLog(tokenStorageEmailForLog(bundle)),
+		}).Info("Claude OAuth token exchange completed")
+
+		// A card re-auth may only write the target's credential file when the
+		// browser login was the target account; otherwise nothing is persisted
+		// and no in-memory auth is touched.
+		if errIdentity := verifyClaudeReauthIdentity(targetAuth, tokenStorageEmailForLog(bundle)); errIdentity != nil {
+			log.WithFields(log.Fields{
+				"state":     safeState,
+				"auth_name": safeAuthNameForLog(targetAuthName),
+			}).Warnf("Claude OAuth re-auth rejected: %v", errIdentity)
+			SetOAuthSessionError(state, errIdentity.Error())
 			return
 		}
 
-		// Create token storage
+		// Create token storage. A re-auth keeps the target's ID, file name,
+		// proxy_url, note and scheduling metadata.
 		tokenStorage := anthropicAuth.CreateTokenStorage(bundle)
-		record := &coreauth.Auth{
-			ID:       fmt.Sprintf("claude-%s.json", tokenStorage.Email),
-			Provider: "claude",
-			FileName: fmt.Sprintf("claude-%s.json", tokenStorage.Email),
-			Storage:  tokenStorage,
-			Metadata: map[string]any{"email": tokenStorage.Email},
-		}
-		// 把 setup 的托管头种子和 proxy_url 等字段写进落库 record，保证新账号 proxy_url 不为空。
+		record := buildClaudeOAuthTokenRecord(targetAuth, tokenStorage)
+		// Carry the setup managed-header seed and proxy_url into the persisted
+		// record so a new account never lands with an empty proxy_url.
 		copyOAuthSetupSeed(record, exchangeAuth)
 		h.applyOAuthAccountSetupToRecord(record, setup)
 		if errGuard := guardOAuthSessionPendingForSave(state, "anthropic"); errGuard != nil {
@@ -199,10 +264,26 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 
 	fmt.Println("Initializing Codex authentication...")
 
-	// 解析可选的账号级 setup（note / proxy_url）；proxy_url 非法直接 400。
+	// Fork (fix-oauth-egress-anticorr): a card re-auth (auth_name) exchanges the
+	// code through the TARGET account's proxy and identity; a missing target or a
+	// target without a usable proxy is rejected before any outbound connection.
+	targetAuth, targetAuthName, errTarget := h.resolveOAuthReauthTarget(c, "codex")
+	if errTarget != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errTarget.Error()})
+		return
+	}
+
+	// Parse the optional account setup (note / proxy_url); an invalid proxy_url is a 400.
 	setup, errSetup := parseOAuthAccountSetupFromRequest(c)
 	if errSetup != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": errSetup.Error()})
+		return
+	}
+	if targetAuth != nil {
+		// A re-auth keeps the target's own proxy / note; setup fields are ignored.
+		setup = nil
+	} else if errEgress := h.checkOAuthStartEgress(setup); errEgress != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errEgress.Error()})
 		return
 	}
 
@@ -222,9 +303,16 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 		return
 	}
 
-	// Initialize Codex auth service. 新账号 setup 先合成一份临时账号身份，token 交换就走
-	// 账号自己的代理 + 托管头 + 运行时画像；setup 为空时退回核心全局 codex 服务，行为不变。
-	setupAuth := h.prepareOAuthSetupRuntimeAuth("codex", setup)
+	// Initialize Codex auth service. A re-auth binds the exchange to the target
+	// account; a new-account setup synthesizes a temporary account identity. Both
+	// exchange over that account's own proxy with its managed headers and the
+	// codex-rs ClientHello (see oauthIdentityHTTPClient). Only a request with
+	// neither (already gated on a usable global proxy above) uses the global
+	// codex service.
+	setupAuth := targetAuth
+	if setupAuth == nil {
+		setupAuth = h.prepareOAuthSetupRuntimeAuth("codex", setup)
+	}
 	openaiAuth := newCodexOAuthService(h.cfg)
 	if setupAuth != nil {
 		openaiAuth = codex.NewCodexAuthWithHTTPClient(h.oauthIdentityHTTPClient(ctx, "auth.openai.com", setupAuth, anthropicOAuthExchangeTimeout))
@@ -276,10 +364,7 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 				SetOAuthSessionError(state, "Timeout waiting for OAuth callback")
 				return
 			}
-			if data, errR := os.ReadFile(waitFile); errR == nil {
-				var m map[string]string
-				_ = json.Unmarshal(data, &m)
-				_ = os.Remove(waitFile)
+			if m, okRead := readOAuthCallbackFile(waitFile); okRead {
 				if errStr := m["error"]; errStr != "" {
 					oauthErr := codex.NewOAuthError(errStr, "", http.StatusBadRequest)
 					log.Error(codex.GetUserFriendlyMessage(oauthErr))
@@ -312,12 +397,30 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 		claims, _ := codex.ParseJWTToken(bundle.TokenData.IDToken)
 		planType := ""
 		hashAccountID := ""
+		loginAccountID := ""
+		loginEmail := strings.TrimSpace(bundle.TokenData.Email)
 		if claims != nil {
 			planType = strings.TrimSpace(claims.CodexAuthInfo.ChatgptPlanType)
-			if accountID := claims.GetAccountID(); accountID != "" {
-				digest := sha256.Sum256([]byte(accountID))
+			loginAccountID = strings.TrimSpace(claims.GetAccountID())
+			if loginEmail == "" {
+				loginEmail = strings.TrimSpace(claims.GetUserEmail())
+			}
+			if loginAccountID != "" {
+				digest := sha256.Sum256([]byte(loginAccountID))
 				hashAccountID = hex.EncodeToString(digest[:])[:8]
 			}
+		}
+
+		// A card re-auth may only persist when the browser login was the target
+		// ChatGPT account; otherwise the other account's file would inherit the
+		// target's proxy and managed-header seed. Nothing is written on mismatch.
+		if errIdentity := verifyCodexReauthIdentity(targetAuth, loginAccountID, loginEmail); errIdentity != nil {
+			log.WithFields(log.Fields{
+				"state":     maskOAuthStateForLog(state),
+				"auth_name": safeAuthNameForLog(targetAuthName),
+			}).Warnf("Codex OAuth re-auth rejected: %v", errIdentity)
+			SetOAuthSessionError(state, errIdentity.Error())
+			return
 		}
 
 		// Create token storage and persist
@@ -333,9 +436,23 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 				"account_id": tokenStorage.AccountID,
 			},
 		}
-		// 把 setup 的托管头种子和 proxy_url 等字段写进落库 record，保证新账号 proxy_url 不为空。
+		// Carry the managed-header seed and proxy_url into the persisted record so
+		// the account never lands with an empty proxy_url. A re-auth keeps the
+		// proxy the exchange actually used, even if the claims map to a new file.
 		copyOAuthSetupSeed(record, setupAuth)
+		if targetAuth != nil {
+			if proxyURL := authProxyURL(targetAuth); proxyURL != "" {
+				record.ProxyURL = proxyURL
+				record.Metadata["proxy_url"] = proxyURL
+			}
+			// Keep the target's operator settings and runtime identity instead of
+			// regenerating account_settings for an existing account.
+			inheritReauthAccountSettings(record, targetAuth)
+		}
 		h.applyOAuthAccountSetupToRecord(record, setup)
+		if targetAuth != nil {
+			h.preserveReauthRuntimeIdentityCreatedAt(record, targetAuth)
+		}
 		if errGuard := guardOAuthSessionPendingForSave(state, "codex"); errGuard != nil {
 			return
 		}
@@ -419,10 +536,7 @@ func (h *Handler) RequestAntigravityToken(c *gin.Context) {
 				SetOAuthSessionError(state, "OAuth flow timed out")
 				return
 			}
-			if data, errReadFile := os.ReadFile(waitFile); errReadFile == nil {
-				var payload map[string]string
-				_ = json.Unmarshal(data, &payload)
-				_ = os.Remove(waitFile)
+			if payload, okRead := readOAuthCallbackFile(waitFile); okRead {
 				if errStr := strings.TrimSpace(payload["error"]); errStr != "" {
 					log.Errorf("Authentication failed: %s", errStr)
 					SetOAuthSessionError(state, "Authentication failed")
