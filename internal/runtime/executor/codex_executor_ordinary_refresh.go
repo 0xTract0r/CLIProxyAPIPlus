@@ -1,9 +1,11 @@
 package executor
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"strings"
@@ -27,8 +29,11 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 	if auth == nil {
 		return nil, statusErr{code: 400, msg: "missing Codex credential", requestScoped: true}
 	}
-	if auth.Disabled {
+	if auth.Disabled || auth.Status == cliproxyauth.StatusDisabled {
 		return nil, statusErr{code: 403, msg: "Codex credential is disabled", requestScoped: true}
+	}
+	if auth.RefreshDisabled() || auth.AutoQuarantined {
+		return auth, nil
 	}
 	if fresh, handled, err := helps.RefreshAuthViaHome(ctx, e.cfg, auth); handled {
 		return fresh, err
@@ -69,7 +74,9 @@ func readOrdinaryCodexCredential(path string) (map[string]any, error) {
 		return nil, err
 	}
 	var record map[string]any
-	if err = json.Unmarshal(payload, &record); err != nil || record == nil {
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.UseNumber()
+	if err = decoder.Decode(&record); err != nil || record == nil || decoder.Decode(new(json.RawMessage)) != io.EOF {
 		return nil, fmt.Errorf("invalid Codex credential JSON")
 	}
 	return record, nil
@@ -106,6 +113,11 @@ func refreshOrdinaryCodexGrant(ctx context.Context, auth *cliproxyauth.Auth, dis
 		}
 		if tokenDisk != token {
 			return nil, ordinaryCodexGrantChanged()
+		}
+		disabled, _ := baseline["disabled"].(bool)
+		stored := &cliproxyauth.Auth{Metadata: baseline}
+		if disabled || stored.RefreshDisabled() {
+			return nil, cliproxyauth.ErrSelectedRefreshUnavailable
 		}
 		if accessDisk != access {
 			if accountDisk == "" || accountDisk != account || tokenDisk == "" || accessDisk == "" {

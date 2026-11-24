@@ -48,6 +48,9 @@ func (e *ClaudeExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (
 	if auth == nil {
 		return nil, statusErr{code: http.StatusBadRequest, msg: "missing Claude credential", requestScoped: true}
 	}
+	if auth.Disabled || auth.Status == cliproxyauth.StatusDisabled || auth.AutoQuarantined || auth.RefreshDisabled() {
+		return auth, nil
+	}
 	if refreshed, handled, err := helps.RefreshAuthViaHome(ctx, e.cfg, auth); handled {
 		return refreshed, err
 	}
