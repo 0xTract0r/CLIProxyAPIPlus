@@ -118,6 +118,7 @@ func TestOrdinaryHomeInitialSelectionFailures(t *testing.T) {
 	}{
 		{name: "home_unavailable", selectionErr: errors.New("synthetic local selection unavailable"), status: http.StatusServiceUnavailable},
 		{name: "invalid_auth", payload: []byte(`{}`), status: http.StatusBadGateway},
+		{name: "invalid_home_concurrency", payload: []byte(`{"concurrency":"invalid","auth":{"id":"home-auth","provider":"home-execution","status":"active"}}`), status: http.StatusBadGateway},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			for _, mode := range []string{"execute", "count", "stream"} {
