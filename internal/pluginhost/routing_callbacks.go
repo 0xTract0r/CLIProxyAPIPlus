@@ -28,7 +28,7 @@ func (h *Host) callHostRoutingResetCooldown(ctx context.Context, request []byte)
 		return nil, fmt.Errorf("core auth manager unavailable")
 	}
 	resetCtx := coreauth.WithSkipPersist(ctx)
-	updated, models, errReset := manager.ResetQuota(resetCtx, auth.ID)
+	updated, models, errReset := manager.ResetQuotaForSelection(resetCtx, auth)
 	if errReset != nil {
 		return nil, fmt.Errorf("reset cooldown: %w", errReset)
 	}

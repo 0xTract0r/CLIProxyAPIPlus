@@ -1138,7 +1138,83 @@ func dedupeStrings(values []string) []string {
 }
 
 // ResetQuota clears quota/cooldown state for an auth and resumes registry routing.
+// ErrQuotaResetProtected indicates that a manual reset may discard an active
+// or unverified service limit.
+var ErrQuotaResetProtected = errors.New("quota reset refused while a credential limit is active or unverified")
+
+// ErrQuotaResetSelectionChanged indicates the selected credential was replaced
+// before a manual reset acquired its mutation lock.
+var ErrQuotaResetSelectionChanged = errors.New("quota reset refused because the selected credential changed")
+
+// CheckQuotaReset verifies the selected credential before reporting a plugin
+// operation unavailable. It does not dispatch a plugin or mutate state.
+func (m *Manager) CheckQuotaReset(selected *Auth) error {
+	if m == nil || selected == nil {
+		return ErrQuotaResetSelectionChanged
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	current := m.auths[selected.ID]
+	if !sameQuotaResetSelection(current, selected) {
+		return ErrQuotaResetSelectionChanged
+	}
+	if quotaResetProtected(current, time.Now()) {
+		return ErrQuotaResetProtected
+	}
+	return nil
+}
+
+func sameQuotaResetSelection(current, selected *Auth) bool {
+	return current != nil && selected != nil && current.ID == selected.ID && current.Index == selected.Index &&
+		current.RegistrationEpoch == selected.RegistrationEpoch && current.CredentialVersion == selected.CredentialVersion
+}
+
+func quotaResetWindow(now time.Time, quota QuotaState, last *Error, unavailable bool, deadlines ...time.Time) bool {
+	if quota.NextRecoverAt.After(now) || (quota.Exceeded && quota.NextRecoverAt.IsZero()) {
+		return true
+	}
+	for _, deadline := range deadlines {
+		if deadline.After(now) {
+			return true
+		}
+	}
+	return unavailable && last != nil && last.HTTPStatus == http.StatusTooManyRequests &&
+		(!quota.Exceeded || quota.NextRecoverAt.IsZero())
+}
+
+func modelQuotaResetProtected(state *ModelState, now time.Time) bool {
+	return state != nil && quotaResetWindow(now, state.Quota, state.LastError, state.Unavailable || state.Status == StatusError,
+		state.NextRetryAfter, state.forceCooldownUntil, state.quotaForceCooldownUntil, state.nonQuotaCooldownUntil)
+}
+
+func quotaResetProtected(auth *Auth, now time.Time) bool {
+	if quotaResetWindow(now, auth.Quota, auth.LastError, auth.Unavailable || auth.Status == StatusError,
+		auth.NextRetryAfter, auth.forceCooldownUntil, auth.quotaForceCooldownUntil, auth.credQuotaForceUntil,
+		auth.credentialRetryAfter, auth.nonAuthCredentialRetryAfter, auth.nonQuotaCooldownUntil) {
+		return true
+	}
+	for _, state := range auth.ModelStates {
+		if modelQuotaResetProtected(state, now) || (state != nil && modelQuotaResetProtected(state.credentialQuotaShadow, now)) {
+			return true
+		}
+	}
+	return false
+}
+
 func (m *Manager) ResetQuota(ctx context.Context, authID string) (*Auth, []string, error) {
+	return m.resetQuota(ctx, authID, nil)
+}
+
+// ResetQuotaForSelection atomically resets local routing state only when the
+// credential still matches the original management selection.
+func (m *Manager) ResetQuotaForSelection(ctx context.Context, selected *Auth) (*Auth, []string, error) {
+	if selected == nil {
+		return nil, nil, ErrQuotaResetSelectionChanged
+	}
+	return m.resetQuota(ctx, selected.ID, selected)
+}
+
+func (m *Manager) resetQuota(ctx context.Context, authID string, selected *Auth) (*Auth, []string, error) {
 	if m == nil {
 		return nil, nil, nil
 	}
@@ -1157,9 +1233,17 @@ func (m *Manager) ResetQuota(ctx context.Context, authID string) (*Auth, []strin
 	defer releaseMutation()
 	m.mu.Lock()
 	auth, ok := m.auths[authID]
+	if selected != nil && !sameQuotaResetSelection(auth, selected) {
+		m.mu.Unlock()
+		return nil, nil, ErrQuotaResetSelectionChanged
+	}
 	if !ok || auth == nil {
 		m.mu.Unlock()
 		return nil, nil, nil
+	}
+	if quotaResetProtected(auth, now) {
+		m.mu.Unlock()
+		return nil, nil, ErrQuotaResetProtected
 	}
 
 	var cooldownRecordsBefore []CooldownStateRecord
