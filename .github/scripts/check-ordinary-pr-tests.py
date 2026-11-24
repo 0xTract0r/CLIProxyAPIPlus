@@ -65,6 +65,8 @@ REQUIRED = {
     },
     "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy": {
         "TestOrdinaryRetiredFallbackNotInPublicCatalog",
+        "TestOrdinaryServiceHTTPAdmissionCancelsWaitingAndReleasesStream",
+        "TestOrdinaryServiceHTTPAdmissionPreservesRetryAfter",
         "TestOrdinaryExternallyImplementedLegacyProviderKeepsExecutableCatalog",
     },
     "github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor": {
@@ -73,6 +75,8 @@ REQUIRED = {
         "TestOrdinaryClaudeIndependentPublicMessages/stream",
         "TestOrdinaryClaudePayloadRulesOnPublicMessages",
         "TestOrdinaryClaudePublicTokenCountUsesOnlyCurrentInput",
+        "TestOrdinaryGeminiRejectsForeignSignatureBeforeTransport",
+        "TestOrdinaryGeminiInteractionsRejectsForeignAndKeepsOpaque",
     },
     "github.com/router-for-me/CLIProxyAPI/v8/test": {
         "TestOrdinarySingleGrantUpstream502AcrossPublicRoutes",
