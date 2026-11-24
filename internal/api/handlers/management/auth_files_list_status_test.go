@@ -5,17 +5,24 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
 func TestListAuthFilesIncludesLiveStatusFields(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
 	gin.SetMode(gin.TestMode)
 
+	authDir := t.TempDir()
+	filePath := filepath.Join(authDir, "claude-status.json")
+	if err := os.WriteFile(filePath, []byte(`{"type":"claude","email":"fixture@example.invalid"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
 	store := &memoryAuthStore{}
 	manager := coreauth.NewManager(store, nil, nil)
 	record := &coreauth.Auth{
@@ -27,7 +34,7 @@ func TestListAuthFilesIncludesLiveStatusFields(t *testing.T) {
 		StatusMessage: "token refresh failed with status 401: invalid_grant",
 		Unavailable:   true,
 		Attributes: map[string]string{
-			"path": "/tmp/claude-status.json",
+			"path": filePath,
 		},
 		Metadata: map[string]any{
 			"type":  "claude",
@@ -38,7 +45,7 @@ func TestListAuthFilesIncludesLiveStatusFields(t *testing.T) {
 		t.Fatalf("register auth: %v", errRegister)
 	}
 
-	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
 
 	rec := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(rec)

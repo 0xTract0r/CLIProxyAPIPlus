@@ -16,8 +16,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -91,6 +91,12 @@ type DiscoveredModel struct {
 
 type AuthClient struct {
 	httpClient *http.Client
+}
+
+// NewAuthClientWithHTTPClient permits the web OAuth caller to enforce its
+// redirect policy and timeout without changing the CLI's client.
+func NewAuthClientWithHTTPClient(client *http.Client) *AuthClient {
+	return &AuthClient{httpClient: client}
 }
 
 func NewAuthClient(cfg *config.Config) *AuthClient {

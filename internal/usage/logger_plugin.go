@@ -6,16 +6,17 @@ package usage
 import (
 	"context"
 	"fmt"
+	"maps"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/gin-gonic/gin"
-	internallogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
+	internallogging "github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	coreusage "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
 )
 
 var statisticsEnabled atomic.Bool
@@ -44,7 +45,7 @@ func NewLoggerPlugin() *LoggerPlugin { return &LoggerPlugin{stats: defaultReques
 //   - ctx: The context for the usage record
 //   - record: The usage record to aggregate
 func (p *LoggerPlugin) HandleUsage(ctx context.Context, record coreusage.Record) {
-	if p == nil || p.stats == nil {
+	if p == nil || p.stats == nil || coreusage.HasRequestObserver(ctx) {
 		return
 	}
 	p.stats.Record(ctx, record)
@@ -58,8 +59,29 @@ func StatisticsEnabled() bool { return statisticsEnabled.Load() }
 
 // RequestStatistics maintains aggregated request metrics in memory.
 type RequestStatistics struct {
+	observerMu           sync.RWMutex
+	recordingDisabled    bool
+	observerClosed       bool
+	knownUsageKeyBuckets map[string]struct{}
+
 	mu sync.RWMutex
 
+	statisticsData
+
+	persistMu            sync.Mutex // serialize restore, snapshot capture, and publication
+	persistPath          string
+	persistRevision      snapshotRevision // guarded by persistMu
+	persistLineage       uint64           // guarded by persistMu
+	persistRestoreFailed bool             // guarded by persistMu
+
+	persistRunning atomic.Bool
+	persistDirty   atomic.Bool
+
+	catalog *PricingCatalogManager
+}
+
+// statisticsData holds the state published after a durable history change.
+type statisticsData struct {
 	totalRequests       int64
 	successCount        int64
 	failureCount        int64
@@ -69,8 +91,6 @@ type RequestStatistics struct {
 	unpricedRequests    int64
 	unfinalizedRequests int64
 
-	persistPath string
-
 	apis map[string]*apiStats
 
 	requestsByDay    map[string]int64
@@ -79,11 +99,6 @@ type RequestStatistics struct {
 	tokensByHour     map[int]int64
 	costByDayMicros  map[string]int64
 	costByHourMicros map[int]int64
-
-	persistRunning atomic.Bool
-	persistDirty   atomic.Bool
-
-	catalog *PricingCatalogManager
 }
 
 // apiStats holds aggregated metrics for a single API key.
@@ -111,6 +126,7 @@ type modelStats struct {
 
 // RequestDetail stores the timestamp, latency, and token usage for a single request.
 type RequestDetail struct {
+	APIKeyHash      string `json:"api_key_hash,omitempty"`
 	ServiceTier     string `json:"service_tier,omitempty"`
 	ReasoningEffort string `json:"reasoning_effort,omitempty"`
 	TTFTMs          int64  `json:"ttft_ms,omitempty"`
@@ -240,21 +256,54 @@ func NewRequestStatisticsWithCatalog(catalog *PricingCatalogManager) *RequestSta
 		catalog = defaultPricingCatalog
 	}
 	return &RequestStatistics{
-		apis:             make(map[string]*apiStats),
-		requestsByDay:    make(map[string]int64),
-		requestsByHour:   make(map[int]int64),
-		tokensByDay:      make(map[string]int64),
-		tokensByHour:     make(map[int]int64),
-		costByDayMicros:  make(map[string]int64),
-		costByHourMicros: make(map[int]int64),
-		catalog:          catalog,
+		statisticsData: statisticsData{
+			apis:             make(map[string]*apiStats),
+			requestsByDay:    make(map[string]int64),
+			requestsByHour:   make(map[int]int64),
+			tokensByDay:      make(map[string]int64),
+			tokensByHour:     make(map[int]int64),
+			costByDayMicros:  make(map[string]int64),
+			costByHourMicros: make(map[int]int64),
+		},
+		catalog: catalog,
 	}
+}
+
+// cloneStatisticsDataLocked is used only when a transaction adds details.
+func (s *RequestStatistics) cloneStatisticsDataLocked() statisticsData {
+	data := s.statisticsData
+	data.requestsByDay = maps.Clone(data.requestsByDay)
+	data.requestsByHour = maps.Clone(data.requestsByHour)
+	data.tokensByDay = maps.Clone(data.tokensByDay)
+	data.tokensByHour = maps.Clone(data.tokensByHour)
+	data.costByDayMicros = maps.Clone(data.costByDayMicros)
+	data.costByHourMicros = maps.Clone(data.costByHourMicros)
+	data.apis = maps.Clone(data.apis)
+	for name, stats := range data.apis {
+		if stats == nil {
+			continue
+		}
+		copyAPI := *stats
+		copyAPI.Models = maps.Clone(stats.Models)
+		for model, stats := range copyAPI.Models {
+			if stats == nil {
+				continue
+			}
+			copyModel := *stats
+			copyModel.Details = slices.Clone(stats.Details)
+			copyAPI.Models[model] = &copyModel
+		}
+		data.apis[name] = &copyAPI
+	}
+	return data
 }
 
 // Record ingests a new usage record and updates the aggregates.
 func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record) {
-	detail := normaliseDetail(record.Detail)
-	pacingHandled := coreauth.RecordAccountPacingUsage(ctx, record.Provider, strings.TrimSpace(record.AuthID), schedulerBillableTokens(detail))
+	detail, err := normaliseDetail(record.Detail)
+	if err != nil {
+		return
+	}
 	if s == nil {
 		return
 	}
@@ -265,26 +314,18 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 	if timestamp.IsZero() {
 		timestamp = time.Now()
 	}
-	// Harden P1b/P3: feed the adaptive account scheduler off this completed request.
-	//   - real-time upstream rate-limit headers -> the per-account live headroom
-	//     overlay (selection prefers it over the slower quota snapshot);
-	//   - non-cache-read billable tokens -> the per-account warm-up token budget
-	//     (activates the first batch's inert token gate).
-	// Both are strict no-ops unless an adaptive Manager is active, so ordinary
-	// deployments are byte-identical. Done here in the single usage sink so stream
-	// and non-stream requests are covered uniformly (the executor paths that publish
-	// usage all funnel through here).
-	if scheduleAuthID := strings.TrimSpace(record.AuthID); scheduleAuthID != "" {
-		coreauth.IngestServingRateHeaders(record.Provider, scheduleAuthID, record.ResponseHeaders, timestamp)
-		if gateTokens := schedulerBillableTokens(detail); !pacingHandled && gateTokens > 0 {
-			coreauth.RecordAccountBillableTokens(scheduleAuthID, int(gateTokens))
-		}
-	}
+	s.recordStatistics(ctx, record, detail, timestamp)
+}
+
+func (s *RequestStatistics) recordStatistics(ctx context.Context, record coreusage.Record, detail TokenStats, timestamp time.Time) {
 	totalTokens := detail.TotalTokens
 	totalBillableTokens := detail.BillableTokens
-	statsKey := record.APIKey
+	statsKey := strings.TrimSpace(record.APIKey)
 	if statsKey == "" {
-		statsKey = resolveAPIIdentifier(ctx, record)
+		statsKey = strings.TrimSpace(resolveAPIIdentifier(ctx, record))
+		if statsKey == "" {
+			statsKey = "unknown"
+		}
 	}
 	failed := record.Failed
 	if !failed {
@@ -311,6 +352,7 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 		sessionID = coreauth.SessionIDFromContext(ctx)
 	}
 	requestDetail := RequestDetail{
+		APIKeyHash:      usageKeyHash(statsKey),
 		ServiceTier:     record.ServiceTier,
 		ReasoningEffort: record.ReasoningEffort,
 		TTFTMs:          record.TTFT.Milliseconds(),
@@ -331,7 +373,15 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 		requestDetail.PricingStatus = string(pricing.State)
 	}
 
+	if err := checkUsageDetail(requestDetail); err != nil {
+		return
+	}
 	s.mu.Lock()
+	remaining := s.usageCapacityLocked()
+	if !remaining.consume(detail, pricing) {
+		s.mu.Unlock()
+		return
+	}
 
 	s.totalRequests++
 	if success {
@@ -796,14 +846,46 @@ func (s *RequestStatistics) MergeSnapshot(snapshot StatisticsSnapshot) MergeResu
 }
 
 func (s *RequestStatistics) mergeSnapshot(snapshot StatisticsSnapshot, persist bool) MergeResult {
-	result := MergeResult{}
+	return s.mergeSnapshotDetails(snapshot, persist, false)
+}
+
+// A disk snapshot owns the request details it contains. Match existing records
+// one-for-one so a restore is idempotent without dropping repeated stored rows.
+func (s *RequestStatistics) mergeSnapshotDetails(snapshot StatisticsSnapshot, persist, restore bool) MergeResult {
+	result, _ := s.mergeSnapshotChecked(snapshot, persist, restore)
+	return result
+}
+
+// ImportSnapshot validates the incoming request details as one batch before
+// adding any of them. Export pages need only contain their own details.
+func (s *RequestStatistics) ImportSnapshot(snapshot StatisticsSnapshot) (MergeResult, error) {
+	return s.mergeSnapshotChecked(snapshot, true, false)
+}
+
+func (s *RequestStatistics) mergeSnapshotChecked(snapshot StatisticsSnapshot, persist, restore bool) (MergeResult, error) {
 	if s == nil {
-		return result
+		return MergeResult{}, nil
 	}
-
 	s.mu.Lock()
+	result, err := s.mergeSnapshotLocked(snapshot, restore)
+	s.mu.Unlock()
+	if err == nil && persist && result.Added > 0 {
+		s.schedulePersistence()
+	}
+	return result, err
+}
 
-	seen := make(map[string]struct{})
+func (s *RequestStatistics) mergeSnapshotLocked(snapshot StatisticsSnapshot, restore bool) (MergeResult, error) {
+	var result MergeResult
+	type pendingDetail struct {
+		apiName, modelName string
+		detail             RequestDetail
+		pricing            pricingTotals
+	}
+	var pending []pendingDetail
+	var apiNames []string
+	remaining := s.usageCapacityLocked()
+	seen := make(map[string]int)
 	for apiName, stats := range s.apis {
 		if stats == nil {
 			continue
@@ -813,65 +895,80 @@ func (s *RequestStatistics) mergeSnapshot(snapshot StatisticsSnapshot, persist b
 				continue
 			}
 			for _, detail := range modelStatsValue.Details {
-				seen[dedupKey(apiName, modelName, detail)] = struct{}{}
+				seen[dedupKey(apiName, modelName, detail)]++
 			}
 		}
 	}
 
 	for apiName, apiSnapshot := range snapshot.APIs {
-		apiName = strings.TrimSpace(apiName)
+		apiName = s.normalizeUsageBucketLocked(strings.TrimSpace(apiName))
 		if apiName == "" {
 			continue
 		}
-		stats, ok := s.apis[apiName]
-		if !ok || stats == nil {
-			stats = &apiStats{Models: make(map[string]*modelStats)}
-			s.apis[apiName] = stats
-		} else if stats.Models == nil {
-			stats.Models = make(map[string]*modelStats)
-		}
+		apiNames = append(apiNames, apiName)
 		for modelName, modelSnapshot := range apiSnapshot.Models {
 			modelName = strings.TrimSpace(modelName)
 			if modelName == "" {
 				modelName = "unknown"
 			}
 			for _, detail := range modelSnapshot.Details {
-				detail.Tokens = normaliseTokenStats(detail.Tokens)
+				tokens, err := checkedUsageTokens(detail.Tokens)
+				if err != nil {
+					return MergeResult{}, err
+				}
+				detail.Tokens = tokens
 				if detail.LatencyMs < 0 {
 					detail.LatencyMs = 0
 				}
 				if detail.Timestamp.IsZero() {
 					detail.Timestamp = time.Now()
 				}
+				if err := checkUsageDetail(detail); err != nil {
+					return MergeResult{}, err
+				}
 				key := dedupKey(apiName, modelName, detail)
-				if _, exists := seen[key]; exists {
+				if hash := usageKeyHash(apiName); hash != "" {
+					detail.APIKeyHash, detail.Source = hash, apiName
+				}
+				if seen[key] > 0 {
+					if restore {
+						seen[key]--
+					}
 					result.Skipped++
 					continue
 				}
-				seen[key] = struct{}{}
-				s.recordImported(apiName, modelName, stats, detail)
-				result.Added++
+				if !restore {
+					seen[key] = 1
+				}
+				pricing := s.computeDetailPricing(modelName, detail.Tokens)
+				if !remaining.consume(detail.Tokens, pricing) {
+					return MergeResult{}, errUsageCapacity
+				}
+				pending = append(pending, pendingDetail{apiName, modelName, detail, pricing})
 			}
 		}
 	}
 
-	s.mu.Unlock()
-	if persist && result.Added > 0 {
-		s.schedulePersistence()
+	for _, name := range apiNames {
+		stats := s.apis[name]
+		if stats == nil {
+			stats = &apiStats{}
+			s.apis[name] = stats
+		}
+		if stats.Models == nil {
+			stats.Models = make(map[string]*modelStats)
+		}
 	}
-
-	return result
+	for _, row := range pending {
+		s.recordImported(row.modelName, s.apis[row.apiName], row.detail, row.pricing)
+	}
+	result.Added = int64(len(pending))
+	return result, nil
 }
 
-func (s *RequestStatistics) recordImported(apiName, modelName string, stats *apiStats, detail RequestDetail) {
+func (s *RequestStatistics) recordImported(modelName string, stats *apiStats, detail RequestDetail, pricing pricingTotals) {
 	totalTokens := detail.Tokens.TotalTokens
-	if totalTokens < 0 {
-		totalTokens = 0
-	}
 	totalBillableTokens := detail.Tokens.BillableTokens
-	if totalBillableTokens < 0 {
-		totalBillableTokens = billableTokenCount(detail.Tokens)
-	}
 
 	s.totalRequests++
 	if detail.Failed {
@@ -882,7 +979,6 @@ func (s *RequestStatistics) recordImported(apiName, modelName string, stats *api
 	s.totalTokens += totalTokens
 	s.totalBillableTokens += totalBillableTokens
 
-	pricing := s.computeDetailPricing(modelName, detail.Tokens)
 	if detail.CostUSD == 0 {
 		detail.CostUSD = microsToUSD(pricing.CostMicros)
 	}
@@ -1082,11 +1178,17 @@ func (s *RequestStatistics) PutPricingOverride(model string, override PricingMod
 
 // DeletePricingOverride removes a manual pricing override and recalculates historical usage costs.
 func (s *RequestStatistics) DeletePricingOverride(model string) bool {
-	deleted := s.pricingCatalog().DeleteOverride(model)
+	deleted, _ := s.DeletePricingOverrideWithError(model)
+	return deleted
+}
+
+// DeletePricingOverrideWithError reports failed persistence to management callers.
+func (s *RequestStatistics) DeletePricingOverrideWithError(model string) (bool, error) {
+	deleted, err := s.pricingCatalog().DeleteOverrideWithError(model)
 	if deleted {
 		s.RecalculatePricing()
 	}
-	return deleted
+	return deleted, err
 }
 
 // RecalculatePricing recomputes all cost fields from the current pricing catalog.
@@ -1230,23 +1332,8 @@ func pricingStatusString(state pricingState) string {
 }
 
 func resolveAPIIdentifier(ctx context.Context, record coreusage.Record) string {
-	if ctx != nil {
-		if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil {
-			path := ginCtx.FullPath()
-			if path == "" && ginCtx.Request != nil {
-				path = ginCtx.Request.URL.Path
-			}
-			method := ""
-			if ginCtx.Request != nil {
-				method = ginCtx.Request.Method
-			}
-			if path != "" {
-				if method != "" {
-					return method + " " + path
-				}
-				return path
-			}
-		}
+	if endpoint := strings.TrimSpace(internallogging.GetEndpoint(ctx)); endpoint != "" {
+		return endpoint
 	}
 	if record.Provider != "" {
 		return record.Provider
@@ -1255,45 +1342,23 @@ func resolveAPIIdentifier(ctx context.Context, record coreusage.Record) string {
 }
 
 func resolveSuccess(ctx context.Context) bool {
-	if ctx == nil {
-		return true
-	}
-	ginCtx, ok := ctx.Value("gin").(*gin.Context)
-	if !ok || ginCtx == nil {
-		return true
-	}
-	status := ginCtx.Writer.Status()
-	if status == 0 {
-		return true
-	}
-	return status < httpStatusBadRequest
+	status := internallogging.GetResponseStatus(ctx)
+	return status == 0 || status < httpStatusBadRequest
 }
 
 const httpStatusBadRequest = 400
 
-func normaliseDetail(detail coreusage.Detail) TokenStats {
+func normaliseDetail(detail coreusage.Detail) (TokenStats, error) {
 	tokens := TokenStats{
 		InputTokens:      detail.InputTokens,
 		OutputTokens:     detail.OutputTokens,
 		ReasoningTokens:  detail.ReasoningTokens,
 		CachedTokens:     detail.CachedTokens,
 		CacheReadTokens:  detail.CacheReadTokens,
-		CacheWriteTokens: detail.CacheWriteTokens,
+		CacheWriteTokens: detail.EffectiveCacheCreationTokens(),
 		TotalTokens:      detail.TotalTokens,
 	}
-	if tokens.CacheReadTokens == 0 && tokens.CachedTokens > 0 {
-		tokens.CacheReadTokens = tokens.CachedTokens
-	}
-	if tokens.CachedTokens == 0 && tokens.CacheReadTokens > 0 {
-		tokens.CachedTokens = tokens.CacheReadTokens
-	}
-	if tokens.TotalTokens == 0 {
-		tokens.TotalTokens = detail.InputTokens + detail.OutputTokens + detail.ReasoningTokens
-	}
-	if tokens.BillableTokens == 0 {
-		tokens.BillableTokens = billableTokenCount(tokens)
-	}
-	return tokens
+	return checkedUsageTokens(tokens)
 }
 
 func normaliseTokenStats(tokens TokenStats) TokenStats {
@@ -1319,24 +1384,6 @@ func billableTokenCount(tokens TokenStats) int64 {
 	}
 	cacheRead := maxInt64(tokens.CacheReadTokens, tokens.CachedTokens)
 	return total + cacheRead + tokens.CacheWriteTokens
-}
-
-// schedulerBillableTokens is the non-cache-read billable token count fed into the
-// adaptive per-account warm-up token budget (harden P3). It deliberately EXCLUDES
-// cache-read tokens (ITPM semantics: cached reads do not count toward the input-
-// token-per-minute pressure the warm-up token budget guards), unlike
-// billableTokenCount which adds them for cost/pricing accounting. Cache-WRITE
-// tokens (a real, billed write) are kept. Returns 0 when nothing is countable.
-func schedulerBillableTokens(tokens TokenStats) int64 {
-	total := tokens.TotalTokens
-	if total == 0 {
-		total = tokens.InputTokens + tokens.OutputTokens + tokens.ReasoningTokens
-	}
-	v := total + tokens.CacheWriteTokens
-	if v < 0 {
-		return 0
-	}
-	return v
 }
 
 func normaliseLatency(latency time.Duration) int64 {

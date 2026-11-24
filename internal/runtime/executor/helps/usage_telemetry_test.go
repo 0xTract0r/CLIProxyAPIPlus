@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
 )
 
 func TestTelemetryHTTPStreamingAndTLS(t *testing.T) {
@@ -53,7 +53,7 @@ func TestTelemetryContentStallSnapshotsAndSplitBilling(t *testing.T) {
 	r.requestedAt = time.Now().Add(-2 * time.Second)
 	r.ObserveContentEvent([]byte(`{"type":"response.output_text.delta","delta":"a"}`))
 	// Set the previous event offset to exercise the 1000 ms rule without sleeping.
-	r.telemetry.LastContentMS = intPtr(0)
+	r.telemetry.LastContentMS = telemetryMillisPtr(0)
 	first := r.buildRecord(usage.Detail{}, false)
 	r.ObserveContentEvent([]byte(`{"type":"response.function_call_arguments.delta","delta":"{}"}`))
 	r.ObserveContentEvent([]byte(`{"type":"response.completed"}`))
@@ -86,7 +86,7 @@ func TestTelemetrySSEBoundedAndUnsupported(t *testing.T) {
 
 func TestContentEventObserverHandlesKnownSSEWithNonSSEHeaders(t *testing.T) {
 	r := NewUsageReporter(context.Background(), "codex", "test", nil)
-	r.SetCodexFastContext([]byte(`{}`), []byte(`{}`), false)
+	r.telemetry.Version = 2
 	r.UseDecodedContentTelemetry()
 	observer := r.ContentEventObserver()
 	first := `data: {"type":"response.output_text.delta","delta":"hello"}` + "\n"
@@ -113,7 +113,7 @@ func TestContentEventObserverHandlesKnownSSEWithNonSSEHeaders(t *testing.T) {
 
 func TestDecodedContentTelemetryKeepsUnsupportedVisibleEventsIncomplete(t *testing.T) {
 	r := NewUsageReporter(context.Background(), "codex", "test", nil)
-	r.SetCodexFastContext([]byte(`{}`), []byte(`{}`), false)
+	r.telemetry.Version = 2
 	r.UseDecodedContentTelemetry()
 	r.ObserveContentEvent([]byte(`{"type":"response.unknown_visible.delta","delta":"future"}`))
 	r.ObserveContentEvent([]byte(`{"type":"response.output_text.delta","delta":"known"}`))

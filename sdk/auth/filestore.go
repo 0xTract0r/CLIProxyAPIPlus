@@ -3,9 +3,9 @@ package auth
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
-	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -15,8 +15,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/codex"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
 // PluginAuthParser parses auth JSON owned by plugin providers.
@@ -55,15 +56,32 @@ func currentPluginAuthParser() PluginAuthParser {
 
 // FileTokenStore persists token records and auth metadata using the filesystem as backing storage.
 type FileTokenStore struct {
-	mu      sync.Mutex
-	dirLock sync.RWMutex
-	baseDir string
+	mu            sync.Mutex
+	sharedWriteMu *sync.Mutex
+	dirLock       sync.RWMutex
+	baseDir       string
 }
 
 // NewFileTokenStore creates a token store that saves credentials to disk through the
 // TokenStorage implementation embedded in the token record.
 func NewFileTokenStore() *FileTokenStore {
 	return &FileTokenStore{}
+}
+
+// WithBaseDir returns a directory view of this store. Views share the
+// original store's write lock, but changing a view's directory is local to it.
+func (s *FileTokenStore) WithBaseDir(dir string) *FileTokenStore {
+	return &FileTokenStore{
+		baseDir:       strings.TrimSpace(dir),
+		sharedWriteMu: s.writeMutex(),
+	}
+}
+
+func (s *FileTokenStore) writeMutex() *sync.Mutex {
+	if s.sharedWriteMu != nil {
+		return s.sharedWriteMu
+	}
+	return &s.mu
 }
 
 // SetBaseDir updates the default directory used for auth JSON persistence when no explicit path is provided.
@@ -78,6 +96,10 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 	if auth == nil {
 		return "", fmt.Errorf("auth filestore: auth is nil")
 	}
+	cliproxyauth.NormalizeCredentialMetadata(auth.Metadata)
+	if errWeight := cliproxyauth.ValidateAuthWeight(auth); errWeight != nil {
+		return "", fmt.Errorf("auth filestore: %w", errWeight)
+	}
 
 	path, err := s.resolveAuthPath(auth)
 	if err != nil {
@@ -87,63 +109,133 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 		return "", fmt.Errorf("auth filestore: missing file path attribute for %s", auth.ID)
 	}
 
-	if auth.Disabled {
+	if patch, ok := explicitAccountSettingsPatch(ctx); ok &&
+		(patch.selectedCodexLogin || patch.file.Valid() || (auth.Storage == nil && !cliproxyauth.IsCodexAuthRecord(auth))) {
+		return s.saveAccountSettingsPatch(path, auth, patch)
+	}
+
+	// Runtime updates must not recreate a disabled credential whose source file
+	// was deliberately removed. Login and migration callers explicitly mark the
+	// save when creating a missing disabled credential is intentional.
+	explicitEdit := cliproxyauth.IsExplicitCredentialEdit(ctx)
+	xaiLogin := cliproxyauth.HasAuthCreationIntent(ctx) && strings.EqualFold(auth.Provider, "xai")
+	if !explicitEdit && auth.Disabled && !cliproxyauth.HasAuthCreationIntent(ctx) {
 		if _, statErr := os.Stat(path); os.IsNotExist(statErr) {
 			return "", nil
 		}
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	writeMu := s.writeMutex()
+	writeMu.Lock()
+	defer writeMu.Unlock()
+
+	if explicitEdit {
+		if err := s.requireScopedExistingAuthFile(path); err != nil {
+			return "", err
+		}
+	}
 
 	if err = os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return "", fmt.Errorf("auth filestore: create dir failed: %w", err)
 	}
 
-	// Snapshot the current on-disk auth JSON before overwriting it, keeping a rolling
-	// window of the most recent versions for recovery. Snapshotting is best-effort:
-	// a snapshot failure must never block persisting the new auth state.
-	snapshotAuthFileHistory(path)
+	// 专用持久化自行获取写锁，保留其原有的快照时机。
+	if cliproxyauth.IsCodexAuthRecord(auth) {
+		snapshotAuthFileHistory(path)
+	}
 
 	// metadataSetter is a private interface for TokenStorage implementations that support metadata injection.
 	type metadataSetter interface {
 		SetMetadata(map[string]any)
 	}
 
-	switch {
-	case auth.Storage != nil:
-		if auth.Metadata == nil {
-			auth.Metadata = make(map[string]any)
+	if handled, errCodex := cliproxyauth.PersistCodexAuthFile(ctx, path, auth); handled {
+		if errCodex != nil {
+			return "", errCodex
 		}
-		auth.Metadata["disabled"] = auth.Disabled
-		if setter, ok := auth.Storage.(metadataSetter); ok {
-			setter.SetMetadata(auth.Metadata)
+	} else {
+		lockPath := path
+		if xaiLogin || (auth.Storage == nil && auth.Metadata != nil) {
+			lockPath, err = ordinaryAuthWritePath(path)
+			if err != nil {
+				return "", err
+			}
 		}
-		if err = auth.Storage.SaveTokenToFile(path); err != nil {
+		// 非 Codex 覆盖也可能替换仍有 SIWC 写入的 Codex 文件。
+		// 与上面的 Codex 持久化一致：先 store mutex，后 file lock；不能在 Save 外套锁。
+		var plan *XAILoginPersistence
+		if xaiLogin {
+			plan, _ = ctx.Value(xaiLoginPlanKey{}).(*XAILoginPersistence)
+		}
+		if err = codex.WithFileLock(lockPath, func() error {
+			if xaiLogin {
+				current, errPath := ordinaryAuthWritePath(path)
+				if errPath != nil {
+					return errPath
+				}
+				if current != lockPath {
+					return cliproxyauth.ErrFileRemovalBusy
+				}
+				existing, errTarget := xaiLoginDestination(path, auth.Metadata)
+				if errTarget != nil {
+					return errTarget
+				}
+				if plan != nil {
+					if err := plan.verifyLocked(lockPath, existing); err != nil {
+						return err
+					}
+				}
+			}
+			switch {
+			case auth.Storage != nil:
+				if auth.Metadata == nil {
+					auth.Metadata = make(map[string]any)
+				}
+				auth.Metadata["disabled"] = auth.Disabled
+				if setter, ok := auth.Storage.(metadataSetter); ok {
+					setter.SetMetadata(auth.Metadata)
+				}
+				snapshotAuthFileHistory(path)
+				if err = auth.Storage.SaveTokenToFile(path); err != nil {
+					return err
+				}
+			case auth.Metadata != nil:
+				current, errPath := ordinaryAuthWritePath(path)
+				if errPath != nil {
+					return errPath
+				}
+				if current != lockPath {
+					if _, statErr := os.Stat(path); explicitEdit && os.IsNotExist(statErr) {
+						return cliproxyauth.ErrCredentialFileRemoved
+					}
+					return cliproxyauth.ErrFileRemovalBusy
+				}
+				auth.Metadata["disabled"] = auth.Disabled
+				raw, errMarshal := json.Marshal(auth.Metadata)
+				if errMarshal != nil {
+					return fmt.Errorf("auth filestore: marshal metadata failed: %w", errMarshal)
+				}
+				if existing, errRead := os.ReadFile(path); errRead == nil {
+					if jsonEqual(existing, raw) {
+						break
+					}
+				} else if !os.IsNotExist(errRead) {
+					return fmt.Errorf("auth filestore: read existing failed: %w", errRead)
+				} else if explicitEdit {
+					return cliproxyauth.ErrCredentialFileRemoved
+				}
+				snapshotAuthFileHistory(path)
+				if errWrite := writeFileAtomic(path, raw, 0o600); errWrite != nil {
+					return fmt.Errorf("auth filestore: write file failed: %w", errWrite)
+				}
+
+			default:
+				return fmt.Errorf("auth filestore: nothing to persist for %s", auth.ID)
+			}
+			return nil
+		}); err != nil {
 			return "", err
 		}
-	case auth.Metadata != nil:
-		auth.Metadata["disabled"] = auth.Disabled
-		raw, errMarshal := json.Marshal(auth.Metadata)
-		if errMarshal != nil {
-			return "", fmt.Errorf("auth filestore: marshal metadata failed: %w", errMarshal)
-		}
-		if existing, errRead := os.ReadFile(path); errRead == nil {
-			if jsonEqual(existing, raw) {
-				return path, nil
-			}
-		} else if !os.IsNotExist(errRead) {
-			return "", fmt.Errorf("auth filestore: read existing failed: %w", errRead)
-		}
-		// Atomic write: a refresh token is high-value state that may require manual
-		// re-auth if lost, so an interrupted write must never truncate or leave a
-		// half-written auth file. Write to a temp file in the same directory, fsync,
-		// then rename over the target. On any failure the previous file is intact.
-		if errWrite := writeFileAtomic(path, raw, 0o600); errWrite != nil {
-			return "", fmt.Errorf("auth filestore: write file failed: %w", errWrite)
-		}
-	default:
-		return "", fmt.Errorf("auth filestore: nothing to persist for %s", auth.ID)
 	}
 
 	if auth.Attributes == nil {
@@ -168,6 +260,8 @@ const authFileHistoryDirName = ".history"
 // per auth file. Older snapshots beyond this window are pruned.
 const authFileHistoryKeep = 7
 
+const authFileHistoryTimestamp = "20060102T150405.000000000"
+
 // snapshotAuthFileHistory copies the current contents of an auth JSON file into a
 // permission-tightened history subdirectory before it is overwritten, keeping the
 // most recent authFileHistoryKeep snapshots and pruning older ones. It is
@@ -185,9 +279,14 @@ func snapshotAuthFileHistory(path string) {
 		return
 	}
 
+	info, errStat := os.Lstat(historyDir)
+	if errStat != nil || !info.IsDir() || info.Mode().Perm()&0o077 != 0 {
+		return
+	}
+
 	// Snapshot name encodes the source file and a high-resolution timestamp so the
 	// lexical order matches chronological order for pruning.
-	snapshotName := fmt.Sprintf("%s.%s.bak", baseName, time.Now().UTC().Format("20060102T150405.000000000"))
+	snapshotName := fmt.Sprintf("%s.%s.bak", baseName, time.Now().UTC().Format(authFileHistoryTimestamp))
 	snapshotPath := filepath.Join(historyDir, snapshotName)
 	if errWrite := writeFileAtomic(snapshotPath, data, 0o600); errWrite != nil {
 		return
@@ -211,7 +310,10 @@ func pruneAuthFileHistory(historyDir, baseName string) {
 		}
 		name := entry.Name()
 		if strings.HasPrefix(name, prefix) && strings.HasSuffix(name, ".bak") {
-			snapshots = append(snapshots, name)
+			stamp := strings.TrimSuffix(strings.TrimPrefix(name, prefix), ".bak")
+			if parsed, err := time.Parse(authFileHistoryTimestamp, stamp); err == nil && parsed.Format(authFileHistoryTimestamp) == stamp {
+				snapshots = append(snapshots, name)
+			}
 		}
 	}
 	if len(snapshots) <= authFileHistoryKeep {
@@ -270,7 +372,7 @@ func (s *FileTokenStore) List(ctx context.Context) ([]*cliproxyauth.Auth, error)
 			return walkErr
 		}
 		if d.IsDir() {
-			if path != dir && strings.EqualFold(d.Name(), "incident-archives") {
+			if path != dir && (strings.EqualFold(d.Name(), "incident-archives") || d.Name() == authFileHistoryDirName) {
 				return filepath.SkipDir
 			}
 			return nil
@@ -293,6 +395,48 @@ func (s *FileTokenStore) List(ctx context.Context) ([]*cliproxyauth.Auth, error)
 	return entries, nil
 }
 
+func ordinaryAuthWritePath(path string) (string, error) {
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	if resolved, err := filepath.EvalSymlinks(absolute); err == nil {
+		return resolved, nil
+	}
+	if parent, err := filepath.EvalSymlinks(filepath.Dir(absolute)); err == nil {
+		absolute = filepath.Join(parent, filepath.Base(absolute))
+	}
+	return absolute, nil
+}
+
+// WithExistingAuthFile serializes an unlink with credential writes to the same
+// normalized path. The callback gets the latest directory entry and must act
+// on the original path, so removing a symbolic link leaves its target intact.
+func WithExistingAuthFile(path string, remove func(os.FileInfo) error) error {
+	// Avoid creating a missing credential directory just to lock a no-op.
+	if _, err := os.Lstat(path); err != nil {
+		return err
+	}
+	target, err := ordinaryAuthWritePath(path)
+	if err != nil {
+		return err
+	}
+	return codex.WithFileLock(target, func() error {
+		info, err := os.Lstat(path)
+		if err != nil {
+			return err
+		}
+		current, err := ordinaryAuthWritePath(path)
+		if err != nil {
+			return err
+		}
+		if current != target {
+			return cliproxyauth.ErrFileRemovalBusy
+		}
+		return remove(info)
+	})
+}
+
 // Delete removes the auth file.
 func (s *FileTokenStore) Delete(ctx context.Context, id string) error {
 	id = strings.TrimSpace(id)
@@ -303,7 +447,10 @@ func (s *FileTokenStore) Delete(ctx context.Context, id string) error {
 	if err != nil {
 		return err
 	}
-	if err = os.Remove(path); err != nil && !os.IsNotExist(err) {
+	err = WithExistingAuthFile(path, func(os.FileInfo) error {
+		return os.Remove(path)
+	})
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("auth filestore: delete failed: %w", err)
 	}
 	return nil
@@ -328,9 +475,13 @@ func (s *FileTokenStore) readAuthFiles(path, baseDir string) ([]*cliproxyauth.Au
 	if len(data) == 0 {
 		return nil, nil
 	}
-	metadata := make(map[string]any)
-	if err = json.Unmarshal(data, &metadata); err != nil {
+	metadata, err := cliproxyauth.DecodeCredentialMetadata(data)
+	if err != nil {
 		return nil, fmt.Errorf("unmarshal auth json: %w", err)
+	}
+	cliproxyauth.NormalizeCredentialMetadata(metadata)
+	if errWeight := cliproxyauth.ValidateAuthWeight(&cliproxyauth.Auth{Metadata: metadata}); errWeight != nil {
+		return nil, errWeight
 	}
 	provider, _ := metadata["type"].(string)
 	provider = strings.TrimSpace(provider)
@@ -358,6 +509,7 @@ func (s *FileTokenStore) readAuthFiles(path, baseDir string) ([]*cliproxyauth.Au
 				if auth == nil {
 					continue
 				}
+				cliproxyauth.NormalizeCredentialMetadata(auth.Metadata)
 				if len(auths) > 1 {
 					cliproxyauth.MarkPluginVirtualAuth(auth, path, index)
 				}
@@ -377,6 +529,21 @@ func (s *FileTokenStore) readAuthFiles(path, baseDir string) ([]*cliproxyauth.Au
 					}
 					auth.Metadata["disabled"] = true
 				}
+				if p, ok := metadata["proxy_url"].(string); ok && auth.ProxyURL == "" {
+					auth.ProxyURL = strings.TrimSpace(p)
+				}
+				if pref, ok := metadata["prefix"].(string); ok && auth.Prefix == "" {
+					auth.Prefix = strings.Trim(strings.TrimSpace(pref), "/")
+				}
+				if errWeight := cliproxyauth.ApplyAuthWeightMetadata(auth, metadata); errWeight != nil {
+					return nil, errWeight
+				}
+				cliproxyauth.ApplyAuthPriorityMetadata(auth, metadata)
+				if _, inherited := auth.Attributes[cliproxyauth.AttributeFilePriority]; inherited {
+					if setter, ok := auth.Storage.(interface{ SetMetadata(map[string]any) }); ok {
+						setter.SetMetadata(auth.Metadata)
+					}
+				}
 				cliproxyauth.ApplyCustomHeadersFromMetadata(auth)
 			}
 			return auths, nil
@@ -384,27 +551,6 @@ func (s *FileTokenStore) readAuthFiles(path, baseDir string) ([]*cliproxyauth.Au
 	}
 	if provider == "" {
 		provider = "unknown"
-	}
-	if provider == "antigravity" {
-		projectID := ""
-		if pid, ok := metadata["project_id"].(string); ok {
-			projectID = strings.TrimSpace(pid)
-		}
-		if projectID == "" {
-			accessToken := extractAccessToken(metadata)
-			if accessToken != "" {
-				fetchedProjectID, errFetch := FetchAntigravityProjectID(context.Background(), accessToken, http.DefaultClient)
-				if errFetch == nil && strings.TrimSpace(fetchedProjectID) != "" {
-					metadata["project_id"] = strings.TrimSpace(fetchedProjectID)
-					if raw, errMarshal := json.Marshal(metadata); errMarshal == nil {
-						if file, errOpen := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0o600); errOpen == nil {
-							_, _ = file.Write(raw)
-							_ = file.Close()
-						}
-					}
-				}
-			}
-		}
 	}
 	info, errStat = os.Stat(path)
 	if errStat != nil {
@@ -442,6 +588,18 @@ func (s *FileTokenStore) readAuthFiles(path, baseDir string) ([]*cliproxyauth.Au
 		}
 	}
 
+	proxyURL := ""
+	if p, ok := metadata["proxy_url"].(string); ok {
+		proxyURL = strings.TrimSpace(p)
+	}
+	prefix := ""
+	if rawPrefix, ok := metadata["prefix"].(string); ok {
+		trimmed := strings.TrimSpace(rawPrefix)
+		trimmed = strings.Trim(trimmed, "/")
+		if trimmed != "" && !strings.Contains(trimmed, "/") {
+			prefix = trimmed
+		}
+	}
 	auth := &cliproxyauth.Auth{
 		ID:              id,
 		Provider:        provider,
@@ -449,6 +607,8 @@ func (s *FileTokenStore) readAuthFiles(path, baseDir string) ([]*cliproxyauth.Au
 		Label:           s.labelFor(metadata),
 		Status:          status,
 		Disabled:        disabled,
+		Prefix:          prefix,
+		ProxyURL:        proxyURL,
 		AutoQuarantined: autoQuarantined,
 		// Unavailable mirrors markAutoQuarantine's own in-memory state so a
 		// restored record is byte-for-byte consistent with a live-quarantined
@@ -479,7 +639,6 @@ func (s *FileTokenStore) readAuthFiles(path, baseDir string) ([]*cliproxyauth.Au
 			}
 		}
 	}
-	cliproxyauth.ApplyRuntimeFieldsFromMetadata(auth)
 	cliproxyauth.ApplyCustomHeadersFromMetadata(auth)
 	// Restore the terminal reauth-required lock (persisted by
 	// markRefreshReauthRequiredWithReason) the same way autoQuarantined is
@@ -522,6 +681,9 @@ func compactPluginAuths(auths []*cliproxyauth.Auth) []*cliproxyauth.Auth {
 		if auth == nil {
 			continue
 		}
+		if errWeight := cliproxyauth.ValidateAuthWeight(auth); errWeight != nil {
+			continue
+		}
 		out = append(out, auth)
 	}
 	return out
@@ -539,6 +701,37 @@ func (s *FileTokenStore) idFor(path, baseDir string) string {
 		id = strings.ToLower(id)
 	}
 	return id
+}
+
+// requireScopedExistingAuthFile rejects edits to stale records after an
+// AuthDir change. Call under the same write lock used by Save.
+func (s *FileTokenStore) requireScopedExistingAuthFile(path string) error {
+	dir := strings.TrimSpace(s.baseDirSnapshot())
+	if dir == "" {
+		return cliproxyauth.ErrCredentialFileRemoved
+	}
+	absoluteDir, err := filepath.Abs(dir)
+	if err != nil {
+		return cliproxyauth.ErrCredentialFileRemoved
+	}
+	absolutePath, err := filepath.Abs(path)
+	if err != nil {
+		return cliproxyauth.ErrCredentialFileRemoved
+	}
+	rel, err := filepath.Rel(absoluteDir, absolutePath)
+	if err != nil || !filepath.IsLocal(rel) {
+		return cliproxyauth.ErrCredentialFileRemoved
+	}
+	root, err := os.OpenRoot(absoluteDir)
+	if err != nil {
+		return cliproxyauth.ErrCredentialFileRemoved
+	}
+	defer root.Close()
+	info, err := root.Lstat(rel)
+	if err != nil || !info.Mode().IsRegular() {
+		return cliproxyauth.ErrCredentialFileRemoved
+	}
+	return nil
 }
 
 func (s *FileTokenStore) resolveAuthPath(auth *cliproxyauth.Auth) (string, error) {
@@ -671,4 +864,12 @@ func deepEqualJSON(a, b any) bool {
 	default:
 		return false
 	}
+}
+
+func withAccountSettingsFileLock(path string, fn func() error) error {
+	return codex.WithFileLock(path, fn)
+}
+
+func writeAccountSettingsWithHistory(path string, old, next []byte, guard *ordinaryCredentialMetadataGuard) error {
+	return writeFileAtomicWithMetadata(path, next, 0600, guard, func() { snapshotAuthFileHistory(path) })
 }

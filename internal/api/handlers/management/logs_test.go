@@ -2,8 +2,6 @@ package management
 
 import (
 	"compress/gzip"
-	"encoding/base64"
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -15,9 +13,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MoeForge/moego/base64"
+	"github.com/MoeForge/moego/json"
+
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	"golang.org/x/crypto/bcrypt"
+
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
 )
 
 func TestDecodeLogCursorRejectsUnsafeFiles(t *testing.T) {
@@ -729,6 +732,227 @@ func writeMainLog(t *testing.T, dir, content string) {
 	}
 }
 
+func TestGetRequestLogByID_SelectsLatestOnReusedID(t *testing.T) {
+	dir := t.TempDir()
+	h := newLogsTestHandler(dir, true)
+
+	oldPath := filepath.Join(dir, "v1_chat_completions-2026-09-23T100000-00000000.log")
+	newPath := filepath.Join(dir, "v1_chat_completions-2026-09-23T110000-00000000.log")
+
+	if errWrite := os.WriteFile(oldPath, []byte("old log content"), 0o644); errWrite != nil {
+		t.Fatalf("write old log: %v", errWrite)
+	}
+	oldTime := time.Now().Add(-time.Hour)
+	if errChtimes := os.Chtimes(oldPath, oldTime, oldTime); errChtimes != nil {
+		t.Fatalf("chtimes old log: %v", errChtimes)
+	}
+
+	if errWrite := os.WriteFile(newPath, []byte("new log content"), 0o644); errWrite != nil {
+		t.Fatalf("write new log: %v", errWrite)
+	}
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Params = gin.Params{{Key: "id", Value: "00000000"}}
+	c.Request = httptest.NewRequest(http.MethodGet, "/v0/management/logs/request/00000000", nil)
+
+	h.GetRequestLogByID(c)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body: %s", rec.Code, rec.Body.String())
+	}
+
+	if body := rec.Body.String(); body != "new log content" {
+		t.Fatalf("body = %q, want %q", body, "new log content")
+	}
+}
+
+func TestGetRequestLogByID_SelectsLatestOnSameModTimeTieBreak(t *testing.T) {
+	dir := t.TempDir()
+	h := newLogsTestHandler(dir, true)
+
+	file1 := filepath.Join(dir, "v1_chat_completions-2026-09-23T100000-00000000.log")
+	file2 := filepath.Join(dir, "v1_chat_completions-2026-09-23T100000_1-00000000.log")
+
+	if errWrite := os.WriteFile(file1, []byte("file1 content"), 0o644); errWrite != nil {
+		t.Fatalf("write file1: %v", errWrite)
+	}
+	if errWrite := os.WriteFile(file2, []byte("file2 content"), 0o644); errWrite != nil {
+		t.Fatalf("write file2: %v", errWrite)
+	}
+	sameTime := time.Date(2026, 9, 23, 10, 0, 0, 0, time.UTC)
+	if errChtimes := os.Chtimes(file1, sameTime, sameTime); errChtimes != nil {
+		t.Fatalf("chtimes file1: %v", errChtimes)
+	}
+	if errChtimes := os.Chtimes(file2, sameTime, sameTime); errChtimes != nil {
+		t.Fatalf("chtimes file2: %v", errChtimes)
+	}
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Params = gin.Params{{Key: "id", Value: "00000000"}}
+	c.Request = httptest.NewRequest(http.MethodGet, "/v0/management/logs/request/00000000", nil)
+
+	h.GetRequestLogByID(c)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body: %s", rec.Code, rec.Body.String())
+	}
+
+	if body := rec.Body.String(); body != "file2 content" {
+		t.Fatalf("body = %q, want %q", body, "file2 content")
+	}
+}
+
+func TestGetRequestLogByID_SelectsLatestOnSameModTimeSequence9Vs10(t *testing.T) {
+	dir := t.TempDir()
+	h := newLogsTestHandler(dir, true)
+
+	file9 := filepath.Join(dir, "v1_chat_completions-2026-09-23T100000_9-00000000.log")
+	file10 := filepath.Join(dir, "v1_chat_completions-2026-09-23T100000_10-00000000.log")
+
+	if errWrite := os.WriteFile(file9, []byte("file9 content"), 0o644); errWrite != nil {
+		t.Fatalf("write file9: %v", errWrite)
+	}
+	if errWrite := os.WriteFile(file10, []byte("file10 content"), 0o644); errWrite != nil {
+		t.Fatalf("write file10: %v", errWrite)
+	}
+	sameTime := time.Date(2026, 9, 23, 10, 0, 0, 0, time.UTC)
+	if errChtimes := os.Chtimes(file9, sameTime, sameTime); errChtimes != nil {
+		t.Fatalf("chtimes file9: %v", errChtimes)
+	}
+	if errChtimes := os.Chtimes(file10, sameTime, sameTime); errChtimes != nil {
+		t.Fatalf("chtimes file10: %v", errChtimes)
+	}
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Params = gin.Params{{Key: "id", Value: "00000000"}}
+	c.Request = httptest.NewRequest(http.MethodGet, "/v0/management/logs/request/00000000", nil)
+
+	h.GetRequestLogByID(c)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body: %s", rec.Code, rec.Body.String())
+	}
+
+	if body := rec.Body.String(); body != "file10 content" {
+		t.Fatalf("body = %q, want %q (numerical sequence 10 must beat 9)", body, "file10 content")
+	}
+}
+
+func TestGetRequestLogByID_SelectsLatestAcrossTimestampsWithSequenceOnModTimeTie(t *testing.T) {
+	dir := t.TempDir()
+	h := newLogsTestHandler(dir, true)
+
+	oldFileWithSeq := filepath.Join(dir, "v1_chat_completions-2026-09-23T100000_9-00000000.log")
+	newFileWithoutSeq := filepath.Join(dir, "v1_chat_completions-2026-09-23T110000-00000000.log")
+
+	if errWrite := os.WriteFile(oldFileWithSeq, []byte("old with seq content"), 0o644); errWrite != nil {
+		t.Fatalf("write oldFileWithSeq: %v", errWrite)
+	}
+	if errWrite := os.WriteFile(newFileWithoutSeq, []byte("new without seq content"), 0o644); errWrite != nil {
+		t.Fatalf("write newFileWithoutSeq: %v", errWrite)
+	}
+	sameTime := time.Date(2026, 9, 23, 11, 0, 0, 0, time.UTC)
+	if errChtimes := os.Chtimes(oldFileWithSeq, sameTime, sameTime); errChtimes != nil {
+		t.Fatalf("chtimes oldFileWithSeq: %v", errChtimes)
+	}
+	if errChtimes := os.Chtimes(newFileWithoutSeq, sameTime, sameTime); errChtimes != nil {
+		t.Fatalf("chtimes newFileWithoutSeq: %v", errChtimes)
+	}
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Params = gin.Params{{Key: "id", Value: "00000000"}}
+	c.Request = httptest.NewRequest(http.MethodGet, "/v0/management/logs/request/00000000", nil)
+
+	h.GetRequestLogByID(c)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body: %s", rec.Code, rec.Body.String())
+	}
+
+	if body := rec.Body.String(); body != "new without seq content" {
+		t.Fatalf("body = %q, want %q (timestamp T110000 must beat T100000 even if older had higher sequence)", body, "new without seq content")
+	}
+}
+
+func TestGetRequestLogByID_SelectsLatestCrossYearBoundaryOnModTimeTie(t *testing.T) {
+	dir := t.TempDir()
+	h := newLogsTestHandler(dir, true)
+
+	oldYearFile := filepath.Join(dir, "v1_chat_completions-2026-12-31T235959-00000000.log")
+	newYearFile := filepath.Join(dir, "v1_chat_completions-2027-01-01T000000-00000000.log")
+
+	if errWrite := os.WriteFile(oldYearFile, []byte("2026 content"), 0o644); errWrite != nil {
+		t.Fatalf("write oldYearFile: %v", errWrite)
+	}
+	if errWrite := os.WriteFile(newYearFile, []byte("2027 content"), 0o644); errWrite != nil {
+		t.Fatalf("write newYearFile: %v", errWrite)
+	}
+	sameTime := time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC)
+	if errChtimes := os.Chtimes(oldYearFile, sameTime, sameTime); errChtimes != nil {
+		t.Fatalf("chtimes oldYearFile: %v", errChtimes)
+	}
+	if errChtimes := os.Chtimes(newYearFile, sameTime, sameTime); errChtimes != nil {
+		t.Fatalf("chtimes newYearFile: %v", errChtimes)
+	}
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Params = gin.Params{{Key: "id", Value: "00000000"}}
+	c.Request = httptest.NewRequest(http.MethodGet, "/v0/management/logs/request/00000000", nil)
+
+	h.GetRequestLogByID(c)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body: %s", rec.Code, rec.Body.String())
+	}
+
+	if body := rec.Body.String(); body != "2027 content" {
+		t.Fatalf("body = %q, want %q (2027-01-01 must beat 2026-12-31 on mod time tie)", body, "2027 content")
+	}
+}
+
+func TestGetRequestLogByID_MatchesFullUUIDAndShortID(t *testing.T) {
+	dir := t.TempDir()
+	h := newLogsTestHandler(dir, true)
+
+	logPath := filepath.Join(dir, "v1_chat_completions-2026-09-28T100000-1234abcd.log")
+	if errWrite := os.WriteFile(logPath, []byte("uuid v7 request log content"), 0o644); errWrite != nil {
+		t.Fatalf("write log: %v", errWrite)
+	}
+
+	// 1. Fetch via short 8-char ID
+	recShort := httptest.NewRecorder()
+	cShort, _ := gin.CreateTestContext(recShort)
+	cShort.Params = gin.Params{{Key: "id", Value: "1234abcd"}}
+	cShort.Request = httptest.NewRequest(http.MethodGet, "/v0/management/logs/request/1234abcd", nil)
+	h.GetRequestLogByID(cShort)
+
+	if recShort.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body: %s", recShort.Code, recShort.Body.String())
+	}
+	if body := recShort.Body.String(); body != "uuid v7 request log content" {
+		t.Fatalf("body = %q, want %q", body, "uuid v7 request log content")
+	}
+
+	// 2. Fetch via full 36-char UUID string ending with same 8 chars
+	recFull := httptest.NewRecorder()
+	cFull, _ := gin.CreateTestContext(recFull)
+	cFull.Params = gin.Params{{Key: "id", Value: "018f3a5b-1234-7abc-def0-00001234abcd"}}
+	cFull.Request = httptest.NewRequest(http.MethodGet, "/v0/management/logs/request/018f3a5b-1234-7abc-def0-00001234abcd", nil)
+	h.GetRequestLogByID(cFull)
+
+	if recFull.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body: %s", recFull.Code, recFull.Body.String())
+	}
+	if body := recFull.Body.String(); body != "uuid v7 request log content" {
+		t.Fatalf("body = %q, want %q", body, "uuid v7 request log content")
+	}
+}
+
 func TestGetRequestLogByIDServesGzipCompressedLog(t *testing.T) {
 	dir := t.TempDir()
 	requestID := "req-gzip-1"
@@ -902,4 +1126,236 @@ func appendMainLog(t *testing.T, dir, content string) {
 	if errClose := file.Close(); errClose != nil {
 		t.Fatalf("close main log: %v", errClose)
 	}
+}
+
+// The plain and gzip files can coexist during archiving. Only copies of the
+// same request log prefer plain. Between distinct records, newest wins.
+func TestGetRequestLogByIDSelectsLatestLogWithGzipAndArchive(t *testing.T) {
+	type logFile struct {
+		name  string
+		body  string
+		newer bool
+	}
+	const shortID = "1234abcd"
+	const fullID = "018f3a5b-1234-7abc-def0-00001234abcd"
+	for _, tc := range []struct {
+		name    string
+		id      string
+		archive bool
+		files   []logFile
+		want    string
+	}{
+		{"mtime before name", shortID, false, []logFile{
+			{"app-2026-09-23T110000-1234abcd.log", "old", false},
+			{"app-2026-09-23T100000-1234abcd.log.gz", "new", true},
+		}, "new"},
+		{"collision 9 vs 10", fullID, false, []logFile{
+			{"app-2026-09-23T100000_9-1234abcd.log", "old", false},
+			{"app-2026-09-23T100000_10-1234abcd.log.gz", "new", false},
+		}, "new"},
+		{"timestamp over sequence", shortID, false, []logFile{
+			{"app-2026-09-23T100000_9-1234abcd.log.gz", "old", false},
+			{"app-2026-09-23T110000-1234abcd.log", "new", false},
+		}, "new"},
+		{"archive year boundary", fullID, true, []logFile{
+			{"app-2026-12-31T235959-1234abcd.log.gz", "old", false},
+			{"app-2027-01-01T000000-1234abcd.log.gz", "new", false},
+		}, "new"},
+		{"prefer exact legacy ID", fullID, false, []logFile{
+			{"app-2026-09-23T100000-018f3a5b-1234-7abc-def0-00001234abcd.log", "exact", false},
+			{"app-2026-09-23T110000-1234abcd.log.gz", "short", true},
+		}, "exact"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			local := t.TempDir()
+			h := newLogsTestHandler(local, true)
+			dir := local
+			if tc.archive {
+				dir = t.TempDir()
+				h.requestLogArchiveDir = dir
+			}
+			at := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
+			for _, fixture := range tc.files {
+				path := filepath.Join(dir, fixture.name)
+				if strings.HasSuffix(fixture.name, ".gz") {
+					written := writeGzipRequestLog(t, dir, "fixture", fixture.body)
+					if err := os.Rename(written, path); err != nil {
+						t.Fatal(err)
+					}
+				} else if err := os.WriteFile(path, []byte(fixture.body), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				mtime := at
+				if fixture.newer {
+					mtime = at.Add(time.Minute)
+				}
+				if err := os.Chtimes(path, mtime, mtime); err != nil {
+					t.Fatal(err)
+				}
+			}
+			response := performGetRequestLogByID(t, h, tc.id)
+			if response.Code != http.StatusOK || response.Body.String() != tc.want {
+				t.Fatalf("status = %d, body = %q, want 200 and %q", response.Code, response.Body.String(), tc.want)
+			}
+		})
+	}
+}
+
+func TestRequestLogManagementRouteRequiresLocalAuthentication(t *testing.T) {
+	const key = "synthetic-management-secret"
+	hash, err := bcrypt.GenerateFromPassword([]byte(key), bcrypt.MinCost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{}
+	cfg.RemoteManagement.SecretKey = string(hash)
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	archive := t.TempDir()
+	t.Setenv("REQUEST_LOG_ARCHIVE_DIR", archive)
+	h := NewHandlerWithoutConfigFilePath(cfg, nil)
+	h.SetLogDirectory(t.TempDir())
+	writeGzipRequestLog(t, archive, "abcd1234", "synthetic archived record")
+	router := gin.New()
+	if err := router.SetTrustedProxies(nil); err != nil {
+		t.Fatal(err)
+	}
+	router.GET("/v0/management/request-log-by-id/:id", h.Middleware(), h.GetRequestLogByID)
+	for _, tc := range []struct {
+		name   string
+		host   string
+		key    string
+		status int
+		body   string
+	}{
+		{"remote denied", "192.0.2.10:4000", key, http.StatusForbidden, "remote management disabled"},
+		{"local missing key", "127.0.0.1:4000", "", http.StatusUnauthorized, "missing management key"},
+		{"local authorized", "127.0.0.1:4000", key, http.StatusOK, "synthetic archived record"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodGet, "/v0/management/request-log-by-id/abcd1234", nil)
+			request.RemoteAddr = tc.host
+			if tc.key != "" {
+				request.Header.Set("Authorization", "Bearer "+tc.key)
+			}
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+			if response.Code != tc.status || !strings.Contains(response.Body.String(), tc.body) {
+				t.Fatalf("status = %d, body = %q", response.Code, response.Body.String())
+			}
+			if tc.status != http.StatusOK && strings.Contains(response.Body.String(), "synthetic archived record") {
+				t.Fatal("denied request was served log contents")
+			}
+		})
+	}
+}
+
+func TestRequestLogWriterKeepsLegacyCollisionDistinctFromGzip(t *testing.T) {
+	dir := t.TempDir()
+	const id = "abcd1234"
+	const legacy = "old uncompressed request"
+	const layout = "2006-01-02T150405"
+	const writes = 4
+	started := time.Now().In(logging.DisplayLocation()).Truncate(time.Second)
+	oldTime := time.Unix(100, 0)
+	tieTime := oldTime.Add(time.Hour)
+	setTime := func(name string, when time.Time) {
+		t.Helper()
+		if err := os.Chtimes(filepath.Join(dir, name), when, when); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Reserve the writer's wall-clock window, including second boundaries.
+	for second := -2; second <= 30; second++ {
+		prefix := "v1-responses-" + started.Add(time.Duration(second)*time.Second).Format(layout)
+		name := prefix + "-" + id + ".log"
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(legacy), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		setTime(name, oldTime)
+		if err := os.Symlink("missing-legacy-target", filepath.Join(dir, prefix+"_1-"+id+".log")); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	logger := logging.NewFileRequestLogger(true, dir, "", 0)
+	start, results := make(chan struct{}), make(chan error, writes)
+	for i := 0; i < writes; i++ {
+		go func() {
+			<-start
+			marker := "new request #" + strconv.Itoa(i)
+			results <- logger.LogRequest("/v1/responses", http.MethodPost, nil, []byte(marker),
+				http.StatusOK, nil, []byte("ok"), nil, nil, nil, nil, nil, id, started, started)
+		}()
+	}
+	close(start)
+	for i := 0; i < writes; i++ {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	h := newLogsTestHandler(dir, true)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	bodies := make(map[string]string, writes)
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasSuffix(name, ".log.gz") {
+			continue
+		}
+		meta := parseLogMetadata(strings.TrimSuffix(name, ".gz"), id)
+		if !meta.hasTime || meta.seq < 2 {
+			t.Fatalf("new record reused a reserved plain or symlink name: %s", name)
+		}
+		prefix := "v1-responses-" + meta.time.Format(layout)
+		plainName := prefix + "-" + id + ".log"
+		plain, err := os.ReadFile(filepath.Join(dir, plainName))
+		if err != nil || string(plain) != legacy {
+			t.Fatalf("same-second legacy record changed: %s (%v)", plainName, err)
+		}
+		link := filepath.Join(dir, prefix+"_1-"+id+".log")
+		if target, err := os.Readlink(link); err != nil || target != "missing-legacy-target" {
+			t.Fatalf("reserved symbolic link changed: %s (%v)", link, err)
+		}
+		rec := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(rec)
+		c.Request = httptest.NewRequest(http.MethodGet, "/fixture", nil)
+		h.serveRequestLog(c, "", name)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("cannot read published gzip %s: %d %s", name, rec.Code, rec.Body)
+		}
+		names = append(names, name)
+		bodies[name] = rec.Body.String()
+		setTime(name, tieTime)
+		setTime(plainName, tieTime)
+	}
+	if len(names) != writes {
+		t.Fatalf("published %d files, want %d", len(names), writes)
+	}
+	for i := 0; i < writes; i++ {
+		marker := "new request #" + strconv.Itoa(i)
+		found := 0
+		for _, body := range bodies {
+			if strings.Contains(body, marker) {
+				found++
+			}
+		}
+		if found != 1 {
+			t.Fatalf("expected one published copy of %q, got %d", marker, found)
+		}
+	}
+	expectLatest := func(want string) {
+		t.Helper()
+		rec := performGetRequestLogByID(t, h, id)
+		if rec.Code != http.StatusOK || rec.Body.String() != bodies[want] {
+			t.Fatalf("latest log for %s: %d, %q", want, rec.Code, rec.Body)
+		}
+	}
+	// ReadDir sorts names; for this fixture all sequence numbers are one digit.
+	expectLatest(names[len(names)-1])
+	setTime(names[0], tieTime.Add(time.Second))
+	expectLatest(names[0])
 }

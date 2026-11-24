@@ -3,16 +3,33 @@ package proxyutil
 import (
 	"bufio"
 	"context"
-	"encoding/base64"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"errors"
 	"fmt"
+	"github.com/MoeForge/moego/base64"
 	"io"
+	"math/big"
 	"net"
 	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
+
+func isPeerClosedReadError(err error) bool {
+	return errors.Is(err, io.EOF) || errors.Is(err, syscall.ECONNRESET)
+}
 
 func mustDefaultTransport(t *testing.T) *http.Transport {
 	t.Helper()
@@ -22,26 +39,6 @@ func mustDefaultTransport(t *testing.T) *http.Transport {
 		t.Fatal("http.DefaultTransport is not an *http.Transport")
 	}
 	return transport
-}
-
-func TestBuildHTTPTransportSOCKS5DialContextHonorsCancelledContext(t *testing.T) {
-	transport, mode, err := BuildHTTPTransport("socks5://127.0.0.1:1")
-	if err != nil {
-		t.Fatalf("BuildHTTPTransport returned error: %v", err)
-	}
-	if mode != ModeProxy {
-		t.Fatalf("mode = %v, want %v", mode, ModeProxy)
-	}
-	if transport == nil || transport.DialContext == nil {
-		t.Fatalf("expected transport with DialContext")
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	_, err = transport.DialContext(ctx, "tcp", "api.anthropic.com:443")
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("DialContext error = %v, want context canceled", err)
-	}
 }
 
 func TestParse(t *testing.T) {
@@ -186,6 +183,50 @@ func TestBuildHTTPTransportSOCKS5HProxy(t *testing.T) {
 	}
 	if transport.DialContext == nil {
 		t.Fatal("expected SOCKS5H transport to have custom DialContext")
+	}
+}
+
+func TestBuildHTTPTransportHTTPSProxyInheritsDefaultTransportSettings(t *testing.T) {
+	t.Parallel()
+
+	transport, mode, errBuild := BuildHTTPTransport("https://proxy.example.com:8443")
+	if errBuild != nil {
+		t.Fatalf("BuildHTTPTransport returned error: %v", errBuild)
+	}
+	if mode != ModeProxy {
+		t.Fatalf("mode = %d, want %d", mode, ModeProxy)
+	}
+	if transport == nil {
+		t.Fatal("expected transport, got nil")
+	}
+	if transport.Proxy == nil {
+		t.Fatal("expected HTTPS proxy transport to retain Proxy function")
+	}
+	if transport.DialTLSContext == nil {
+		t.Fatal("expected HTTPS proxy transport to configure custom DialTLSContext")
+	}
+
+	req, errRequest := http.NewRequest(http.MethodGet, "https://example.com", nil)
+	if errRequest != nil {
+		t.Fatalf("http.NewRequest returned error: %v", errRequest)
+	}
+	proxyURL, errProxy := transport.Proxy(req)
+	if errProxy != nil {
+		t.Fatalf("transport.Proxy returned error: %v", errProxy)
+	}
+	if proxyURL == nil || proxyURL.String() != "https://proxy.example.com:8443" {
+		t.Fatalf("proxy URL = %v, want https://proxy.example.com:8443", proxyURL)
+	}
+
+	defaultTransport := mustDefaultTransport(t)
+	if transport.ForceAttemptHTTP2 != defaultTransport.ForceAttemptHTTP2 {
+		t.Fatalf("ForceAttemptHTTP2 = %v, want %v", transport.ForceAttemptHTTP2, defaultTransport.ForceAttemptHTTP2)
+	}
+	if transport.IdleConnTimeout != defaultTransport.IdleConnTimeout {
+		t.Fatalf("IdleConnTimeout = %v, want %v", transport.IdleConnTimeout, defaultTransport.IdleConnTimeout)
+	}
+	if transport.TLSHandshakeTimeout != defaultTransport.TLSHandshakeTimeout {
+		t.Fatalf("TLSHandshakeTimeout = %v, want %v", transport.TLSHandshakeTimeout, defaultTransport.TLSHandshakeTimeout)
 	}
 }
 
@@ -414,5 +455,1161 @@ func TestParseErrorDoesNotExposeProxyCredentials(t *testing.T) {
 		strings.Contains(errParse.Error(), "user") ||
 		strings.Contains(errParse.Error(), "secret") {
 		t.Fatalf("parse error exposes proxy credentials: %q", errParse.Error())
+	}
+}
+
+func newTestCertificate(t *testing.T) tls.Certificate {
+	t.Helper()
+
+	key, errKey := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if errKey != nil {
+		t.Fatalf("generate test key: %v", errKey)
+	}
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "127.0.0.1"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
+		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		IsCA:         true,
+	}
+	der, errCreate := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if errCreate != nil {
+		t.Fatalf("create test certificate: %v", errCreate)
+	}
+	leaf, errParse := x509.ParseCertificate(der)
+	if errParse != nil {
+		t.Fatalf("parse test certificate: %v", errParse)
+	}
+	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key, Leaf: leaf}
+}
+
+func TestBuildHTTPTransportHTTPSProxyH2Negotiation(t *testing.T) {
+	t.Parallel()
+
+	targetServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprint(w, "target ok")
+	}))
+	defer targetServer.Close()
+
+	proxyCert := newTestCertificate(t)
+	proxyListener, errListen := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
+		Certificates: []tls.Certificate{proxyCert},
+		NextProtos:   []string{"h2", "http/1.1"},
+	})
+	if errListen != nil {
+		t.Fatalf("tls.Listen returned error: %v", errListen)
+	}
+	defer func() {
+		if errClose := proxyListener.Close(); errClose != nil {
+			t.Errorf("proxyListener.Close returned error: %v", errClose)
+		}
+	}()
+
+	proxyDone := make(chan error, 1)
+	go func() {
+		conn, errAccept := proxyListener.Accept()
+		if errAccept != nil {
+			proxyDone <- errAccept
+			return
+		}
+		defer func() { _ = conn.Close() }()
+
+		tlsConn, ok := conn.(*tls.Conn)
+		if !ok {
+			proxyDone <- errors.New("conn is not *tls.Conn")
+			return
+		}
+		if errHandshake := tlsConn.Handshake(); errHandshake != nil {
+			proxyDone <- fmt.Errorf("tls handshake failed: %w", errHandshake)
+			return
+		}
+
+		// When ALPN negotiates h2, a proxy expecting HTTP/2 frames will reject
+		// plain HTTP/1.1 CONNECT requests (reproducing unexpected EOF / bogus greeting).
+		if tlsConn.ConnectionState().NegotiatedProtocol == "h2" {
+			proxyDone <- fmt.Errorf("proxy negotiated h2 ALPN: client must negotiate http/1.1 for CONNECT proxy leg")
+			return
+		}
+
+		req, errRead := http.ReadRequest(bufio.NewReader(tlsConn))
+		if errRead != nil {
+			proxyDone <- fmt.Errorf("read CONNECT request failed: %w", errRead)
+			return
+		}
+		if req.Method != http.MethodConnect {
+			proxyDone <- fmt.Errorf("method = %s, want CONNECT", req.Method)
+			return
+		}
+
+		targetURL, _ := url.Parse(targetServer.URL)
+		targetConn, errDial := net.Dial("tcp", targetURL.Host)
+		if errDial != nil {
+			proxyDone <- fmt.Errorf("dial target failed: %w", errDial)
+			return
+		}
+		defer func() { _ = targetConn.Close() }()
+
+		if _, errWrite := io.WriteString(tlsConn, "HTTP/1.1 200 Connection Established\r\n\r\n"); errWrite != nil {
+			proxyDone <- fmt.Errorf("write CONNECT response failed: %w", errWrite)
+			return
+		}
+
+		go func() {
+			_, _ = io.Copy(targetConn, tlsConn)
+			_ = targetConn.Close()
+		}()
+		_, _ = io.Copy(tlsConn, targetConn)
+		_ = tlsConn.Close()
+		proxyDone <- nil
+	}()
+
+	proxyURL := "https://" + proxyListener.Addr().String()
+	transport, mode, errBuild := BuildHTTPTransport(proxyURL)
+	if errBuild != nil {
+		t.Fatalf("BuildHTTPTransport returned error: %v", errBuild)
+	}
+	if mode != ModeProxy {
+		t.Fatalf("mode = %d, want %d", mode, ModeProxy)
+	}
+
+	// Trust proxy cert in DialTLSContext and target cert in TLSClientConfig
+	certPool := x509.NewCertPool()
+	certPool.AddCert(proxyCert.Leaf)
+	parsedProxyURL, _ := url.Parse(proxyURL)
+	transport.DialTLSContext = buildHTTPSProxyDialTLSContext(parsedProxyURL, &tls.Config{RootCAs: certPool}, transport.TLSHandshakeTimeout, transport.DialContext)
+
+	targetCertPool := x509.NewCertPool()
+	for _, cert := range targetServer.TLS.Certificates {
+		if x509Cert, errParse := x509.ParseCertificate(cert.Certificate[0]); errParse == nil {
+			targetCertPool.AddCert(x509Cert)
+		}
+	}
+	transport.TLSClientConfig = &tls.Config{RootCAs: targetCertPool}
+
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   5 * time.Second,
+	}
+
+	req, errReq := http.NewRequest(http.MethodGet, targetServer.URL, nil)
+	if errReq != nil {
+		t.Fatalf("http.NewRequest returned error: %v", errReq)
+	}
+	req.Close = true
+
+	resp, errGet := client.Do(req)
+	if errGet != nil {
+		t.Fatalf("client.Do returned error: %v", errGet)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	body, errBody := io.ReadAll(resp.Body)
+	if errBody != nil {
+		t.Fatalf("read response body failed: %v", errBody)
+	}
+	if string(body) != "target ok" {
+		t.Fatalf("body = %q, want %q", string(body), "target ok")
+	}
+
+	transport.CloseIdleConnections()
+
+	if errProxy := <-proxyDone; errProxy != nil {
+		t.Fatalf("proxy returned error: %v", errProxy)
+	}
+}
+
+func TestBuildHTTPTransportHTTPSProxyHTTPTarget(t *testing.T) {
+	t.Parallel()
+
+	targetServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprint(w, "http target ok")
+	}))
+	defer targetServer.Close()
+
+	proxyCert := newTestCertificate(t)
+	proxyListener, errListen := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
+		Certificates: []tls.Certificate{proxyCert},
+		NextProtos:   []string{"h2", "http/1.1"},
+	})
+	if errListen != nil {
+		t.Fatalf("tls.Listen returned error: %v", errListen)
+	}
+	defer func() {
+		if errClose := proxyListener.Close(); errClose != nil {
+			t.Errorf("proxyListener.Close returned error: %v", errClose)
+		}
+	}()
+
+	proxyDone := make(chan error, 1)
+	go func() {
+		conn, errAccept := proxyListener.Accept()
+		if errAccept != nil {
+			proxyDone <- errAccept
+			return
+		}
+		defer func() { _ = conn.Close() }()
+
+		tlsConn, ok := conn.(*tls.Conn)
+		if !ok {
+			proxyDone <- errors.New("conn is not *tls.Conn")
+			return
+		}
+		if errHandshake := tlsConn.Handshake(); errHandshake != nil {
+			proxyDone <- fmt.Errorf("tls handshake failed: %w", errHandshake)
+			return
+		}
+
+		if proto := tlsConn.ConnectionState().NegotiatedProtocol; proto != "http/1.1" {
+			proxyDone <- fmt.Errorf("proxy negotiated %q, want http/1.1", proto)
+			return
+		}
+
+		req, errRead := http.ReadRequest(bufio.NewReader(tlsConn))
+		if errRead != nil {
+			proxyDone <- fmt.Errorf("read request failed: %w", errRead)
+			return
+		}
+		// Plain HTTP target via forward proxy sends standard GET http://host/path
+		if req.Method != http.MethodGet {
+			proxyDone <- fmt.Errorf("method = %s, want GET", req.Method)
+			return
+		}
+
+		targetURL, _ := url.Parse(targetServer.URL)
+		targetConn, errDial := net.Dial("tcp", targetURL.Host)
+		if errDial != nil {
+			proxyDone <- fmt.Errorf("dial target failed: %w", errDial)
+			return
+		}
+		defer func() { _ = targetConn.Close() }()
+
+		if errWrite := req.Write(targetConn); errWrite != nil {
+			proxyDone <- fmt.Errorf("write to target failed: %w", errWrite)
+			return
+		}
+
+		targetResp, errTargetResp := http.ReadResponse(bufio.NewReader(targetConn), req)
+		if errTargetResp != nil {
+			proxyDone <- fmt.Errorf("read target response failed: %w", errTargetResp)
+			return
+		}
+		defer func() { _ = targetResp.Body.Close() }()
+
+		if errWrite := targetResp.Write(tlsConn); errWrite != nil {
+			proxyDone <- fmt.Errorf("write response to proxy client failed: %w", errWrite)
+			return
+		}
+
+		proxyDone <- nil
+	}()
+
+	proxyURL := "https://" + proxyListener.Addr().String()
+	transport, mode, errBuild := BuildHTTPTransport(proxyURL)
+	if errBuild != nil {
+		t.Fatalf("BuildHTTPTransport returned error: %v", errBuild)
+	}
+	if mode != ModeProxy {
+		t.Fatalf("mode = %d, want %d", mode, ModeProxy)
+	}
+
+	certPool := x509.NewCertPool()
+	certPool.AddCert(proxyCert.Leaf)
+	parsedProxyURL, _ := url.Parse(proxyURL)
+	transport.DialTLSContext = buildHTTPSProxyDialTLSContext(parsedProxyURL, &tls.Config{RootCAs: certPool}, transport.TLSHandshakeTimeout, transport.DialContext)
+
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   5 * time.Second,
+	}
+
+	req, errReq := http.NewRequest(http.MethodGet, targetServer.URL, nil)
+	if errReq != nil {
+		t.Fatalf("http.NewRequest returned error: %v", errReq)
+	}
+	req.Close = true
+
+	resp, errGet := client.Do(req)
+	if errGet != nil {
+		t.Fatalf("client.Do returned error: %v", errGet)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	body, errBody := io.ReadAll(resp.Body)
+	if errBody != nil {
+		t.Fatalf("read response body failed: %v", errBody)
+	}
+	if string(body) != "http target ok" {
+		t.Fatalf("body = %q, want %q", string(body), "http target ok")
+	}
+
+	transport.CloseIdleConnections()
+
+	if errProxy := <-proxyDone; errProxy != nil {
+		t.Fatalf("proxy returned error: %v", errProxy)
+	}
+}
+
+func TestBuildDialerHTTPSProxyCONNECT(t *testing.T) {
+	t.Parallel()
+
+	proxyCert := newTestCertificate(t)
+	proxyListener, errListen := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
+		Certificates: []tls.Certificate{proxyCert},
+		NextProtos:   []string{"h2", "http/1.1"},
+	})
+	if errListen != nil {
+		t.Fatalf("tls.Listen returned error: %v", errListen)
+	}
+	defer func() {
+		if errClose := proxyListener.Close(); errClose != nil {
+			t.Errorf("proxyListener.Close returned error: %v", errClose)
+		}
+	}()
+
+	done := make(chan error, 1)
+	go func() {
+		conn, errAccept := proxyListener.Accept()
+		if errAccept != nil {
+			done <- errAccept
+			return
+		}
+		defer func() { _ = conn.Close() }()
+
+		tlsConn, ok := conn.(*tls.Conn)
+		if !ok {
+			done <- errors.New("conn is not *tls.Conn")
+			return
+		}
+		if errHandshake := tlsConn.Handshake(); errHandshake != nil {
+			done <- fmt.Errorf("tls handshake failed: %w", errHandshake)
+			return
+		}
+
+		if proto := tlsConn.ConnectionState().NegotiatedProtocol; proto != "http/1.1" {
+			done <- fmt.Errorf("negotiated protocol = %q, want http/1.1", proto)
+			return
+		}
+
+		req, errRead := http.ReadRequest(bufio.NewReader(tlsConn))
+		if errRead != nil {
+			done <- fmt.Errorf("read CONNECT request failed: %w", errRead)
+			return
+		}
+		if req.Method != http.MethodConnect {
+			done <- fmt.Errorf("method = %s, want CONNECT", req.Method)
+			return
+		}
+		if req.Host != "target.example.com:443" {
+			done <- fmt.Errorf("host = %s, want target.example.com:443", req.Host)
+			return
+		}
+		wantAuth := "Basic " + base64.StdEncoding.EncodeToString([]byte("user:pass"))
+		if gotAuth := req.Header.Get("Proxy-Authorization"); gotAuth != wantAuth {
+			done <- fmt.Errorf("Proxy-Authorization = %q, want %q", gotAuth, wantAuth)
+			return
+		}
+
+		if _, errWrite := io.WriteString(tlsConn, "HTTP/1.1 200 Connection Established\r\n\r\nok"); errWrite != nil {
+			done <- fmt.Errorf("write CONNECT response failed: %w", errWrite)
+			return
+		}
+
+		buf := make([]byte, 4)
+		n, errReadTunnel := io.ReadFull(tlsConn, buf)
+		if errReadTunnel != nil {
+			done <- fmt.Errorf("read tunneled payload failed after %d bytes: %w", n, errReadTunnel)
+			return
+		}
+		if string(buf) != "ping" {
+			done <- fmt.Errorf("tunneled payload = %q, want ping", string(buf))
+			return
+		}
+		done <- nil
+	}()
+
+	dialer, mode, errBuild := BuildDialer("https://user:pass@" + proxyListener.Addr().String())
+	if errBuild != nil {
+		t.Fatalf("BuildDialer returned error: %v", errBuild)
+	}
+	if mode != ModeProxy {
+		t.Fatalf("mode = %d, want %d", mode, ModeProxy)
+	}
+	httpDialer, ok := dialer.(*httpConnectDialer)
+	if !ok {
+		t.Fatalf("dialer type = %T, want *httpConnectDialer", dialer)
+	}
+	certPool := x509.NewCertPool()
+	certPool.AddCert(proxyCert.Leaf)
+	httpDialer.tlsConfig = &tls.Config{RootCAs: certPool}
+
+	conn, errDial := dialer.Dial("tcp", "target.example.com:443")
+	if errDial != nil {
+		t.Fatalf("dialer.Dial returned error: %v", errDial)
+	}
+	defer func() {
+		if errClose := conn.Close(); errClose != nil {
+			t.Errorf("conn.Close returned error: %v", errClose)
+		}
+	}()
+
+	buf := make([]byte, 2)
+	n, errRead := io.ReadFull(conn, buf)
+	if errRead != nil {
+		t.Fatalf("conn.Read returned error after %d bytes: %v", n, errRead)
+	}
+	if string(buf) != "ok" {
+		t.Fatalf("buffered tunnel payload = %q, want ok", string(buf))
+	}
+
+	if _, errWrite := conn.Write([]byte("ping")); errWrite != nil {
+		t.Fatalf("conn.Write returned error: %v", errWrite)
+	}
+
+	if errServer := <-done; errServer != nil {
+		t.Fatalf("proxy server returned error: %v", errServer)
+	}
+}
+
+func TestBuildHTTPTransportHTTPSProxyTLSHandshakeTimeout(t *testing.T) {
+	t.Parallel()
+
+	listener, errListen := net.Listen("tcp", "127.0.0.1:0")
+	if errListen != nil {
+		t.Fatalf("net.Listen returned error: %v", errListen)
+	}
+	defer func() {
+		if errClose := listener.Close(); errClose != nil {
+			t.Errorf("listener.Close returned error: %v", errClose)
+		}
+	}()
+
+	go func() {
+		conn, errAccept := listener.Accept()
+		if errAccept != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		// Stall indefinitely without performing TLS handshake
+		time.Sleep(2 * time.Second)
+	}()
+
+	proxyURL := "https://" + listener.Addr().String()
+	transport, mode, errBuild := BuildHTTPTransport(proxyURL)
+	if errBuild != nil {
+		t.Fatalf("BuildHTTPTransport returned error: %v", errBuild)
+	}
+	if mode != ModeProxy {
+		t.Fatalf("mode = %d, want %d", mode, ModeProxy)
+	}
+
+	transport.TLSHandshakeTimeout = 50 * time.Millisecond
+	parsedProxyURL, _ := url.Parse(proxyURL)
+	transport.DialTLSContext = buildHTTPSProxyDialTLSContext(parsedProxyURL, nil, transport.TLSHandshakeTimeout, transport.DialContext)
+
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   2 * time.Second,
+	}
+
+	start := time.Now()
+	_, errGet := client.Get("https://example.com/test")
+	duration := time.Since(start)
+
+	if errGet == nil {
+		t.Fatal("expected error due to TLS handshake timeout, got nil")
+	}
+	if duration >= time.Second {
+		t.Fatalf("request took %v, expected TLSHandshakeTimeout of 50ms to abort sooner", duration)
+	}
+}
+
+func TestBuildHTTPTransportHTTPSProxyClonedTransport(t *testing.T) {
+	t.Parallel()
+
+	targetServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprint(w, "cloned target ok")
+	}))
+	defer targetServer.Close()
+
+	proxyCert := newTestCertificate(t)
+	proxyListener, errListen := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
+		Certificates: []tls.Certificate{proxyCert},
+		NextProtos:   []string{"h2", "http/1.1"},
+	})
+	if errListen != nil {
+		t.Fatalf("tls.Listen returned error: %v", errListen)
+	}
+	defer func() {
+		if errClose := proxyListener.Close(); errClose != nil {
+			t.Errorf("proxyListener.Close returned error: %v", errClose)
+		}
+	}()
+
+	proxyDone := make(chan error, 1)
+	go func() {
+		conn, errAccept := proxyListener.Accept()
+		if errAccept != nil {
+			proxyDone <- errAccept
+			return
+		}
+		defer func() { _ = conn.Close() }()
+
+		tlsConn, ok := conn.(*tls.Conn)
+		if !ok {
+			proxyDone <- errors.New("conn is not *tls.Conn")
+			return
+		}
+		if errHandshake := tlsConn.Handshake(); errHandshake != nil {
+			proxyDone <- fmt.Errorf("tls handshake failed: %w", errHandshake)
+			return
+		}
+
+		if proto := tlsConn.ConnectionState().NegotiatedProtocol; proto != "http/1.1" {
+			proxyDone <- fmt.Errorf("proxy negotiated %q, want http/1.1", proto)
+			return
+		}
+
+		req, errRead := http.ReadRequest(bufio.NewReader(tlsConn))
+		if errRead != nil {
+			proxyDone <- fmt.Errorf("read request failed: %w", errRead)
+			return
+		}
+
+		targetURL, _ := url.Parse(targetServer.URL)
+		targetConn, errDial := net.Dial("tcp", targetURL.Host)
+		if errDial != nil {
+			proxyDone <- fmt.Errorf("dial target failed: %w", errDial)
+			return
+		}
+		defer func() { _ = targetConn.Close() }()
+
+		if errWrite := req.Write(targetConn); errWrite != nil {
+			proxyDone <- fmt.Errorf("write to target failed: %w", errWrite)
+			return
+		}
+
+		targetResp, errTargetResp := http.ReadResponse(bufio.NewReader(targetConn), req)
+		if errTargetResp != nil {
+			proxyDone <- fmt.Errorf("read target response failed: %w", errTargetResp)
+			return
+		}
+		defer func() { _ = targetResp.Body.Close() }()
+
+		if errWrite := targetResp.Write(tlsConn); errWrite != nil {
+			proxyDone <- fmt.Errorf("write response to proxy client failed: %w", errWrite)
+			return
+		}
+
+		proxyDone <- nil
+	}()
+
+	proxyURL := "https://" + proxyListener.Addr().String()
+	transport, mode, errBuild := BuildHTTPTransport(proxyURL)
+	if errBuild != nil {
+		t.Fatalf("BuildHTTPTransport returned error: %v", errBuild)
+	}
+	if mode != ModeProxy {
+		t.Fatalf("mode = %d, want %d", mode, ModeProxy)
+	}
+
+	certPool := x509.NewCertPool()
+	certPool.AddCert(proxyCert.Leaf)
+	parsedProxyURL, _ := url.Parse(proxyURL)
+	transport.DialTLSContext = buildHTTPSProxyDialTLSContext(parsedProxyURL, &tls.Config{RootCAs: certPool}, transport.TLSHandshakeTimeout, transport.DialContext)
+
+	clonedTransport := transport.Clone()
+
+	client := &http.Client{
+		Transport: clonedTransport,
+		Timeout:   5 * time.Second,
+	}
+
+	req, errReq := http.NewRequest(http.MethodGet, targetServer.URL, nil)
+	if errReq != nil {
+		t.Fatalf("http.NewRequest returned error: %v", errReq)
+	}
+	req.Close = true
+
+	resp, errGet := client.Do(req)
+	if errGet != nil {
+		t.Fatalf("client.Do returned error: %v", errGet)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	body, errBody := io.ReadAll(resp.Body)
+	if errBody != nil {
+		t.Fatalf("read response body failed: %v", errBody)
+	}
+	if string(body) != "cloned target ok" {
+		t.Fatalf("body = %q, want %q", string(body), "cloned target ok")
+	}
+
+	clonedTransport.CloseIdleConnections()
+
+	if errProxy := <-proxyDone; errProxy != nil {
+		t.Fatalf("proxy returned error: %v", errProxy)
+	}
+}
+
+func TestBuildHTTPTransportSOCKS5DialContextHonorsCancellation(t *testing.T) {
+	t.Parallel()
+
+	for _, scheme := range []string{"socks5", "socks5h"} {
+		scheme := scheme
+		t.Run(scheme, func(t *testing.T) {
+			t.Parallel()
+
+			listener, errListen := net.Listen("tcp", "127.0.0.1:0")
+			if errListen != nil {
+				t.Fatalf("net.Listen returned error: %v", errListen)
+			}
+			defer func() {
+				if errClose := listener.Close(); errClose != nil && !errors.Is(errClose, net.ErrClosed) {
+					t.Errorf("listener.Close returned error: %v", errClose)
+				}
+			}()
+
+			greetingRead := make(chan struct{})
+			serverDone := make(chan error, 1)
+			stopServer := make(chan struct{})
+			defer close(stopServer)
+
+			go func() {
+				conn, errAccept := listener.Accept()
+				if errAccept != nil {
+					serverDone <- errAccept
+					return
+				}
+				defer func() { _ = conn.Close() }()
+				go func() {
+					<-stopServer
+					_ = conn.Close()
+				}()
+				if errDeadline := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); errDeadline != nil {
+					serverDone <- errDeadline
+					return
+				}
+				// Read the 3-byte SOCKS5 greeting, then stall without replying so
+				// only context cancellation can abort the dial.
+				var greeting [3]byte
+				if _, errRead := io.ReadFull(conn, greeting[:]); errRead != nil {
+					serverDone <- errRead
+					return
+				}
+				if greeting != [3]byte{0x05, 0x01, 0x00} {
+					serverDone <- fmt.Errorf("unexpected SOCKS5 greeting: %x", greeting)
+					return
+				}
+				close(greetingRead)
+				var buf [1]byte
+				_, errEOF := conn.Read(buf[:])
+				serverDone <- errEOF
+			}()
+
+			transport, mode, errBuild := BuildHTTPTransport(scheme + "://" + listener.Addr().String())
+			if errBuild != nil {
+				t.Fatalf("BuildHTTPTransport returned error: %v", errBuild)
+			}
+			if mode != ModeProxy {
+				t.Fatalf("mode = %d, want %d", mode, ModeProxy)
+			}
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			dialDone := make(chan error, 1)
+			go func() {
+				conn, errDial := transport.DialContext(ctx, "tcp", "daily-cloudcode-pa.googleapis.com:443")
+				if conn != nil {
+					_ = conn.Close()
+				}
+				dialDone <- errDial
+			}()
+
+			select {
+			case <-greetingRead:
+			case <-time.After(time.Second):
+				t.Fatal("SOCKS5 proxy did not receive greeting")
+			}
+
+			cancel()
+
+			select {
+			case errDial := <-dialDone:
+				if errDial == nil {
+					t.Fatal("canceled SOCKS5 DialContext returned nil error")
+				}
+			case <-time.After(time.Second):
+				t.Fatal("canceled SOCKS5 DialContext did not return")
+			}
+
+			select {
+			case errServer := <-serverDone:
+				if !isPeerClosedReadError(errServer) {
+					t.Fatalf("SOCKS5 proxy read error = %v, want peer close (io.EOF or ECONNRESET)", errServer)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("SOCKS5 proxy connection was not closed after cancellation")
+			}
+		})
+	}
+}
+
+func TestBuildHTTPTransportSOCKS5DialContextHonorsDeadline(t *testing.T) {
+	t.Parallel()
+
+	for _, scheme := range []string{"socks5", "socks5h"} {
+		scheme := scheme
+		t.Run(scheme, func(t *testing.T) {
+			t.Parallel()
+
+			listener, errListen := net.Listen("tcp", "127.0.0.1:0")
+			if errListen != nil {
+				t.Fatalf("net.Listen returned error: %v", errListen)
+			}
+			defer func() {
+				if errClose := listener.Close(); errClose != nil && !errors.Is(errClose, net.ErrClosed) {
+					t.Errorf("listener.Close returned error: %v", errClose)
+				}
+			}()
+
+			greetingRead := make(chan struct{})
+			serverDone := make(chan error, 1)
+			stopServer := make(chan struct{})
+			defer close(stopServer)
+
+			go func() {
+				conn, errAccept := listener.Accept()
+				if errAccept != nil {
+					serverDone <- fmt.Errorf("accept: %w", errAccept)
+					return
+				}
+				defer func() { _ = conn.Close() }()
+				go func() {
+					<-stopServer
+					_ = conn.Close()
+				}()
+				if errDeadline := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); errDeadline != nil {
+					serverDone <- errDeadline
+					return
+				}
+				var greeting [3]byte
+				if _, errRead := io.ReadFull(conn, greeting[:]); errRead != nil {
+					serverDone <- fmt.Errorf("read greeting: %w", errRead)
+					return
+				}
+				if greeting != [3]byte{0x05, 0x01, 0x00} {
+					serverDone <- fmt.Errorf("unexpected SOCKS5 greeting: %x", greeting)
+					return
+				}
+				close(greetingRead)
+				var buf [1]byte
+				_, errEOF := conn.Read(buf[:])
+				serverDone <- errEOF
+			}()
+
+			transport, mode, errBuild := BuildHTTPTransport(scheme + "://" + listener.Addr().String())
+			if errBuild != nil {
+				t.Fatalf("BuildHTTPTransport returned error: %v", errBuild)
+			}
+			if mode != ModeProxy {
+				t.Fatalf("mode = %d, want %d", mode, ModeProxy)
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+			defer cancel()
+
+			dialDone := make(chan error, 1)
+			go func() {
+				conn, errDial := transport.DialContext(ctx, "tcp", "daily-cloudcode-pa.googleapis.com:443")
+				if conn != nil {
+					_ = conn.Close()
+				}
+				dialDone <- errDial
+			}()
+
+			// Ensure the dial actually reached SOCKS5 negotiation before verifying
+			// that the context deadline aborts the stalled handshake and closes the peer socket.
+			select {
+			case <-greetingRead:
+			case <-time.After(time.Second):
+				t.Fatal("SOCKS5 proxy did not receive greeting")
+			}
+
+			select {
+			case errDial := <-dialDone:
+				if errDial == nil {
+					t.Fatal("timed-out SOCKS5 DialContext returned nil error")
+				}
+				var netErr net.Error
+				if !errors.Is(errDial, context.DeadlineExceeded) && (!errors.As(errDial, &netErr) || !netErr.Timeout()) {
+					t.Fatalf("DialContext error = %v, want timeout/deadline error", errDial)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("SOCKS5 DialContext ignored context deadline")
+			}
+
+			select {
+			case errServer := <-serverDone:
+				if !isPeerClosedReadError(errServer) {
+					t.Fatalf("SOCKS5 proxy read error = %v, want peer close (io.EOF or ECONNRESET)", errServer)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("SOCKS5 proxy connection was not closed after deadline")
+			}
+		})
+	}
+}
+
+func TestBuildHTTPTransportSOCKS5HTTPClientDoCancellationClosesProxyConn(t *testing.T) {
+	t.Parallel()
+
+	for _, scheme := range []string{"socks5", "socks5h"} {
+		scheme := scheme
+		t.Run(scheme, func(t *testing.T) {
+			t.Parallel()
+
+			listener, errListen := net.Listen("tcp", "127.0.0.1:0")
+			if errListen != nil {
+				t.Fatalf("net.Listen returned error: %v", errListen)
+			}
+			defer func() {
+				if errClose := listener.Close(); errClose != nil && !errors.Is(errClose, net.ErrClosed) {
+					t.Errorf("listener.Close returned error: %v", errClose)
+				}
+			}()
+
+			greetingRead := make(chan struct{})
+			serverDone := make(chan error, 1)
+			stopServer := make(chan struct{})
+			defer close(stopServer)
+
+			go func() {
+				conn, errAccept := listener.Accept()
+				if errAccept != nil {
+					serverDone <- fmt.Errorf("accept: %w", errAccept)
+					return
+				}
+				defer func() { _ = conn.Close() }()
+				go func() {
+					<-stopServer
+					_ = conn.Close()
+				}()
+				if errDeadline := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); errDeadline != nil {
+					serverDone <- errDeadline
+					return
+				}
+				var greeting [3]byte
+				if _, errRead := io.ReadFull(conn, greeting[:]); errRead != nil {
+					serverDone <- fmt.Errorf("read greeting: %w", errRead)
+					return
+				}
+				if greeting != [3]byte{0x05, 0x01, 0x00} {
+					serverDone <- fmt.Errorf("unexpected SOCKS5 greeting: %x", greeting)
+					return
+				}
+				close(greetingRead)
+				var buf [1]byte
+				_, errEOF := conn.Read(buf[:])
+				serverDone <- errEOF
+			}()
+
+			transport, mode, errBuild := BuildHTTPTransport(scheme + "://" + listener.Addr().String())
+			if errBuild != nil {
+				t.Fatalf("BuildHTTPTransport returned error: %v", errBuild)
+			}
+			if mode != ModeProxy {
+				t.Fatalf("mode = %d, want %d", mode, ModeProxy)
+			}
+
+			client := &http.Client{Transport: transport}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			req, errReq := http.NewRequestWithContext(ctx, http.MethodGet, "https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist", nil)
+			if errReq != nil {
+				t.Fatalf("http.NewRequestWithContext returned error: %v", errReq)
+			}
+
+			reqDone := make(chan error, 1)
+			go func() {
+				resp, errDo := client.Do(req)
+				if resp != nil && resp.Body != nil {
+					_ = resp.Body.Close()
+				}
+				transport.CloseIdleConnections()
+				reqDone <- errDo
+			}()
+
+			select {
+			case <-greetingRead:
+			case <-time.After(2 * time.Second):
+				t.Fatal("SOCKS5 proxy did not receive greeting")
+			}
+
+			cancel()
+
+			select {
+			case errDo := <-reqDone:
+				if errDo == nil {
+					t.Fatal("canceled HTTP request returned nil error")
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("canceled HTTP request did not return")
+			}
+
+			select {
+			case errServer := <-serverDone:
+				if !isPeerClosedReadError(errServer) {
+					t.Fatalf("SOCKS5 proxy read error = %v, want peer close (io.EOF or ECONNRESET)", errServer)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("SOCKS5 proxy connection was not closed after HTTP request cancellation")
+			}
+		})
+	}
+}
+
+func TestBuildHTTPTransportSOCKS5DialContextPreCanceled(t *testing.T) {
+	t.Parallel()
+
+	for _, scheme := range []string{"socks5", "socks5h"} {
+		scheme := scheme
+		t.Run(scheme, func(t *testing.T) {
+			t.Parallel()
+
+			listener, errListen := net.Listen("tcp", "127.0.0.1:0")
+			if errListen != nil {
+				t.Fatalf("net.Listen returned error: %v", errListen)
+			}
+			defer func() {
+				if errClose := listener.Close(); errClose != nil && !errors.Is(errClose, net.ErrClosed) {
+					t.Errorf("listener.Close returned error: %v", errClose)
+				}
+			}()
+
+			accepted := make(chan struct{}, 1)
+			go func() {
+				conn, errAccept := listener.Accept()
+				if errAccept != nil {
+					return
+				}
+				_ = conn.Close()
+				accepted <- struct{}{}
+			}()
+
+			transport, mode, errBuild := BuildHTTPTransport(scheme + "://" + listener.Addr().String())
+			if errBuild != nil {
+				t.Fatalf("BuildHTTPTransport returned error: %v", errBuild)
+			}
+			if mode != ModeProxy {
+				t.Fatalf("mode = %d, want %d", mode, ModeProxy)
+			}
+
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+
+			conn, errDial := transport.DialContext(ctx, "tcp", "daily-cloudcode-pa.googleapis.com:443")
+			if conn != nil {
+				_ = conn.Close()
+			}
+			if !errors.Is(errDial, context.Canceled) {
+				t.Fatalf("DialContext error = %v, want %v", errDial, context.Canceled)
+			}
+
+			select {
+			case <-accepted:
+				t.Fatal("pre-canceled SOCKS5 DialContext dialed proxy unexpectedly")
+			default:
+			}
+		})
+	}
+}
+
+func TestBuildHTTPTransportSOCKS5DialContextTunnel(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		scheme string
+		nilCtx bool
+	}{
+		{name: "socks5", scheme: "socks5"},
+		{name: "socks5h", scheme: "socks5h"},
+		{name: "socks5h nil context", scheme: "socks5h", nilCtx: true},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			listener, errListen := net.Listen("tcp", "127.0.0.1:0")
+			if errListen != nil {
+				t.Fatalf("net.Listen returned error: %v", errListen)
+			}
+			defer func() {
+				if errClose := listener.Close(); errClose != nil && !errors.Is(errClose, net.ErrClosed) {
+					t.Errorf("listener.Close returned error: %v", errClose)
+				}
+			}()
+
+			serverDone := make(chan error, 1)
+			go func() {
+				conn, errAccept := listener.Accept()
+				if errAccept != nil {
+					serverDone <- errAccept
+					return
+				}
+				defer func() { _ = conn.Close() }()
+				if errDeadline := conn.SetDeadline(time.Now().Add(5 * time.Second)); errDeadline != nil {
+					serverDone <- errDeadline
+					return
+				}
+
+				// Greeting: VER=5, NMETHODS=1, METHODS=[0x00]
+				var greeting [3]byte
+				if _, errRead := io.ReadFull(conn, greeting[:]); errRead != nil {
+					serverDone <- fmt.Errorf("read greeting: %w", errRead)
+					return
+				}
+				if greeting != [3]byte{0x05, 0x01, 0x00} {
+					serverDone <- fmt.Errorf("greeting = %x, want 050100", greeting)
+					return
+				}
+				if _, errWrite := conn.Write([]byte{0x05, 0x00}); errWrite != nil {
+					serverDone <- fmt.Errorf("write method selection: %w", errWrite)
+					return
+				}
+
+				// CONNECT request: VER=5, CMD=1, RSV=0, ATYP=3 (FQDN)
+				var header [5]byte
+				if _, errRead := io.ReadFull(conn, header[:]); errRead != nil {
+					serverDone <- fmt.Errorf("read CONNECT header: %w", errRead)
+					return
+				}
+				if header[0] != 0x05 || header[1] != 0x01 || header[2] != 0x00 || header[3] != 0x03 {
+					serverDone <- fmt.Errorf("CONNECT header = %x, want 05010003", header[:4])
+					return
+				}
+				addrBuf := make([]byte, int(header[4])+2)
+				if _, errRead := io.ReadFull(conn, addrBuf); errRead != nil {
+					serverDone <- fmt.Errorf("read CONNECT addr: %w", errRead)
+					return
+				}
+				gotHost := string(addrBuf[:len(addrBuf)-2])
+				gotPort := int(addrBuf[len(addrBuf)-2])<<8 | int(addrBuf[len(addrBuf)-1])
+				if gotHost != "target.example.com" || gotPort != 443 {
+					serverDone <- fmt.Errorf("CONNECT target = %s:%d, want target.example.com:443", gotHost, gotPort)
+					return
+				}
+
+				// Reply: succeeded, bound 127.0.0.1:0
+				if _, errWrite := conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0}); errWrite != nil {
+					serverDone <- fmt.Errorf("write CONNECT reply: %w", errWrite)
+					return
+				}
+				if _, errWrite := io.WriteString(conn, "ok"); errWrite != nil {
+					serverDone <- fmt.Errorf("write tunnel payload: %w", errWrite)
+					return
+				}
+				var ping [4]byte
+				if _, errRead := io.ReadFull(conn, ping[:]); errRead != nil {
+					serverDone <- fmt.Errorf("read tunnel payload: %w", errRead)
+					return
+				}
+				if string(ping[:]) != "ping" {
+					serverDone <- fmt.Errorf("tunnel payload = %q, want ping", string(ping[:]))
+					return
+				}
+				serverDone <- nil
+			}()
+
+			transport, mode, errBuild := BuildHTTPTransport(tt.scheme + "://" + listener.Addr().String())
+			if errBuild != nil {
+				t.Fatalf("BuildHTTPTransport returned error: %v", errBuild)
+			}
+			if mode != ModeProxy {
+				t.Fatalf("mode = %d, want %d", mode, ModeProxy)
+			}
+
+			var dialCtx context.Context
+			if !tt.nilCtx {
+				var cancel context.CancelFunc
+				dialCtx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+			}
+
+			conn, errDial := transport.DialContext(dialCtx, "tcp", "target.example.com:443")
+			if errDial != nil {
+				t.Fatalf("DialContext returned error: %v", errDial)
+			}
+			defer func() {
+				if errClose := conn.Close(); errClose != nil {
+					t.Errorf("conn.Close returned error: %v", errClose)
+				}
+			}()
+
+			var resp [2]byte
+			if _, errRead := io.ReadFull(conn, resp[:]); errRead != nil {
+				t.Fatalf("conn.Read returned error: %v", errRead)
+			}
+			if string(resp[:]) != "ok" {
+				t.Fatalf("tunnel payload = %q, want ok", string(resp[:]))
+			}
+			if _, errWrite := conn.Write([]byte("ping")); errWrite != nil {
+				t.Fatalf("conn.Write returned error: %v", errWrite)
+			}
+			if errServer := <-serverDone; errServer != nil {
+				t.Fatalf("proxy server returned error: %v", errServer)
+			}
+		})
+	}
+}
+
+func TestBuildHTTPTransportSOCKS5DialContextHonorsCancelledContext(t *testing.T) {
+	transport, mode, err := BuildHTTPTransport("socks5://127.0.0.1:1")
+	if err != nil {
+		t.Fatalf("BuildHTTPTransport returned error: %v", err)
+	}
+	if mode != ModeProxy {
+		t.Fatalf("mode = %v, want %v", mode, ModeProxy)
+	}
+	if transport == nil || transport.DialContext == nil {
+		t.Fatalf("expected transport with DialContext")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err = transport.DialContext(ctx, "tcp", "unused.invalid:443")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("DialContext error = %v, want context canceled", err)
+	}
+}
+
+func TestConfiguredTestCAKeepsOriginTrustIsolated(t *testing.T) {
+	original := &tls.Config{RootCAs: x509.NewCertPool(), ServerName: "configured.example"}
+	cert := newTestCertificate(t)
+	path := filepath.Join(t.TempDir(), "ca.pem")
+	contents := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Certificate[0]})
+	if err := os.WriteFile(path, contents, 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("QUOTIO_TEST_CA_FILE", path)
+	updated := withTestRootCA(original)
+	if updated == original || updated.ServerName != original.ServerName || original.RootCAs.Equal(updated.RootCAs) || updated.InsecureSkipVerify {
+		t.Fatal("extra CA must only extend the returned configuration")
+	}
+	roots := x509.NewCertPool()
+	roots.AddCert(cert.Leaf)
+	if !roots.Equal(updated.RootCAs) {
+		t.Fatal("an explicit CA pool grew beyond the configured test certificate")
+	}
+	t.Setenv("QUOTIO_TEST_CA_FILE", filepath.Join(t.TempDir(), "missing"))
+	if withTestRootCA(original) != original || withTestRootCA(nil) != nil {
+		t.Fatal("absent certificate must leave custom and default trust intact")
 	}
 }

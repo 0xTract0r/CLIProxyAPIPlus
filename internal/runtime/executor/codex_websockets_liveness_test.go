@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
 func TestCodexWebsocketControlFramesRefreshReadDeadline(t *testing.T) {
@@ -53,7 +53,7 @@ func TestCodexWebsocketControlFramesRefreshReadDeadline(t *testing.T) {
 			}
 			defer closer.Close()
 			if tc.session {
-				sess := newCodexWebsocketSession(t.Name(), "auth", "ws://test")
+				sess := &codexWebsocketSession{sessionID: t.Name(), conn: conn, connCloser: closer}
 				if tc.active {
 					ch := sess.activate(conn)
 					defer sess.clearActive(conn, ch)

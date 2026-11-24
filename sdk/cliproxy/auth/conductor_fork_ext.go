@@ -7,97 +7,20 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
-	log "github.com/sirupsen/logrus"
 )
 
-// This file carries fork-only Manager behavior that upstream v7.2.101 does not
-// have, ported out of the fork conductor monolith into the upstream split-file
-// structure. Each item here still has live callers (either inside this package
-// or in other packages) so dropping them would break the build and silently
-// remove a fork capability.
-
-// SetHook replaces the lifecycle hook used for auth and result observations.
-// Upstream removed the setter; the fork wires the auth-registry hook through it
-// from sdk/cliproxy/builder.go (coreManager.SetHook(authRegistryHook{...})).
-func (m *Manager) SetHook(hook Hook) {
-	if m == nil {
-		return
-	}
-	if hook == nil {
-		hook = NoopHook{}
-	}
-	m.mu.Lock()
-	m.hook = hook
-	m.mu.Unlock()
-}
-
-// hydrateRuntimeFields applies runtime-only fields (per-account proxy_url and
-// custom outbound headers) from persisted metadata onto the auth. It is invoked
-// at Register/Update so a freshly loaded or updated credential carries its
-// per-account egress configuration (T041 proxy binding, #66 managed headers)
-// before the scheduler and executors observe it. Upstream dropped this call;
-// the fork keeps it because the runtime fields are anti-correlation critical.
-func hydrateRuntimeFields(auth *Auth) {
-	ApplyRuntimeFieldsFromMetadata(auth)
-	ApplyCustomHeadersFromMetadata(auth)
-}
-
-// authAllowsRouteModel reports whether the given auth is permitted to serve the
-// given route model. It gates subscription-restricted models (Claude Opus,
-// Codex Spark) at the scheduler layer so an account whose plan does not include
-// a premium model is never rotated in for it. Called from scheduler.go while
-// building each auth's servable model set.
-func authAllowsRouteModel(auth *Auth, model string) bool {
-	if auth == nil {
-		return true
-	}
-	switch strings.ToLower(strings.TrimSpace(auth.Provider)) {
-	case "claude":
-		return authAllowsClaudeRouteModel(auth, model)
-	case "codex":
-		return authAllowsCodexRouteModel(auth, model)
-	default:
-		return true
-	}
-}
-
-func authAllowsClaudeRouteModel(auth *Auth, model string) bool {
-	if registry.IsClaudeOpus1MAlias(canonicalModelKey(model)) {
-		return registry.ClaudePlanAllowsOpusLongContext(authClaudeSubscriptionPlanType(auth), auth.ClaudeUsageCreditsEnabled())
-	}
-	if !registry.IsClaudeOpusModelID(canonicalModelKey(model)) {
-		return true
-	}
-	return authAllowsClaudeOpusModel(auth)
-}
-
-func authAllowsCodexRouteModel(auth *Auth, model string) bool {
-	if !registry.IsCodexSparkModelID(canonicalModelKey(model)) {
-		return true
-	}
-	return registry.CodexPlanAllowsSpark(authCodexSubscriptionPlanType(auth))
-}
-
-// IncrementCyberPolicyCount atomically bumps the cyber_policy flag counter and
-// timestamp for the auth with the given ID, then persists the change.
-//
-// The read-modify-write of CyberPolicyFlagCount / LastCyberPolicyAt happens
-// entirely under m.mu so concurrent hits cannot lose increments. Persistence
-// (store + hooks) runs after the lock is released to avoid re-entrant locking
-// inside Update / persist. When persistence fails the in-memory counter is
-// still bumped (visible to subsequent reads via m.auths) but the error is
-// surfaced so callers can suppress webhook dispatch and emit an ERROR log.
-//
-// Returns the new count, the timestamp recorded, and a persistence error if
-// any. When the auth cannot be located it returns (0, zero time, nil). Called
-// from internal/runtime/executor/codex_cyber_policy.go.
+// IncrementCyberPolicyCount records a provider refusal for the operator.
+// Updates use the same per-credential mutation lock as administrative writes.
 func (m *Manager) IncrementCyberPolicyCount(ctx context.Context, authID string) (int, time.Time, error) {
 	authID = strings.TrimSpace(authID)
 	if authID == "" {
 		return 0, time.Time{}, nil
 	}
+	release, err := m.lockAuthMutationContext(ctx, authID)
+	if err != nil {
+		return 0, time.Time{}, err
+	}
+	defer release()
 	now := time.Now().UTC()
 	m.mu.Lock()
 	existing, ok := m.auths[authID]
@@ -124,39 +47,12 @@ func (m *Manager) IncrementCyberPolicyCount(ctx context.Context, authID string) 
 	return newCount, now, nil
 }
 
-// Codex credit headers. Once a plan window is exhausted the upstream keeps
-// serving the account by drawing down its credit balance server-side (the client
-// sends no extra parameter), and every response advertises that state here.
 const (
 	codexCreditsHasCreditsHeader = "X-Codex-Credits-Has-Credits"
 	codexCreditsBalanceHeader    = "X-Codex-Credits-Balance"
 	codexCreditsUnlimitedHeader  = "X-Codex-Credits-Unlimited"
 )
 
-// codexCreditsUsable reports whether a Codex response's credit headers say the
-// account can keep being served after its plan quota window is exhausted. In that
-// state the upstream bills the overflow to the account's credits, so a
-// used-percent of 100 on an otherwise successful response does NOT mean the
-// account is about to start rejecting requests.
-//
-// It returns true only when X-Codex-Credits-Has-Credits is "true" (matched
-// case-insensitively; the upstream sends "True"/"False") AND either
-// X-Codex-Credits-Unlimited is "true" or X-Codex-Credits-Balance parses as a
-// finite number > 0. A missing, unparseable, zero or negative signal returns
-// false so every caller keeps its pre-credits behavior (fail-safe: an ambiguous
-// response still cools the account exactly as before).
-//
-// Scope: credits are only known to cover the main X-Codex buckets. An exhausted
-// X-Codex-Bengalfox bucket is never exempted (no evidence credits apply to it).
-//
-// Callers: the success-path proactive cooldown below, the real-time selection
-// overlay in account_quota.go, and (via CodexCreditsUsable) the executor's 429
-// classification in codex_executor_terminal.go. On a 429 the credit exemption only
-// applies when the body is NOT an explicit usage-limit rejection; a 429
-// usage_limit_reached still cools to the window reset regardless of these headers,
-// because a hard upstream rejection proves the credit path is not usable for this
-// account (e.g. third-party credit use is not enabled). That is the backstop
-// whenever these headers turn out to be optimistic.
 func codexCreditsUsable(headers http.Header) bool {
 	if len(headers) == 0 {
 		return false
@@ -178,129 +74,11 @@ func codexCreditsUsable(headers http.Header) bool {
 	return balance > 0
 }
 
-// CodexCreditsUsable exposes codexCreditsUsable to the Codex executor so its 429
-// classification shares the exact same credit predicate (single source of truth).
+// CodexCreditsUsable decodes the reported credit balance for SDK consumers.
 func CodexCreditsUsable(headers http.Header) bool {
 	return codexCreditsUsable(headers)
 }
 
-// codexHeaderTrue reports whether a Codex boolean header value is "true",
-// case-insensitively and ignoring surrounding whitespace.
 func codexHeaderTrue(raw string) bool {
 	return strings.EqualFold(strings.TrimSpace(raw), "true")
-}
-
-// quotaRetryAfterFromHeaders inspects codex quota headers on a response and, when
-// the primary or secondary usage bucket is already exhausted (>=100%), returns
-// the retry-after until the soonest reset. This lets a "successful" codex
-// response proactively cool the account down so the scheduler rotates off it
-// before it starts returning 429s. Fork-only codex quota-rotation capability;
-// upstream v7.2.101 does not parse these headers. Guarded by scheduler_test.go
-// TestManager_ExecuteSuccessCodexExhaustedHeaderCoolsAuth (+ ExecuteCount).
-//
-// Credits exception: when the same response reports usable account credits
-// (codexCreditsUsable), an exhausted MAIN X-Codex bucket does not cool the
-// account. The upstream keeps serving such an account from its credit balance, so
-// cooling it until the plan window resets (up to ~7 days for the weekly window)
-// would locally 429 an account the upstream is still accepting. An exhausted
-// X-Codex-Bengalfox bucket still cools as before (credits are not known to cover
-// it). If the credit path is in fact not usable, the upstream answers 429
-// usage_limit_reached and the executor's 429 path still cools to the window reset
-// (see codexCreditsUsable). Guarded by codex_credits_cooldown_test.go.
-func quotaRetryAfterFromHeaders(provider string, headers http.Header, now time.Time) *time.Duration {
-	if !strings.EqualFold(strings.TrimSpace(provider), "codex") || len(headers) == 0 {
-		return nil
-	}
-	if now.IsZero() {
-		now = time.Now()
-	}
-	latestMain := quotaHeaderLatestExhaustedReset(headers, "X-Codex", now)
-	latestBengalfox := quotaHeaderLatestExhaustedReset(headers, "X-Codex-Bengalfox", now)
-	if latestMain.After(now) && codexCreditsUsable(headers) {
-		// Debug only: this fires on every credit-backed response once a window is
-		// exhausted. No auth identifier is logged (auth IDs may embed an email).
-		log.WithField("reset_in", latestMain.Sub(now).Round(time.Second)).
-			Debug("codex quota window exhausted but credits available; skip proactive cooldown")
-		latestMain = time.Time{}
-	}
-	latest := latestMain
-	if latestBengalfox.After(latest) {
-		latest = latestBengalfox
-	}
-	if latest.IsZero() || !latest.After(now) {
-		return nil
-	}
-	retryAfter := latest.Sub(now)
-	return &retryAfter
-}
-
-// quotaHeaderLatestExhaustedReset returns the latest reset among prefix's
-// Primary/Secondary windows that report used-percent >= 100, or zero when none is
-// exhausted with a usable future reset.
-func quotaHeaderLatestExhaustedReset(headers http.Header, prefix string, now time.Time) time.Time {
-	var latest time.Time
-	for _, window := range []string{"-Primary", "-Secondary"} {
-		if !quotaHeaderPercentExhausted(headers.Get(prefix + window + "-Used-Percent")) {
-			continue
-		}
-		if resetAt := quotaHeaderResetTime(headers, prefix+window, now); resetAt.After(latest) {
-			latest = resetAt
-		}
-	}
-	return latest
-}
-
-func quotaHeaderPercentExhausted(raw string) bool {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return false
-	}
-	value, err := strconv.ParseFloat(raw, 64)
-	return err == nil && value >= 100
-}
-
-func quotaHeaderResetTime(headers http.Header, prefix string, now time.Time) time.Time {
-	if headers == nil {
-		return time.Time{}
-	}
-	if raw := strings.TrimSpace(headers.Get(prefix + "-Reset-At")); raw != "" {
-		if unixSeconds, err := strconv.ParseInt(raw, 10, 64); err == nil && unixSeconds > 0 {
-			resetAt := time.Unix(unixSeconds, 0)
-			if resetAt.After(now) {
-				return resetAt
-			}
-		}
-	}
-	if raw := strings.TrimSpace(headers.Get(prefix + "-Reset-After-Seconds")); raw != "" {
-		if seconds, err := strconv.ParseInt(raw, 10, 64); err == nil && seconds > 0 {
-			return now.Add(time.Duration(seconds) * time.Second)
-		}
-	}
-	return time.Time{}
-}
-
-// quotaRetryAfterFromHeadersNow is a convenience wrapper for execution/stream
-// call sites that do not otherwise need the time package; it evaluates the codex
-// quota headers against the current wall-clock time.
-func quotaRetryAfterFromHeadersNow(provider string, headers http.Header) *time.Duration {
-	return quotaRetryAfterFromHeaders(provider, headers, time.Now())
-}
-
-// resultIndicatesPlanQuota reports whether a 429 error explicitly signals a
-// plan-level usage/quota exhaustion (e.g. codex usage_limit_reached), as opposed
-// to a transient capacity / TPM rate limit. MarkResult's 429 handling uses it
-// (together with the presence of an upstream RetryAfter hint) to decide between
-// the plan-quota cooldown (Quota.Exceeded=true, escalating) and the brief
-// transient cooldown (Quota.Exceeded=false). A bare "rate_limit" without a quota
-// marker stays transient so a capacity blip does not flip plan-level quota state.
-func resultIndicatesPlanQuota(err *Error) bool {
-	if err == nil {
-		return false
-	}
-	text := strings.ToLower(err.Message + " " + err.Code)
-	return strings.Contains(text, "quota") ||
-		strings.Contains(text, "usage_limit") ||
-		strings.Contains(text, "usage limit") ||
-		strings.Contains(text, "plan_limit") ||
-		strings.Contains(text, "plan limit")
 }

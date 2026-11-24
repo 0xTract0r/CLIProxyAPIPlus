@@ -5,8 +5,8 @@ import (
 	"sync"
 	"time"
 
-	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executionregistry"
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executionregistry"
 )
 
 // ConcurrencyReleaseFrame is the cumulative release accepted by Home for one credential and model.
@@ -25,6 +25,7 @@ type releaseState struct {
 type releaseFlusher struct {
 	mu             sync.Mutex
 	groups         map[executionregistry.ReleaseGroup]releaseState
+	pending        map[executionregistry.ReleaseGroup]int64
 	flushInterval  time.Duration
 	maxBackoff     time.Duration
 	configProvider func() internalconfig.CredentialConcurrencyConfig
@@ -36,6 +37,7 @@ type releaseFlusher struct {
 func newReleaseFlusher(flushInterval, maxBackoff time.Duration, send func(context.Context, ConcurrencyReleaseFrame) error) *releaseFlusher {
 	return &releaseFlusher{
 		groups:        make(map[executionregistry.ReleaseGroup]releaseState),
+		pending:       make(map[executionregistry.ReleaseGroup]int64),
 		flushInterval: flushInterval,
 		maxBackoff:    maxBackoff,
 		send:          send,
@@ -61,6 +63,17 @@ func (f *releaseFlusher) SetConfigProvider(provider func() internalconfig.Creden
 	f.signal()
 }
 
+// SetSender replaces the Home lifetime used for subsequent release attempts.
+func (f *releaseFlusher) SetSender(send func(context.Context, ConcurrencyReleaseFrame) error) {
+	if f == nil {
+		return
+	}
+	f.mu.Lock()
+	f.send = send
+	f.mu.Unlock()
+	f.signal()
+}
+
 // MarkDirty records the latest cumulative sequence for one release group and
 // returns a ticket completed when Home acknowledges that sequence.
 func (f *releaseFlusher) MarkDirty(group executionregistry.ReleaseGroup, sequence int64) *executionregistry.ReleaseTicket {
@@ -82,6 +95,9 @@ func (f *releaseFlusher) MarkDirty(group executionregistry.ReleaseGroup, sequenc
 			state.Latest = sequence
 		}
 		f.groups[group] = state
+		if current, ok := f.pending[group]; !ok || sequence > current {
+			f.pending[group] = sequence
+		}
 	}
 	f.mu.Unlock()
 	f.signal()
@@ -99,6 +115,7 @@ func (f *releaseFlusher) Run(ctx context.Context) {
 
 	timer := time.NewTimer(0)
 	defer timer.Stop()
+	timerC := timer.C
 	delay := f.timings().flushInterval
 	backingOff := false
 	for {
@@ -108,16 +125,28 @@ func (f *releaseFlusher) Run(ctx context.Context) {
 		case <-f.wake:
 			if !backingOff {
 				resetReleaseTimer(timer, 0)
+				timerC = timer.C
 			}
 		case forceCtx := <-f.force:
 			resetReleaseTimer(timer, 0)
+			timerC = timer.C
 			failed := f.flush(forceCtx)
 			delay, backingOff = f.nextDelay(delay, failed)
-			resetReleaseTimer(timer, delay)
-		case <-timer.C:
+			if f.idle() && !backingOff {
+				timerC = nil
+			} else {
+				resetReleaseTimer(timer, delay)
+				timerC = timer.C
+			}
+		case <-timerC:
 			failed := f.flush(ctx)
 			delay, backingOff = f.nextDelay(delay, failed)
-			timer.Reset(delay)
+			if f.idle() && !backingOff {
+				timerC = nil
+			} else {
+				timer.Reset(delay)
+				timerC = timer.C
+			}
 		}
 	}
 }
@@ -174,31 +203,38 @@ func (f *releaseFlusher) timings() releaseFlusherTimings {
 }
 
 func (f *releaseFlusher) flush(ctx context.Context) bool {
-	if f == nil || f.send == nil {
+	if f == nil {
 		return false
 	}
 
 	f.mu.Lock()
-	pending := make(map[executionregistry.ReleaseGroup]int64, len(f.groups))
-	for group, state := range f.groups {
-		if state.Latest > state.Acked {
-			pending[group] = state.Latest
-		}
+	if len(f.pending) == 0 {
+		f.mu.Unlock()
+		return false
+	}
+	send := f.send
+	pending := make(map[executionregistry.ReleaseGroup]int64, len(f.pending))
+	for group, sequence := range f.pending {
+		pending[group] = sequence
 	}
 	f.mu.Unlock()
+	if send == nil {
+		return false
+	}
 
 	failed := false
 	for group, sequence := range pending {
-		errSend := f.send(ctx, ConcurrencyReleaseFrame{
+		errSend := send(ctx, ConcurrencyReleaseFrame{
 			CredentialID: group.CredentialID,
 			Model:        group.Model,
 			ReleaseSeq:   sequence,
 		})
+		f.mu.Lock()
 		if errSend != nil {
 			failed = true
+			f.mu.Unlock()
 			continue
 		}
-		f.mu.Lock()
 		state := f.groups[group]
 		if sequence > state.Acked {
 			state.Acked = sequence
@@ -212,6 +248,9 @@ func (f *releaseFlusher) flush(ctx context.Context) bool {
 			}
 		}
 		f.groups[group] = state
+		if current, ok := f.pending[group]; ok && current <= state.Acked {
+			delete(f.pending, group)
+		}
 		f.mu.Unlock()
 	}
 	return failed
@@ -243,12 +282,7 @@ func (f *releaseFlusher) Flush(ctx context.Context) error {
 func (f *releaseFlusher) idle() bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	for _, state := range f.groups {
-		if state.Latest > state.Acked {
-			return false
-		}
-	}
-	return true
+	return len(f.pending) == 0
 }
 
 func (f *releaseFlusher) signal() {

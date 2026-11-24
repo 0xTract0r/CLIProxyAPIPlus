@@ -2,7 +2,6 @@ package management
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -10,9 +9,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/MoeForge/moego/json"
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/usage"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/redisqueue"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/usage"
 )
 
 type usageQueueRecord []byte
@@ -206,7 +206,19 @@ func (h *Handler) ImportUsageStatistics(c *gin.Context) {
 		return
 	}
 
-	result := h.usageStats.MergeSnapshot(payload.Usage)
+	result, err := h.usageStats.ImportAndSave(payload.Usage)
+	if errors.Is(err, usage.ErrUsageImportInvalid) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if errors.Is(err, usage.ErrUsageSnapshotChanged) {
+		c.JSON(http.StatusConflict, gin.H{"error": "usage history unavailable or changed; import was not committed"})
+		return
+	}
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "usage history could not be saved"})
+		return
+	}
 	snapshot := h.usageStats.Snapshot()
 	c.JSON(http.StatusOK, gin.H{
 		"added":           result.Added,
@@ -229,6 +241,10 @@ func (h *Handler) GetUsageQueue(c *gin.Context) {
 		return
 	}
 
+	if h.usageStats != usage.GetRequestStatistics() {
+		c.JSON(http.StatusOK, []usageQueueRecord{})
+		return
+	}
 	items := redisqueue.PopOldest(count)
 	records := make([]usageQueueRecord, 0, len(items))
 	for _, item := range items {
@@ -304,6 +320,10 @@ func (h *Handler) PutUsagePricingOverride(c *gin.Context) {
 		OutputUSDPerMTok:      payload.OutputUSDPerMTok,
 		CacheWriteUSDPerMTok:  payload.CacheWriteUSDPerMTok,
 	}); err != nil {
+		if errors.Is(err, usage.ErrPricingPersistence) {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "pricing persistence failed"})
+			return
+		}
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
@@ -319,7 +339,12 @@ func (h *Handler) DeleteUsagePricingOverride(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "usage statistics unavailable"})
 		return
 	}
-	if !h.usageStats.DeletePricingOverride(c.Param("model")) {
+	deleted, err := h.usageStats.DeletePricingOverrideWithError(c.Param("model"))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "pricing persistence failed"})
+		return
+	}
+	if !deleted {
 		c.JSON(http.StatusNotFound, gin.H{"error": "pricing override not found"})
 		return
 	}

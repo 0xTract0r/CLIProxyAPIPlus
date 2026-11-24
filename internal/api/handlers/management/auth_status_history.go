@@ -7,13 +7,14 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -39,6 +40,7 @@ var (
 )
 
 type authStatusHistoryEvent struct {
+	source          *os.Root
 	EventType       string    `json:"event_type"`
 	OccurredAt      time.Time `json:"occurred_at"`
 	AuthName        string    `json:"auth_name,omitempty"`
@@ -164,18 +166,32 @@ func deriveAuthStatusHistoryEventType(before, after authStatusHistorySnapshot, e
 	return "checked"
 }
 
-func (h *Handler) appendAuthStatusHistoryEvent(event authStatusHistoryEvent) {
-	if h == nil || h.cfg == nil {
-		return
+// openAuthStatusHistorySource captures the physical directory before the
+// producer starts work. The producer closes the handle when it finishes.
+func (h *Handler) openAuthStatusHistorySource() (*os.Root, error) {
+	cfg := h.configSnapshot()
+	if cfg == nil || strings.TrimSpace(cfg.AuthDir) == "" {
+		return nil, errors.New("auth status history source directory is missing")
 	}
-	path := authStatusHistoryPath(h.cfg.AuthDir)
-	if path == "" {
-		return
-	}
+	return os.OpenRoot(strings.TrimSpace(cfg.AuthDir))
+}
 
+// The source handle is captured by the producer when its operation starts.
+func (h *Handler) appendAuthStatusHistoryEvent(event authStatusHistoryEvent) error {
+	if err := appendAuthStatusHistoryAtSource(event); err != nil {
+		log.Warn("management: auth status history was not saved")
+		return err
+	}
+	return nil
+}
+
+func appendAuthStatusHistoryAtSource(event authStatusHistoryEvent) error {
+	if event.source == nil {
+		return errors.New("auth status history source directory is missing")
+	}
 	event.EventType = strings.TrimSpace(event.EventType)
 	if event.EventType == "" {
-		return
+		return errors.New("auth status history event type is missing")
 	}
 	if event.OccurredAt.IsZero() {
 		event.OccurredAt = time.Now().UTC()
@@ -186,35 +202,59 @@ func (h *Handler) appendAuthStatusHistoryEvent(event authStatusHistoryEvent) {
 	event.Provider = strings.TrimSpace(event.Provider)
 	event.Trigger = normalizeAuthStatusHistoryTrigger(event.Trigger)
 	event.PreviousStatus = strings.TrimSpace(event.PreviousStatus)
-	event.PreviousMessage = strings.TrimSpace(event.PreviousMessage)
 	event.Status = strings.TrimSpace(event.Status)
-	event.StatusMessage = strings.TrimSpace(event.StatusMessage)
-	event.Error = strings.TrimSpace(event.Error)
+	redactAuthStatusHistory(&event)
 
 	data, err := json.Marshal(event)
 	if err != nil {
-		log.WithError(err).Warn("management: marshal auth status history failed")
-		return
+		return err
 	}
-
 	authStatusHistoryWriteMu.Lock()
 	defer authStatusHistoryWriteMu.Unlock()
-
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		log.WithError(err).Warn("management: create auth status history dir failed")
-		return
+	root := event.source
+	if err := root.MkdirAll(authStatusHistoryDirName, 0o700); err != nil {
+		return err
 	}
-
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	f, err := root.OpenFile(filepath.Join(authStatusHistoryDirName, authStatusHistoryFileName), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
-		log.WithError(err).Warn("management: open auth status history failed")
-		return
+		return err
 	}
-	defer f.Close()
+	_, writeErr := f.Write(append(data, '\n'))
+	return errors.Join(writeErr, f.Close())
+}
 
-	if _, err := f.Write(append(data, '\n')); err != nil {
-		log.WithError(err).Warn("management: append auth status history failed")
+var auditHistorySecret = regexp.MustCompile(`(?i)(\b(?:access[_ -]?token|refresh[_ -]?token|id[_ -]?token|client[_ -]?secret|api[_ -]?key|password|authorization[_ -]?code|code|state)["']?\s*[:=]|\b(?:bearer|basic)\s+\S+|://[^/\s]+@)`)
+
+func redactAuditHistoryText(s string) string {
+	s = strings.TrimSpace(s)
+	if auditHistorySecret.MatchString(s) {
+		return "[redacted]"
 	}
+	return s
+}
+
+func redactAuthStatusHistory(event *authStatusHistoryEvent) {
+	event.PreviousMessage = redactAuditHistoryText(event.PreviousMessage)
+	event.StatusMessage = redactAuditHistoryText(event.StatusMessage)
+	event.Error = redactAuditHistoryText(event.Error)
+}
+
+func openAuditHistory(path string) (*os.File, error) {
+	parent := filepath.Dir(path)
+	root, err := os.OpenRoot(filepath.Dir(parent))
+	if err != nil {
+		return nil, err
+	}
+	defer root.Close()
+	name := filepath.Join(filepath.Base(parent), filepath.Base(path))
+	info, err := root.Stat(name)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, errors.New("history is not a regular file")
+	}
+	return root.Open(name)
 }
 
 func readAuthStatusHistoryEventsFromFile(path, authName string, limit int) ([]authStatusHistoryEvent, error) {
@@ -227,7 +267,9 @@ func readAuthStatusHistoryEventsFromFile(path, authName string, limit int) ([]au
 		limit = defaultAuthStatusHistoryLimit
 	}
 
-	f, err := os.Open(path)
+	authStatusHistoryWriteMu.Lock()
+	defer authStatusHistoryWriteMu.Unlock()
+	f, err := openAuditHistory(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return []authStatusHistoryEvent{}, nil
@@ -255,6 +297,7 @@ func readAuthStatusHistoryEventsFromFile(path, authName string, limit int) ([]au
 		if !event.OccurredAt.IsZero() {
 			event.OccurredAt = event.OccurredAt.UTC()
 		}
+		redactAuthStatusHistory(&event)
 		events = append(events, event)
 	}
 	if err := scanner.Err(); err != nil {
@@ -271,7 +314,8 @@ func readAuthStatusHistoryEventsFromFile(path, authName string, limit int) ([]au
 }
 
 func (h *Handler) ListAuthStatusHistory(c *gin.Context) {
-	if h == nil || h.cfg == nil {
+	cfg := h.configSnapshot()
+	if cfg == nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "handler not initialized"})
 		return
 	}
@@ -288,9 +332,9 @@ func (h *Handler) ListAuthStatusHistory(c *gin.Context) {
 		return
 	}
 
-	events, err := readAuthStatusHistoryEventsFromFile(authStatusHistoryPath(h.cfg.AuthDir), authName, limit)
+	events, err := readAuthStatusHistoryEventsFromFile(authStatusHistoryPath(cfg.AuthDir), authName, limit)
 	if err != nil {
-		log.WithError(err).Warn("management: read auth status history failed")
+		log.Warn("management: read auth status history failed")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read auth status history"})
 		return
 	}

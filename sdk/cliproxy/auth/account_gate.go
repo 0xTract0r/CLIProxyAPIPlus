@@ -2,64 +2,14 @@ package auth
 
 import (
 	"encoding/json"
-	"net/http"
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
-
-	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 )
 
-// AccountConcurrencyGate is the per-account in-flight concurrency semaphore and
-// per-account UTC-daily request budget counter for the adaptive
-// account-scheduling change
-// (openspec/changes/add-adaptive-account-scheduling, design.md §5.1 / §6.2).
-//
-// It closes the two gaps the earlier warm-up wiring left open:
-//
-//   - Concurrency: config.AccountWarmupStage.ConcurrencyLimit /
-//     config.AccountMatureLimitsConfig.ConcurrencyLimit describe how many
-//     requests one account may have IN FLIGHT at once, but nothing counted
-//     real in-flight requests. This type maintains that live count so the
-//     adaptive selector can steer away from an account already at its ceiling
-//     and the execution path can hold/release a slot for a request's lifetime.
-//
-//   - Daily budget: config.AccountWarmupStage.DailyBudget is design §5.1's
-//     PRIMARY warm-up throttle ("第1周 ≤200/日 ..."), yet no request was ever
-//     counted against it. This type keeps one request-per-UTC-day counter per
-//     account so the selector can skip a warming account that has spent its
-//     day's budget (mature accounts have DailyBudget 0 = unbounded).
-//
-// Design intent this type deliberately encodes:
-//
-//   - Per-account, never a global pool (design D2): every authID has its own
-//     independent in-flight count and daily counter; one busy account never
-//     constrains another.
-//
-//   - In-memory, restart starts conservative, no persistence (design §6.2):
-//     on a process restart every in-flight count is 0 and every daily counter
-//     is empty. Losing the daily count on restart errs toward LESS throttling
-//     (an account could serve slightly more than its day's budget across a
-//     restart) which is a bounded, self-correcting direction, exactly why §6.2
-//     classifies this as "safe to lose on restart, no DB". Losing in-flight
-//     counts on restart is likewise safe: in-flight requests belonging to the
-//     dead process are gone, so a fresh 0 is correct.
-//
-//   - Soft ceiling, never a hard denier (task brief): Acquire ALWAYS records
-//     the slot (so Release always pairs and the live count stays accurate even
-//     when two goroutines race the same last slot -- the accepted "偶发 +1
-//     瞬时越界") and only REPORTS whether the post-acquire count is within the
-//     limit. The caller decides what to do with an over-limit report (the
-//     non-stream execution path fails over to another credential before it has
-//     sent anything; the stream path keeps the slot because the request is
-//     already out). This gate never manufactures a failure the upstream did
-//     not send.
-//
-// All exported methods are safe for concurrent use; a single mutex serializes
-// every access to both maps (correctness/race-freedom is the priority here, per
-// the design's concurrency-critical framing).
+// AccountConcurrencyGate counts in-flight work and rolling usage for caller
+// supplied keys. It does not select credentials or register a runtime policy.
 type AccountConcurrencyGate struct {
 	// mu guards inflight and daily. One mutex is used deliberately: no counter
 	// is ever read or written outside this lock, which makes the type race-free
@@ -70,8 +20,6 @@ type AccountConcurrencyGate struct {
 	// deleted the moment its count returns to 0 (see Release), so the map is
 	// bounded by the set of accounts with active traffic, not by history.
 	inflight map[string]int
-	pending  map[string]int
-	bindings map[string]int
 
 	// daily maps authID -> that account's rolling 24-hour REQUEST counter
 	// (harden-account-scheduling-limiter P2). It replaced the earlier single
@@ -173,10 +121,8 @@ func NewAccountConcurrencyGate(opts ...AccountConcurrencyGateOption) *AccountCon
 //     tracked so InFlight stays accurate, it just never reports over-limit), or
 //     when authID == "" (nothing to key on: returns true, records nothing, and
 //     the paired Release is a harmless no-op).
-//   - false when the increment pushed the count past a positive limit. The
-//     caller may then Release and fail over to another account (it has not sent
-//     anything yet), or -- when the request is already in flight (streaming) --
-//     keep the slot and accept the transient overage.
+//   - false when the increment pushed the count past a positive limit.
+//     The call is still paired with Release.
 func (g *AccountConcurrencyGate) Acquire(authID string, limit int) bool {
 	if authID == "" {
 		return true
@@ -211,8 +157,7 @@ func (g *AccountConcurrencyGate) Release(authID string) {
 }
 
 // InFlight returns the current number of in-flight requests recorded for
-// authID (0 if none). It is a plain read used by the selector to steer away
-// from an account already at its ceiling; it does not itself gate.
+// authID (0 if none).
 func (g *AccountConcurrencyGate) InFlight(authID string) int {
 	if authID == "" {
 		return 0
@@ -529,177 +474,3 @@ func metadataInt64(raw any) (int64, bool) {
 // AdaptiveSelector owns, so the selector's Pick-time avoidance and the
 // execution path's acquire/release/record all share one live count.
 // ---------------------------------------------------------------------------
-
-// accountGateProvider is implemented by a selector that owns an
-// AccountConcurrencyGate (the AdaptiveSelector). The Manager type-asserts its
-// current selector to this so the execution path can reach the same gate the
-// selector gates against, without a back-reference from the selector to the
-// Manager. A non-adaptive selector (round-robin/fill-first) does not implement
-// it, so the gate is transparently absent and no gating happens (design D7).
-type accountGateProvider interface {
-	AccountGate() *AccountConcurrencyGate
-}
-
-// accountConcurrencyGate returns the gate owned by the active selector, or nil
-// when the current selector is not the adaptive one (in which case the whole
-// concurrency/daily-budget mechanism is inert -- the pre-adaptive behavior).
-func (m *Manager) accountConcurrencyGate() *AccountConcurrencyGate {
-	if m == nil {
-		return nil
-	}
-	if provider, ok := m.Selector().(accountGateProvider); ok && provider != nil {
-		return provider.AccountGate()
-	}
-	return nil
-}
-
-// accountConcurrencyGateLocked is accountConcurrencyGate for callers that ALREADY
-// hold m.mu (read or write). It reads m.selector directly instead of going through
-// Selector(), which re-acquires m.mu.RLock() -- calling that while m.mu is held
-// self-deadlocks the non-reentrant RWMutex (e.g. MarkResult holds m.mu.Lock() and
-// then records the warm-up daily budget). Same semantics otherwise: nil when the
-// current selector is not the adaptive one, so the whole mechanism stays inert.
-func (m *Manager) accountConcurrencyGateLocked() *AccountConcurrencyGate {
-	if m == nil {
-		return nil
-	}
-	if provider, ok := m.selector.(accountGateProvider); ok && provider != nil {
-		return provider.AccountGate()
-	}
-	return nil
-}
-
-// accountSchedulingConfig reads the live AccountSchedulingConfig from the
-// runtime config snapshot (the same snapshot the rest of the execution path
-// reads). An unset/zero config yields a zero AccountSchedulingConfig, which
-// resolves every account to the mature ceiling with a 0 concurrency limit and
-// 0 daily budget -- i.e. no gating -- a safe default.
-func (m *Manager) accountSchedulingConfig() internalconfig.AccountSchedulingConfig {
-	if cfg, ok := m.runtimeConfig.Load().(*internalconfig.Config); ok && cfg != nil {
-		return cfg.AccountScheduling
-	}
-	return internalconfig.AccountSchedulingConfig{}
-}
-
-// accountExecutionSlot is a one-request handle over the gate: it remembers which
-// account's slot was taken so release acts on the same authID and the same gate
-// instance, even if the Manager's selector is swapped mid-request (the captured
-// gate pointer, not a fresh lookup, is released). A nil slot (no active gate)
-// makes every method a no-op, so callers need no gate-presence branching.
-//
-// Note (P2): the rolling-24h daily-budget REQUEST count is no longer driven from
-// this slot on the execution path. It moved to MarkResult (the single result
-// sink), so a request is counted "on result" rather than "on send" -- a
-// concurrency-busy failover never reaches MarkResult and so records no phantom
-// count. The slot now carries ONLY the in-flight concurrency reservation.
-type accountExecutionSlot struct {
-	gate           *AccountConcurrencyGate
-	authID         string
-	releaseOnce    sync.Once
-	resultOnce     sync.Once
-	sent           atomic.Bool
-	pacingRateUsed atomic.Bool
-	target         bool
-	countOnly      bool
-	dailyBudget    int
-	manager        *Manager
-	bindingKey     string
-}
-
-// beginAccountExecution reserves one in-flight concurrency slot for auth on the
-// active gate and reports whether the account is still within its concurrency
-// ceiling after the reservation. It returns a nil slot (and within=true) when
-// no gate is active or auth has no ID, so the non-adaptive path is unaffected.
-//
-// The concurrency limit is the account's current warm-up stage (or mature)
-// ConcurrencyLimit -- AccountWarmupStatus already resolves that single value
-// for both warming and mature accounts.
-//
-// The caller MUST call slot.release() exactly once when the request's in-flight
-// lifetime ends (via defer on the non-stream path; plumbed into the stream
-// wrapper's completion on the stream path). When within is false the caller may
-// release immediately and fail over (non-stream, nothing sent yet) instead of
-// proceeding over the ceiling. Daily-budget request counting is NOT done here
-// anymore -- it happens in MarkResult (see the slot type doc).
-func (m *Manager) beginAccountExecution(auth *Auth) (*accountExecutionSlot, bool) {
-	gate := m.accountConcurrencyGate()
-	if gate == nil || auth == nil || auth.ID == "" {
-		return nil, true
-	}
-	cfg := m.accountSchedulingConfig()
-	// Only gate the providers this scheduler actually manages (positive
-	// configured tier weight -- claude/codex today), matching the selector's
-	// adaptiveEligible. A non-adaptive provider (gemini/antigravity/...) is left
-	// entirely ungated so its concurrency/daily counting and any failover are
-	// never surprise-applied to it.
-	if auth.AccountTierBaseWeight(cfg.TierWeights) <= 0 {
-		return nil, true
-	}
-	limit := int(AccountLimitPolicyFor(auth, time.Now(), cfg).Fields["concurrency"].Effective)
-	// Scale the concurrency ceiling by the per-account rate multiplier (§8.3) so
-	// the execution-path acquire enforces the SAME scaled limit the selector's
-	// Pick-time hasConcurrencyHeadroom read avoids against (one source of truth).
-	within := gate.Acquire(auth.ID, limit)
-	return &accountExecutionSlot{gate: gate, authID: auth.ID}, within
-}
-
-// release drops the in-flight slot exactly once. Safe on a nil slot and safe to
-// call more than once (only the first call decrements). It is the release point
-// deferred/plumbed onto every execution exit path so a slot is never leaked --
-// a leaked slot would leave the account permanently counted as busy and drop it
-// out of selection forever.
-func (s *accountExecutionSlot) release() {
-	if s == nil || s.gate == nil {
-		return
-	}
-	s.releaseOnce.Do(func() {
-		if s.target {
-			s.gate.releaseWarmupReservation(s.authID, s.bindingKey)
-		} else {
-			s.gate.Release(s.authID)
-		}
-		notifyPacingAdmission()
-	})
-}
-
-// errAccountConcurrencyBusy is the retryable error the non-stream execution path
-// records when an account is at its concurrency ceiling and the request fails
-// over to another credential. It is retryable so a genuine full-fleet moment
-// surfaces as backpressure the caller can retry, never a hard/terminal failure.
-func errAccountConcurrencyBusy(authID string) error {
-	message := "account concurrency limit reached, failing over"
-	if authID != "" {
-		message = "account " + authID + " concurrency limit reached, failing over"
-	}
-	return &Error{
-		Code:       "account_concurrency_exceeded",
-		Message:    message,
-		Retryable:  true,
-		HTTPStatus: http.StatusTooManyRequests,
-	}
-}
-
-// errAccountDailyBudgetExhausted is the retryable error the adaptive selector
-// returns when the ONLY accounts able to serve a request are still-warming
-// accounts that have all spent their UTC-daily warm-up budget. In that thin-pool
-// case the empty-candidate branch would otherwise degrade to the round-robin
-// fallback, which re-picks over the full pool and ignores the daily budget --
-// hammering the very account warm-up is protecting (only the concurrency=1 gate
-// left as a backstop). Denying instead keeps the account protected.
-//
-// It deliberately reuses errAccountConcurrencyBusy's failover semantics (Retryable
-// + 429, no RetryAfter) rather than inventing a new mechanism, so a genuinely
-// budget-exhausted moment surfaces as backpressure the caller can retry, never a
-// hard/terminal failure. A distinct Code is kept only so the two protective
-// denials are legible apart in logs and client errors. Like the concurrency
-// error, it carries no RetryAfter, so Manager.shouldRetryAfterError does not spin
-// on it (a 429 with no cooldown target and no RetryAfter is not retried in place)
-// and it surfaces to the client as backpressure.
-func errAccountDailyBudgetExhausted() error {
-	return &Error{
-		Code:       "account_daily_budget_exhausted",
-		Message:    "all serving accounts are warming and over their daily budget, failing over",
-		Retryable:  true,
-		HTTPStatus: http.StatusTooManyRequests,
-	}
-}

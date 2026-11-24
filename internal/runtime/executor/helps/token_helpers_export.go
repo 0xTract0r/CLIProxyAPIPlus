@@ -1,6 +1,9 @@
 package helps
 
-import "github.com/tidwall/gjson"
+import (
+	"github.com/MoeForge/moego/ojson"
+	"github.com/tidwall/gjson"
+)
 
 func GetTokenizer(model string) (*TokenizerWrapper, error) {
 	return getTokenizer(model)
@@ -23,5 +26,9 @@ func BuildOpenAIUsageJSON(count int64) []byte {
 }
 
 func CollectOpenAIContent(content gjson.Result, segments *[]string) {
-	collectOpenAIContent(content, segments)
+	if content.Type == gjson.String {
+		addIfNotEmpty(segments, content.String())
+		return
+	}
+	collectOpenAIContent(ojson.Parse(content.Raw), segments)
 }

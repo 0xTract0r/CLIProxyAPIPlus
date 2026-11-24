@@ -9,50 +9,40 @@ import (
 	"compress/gzip"
 	"compress/zlib"
 	"context"
-	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
 	"time"
 
+	"github.com/MoeForge/moego/json"
+	"github.com/MoeForge/moego/ojson"
 	"github.com/andybalholm/brotli"
 	"github.com/klauspost/compress/zstd"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/sync/singleflight"
 )
 
 // OAuth configuration constants for OpenAI Codex
 const (
-	AuthURL     = "https://auth.openai.com/oauth/authorize"
-	TokenURL    = "https://auth.openai.com/oauth/token"
-	ClientID    = "app_EMoamEEZ73f0CkXaXp7hrann"
-	RedirectURI = "http://localhost:1455/auth/callback"
-
-	// codexOAuthUserAgent mirrors codexUserAgent used by serving (defined in
-	// internal/runtime/executor). OAuth token exchange/refresh has no inbound
-	// client context, so it uses this constant to stay consistent with the serving
-	// identity. Kept as a local copy because that constant is unexported and
-	// importing the executor package here would create an import cycle.
-	codexOAuthUserAgent = "codex-tui/0.135.0 (Mac OS 26.5.0; arm64) iTerm.app/3.6.10 (codex-tui; 0.135.0)"
+	AuthURL             = "https://auth.openai.com/oauth/authorize"
+	TokenURL            = "https://auth.openai.com/oauth/token"
+	ClientID            = "app_EMoamEEZ73f0CkXaXp7hrann"
+	RedirectURI         = "http://localhost:1455/auth/callback"
+	codexRefreshTimeout = 30 * time.Second
 )
 
 // CodexAuth handles the OpenAI OAuth2 authentication flow.
 // It manages the HTTP client and provides methods for generating authorization URLs,
 // exchanging authorization codes for tokens, and refreshing access tokens.
 type CodexAuth struct {
-	httpClient *http.Client
-	// userAgent, when non-empty, is set on OAuth token exchange/refresh requests.
-	// Only the bare-client constructors (NewCodexAuthWithProxyURL) populate it so
-	// background token refresh presents the serving identity; the management-bound
-	// client (NewCodexAuthWithHTTPClient) leaves it empty and relies on its own
-	// managed-header transport.
-	userAgent string
+	httpClient        *http.Client
+	siwcAgentNameHint string
+	refreshJournal    RefreshJournal
 }
 
 var codexRefreshGroup singleflight.Group
@@ -68,35 +58,32 @@ func NewCodexAuth(cfg *config.Config) *CodexAuth {
 func NewCodexAuthWithProxyURL(cfg *config.Config, proxyURL string) *CodexAuth {
 	effectiveProxyURL := strings.TrimSpace(proxyURL)
 	var sdkCfg config.SDKConfig
+	agentNameHint := SIWCAgentNameHint
 	if cfg != nil {
 		sdkCfg = cfg.SDKConfig
 		if effectiveProxyURL == "" {
 			effectiveProxyURL = strings.TrimSpace(cfg.ProxyURL)
 		}
+		agentNameHint = cfg.Codex.EffectiveSignInWithChatGPTIdentifier()
 	}
 	sdkCfg.ProxyURL = effectiveProxyURL
-	// Anti-correlation (leak 03117a8e): OAuth token exchange/refresh must present
-	// the SAME replicated codex-rs (Rust/rustls) ClientHello that serving uses for
-	// the codex outbound path, not a Go-default TLS fingerprint. util.SetProxy is
-	// kept only for the management/defensive path (NewCodexAuthWithHTTPClient); the
-	// bare refresh client here uses the serving uTLS profile
-	// (codex_rustls_native_v1), strict no-downgrade, HTTP/1.1 only, with the same
-	// per-account proxy. timeout=0 preserves the prior context-governed behavior
-	// (the bare client had no http.Client.Timeout).
+	var journal RefreshJournal
+	if cfg != nil && strings.TrimSpace(cfg.AuthDir) != "" {
+		journal = &FileRefreshJournal{Dir: cfg.AuthDir}
+	}
 	return &CodexAuth{
-		httpClient: helps.NewOAuthRefreshUtlsHTTPClient(effectiveProxyURL, helps.CodexRustlsClientHelloProfileID, 0),
-		userAgent:  codexOAuthUserAgent,
+		httpClient:        util.SetProxy(&sdkCfg, &http.Client{}),
+		siwcAgentNameHint: agentNameHint,
+		refreshJournal:    journal,
 	}
 }
 
-// NewCodexAuthWithHTTPClient creates a CodexAuth with a caller-managed HTTP
-// client. Management OAuth uses this to bind token exchange to the same
-// account-scoped runtime transport and managed headers that will be persisted.
+// NewCodexAuthWithHTTPClient accepts a generic caller-provided HTTP client.
 func NewCodexAuthWithHTTPClient(client *http.Client) *CodexAuth {
 	if client == nil {
-		client = util.SetProxy(nil, &http.Client{})
+		return NewCodexAuth(nil)
 	}
-	return &CodexAuth{httpClient: client}
+	return &CodexAuth{httpClient: client, siwcAgentNameHint: SIWCAgentNameHint}
 }
 
 // GenerateAuthURL creates the OAuth authorization URL with PKCE (Proof Key for Code Exchange).
@@ -158,9 +145,6 @@ func (o *CodexAuth) ExchangeCodeForTokensWithRedirect(ctx context.Context, code,
 
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
-	if o.userAgent != "" {
-		req.Header.Set("User-Agent", o.userAgent)
-	}
 
 	resp, err := o.httpClient.Do(req)
 	if err != nil {
@@ -172,12 +156,11 @@ func (o *CodexAuth) ExchangeCodeForTokensWithRedirect(ctx context.Context, code,
 
 	body, err := readTokenResponseBody(resp)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read token response: %w", err)
+		return nil, fmt.Errorf("failed to read token response: status=%d invalid response body", resp.StatusCode)
 	}
-	// log.Debugf("Token response: %s", string(body))
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("token exchange failed: %s", summarizeTokenHTTPResponse(resp, body))
+		return nil, fmt.Errorf("token exchange failed with status %d: %s", resp.StatusCode, publicTokenErrorCode(body))
 	}
 
 	// Parse token response
@@ -190,7 +173,7 @@ func (o *CodexAuth) ExchangeCodeForTokensWithRedirect(ctx context.Context, code,
 	}
 
 	if err = json.Unmarshal(body, &tokenResp); err != nil {
-		return nil, fmt.Errorf("failed to parse token response: %w; %s", err, summarizeTokenHTTPResponse(resp, body))
+		return nil, fmt.Errorf("failed to parse token response: status=%d invalid JSON token payload", resp.StatusCode)
 	}
 
 	// Extract account ID from ID token
@@ -201,9 +184,11 @@ func (o *CodexAuth) ExchangeCodeForTokensWithRedirect(ctx context.Context, code,
 
 	accountID := ""
 	email := ""
+	planType := DefaultPlanType
 	if claims != nil {
 		accountID = claims.GetAccountID()
 		email = claims.GetUserEmail()
+		planType = claims.GetPlanType()
 	}
 
 	// Create token data
@@ -213,6 +198,7 @@ func (o *CodexAuth) ExchangeCodeForTokensWithRedirect(ctx context.Context, code,
 		RefreshToken: tokenResp.RefreshToken,
 		AccountID:    accountID,
 		Email:        email,
+		PlanType:     planType,
 		Expire:       time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second).Format(time.RFC3339),
 	}
 
@@ -237,7 +223,14 @@ func (o *CodexAuth) RefreshTokens(ctx context.Context, refreshToken string) (*Co
 	}
 
 	result, err, _ := codexRefreshGroup.Do(refreshToken, func() (interface{}, error) {
-		return o.refreshTokensSingleFlight(context.WithoutCancel(ctx), refreshToken)
+		refreshCtx, cancelRefresh := context.WithTimeout(context.WithoutCancel(ctx), codexRefreshTimeout)
+		defer cancelRefresh()
+		if errReadiness := codexRefreshReadiness(refreshCtx, "Codex"); errReadiness != nil {
+			return nil, errReadiness
+		}
+		return journalRefresh(refreshCtx, o.journal(ctx), ClientID, refreshToken, func() (*CodexTokenData, error) {
+			return o.refreshTokensSingleFlight(refreshCtx, refreshToken)
+		}, decodeRefreshReceipt)
 	})
 	if err != nil {
 		return nil, err
@@ -259,18 +252,15 @@ func (o *CodexAuth) refreshTokensSingleFlight(ctx context.Context, refreshToken 
 
 	req, errReq := http.NewRequestWithContext(ctx, "POST", TokenURL, strings.NewReader(data.Encode()))
 	if errReq != nil {
-		return nil, fmt.Errorf("failed to create refresh request: %w", errReq)
+		return nil, &RefreshPreSendError{Stage: "request-create", Cause: errReq}
 	}
 
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
-	if o.userAgent != "" {
-		req.Header.Set("User-Agent", o.userAgent)
-	}
 
-	resp, errDo := o.httpClient.Do(req)
+	resp, errDo := o.doRefreshRequest(req)
 	if errDo != nil {
-		return nil, fmt.Errorf("token refresh request failed: %w", errDo)
+		return nil, errDo
 	}
 	defer func() {
 		if errClose := resp.Body.Close(); errClose != nil {
@@ -278,13 +268,17 @@ func (o *CodexAuth) refreshTokensSingleFlight(ctx context.Context, refreshToken 
 		}
 	}()
 
-	body, err := readTokenResponseBody(resp)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read refresh response: %w", err)
+	body, errRead := readTokenResponseBody(resp)
+	if errRead != nil {
+		return nil, &RefreshOutcomeUnknownError{Stage: "response-read"}
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("token refresh failed: %s", summarizeTokenHTTPResponse(resp, body))
+		errResponse := fmt.Errorf("token refresh failed with status %d: %s", resp.StatusCode, publicTokenErrorCode(body))
+		if isNonRetryableRefreshErr(errResponse) {
+			return nil, errResponse
+		}
+		return nil, &RefreshOutcomeUnknownError{Stage: "response-status", Cause: errResponse}
 	}
 
 	var tokenResp struct {
@@ -295,8 +289,16 @@ func (o *CodexAuth) refreshTokensSingleFlight(ctx context.Context, refreshToken 
 		ExpiresIn    int    `json:"expires_in"`
 	}
 
-	if err = json.Unmarshal(body, &tokenResp); err != nil {
-		return nil, fmt.Errorf("failed to parse refresh response: %w; %s", err, summarizeTokenHTTPResponse(resp, body))
+	if !ojson.ValidBytes(body) {
+		return nil, &RefreshOutcomeUnknownError{Stage: "response-decode"}
+	}
+	response := ojson.ParseBytes(body)
+	tokenResp.AccessToken = response.Get("access_token").String()
+	tokenResp.RefreshToken = response.Get("refresh_token").String()
+	tokenResp.IDToken = response.Get("id_token").String()
+	tokenResp.ExpiresIn = int(response.Get("expires_in").Int())
+	if response.Get("access_token").Type != ojson.String || strings.TrimSpace(tokenResp.AccessToken) == "" || response.Get("expires_in").Type != ojson.Number || tokenResp.ExpiresIn <= 0 || response.Get("refresh_token").Type != ojson.String || strings.TrimSpace(tokenResp.RefreshToken) == "" {
+		return nil, &RefreshOutcomeUnknownError{Stage: "response-decode"}
 	}
 
 	// Extract account ID from ID token
@@ -307,9 +309,11 @@ func (o *CodexAuth) refreshTokensSingleFlight(ctx context.Context, refreshToken 
 
 	accountID := ""
 	email := ""
+	planType := DefaultPlanType
 	if claims != nil {
 		accountID = claims.GetAccountID()
 		email = claims.Email
+		planType = claims.GetPlanType()
 	}
 
 	return &CodexTokenData{
@@ -318,6 +322,7 @@ func (o *CodexAuth) refreshTokensSingleFlight(ctx context.Context, refreshToken 
 		RefreshToken: tokenResp.RefreshToken,
 		AccountID:    accountID,
 		Email:        email,
+		PlanType:     planType,
 		Expire:       time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second).Format(time.RFC3339),
 	}, nil
 }
@@ -325,6 +330,10 @@ func (o *CodexAuth) refreshTokensSingleFlight(ctx context.Context, refreshToken 
 // CreateTokenStorage creates a new CodexTokenStorage from a CodexAuthBundle.
 // It populates the storage struct with token data, user information, and timestamps.
 func (o *CodexAuth) CreateTokenStorage(bundle *CodexAuthBundle) *CodexTokenStorage {
+	planType := DefaultPlanType
+	if bundle != nil && strings.TrimSpace(bundle.TokenData.PlanType) != "" {
+		planType = strings.TrimSpace(bundle.TokenData.PlanType)
+	}
 	storage := &CodexTokenStorage{
 		IDToken:      bundle.TokenData.IDToken,
 		AccessToken:  bundle.TokenData.AccessToken,
@@ -333,6 +342,7 @@ func (o *CodexAuth) CreateTokenStorage(bundle *CodexAuthBundle) *CodexTokenStora
 		LastRefresh:  bundle.LastRefresh,
 		Email:        bundle.TokenData.Email,
 		Expire:       bundle.TokenData.Expire,
+		PlanType:     planType,
 	}
 
 	return storage
@@ -342,6 +352,9 @@ func (o *CodexAuth) CreateTokenStorage(bundle *CodexAuthBundle) *CodexTokenStora
 // It attempts to refresh the tokens up to a specified maximum number of retries,
 // with an exponential backoff strategy to handle transient network errors.
 func (o *CodexAuth) RefreshTokensWithRetry(ctx context.Context, refreshToken string, maxRetries int) (*CodexTokenData, error) {
+	if maxRetries <= 0 {
+		maxRetries = 1
+	}
 	var lastErr error
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
@@ -358,64 +371,89 @@ func (o *CodexAuth) RefreshTokensWithRetry(ctx context.Context, refreshToken str
 		if err == nil {
 			return tokenData, nil
 		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, ErrSIWCRefreshDeferred) {
+			return nil, err
+		}
 		if isNonRetryableRefreshErr(err) {
-			log.Errorf("Token refresh attempt %d failed with non-retryable error: %v", attempt+1, err)
+			log.Warnf("Token refresh attempt %d failed with non-retryable error: %v", attempt+1, err)
 			return nil, err
 		}
 
 		lastErr = err
-		if attempt+1 >= maxRetries {
-			log.Errorf("Token refresh attempt %d failed: %v", attempt+1, err)
-		} else {
-			log.Warnf("Token refresh attempt %d failed: %v", attempt+1, err)
-		}
+		log.Warnf("Token refresh attempt %d failed: %v", attempt+1, err)
 	}
 
 	return nil, fmt.Errorf("token refresh failed after %d attempts: %w", maxRetries, lastErr)
 }
 
 func isNonRetryableRefreshErr(err error) bool {
-	if err == nil {
+	if err == nil || IsRefreshPreSendError(err) {
 		return false
 	}
-	raw := strings.ToLower(err.Error())
-	if raw == "" {
-		return false
-	}
-	normalized := strings.NewReplacer("-", "_", " ", "_").Replace(raw)
-	if strings.Contains(normalized, "refresh_token_reused") || strings.Contains(normalized, "refresh_token_reuse") || strings.Contains(normalized, "refresh_token_already_used") {
+	if IsRefreshOutcomeUnknown(err) {
 		return true
 	}
-	return strings.Contains(normalized, "refresh") && strings.Contains(normalized, "already") && (strings.Contains(normalized, "used") || strings.Contains(normalized, "reuse"))
+	raw := strings.ToLower(err.Error())
+	normalized := strings.NewReplacer("-", "_", " ", "_").Replace(raw)
+	if strings.Contains(normalized, "refresh_token_reused") ||
+		strings.Contains(normalized, "refresh_token_reuse") ||
+		strings.Contains(normalized, "refresh_token_already_used") {
+		return true
+	}
+	if strings.Contains(normalized, "refresh") && strings.Contains(normalized, "already") &&
+		(strings.Contains(normalized, "used") || strings.Contains(normalized, "reuse")) {
+		return true
+	}
+	for _, token := range []string{
+		"refresh_token_reused",
+		"refresh_token_expired",
+		"refresh_token_invalidated",
+		"token_revoked",
+		"invalid_grant",
+		"invalid_client",
+		"status 401",
+		"401 unauthorized",
+		"request failed (401)",
+	} {
+		if strings.Contains(raw, token) {
+			return true
+		}
+	}
+	return false
 }
 
-func summarizeTokenHTTPResponse(resp *http.Response, body []byte) string {
-	status := 0
-	contentType := ""
-	contentEncoding := ""
-	if resp != nil {
-		status = resp.StatusCode
-		contentType = strings.TrimSpace(resp.Header.Get("Content-Type"))
-		contentEncoding = strings.TrimSpace(resp.Header.Get("Content-Encoding"))
+// publicTokenErrorCode emits only fixed protocol error categories. Responses
+// can contain credentials in arbitrary fields, including error descriptions.
+func publicTokenErrorCode(body []byte) string {
+	doc := ojson.ParseBytes(body)
+	for _, field := range []string{"error_description", "error.message"} {
+		text := strings.NewReplacer("-", "_", " ", "_").Replace(strings.ToLower(doc.Get(field).String()))
+		if strings.Contains(text, "refresh_token_reused") || strings.Contains(text, "refresh_token_already_used") ||
+			(strings.Contains(text, "refresh") && strings.Contains(text, "already") && strings.Contains(text, "used")) {
+			return "refresh_token_reused"
+		}
 	}
-	if contentType == "" {
-		contentType = "<empty>"
+	for _, value := range []string{doc.Get("error.code").String(), doc.Get("code").String(), doc.Get("error").String()} {
+		switch strings.ToLower(strings.TrimSpace(value)) {
+		case "refresh_token_reused", "refresh_token_reuse", "refresh_token_already_used",
+			"refresh_token_expired", "refresh_token_invalidated", "token_revoked",
+			"invalid_grant", "invalid_client":
+			return strings.ToLower(strings.TrimSpace(value))
+		}
 	}
-	if contentEncoding == "" {
-		contentEncoding = "<empty>"
-	}
+	return "unrecognized OAuth error"
+}
 
-	preview := strings.TrimSpace(string(body))
-	const maxPreview = 512
-	if len(preview) > maxPreview {
-		preview = preview[:maxPreview] + "...(truncated)"
+func readBoundedTokenBody(reader io.Reader) ([]byte, error) {
+	const maxTokenBody = 4 << 20
+	body, err := io.ReadAll(io.LimitReader(reader, maxTokenBody+1))
+	if err != nil {
+		return nil, err
 	}
-	if preview == "" {
-		preview = "<empty>"
-	} else {
-		preview = strconv.QuoteToASCII(preview)
+	if len(body) > maxTokenBody {
+		return nil, fmt.Errorf("token response exceeds size limit")
 	}
-	return fmt.Sprintf("status=%d content_type=%s content_encoding=%s body_preview=%s", status, contentType, contentEncoding, preview)
+	return body, nil
 }
 
 func readTokenResponseBody(resp *http.Response) ([]byte, error) {
@@ -423,7 +461,7 @@ func readTokenResponseBody(resp *http.Response) ([]byte, error) {
 		return nil, fmt.Errorf("empty token response body")
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := readBoundedTokenBody(resp.Body)
 	if err != nil {
 		return nil, err
 	}
@@ -468,16 +506,16 @@ func decodeTokenResponseBody(body []byte, encoding string) ([]byte, error) {
 		defer func() {
 			_ = reader.Close()
 		}()
-		return io.ReadAll(reader)
+		return readBoundedTokenBody(reader)
 	case "br":
-		return io.ReadAll(brotli.NewReader(bytes.NewReader(body)))
+		return readBoundedTokenBody(brotli.NewReader(bytes.NewReader(body)))
 	case "zstd":
-		reader, err := zstd.NewReader(bytes.NewReader(body))
+		reader, err := zstd.NewReader(bytes.NewReader(body), zstd.WithDecoderConcurrency(1), zstd.WithDecoderMaxMemory(8<<20), zstd.WithDecoderMaxWindow(4<<20))
 		if err != nil {
 			return nil, fmt.Errorf("decode zstd token response: %w", err)
 		}
 		defer reader.Close()
-		return io.ReadAll(reader)
+		return readBoundedTokenBody(reader)
 	case "deflate":
 		reader, err := zlib.NewReader(bytes.NewReader(body))
 		if err != nil {
@@ -486,15 +524,18 @@ func decodeTokenResponseBody(body []byte, encoding string) ([]byte, error) {
 		defer func() {
 			_ = reader.Close()
 		}()
-		return io.ReadAll(reader)
+		return readBoundedTokenBody(reader)
 	default:
-		return nil, fmt.Errorf("unsupported token response content-encoding %q", encoding)
+		return nil, fmt.Errorf("unsupported token response content encoding")
 	}
 }
 
 // UpdateTokenStorage updates an existing CodexTokenStorage with new token data.
 // This is typically called after a successful token refresh to persist the new credentials.
 func (o *CodexAuth) UpdateTokenStorage(storage *CodexTokenStorage, tokenData *CodexTokenData) {
+	if storage == nil || tokenData == nil {
+		return
+	}
 	storage.IDToken = tokenData.IDToken
 	storage.AccessToken = tokenData.AccessToken
 	storage.RefreshToken = tokenData.RefreshToken
@@ -502,4 +543,9 @@ func (o *CodexAuth) UpdateTokenStorage(storage *CodexTokenStorage, tokenData *Co
 	storage.LastRefresh = time.Now().Format(time.RFC3339)
 	storage.Email = tokenData.Email
 	storage.Expire = tokenData.Expire
+	planType := DefaultPlanType
+	if strings.TrimSpace(tokenData.PlanType) != "" {
+		planType = strings.TrimSpace(tokenData.PlanType)
+	}
+	storage.PlanType = planType
 }

@@ -1,0 +1,23 @@
+# Ordinary fork survival assertions. Original source row numbers and dispositions are recorded in the review.
+fork路由-OAuth回调	/google/callback	route	"/google/callback"	internal/api/server_routes.go
+fork路由-OAuth回调	/gitlab/callback	route	"/gitlab/callback"	internal/api/server_routes.go
+fork路由-管理端点	proxy-connectivity-probe	route	/diagnostics/proxy-connectivity-probe	internal/api/server_management.go
+fork路由-管理端点	usage/pricing	route	"/usage/pricing"	internal/api/server_management.go
+fork路由-管理端点	quota/snapshots	route	/quota/snapshots	internal/api/server_management.go
+fork路由-管理端点	logs-compress-after-days	route	/logs-compress-after-days	internal/api/server_management.go
+fork文件-amp模块	internal/api/modules/amp/	file	-	internal/api/modules/amp
+fork文件-反关联支撑	proxy_helpers.go	file	-	internal/runtime/executor/helps/proxy_helpers.go
+fork文件-反关联支撑	disable_image_generation_mode.go	file	-	internal/config/disable_image_generation_mode.go
+fork路由-Amp管理	ampcode(base)	route	mgmt\.GET\("/ampcode", s\.mgmt\.GetAmpCode\)	internal/api/server_management.go
+fork路由-Amp管理	ampcode/upstream-url	route	s\.mgmt\.PutAmpUpstreamURL	internal/api/server_management.go
+fork路由-Amp管理	ampcode/restrict-management-to-localhost	route	s\.mgmt\.GetAmpRestrictManagementToLocalhost	internal/api/server_management.go
+fork路由-Amp管理	ampcode/model-mappings	route	s\.mgmt\.GetAmpModelMappings	internal/api/server_management.go
+fork路由-Amp管理	ampcode/force-model-mappings	route	s\.mgmt\.GetAmpForceModelMappings	internal/api/server_management.go
+反关联-账号封禁时间暴露	refresh_disabled_at@buildAuthFileEntry	pattern	entry\["refresh_disabled_at"\]	internal/api/handlers/management/auth_files.go
+调度层-限流器加固	OverTokenBudget超预算判定	symbol	^func \(g \*AccountConcurrencyGate\) OverTokenBudget\(	sdk/cliproxy/auth/account_gate.go
+调度层-限流器加固	RecordTokensWindow滚动窗口记账	symbol	^func \(g \*AccountConcurrencyGate\) RecordTokensWindow\(	sdk/cliproxy/auth/account_gate.go
+request-log-archive	reader-env	pattern	REQUEST_LOG_ARCHIVE_DIR	internal/api/handlers/management/handler.go
+request-log-archive	local-first-reader	symbol	^func \(h \*Handler\) openRequestLog\(	internal/api/handlers/management/request_log_archive.go
+request-log-archive	reader-regression	symbol	^func TestRequestLogArchiveReadAndLocalPriority\(	internal/api/handlers/management/request_log_archive_test.go
+codex-client-catalog	non-template-supported-in-api	pattern	entry\["supported_in_api"\] = true	internal/client/codex/models/models.go
+codex-client-catalog	non-template-supported-in-api-regression	symbol	^func TestCodexClientModelsResponse_NonTemplateModelsSupportedInAPI\(	internal/client/codex/models/models_test.go

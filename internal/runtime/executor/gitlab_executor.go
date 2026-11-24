@@ -1,1336 +1,226 @@
 package executor
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
+	"errors"
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/gitlab"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
-	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
-	"github.com/tidwall/gjson"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/gitlab"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
 )
 
-const (
-	gitLabProviderKey             = "gitlab"
-	gitLabAuthMethodOAuth         = "oauth"
-	gitLabAuthMethodPAT           = "pat"
-	gitLabChatEndpoint            = "/api/v4/chat/completions"
-	gitLabCodeSuggestionsEndpoint = "/api/v4/code_suggestions/completions"
-	gitLabSSEStreamingHeader      = "X-Supports-Sse-Streaming"
-)
+const GitLabCodeSuggestionsModel = "gitlab-code-suggestions"
 
-type GitLabExecutor struct {
-	cfg *config.Config
-	// authManager 用于把 Codex 网关 fallback 路径上的 cyber_policy 命中计数回写到
-	// 同一 Auth 记录上。当通过 NewGitLabExecutor 构造时保持 nil（仅用于测试场景）。
-	authManager *cliproxyauth.Manager
-}
+const maxGitLabSuggestionResponse = 4 << 20
 
-type gitLabPrompt struct {
-	Instruction           string
-	FileName              string
-	ContentAboveCursor    string
-	ChatContext           []map[string]any
-	CodeSuggestionContext []map[string]any
-}
+type GitLabExecutor struct{ cfg *config.Config }
 
-type gitLabOpenAIStreamState struct {
-	ID           string
-	Model        string
-	Created      int64
-	LastFullText string
-	Started      bool
-	Finished     bool
-}
+func NewGitLabExecutor(cfg *config.Config) *GitLabExecutor { return &GitLabExecutor{cfg: cfg} }
 
-func NewGitLabExecutor(cfg *config.Config) *GitLabExecutor {
-	return &GitLabExecutor{cfg: cfg}
-}
+func (e *GitLabExecutor) Identifier() string { return "gitlab" }
 
-// NewGitLabExecutorWithManager 让 GitLab Duo 在落到 Codex OpenAI 网关 fallback 时
-// 也能把 cyber_policy 命中写回 auth manager；production 入口应使用本构造函数。
-func NewGitLabExecutorWithManager(cfg *config.Config, manager *cliproxyauth.Manager) *GitLabExecutor {
-	return &GitLabExecutor{cfg: cfg, authManager: manager}
-}
-
-func (e *GitLabExecutor) Identifier() string { return gitLabProviderKey }
-
-func (e *GitLabExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
-	if nativeExec, nativeAuth, nativeReq, ok := e.nativeGateway(auth, req); ok {
-		return nativeExec.Execute(ctx, nativeAuth, nativeReq, opts)
-	}
-	baseModel := thinking.ParseSuffix(req.Model).ModelName
-
-	reporter := newUsageReporter(ctx, e.Identifier(), baseModel, auth)
-	defer reporter.trackFailure(ctx, &err)
-
-	translated, err := e.translateToOpenAI(req, opts)
+func (e *GitLabExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Auth) error {
+	base, err := gitLabRuntimeBaseURL(auth)
 	if err != nil {
-		return resp, err
+		return err
 	}
-	prompt := buildGitLabPrompt(translated)
-	if strings.TrimSpace(prompt.Instruction) == "" && strings.TrimSpace(prompt.ContentAboveCursor) == "" {
-		err = statusErr{code: http.StatusBadRequest, msg: "gitlab duo executor: request has no usable text content"}
-		return resp, err
+	if req == nil || req.URL == nil || req.Method != http.MethodPost ||
+		req.URL.String() != base+"/api/v4/code_suggestions/completions" || req.Host != "" && req.Host != req.URL.Host {
+		return ordinaryProviderStop(http.StatusBadRequest, "GitLab credentials are scoped to the configured Code Suggestions endpoint")
 	}
-
-	text, err := e.invokeText(ctx, auth, prompt)
-	if err != nil {
-		return resp, err
+	token := gitLabRuntimeCredential(auth, "access_token")
+	if gitLabRuntimeCredential(auth, "auth_method") == "pat" || token == "" {
+		token = gitLabRuntimeCredential(auth, "personal_access_token")
 	}
-
-	responseModel := gitLabResolvedModel(auth, req.Model)
-	openAIResponse := buildGitLabOpenAIResponse(responseModel, text, translated)
-	reporter.publish(ctx, parseOpenAIUsage(openAIResponse))
-	reporter.ensurePublished(ctx)
-
-	var param any
-	out := sdktranslator.TranslateNonStream(
-		ctx,
-		sdktranslator.FromString("openai"),
-		opts.SourceFormat,
-		req.Model,
-		opts.OriginalRequest,
-		translated,
-		openAIResponse,
-		&param,
-	)
-	return cliproxyexecutor.Response{Payload: []byte(out), Headers: make(http.Header)}, nil
-}
-
-func (e *GitLabExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
-	if nativeExec, nativeAuth, nativeReq, ok := e.nativeGateway(auth, req); ok {
-		return nativeExec.ExecuteStream(ctx, nativeAuth, nativeReq, opts)
+	if token == "" {
+		return ordinaryProviderStop(http.StatusUnauthorized, "GitLab OAuth access token or personal access token is required")
 	}
-	baseModel := thinking.ParseSuffix(req.Model).ModelName
-
-	reporter := newUsageReporter(ctx, e.Identifier(), baseModel, auth)
-	defer reporter.trackFailure(ctx, &err)
-
-	translated, err := e.translateToOpenAI(req, opts)
-	if err != nil {
-		return nil, err
-	}
-	prompt := buildGitLabPrompt(translated)
-	if strings.TrimSpace(prompt.Instruction) == "" && strings.TrimSpace(prompt.ContentAboveCursor) == "" {
-		return nil, statusErr{code: http.StatusBadRequest, msg: "gitlab duo executor: request has no usable text content"}
-	}
-
-	if result, streamErr := e.requestCodeSuggestionsStream(ctx, auth, prompt, translated, req, opts, reporter); streamErr == nil {
-		return result, nil
-	} else if !shouldFallbackToCodeSuggestions(streamErr) {
-		return nil, streamErr
-	}
-
-	text, err := e.invokeText(ctx, auth, prompt)
-	if err != nil {
-		return nil, err
-	}
-	responseModel := gitLabResolvedModel(auth, req.Model)
-	openAIResponse := buildGitLabOpenAIResponse(responseModel, text, translated)
-	reporter.publish(ctx, parseOpenAIUsage(openAIResponse))
-	reporter.ensurePublished(ctx)
-
-	out := make(chan cliproxyexecutor.StreamChunk, 8)
-	go func() {
-		defer close(out)
-		var param any
-		lines := buildGitLabOpenAIStream(responseModel, text)
-		for _, line := range lines {
-			chunks := sdktranslator.TranslateStream(
-				ctx,
-				sdktranslator.FromString("openai"),
-				opts.SourceFormat,
-				req.Model,
-				opts.OriginalRequest,
-				translated,
-				[]byte(line),
-				&param,
-			)
-			for i := range chunks {
-				out <- cliproxyexecutor.StreamChunk{Payload: []byte(chunks[i])}
-			}
-		}
-	}()
-	return &cliproxyexecutor.StreamResult{Headers: make(http.Header), Chunks: out}, nil
-}
-
-func (e *GitLabExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {
-	if auth == nil {
-		return nil, fmt.Errorf("gitlab duo executor: auth is nil")
-	}
-	baseURL := gitLabBaseURL(auth)
-	token := gitLabPrimaryToken(auth)
-	if baseURL == "" || token == "" {
-		return nil, fmt.Errorf("gitlab duo executor: missing base URL or token")
-	}
-
-	// Honor the account-scoped auth.ProxyURL (e.g. SOCKS5 proxy assigned to a
-	// specific GitLab Duo auth file) so OAuth refresh and direct-access token
-	// exchange egress via the account proxy instead of silently falling back to
-	// the global cfg.ProxyURL. Mirrors the refresh-proxy invariant in
-	// docs/repo-memory-ledger.md section 13.
-	client := gitlab.NewAuthClientWithProxyURL(e.cfg, auth.ProxyURL)
-	method := strings.ToLower(strings.TrimSpace(gitLabMetadataString(auth.Metadata, "auth_method", "auth_kind")))
-	if method == "" {
-		method = gitLabAuthMethodOAuth
-	}
-
-	if method == gitLabAuthMethodOAuth {
-		if refreshed, refreshErr := e.refreshOAuthToken(ctx, client, auth, baseURL); refreshErr == nil && refreshed != nil {
-			token = refreshed.AccessToken
-			applyGitLabTokenMetadata(auth.Metadata, refreshed)
-		}
-	}
-
-	direct, err := client.FetchDirectAccess(ctx, baseURL, token)
-	if err != nil && method == gitLabAuthMethodOAuth {
-		if refreshed, refreshErr := e.refreshOAuthToken(ctx, client, auth, baseURL); refreshErr == nil && refreshed != nil {
-			token = refreshed.AccessToken
-			applyGitLabTokenMetadata(auth.Metadata, refreshed)
-			direct, err = client.FetchDirectAccess(ctx, baseURL, token)
-		}
-	}
-	if err != nil {
-		return nil, err
-	}
-
-	if auth.Metadata == nil {
-		auth.Metadata = make(map[string]any)
-	}
-	auth.Metadata["type"] = gitLabProviderKey
-	auth.Metadata["auth_method"] = method
-	auth.Metadata["auth_kind"] = gitLabAuthKind(method)
-	auth.Metadata["base_url"] = gitlab.NormalizeBaseURL(baseURL)
-	auth.Metadata["last_refresh"] = time.Now().UTC().Format(time.RFC3339)
-	mergeGitLabDirectAccessMetadata(auth.Metadata, direct)
-	return auth, nil
-}
-
-func (e *GitLabExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-	if nativeExec, nativeAuth, nativeReq, ok := e.nativeGateway(auth, req); ok {
-		return nativeExec.CountTokens(ctx, nativeAuth, nativeReq, opts)
-	}
-	baseModel := thinking.ParseSuffix(req.Model).ModelName
-	translated := sdktranslator.TranslateRequest(opts.SourceFormat, sdktranslator.FromString("openai"), baseModel, req.Payload, false)
-	enc, err := tokenizerForModel(baseModel)
-	if err != nil {
-		return cliproxyexecutor.Response{}, fmt.Errorf("gitlab duo executor: tokenizer init failed: %w", err)
-	}
-	count, err := countOpenAIChatTokens(enc, translated)
-	if err != nil {
-		return cliproxyexecutor.Response{}, err
-	}
-	return cliproxyexecutor.Response{Payload: buildOpenAIUsageJSON(count), Headers: make(http.Header)}, nil
+	req.Header = http.Header{"Authorization": {"Bearer " + token}, "Content-Type": {"application/json"}, "Accept": {"application/json"}}
+	return nil
 }
 
 func (e *GitLabExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth, req *http.Request) (*http.Response, error) {
 	if req == nil {
-		return nil, fmt.Errorf("gitlab duo executor: request is nil")
-	}
-	if nativeExec, nativeAuth := e.nativeGatewayHTTP(auth); nativeExec != nil {
-		return nativeExec.HttpRequest(ctx, nativeAuth, req)
+		return nil, ordinaryProviderStop(http.StatusBadRequest, "GitLab request is missing")
 	}
 	if ctx == nil {
 		ctx = req.Context()
 	}
-	httpReq := req.WithContext(ctx)
-	if token := gitLabPrimaryToken(auth); token != "" {
-		httpReq.Header.Set("Authorization", "Bearer "+token)
-	}
-	return newProxyAwareHTTPClient(ctx, e.cfg, auth, 0).Do(httpReq)
-}
-
-func (e *GitLabExecutor) translateToOpenAI(req cliproxyexecutor.Request, opts cliproxyexecutor.Options) ([]byte, error) {
-	baseModel := thinking.ParseSuffix(req.Model).ModelName
-	return sdktranslator.TranslateRequest(opts.SourceFormat, sdktranslator.FromString("openai"), baseModel, req.Payload, opts.Stream), nil
-}
-
-func (e *GitLabExecutor) nativeGateway(
-	auth *cliproxyauth.Auth,
-	req cliproxyexecutor.Request,
-) (cliproxyauth.ProviderExecutor, *cliproxyauth.Auth, cliproxyexecutor.Request, bool) {
-	if nativeAuth, ok := buildGitLabAnthropicGatewayAuth(auth); ok {
-		nativeReq := req
-		nativeReq.Model = gitLabResolvedModel(auth, req.Model)
-		return NewClaudeExecutor(e.cfg), nativeAuth, nativeReq, true
-	}
-	if nativeAuth, ok := buildGitLabOpenAIGatewayAuth(auth); ok {
-		nativeReq := req
-		nativeReq.Model = gitLabResolvedModel(auth, req.Model)
-		// 把 manager 透传到 codex executor，cyber_policy 命中才能计数 + 触发 webhook
-		return NewCodexExecutorWithManager(e.cfg, e.authManager), nativeAuth, nativeReq, true
-	}
-	return nil, nil, req, false
-}
-
-func (e *GitLabExecutor) nativeGatewayHTTP(auth *cliproxyauth.Auth) (cliproxyauth.ProviderExecutor, *cliproxyauth.Auth) {
-	if nativeAuth, ok := buildGitLabAnthropicGatewayAuth(auth); ok {
-		return NewClaudeExecutor(e.cfg), nativeAuth
-	}
-	if nativeAuth, ok := buildGitLabOpenAIGatewayAuth(auth); ok {
-		// HttpRequest 路径同样把 manager 透传，保持与 nativeGateway 一致
-		return NewCodexExecutorWithManager(e.cfg, e.authManager), nativeAuth
-	}
-	return nil, nil
-}
-
-func (e *GitLabExecutor) invokeText(ctx context.Context, auth *cliproxyauth.Auth, prompt gitLabPrompt) (string, error) {
-	if text, err := e.requestChat(ctx, auth, prompt); err == nil {
-		return text, nil
-	} else if !shouldFallbackToCodeSuggestions(err) {
-		return "", err
-	}
-	return e.requestCodeSuggestions(ctx, auth, prompt)
-}
-
-func (e *GitLabExecutor) requestChat(ctx context.Context, auth *cliproxyauth.Auth, prompt gitLabPrompt) (string, error) {
-	body := map[string]any{
-		"content":            prompt.Instruction,
-		"with_clean_history": true,
-	}
-	if len(prompt.ChatContext) > 0 {
-		body["additional_context"] = prompt.ChatContext
-	}
-	return e.doJSONTextRequest(ctx, auth, gitLabChatEndpoint, body)
-}
-
-func (e *GitLabExecutor) requestCodeSuggestions(ctx context.Context, auth *cliproxyauth.Auth, prompt gitLabPrompt) (string, error) {
-	contentAbove := strings.TrimSpace(prompt.ContentAboveCursor)
-	if contentAbove == "" {
-		contentAbove = prompt.Instruction
-	}
-	body := map[string]any{
-		"current_file": map[string]any{
-			"file_name":            prompt.FileName,
-			"content_above_cursor": contentAbove,
-			"content_below_cursor": "",
-		},
-		"intent":           "generation",
-		"generation_type":  "small_file",
-		"user_instruction": prompt.Instruction,
-		"stream":           false,
-	}
-	if len(prompt.CodeSuggestionContext) > 0 {
-		body["context"] = prompt.CodeSuggestionContext
-	}
-	return e.doJSONTextRequest(ctx, auth, gitLabCodeSuggestionsEndpoint, body)
-}
-
-func (e *GitLabExecutor) requestCodeSuggestionsStream(
-	ctx context.Context,
-	auth *cliproxyauth.Auth,
-	prompt gitLabPrompt,
-	translated []byte,
-	req cliproxyexecutor.Request,
-	opts cliproxyexecutor.Options,
-	reporter *usageReporter,
-) (*cliproxyexecutor.StreamResult, error) {
-	contentAbove := strings.TrimSpace(prompt.ContentAboveCursor)
-	if contentAbove == "" {
-		contentAbove = prompt.Instruction
-	}
-	body := map[string]any{
-		"current_file": map[string]any{
-			"file_name":            prompt.FileName,
-			"content_above_cursor": contentAbove,
-			"content_below_cursor": "",
-		},
-		"intent":           "generation",
-		"generation_type":  "small_file",
-		"user_instruction": prompt.Instruction,
-		"stream":           true,
-	}
-	if len(prompt.CodeSuggestionContext) > 0 {
-		body["context"] = prompt.CodeSuggestionContext
-	}
-
-	httpResp, bodyRaw, err := e.doJSONRequest(ctx, auth, gitLabCodeSuggestionsEndpoint, body, "text/event-stream")
-	if err != nil {
+	req = req.Clone(ctx)
+	if err := e.PrepareRequest(req, auth); err != nil {
 		return nil, err
 	}
-	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		defer func() { _ = httpResp.Body.Close() }()
-		respBody, readErr := io.ReadAll(httpResp.Body)
-		if readErr != nil {
-			recordAPIResponseError(ctx, e.cfg, readErr)
-			return nil, readErr
-		}
-		appendAPIResponseChunk(ctx, e.cfg, respBody)
-		return nil, statusErr{code: httpResp.StatusCode, msg: strings.TrimSpace(string(respBody))}
-	}
-
-	responseModel := gitLabResolvedModel(auth, req.Model)
-	out := make(chan cliproxyexecutor.StreamChunk, 16)
-	go func() {
-		defer close(out)
-		defer func() { _ = httpResp.Body.Close() }()
-
-		scanner := bufio.NewScanner(httpResp.Body)
-		scanner.Buffer(nil, 52_428_800)
-
-		var (
-			param     any
-			eventName string
-			state     gitLabOpenAIStreamState
-		)
-		for scanner.Scan() {
-			line := bytes.Clone(scanner.Bytes())
-			appendAPIResponseChunk(ctx, e.cfg, line)
-			trimmed := bytes.TrimSpace(line)
-			if len(trimmed) == 0 {
-				continue
-			}
-			if bytes.HasPrefix(trimmed, []byte("event:")) {
-				eventName = strings.TrimSpace(string(trimmed[len("event:"):]))
-				continue
-			}
-			if !bytes.HasPrefix(trimmed, []byte("data:")) {
-				continue
-			}
-			payload := bytes.TrimSpace(trimmed[len("data:"):])
-			normalized := normalizeGitLabStreamChunk(eventName, payload, responseModel, &state)
-			eventName = ""
-			for _, item := range normalized {
-				if detail, ok := parseOpenAIStreamUsage(item); ok {
-					reporter.publish(ctx, detail)
-				}
-				chunks := sdktranslator.TranslateStream(
-					ctx,
-					sdktranslator.FromString("openai"),
-					opts.SourceFormat,
-					req.Model,
-					opts.OriginalRequest,
-					translated,
-					item,
-					&param,
-				)
-				for i := range chunks {
-					out <- cliproxyexecutor.StreamChunk{Payload: []byte(chunks[i])}
-				}
-			}
-		}
-		if errScan := scanner.Err(); errScan != nil {
-			recordAPIResponseError(ctx, e.cfg, errScan)
-			reporter.publishFailure(ctx)
-			out <- cliproxyexecutor.StreamChunk{Err: errScan}
-			return
-		}
-		if !state.Finished {
-			for _, item := range finalizeGitLabStream(responseModel, &state) {
-				chunks := sdktranslator.TranslateStream(
-					ctx,
-					sdktranslator.FromString("openai"),
-					opts.SourceFormat,
-					req.Model,
-					opts.OriginalRequest,
-					translated,
-					item,
-					&param,
-				)
-				for i := range chunks {
-					out <- cliproxyexecutor.StreamChunk{Payload: []byte(chunks[i])}
-				}
-			}
-		}
-		reporter.ensurePublished(ctx)
-	}()
-
-	return &cliproxyexecutor.StreamResult{
-		Headers: cloneGitLabStreamHeaders(httpResp.Header, bodyRaw),
-		Chunks:  out,
-	}, nil
+	return ordinaryProviderClient(ctx, e.cfg, auth).Do(req)
 }
 
-func (e *GitLabExecutor) doJSONTextRequest(ctx context.Context, auth *cliproxyauth.Auth, endpoint string, payload map[string]any) (string, error) {
-	resp, _, err := e.doJSONRequest(ctx, auth, endpoint, payload, "application/json")
-	if err != nil {
-		return "", err
+func (e *GitLabExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ cliproxyexecutor.Response, err error) {
+	if opts.Stream || strings.TrimSpace(req.Model) != GitLabCodeSuggestionsModel {
+		return cliproxyexecutor.Response{}, ordinaryProviderStop(http.StatusNotImplemented, "GitLab supports the explicit code suggestions model and synchronous current_file requests")
 	}
-	defer func() { _ = resp.Body.Close() }()
-
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		recordAPIResponseError(ctx, e.cfg, err)
-		return "", err
+	var body struct {
+		CurrentFile     json.RawMessage `json:"current_file"`
+		Intent          json.RawMessage `json:"intent,omitempty"`
+		Context         json.RawMessage `json:"context,omitempty"`
+		UserInstruction json.RawMessage `json:"user_instruction,omitempty"`
+		Messages        json.RawMessage `json:"messages,omitempty"`
 	}
-	appendAPIResponseChunk(ctx, e.cfg, respBody)
-
+	var file struct {
+		FileName           string  `json:"file_name"`
+		ContentAboveCursor *string `json:"content_above_cursor"`
+	}
+	if err := json.Unmarshal(req.Payload, &body); err != nil ||
+		json.Unmarshal(body.CurrentFile, &file) != nil || strings.TrimSpace(file.FileName) == "" ||
+		file.ContentAboveCursor == nil || len(body.Messages) != 0 {
+		return cliproxyexecutor.Response{}, ordinaryProviderStop(http.StatusBadRequest, "GitLab Code Suggestions requires current_file.file_name and current_file.content_above_cursor")
+	}
+	base, err := gitLabRuntimeBaseURL(auth)
+	if err != nil {
+		return cliproxyexecutor.Response{}, err
+	}
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return cliproxyexecutor.Response{}, ordinaryProviderStop(http.StatusBadRequest, "invalid GitLab Code Suggestions request")
+	}
+	reporter := helps.NewExecutorUsageReporter(ctx, e, req.Model, auth)
+	defer reporter.TrackFailure(ctx, &err)
+	upstream, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/api/v4/code_suggestions/completions", bytes.NewReader(payload))
+	if err != nil {
+		return cliproxyexecutor.Response{}, err
+	}
+	resp, err := e.HttpRequest(ctx, auth, upstream)
+	if err != nil {
+		return cliproxyexecutor.Response{}, err
+	}
+	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", statusErr{code: resp.StatusCode, msg: strings.TrimSpace(string(respBody))}
+		rejected := statusErr{code: resp.StatusCode, msg: "GitLab Code Suggestions rejected the request",
+			retryAfter: parseRetryAfterHeader(resp.Header, time.Now())}
+		return cliproxyexecutor.Response{}, ordinaryProviderRefusal{rejected}
 	}
-
-	text, err := parseGitLabTextResponse(endpoint, respBody)
+	payload, err = io.ReadAll(io.LimitReader(resp.Body, maxGitLabSuggestionResponse+1))
 	if err != nil {
-		return "", err
+		return cliproxyexecutor.Response{}, err
 	}
-	return strings.TrimSpace(text), nil
+	if len(payload) > maxGitLabSuggestionResponse || !json.Valid(payload) {
+		return cliproxyexecutor.Response{}, ordinaryProviderStop(http.StatusBadGateway, "invalid GitLab Code Suggestions response")
+	}
+	var metrics struct {
+		Metadata struct {
+			Model struct {
+				Usage struct {
+					Input  int64 `json:"input_tokens"`
+					Output int64 `json:"output_tokens"`
+				} `json:"tokens_consumption_metadata"`
+			} `json:"model"`
+		} `json:"metadata"`
+	}
+	if json.Unmarshal(payload, &metrics) == nil {
+		count := metrics.Metadata.Model.Usage
+		reporter.Publish(ctx, usage.Detail{InputTokens: count.Input, OutputTokens: count.Output, TotalTokens: count.Input + count.Output})
+	}
+	reporter.EnsurePublished(ctx)
+	return cliproxyexecutor.Response{Payload: payload, Headers: resp.Header.Clone()}, nil
 }
 
-func (e *GitLabExecutor) doJSONRequest(
-	ctx context.Context,
-	auth *cliproxyauth.Auth,
-	endpoint string,
-	payload map[string]any,
-	accept string,
-) (*http.Response, []byte, error) {
-	token := gitLabPrimaryToken(auth)
-	baseURL := gitLabBaseURL(auth)
-	if token == "" || baseURL == "" {
-		return nil, nil, statusErr{code: http.StatusUnauthorized, msg: "gitlab duo executor: missing credentials"}
-	}
-
-	body, err := json.Marshal(payload)
-	if err != nil {
-		return nil, nil, fmt.Errorf("gitlab duo executor: marshal request failed: %w", err)
-	}
-
-	url := strings.TrimRight(baseURL, "/") + endpoint
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
-	if err != nil {
-		return nil, nil, err
-	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", accept)
-	req.Header.Set("User-Agent", "CLIProxyAPI/GitLab-Duo")
-	applyGitLabRequestHeaders(req, auth)
-	if strings.EqualFold(accept, "text/event-stream") {
-		req.Header.Set("Cache-Control", "no-cache")
-		req.Header.Set(gitLabSSEStreamingHeader, "true")
-		req.Header.Set("Accept-Encoding", "identity")
-	}
-
-	var authID, authLabel, authType, authValue string
-	if auth != nil {
-		authID = auth.ID
-		authLabel = auth.Label
-		authType, authValue = auth.AccountInfo()
-	}
-	recordAPIRequest(ctx, e.cfg, upstreamRequestLog{
-		URL:       url,
-		Method:    http.MethodPost,
-		Headers:   req.Header.Clone(),
-		Body:      body,
-		Provider:  e.Identifier(),
-		AuthID:    authID,
-		AuthLabel: authLabel,
-		AuthType:  authType,
-		AuthValue: authValue,
-	})
-
-	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		recordAPIResponseError(ctx, e.cfg, err)
-		return nil, body, err
-	}
-	recordAPIResponseMetadata(ctx, e.cfg, resp.StatusCode, resp.Header.Clone())
-	return resp, body, nil
+func (e *GitLabExecutor) ExecuteStream(context.Context, *cliproxyauth.Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	return nil, ordinaryProviderStop(http.StatusNotImplemented, "GitLab Code Suggestions completions do not stream")
 }
 
-func (e *GitLabExecutor) refreshOAuthToken(ctx context.Context, client *gitlab.AuthClient, auth *cliproxyauth.Auth, baseURL string) (*gitlab.TokenResponse, error) {
+func (e *GitLabExecutor) CountTokens(context.Context, *cliproxyauth.Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, ordinaryProviderStop(http.StatusNotImplemented, "GitLab Code Suggestions does not expose token counting")
+}
+
+func (e *GitLabExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {
+	refresh := gitLabRuntimeCredential(auth, "refresh_token")
+	if refresh == "" || gitLabRuntimeCredential(auth, "auth_method") == "pat" {
+		return auth, nil
+	}
+	base, err := gitLabRuntimeBaseURL(auth)
+	if err != nil {
+		return auth, err
+	}
+	clientID := gitLabRuntimeCredential(auth, "oauth_client_id")
+	if clientID == "" {
+		return auth, ordinaryProviderStop(http.StatusUnauthorized, "GitLab OAuth application ID is missing")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	client := gitlab.NewAuthClientWithHTTPClient(ordinaryProviderClient(ctx, e.cfg, auth))
+	token, err := client.RefreshTokens(ctx, base, clientID, gitLabRuntimeCredential(auth, "oauth_client_secret"), refresh)
+	if err != nil || token == nil || strings.TrimSpace(token.AccessToken) == "" {
+		if ctx.Err() != nil {
+			return auth, ctx.Err()
+		}
+		return auth, ordinaryProviderStop(http.StatusBadGateway, "GitLab OAuth refresh failed")
+	}
+	next := auth.Clone()
+	next.Metadata["access_token"] = token.AccessToken
+	if token.RefreshToken != "" {
+		next.Metadata["refresh_token"] = token.RefreshToken
+	}
+	now := time.Now().UTC()
+	next.Metadata["last_refresh"] = now.Format(time.RFC3339)
+	if expiry := gitlab.TokenExpiry(now, token); !expiry.IsZero() {
+		next.Metadata["oauth_expires_at"] = expiry.Format(time.RFC3339)
+	}
+	return next, nil
+}
+
+func gitLabRuntimeBaseURL(auth *cliproxyauth.Auth) (string, error) {
+	if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), "gitlab") ||
+		auth.Disabled || auth.Status == cliproxyauth.StatusDisabled {
+		return "", ordinaryProviderStop(http.StatusUnauthorized, "an enabled GitLab credential is required")
+	}
+	configured := gitlab.NormalizeBaseURL(os.Getenv("GITLAB_BASE_URL"))
+	target, err := url.Parse(configured)
+	if err != nil || target.Scheme != "https" || target.Hostname() == "" || target.User != nil ||
+		target.RawQuery != "" || target.ForceQuery || target.Fragment != "" {
+		return "", ordinaryProviderStop(http.StatusServiceUnavailable, "the configured GitLab HTTPS endpoint is invalid")
+	}
+	if saved := gitLabRuntimeCredential(auth, "base_url"); saved == "" || gitlab.NormalizeBaseURL(saved) != configured {
+		return "", ordinaryProviderStop(http.StatusForbidden, "the GitLab credential belongs to a different configured instance")
+	}
+	return configured, nil
+}
+
+func gitLabRuntimeCredential(auth *cliproxyauth.Auth, key string) string {
 	if auth == nil {
-		return nil, fmt.Errorf("gitlab duo executor: auth is nil")
-	}
-	refreshToken := gitLabMetadataString(auth.Metadata, "refresh_token")
-	if refreshToken == "" {
-		return nil, fmt.Errorf("gitlab duo executor: refresh token missing")
-	}
-	if !gitLabOAuthTokenNeedsRefresh(auth.Metadata) && gitLabPrimaryToken(auth) != "" {
-		return nil, nil
-	}
-	return client.RefreshTokens(
-		ctx,
-		baseURL,
-		gitLabMetadataString(auth.Metadata, "oauth_client_id"),
-		gitLabMetadataString(auth.Metadata, "oauth_client_secret"),
-		refreshToken,
-	)
-}
-
-func buildGitLabPrompt(payload []byte) gitLabPrompt {
-	root := gjson.ParseBytes(payload)
-	prompt := gitLabPrompt{
-		FileName: "prompt.txt",
-	}
-
-	msgs := root.Get("messages")
-	if msgs.Exists() && msgs.IsArray() {
-		systemIndex := 0
-		contextIndex := 0
-		transcript := make([]string, 0, len(msgs.Array()))
-		var lastUser string
-		msgs.ForEach(func(_, msg gjson.Result) bool {
-			role := strings.TrimSpace(msg.Get("role").String())
-			if role == "" {
-				role = "user"
-			}
-			content := openAIContentText(msg.Get("content"))
-			if content == "" {
-				return true
-			}
-			switch role {
-			case "system":
-				systemIndex++
-				prompt.ChatContext = append(prompt.ChatContext, map[string]any{
-					"category": "snippet",
-					"id":       fmt.Sprintf("system-%d", systemIndex),
-					"content":  content,
-				})
-			case "user":
-				lastUser = content
-				contextIndex++
-				prompt.CodeSuggestionContext = append(prompt.CodeSuggestionContext, map[string]any{
-					"type":    "snippet",
-					"name":    fmt.Sprintf("user-%d", contextIndex),
-					"content": content,
-				})
-				transcript = append(transcript, "User:\n"+content)
-			default:
-				contextIndex++
-				prompt.ChatContext = append(prompt.ChatContext, map[string]any{
-					"category": "snippet",
-					"id":       fmt.Sprintf("%s-%d", role, contextIndex),
-					"content":  content,
-				})
-				prompt.CodeSuggestionContext = append(prompt.CodeSuggestionContext, map[string]any{
-					"type":    "snippet",
-					"name":    fmt.Sprintf("%s-%d", role, contextIndex),
-					"content": content,
-				})
-				transcript = append(transcript, strings.Title(role)+":\n"+content)
-			}
-			return true
-		})
-		prompt.Instruction = strings.TrimSpace(lastUser)
-		prompt.ContentAboveCursor = truncateGitLabPrompt(strings.Join(transcript, "\n\n"), 12000)
-	}
-
-	if prompt.Instruction == "" {
-		for _, key := range []string{"prompt", "input", "instructions"} {
-			if value := strings.TrimSpace(root.Get(key).String()); value != "" {
-				prompt.Instruction = value
-				break
-			}
-		}
-	}
-	if prompt.ContentAboveCursor == "" {
-		prompt.ContentAboveCursor = prompt.Instruction
-	}
-	prompt.Instruction = truncateGitLabPrompt(prompt.Instruction, 4000)
-	prompt.ContentAboveCursor = truncateGitLabPrompt(prompt.ContentAboveCursor, 12000)
-	return prompt
-}
-
-func openAIContentText(content gjson.Result) string {
-	segments := make([]string, 0, 8)
-	collectOpenAIContent(content, &segments)
-	return strings.TrimSpace(strings.Join(segments, "\n"))
-}
-
-func truncateGitLabPrompt(value string, limit int) string {
-	value = strings.TrimSpace(value)
-	if limit <= 0 || len(value) <= limit {
-		return value
-	}
-	return strings.TrimSpace(value[:limit])
-}
-
-func parseGitLabTextResponse(endpoint string, body []byte) (string, error) {
-	if endpoint == gitLabChatEndpoint {
-		var text string
-		if err := json.Unmarshal(body, &text); err == nil {
-			return text, nil
-		}
-		if value := strings.TrimSpace(gjson.GetBytes(body, "response").String()); value != "" {
-			return value, nil
-		}
-	}
-	if value := strings.TrimSpace(gjson.GetBytes(body, "choices.0.text").String()); value != "" {
-		return value, nil
-	}
-	if value := strings.TrimSpace(gjson.GetBytes(body, "response").String()); value != "" {
-		return value, nil
-	}
-	var plain string
-	if err := json.Unmarshal(body, &plain); err == nil && strings.TrimSpace(plain) != "" {
-		return plain, nil
-	}
-	return "", fmt.Errorf("gitlab duo executor: upstream returned no text payload")
-}
-
-func applyGitLabRequestHeaders(req *http.Request, auth *cliproxyauth.Auth) {
-	if req == nil {
-		return
-	}
-	if auth != nil {
-		util.ApplyCustomHeadersFromAttrs(req, auth.Attributes)
-	}
-	for key, value := range gitLabGatewayHeaders(auth) {
-		if key == "" || value == "" {
-			continue
-		}
-		req.Header.Set(key, value)
-	}
-}
-
-func gitLabGatewayHeaders(auth *cliproxyauth.Auth) map[string]string {
-	if auth == nil || auth.Metadata == nil {
-		return nil
-	}
-	raw, ok := auth.Metadata["duo_gateway_headers"]
-	if !ok {
-		return nil
-	}
-	out := make(map[string]string)
-	switch typed := raw.(type) {
-	case map[string]string:
-		for key, value := range typed {
-			key = strings.TrimSpace(key)
-			value = strings.TrimSpace(value)
-			if key != "" && value != "" {
-				out[key] = value
-			}
-		}
-	case map[string]any:
-		for key, value := range typed {
-			key = strings.TrimSpace(key)
-			if key == "" {
-				continue
-			}
-			strValue := strings.TrimSpace(fmt.Sprint(value))
-			if strValue != "" {
-				out[key] = strValue
-			}
-		}
-	}
-	if len(out) == 0 {
-		return nil
-	}
-	return out
-}
-
-func cloneGitLabStreamHeaders(headers http.Header, _ []byte) http.Header {
-	cloned := headers.Clone()
-	if cloned == nil {
-		cloned = make(http.Header)
-	}
-	cloned.Set("Content-Type", "text/event-stream")
-	return cloned
-}
-
-func normalizeGitLabStreamChunk(eventName string, payload []byte, fallbackModel string, state *gitLabOpenAIStreamState) [][]byte {
-	payload = bytes.TrimSpace(payload)
-	if len(payload) == 0 {
-		return nil
-	}
-	if bytes.Equal(payload, []byte("[DONE]")) {
-		return finalizeGitLabStream(fallbackModel, state)
-	}
-
-	root := gjson.ParseBytes(payload)
-	if root.Exists() {
-		if obj := root.Get("object").String(); obj == "chat.completion.chunk" {
-			return [][]byte{append([]byte("data: "), bytes.Clone(payload)...)}
-		}
-		if root.Get("choices.0.delta").Exists() || root.Get("choices.0.finish_reason").Exists() {
-			return [][]byte{append([]byte("data: "), bytes.Clone(payload)...)}
-		}
-	}
-
-	state.ensureInitialized(fallbackModel, root)
-
-	switch strings.TrimSpace(eventName) {
-	case "stream_end":
-		return finalizeGitLabStream(fallbackModel, state)
-	case "stream_start":
-		if text := extractGitLabStreamText(root); text != "" {
-			return state.emitText(text)
-		}
-		return nil
-	}
-
-	if done := root.Get("done"); done.Exists() && done.Bool() {
-		return finalizeGitLabStream(fallbackModel, state)
-	}
-	if finishReason := strings.TrimSpace(root.Get("finish_reason").String()); finishReason != "" {
-		out := state.emitText(extractGitLabStreamText(root))
-		return append(out, state.finish(finishReason)...)
-	}
-
-	return state.emitText(extractGitLabStreamText(root))
-}
-
-func extractGitLabStreamText(root gjson.Result) string {
-	for _, key := range []string{
-		"choices.0.delta.content",
-		"choices.0.text",
-		"delta.content",
-		"content_chunk",
-		"content",
-		"text",
-		"response",
-		"completion",
-	} {
-		if value := root.Get(key).String(); strings.TrimSpace(value) != "" {
-			return value
-		}
-	}
-	return ""
-}
-
-func finalizeGitLabStream(fallbackModel string, state *gitLabOpenAIStreamState) [][]byte {
-	if state == nil {
-		return nil
-	}
-	state.ensureInitialized(fallbackModel, gjson.Result{})
-	return state.finish("stop")
-}
-
-func (s *gitLabOpenAIStreamState) ensureInitialized(fallbackModel string, root gjson.Result) {
-	if s == nil {
-		return
-	}
-	if s.ID == "" {
-		s.ID = fmt.Sprintf("gitlab-%d", time.Now().UnixNano())
-	}
-	if s.Created == 0 {
-		s.Created = time.Now().Unix()
-	}
-	if s.Model == "" {
-		for _, key := range []string{"model.name", "model", "metadata.model_name"} {
-			if value := strings.TrimSpace(root.Get(key).String()); value != "" {
-				s.Model = value
-				break
-			}
-		}
-	}
-	if s.Model == "" {
-		s.Model = fallbackModel
-	}
-}
-
-func (s *gitLabOpenAIStreamState) emitText(text string) [][]byte {
-	if s == nil {
-		return nil
-	}
-	if strings.TrimSpace(text) == "" {
-		return nil
-	}
-	delta := s.nextDelta(text)
-	if delta == "" {
-		return nil
-	}
-	out := make([][]byte, 0, 2)
-	if !s.Started {
-		out = append(out, s.buildChunk(map[string]any{"role": "assistant"}, ""))
-		s.Started = true
-	}
-	out = append(out, s.buildChunk(map[string]any{"content": delta}, ""))
-	return out
-}
-
-func (s *gitLabOpenAIStreamState) finish(reason string) [][]byte {
-	if s == nil || s.Finished {
-		return nil
-	}
-	if !s.Started {
-		s.Started = true
-	}
-	s.Finished = true
-	return [][]byte{
-		s.buildChunk(map[string]any{}, reason),
-		[]byte("data: [DONE]"),
-	}
-}
-
-func (s *gitLabOpenAIStreamState) nextDelta(text string) string {
-	if s == nil {
-		return text
-	}
-	if strings.TrimSpace(text) == "" {
 		return ""
 	}
-	if s.LastFullText == "" {
-		s.LastFullText = text
-		return text
-	}
-	if text == s.LastFullText {
-		return ""
-	}
-	if strings.HasPrefix(text, s.LastFullText) {
-		delta := text[len(s.LastFullText):]
-		s.LastFullText = text
-		return delta
-	}
-	s.LastFullText += text
-	return text
+	value, _ := auth.Metadata[key].(string)
+	return strings.TrimSpace(value)
 }
 
-func (s *gitLabOpenAIStreamState) buildChunk(delta map[string]any, finishReason string) []byte {
-	payload := map[string]any{
-		"id":      s.ID,
-		"object":  "chat.completion.chunk",
-		"created": s.Created,
-		"model":   s.Model,
-		"choices": []map[string]any{{
-			"index": 0,
-			"delta": delta,
-		}},
-	}
-	if finishReason != "" {
-		payload["choices"] = []map[string]any{{
-			"index":         0,
-			"delta":         delta,
-			"finish_reason": finishReason,
-		}}
-	}
-	raw, _ := json.Marshal(payload)
-	return append([]byte("data: "), raw...)
+func ordinaryProviderClient(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth) *http.Client {
+	client := *helps.NewProxyAwareHTTPClient(ctx, cfg, auth, 0)
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	return &client
 }
 
-func shouldFallbackToCodeSuggestions(err error) bool {
-	if err == nil {
-		return false
-	}
-	status, ok := err.(interface{ StatusCode() int })
-	if !ok {
-		return false
-	}
-	switch status.StatusCode() {
-	case http.StatusForbidden, http.StatusNotFound, http.StatusMethodNotAllowed, http.StatusNotImplemented:
-		return true
-	default:
-		return false
-	}
+type ordinaryProviderRefusal struct{ statusErr }
+
+func (ordinaryProviderRefusal) IsRequestStop() bool { return true }
+
+func ordinaryProviderStop(status int, message string) ordinaryProviderRefusal {
+	return ordinaryProviderRefusal{statusErr{code: status, msg: message}}
 }
 
-func buildGitLabOpenAIResponse(model, text string, translatedReq []byte) []byte {
-	promptTokens, completionTokens := gitLabUsage(model, translatedReq, text)
-	payload := map[string]any{
-		"id":      fmt.Sprintf("gitlab-%d", time.Now().UnixNano()),
-		"object":  "chat.completion",
-		"created": time.Now().Unix(),
-		"model":   model,
-		"choices": []map[string]any{{
-			"index": 0,
-			"message": map[string]any{
-				"role":    "assistant",
-				"content": text,
-			},
-			"finish_reason": "stop",
-		}},
-		"usage": map[string]any{
-			"prompt_tokens":     promptTokens,
-			"completion_tokens": completionTokens,
-			"total_tokens":      promptTokens + completionTokens,
-		},
+func preserveOrdinaryProviderRefusal(err error) error {
+	var status statusErr
+	if errors.As(err, &status) && status.code >= 300 && status.code <= 599 {
+		return ordinaryProviderRefusal{status}
 	}
-	raw, _ := json.Marshal(payload)
-	return raw
-}
-
-func buildGitLabOpenAIStream(model, text string) []string {
-	now := time.Now().Unix()
-	id := fmt.Sprintf("gitlab-%d", time.Now().UnixNano())
-	chunks := []map[string]any{
-		{
-			"id":      id,
-			"object":  "chat.completion.chunk",
-			"created": now,
-			"model":   model,
-			"choices": []map[string]any{{
-				"index": 0,
-				"delta": map[string]any{"role": "assistant"},
-			}},
-		},
-		{
-			"id":      id,
-			"object":  "chat.completion.chunk",
-			"created": now,
-			"model":   model,
-			"choices": []map[string]any{{
-				"index": 0,
-				"delta": map[string]any{"content": text},
-			}},
-		},
-		{
-			"id":      id,
-			"object":  "chat.completion.chunk",
-			"created": now,
-			"model":   model,
-			"choices": []map[string]any{{
-				"index":         0,
-				"delta":         map[string]any{},
-				"finish_reason": "stop",
-			}},
-		},
-	}
-	lines := make([]string, 0, len(chunks)+1)
-	for _, chunk := range chunks {
-		raw, _ := json.Marshal(chunk)
-		lines = append(lines, "data: "+string(raw))
-	}
-	lines = append(lines, "data: [DONE]")
-	return lines
-}
-
-func gitLabUsage(model string, translatedReq []byte, text string) (int64, int64) {
-	enc, err := tokenizerForModel(model)
-	if err != nil {
-		return 0, 0
-	}
-	promptTokens, err := countOpenAIChatTokens(enc, translatedReq)
-	if err != nil {
-		promptTokens = 0
-	}
-	completionCount, err := enc.Count(strings.TrimSpace(text))
-	if err != nil {
-		return promptTokens, 0
-	}
-	return promptTokens, int64(completionCount)
-}
-
-func buildGitLabAnthropicGatewayAuth(auth *cliproxyauth.Auth) (*cliproxyauth.Auth, bool) {
-	if !gitLabUsesAnthropicGateway(auth) {
-		return nil, false
-	}
-	baseURL := gitLabAnthropicGatewayBaseURL(auth)
-	token := gitLabMetadataString(auth.Metadata, "duo_gateway_token")
-	if baseURL == "" || token == "" {
-		return nil, false
-	}
-
-	nativeAuth := auth.Clone()
-	nativeAuth.Provider = "claude"
-	if nativeAuth.Attributes == nil {
-		nativeAuth.Attributes = make(map[string]string)
-	}
-	nativeAuth.Attributes["api_key"] = token
-	nativeAuth.Attributes["base_url"] = baseURL
-	for key, value := range gitLabGatewayHeaders(auth) {
-		if key == "" || value == "" {
-			continue
-		}
-		nativeAuth.Attributes["header:"+key] = value
-	}
-	return nativeAuth, true
-}
-
-func buildGitLabOpenAIGatewayAuth(auth *cliproxyauth.Auth) (*cliproxyauth.Auth, bool) {
-	if !gitLabUsesOpenAIGateway(auth) {
-		return nil, false
-	}
-	baseURL := gitLabOpenAIGatewayBaseURL(auth)
-	token := gitLabMetadataString(auth.Metadata, "duo_gateway_token")
-	if baseURL == "" || token == "" {
-		return nil, false
-	}
-
-	nativeAuth := auth.Clone()
-	nativeAuth.Provider = "codex"
-	if nativeAuth.Attributes == nil {
-		nativeAuth.Attributes = make(map[string]string)
-	}
-	nativeAuth.Attributes["api_key"] = token
-	nativeAuth.Attributes["base_url"] = baseURL
-	for key, value := range gitLabGatewayHeaders(auth) {
-		if key == "" || value == "" {
-			continue
-		}
-		nativeAuth.Attributes["header:"+key] = value
-	}
-	return nativeAuth, true
-}
-
-func gitLabUsesAnthropicGateway(auth *cliproxyauth.Auth) bool {
-	if auth == nil || auth.Metadata == nil {
-		return false
-	}
-	provider := strings.ToLower(gitLabMetadataString(auth.Metadata, "model_provider"))
-	if provider == "" {
-		modelName := strings.ToLower(gitLabMetadataString(auth.Metadata, "model_name"))
-		provider = inferGitLabProviderFromModel(modelName)
-	}
-	return provider == "anthropic" &&
-		gitLabMetadataString(auth.Metadata, "duo_gateway_base_url") != "" &&
-		gitLabMetadataString(auth.Metadata, "duo_gateway_token") != ""
-}
-
-func gitLabUsesOpenAIGateway(auth *cliproxyauth.Auth) bool {
-	if auth == nil || auth.Metadata == nil {
-		return false
-	}
-	provider := strings.ToLower(gitLabMetadataString(auth.Metadata, "model_provider"))
-	if provider == "" {
-		modelName := strings.ToLower(gitLabMetadataString(auth.Metadata, "model_name"))
-		provider = inferGitLabProviderFromModel(modelName)
-	}
-	return provider == "openai" &&
-		gitLabMetadataString(auth.Metadata, "duo_gateway_base_url") != "" &&
-		gitLabMetadataString(auth.Metadata, "duo_gateway_token") != ""
-}
-
-func inferGitLabProviderFromModel(model string) string {
-	model = strings.ToLower(strings.TrimSpace(model))
-	switch {
-	case strings.Contains(model, "claude"):
-		return "anthropic"
-	case strings.Contains(model, "gpt"), strings.Contains(model, "o1"), strings.Contains(model, "o3"), strings.Contains(model, "o4"):
-		return "openai"
-	default:
-		return ""
-	}
-}
-
-func gitLabAnthropicGatewayBaseURL(auth *cliproxyauth.Auth) string {
-	raw := strings.TrimSpace(gitLabMetadataString(auth.Metadata, "duo_gateway_base_url"))
-	if raw == "" {
-		return ""
-	}
-	base, err := url.Parse(raw)
-	if err != nil {
-		return strings.TrimRight(raw, "/")
-	}
-	path := strings.TrimRight(base.EscapedPath(), "/")
-	switch {
-	case strings.HasSuffix(path, "/ai/v1/proxy/anthropic"), strings.HasSuffix(path, "/v1/proxy/anthropic"):
-		return strings.TrimRight(base.String(), "/")
-	case path == "/ai":
-		base.Path = "/ai/v1/proxy/anthropic"
-	case path != "":
-		base.Path = strings.TrimRight(path, "/") + "/v1/proxy/anthropic"
-	case strings.Contains(strings.ToLower(base.Host), "gitlab.com"):
-		base.Path = "/ai/v1/proxy/anthropic"
-	default:
-		base.Path = "/v1/proxy/anthropic"
-	}
-	return strings.TrimRight(base.String(), "/")
-}
-
-func gitLabOpenAIGatewayBaseURL(auth *cliproxyauth.Auth) string {
-	raw := strings.TrimSpace(gitLabMetadataString(auth.Metadata, "duo_gateway_base_url"))
-	if raw == "" {
-		return ""
-	}
-	base, err := url.Parse(raw)
-	if err != nil {
-		return strings.TrimRight(raw, "/")
-	}
-	path := strings.TrimRight(base.EscapedPath(), "/")
-	switch {
-	case strings.HasSuffix(path, "/ai/v1/proxy/openai/v1"), strings.HasSuffix(path, "/v1/proxy/openai/v1"):
-		return strings.TrimRight(base.String(), "/")
-	case path == "/ai":
-		base.Path = "/ai/v1/proxy/openai/v1"
-	case path != "":
-		base.Path = strings.TrimRight(path, "/") + "/v1/proxy/openai/v1"
-	case strings.Contains(strings.ToLower(base.Host), "gitlab.com"):
-		base.Path = "/ai/v1/proxy/openai/v1"
-	default:
-		base.Path = "/v1/proxy/openai/v1"
-	}
-	return strings.TrimRight(base.String(), "/")
-}
-
-func gitLabPrimaryToken(auth *cliproxyauth.Auth) string {
-	if auth == nil || auth.Metadata == nil {
-		return ""
-	}
-	if token := gitLabMetadataString(auth.Metadata, "access_token"); token != "" {
-		return token
-	}
-	return gitLabMetadataString(auth.Metadata, "personal_access_token")
-}
-
-func gitLabBaseURL(auth *cliproxyauth.Auth) string {
-	if auth == nil || auth.Metadata == nil {
-		return ""
-	}
-	return gitlab.NormalizeBaseURL(gitLabMetadataString(auth.Metadata, "base_url"))
-}
-
-func gitLabResolvedModel(auth *cliproxyauth.Auth, requested string) string {
-	requested = strings.TrimSpace(thinking.ParseSuffix(requested).ModelName)
-	if requested != "" && !strings.EqualFold(requested, "gitlab-duo") {
-		return requested
-	}
-	if auth != nil && auth.Metadata != nil {
-		for _, model := range gitlab.ExtractDiscoveredModels(auth.Metadata) {
-			if name := strings.TrimSpace(model.ModelName); name != "" {
-				return name
-			}
-		}
-	}
-	if requested != "" {
-		return requested
-	}
-	return "gitlab-duo"
-}
-
-func gitLabMetadataString(metadata map[string]any, keys ...string) string {
-	for _, key := range keys {
-		if metadata == nil {
-			return ""
-		}
-		if value, ok := metadata[key].(string); ok {
-			if trimmed := strings.TrimSpace(value); trimmed != "" {
-				return trimmed
-			}
-		}
-	}
-	return ""
-}
-
-func gitLabOAuthTokenNeedsRefresh(metadata map[string]any) bool {
-	expiry := gitLabMetadataString(metadata, "oauth_expires_at")
-	if expiry == "" {
-		return true
-	}
-	ts, err := time.Parse(time.RFC3339, expiry)
-	if err != nil {
-		return true
-	}
-	return time.Until(ts) <= 5*time.Minute
-}
-
-func applyGitLabTokenMetadata(metadata map[string]any, tokenResp *gitlab.TokenResponse) {
-	if metadata == nil || tokenResp == nil {
-		return
-	}
-	if accessToken := strings.TrimSpace(tokenResp.AccessToken); accessToken != "" {
-		metadata["access_token"] = accessToken
-	}
-	if refreshToken := strings.TrimSpace(tokenResp.RefreshToken); refreshToken != "" {
-		metadata["refresh_token"] = refreshToken
-	}
-	if tokenType := strings.TrimSpace(tokenResp.TokenType); tokenType != "" {
-		metadata["token_type"] = tokenType
-	}
-	if scope := strings.TrimSpace(tokenResp.Scope); scope != "" {
-		metadata["scope"] = scope
-	}
-	if expiry := gitlab.TokenExpiry(time.Now(), tokenResp); !expiry.IsZero() {
-		metadata["oauth_expires_at"] = expiry.Format(time.RFC3339)
-	}
-}
-
-func mergeGitLabDirectAccessMetadata(metadata map[string]any, direct *gitlab.DirectAccessResponse) {
-	if metadata == nil || direct == nil {
-		return
-	}
-	if base := strings.TrimSpace(direct.BaseURL); base != "" {
-		metadata["duo_gateway_base_url"] = base
-	}
-	if token := strings.TrimSpace(direct.Token); token != "" {
-		metadata["duo_gateway_token"] = token
-	}
-	if direct.ExpiresAt > 0 {
-		expiry := time.Unix(direct.ExpiresAt, 0).UTC()
-		metadata["duo_gateway_expires_at"] = expiry.Format(time.RFC3339)
-		if ttl := expiry.Sub(time.Now().UTC()); ttl > 0 {
-			interval := int(ttl.Seconds()) / 2
-			switch {
-			case interval < 60:
-				interval = 60
-			case interval > 240:
-				interval = 240
-			}
-			metadata["refresh_interval_seconds"] = interval
-		}
-	}
-	if len(direct.Headers) > 0 {
-		headers := make(map[string]string, len(direct.Headers))
-		for key, value := range direct.Headers {
-			key = strings.TrimSpace(key)
-			value = strings.TrimSpace(value)
-			if key == "" || value == "" {
-				continue
-			}
-			headers[key] = value
-		}
-		if len(headers) > 0 {
-			metadata["duo_gateway_headers"] = headers
-		}
-	}
-	if direct.ModelDetails != nil {
-		modelDetails := map[string]any{}
-		if provider := strings.TrimSpace(direct.ModelDetails.ModelProvider); provider != "" {
-			modelDetails["model_provider"] = provider
-			metadata["model_provider"] = provider
-		}
-		if model := strings.TrimSpace(direct.ModelDetails.ModelName); model != "" {
-			modelDetails["model_name"] = model
-			metadata["model_name"] = model
-		}
-		if len(modelDetails) > 0 {
-			metadata["model_details"] = modelDetails
-		}
-	}
-}
-
-func gitLabAuthKind(method string) string {
-	switch strings.ToLower(strings.TrimSpace(method)) {
-	case gitLabAuthMethodPAT:
-		return "personal_access_token"
-	default:
-		return "oauth"
-	}
-}
-
-func GitLabModelsFromAuth(auth *cliproxyauth.Auth) []*registry.ModelInfo {
-	models := make([]*registry.ModelInfo, 0, 4)
-	seen := make(map[string]struct{}, 4)
-	addModel := func(id, displayName, provider string) {
-		id = strings.TrimSpace(id)
-		if id == "" {
-			return
-		}
-		key := strings.ToLower(id)
-		if _, ok := seen[key]; ok {
-			return
-		}
-		seen[key] = struct{}{}
-		models = append(models, &registry.ModelInfo{
-			ID:          id,
-			Object:      "model",
-			Created:     time.Now().Unix(),
-			OwnedBy:     "gitlab",
-			Type:        "gitlab",
-			DisplayName: displayName,
-			Description: provider,
-			UserDefined: true,
-		})
-	}
-
-	addModel("gitlab-duo", "GitLab Duo", "gitlab")
-	if auth == nil {
-		return models
-	}
-	for _, model := range gitlab.ExtractDiscoveredModels(auth.Metadata) {
-		name := strings.TrimSpace(model.ModelName)
-		if name == "" {
-			continue
-		}
-		displayName := "GitLab Duo"
-		if provider := strings.TrimSpace(model.ModelProvider); provider != "" {
-			displayName = fmt.Sprintf("GitLab Duo (%s)", provider)
-		}
-		addModel(name, displayName, strings.TrimSpace(model.ModelProvider))
-	}
-	return models
+	return err
 }

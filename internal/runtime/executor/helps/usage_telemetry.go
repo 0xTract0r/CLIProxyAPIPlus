@@ -13,12 +13,12 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
 	"github.com/tidwall/gjson"
 )
 
-func intPtr(v int64) *int64 { return &v }
+func telemetryMillisPtr(v int64) *int64 { return &v }
 func (r *UsageReporter) initTelemetry(ctx context.Context) {
 	r.telemetry = usage.Telemetry{Version: 1, AttemptID: uuid.NewString(), StartedAtMS: r.requestedAt.UnixMilli(), Transport: "unknown", ObservationKind: "attempt_only", ObservedStages: []string{"executor"}}
 	if ctx != nil {
@@ -30,7 +30,7 @@ func (r *UsageReporter) observeFirstBody() {
 	r.telemetryMu.Lock()
 	defer r.telemetryMu.Unlock()
 	if r.telemetry.FirstBodyMS == nil {
-		r.telemetry.FirstBodyMS = intPtr(r.offset())
+		r.telemetry.FirstBodyMS = telemetryMillisPtr(r.offset())
 		r.telemetry.ObservedStages = append(r.telemetry.ObservedStages, "first_body")
 	}
 }
@@ -42,7 +42,7 @@ func (r *UsageReporter) observeHeaders(resp *http.Response) {
 		r.telemetry.ObservationKind = "http_body"
 	}
 	if r.telemetry.ResponseHeadersMS == nil {
-		r.telemetry.ResponseHeadersMS = intPtr(r.offset())
+		r.telemetry.ResponseHeadersMS = telemetryMillisPtr(r.offset())
 		r.telemetry.ObservedStages = append(r.telemetry.ObservedStages, "response_headers")
 	}
 }
@@ -65,7 +65,7 @@ func (r *UsageReporter) traceRequest(req *http.Request) *http.Request {
 			connectStart := connectStarts[network+"|"+addr]
 			delete(connectStarts, network+"|"+addr)
 			if err == nil && !connectStart.IsZero() && r.telemetry.ConnectMS == nil {
-				r.telemetry.ConnectMS = intPtr(time.Since(connectStart).Milliseconds())
+				r.telemetry.ConnectMS = telemetryMillisPtr(time.Since(connectStart).Milliseconds())
 				r.telemetry.ObservedStages = append(r.telemetry.ObservedStages, "connect")
 			}
 		},
@@ -74,7 +74,7 @@ func (r *UsageReporter) traceRequest(req *http.Request) *http.Request {
 			r.telemetryMu.Lock()
 			defer r.telemetryMu.Unlock()
 			if err == nil && !tlsStart.IsZero() && r.telemetry.TLSMS == nil {
-				r.telemetry.TLSMS = intPtr(time.Since(tlsStart).Milliseconds())
+				r.telemetry.TLSMS = telemetryMillisPtr(time.Since(tlsStart).Milliseconds())
 				r.telemetry.ObservedStages = append(r.telemetry.ObservedStages, "tls")
 			}
 		},
@@ -253,6 +253,9 @@ func (r *UsageReporter) ObserveContentEvent(payload []byte) {
 			}
 		}
 	}
+	if content {
+		r.ObserveTokenEvent(true)
+	}
 	r.telemetryMu.Lock()
 	defer r.telemetryMu.Unlock()
 	t := &r.telemetry
@@ -271,11 +274,11 @@ func (r *UsageReporter) ObserveContentEvent(payload []byte) {
 		if visible {
 			now := r.offset()
 			if t.FirstVisibleContentMS == nil {
-				t.FirstVisibleContentMS = intPtr(now)
-				t.VisibleContentEvents = intPtr(0)
+				t.FirstVisibleContentMS = telemetryMillisPtr(now)
+				t.VisibleContentEvents = telemetryMillisPtr(0)
 			}
 			*t.VisibleContentEvents++
-			t.LastVisibleContentMS = intPtr(now)
+			t.LastVisibleContentMS = telemetryMillisPtr(now)
 		}
 	}
 	if recognized && t.ObservationKind != "content_observation_truncated" {
@@ -294,24 +297,24 @@ func (r *UsageReporter) ObserveContentEvent(payload []byte) {
 	}
 	now := r.offset()
 	if t.ContentChunks == nil {
-		t.ContentChunks = intPtr(0)
-		t.StallCount = intPtr(0)
-		t.StallDurationMS = intPtr(0)
-		t.StallThresholdMS = intPtr(1000)
-		t.MaxContentGapMS = intPtr(0)
-		t.FirstContentMS = intPtr(now)
+		t.ContentChunks = telemetryMillisPtr(0)
+		t.StallCount = telemetryMillisPtr(0)
+		t.StallDurationMS = telemetryMillisPtr(0)
+		t.StallThresholdMS = telemetryMillisPtr(1000)
+		t.MaxContentGapMS = telemetryMillisPtr(0)
+		t.FirstContentMS = telemetryMillisPtr(now)
 		t.ObservedStages = append(t.ObservedStages, "content_events")
 	}
 	if t.LastContentMS != nil {
 		gap := max(0, now-*t.LastContentMS)
-		t.MaxContentGapMS = intPtr(max(*t.MaxContentGapMS, gap))
+		t.MaxContentGapMS = telemetryMillisPtr(max(*t.MaxContentGapMS, gap))
 		if gap >= 1000 {
 			*t.StallCount++
 			*t.StallDurationMS += gap
 		}
 	}
 	*t.ContentChunks++
-	t.LastContentMS = intPtr(now)
+	t.LastContentMS = telemetryMillisPtr(now)
 }
 func (r *UsageReporter) observeFailure(errs ...error) {
 	if r == nil {
@@ -340,7 +343,7 @@ func (r *UsageReporter) telemetrySnapshot(failed bool, fail usage.Failure) *usag
 	defer r.telemetryMu.Unlock()
 	t := r.telemetry
 	if t.VisibleContentEvents != nil {
-		t.VisibleContentEvents = intPtr(*t.VisibleContentEvents)
+		t.VisibleContentEvents = telemetryMillisPtr(*t.VisibleContentEvents)
 	}
 	t.EndedAtMS = time.Now().UnixMilli()
 	t.ObservedStages = append([]string(nil), t.ObservedStages...)
@@ -348,7 +351,7 @@ func (r *UsageReporter) telemetrySnapshot(failed bool, fail usage.Failure) *usag
 	// stream observations cannot mutate an already-published accounting record.
 	for _, p := range []**int64{&t.ConnectMS, &t.TLSMS, &t.ResponseHeadersMS, &t.FirstBodyMS, &t.FirstContentMS, &t.LastContentMS, &t.ContentChunks, &t.MaxContentGapMS, &t.StallCount, &t.StallDurationMS, &t.StallThresholdMS} {
 		if *p != nil {
-			*p = intPtr(**p)
+			*p = telemetryMillisPtr(**p)
 		}
 	}
 	if t.StreamCompleted != nil {

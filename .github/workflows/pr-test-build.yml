@@ -12,13 +12,25 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
           cache: true
       - name: Test
-        run: GOTOOLCHAIN=auto go test -timeout 600s ./...
+        shell: bash
+        run: |
+          set -euo pipefail
+          results="$(mktemp)"
+          trap 'rm -f "$results"' EXIT
+          GOTOOLCHAIN=auto go test -json -count=1 -timeout 600s ./... | tee "$results"
+          python3 .github/scripts/check-ordinary-pr-tests.py "$results"
+      - name: Ordinary fork feature survival audit
+        run: |
+          bash scripts/upstream-sync/check-fork-features-alive.sh . \
+            --manifest scripts/upstream-sync/ordinary-fork-feature-manifest.tsv
       # IMPORTANT: keep "Refresh models catalog" AFTER "Test". This step rewrites the
       # committed model catalog on disk; registry tests assert the committed catalog
       # state, so running it before "Test" mutates the catalog and turns those
@@ -29,5 +41,11 @@ jobs:
         run: |
           go build -o test-output ./cmd/server
           rm -f test-output
-      - name: fork feature survival audit
-        run: bash scripts/upstream-sync/check-fork-features-alive.sh
+      - name: Cross-build for Solaris
+        env:
+          GOOS: solaris
+          GOARCH: amd64
+          CGO_ENABLED: 0
+        run: |
+          go build -o test-output-solaris ./cmd/server
+          rm -f test-output-solaris

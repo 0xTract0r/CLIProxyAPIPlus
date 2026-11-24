@@ -133,6 +133,8 @@ GLM CODING PLANを10%割引で取得：https://z.ai/subscribe?ic=8JVLJQFSKB
 
 ## はじめに
 
+この版に対応する管理・SDK ドキュメントの一覧は[上流の README](https://github.com/router-for-me/CLIProxyAPI/blob/6960763455c4ac3d4828fb1736aa5de2183ccecf/README_JA.md)を参照してください。
+
 CLIProxyAPIガイド：[https://help.router-for.me/](https://help.router-for.me/)
 
 ## 管理API

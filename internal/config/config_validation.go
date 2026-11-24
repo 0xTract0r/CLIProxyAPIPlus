@@ -2,20 +2,47 @@ package config
 
 import (
 	"bytes"
-	"encoding/json"
-	"strings"
 
+	"github.com/MoeForge/moego/json"
+	"github.com/MoeForge/moego/regexp"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/crypto/bcrypt"
 )
 
-// SanitizePayloadRules validates raw JSON payload rule params and drops invalid rules.
+// SanitizePayloadRules drops invalid rules and skips invalid regex entries individually.
 func (cfg *Config) SanitizePayloadRules() {
 	if cfg == nil {
 		return
 	}
 	cfg.Payload.DefaultRaw = sanitizePayloadRawRules(cfg.Payload.DefaultRaw, "default-raw")
 	cfg.Payload.OverrideRaw = sanitizePayloadRawRules(cfg.Payload.OverrideRaw, "override-raw")
+	if len(cfg.Payload.Replace) > 0 {
+		valid := make([]PayloadReplaceRule, 0, len(cfg.Payload.Replace))
+		for i, rule := range cfg.Payload.Replace {
+			if errValidate := rule.Validate(); errValidate != nil {
+				log.Warnf("payload.replace rule %d dropped: invalid rule", i+1)
+				continue
+			}
+			replacements := make([]PayloadReplacement, 0, len(rule.Replacements))
+			for j, replacement := range rule.Replacements {
+				// Validation guarantees that two-key entries are regex replacements.
+				if len(replacement) == 2 {
+					pattern := replacement["pattern"]
+					if _, errCompile := regexp.Compile(pattern); pattern == "" || errCompile != nil {
+						log.Warnf("payload.replace rule %d replacement %d skipped: invalid regex", i+1, j+1)
+						continue
+					}
+				}
+				replacements = append(replacements, replacement)
+			}
+			if len(replacements) == 0 {
+				continue
+			}
+			rule.Replacements = replacements
+			valid = append(valid, rule)
+		}
+		cfg.Payload.Replace = valid
+	}
 }
 
 func sanitizePayloadRawRules(rules []PayloadRule, section string) []PayloadRule {
@@ -64,9 +91,19 @@ func payloadRawString(value any) ([]byte, bool) {
 	}
 }
 
-// looksLikeBcrypt returns true if the provided string appears to be a bcrypt hash.
+// looksLikeBcrypt recognizes supported bcrypt encodings without treating an
+// arbitrary plaintext string with a bcrypt prefix as safe to upload.
 func looksLikeBcrypt(s string) bool {
-	return len(s) > 4 && (s[:4] == "$2a$" || s[:4] == "$2b$" || s[:4] == "$2y$")
+	if len(s) != 60 || (s[:4] != "$2a$" && s[:4] != "$2b$" && s[:4] != "$2y$") || s[6] != '$' {
+		return false
+	}
+	for _, c := range s[7:] {
+		if (c < 'A' || c > 'Z') && (c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '.' && c != '/' {
+			return false
+		}
+	}
+	_, errCost := bcrypt.Cost([]byte(s))
+	return errCost == nil
 }
 
 // hashSecret hashes the given secret using bcrypt.
@@ -85,34 +122,6 @@ func (cfg *Config) SanitizeClaudeConfig() {
 		return
 	}
 	cfg.Claude.SonnetLongContextPolicy = NormalizeClaudeSonnetLongContextPolicy(cfg.Claude.SonnetLongContextPolicy)
-}
-
-// SanitizeManagedHeaderProfile clamps managed-header online-refresh timing knobs.
-func (cfg *Config) SanitizeManagedHeaderProfile() {
-	if cfg == nil {
-		return
-	}
-	// fork(anticorr) requirement ⑥ plan A: the managed-header online-update (npm)
-	// flag must materialize a non-nil default of OFF when the config file omits it,
-	// so the outbound claude-cli version ceiling is the account's real observed
-	// high-water mark and never npm "latest". An explicit `online-update: true`
-	// survives (unmarshal sets the pointer before this runs).
-	if cfg.ManagedHeaderProfile.OnlineUpdate == nil {
-		onlineUpdate := false
-		cfg.ManagedHeaderProfile.OnlineUpdate = &onlineUpdate
-	}
-	if cfg.ManagedHeaderProfile.FetchTimeoutSeconds <= 0 {
-		cfg.ManagedHeaderProfile.FetchTimeoutSeconds = 2
-	}
-	if cfg.ManagedHeaderProfile.FetchTimeoutSeconds > 10 {
-		cfg.ManagedHeaderProfile.FetchTimeoutSeconds = 10
-	}
-	if cfg.ManagedHeaderProfile.CacheTTLSeconds <= 0 {
-		cfg.ManagedHeaderProfile.CacheTTLSeconds = 6 * 60 * 60
-	}
-	if cfg.ManagedHeaderProfile.CacheTTLSeconds < 60 {
-		cfg.ManagedHeaderProfile.CacheTTLSeconds = 60
-	}
 }
 
 // SanitizeQuotaSnapshotRefresh normalizes the persisted quota snapshot refresh
@@ -146,25 +155,4 @@ func (cfg *Config) SanitizeQuotaSnapshotRefresh() {
 		DefaultQuotaSnapshotRefreshStartupMaxStalenessString,
 		true,
 	)
-}
-
-// SanitizeKiroKeys trims whitespace from Kiro credential fields.
-func (cfg *Config) SanitizeKiroKeys() {
-	if cfg == nil || len(cfg.KiroKey) == 0 {
-		return
-	}
-	for i := range cfg.KiroKey {
-		entry := &cfg.KiroKey[i]
-		entry.TokenFile = strings.TrimSpace(entry.TokenFile)
-		entry.AccessToken = strings.TrimSpace(entry.AccessToken)
-		entry.RefreshToken = strings.TrimSpace(entry.RefreshToken)
-		entry.ExpiresAt = strings.TrimSpace(entry.ExpiresAt)
-		entry.Email = strings.TrimSpace(entry.Email)
-		entry.ProfileArn = strings.TrimSpace(entry.ProfileArn)
-		entry.Region = strings.TrimSpace(entry.Region)
-		entry.AgentTaskType = strings.TrimSpace(entry.AgentTaskType)
-		entry.Prefix = normalizeModelPrefix(entry.Prefix)
-		entry.PreferredEndpoint = strings.TrimSpace(entry.PreferredEndpoint)
-		entry.ProxyURL = strings.TrimSpace(entry.ProxyURL)
-	}
 }

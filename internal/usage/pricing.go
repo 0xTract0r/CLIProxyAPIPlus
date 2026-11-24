@@ -47,7 +47,7 @@ const (
 const (
 	defaultOpenAIPricingURL    = "https://developers.openai.com/api/docs/pricing"
 	defaultAnthropicPricingURL = "https://www.anthropic.com/pricing"
-	defaultPricingUserAgent    = "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
+	defaultPricingUserAgent    = "CLIProxyAPI-Pricing/1.0"
 )
 
 const (
@@ -149,7 +149,8 @@ type pricingFetcher struct {
 }
 
 type PricingCatalogManager struct {
-	mu sync.RWMutex
+	transactionMu sync.Mutex // serializes persistence, path changes and full refreshes
+	mu            sync.RWMutex
 
 	filePath         string
 	persistedAt      time.Time
@@ -305,62 +306,63 @@ func (m *PricingCatalogManager) SetPersistencePath(path string) error {
 		}
 	}
 
+	m.transactionMu.Lock()
+	defer m.transactionMu.Unlock()
 	m.mu.Lock()
-	m.filePath = cleaned
-	m.mu.Unlock()
-
-	if cleaned == "" {
-		return nil
+	defer m.mu.Unlock()
+	if err := m.loadPricingLocked(cleaned); err != nil {
+		return err
 	}
-	return m.LoadFromPersistence()
+	m.filePath = cleaned
+	return nil
 }
 
 func (m *PricingCatalogManager) SaveToPersistence() error {
 	if m == nil {
 		return nil
 	}
-	path := m.persistencePath()
-	if path == "" {
+	m.transactionMu.Lock()
+	defer m.transactionMu.Unlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.savePricingLocked()
+}
+
+func (m *PricingCatalogManager) savePricingLocked() error {
+	if m.filePath == "" {
 		return nil
 	}
-
-	m.mu.RLock()
 	payload := pricingCatalogFile{
-		Version:         pricingCatalogFileVersion,
-		PersistedAt:     time.Now().UTC(),
-		LastRefreshedAt: m.lastRefreshedAt,
-		OfficialModels:  clonePricingModelMap(m.officialModels),
-		Overrides:       clonePricingModelMap(m.overrides),
-		Sources:         clonePricingSourceMap(m.sources),
+		Version: pricingCatalogFileVersion, PersistedAt: time.Now().UTC(),
+		LastRefreshedAt: m.lastRefreshedAt, OfficialModels: m.officialModels,
+		Overrides: m.overrides, Sources: m.sources,
 	}
-	m.mu.RUnlock()
-
 	data, err := json.Marshal(payload)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: %w", ErrPricingPersistence, err)
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
+	if err := writeUsageSnapshot(m.filePath, data); err != nil {
+		return fmt.Errorf("%w: %w", ErrPricingPersistence, err)
 	}
-	tmpPath := path + ".tmp"
-	if err := os.WriteFile(tmpPath, data, 0o600); err != nil {
-		return err
-	}
-	if err := os.Rename(tmpPath, path); err != nil {
-		return err
-	}
-
-	m.mu.Lock()
 	m.persistedAt = payload.PersistedAt
-	m.mu.Unlock()
 	return nil
 }
+
+// ErrPricingPersistence distinguishes server write failures from input validation.
+var ErrPricingPersistence = errors.New("pricing persistence failed")
 
 func (m *PricingCatalogManager) LoadFromPersistence() error {
 	if m == nil {
 		return nil
 	}
-	path := m.persistencePath()
+	m.transactionMu.Lock()
+	defer m.transactionMu.Unlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.loadPricingLocked(m.filePath)
+}
+
+func (m *PricingCatalogManager) loadPricingLocked(path string) error {
 	if path == "" {
 		return nil
 	}
@@ -381,7 +383,6 @@ func (m *PricingCatalogManager) LoadFromPersistence() error {
 		return fmt.Errorf("unsupported pricing catalog version %d", payload.Version)
 	}
 
-	m.mu.Lock()
 	m.persistedAt = payload.PersistedAt
 	m.lastRefreshedAt = payload.LastRefreshedAt
 	m.officialModels = canonicalizePricingModelMap(payload.OfficialModels, pricingSourceOfficial)
@@ -389,7 +390,6 @@ func (m *PricingCatalogManager) LoadFromPersistence() error {
 	m.sources = clonePricingSourceMap(payload.Sources)
 	m.ensureSourceMetadataLocked()
 	m.rebuildAliasIndexLocked()
-	m.mu.Unlock()
 	return nil
 }
 
@@ -417,15 +417,6 @@ func (m *PricingCatalogManager) nextAutoRefreshDelay(now time.Time, interval tim
 	return jitterDuration(now, pricingRefreshJitterMax)
 }
 
-func (m *PricingCatalogManager) persistencePath() string {
-	if m == nil {
-		return ""
-	}
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.filePath
-}
-
 func (m *PricingCatalogManager) PutOverride(model string, override PricingModel) (PricingModel, error) {
 	if m == nil {
 		return PricingModel{}, errors.New("pricing catalog unavailable")
@@ -444,37 +435,54 @@ func (m *PricingCatalogManager) PutOverride(model string, override PricingModel)
 	entry := normalizePricingModel(override, canonical, pricingSourceOverride)
 	entry.PricingStatus = pricingStatePriced
 
+	m.transactionMu.Lock()
+	defer m.transactionMu.Unlock()
 	m.mu.Lock()
+	defer m.mu.Unlock()
+	before, existed := m.overrides[canonical]
 	m.overrides[canonical] = entry
-	m.rebuildAliasIndexLocked()
-	m.mu.Unlock()
-
-	if err := m.SaveToPersistence(); err != nil {
+	if err := m.savePricingLocked(); err != nil {
+		if existed {
+			m.overrides[canonical] = before
+		} else {
+			delete(m.overrides, canonical)
+		}
 		return PricingModel{}, err
 	}
+	m.rebuildAliasIndexLocked()
 	return entry, nil
 }
 
 func (m *PricingCatalogManager) DeleteOverride(model string) bool {
+	deleted, _ := m.DeleteOverrideWithError(model)
+	return deleted
+}
+
+// DeleteOverrideWithError reports whether the override was durably removed.
+func (m *PricingCatalogManager) DeleteOverrideWithError(model string) (bool, error) {
 	if m == nil {
-		return false
+		return false, nil
 	}
 	canonical := normalizeCanonicalModelID(model)
 	if canonical == "" {
-		return false
+		return false, nil
 	}
-
+	m.transactionMu.Lock()
+	defer m.transactionMu.Unlock()
 	m.mu.Lock()
-	_, existed := m.overrides[canonical]
-	if existed {
-		delete(m.overrides, canonical)
-		m.rebuildAliasIndexLocked()
+	defer m.mu.Unlock()
+
+	old, exists := m.overrides[canonical]
+	if !exists {
+		return false, nil
 	}
-	m.mu.Unlock()
-	if existed {
-		_ = m.SaveToPersistence()
+	delete(m.overrides, canonical)
+	if err := m.savePricingLocked(); err != nil {
+		m.overrides[canonical] = old
+		return false, err
 	}
-	return existed
+	m.rebuildAliasIndexLocked()
+	return true, nil
 }
 
 func (m *PricingCatalogManager) RefreshOfficial(ctx context.Context) error {
@@ -482,6 +490,8 @@ func (m *PricingCatalogManager) RefreshOfficial(ctx context.Context) error {
 		return errors.New("pricing catalog unavailable")
 	}
 
+	m.transactionMu.Lock()
+	defer m.transactionMu.Unlock()
 	m.mu.RLock()
 	client := m.httpClient
 	fetchers := append([]pricingFetcher(nil), m.fetchers...)
@@ -537,16 +547,15 @@ func (m *PricingCatalogManager) RefreshOfficial(ctx context.Context) error {
 	}
 
 	m.mu.Lock()
-	m.officialModels = currentOfficial
-	m.sources = currentSources
-	m.lastRefreshedAt = now
+	defer m.mu.Unlock()
+	beforeModels, beforeSources, beforeRefresh := m.officialModels, m.sources, m.lastRefreshedAt
+	m.officialModels, m.sources, m.lastRefreshedAt = currentOfficial, currentSources, now
 	m.ensureSourceMetadataLocked()
-	m.rebuildAliasIndexLocked()
-	m.mu.Unlock()
-
-	if err := m.SaveToPersistence(); err != nil {
+	if err := m.savePricingLocked(); err != nil {
+		m.officialModels, m.sources, m.lastRefreshedAt = beforeModels, beforeSources, beforeRefresh
 		return err
 	}
+	m.rebuildAliasIndexLocked()
 	if len(refreshErrors) > 0 {
 		return fmt.Errorf("pricing refresh partial failure: %s", strings.Join(refreshErrors, "; "))
 	}

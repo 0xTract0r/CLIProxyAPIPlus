@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strings"
 
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
 // BuildAuthChangeDetails computes a redacted, human-readable list of auth field changes.
@@ -28,12 +28,7 @@ func BuildAuthChangeDetails(oldAuth, newAuth *coreauth.Auth) []string {
 		changes = append(changes, fmt.Sprintf("prefix: %s -> %s", oldPrefix, newPrefix))
 	}
 
-	// Compare proxy_url (redacted)
-	oldProxy := strings.TrimSpace(oldAuth.ProxyURL)
-	newProxy := strings.TrimSpace(newAuth.ProxyURL)
-	if oldProxy != newProxy {
-		changes = append(changes, fmt.Sprintf("proxy_url: %s -> %s", formatProxyURL(oldProxy), formatProxyURL(newProxy)))
-	}
+	changes = appendRedactedValueChange(changes, "proxy_url", oldAuth.ProxyURL, newAuth.ProxyURL)
 
 	// Compare disabled
 	if oldAuth.Disabled != newAuth.Disabled {

@@ -1,178 +1,22 @@
 package management
 
-// Fork-only management endpoint. It gives operators an API-driven way to set or
-// clear an account's adaptive-scheduling overrides
-// (account_scheduling.tier_override and account_scheduling.rate_scale) so tier
-// differentiation / a per-account safety-test rate multiplier can be tuned at
-// runtime instead of hand-editing the auth JSON on disk. Keep additions grouped
-// here (like auth_files_anticorr.go) so they survive future upstream syncs.
-
 import (
 	"encoding/json"
-	"errors"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"net/http"
 	"strings"
-	"time"
 
 	"github.com/gin-gonic/gin"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
 
-// PatchAuthFileAccountScheduling sets or clears the operator-controlled
-// adaptive-scheduling overrides on an account -- account_scheduling.tier_override,
-// account_scheduling.rate_scale and account_scheduling.first_production_at
-// (openspec add-adaptive-account-scheduling design §8.3/§8.4/§8.5).
-//
-// It mirrors PatchAuthFileAccountSettings (dedicated fork-only PATCH: locate by
-// name/auth_index, mutate metadata, persist + make the running selector observe
-// it via h.authManager.Update, then return the refreshed projection) but writes
-// ONLY the scheduling override sub-keys, routed through coreauth's namespaced
-// writers (SetAccountTierOverride / ClearAccountTierOverride /
-// SetAccountRateScale / ClearAccountRateScale /
-// SetAccountFirstProductionAt / ClearAccountFirstProductionAt) so they land in the
-// top-level account_scheduling object that survives the ~45min quota refresh.
-//
-// Request body (application/json):
-//
-//	{
-//	  "name": "<auth id | display name>",           // required
-//	  "auth_index": "<optional stable index>",       // optional, for disambiguation
-//	  "tier_override": "max_5x" | "" | null,         // present => set/clear; absent => untouched
-//	  "rate_scale": 0.5 | "" | null,                  // present => set/clear; absent => untouched
-//	  "first_production_at": "2026-01-02T15:04:05Z" | "" | null // present => set/clear; absent => untouched
-//	}
-//
-// Field presence is what distinguishes intent (decoded via json.RawMessage so an
-// absent field is never confused with an explicit null): at least one of
-// tier_override / rate_scale / first_production_at must be present or the request
-// is a 400. An explicit empty string or JSON null clears that override --
-// clearing tier_override lets tier_source fall back to "auto" (derived on read by
-// the projection), clearing rate_scale falls back to the config default (else
-// 1.0), and clearing first_production_at re-opens the append-only auto-mint path
-// (the next real serving success re-stamps a fresh anchor).
-//
-// Validation: tier_override must be a legal, provider-appropriate tier (claude:
-// max_20x/max_5x/pro; codex: codex_pro/codex_plus) or a 400 with the legal set is
-// returned; rate_scale must parse as a number > 0 or a 400 is returned;
-// first_production_at must be a legal RFC3339 timestamp that is NOT in the future
-// or a 400 is returned.
-//
-// first_production_at is the operator-explicit backfill channel (design §8.5),
-// deliberately distinct from EnsureAuthFirstProductionAt's append-only auto-mint:
-// it exists to migrate accounts that were already aged/in-production BEFORE
-// adaptive scheduling was enabled (which otherwise get auto-minted as brand-new
-// and clamped to the strictest warm-up stage) to their true first-production
-// date. Only a future timestamp is rejected here; any past date is accepted and
-// the operator owns its correctness. WARNING to operators: setting an anchor
-// EARLIER than the truth makes the account look more mature than it is (less
-// warm-up), which is the account-safety-risky direction -- only backfill dates
-// you have actually confirmed for genuinely aged accounts.
-//
-// Auth: registered under the same /v0/management admin auth as its siblings (no
-// new exemption).
+// PatchAuthFileAccountScheduling handles clients that still submit legacy settings.
 func (h *Handler) PatchAuthFileAccountScheduling(c *gin.Context) {
-	if h.authManager == nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
-		return
-	}
-
-	var req map[string]json.RawMessage
-	decoder := json.NewDecoder(c.Request.Body)
-	decoder.UseNumber()
-	if err := decoder.Decode(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
-		return
-	}
-
-	name, ok := decodeAccountSchedulingStringField(req, "name")
-	if !ok || name == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
-		return
-	}
-	authIndex, indexOK := decodeAccountSchedulingStringField(req, "auth_index")
-	if _, present := req["auth_index"]; present && (!indexOK || authIndex == "") {
-		c.JSON(400, gin.H{"error": "auth_index must be a nonempty string"})
-		return
-	}
-
-	_, tierPresent := req["tier_override"]
-	_, ratePresent := req["rate_scale"]
-	_, fpPresent := req["first_production_at"]
-	_, limitPresent := req["limit_overrides"]
-	_, temporaryPresent := req["temporary_limits"]
-	_, speedPresent := req["speed_profile"]
-	_, modePresent := req["warmup_mode"]
-	_, periodPresent := req["warmup_period_days"]
-	controlsPresent := speedPresent || modePresent || periodPresent
-	if (limitPresent || temporaryPresent || controlsPresent) && authIndex == "" {
-		c.JSON(400, gin.H{"error": "name and auth_index are required for limits"})
-		return
-	}
-	if !tierPresent && !ratePresent && !fpPresent && !limitPresent && !temporaryPresent && !controlsPresent {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "at least one of tier_override, rate_scale or first_production_at is required"})
-		return
-	}
-
-	// Locate the account the same way the sibling auth-file endpoints do:
-	// id/filename (+ optional auth_index) via lookupAuthFile, falling back to the
-	// display-name resolution used by the account-settings endpoint.
-	targetAuth, _ := h.lookupAuthFile(name, authIndex)
-	if targetAuth == nil && authIndex == "" {
-		targetAuth = findAuthByName(h.authManager, name)
-	}
-	if targetAuth == nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "auth file not found"})
-		return
-	}
-	if coreauth.IsPluginVirtualAuth(targetAuth) {
-		c.JSON(http.StatusConflict, gin.H{"error": errPluginVirtualAuth.Error()})
-		return
-	}
-	if (limitPresent || temporaryPresent || controlsPresent) && coreauth.IsConfigAPIKeyAuth(targetAuth) {
-		c.JSON(409, gin.H{"error": "static configuration accounts do not support persistent limit overrides", "reason": "static_config_account"})
-		return
-	}
-
-	// Claude-only controls: account scheduling is scoped to Claude accounts
-	// (mirroring the serving-side codex->0 AccountTierBaseWeight and the claude-only
-	// read projection in buildAuthFileEntry). Reject overrides on non-Claude
-	// accounts so codex/grok/gemini records cannot acquire a scheduling object.
-	if providerKey(targetAuth) != "claude" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "account-scheduling controls apply to Claude accounts only"})
-		return
-	}
-
-	updated, err := h.authManager.UpdateAccountScheduling(c.Request.Context(), targetAuth.ID, authIndex, func(a *coreauth.Auth, cfg config.AccountSchedulingConfig) error {
-		return applyAccountSchedulingPatch(a, cfg, req, time.Now())
-	})
-	if err != nil {
-		status := http.StatusBadRequest
-		if errors.Is(err, coreauth.ErrAccountSchedulingNotFound) {
-			status = http.StatusNotFound
-		}
-		if errors.Is(err, coreauth.ErrAccountSchedulingPersist) {
-			status = http.StatusInternalServerError
-		}
-		body := gin.H{"error": err.Error()}
-		if err.Error() == "invalid tier_override for provider" {
-			body["legal_values"] = coreauth.LegalTierOverrideValues(targetAuth.Provider)
-		}
-		c.JSON(status, body)
-		return
-	}
-	targetAuth = updated
-
-	c.JSON(http.StatusOK, gin.H{
-		"name":               authDisplayName(targetAuth),
-		"auth_index":         targetAuth.Index,
-		"account_scheduling": h.buildAccountSchedulingView(targetAuth),
-	})
+	unavailableLegacyAccountScheduling(c)
 }
 
-// decodeAccountSchedulingStringField unmarshals a string field from the raw
-// request map, returning ok=false when the field is absent or not a JSON string.
-// The returned value is whitespace-trimmed.
+func unavailableLegacyAccountScheduling(c *gin.Context) {
+	c.JSON(http.StatusGone, gin.H{"error": "legacy account scheduling is unavailable in this runtime"})
+}
+
 func decodeAccountSchedulingStringField(req map[string]json.RawMessage, key string) (string, bool) {
 	raw, ok := req[key]
 	if !ok {

@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -34,26 +35,26 @@ func openRequestLogIn(dir, requestID, exactName string) (*os.File, string, error
 	if err != nil {
 		return nil, "", err
 	}
-	var candidates []os.DirEntry
+	shortID := logging.ShortRequestID(requestID)
+	byName := make(map[string]*requestLogCandidate)
 	for _, entry := range entries {
 		name := entry.Name()
 		if entry.IsDir() || entry.Type()&os.ModeSymlink != 0 {
 			continue
 		}
-		if exactName != "" {
+		logicalName := strings.TrimSuffix(name, ".gz")
+		matchID := requestID
+		switch {
+		case exactName != "":
 			if name != exactName && !(strings.HasSuffix(exactName, ".log") && name == exactName+".gz") {
 				continue
 			}
-		} else if !strings.HasSuffix(name, "-"+requestID+".log") && !strings.HasSuffix(name, "-"+requestID+".log.gz") {
+		case strings.HasSuffix(logicalName, "-"+requestID+".log"):
+		case strings.HasSuffix(logicalName, "-"+shortID+".log"):
+			matchID = shortID
+		default:
 			continue
 		}
-		candidates = append(candidates, entry)
-	}
-	// Preserve the legacy preference for a plain local log when both exist.
-	sort.SliceStable(candidates, func(i, j int) bool {
-		return !strings.HasSuffix(candidates[i].Name(), ".gz") && strings.HasSuffix(candidates[j].Name(), ".gz")
-	})
-	for _, entry := range candidates {
 		info, err := entry.Info()
 		if os.IsNotExist(err) {
 			continue
@@ -64,24 +65,70 @@ func openRequestLogIn(dir, requestID, exactName string) (*os.File, string, error
 		if !info.Mode().IsRegular() {
 			continue
 		}
-		file, err := os.Open(filepath.Join(dir, entry.Name()))
-		if os.IsNotExist(err) {
-			continue
+		candidate := byName[logicalName]
+		if candidate == nil {
+			candidate = &requestLogCandidate{name: logicalName, requestID: matchID, metadata: parseLogMetadata(logicalName, matchID)}
+			byName[logicalName] = candidate
 		}
-		if err != nil {
-			return nil, "", err
+		if name == logicalName {
+			candidate.plain = info
+		} else {
+			candidate.compressed = info
 		}
-		opened, err := file.Stat()
-		if err != nil || !opened.Mode().IsRegular() || !os.SameFile(info, opened) {
-			_ = file.Close()
+	}
+	candidates := make([]*requestLogCandidate, 0, len(byName))
+	for _, candidate := range byName {
+		candidates = append(candidates, candidate)
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		left, right := candidates[i], candidates[j]
+		if left.requestID != right.requestID {
+			// Legacy logs may contain the complete ID, which identifies the request
+			// more precisely than a matching shortened suffix.
+			return left.requestID == requestID
+		}
+		return logFileIsNewer(left.name, left.preferred().ModTime(), left.metadata, right.name, right.preferred().ModTime(), right.metadata)
+	})
+	for _, candidate := range candidates {
+		// Plain and compressed copies of the same log can briefly coexist.
+		for _, info := range []os.FileInfo{candidate.plain, candidate.compressed} {
+			if info == nil {
+				continue
+			}
+			file, err := os.Open(filepath.Join(dir, info.Name()))
+			if os.IsNotExist(err) {
+				continue
+			}
 			if err != nil {
 				return nil, "", err
 			}
-			continue
+			opened, err := file.Stat()
+			if err != nil || !opened.Mode().IsRegular() || !os.SameFile(info, opened) {
+				_ = file.Close()
+				if err != nil {
+					return nil, "", err
+				}
+				continue
+			}
+			return file, info.Name(), nil
 		}
-		return file, entry.Name(), nil
 	}
 	return nil, "", errRequestLogMissing
+}
+
+type requestLogCandidate struct {
+	name       string
+	requestID  string
+	metadata   logFileMeta
+	plain      os.FileInfo
+	compressed os.FileInfo
+}
+
+func (c *requestLogCandidate) preferred() os.FileInfo {
+	if c.plain != nil {
+		return c.plain
+	}
+	return c.compressed
 }
 
 // openRequestLog holds the selected FD across migration. Local ENOENT falls

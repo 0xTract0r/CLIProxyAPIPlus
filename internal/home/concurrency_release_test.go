@@ -3,16 +3,17 @@ package home
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
-	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executionregistry"
+	"github.com/MoeForge/moego/json"
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executionregistry"
 )
 
 func concurrencyReleaseFrameFromFixture(t *testing.T) ConcurrencyReleaseFrame {
@@ -95,6 +96,56 @@ func (s *recordingReleaseSender) WaitForSequence(sequence int64, timeout time.Du
 		case <-timer.C:
 			return false
 		case <-s.sent:
+		}
+	}
+}
+
+func TestReleaseFlusherIdleFlushDoesNotAllocate(t *testing.T) {
+	flusher := newReleaseFlusher(time.Hour, time.Hour, func(context.Context, ConcurrencyReleaseFrame) error {
+		return nil
+	})
+	// Simulate a long-lived pool: every credential/model pair has been acked and
+	// remains in the state map. An idle flush must not walk (or allocate for) it.
+	for i := 0; i < 1000; i++ {
+		group := executionregistry.ReleaseGroup{CredentialID: fmt.Sprintf("cred-%d", i), Model: "gpt"}
+		flusher.groups[group] = releaseState{Latest: 1, Acked: 1}
+	}
+
+	var failed bool
+	allocs := testing.AllocsPerRun(100, func() {
+		failed = flusher.flush(context.Background())
+	})
+	if failed {
+		t.Fatal("idle flush reported a failure")
+	}
+	if allocs != 0 {
+		t.Fatalf("idle flush allocated %.1f objects, want 0", allocs)
+	}
+}
+
+func TestReleaseFlusherClearsPendingAfterAck(t *testing.T) {
+	sender := &recordingReleaseSender{sent: make(chan struct{}, 4)}
+	flusher := newReleaseFlusher(time.Millisecond, 10*time.Millisecond, sender.Send)
+	group := executionregistry.ReleaseGroup{CredentialID: "cred-1", Model: "gpt"}
+	flusher.MarkDirty(group, 1)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go flusher.Run(ctx)
+
+	if !sender.WaitForSequence(1, time.Second) {
+		t.Fatal("release sequence 1 was not acknowledged")
+	}
+
+	deadline := time.NewTimer(time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for !flusher.idle() {
+		select {
+		case <-ticker.C:
+		case <-deadline.C:
+			t.Fatal("pending release was not cleared after acknowledgement")
 		}
 	}
 }
@@ -472,5 +523,34 @@ func TestScopeEndBlocksDrainUntilReleaseSinkFlushesFinalSequence(t *testing.T) {
 	}
 	if got := sender.LastSequence(); got != 1 {
 		t.Fatalf("final flushed sequence = %d, want 1", got)
+	}
+}
+
+func TestReleaseFlusherSenderReplacementPreservesTicket(t *testing.T) {
+	flusher := newReleaseFlusher(time.Hour, time.Hour, func(context.Context, ConcurrencyReleaseFrame) error {
+		return errors.New("old Home unavailable")
+	})
+	group := executionregistry.ReleaseGroup{CredentialID: "cred-1", Model: "gpt"}
+	ticket := flusher.MarkDirty(group, 1)
+	if ticket == nil {
+		t.Fatal("MarkDirty() ticket = nil")
+	}
+	if failed := flusher.flush(context.Background()); !failed {
+		t.Fatal("old sender release attempt did not fail")
+	}
+
+	flusher.SetSender(func(_ context.Context, frame ConcurrencyReleaseFrame) error {
+		if frame.CredentialID != group.CredentialID || frame.Model != group.Model || frame.ReleaseSeq != 1 {
+			t.Fatalf("replacement sender frame = %#v", frame)
+		}
+		return nil
+	})
+	if failed := flusher.flush(context.Background()); failed {
+		t.Fatal("replacement sender release attempt failed")
+	}
+	waitCtx, cancelWait := context.WithTimeout(context.Background(), time.Second)
+	defer cancelWait()
+	if errWait := ticket.Wait(waitCtx); errWait != nil {
+		t.Fatalf("ticket did not survive sender replacement: %v", errWait)
 	}
 }

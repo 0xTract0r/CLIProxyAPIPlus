@@ -5,24 +5,19 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 )
 
 type upstreamRequestLog = helps.UpstreamRequestLog
-type sensitiveWordMatcher = helps.SensitiveWordMatcher
 type tokenizerWrapper = helps.TokenizerWrapper
 
 func newProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, timeout time.Duration) *http.Client {
 	return helps.NewProxyAwareHTTPClient(ctx, cfg, auth, timeout)
-}
-
-func withRuntimeTransportHostFromRequest(ctx context.Context, req *http.Request) context.Context {
-	return helps.WithRuntimeTransportHostFromRequest(ctx, req)
 }
 
 func payloadRequestedModel(opts cliproxyexecutor.Options, fallback string) string {
@@ -59,22 +54,6 @@ func logWithRequestID(ctx context.Context) *log.Entry {
 
 func jsonPayload(line []byte) []byte {
 	return helps.JSONPayload(line)
-}
-
-func isClaudeCodeClient(userAgent string) bool {
-	return helps.IsClaudeCodeClient(userAgent)
-}
-
-func shouldCloak(cloakMode string, userAgent string) bool {
-	return helps.ShouldCloak(cloakMode, userAgent)
-}
-
-func buildSensitiveWordMatcher(words []string) *sensitiveWordMatcher {
-	return helps.BuildSensitiveWordMatcher(words)
-}
-
-func obfuscateSensitiveWords(payload []byte, matcher *sensitiveWordMatcher) []byte {
-	return helps.ObfuscateSensitiveWords(payload, matcher)
 }
 
 func getTokenizer(model string) (*tokenizerWrapper, error) {

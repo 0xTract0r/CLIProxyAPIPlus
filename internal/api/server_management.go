@@ -7,7 +7,7 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/managementasset"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/managementasset"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -21,6 +21,7 @@ func (s *Server) registerManagementRoutes() {
 
 	log.Info("management routes registered after secret key configuration")
 
+	s.registerManagementV8Routes()
 	s.engine.POST("/v0/management/oauth-callback", s.managementAvailabilityMiddleware(), s.mgmt.PostOAuthCallback)
 	s.engine.GET("/v0/management/oauth-callback", s.managementAvailabilityMiddleware(), s.mgmt.GetOAuthCallback)
 
@@ -28,6 +29,7 @@ func (s *Server) registerManagementRoutes() {
 	mgmt.Use(s.managementAvailabilityMiddleware(), s.mgmt.Middleware())
 	{
 		mgmt.GET("/config", s.mgmt.GetConfig)
+		mgmt.POST("/diagnostics/proxy-connectivity-probe", s.mgmt.RunProxyConnectivityProbe)
 		mgmt.GET("/config.yaml", s.mgmt.GetConfigYAML)
 		mgmt.PUT("/config.yaml", s.mgmt.PutConfigYAML)
 		mgmt.GET("/latest-version", s.mgmt.GetLatestVersion)
@@ -39,6 +41,10 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/plugins/:id/config", s.mgmt.GetPluginConfig)
 		mgmt.PUT("/plugins/:id/config", s.mgmt.PutPluginConfig)
 		mgmt.PATCH("/plugins/:id/config", s.mgmt.PatchPluginConfig)
+		mgmt.GET("/plugins/:id/quota", s.mgmt.GetPluginQuota)
+		mgmt.POST("/plugins/:id/quota", s.mgmt.FetchPluginQuota)
+		mgmt.DELETE("/plugins/:id/quota", s.mgmt.ResetPluginQuota)
+		mgmt.POST("/plugins/:id/quota/reset", s.mgmt.ResetPluginQuota)
 
 		mgmt.GET("/debug", s.mgmt.GetDebug)
 		mgmt.PUT("/debug", s.mgmt.PutDebug)
@@ -52,11 +58,9 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PUT("/logs-max-total-size-mb", s.mgmt.PutLogsMaxTotalSizeMB)
 		mgmt.PATCH("/logs-max-total-size-mb", s.mgmt.PutLogsMaxTotalSizeMB)
 
-		// fork-only: log retention (compress/delete after N days) routes.
 		mgmt.GET("/logs-compress-after-days", s.mgmt.GetLogsCompressAfterDays)
 		mgmt.PUT("/logs-compress-after-days", s.mgmt.PutLogsCompressAfterDays)
 		mgmt.PATCH("/logs-compress-after-days", s.mgmt.PutLogsCompressAfterDays)
-
 		mgmt.GET("/logs-delete-after-days", s.mgmt.GetLogsDeleteAfterDays)
 		mgmt.PUT("/logs-delete-after-days", s.mgmt.PutLogsDeleteAfterDays)
 		mgmt.PATCH("/logs-delete-after-days", s.mgmt.PutLogsDeleteAfterDays)
@@ -76,15 +80,6 @@ func (s *Server) registerManagementRoutes() {
 
 		mgmt.POST("/api-call", s.mgmt.APICall)
 
-		// fork-only: usage statistics + pricing management routes.
-		mgmt.GET("/usage", s.mgmt.GetUsageStatistics)
-		mgmt.GET("/usage/export", s.mgmt.ExportUsageStatistics)
-		mgmt.POST("/usage/import", s.mgmt.ImportUsageStatistics)
-		mgmt.GET("/usage/pricing", s.mgmt.GetUsagePricing)
-		mgmt.POST("/usage/pricing/refresh", s.mgmt.RefreshUsagePricing)
-		mgmt.PUT("/usage/pricing/overrides/:model", s.mgmt.PutUsagePricingOverride)
-		mgmt.DELETE("/usage/pricing/overrides/:model", s.mgmt.DeleteUsagePricingOverride)
-
 		mgmt.GET("/quota-exceeded/switch-project", s.mgmt.GetSwitchProject)
 		mgmt.PUT("/quota-exceeded/switch-project", s.mgmt.PutSwitchProject)
 		mgmt.PATCH("/quota-exceeded/switch-project", s.mgmt.PutSwitchProject)
@@ -94,14 +89,24 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PATCH("/quota-exceeded/switch-preview-model", s.mgmt.PutSwitchPreviewModel)
 		mgmt.POST("/reset-quota", s.mgmt.ResetQuota)
 
-		// fork-only: quota snapshot cache routes.
-		mgmt.GET("/quota/snapshots", s.mgmt.GetQuotaSnapshots)
-		mgmt.POST("/quota/refresh", s.mgmt.RefreshQuotaSnapshots)
+		mgmt.GET("/quota/providers", s.mgmt.GetQuotaProviders)
+		mgmt.POST("/quota/fetch", s.mgmt.FetchCredentialQuota)
+		mgmt.POST("/quota/reset", s.mgmt.ResetCredentialQuota)
 
 		mgmt.GET("/api-keys", s.mgmt.GetAPIKeys)
 		mgmt.PUT("/api-keys", s.mgmt.PutAPIKeys)
 		mgmt.PATCH("/api-keys", s.mgmt.PatchAPIKeys)
 		mgmt.DELETE("/api-keys", s.mgmt.DeleteAPIKeys)
+		mgmt.GET("/quota/snapshots", s.mgmt.GetStoredQuotaSnapshots)
+
+		mgmt.GET("/usage", s.mgmt.GetUsageStatistics)
+		mgmt.GET("/usage/export", s.mgmt.ExportUsageStatistics)
+		mgmt.POST("/usage/import", s.mgmt.ImportUsageStatistics)
+		mgmt.GET("/usage/pricing", s.mgmt.GetUsagePricing)
+		mgmt.POST("/usage/pricing/refresh", s.mgmt.RefreshUsagePricing)
+		mgmt.PUT("/usage/pricing/overrides/:model", s.mgmt.PutUsagePricingOverride)
+		mgmt.DELETE("/usage/pricing/overrides/:model", s.mgmt.DeleteUsagePricingOverride)
+
 		mgmt.GET("/api-key-usage", s.mgmt.GetAPIKeyUsage)
 		mgmt.GET("/usage-queue", s.mgmt.GetUsageQueue)
 
@@ -127,7 +132,54 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PUT("/ws-auth", s.mgmt.PutWebsocketAuth)
 		mgmt.PATCH("/ws-auth", s.mgmt.PutWebsocketAuth)
 
-		// fork-only: Amp CLI integration management routes.
+		mgmt.GET("/request-retry", s.mgmt.GetRequestRetry)
+		mgmt.PUT("/request-retry", s.mgmt.PutRequestRetry)
+		mgmt.PATCH("/request-retry", s.mgmt.PutRequestRetry)
+		mgmt.GET("/max-retry-credentials", s.mgmt.GetMaxRetryCredentials)
+		mgmt.PUT("/max-retry-credentials", s.mgmt.PutMaxRetryCredentials)
+		mgmt.PATCH("/max-retry-credentials", s.mgmt.PutMaxRetryCredentials)
+		mgmt.GET("/max-retry-interval", s.mgmt.GetMaxRetryInterval)
+		mgmt.PUT("/max-retry-interval", s.mgmt.PutMaxRetryInterval)
+		mgmt.PATCH("/max-retry-interval", s.mgmt.PutMaxRetryInterval)
+
+		mgmt.GET("/force-model-prefix", s.mgmt.GetForceModelPrefix)
+		mgmt.PUT("/force-model-prefix", s.mgmt.PutForceModelPrefix)
+		mgmt.PATCH("/force-model-prefix", s.mgmt.PutForceModelPrefix)
+
+		mgmt.GET("/routing/strategy", s.mgmt.GetRoutingStrategy)
+		mgmt.PUT("/routing/strategy", s.mgmt.PutRoutingStrategy)
+		mgmt.PATCH("/routing/strategy", s.mgmt.PutRoutingStrategy)
+
+		mgmt.GET("/claude-api-key", s.mgmt.GetClaudeKeys)
+		mgmt.PUT("/claude-api-key", s.mgmt.PutClaudeKeys)
+		mgmt.PATCH("/claude-api-key", s.mgmt.PatchClaudeKey)
+		mgmt.DELETE("/claude-api-key", s.mgmt.DeleteClaudeKey)
+
+		mgmt.GET("/codex-api-key", s.mgmt.GetCodexKeys)
+		mgmt.PUT("/codex-api-key", s.mgmt.PutCodexKeys)
+		mgmt.PATCH("/codex-api-key", s.mgmt.PatchCodexKey)
+		mgmt.DELETE("/codex-api-key", s.mgmt.DeleteCodexKey)
+
+		mgmt.GET("/xai-api-key", s.mgmt.GetXAIKeys)
+		mgmt.PUT("/xai-api-key", s.mgmt.PutXAIKeys)
+		mgmt.PATCH("/xai-api-key", s.mgmt.PatchXAIKey)
+		mgmt.DELETE("/xai-api-key", s.mgmt.DeleteXAIKey)
+
+		mgmt.GET("/meta-api-key", s.mgmt.GetMetaKeys)
+		mgmt.PUT("/meta-api-key", s.mgmt.PutMetaKeys)
+		mgmt.PATCH("/meta-api-key", s.mgmt.PatchMetaKey)
+		mgmt.DELETE("/meta-api-key", s.mgmt.DeleteMetaKey)
+
+		mgmt.GET("/openai-compatibility", s.mgmt.GetOpenAICompat)
+		mgmt.PUT("/openai-compatibility", s.mgmt.PutOpenAICompat)
+		mgmt.PATCH("/openai-compatibility", s.mgmt.PatchOpenAICompat)
+		mgmt.DELETE("/openai-compatibility", s.mgmt.DeleteOpenAICompat)
+
+		mgmt.GET("/vertex-api-key", s.mgmt.GetVertexCompatKeys)
+		mgmt.PUT("/vertex-api-key", s.mgmt.PutVertexCompatKeys)
+		mgmt.PATCH("/vertex-api-key", s.mgmt.PatchVertexCompatKey)
+		mgmt.DELETE("/vertex-api-key", s.mgmt.DeleteVertexCompatKey)
+
 		mgmt.GET("/ampcode", s.mgmt.GetAmpCode)
 		mgmt.GET("/ampcode/upstream-url", s.mgmt.GetAmpUpstreamURL)
 		mgmt.PUT("/ampcode/upstream-url", s.mgmt.PutAmpUpstreamURL)
@@ -152,50 +204,6 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PATCH("/ampcode/upstream-api-keys", s.mgmt.PatchAmpUpstreamAPIKeys)
 		mgmt.DELETE("/ampcode/upstream-api-keys", s.mgmt.DeleteAmpUpstreamAPIKeys)
 
-		mgmt.GET("/request-retry", s.mgmt.GetRequestRetry)
-		mgmt.PUT("/request-retry", s.mgmt.PutRequestRetry)
-		mgmt.PATCH("/request-retry", s.mgmt.PutRequestRetry)
-		mgmt.GET("/max-retry-interval", s.mgmt.GetMaxRetryInterval)
-		mgmt.PUT("/max-retry-interval", s.mgmt.PutMaxRetryInterval)
-		mgmt.PATCH("/max-retry-interval", s.mgmt.PutMaxRetryInterval)
-
-		mgmt.GET("/force-model-prefix", s.mgmt.GetForceModelPrefix)
-		mgmt.PUT("/force-model-prefix", s.mgmt.PutForceModelPrefix)
-		mgmt.PATCH("/force-model-prefix", s.mgmt.PutForceModelPrefix)
-
-		mgmt.GET("/farm-auto-enroll", s.mgmt.GetFarmAutoEnroll)
-		mgmt.PUT("/farm-auto-enroll", s.mgmt.PutFarmAutoEnroll)
-		mgmt.PATCH("/farm-auto-enroll", s.mgmt.PutFarmAutoEnroll)
-
-		mgmt.GET("/routing/strategy", s.mgmt.GetRoutingStrategy)
-		mgmt.PUT("/routing/strategy", s.mgmt.PutRoutingStrategy)
-		mgmt.PATCH("/routing/strategy", s.mgmt.PutRoutingStrategy)
-
-		mgmt.GET("/claude-api-key", s.mgmt.GetClaudeKeys)
-		mgmt.PUT("/claude-api-key", s.mgmt.PutClaudeKeys)
-		mgmt.PATCH("/claude-api-key", s.mgmt.PatchClaudeKey)
-		mgmt.DELETE("/claude-api-key", s.mgmt.DeleteClaudeKey)
-
-		mgmt.GET("/codex-api-key", s.mgmt.GetCodexKeys)
-		mgmt.PUT("/codex-api-key", s.mgmt.PutCodexKeys)
-		mgmt.PATCH("/codex-api-key", s.mgmt.PatchCodexKey)
-		mgmt.DELETE("/codex-api-key", s.mgmt.DeleteCodexKey)
-
-		mgmt.GET("/xai-api-key", s.mgmt.GetXAIKeys)
-		mgmt.PUT("/xai-api-key", s.mgmt.PutXAIKeys)
-		mgmt.PATCH("/xai-api-key", s.mgmt.PatchXAIKey)
-		mgmt.DELETE("/xai-api-key", s.mgmt.DeleteXAIKey)
-
-		mgmt.GET("/openai-compatibility", s.mgmt.GetOpenAICompat)
-		mgmt.PUT("/openai-compatibility", s.mgmt.PutOpenAICompat)
-		mgmt.PATCH("/openai-compatibility", s.mgmt.PatchOpenAICompat)
-		mgmt.DELETE("/openai-compatibility", s.mgmt.DeleteOpenAICompat)
-
-		mgmt.GET("/vertex-api-key", s.mgmt.GetVertexCompatKeys)
-		mgmt.PUT("/vertex-api-key", s.mgmt.PutVertexCompatKeys)
-		mgmt.PATCH("/vertex-api-key", s.mgmt.PatchVertexCompatKey)
-		mgmt.DELETE("/vertex-api-key", s.mgmt.DeleteVertexCompatKey)
-
 		mgmt.GET("/oauth-excluded-models", s.mgmt.GetOAuthExcludedModels)
 		mgmt.PUT("/oauth-excluded-models", s.mgmt.PutOAuthExcludedModels)
 		mgmt.PATCH("/oauth-excluded-models", s.mgmt.PatchOAuthExcludedModels)
@@ -206,8 +214,14 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PATCH("/oauth-model-alias", s.mgmt.PatchOAuthModelAlias)
 		mgmt.DELETE("/oauth-model-alias", s.mgmt.DeleteOAuthModelAlias)
 
+		mgmt.GET("/oauth-request-scoped-errors", s.mgmt.GetOAuthRequestScopedErrors)
+		mgmt.PUT("/oauth-request-scoped-errors", s.mgmt.PutOAuthRequestScopedErrors)
+		mgmt.PATCH("/oauth-request-scoped-errors", s.mgmt.PatchOAuthRequestScopedErrors)
+		mgmt.DELETE("/oauth-request-scoped-errors", s.mgmt.DeleteOAuthRequestScopedErrors)
+
+		mgmt.GET("/oauth-reauth-history", s.mgmt.ListOAuthReauthHistory)
+		mgmt.GET("/auth-status-history", s.mgmt.ListAuthStatusHistory)
 		mgmt.GET("/auth-files", s.mgmt.ListAuthFiles)
-		mgmt.GET("/auth-files/warmup-pacing", s.mgmt.GetAuthFileWarmupPacing)
 		mgmt.GET("/auth-files/models", s.mgmt.GetAuthFileModels)
 		mgmt.GET("/model-definitions/:channel", s.mgmt.GetStaticModelDefinitions)
 		mgmt.GET("/auth-files/download", s.mgmt.DownloadAuthFile)
@@ -215,31 +229,25 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.DELETE("/auth-files", s.mgmt.DeleteAuthFile)
 		mgmt.PATCH("/auth-files/status", s.mgmt.PatchAuthFileStatus)
 		mgmt.PATCH("/auth-files/fields", s.mgmt.PatchAuthFileFields)
-		// fork-only: auth-file status/account-settings, reauth history, and TLS probe routes.
-		mgmt.POST("/auth-files/refresh-status", s.mgmt.RefreshAuthFileStatus)
-		mgmt.POST("/auth-files/test-message", s.mgmt.TestAuthFileMessage)
-		mgmt.GET("/auth-files/account-settings", s.mgmt.GetAuthFileAccountSettings)
-		mgmt.PATCH("/auth-files/account-settings", s.mgmt.PatchAuthFileAccountSettings)
+		mgmt.GET("/auth-files/account-settings", s.mgmt.GetOrdinaryAuthFileAccountSettings)
+		mgmt.PATCH("/auth-files/account-settings", s.mgmt.PatchOrdinaryAuthFileAccountSettings)
 		mgmt.PATCH("/auth-files/account-scheduling", s.mgmt.PatchAuthFileAccountScheduling)
 		mgmt.POST("/auth-files/account-scheduling/preview", s.mgmt.PreviewAuthFileAccountScheduling)
-		mgmt.GET("/oauth-reauth-history", s.mgmt.ListOAuthReauthHistory)
-		mgmt.GET("/auth-status-history", s.mgmt.ListAuthStatusHistory)
-		mgmt.POST("/diagnostics/provider-tls-probe", s.mgmt.RunProviderTLSProbe)
-		mgmt.POST("/diagnostics/proxy-connectivity-probe", s.mgmt.RunProxyConnectivityProbe)
+		mgmt.POST("/auth-files/refresh", s.mgmt.RefreshAuthFiles)
 		mgmt.POST("/vertex/import", s.mgmt.ImportVertexCredential)
 
 		mgmt.GET("/anthropic-auth-url", s.mgmt.RequestAnthropicToken)
-		mgmt.GET("/codex-auth-url", s.mgmt.RequestCodexToken)
+		mgmt.GET("/codex-auth-url", s.mgmt.RequestCodexTokenV0)
 		mgmt.GET("/antigravity-auth-url", s.mgmt.RequestAntigravityToken)
-		// fork-only: additional OAuth provider auth-url routes.
+		mgmt.GET("/kimi-auth-url", s.mgmt.RequestKimiToken)
+		mgmt.GET("/kimi-ai-auth-url", s.mgmt.RequestKimiAIToken)
+		mgmt.GET("/xai-auth-url", s.mgmt.RequestXAIToken)
+		mgmt.GET("/devin-auth-url", s.mgmt.RequestDevinToken)
+		mgmt.GET("/meta-auth-url", s.mgmt.RequestMetaToken)
+		mgmt.GET("/github-auth-url", s.mgmt.RequestCopilotDeviceOAuth)
 		mgmt.GET("/gitlab-auth-url", s.mgmt.RequestGitLabToken)
 		mgmt.POST("/gitlab-auth-url", s.mgmt.RequestGitLabPATToken)
-		mgmt.GET("/gemini-cli-auth-url", s.mgmt.RequestGeminiCLIToken)
 		mgmt.GET("/kilo-auth-url", s.mgmt.RequestKiloToken)
-		mgmt.GET("/kiro-auth-url", s.mgmt.RequestKiroToken)
-		mgmt.GET("/github-auth-url", s.mgmt.RequestGitHubToken)
-		mgmt.GET("/kimi-auth-url", s.mgmt.RequestKimiToken)
-		mgmt.GET("/xai-auth-url", s.mgmt.RequestXAIToken)
 		mgmt.GET("/get-auth-status", s.mgmt.GetAuthStatus)
 		mgmt.DELETE("/oauth-session", s.mgmt.CancelAuthSession)
 	}
@@ -255,11 +263,12 @@ func (s *Server) managementAvailabilityMiddleware() gin.HandlerFunc {
 }
 
 func (s *Server) managementAvailable(c *gin.Context) bool {
-	if s == nil || s.cfg == nil {
+	cfg := s.getConfig()
+	if s == nil || cfg == nil {
 		c.AbortWithStatus(http.StatusNotFound)
 		return false
 	}
-	if s.cfg.Home.Enabled {
+	if cfg.Home.Enabled {
 		c.AbortWithStatus(http.StatusNotFound)
 		return false
 	}
@@ -340,7 +349,8 @@ func (s *Server) pluginResourceNoRoute(c *gin.Context) {
 		}
 		return
 	}
-	if s.cfg == nil || s.cfg.Home.Enabled || s.pluginHost == nil {
+	cfg := s.getConfig()
+	if cfg == nil || cfg.Home.Enabled || s.pluginHost == nil {
 		c.AbortWithStatus(http.StatusNotFound)
 		return
 	}
@@ -352,7 +362,7 @@ func (s *Server) pluginResourceNoRoute(c *gin.Context) {
 }
 
 func (s *Server) serveManagementControlPanel(c *gin.Context) {
-	cfg := s.cfg
+	cfg := s.getConfig()
 	if cfg == nil || cfg.Home.Enabled || cfg.RemoteManagement.DisableControlPanel {
 		c.AbortWithStatus(http.StatusNotFound)
 		return

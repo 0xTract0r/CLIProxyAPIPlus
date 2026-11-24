@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -19,14 +20,14 @@ type oauthCallbackRequest struct {
 }
 
 func (h *Handler) PostOAuthCallback(c *gin.Context) {
-	if h == nil || h.cfg == nil {
+	if h == nil || h.configSnapshot() == nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": "handler not initialized"})
 		return
 	}
 
 	var req oauthCallbackRequest
 	if errBindJSON := c.ShouldBindJSON(&req); errBindJSON != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "invalid body"})
+		c.JSON(clienterror.HTTPStatusFromErrorOr(errBindJSON, http.StatusBadRequest), gin.H{"status": "error", "error": "invalid body"})
 		return
 	}
 	h.handleOAuthCallback(c, req)
@@ -43,7 +44,7 @@ func (h *Handler) GetOAuthCallback(c *gin.Context) {
 }
 
 func (h *Handler) handleOAuthCallback(c *gin.Context, req oauthCallbackRequest) {
-	if h == nil || h.cfg == nil {
+	if h == nil || h.configSnapshot() == nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": "handler not initialized"})
 		return
 	}
@@ -86,7 +87,8 @@ func (h *Handler) handleOAuthCallback(c *gin.Context, req oauthCallbackRequest) 
 		return
 	}
 
-	sessionProvider, sessionStatus, isPlugin, _, completed, ok := GetOAuthSessionDetails(state)
+	session, ok, _ := oauthSessions.pollScoped(state, h.oauthFileScope())
+	sessionProvider, sessionStatus, isPlugin, completed := session.Provider, session.Status, session.Source == oauthSessionSourcePlugin, session.Completed
 	if !ok {
 		c.JSON(http.StatusNotFound, gin.H{"status": "error", "error": "unknown or expired state"})
 		return
@@ -119,9 +121,10 @@ func (h *Handler) handleOAuthCallback(c *gin.Context, req oauthCallbackRequest) 
 		return
 	}
 
-	if _, errWrite := WriteOAuthCallbackFileForPendingSession(h.cfg.AuthDir, canonicalProvider, state, code, errMsg); errWrite != nil {
+	if _, errWrite := h.WriteFileOAuthCallback(canonicalProvider, state, code, errMsg); errWrite != nil {
 		if errors.Is(errWrite, errOAuthSessionNotPending) {
-			_, status, okSession := GetOAuthSession(state)
+			current, okSession, _ := oauthSessions.pollScoped(state, h.oauthFileScope())
+			status := current.Status
 			if okSession && status != "" {
 				c.JSON(http.StatusConflict, gin.H{"status": "error", "error": status})
 				return

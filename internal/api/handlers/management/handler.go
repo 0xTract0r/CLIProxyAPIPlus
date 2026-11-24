@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"fmt"
+	"maps"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -14,15 +15,14 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/buildinfo"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginstore"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/usage"
-	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/buildinfo"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginhost"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginstore"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/usage"
+	sdkAuth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
-	"golang.org/x/crypto/bcrypt"
 )
 
 type attemptInfo struct {
@@ -39,16 +39,20 @@ const attemptMaxIdleTime = 2 * time.Hour
 
 // Handler aggregates config reference, persistence path and helpers.
 type Handler struct {
+	copilotDeviceGrant      *copilotDeviceGrant
+	fileOAuthGeneration     uint64
+	usageStats              *usage.RequestStatistics
+	usageHistoryUnavailable bool
 	cfg                     *config.Config
 	configFilePath          string
 	mu                      sync.Mutex
+	authStatusMu            sync.Mutex
 	reloadMu                sync.Mutex
 	reloadGeneration        uint64
 	appliedReloadGeneration uint64
 	attemptsMu              sync.Mutex
 	failedAttempts          map[string]*attemptInfo // keyed by client IP
 	authManager             *coreauth.Manager
-	usageStats              *usage.RequestStatistics
 	tokenStore              coreauth.Store
 	localPassword           string
 	allowRemoteOverride     bool
@@ -61,17 +65,13 @@ type Handler struct {
 	configReloadHook        func(context.Context, *config.Config)
 	pluginStoreRegistryURL  string
 	pluginStoreHTTPClient   pluginstore.HTTPDoer
-	pluginReleaseCacheMu    sync.Mutex
-	pluginReleaseCache      map[string]pluginReleaseCacheEntry
-	managedHeaderScheduler  *managedHeaderSyncScheduler
-	quotaRefreshCancel      context.CancelFunc
-	farmLivenessProbeCancel context.CancelFunc
-	// quotaRefreshLogMu / quotaRefreshLogState throttle the background quota
-	// poller's observability logs (see quotaRefreshLogAllowed). The poller ticks
-	// once per second across every account, so an unthrottled log line would
-	// flood the process log.
-	quotaRefreshLogMu    sync.Mutex
-	quotaRefreshLogState map[string]quotaRefreshLogEntry
+	pluginStoreRateLimiter  *pluginstore.GitHubRateLimiter
+	pluginReleases          pluginReleaseCache
+	authCache               managementAuthCache
+	siwcOAuthFactory        func(*config.Config, string) siwcOAuthService
+	siwcCommitMu            sync.Mutex
+	v8AuthUploadMu          sync.Mutex
+	pluginLoginSaveMu       sync.Mutex
 }
 
 type configReloadSnapshot struct {
@@ -88,13 +88,16 @@ func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Man
 		log.Warn("ignoring relative REQUEST_LOG_ARCHIVE_DIR")
 		archiveDir = ""
 	}
+	if archiveDir != "" {
+		archiveDir = filepath.Clean(archiveDir)
+	}
 
 	h := &Handler{
-		cfg:                  cfg,
+		usageStats:           usage.GetRequestStatistics(),
+		cfg:                  cfg.CloneForRuntime(),
 		configFilePath:       configFilePath,
 		failedAttempts:       make(map[string]*attemptInfo),
 		authManager:          manager,
-		usageStats:           usage.GetRequestStatistics(),
 		tokenStore:           sdkAuth.GetTokenStore(),
 		allowRemoteOverride:  envSecret != "",
 		envSecret:            envSecret,
@@ -140,13 +143,91 @@ func NewHandlerWithoutConfigFilePath(cfg *config.Config, manager *coreauth.Manag
 }
 
 // SetConfig updates the in-memory config reference when the server hot-reloads.
+// A config parsed from an older version of the config file is ignored: a later
+// save already changed the file, and the reload for that save publishes it.
 func (h *Handler) SetConfig(cfg *config.Config) {
 	if h == nil {
 		return
 	}
+	cloned := cfg.CloneForRuntime()
 	h.mu.Lock()
-	h.cfg = cfg
-	h.mu.Unlock()
+	defer h.mu.Unlock()
+	if h.isStaleConfigFileSnapshotLocked(cloned) {
+		log.Debug("management: ignoring config reload parsed from an older config file version")
+		return
+	}
+	prevSecretHash := ""
+	if h.cfg != nil {
+		prevSecretHash = h.cfg.RemoteManagement.SecretKey
+	}
+	h.publishFileOAuthConfigLocked(cloned)
+	h.syncIsolatedUsageLocked(cloned)
+	nextSecretHash := ""
+	if cloned != nil {
+		nextSecretHash = cloned.RemoteManagement.SecretKey
+	}
+	if prevSecretHash != nextSecretHash {
+		h.authCache.invalidate()
+	}
+}
+
+// configSnapshot returns an independent copy of h.cfg under h.mu, for code that runs outside the request holding it.
+func (h *Handler) configSnapshot() *config.Config {
+	if h == nil {
+		return nil
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.cfg == nil {
+		return nil
+	}
+	if cloned := h.cfg.CloneForRuntime(); cloned != nil {
+		return cloned
+	}
+	copied := *h.cfg
+	return &copied
+}
+
+// pluginHostSnapshot reads h.pluginHost under h.mu.
+func (h *Handler) pluginHostSnapshot() *pluginhost.Host {
+	if h == nil {
+		return nil
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.pluginHost
+}
+
+// oauthConfigWithProxy returns a configuration snapshot for an OAuth session.
+// When proxyURL is non-empty, it returns a cloned config with ProxyURL overridden
+// without mutating the shared handler configuration.
+func (h *Handler) oauthConfigWithProxy(proxyURL string) *config.Config {
+	cfg := h.configSnapshot()
+	proxyURL = strings.TrimSpace(proxyURL)
+	if proxyURL == "" {
+		return cfg
+	}
+	if cfg == nil {
+		return &config.Config{
+			SDKConfig: config.SDKConfig{ProxyURL: proxyURL},
+		}
+	}
+	cfg.ProxyURL = proxyURL
+	return cfg
+}
+
+// isStaleConfigFileSnapshotLocked reports whether cfg was parsed from config file
+// bytes that are no longer on disk. Management saves hold h.mu, so none can land
+// during the check. Callers must hold h.mu.
+func (h *Handler) isStaleConfigFileSnapshotLocked(cfg *config.Config) bool {
+	if cfg == nil || cfg.SourceHash == "" || h.configFilePath == "" {
+		return false
+	}
+	data, errRead := config.ReadConfigFile(h.configFilePath)
+	if errRead != nil {
+		return false
+	}
+	return config.ComputeSourceHash(data) != cfg.SourceHash
 }
 
 // SetAuthManager updates the auth manager reference used by management endpoints.
@@ -155,12 +236,11 @@ func (h *Handler) SetAuthManager(manager *coreauth.Manager) {
 		return
 	}
 	h.mu.Lock()
-	h.authManager = manager
+	if h.authManager != manager {
+		h.authManager = manager
+	}
 	h.mu.Unlock()
 }
-
-// SetUsageStatistics allows replacing the usage statistics reference.
-func (h *Handler) SetUsageStatistics(stats *usage.RequestStatistics) { h.usageStats = stats }
 
 // SetPluginHost updates the plugin host used by plugin-backed management endpoints.
 func (h *Handler) SetPluginHost(host *pluginhost.Host) {
@@ -168,7 +248,9 @@ func (h *Handler) SetPluginHost(host *pluginhost.Host) {
 		return
 	}
 	h.mu.Lock()
-	h.pluginHost = host
+	if h.pluginHost != host {
+		h.pluginHost = host
+	}
 	h.mu.Unlock()
 }
 
@@ -188,6 +270,7 @@ func (h *Handler) reloadSnapshotConfigLocked() configReloadSnapshot {
 	if h == nil || h.cfg == nil {
 		return configReloadSnapshot{}
 	}
+	h.syncIsolatedUsageLocked(h.cfg)
 	h.reloadGeneration++
 	return configReloadSnapshot{
 		cfg:        h.cfg.CloneForRuntime(),
@@ -198,7 +281,7 @@ func (h *Handler) reloadSnapshotConfigLocked() configReloadSnapshot {
 // saveConfigAndSnapshotLocked saves h.cfg and returns a full runtime config snapshot.
 // Callers must hold h.mu.
 func (h *Handler) saveConfigAndSnapshotLocked(c *gin.Context) (configReloadSnapshot, bool) {
-	if errSave := config.SaveConfigPreserveComments(h.configFilePath, h.cfg); errSave != nil {
+	if errSave := config.SaveConfigPreserveComments(h.configFilePath, h.cfg, c.GetBool(ConfigV8ContextKey)); errSave != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to save config: %v", errSave)})
 		return configReloadSnapshot{}, false
 	}
@@ -256,7 +339,11 @@ func (h *Handler) reloadConfigAfterManagementSaveAsync(ctx context.Context, snap
 }
 
 // SetLocalPassword configures the runtime-local password accepted for localhost requests.
-func (h *Handler) SetLocalPassword(password string) { h.localPassword = password }
+func (h *Handler) SetLocalPassword(password string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.localPassword = password
+}
 
 // SetLogDirectory updates the directory where main.log should be looked up.
 func (h *Handler) SetLogDirectory(dir string) {
@@ -308,37 +395,60 @@ func (h *Handler) Middleware() gin.HandlerFunc {
 			provided = c.GetHeader("X-Management-Key")
 		}
 
-		allowed, statusCode, errMsg := h.AuthenticateManagementKey(clientIP, localClient, provided)
+		snapshot := h.managementAuthSnapshot()
+		allowed, statusCode, errMsg := h.authenticateManagementKey(snapshot, clientIP, localClient, provided)
 		if !allowed {
 			c.AbortWithStatusJSON(statusCode, gin.H{"error": errMsg})
 			return
 		}
+		if c.Request.Method != http.MethodOptions {
+			setHeader := func(id string) { c.Header(ServerIDHeader, id) }
+			setHeader(snapshot.serverID)
+			c.Set(managementIdentityKey, managementIdentity{id: snapshot.serverID, setHeader: setHeader})
+		}
 		c.Next()
+	}
+}
+
+type managementAuthConfig struct {
+	allowRemote   bool
+	secretHash    string
+	serverID      string
+	localPassword string
+}
+
+func (h *Handler) managementAuthSnapshot() managementAuthConfig {
+	if h == nil {
+		return managementAuthConfig{}
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.cfg == nil {
+		return managementAuthConfig{localPassword: h.localPassword}
+	}
+	return managementAuthConfig{
+		allowRemote:   h.cfg.RemoteManagement.AllowRemote,
+		secretHash:    h.cfg.RemoteManagement.SecretKey,
+		serverID:      h.cfg.ServerID,
+		localPassword: h.localPassword,
 	}
 }
 
 // AuthenticateManagementKey verifies the provided management key for the given client.
 // It mirrors the behaviour of Middleware() so non-HTTP callers can reuse the same logic.
 func (h *Handler) AuthenticateManagementKey(clientIP string, localClient bool, provided string) (bool, int, string) {
+	return h.authenticateManagementKey(h.managementAuthSnapshot(), clientIP, localClient, provided)
+}
+
+func (h *Handler) authenticateManagementKey(cfg managementAuthConfig, clientIP string, localClient bool, provided string) (bool, int, string) {
 	const maxFailures = 5
 	const banDuration = 30 * time.Minute
 
 	if h == nil {
 		return false, http.StatusForbidden, "remote management disabled"
 	}
-
-	cfg := h.cfg
-	var (
-		allowRemote bool
-		secretHash  string
-	)
-	if cfg != nil {
-		allowRemote = cfg.RemoteManagement.AllowRemote
-		secretHash = cfg.RemoteManagement.SecretKey
-	}
-	if h.allowRemoteOverride {
-		allowRemote = true
-	}
+	allowRemote := cfg.allowRemote || h.allowRemoteOverride
+	secretHash := cfg.secretHash
 	envSecret := h.envSecret
 
 	now := time.Now()
@@ -395,7 +505,7 @@ func (h *Handler) AuthenticateManagementKey(clientIP string, localClient bool, p
 	}
 
 	if localClient {
-		if lp := h.localPassword; lp != "" {
+		if lp := cfg.localPassword; lp != "" {
 			if subtle.ConstantTimeCompare([]byte(provided), []byte(lp)) == 1 {
 				reset()
 				return true, 0, ""
@@ -408,7 +518,7 @@ func (h *Handler) AuthenticateManagementKey(clientIP string, localClient bool, p
 		return true, 0, ""
 	}
 
-	if secretHash == "" || bcrypt.CompareHashAndPassword([]byte(secretHash), []byte(provided)) != nil {
+	if secretHash == "" || !h.authCache.verify(secretHash, provided) {
 		fail()
 		return false, http.StatusUnauthorized, "invalid management key"
 	}
@@ -418,7 +528,7 @@ func (h *Handler) AuthenticateManagementKey(clientIP string, localClient bool, p
 	return true, 0, ""
 }
 
-// persist saves the current in-memory config to disk.
+// persist retains the fork entry point for callers that do not hold h.mu.
 func (h *Handler) persist(c *gin.Context) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -429,10 +539,31 @@ func (h *Handler) persist(c *gin.Context) bool {
 // It expects the caller to hold h.mu.
 func (h *Handler) persistLocked(c *gin.Context) bool {
 	// Preserve comments when writing
-	if err := config.SaveConfigPreserveComments(h.configFilePath, h.cfg); err != nil {
+	if err := config.SaveConfigPreserveComments(h.configFilePath, h.cfg, c.GetBool(ConfigV8ContextKey)); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to save config: %v", err)})
 		return false
 	}
+	h.finishConfigSaveLocked(c)
+	return true
+}
+
+// persistProviderFieldLocked publishes only the selected field and save metadata.
+// Keep the config pointer stable for scalar readers. The caller holds h.mu.
+func persistProviderFieldLocked[T any](h *Handler, c *gin.Context, candidate *config.Config, live *T, staged T) {
+	sourceHash, err := config.SaveConfigPreserveCommentsWithSourceHash(h.configFilePath, candidate, c.GetBool(ConfigV8ContextKey))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save config"})
+		return
+	}
+	*live = staged
+	h.cfg.SourceHash = sourceHash
+	if !maps.Equal(h.cfg.OAuthOnlyFields, candidate.OAuthOnlyFields) {
+		h.cfg.OAuthOnlyFields = candidate.OAuthOnlyFields
+	}
+	h.finishConfigSaveLocked(c)
+}
+
+func (h *Handler) finishConfigSaveLocked(c *gin.Context) {
 	snapshot := h.reloadSnapshotConfigLocked()
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
 	var reqCtx context.Context
@@ -440,10 +571,10 @@ func (h *Handler) persistLocked(c *gin.Context) bool {
 		reqCtx = c.Request.Context()
 	}
 	h.reloadConfigAfterManagementSaveAsync(reqCtx, snapshot)
-	return true
 }
 
-// Helper methods for simple types
+// Helper methods for simple types. The setter and the save run under h.mu, so a
+// reload publishing h.cfg cannot replace it between the change and the save.
 func (h *Handler) updateBoolField(c *gin.Context, set func(bool)) {
 	var body struct {
 		Value *bool `json:"value"`
@@ -452,8 +583,10 @@ func (h *Handler) updateBoolField(c *gin.Context, set func(bool)) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
 		return
 	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	set(*body.Value)
-	h.persist(c)
+	h.persistLocked(c)
 }
 
 func (h *Handler) updateIntField(c *gin.Context, set func(int)) {
@@ -464,8 +597,10 @@ func (h *Handler) updateIntField(c *gin.Context, set func(int)) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
 		return
 	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	set(*body.Value)
-	h.persist(c)
+	h.persistLocked(c)
 }
 
 func (h *Handler) updateStringField(c *gin.Context, set func(string)) {
@@ -476,6 +611,53 @@ func (h *Handler) updateStringField(c *gin.Context, set func(string)) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
 		return
 	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	set(*body.Value)
-	h.persist(c)
+	h.persistLocked(c)
+}
+
+// SetUsageStatistics overrides the production store before serving management routes.
+func (h *Handler) SetUsageStatistics(stats *usage.RequestStatistics) { h.usageStats = stats }
+
+// UsageStatistics returns the instance-owned store used by the management routes.
+func (h *Handler) UsageStatistics() *usage.RequestStatistics {
+	if h == nil {
+		return nil
+	}
+	return h.usageStats
+}
+
+// UseIsolatedUsageStatistics constructs instance-owned stores before serving.
+func (h *Handler) UseIsolatedUsageStatistics(cfg *config.Config, configFilePath string) {
+	if h == nil {
+		return
+	}
+	catalog := usage.NewPricingCatalogManager()
+	stats := usage.NewRequestStatisticsWithCatalog(catalog)
+	if cfg != nil {
+		stats.SetKnownUsageAPIKeys(cfg.APIKeys)
+	}
+	if strings.TrimSpace(configFilePath) != "" {
+		dir := filepath.Dir(configFilePath)
+		if err := catalog.SetPersistencePath(filepath.Join(dir, ".usage-pricing-catalog.json")); err != nil {
+			log.WithError(err).Warn("usage: pricing catalog could not be restored")
+		}
+		if err := stats.SetPersistencePath(filepath.Join(dir, ".usage-statistics.json")); err != nil {
+			h.usageHistoryUnavailable = true
+			log.WithError(err).Warn("usage: instance history could not be restored")
+		}
+	}
+	h.usageStats = stats
+	h.syncIsolatedUsageLocked(cfg)
+}
+
+func (h *Handler) syncIsolatedUsageLocked(cfg *config.Config) {
+	if h.usageStats == nil || h.usageStats == usage.GetRequestStatistics() {
+		return
+	}
+	if cfg != nil {
+		h.usageStats.SetKnownUsageAPIKeys(cfg.APIKeys)
+	}
+	h.usageStats.SetRecordingEnabled(cfg != nil && cfg.UsageStatisticsEnabled)
 }

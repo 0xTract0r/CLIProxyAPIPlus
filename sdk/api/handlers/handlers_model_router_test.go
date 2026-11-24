@@ -10,12 +10,12 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
-	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
-	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	coreexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	sdkconfig "github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 )
 
 type handlerModelRouterTestHost struct {
@@ -93,6 +93,20 @@ type handlerDirectExecutorRouteHost struct {
 	stream       func(context.Context, string, coreexecutor.Request, coreexecutor.Options) (*coreexecutor.StreamResult, error)
 }
 
+type handlerSkipAwareDirectExecutorRouteHost struct {
+	handlerDirectExecutorRouteHost
+	routeSkip string
+}
+
+func (h *handlerSkipAwareDirectExecutorRouteHost) RouteModelExcept(ctx context.Context, req pluginapi.ModelRouteRequest, skipPluginID string) (pluginapi.ModelRouteResponse, bool) {
+	h.routeSkip = skipPluginID
+	return pluginapi.ModelRouteResponse{}, false
+}
+
+func (h *handlerSkipAwareDirectExecutorRouteHost) HasModelRoutersExcept(string) bool {
+	return h != nil && h.hasRouters
+}
+
 func (h *handlerDirectExecutorRouteHost) ExecutePluginExecutor(ctx context.Context, pluginID string, req coreexecutor.Request, opts coreexecutor.Options) (coreexecutor.Response, error) {
 	h.lastPluginID = pluginID
 	h.lastRequest = req
@@ -124,6 +138,8 @@ type handlerDirectExecutorInterceptorHost struct {
 	handlerDirectExecutorRouteHost
 	afterAuthCalled bool
 	afterAuthReq    pluginapi.RequestInterceptRequest
+	responseCalled  bool
+	responseReq     pluginapi.ResponseInterceptRequest
 }
 
 func (h *handlerDirectExecutorInterceptorHost) HasRequestInterceptors() bool { return true }
@@ -146,6 +162,8 @@ func (h *handlerDirectExecutorInterceptorHost) InterceptRequestAfterAuth(ctx con
 }
 
 func (h *handlerDirectExecutorInterceptorHost) InterceptResponse(ctx context.Context, req pluginapi.ResponseInterceptRequest) pluginapi.ResponseInterceptResponse {
+	h.responseCalled = true
+	h.responseReq = req
 	return pluginapi.ResponseInterceptResponse{Headers: cloneHeader(req.ResponseHeaders), Body: cloneBytes(req.Body)}
 }
 
@@ -496,6 +514,42 @@ func TestPrepareStreamModelRouteReusesDecisionDuringExecution(t *testing.T) {
 	}
 }
 
+func TestExecuteModelStreamDoesNotReusePreparedRouteWhenRouterPluginSkipped(t *testing.T) {
+	const originalModel = "prepared-router-model"
+	const mappedModel = "mapped-upstream-model"
+	const originPluginID = "origin-plugin"
+	host := &handlerSkipAwareDirectExecutorRouteHost{}
+	host.hasRouters = true
+	host.route = func(context.Context, pluginapi.ModelRouteRequest) (pluginapi.ModelRouteResponse, bool) {
+		return pluginapi.ModelRouteResponse{Handled: true, TargetKind: pluginapi.ModelRouteTargetExecutor, Target: originPluginID}, true
+	}
+	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, nil)
+	handler.SetModelRouterHost(host)
+	body := []byte(`{"model":"prepared-router-model","stream":true}`)
+	ctx, routedToPlugin := handler.PrepareStreamModelRoute(context.Background(), "openai-response", originalModel, body)
+	if !routedToPlugin {
+		t.Fatal("PrepareStreamModelRoute() did not detect plugin executor route")
+	}
+
+	_, errMsg := handler.ExecuteModelStream(ctx, ModelExecutionRequest{
+		EntryProtocol:      "openai-response",
+		ExitProtocol:       "openai-response",
+		Model:              mappedModel,
+		Stream:             true,
+		Body:               []byte(`{"model":"mapped-upstream-model","stream":true}`),
+		SkipRouterPluginID: originPluginID,
+	})
+	if host.routeSkip != originPluginID {
+		t.Fatalf("router skip id = %q, want %q", host.routeSkip, originPluginID)
+	}
+	if host.lastPluginID == originPluginID {
+		t.Fatalf("plugin executor %q was re-entered despite SkipRouterPluginID", host.lastPluginID)
+	}
+	if errMsg == nil {
+		t.Fatal("ExecuteModelStream() error = nil, want normal provider resolution failure with empty auth manager")
+	}
+}
+
 func TestExecuteModelPropagatesRouterSkipPluginID(t *testing.T) {
 	model := "model-execution-router-skip-model"
 	requestBody := []byte(fmt.Sprintf(`{"model":%q}`, model))
@@ -588,6 +642,36 @@ func TestHandlerProvidersForExecutionRejectsImageOnlyModelOnProviderRoute(t *tes
 			name:          "target-model",
 			originalModel: "original-model",
 			decision:      modelRouteDecision{Provider: "claude", Model: "gpt-image-2"},
+		},
+		{
+			name:          "target-model-image-2.5",
+			originalModel: "original-model",
+			decision:      modelRouteDecision{Provider: "claude", Model: "gpt-image-2.5"},
+		},
+		{
+			name:          "target-model-image-2.5-flare",
+			originalModel: "original-model",
+			decision:      modelRouteDecision{Provider: "claude", Model: "gpt-image-2.5-flare"},
+		},
+		{
+			name:          "target-model-image-2.5-sunburst",
+			originalModel: "original-model",
+			decision:      modelRouteDecision{Provider: "claude", Model: "gpt-image-2.5-sunburst"},
+		},
+		{
+			name:          "target-model-image-2.6",
+			originalModel: "original-model",
+			decision:      modelRouteDecision{Provider: "claude", Model: "gpt-image-2.6"},
+		},
+		{
+			name:          "target-model-image-2.6-flare",
+			originalModel: "original-model",
+			decision:      modelRouteDecision{Provider: "claude", Model: "gpt-image-2.6-flare"},
+		},
+		{
+			name:          "target-model-image-2.6-sunburst",
+			originalModel: "original-model",
+			decision:      modelRouteDecision{Provider: "claude", Model: "gpt-image-2.6-sunburst"},
 		},
 		{
 			name:          "target-model-thinking-suffix",
@@ -779,4 +863,60 @@ func TestQueryFromContextNilURLDoesNotPanic(t *testing.T) {
 	if got := queryFromContext(ctx); got != nil {
 		t.Fatalf("queryFromContext() = %#v, want nil when URL is nil", got)
 	}
+}
+
+func TestResponseInterceptRequest_SetsKindForPluginExecutorExecuteAndCount(t *testing.T) {
+	t.Run("plugin_executor_execution", func(t *testing.T) {
+		originalModel := "plugin-exec-kind-model"
+		host := &handlerDirectExecutorInterceptorHost{}
+		host.hasRouters = true
+		host.route = func(_ context.Context, _ pluginapi.ModelRouteRequest) (pluginapi.ModelRouteResponse, bool) {
+			return pluginapi.ModelRouteResponse{
+				Handled:    true,
+				TargetKind: pluginapi.ModelRouteTargetExecutor,
+				Target:     "exec-plugin",
+			}, true
+		}
+		handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, nil)
+		handler.SetModelRouterHost(host)
+		handler.SetPluginHost(host)
+
+		body, _, errMsg := handler.ExecuteWithAuthManager(context.Background(), "openai", originalModel, []byte(fmt.Sprintf(`{"model":%q}`, originalModel)), "")
+		if errMsg != nil || string(body) != "direct-ok" {
+			t.Fatalf("ExecuteWithAuthManager() body = %q, error = %#v", body, errMsg)
+		}
+		if !host.responseCalled {
+			t.Fatal("InterceptResponse was not called for plugin executor execution")
+		}
+		if host.responseReq.Kind != pluginapi.ResponseInterceptKindExecution {
+			t.Fatalf("ResponseInterceptRequest.Kind = %q, want %q", host.responseReq.Kind, pluginapi.ResponseInterceptKindExecution)
+		}
+	})
+
+	t.Run("plugin_executor_count_tokens", func(t *testing.T) {
+		originalModel := "plugin-count-kind-model"
+		host := &handlerDirectExecutorInterceptorHost{}
+		host.hasRouters = true
+		host.route = func(_ context.Context, _ pluginapi.ModelRouteRequest) (pluginapi.ModelRouteResponse, bool) {
+			return pluginapi.ModelRouteResponse{
+				Handled:    true,
+				TargetKind: pluginapi.ModelRouteTargetExecutor,
+				Target:     "count-plugin",
+			}, true
+		}
+		handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, nil)
+		handler.SetModelRouterHost(host)
+		handler.SetPluginHost(host)
+
+		body, _, errMsg := handler.ExecuteCountWithAuthManager(context.Background(), "claude", originalModel, []byte(fmt.Sprintf(`{"model":%q}`, originalModel)), "")
+		if errMsg != nil || string(body) != "7" {
+			t.Fatalf("ExecuteCountWithAuthManager() body = %q, error = %#v", body, errMsg)
+		}
+		if !host.responseCalled {
+			t.Fatal("InterceptResponse was not called for plugin executor count")
+		}
+		if host.responseReq.Kind != pluginapi.ResponseInterceptKindCountTokens {
+			t.Fatalf("ResponseInterceptRequest.Kind = %q, want %q", host.responseReq.Kind, pluginapi.ResponseInterceptKindCountTokens)
+		}
+	})
 }

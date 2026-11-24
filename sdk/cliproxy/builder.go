@@ -7,14 +7,16 @@ import (
 	"context"
 	"fmt"
 
-	configaccess "github.com/router-for-me/CLIProxyAPI/v7/internal/access/config_access"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/api"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher"
-	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
-	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
+	configaccess "github.com/router-for-me/CLIProxyAPI/v8/internal/access/config_access"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/api"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginhost"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/watcher"
+	sdkaccess "github.com/router-for-me/CLIProxyAPI/v8/sdk/access"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
+	sdkAuth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
 )
 
 // Builder constructs a Service instance with customizable providers.
@@ -48,15 +50,36 @@ type Builder struct {
 	// coreManager handles core authentication and execution.
 	coreManager *coreauth.Manager
 
+	// cooldownStateStore overrides runtime cooldown persistence.
+	cooldownStateStore coreauth.CooldownStateStore
+
+	// pluginInterceptorHost optionally overrides the PluginInterceptorHost
+	// installed on request handlers. The internal pluginHost still owns management
+	// routes and plugin executor wiring.
+	pluginInterceptorHost handlers.PluginInterceptorHost
+
 	// pluginHost owns dynamic plugin lifecycle and adapters.
 	pluginHost *pluginhost.Host
 
 	// postAuthHook is called after auth record creation and before persistence.
 	postAuthHook coreauth.PostAuthHook
 
+	// resultPolicy intercepts execution results before quota mutation and persistence.
+	resultPolicy coreauth.ResultPolicy
+
+	// executorWrapper optionally wraps every built-in executor before registration.
+	executorWrapper ExecutorWrapper
+
 	// serverOptions contains additional server configuration options.
 	serverOptions []api.ServerOption
 }
+
+// ExecutorWrapper rewrites a built-in executor before it is registered with
+// the core manager. The service applies it to every executor it registers,
+// so embedders can wrap built-in executors (for example the Claude executor)
+// once instead of reinstalling the wrapper after each re-registration.
+// A nil result keeps the unwrapped executor.
+type ExecutorWrapper func(provider string, exec coreauth.ProviderExecutor) coreauth.ProviderExecutor
 
 // Hooks allows callers to plug into service lifecycle stages.
 // These callbacks provide opportunities to perform custom initialization
@@ -65,6 +88,13 @@ type Hooks struct {
 	// OnBeforeStart is called before the service starts, allowing configuration
 	// modifications or additional setup.
 	OnBeforeStart func(*config.Config)
+
+	// OnConfigApplied is called once at the end of every successful runtime
+	// config apply, after executor re-registration and model sync. Embedders can
+	// use it to reinstall caller-owned state (executor wrappers, custom selector
+	// adjustments, interceptor context) that config apply would otherwise reset.
+	// The hook runs inside the service config runtime mutex; it must not block.
+	OnConfigApplied func(*Service, *config.Config)
 
 	// OnAfterStart is called after the service has started successfully,
 	// providing access to the service instance for additional operations.
@@ -146,6 +176,22 @@ func (b *Builder) WithCoreAuthManager(mgr *coreauth.Manager) *Builder {
 	return b
 }
 
+// WithCooldownStateStore overrides the store used for runtime cooldown persistence.
+func (b *Builder) WithCooldownStateStore(store coreauth.CooldownStateStore) *Builder {
+	b.cooldownStateStore = store
+	return b
+}
+
+// WithPluginInterceptorHost sets a caller-provided plugin interceptor host for
+// request handling. The server wraps it so plugin model routing, lifecycle
+// callbacks, and websocket observers keep delegating to the internal plugin
+// host; management routes and plugin executors are unaffected. When unset the
+// internal plugin host remains the request interceptor host as before.
+func (b *Builder) WithPluginInterceptorHost(host handlers.PluginInterceptorHost) *Builder {
+	b.pluginInterceptorHost = host
+	return b
+}
+
 // WithPluginHost overrides the dynamic plugin host used by the service.
 func (b *Builder) WithPluginHost(host *pluginhost.Host) *Builder {
 	b.pluginHost = host
@@ -177,6 +223,24 @@ func (b *Builder) WithPostAuthHook(hook coreauth.PostAuthHook) *Builder {
 	return b
 }
 
+// WithResultPolicy sets an execution result policy invoked before in-memory quota mutations and persistence.
+func (b *Builder) WithResultPolicy(policy coreauth.ResultPolicy) *Builder {
+	b.resultPolicy = policy
+	return b
+}
+
+// WithExecutorWrapper registers a wrapper applied to every built-in executor
+// the service registers, on every registration path (startup sync, auth and
+// model refresh, and config apply). Embedders can install a single wrapper
+// instead of reinstalling after each re-registration. A nil wrapper disables
+// the hook; returning nil from the wrapper keeps the unwrapped executor.
+// The wrapper runs under the executor registration mutex and must not
+// re-enter executor registration; it must not block.
+func (b *Builder) WithExecutorWrapper(wrapper ExecutorWrapper) *Builder {
+	b.executorWrapper = wrapper
+	return b
+}
+
 // Build validates inputs, applies defaults, and returns a ready-to-run service.
 func (b *Builder) Build() (*Service, error) {
 	if b.cfg == nil {
@@ -184,6 +248,12 @@ func (b *Builder) Build() (*Service, error) {
 	}
 	if b.configPath == "" {
 		return nil, fmt.Errorf("cliproxy: configuration path is required")
+	}
+	if errValidate := b.cfg.ValidateCredentialWeights(); errValidate != nil {
+		return nil, fmt.Errorf("cliproxy: validate credential weights: %w", errValidate)
+	}
+	if err := b.cfg.ValidateOrdinaryRouting(); err != nil {
+		return nil, err
 	}
 	b.cfg.NormalizePluginsConfig()
 	if errResolvePluginsDir := b.cfg.ResolvePluginsDir(); errResolvePluginsDir != nil && b.cfg.Plugins.Enabled {
@@ -226,29 +296,28 @@ func (b *Builder) Build() (*Service, error) {
 	}
 	accessManager.SetProviders(sdkaccess.RegisteredProviders())
 
+	var localStore *sdkAuth.FileTokenStore
 	coreManager := b.coreManager
+	cooldownStateStore := b.cooldownStateStore
 	var appliedRoutingState *routingRuntimeState
 	if coreManager == nil {
 		tokenStore := sdkAuth.GetTokenStore()
-		if dirSetter, ok := tokenStore.(interface{ SetBaseDir(string) }); ok && b.cfg != nil {
-			dirSetter.SetBaseDir(b.cfg.AuthDir)
+		if b.cfg != nil {
+			if files, ok := tokenStore.(*sdkAuth.FileTokenStore); ok {
+				localStore = files.WithBaseDir(b.cfg.AuthDir)
+				tokenStore = localStore
+			} else if dirSetter, ok := tokenStore.(interface{ SetBaseDir(string) }); ok {
+				dirSetter.SetBaseDir(b.cfg.AuthDir)
+			}
+		}
+		if cooldownStateStore == nil {
+			if provider, ok := tokenStore.(coreauth.CooldownStateStoreProvider); ok {
+				cooldownStateStore = provider.CooldownStateStore()
+			}
 		}
 
-		// Adopt upstream routing-runtime abstraction. The legacy
-		// ClaudeCodeSessionAffinity OR clause is preserved inside
-		// normalizedRoutingRuntimeState (service_config.go) so both the builder
-		// and the config-reload path honor the fork's legacy affinity flag.
 		routingState := normalizedRoutingRuntimeState(b.cfg)
-		// Bootstrap the manager with a throwaway no-op selector (a plain
-		// RoundRobinSelector owns no goroutine). The real, live-scheduling-aware
-		// selector is installed once below, after the *Service exists -- see the
-		// openspec/changes/add-adaptive-account-scheduling (G2) block. Building
-		// the real selector here instead would either (a) miss the live
-		// AccountSchedulingConfig accessor entirely (the *Service does not exist
-		// yet), reintroducing the hot-reload-ignored bug, or (b) create a
-		// goroutine-bearing adaptive/session-affinity selector only to discard
-		// it moments later when we rebind, leaking its reclaim/cache loop.
-		coreManager = coreauth.NewManager(tokenStore, &coreauth.RoundRobinSelector{}, nil)
+		coreManager = coreauth.NewManager(tokenStore, newRoutingSelector(routingState), nil)
 		appliedRoutingState = &routingState
 	}
 	// Attach a default RoundTripper provider so providers can opt-in per-auth transports.
@@ -258,46 +327,38 @@ func (b *Builder) Build() (*Service, error) {
 	if pluginHost != nil {
 		coreManager.SetPluginScheduler(pluginHost)
 	}
+	if b.resultPolicy != nil {
+		coreManager.SetResultPolicy(b.resultPolicy)
+	}
 
 	service := &Service{
-		cfg:                 b.cfg,
-		configPath:          b.configPath,
-		tokenProvider:       tokenProvider,
-		apiKeyProvider:      apiKeyProvider,
-		watcherFactory:      watcherFactory,
-		hooks:               b.hooks,
-		authManager:         authManager,
-		accessManager:       accessManager,
-		coreManager:         coreManager,
-		pluginHost:          pluginHost,
-		appliedRoutingState: appliedRoutingState,
-		serverOptions:       append([]api.ServerOption(nil), b.serverOptions...),
+		pluginInterceptorHost: b.pluginInterceptorHost,
+		cfg:                   b.cfg.CloneForRuntime(),
+		configPath:            b.configPath,
+		tokenProvider:         tokenProvider,
+		apiKeyProvider:        apiKeyProvider,
+		watcherFactory:        watcherFactory,
+		hooks:                 b.hooks,
+		executorWrapper:       b.executorWrapper,
+		authManager:           authManager,
+		accessManager:         accessManager,
+		coreManager:           coreManager,
+		externalCoreManager:   b.coreManager != nil,
+		localStoreRoot:        localStore,
+		cooldownStateStore:    cooldownStateStore,
+		pluginHost:            pluginHost,
+		discoveryManager:      newDiscoveryAdvertiserManager(),
+		appliedRoutingState:   appliedRoutingState,
+		serverOptions:         append([]api.ServerOption(nil), b.serverOptions...),
 	}
-	// fork(anticorr): the core-manager registry hook re-registers plan-filtered
-	// models and refreshes the scheduler entry on every auth add/update. It is a
-	// distinct layer from the upstream builder-level postAuthHook (called after
-	// auth creation, before persistence) and the persist/plugin/reload hooks, so
-	// both coexist.
-	coreManager.SetHook(authRegistryHook{service: service})
-	// openspec/changes/add-adaptive-account-scheduling (G2): install the manager's
-	// real routing selector now that the *Service -- and therefore its
-	// s.liveAccountSchedulingConfig accessor -- exists. This is what fixes the
-	// "boot straight into adaptive, edit account-scheduling, nothing happens
-	// until restart" bug: a static (live == nil) selector could never pick up
-	// warmup-curve / tier-weights / mature-limits edits, because
-	// applyManagerConfig only rebuilds the selector when
-	// routingRuntimeState.selectorShapeEqual is false and accountScheduling is
-	// deliberately excluded from that comparison -- so an account-scheduling-only
-	// reload never triggers a rebuild. Wiring the live accessor into the selector
-	// here means the very first Pick and every later account-scheduling edit read
-	// the current config live, with no rebuild required. appliedRoutingState is
-	// non-nil exactly when this builder created the manager; a caller-injected
-	// coreManager (WithCoreAuthManager) keeps its own selector untouched.
-	if appliedRoutingState != nil {
-		coreManager.SetSelector(newRoutingSelectorWithLiveScheduling(*appliedRoutingState, service.liveAccountSchedulingConfig))
-	}
+	service.removeRegistryHook = coreManager.AddHook(authRegistryHook{service: service})
+	service.proxyPoolPublisher = helps.RegisterProxyPoolPublisher()
+	helps.AdvanceProxyPoolGeneration(service.proxyPoolPublisher, service.cfg)
 	if b.postAuthHook != nil {
 		service.serverOptions = append(service.serverOptions, api.WithPostAuthHook(b.postAuthHook))
+	}
+	if b.pluginInterceptorHost != nil {
+		service.serverOptions = append(service.serverOptions, api.WithPluginInterceptorHost(b.pluginInterceptorHost))
 	}
 	service.serverOptions = append(service.serverOptions,
 		api.WithPostAuthPersistHook(service.runtimeAuthSyncHook()),
@@ -325,10 +386,23 @@ func (s *Service) runtimeAuthSyncHook() coreauth.PostAuthHook {
 			ID:     auth.ID,
 			Auth:   auth,
 		}
-		if s.watcher != nil && s.watcher.DispatchPersistedAuthUpdate(update) {
+		update.PublicationFence = s.persistedFilePublicationFence(auth)
+		release, eligible := update.PublicationFence.Begin()
+		if !eligible {
 			return nil
 		}
-		s.handleAuthUpdate(coreauth.WithSkipPersist(ctx), update)
+		release()
+		if watcher := s.currentWatcher(); watcher != nil {
+			_, rev := watcher.DispatchPersistedAuthUpdateWithRevision(&update)
+			if rev > 0 {
+				update.SetRevision(rev)
+			}
+		}
+		// Detach from request cancellation so runtime model registration always completes
+		// once the credential has been persisted to disk. If the watcher consumer already
+		// claimed this revision, handleAuthUpdate waits for that registration to finish.
+		syncCtx := coreauth.WithSkipPersist(context.Background())
+		s.handleAuthUpdate(syncCtx, update)
 		return nil
 	}
 }
