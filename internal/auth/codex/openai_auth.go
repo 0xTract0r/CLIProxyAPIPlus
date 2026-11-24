@@ -12,8 +12,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -305,7 +307,6 @@ func (o *CodexAuth) refreshTokensSingleFlight(ctx context.Context, refreshToken 
 		RefreshToken string `json:"refresh_token"`
 		IDToken      string `json:"id_token"`
 		TokenType    string `json:"token_type"`
-		ExpiresIn    int    `json:"expires_in"`
 	}
 
 	if !ojson.ValidBytes(body) {
@@ -315,8 +316,8 @@ func (o *CodexAuth) refreshTokensSingleFlight(ctx context.Context, refreshToken 
 	tokenResp.AccessToken = response.Get("access_token").String()
 	tokenResp.RefreshToken = response.Get("refresh_token").String()
 	tokenResp.IDToken = response.Get("id_token").String()
-	tokenResp.ExpiresIn = int(response.Get("expires_in").Int())
-	if response.Get("access_token").Type != ojson.String || strings.TrimSpace(tokenResp.AccessToken) == "" || response.Get("expires_in").Type != ojson.Number || tokenResp.ExpiresIn <= 0 || response.Get("refresh_token").Type != ojson.String || strings.TrimSpace(tokenResp.RefreshToken) == "" {
+	expiresIn, validExpiry := positiveOAuthExpiryDuration(response.Get("expires_in"))
+	if response.Get("access_token").Type != ojson.String || strings.TrimSpace(tokenResp.AccessToken) == "" || !validExpiry || response.Get("refresh_token").Type != ojson.String || strings.TrimSpace(tokenResp.RefreshToken) == "" {
 		return nil, &RefreshOutcomeUnknownError{Stage: "response-decode"}
 	}
 
@@ -342,8 +343,31 @@ func (o *CodexAuth) refreshTokensSingleFlight(ctx context.Context, refreshToken 
 		AccountID:    accountID,
 		Email:        email,
 		PlanType:     planType,
-		Expire:       time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second).Format(time.RFC3339),
+		Expire:       time.Now().Add(expiresIn).Format(time.RFC3339),
 	}, nil
+}
+
+// Decode the provider's seconds as an exact integer and reject durations that
+// cannot fit in time.Duration. Bound exponent and mantissa before parsing.
+func positiveOAuthExpiryDuration(value ojson.Result) (time.Duration, bool) {
+	raw := value.Raw
+	if value.Type != ojson.Number || len(raw) > 64 {
+		return 0, false
+	}
+	if at := strings.IndexAny(raw, "eE"); at >= 0 {
+		if _, err := strconv.ParseInt(raw[at+1:], 10, 8); err != nil {
+			return 0, false
+		}
+	}
+	seconds, ok := new(big.Rat).SetString(raw)
+	if !ok || seconds.Sign() <= 0 || !seconds.IsInt() || !seconds.Num().IsInt64() {
+		return 0, false
+	}
+	n := seconds.Num().Int64()
+	if n > (1<<63-1)/int64(time.Second) {
+		return 0, false
+	}
+	return time.Duration(n) * time.Second, true
 }
 
 // CreateTokenStorage creates a new CodexTokenStorage from a CodexAuthBundle.

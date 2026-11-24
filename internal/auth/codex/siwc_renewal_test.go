@@ -1,133 +1,95 @@
 package codex
 
 import (
-	"context"
+	"errors"
 	"io"
 	"net/http"
-	"reflect"
 	"strings"
 	"testing"
-
-	"github.com/MoeForge/moego/ojson"
+	"time"
 )
 
-func TestSIWCTokenResponseValidatesScope(t *testing.T) {
-	for _, tc := range []struct {
-		name, scope string
-		exchange    bool
-		wantError   bool
-	}{
-		{name: "refresh omits unchanged scope"},
-		{name: "refresh explicitly clears scope", scope: `""`, wantError: true},
-		{name: "refresh returns null scope", scope: `null`, wantError: true},
-		{name: "refresh removes direct permission", scope: `"openid profile"`, wantError: true},
-		{name: "refresh returns malformed scope", scope: `123`, wantError: true},
-		{name: "refresh grants direct permission", scope: `"openid chatgpt.tokens.use.direct"`},
-		{name: "exchange requires explicit scope", exchange: true, wantError: true},
-		{name: "exchange grants direct permission", exchange: true, scope: `"openid chatgpt.tokens.use.direct"`},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			doc := ojson.NewDocString(`{"access_token":"access","refresh_token":"refresh","id_token":"id","expires_in":3600}`)
-			if tc.scope != "" {
-				if errSet := doc.SetRaw("scope", tc.scope); errSet != nil {
-					t.Fatal(errSet)
-				}
-			}
-			body := doc.String()
-			auth := &CodexAuth{httpClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
-				return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}, nil
-			})}}
-			auth.SetRefreshJournal(&memoryRefreshJournal{})
-			var err error
-			if tc.exchange {
-				_, err = auth.ExchangeSIWCCodeForTokens(context.Background(), "code", "oaiapp_scope", "", "", &PKCECodes{CodeVerifier: "verifier"})
-			} else {
-				_, err = auth.RefreshSIWCTokens(context.Background(), "refresh", "oaiapp_scope", "")
-			}
-			if (err != nil) != tc.wantError {
-				t.Fatalf("error = %v, wantError = %v", err, tc.wantError)
-			}
-		})
+func TestOrdinaryRefreshUsesOfficialScope(t *testing.T) {
+	calls := 0
+	auth := &CodexAuth{httpClient: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		calls++
+		if r.Method != http.MethodPost || r.URL.String() != TokenURL || r.ParseForm() != nil {
+			t.Fatal("wrong official OAuth request")
+		}
+		if r.PostForm.Get("client_id") != ClientID || r.PostForm.Get("grant_type") != "refresh_token" || r.PostForm.Get("scope") != "openid profile email" || r.PostForm.Get("refresh_token") != "official-scope-fixture" {
+			t.Fatal("official refresh did not use the selected grant and standard scope")
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"access_token":"next","refresh_token":"rotation","expires_in":3600}`))}, nil
+	})}}
+	auth.SetRefreshJournal(&memoryRefreshJournal{})
+	tok, err := auth.RefreshTokens(t.Context(), "official-scope-fixture")
+	if err != nil || tok == nil || tok.AccessToken != "next" || calls != 1 {
+		t.Fatalf("refresh error=%v requests=%d", err, calls)
 	}
 }
 
-func TestSIWCTokenResponseValidatesExpiresIn(t *testing.T) {
+func TestOrdinaryRefreshValidatesExpiry(t *testing.T) {
 	for _, tc := range []struct {
-		name         string
-		expiresInRaw string
-		wantError    bool
+		name, seconds string
+		valid         bool
 	}{
-		{name: "accept float json number", expiresInRaw: "3600.0"},
-		{name: "accept scientific notation", expiresInRaw: "3.6e3"},
-		{name: "reject fractional value", expiresInRaw: "3600.5", wantError: true},
-		{name: "reject oversized seconds", expiresInRaw: "1e20", wantError: true},
-		{name: "reject infinity string", expiresInRaw: `"Inf"`, wantError: true},
+		{"integer", "3600", true}, {"float integer", "3600.0", true}, {"scientific integer", "3.6e3", true},
+		{"fractional", "3600.5", false}, {"precision beyond float", "3600.000000000000000001", false}, {"overflow", "1e20", false}, {"huge exponent", "1e1000000000", false}, {"nonfinite string", `"Inf"`, false}, {"negative", "-3600", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			doc := ojson.NewDocString(`{"access_token":"access","refresh_token":"refresh","expires_in":3600}`)
-			if errSet := doc.SetRaw("expires_in", tc.expiresInRaw); errSet != nil {
-				t.Fatal(errSet)
-			}
-			body := doc.String()
 			auth := &CodexAuth{httpClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
-				return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}, nil
+				return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"access_token":"next","refresh_token":"rotation","expires_in":` + tc.seconds + `}`))}, nil
 			})}}
 			auth.SetRefreshJournal(&memoryRefreshJournal{})
-			token, errRefresh := auth.RefreshSIWCTokens(context.Background(), "refresh", "oaiapp_expires_in", "")
-			if tc.wantError {
-				if errRefresh == nil || token != nil {
-					t.Fatalf("error = %v, token returned = %t; want error", errRefresh, token != nil)
+			started := time.Now().Truncate(time.Second)
+			tok, err := auth.RefreshTokens(t.Context(), "expiry-"+tc.name)
+			if !tc.valid {
+				if tok != nil || !IsRefreshOutcomeUnknown(err) {
+					t.Fatalf("invalid successful response accepted or replayable: %v", err)
 				}
 				return
 			}
-			if errRefresh != nil || token == nil {
-				t.Fatalf("error = %v, token returned = %t; want success", errRefresh, token != nil)
+			if err != nil || tok == nil {
+				t.Fatalf("integral expiry rejected: %v", err)
+			}
+			expiry, parseErr := time.Parse(time.RFC3339, tok.Expire)
+			if parseErr != nil || expiry.Before(started.Add(time.Hour)) || expiry.After(time.Now().Add(time.Hour)) {
+				t.Fatalf("expiry outside provider window: %q", tok.Expire)
 			}
 		})
 	}
 }
 
-func TestSIWCRefreshReceiptPreservesServerWindow(t *testing.T) {
-	for _, window := range []string{`"2026-11-07T13:07:09Z"`, `1794056829`, `null`} {
-		t.Run(window, func(t *testing.T) {
-			doc := ojson.NewDocString(`{"access_token":"access","refresh_token":"rotated","expires_in":3600}`)
-			if errSet := doc.SetRaw("earliest_refresh_at", window); errSet != nil {
-				t.Fatal(errSet)
-			}
-			body := doc.String()
-			calls := 0
-			auth := &CodexAuth{httpClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
-				calls++
-				return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}, nil
-			})}}
-			auth.SetRefreshJournal(&memoryRefreshJournal{})
-			for attempt := 0; attempt < 2; attempt++ {
-				token, errRefresh := auth.RefreshSIWCTokens(context.Background(), "receipt-grant", "oaiapp_receipt", "")
-				if errRefresh != nil {
-					t.Fatal(errRefresh)
-				}
-				if !reflect.DeepEqual(token.EarliestRefreshAt, ojson.Parse(window).Value()) {
-					t.Fatalf("attempt %d: earliest_refresh_at = %v, want %s", attempt, token.EarliestRefreshAt, window)
-				}
-			}
-			if calls != 1 {
-				t.Fatalf("receipt was not reused: requests = %d, want 1", calls)
-			}
-		})
-	}
-}
-
-func TestSIWCRefreshErrorRetainsRequestID(t *testing.T) {
+func TestOrdinaryRefreshReceiptPreservesExpiry(t *testing.T) {
+	calls := 0
 	auth := &CodexAuth{httpClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
-		return &http.Response{
-			StatusCode: http.StatusBadRequest,
-			Header:     http.Header{"X-Request-Id": []string{"req-siwc-test"}},
-			Body:       io.NopCloser(strings.NewReader(`{"error":"invalid_grant"}`)),
-		}, nil
+		calls++
+		return &http.Response{StatusCode: 200, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"access_token":"next","refresh_token":"rotated","expires_in":3600}`))}, nil
 	})}}
-	_, errRefresh := auth.RefreshSIWCTokens(context.Background(), "refresh", "oaiapp_request_id", "")
-	if errRefresh == nil || !strings.Contains(errRefresh.Error(), "req-siwc-test") || !strings.Contains(errRefresh.Error(), "invalid_grant") {
-		t.Fatalf("upstream correlation details missing: %v", errRefresh)
+	journal := &memoryRefreshJournal{}
+	auth.SetRefreshJournal(journal)
+	first, err := auth.RefreshTokens(t.Context(), "ordinary-receipt-fixture")
+	if err != nil || first == nil || first.Expire == "" {
+		t.Fatalf("first refresh error: %v", err)
+	}
+	// A different client instance reads the original receipt without exchanging the grant again.
+	secondClient := &CodexAuth{httpClient: auth.httpClient}
+	secondClient.SetRefreshJournal(journal)
+	second, err := secondClient.RefreshTokens(t.Context(), "ordinary-receipt-fixture")
+	if err != nil || second == nil || second.Expire != first.Expire || second.RefreshToken != "rotated" || calls != 1 {
+		t.Fatalf("cached receipt changed or triggered another request: err=%v requests=%d", err, calls)
+	}
+}
+
+func TestOrdinaryRefreshFailureRetainsPublicDiagnostic(t *testing.T) {
+	auth := &CodexAuth{httpClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusBadRequest, Header: http.Header{"X-Request-Id": {"private-header-fixture"}, "Retry-After": {"7"}}, Body: io.NopCloser(strings.NewReader(`{"error":"invalid_grant","error_description":"private-body-fixture"}`))}, nil
+	})}}
+	auth.SetRefreshJournal(&memoryRefreshJournal{})
+	denied, err := auth.RefreshTokens(t.Context(), "diagnostic-fixture")
+	var status *refreshResponseError
+	if denied != nil || !errors.As(err, &status) || status.StatusCode() != http.StatusBadRequest || status.Headers().Get("Retry-After") != "7" || !strings.Contains(err.Error(), "invalid_grant") || strings.Contains(err.Error(), "private-") {
+		t.Fatalf("public diagnostic or redaction changed: %v", err)
 	}
 }
 

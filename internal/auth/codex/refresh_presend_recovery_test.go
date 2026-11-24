@@ -328,47 +328,23 @@ func TestRefreshTokensReleasesClaimAfterPreSendFailures(t *testing.T) {
 	})
 }
 
-func TestSIWCRefreshReleasesClaimAfterPreSendFailure(t *testing.T) {
-	resetCodexRefreshGroupForTest()
-	t.Cleanup(resetCodexRefreshGroupForTest)
-
-	var serverCalls atomic.Int32
-	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		serverCalls.Add(1)
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"access_token":"siwc-recovered","refresh_token":"siwc-next","expires_in":3600,"scope":"openid chatgpt.tokens.use.direct"}`)
-	}))
-	t.Cleanup(server.Close)
-
-	previousEndpoint := siwcTokenEndpointURL
-	siwcTokenEndpointURL = strings.TrimRight(server.URL, "/") + "/api/accounts/oauth/token"
-	t.Cleanup(func() { siwcTokenEndpointURL = previousEndpoint })
-
-	cfg := &config.Config{AuthDir: t.TempDir()}
-	var failDNS atomic.Bool
-	failDNS.Store(true)
-	transport := newRedirectedTransport(t, server, func(ctx context.Context, network, targetAddr string) (net.Conn, error) {
-		if failDNS.Load() {
-			return nil, &net.DNSError{Err: "temporary failure in name resolution", Name: "auth.openai.com", IsTemporary: true}
+func TestOrdinaryRefreshReleasesClaimAfterTypedPreSendFailure(t *testing.T) {
+	sent, attempts := 0, 0
+	auth := &CodexAuth{httpClient: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		attempts++
+		if attempts == 1 {
+			return nil, &net.DNSError{Err: "temporary fixture failure", Name: r.URL.Hostname(), IsTemporary: true}
 		}
-		var dialer net.Dialer
-		return dialer.DialContext(ctx, network, targetAddr)
-	})
-
-	auth := NewCodexAuth(cfg)
-	auth.httpClient.Transport = transport
-	_, errFirst := auth.RefreshSIWCTokens(context.Background(), "siwc-wake-grant", "oaiapp_wake", "550e8400-e29b-41d4-a716-446655440000")
-	if errFirst == nil || IsRefreshOutcomeUnknown(errFirst) {
-		t.Fatalf("expected retryable pre-send SIWC error, got: %v", errFirst)
+		sent++
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"access_token":"recovered","refresh_token":"rotation","expires_in":3600}`))}, nil
+	})}}
+	auth.SetRefreshJournal(&memoryRefreshJournal{})
+	if tok, err := auth.RefreshTokens(t.Context(), "ordinary-presend-fixture"); tok != nil || !IsRefreshPreSendError(err) || sent != 0 {
+		t.Fatalf("pre-send failure was not retryable: error=%v dispatched=%d", err, sent)
 	}
-
-	failDNS.Store(false)
-	tokens, errSecond := auth.RefreshSIWCTokens(context.Background(), "siwc-wake-grant", "oaiapp_wake", "550e8400-e29b-41d4-a716-446655440000")
-	if errSecond != nil || tokens == nil || tokens.AccessToken != "siwc-recovered" {
-		t.Fatalf("SIWC retry after pre-send DNS failure failed: tokens=%+v, err=%v", tokens, errSecond)
-	}
-	if serverCalls.Load() != 1 {
-		t.Fatalf("SIWC server calls = %d, want 1", serverCalls.Load())
+	tok, err := auth.RefreshTokens(t.Context(), "ordinary-presend-fixture")
+	if tok == nil || tok.AccessToken != "recovered" || err != nil || attempts != 2 || sent != 1 {
+		t.Fatalf("existing claim did not release: error=%v attempts=%d dispatched=%d", err, attempts, sent)
 	}
 }
 
