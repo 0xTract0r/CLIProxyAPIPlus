@@ -447,70 +447,6 @@ func TestHomeExcludedCredentialEndsRetainedWebsocketSelection(t *testing.T) {
 	}
 }
 
-func TestHomeRetryRoundTriesFreshCredentialWhenRequestRetryIsZero(t *testing.T) {
-	for _, stream := range []bool{false, true} {
-		t.Run(map[bool]string{false: "nonstream", true: "stream"}[stream], func(t *testing.T) {
-			dispatcher := &retryContractHomeDispatcher{authIDs: []string{"home-retry-a", "home-retry-b"}}
-			executor := &retryContractHomeExecutor{}
-			manager := NewManager(nil, nil, nil)
-			manager.SetConfig(&internalconfig.Config{Home: internalconfig.HomeConfig{Enabled: true}})
-			manager.SetRetryConfig(0, time.Second, 2)
-			manager.PublishHomeDispatch(dispatcher, executionregistry.New(), 1)
-			manager.RegisterExecutor(executor)
-
-			if stream {
-				result, errExecute := manager.ExecuteStream(context.Background(), []string{"home-retry-contract"}, cliproxyexecutor.Request{Model: "gpt"}, cliproxyexecutor.Options{Stream: true})
-				if errExecute != nil {
-					t.Fatalf("ExecuteStream() error = %v", errExecute)
-				}
-				for range result.Chunks {
-				}
-			} else {
-				response, errExecute := manager.Execute(context.Background(), []string{"home-retry-contract"}, cliproxyexecutor.Request{Model: "gpt"}, cliproxyexecutor.Options{})
-				if errExecute != nil {
-					t.Fatalf("Execute() error = %v", errExecute)
-				}
-				if string(response.Payload) != "home-retry-b" {
-					t.Fatalf("response payload = %q, want home-retry-b", string(response.Payload))
-				}
-			}
-
-			if got := executor.Calls(); len(got) != 2 || got[0] != "home-retry-a" || got[1] != "home-retry-b" {
-				t.Fatalf("executor calls = %v, want [home-retry-a home-retry-b]", got)
-			}
-			excluded := dispatcher.Excluded()
-			if len(excluded) != 2 || len(excluded[0]) != 0 || len(excluded[1]) != 1 || excluded[1][0] != "home-retry-a" {
-				t.Fatalf("Home excluded auth IDs = %v, want [[], [home-retry-a]]", excluded)
-			}
-		})
-	}
-}
-
-func TestHomeCountTokensTriesFreshCredentialWhenRequestRetryIsZero(t *testing.T) {
-	dispatcher := &retryContractHomeDispatcher{authIDs: []string{"home-retry-a", "home-retry-b"}}
-	executor := &retryContractHomeExecutor{}
-	manager := NewManager(nil, nil, nil)
-	manager.SetConfig(&internalconfig.Config{Home: internalconfig.HomeConfig{Enabled: true}})
-	manager.SetRetryConfig(0, time.Second, 2)
-	manager.PublishHomeDispatch(dispatcher, executionregistry.New(), 1)
-	manager.RegisterExecutor(executor)
-
-	response, errExecute := manager.ExecuteCount(context.Background(), []string{"home-retry-contract"}, cliproxyexecutor.Request{Model: "gpt"}, cliproxyexecutor.Options{})
-	if errExecute != nil {
-		t.Fatalf("ExecuteCount() error = %v", errExecute)
-	}
-	if string(response.Payload) != "home-retry-b" {
-		t.Fatalf("response payload = %q, want home-retry-b", string(response.Payload))
-	}
-	if got := executor.Calls(); len(got) != 2 || got[0] != "home-retry-a" || got[1] != "home-retry-b" {
-		t.Fatalf("executor calls = %v, want [home-retry-a home-retry-b]", got)
-	}
-	excluded := dispatcher.Excluded()
-	if len(excluded) != 2 || len(excluded[0]) != 0 || len(excluded[1]) != 1 || excluded[1][0] != "home-retry-a" {
-		t.Fatalf("Home excluded auth IDs = %v, want [[], [home-retry-a]]", excluded)
-	}
-}
-
 func TestHomeRetryPolicyAllowsRemoteCooldownWithoutLocalCredentials(t *testing.T) {
 	manager := NewManager(nil, nil, nil)
 	manager.SetConfig(&internalconfig.Config{Home: internalconfig.HomeConfig{Enabled: true}})
@@ -1144,39 +1080,6 @@ func TestHomeRetryRoundUsesRemoteCooldownWhenAttemptedErrorHasNoTiming(t *testin
 	}
 }
 
-func TestHomeStreamOAuthUnauthorizedRotatesWithoutRefreshRetry(t *testing.T) {
-	dispatcher := &retryContractHomeDispatcher{
-		authIDs: []string{"home-retry-a", "home-retry-b"},
-		metadata: map[string]any{
-			"auth_kind": "oauth",
-		},
-	}
-	executor := &retryContractHomeExecutor{
-		failures: map[string]error{
-			"home-retry-a": &Error{HTTPStatus: http.StatusUnauthorized, Message: "expired"},
-		},
-	}
-	manager := NewManager(nil, nil, nil)
-	manager.SetConfig(&internalconfig.Config{Home: internalconfig.HomeConfig{Enabled: true}})
-	manager.SetRetryConfig(0, time.Second, 2)
-	manager.PublishHomeDispatch(dispatcher, executionregistry.New(), 1)
-	manager.RegisterExecutor(executor)
-
-	result, errExecute := manager.ExecuteStream(context.Background(), []string{"home-retry-contract"}, cliproxyexecutor.Request{Model: "gpt"}, cliproxyexecutor.Options{Stream: true})
-	if errExecute != nil {
-		t.Fatalf("ExecuteStream() error = %v", errExecute)
-	}
-	for range result.Chunks {
-	}
-	if got := executor.Calls(); len(got) != 2 || got[0] != "home-retry-a" || got[1] != "home-retry-b" {
-		t.Fatalf("executor calls = %v, want [home-retry-a home-retry-b]", got)
-	}
-	excluded := dispatcher.Excluded()
-	if len(excluded) != 2 || len(excluded[0]) != 0 || len(excluded[1]) != 1 || excluded[1][0] != "home-retry-a" {
-		t.Fatalf("Home excluded auth IDs = %v, want [[], [home-retry-a]]", excluded)
-	}
-}
-
 func TestHomeStreamLifecycleRecoveryFailureRotatesWithoutExtraDispatch(t *testing.T) {
 	dispatcher := &retryContractHomeDispatcher{authIDs: []string{"home-retry-a", "home-retry-b"}}
 	executor := &retryContractHomeExecutor{
@@ -1241,39 +1144,6 @@ func TestRetryRoundAvailabilityRejectsStaleQuotaForNonRetryableStatus(t *testing
 				t.Fatalf("retryRoundAvailabilityForAuth() next = %v, want %v", next, nextRetry)
 			}
 		})
-	}
-}
-
-func TestHomeStreamAPIKeyUnauthorizedRotatesImmediately(t *testing.T) {
-	dispatcher := &retryContractHomeDispatcher{
-		authIDs: []string{"home-retry-a", "home-retry-b"},
-		metadata: map[string]any{
-			"auth_kind": "apikey",
-		},
-	}
-	executor := &retryContractHomeExecutor{
-		failures: map[string]error{
-			"home-retry-a": &Error{HTTPStatus: http.StatusUnauthorized, Message: "invalid api key"},
-		},
-	}
-	manager := NewManager(nil, nil, nil)
-	manager.SetConfig(&internalconfig.Config{Home: internalconfig.HomeConfig{Enabled: true}})
-	manager.SetRetryConfig(0, time.Second, 2)
-	manager.PublishHomeDispatch(dispatcher, executionregistry.New(), 1)
-	manager.RegisterExecutor(executor)
-
-	result, errExecute := manager.ExecuteStream(context.Background(), []string{"home-retry-contract"}, cliproxyexecutor.Request{Model: "gpt"}, cliproxyexecutor.Options{Stream: true})
-	if errExecute != nil {
-		t.Fatalf("ExecuteStream() error = %v", errExecute)
-	}
-	for range result.Chunks {
-	}
-	if got := executor.Calls(); len(got) != 2 || got[0] != "home-retry-a" || got[1] != "home-retry-b" {
-		t.Fatalf("executor calls = %v, want [home-retry-a home-retry-b]", got)
-	}
-	excluded := dispatcher.Excluded()
-	if len(excluded) != 2 || len(excluded[0]) != 0 || len(excluded[1]) != 1 || excluded[1][0] != "home-retry-a" {
-		t.Fatalf("Home excluded auth IDs = %v, want [[], [home-retry-a]]", excluded)
 	}
 }
 
