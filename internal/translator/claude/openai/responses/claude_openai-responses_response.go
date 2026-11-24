@@ -815,6 +815,17 @@ func (st *claudeToResponsesState) finalizeReasoningItem(status string, nextSeq f
 	return out
 }
 
+func (st *claudeToResponsesState) emitAssistantTextDelta(text string, nextSeq func() int) []byte {
+	doc := ojson.NewDocString(`{"type":"response.output_text.delta","sequence_number":0,"item_id":"","output_index":0,"content_index":0,"delta":"","logprobs":[]}`)
+	_ = doc.Set("sequence_number", nextSeq())
+	_ = doc.Set("item_id", st.CurrentMsgID)
+	_ = doc.Set("output_index", st.messageOutputIndex())
+	_ = doc.Set("delta", text)
+	st.TextBuf.WriteString(text)
+	st.CurrentTextBuf.WriteString(text)
+	return emitEvent("response.output_text.delta", doc.Bytes())
+}
+
 func (st *claudeToResponsesState) finalizeAssistantMessage(nextSeq func() int) [][]byte {
 	if !st.MessageOpen {
 		return nil
@@ -1087,6 +1098,9 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 				out = append(out, emitEvent("response.content_part.added", partDoc.Bytes()))
 				st.ContentPartOpen = true
 			}
+			if text := cb.Get("text"); text.Type == ojson.String && text.String() != "" {
+				out = append(out, st.emitAssistantTextDelta(text.String(), nextSeq))
+			}
 		} else if typ == "tool_use" {
 			st.InFuncBlock = true
 			callID, name := strings.Clone(cb.Get("id").String()), strings.Clone(cb.Get("name").String())
@@ -1204,15 +1218,7 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 		dt := d.Get("type").String()
 		if dt == "text_delta" {
 			if t := d.Get("text"); t.Exists() {
-				msgDoc := ojson.NewDocString(`{"type":"response.output_text.delta","sequence_number":0,"item_id":"","output_index":0,"content_index":0,"delta":"","logprobs":[]}`)
-				_ = msgDoc.Set("sequence_number", nextSeq())
-				_ = msgDoc.Set("item_id", st.CurrentMsgID)
-				_ = msgDoc.Set("output_index", st.messageOutputIndex())
-				_ = msgDoc.Set("delta", t.String())
-				out = append(out, emitEvent("response.output_text.delta", msgDoc.Bytes()))
-				// aggregate text for response.output
-				st.TextBuf.WriteString(t.String())
-				st.CurrentTextBuf.WriteString(t.String())
+				out = append(out, st.emitAssistantTextDelta(t.String(), nextSeq))
 			}
 		} else if dt == "input_json_delta" {
 			if item := st.WebSearchByBlock[int(root.Get("index").Int())]; item != nil {
@@ -1608,6 +1614,9 @@ func ConvertClaudeResponseToOpenAIResponsesNonStream(ctx context.Context, modelN
 				if len(pendingAnnotations) > 0 {
 					item.annotations = append(item.annotations, pendingAnnotations...)
 					pendingAnnotations = nil
+				}
+				if text := cb.Get("text"); text.Type == ojson.String {
+					item.text.WriteString(text.String())
 				}
 				activeMessageItem = item
 			case "tool_use":
