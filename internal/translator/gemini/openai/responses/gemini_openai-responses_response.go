@@ -2730,6 +2730,11 @@ func (st *geminiToResponsesState) FinalizeToolInput() [][]byte {
 		st.SetToolInputError(fmt.Errorf("upstream apply_patch stream ended before protocol completion"))
 	}
 	st.Completed = true
+	// Before response.created, let the executor return the retained HTTP gateway
+	// error without making a synthetic failure the first SSE event.
+	if !st.Started {
+		return nil
+	}
 	st.Seq++
 	return [][]byte{emitEvent("response.failed", translatorcommon.ApplyPatchFailure(st.ResponseID, st.Seq))}
 }
