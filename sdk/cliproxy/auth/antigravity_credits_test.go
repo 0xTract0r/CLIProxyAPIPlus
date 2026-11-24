@@ -97,43 +97,30 @@ func (h *captureLogHook) Fire(entry *log.Entry) error {
 	return nil
 }
 
-func TestManagerExecuteStream_AntigravityCreditsFallbackAfterBootstrap429(t *testing.T) {
+func TestManagerExecuteStream_AntigravityPreservesBootstrapRefusal(t *testing.T) {
 	const model = "claude-opus-4-6-thinking"
 	executor := &antigravityCreditsFallbackExecutor{}
 	manager := NewManager(nil, nil, nil)
-	manager.SetConfig(&internalconfig.Config{
-		QuotaExceeded: internalconfig.QuotaExceeded{AntigravityCredits: true},
-	})
 	manager.RegisterExecutor(executor)
-	registry.GetGlobalRegistry().RegisterClient("ag-credits", "antigravity", []*registry.ModelInfo{{ID: model}})
-	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient("ag-credits") })
-	if _, errRegister := manager.Register(context.Background(), &Auth{ProxyURL: "http://test-proxy:8080", ID: "ag-credits", Provider: "antigravity"}); errRegister != nil {
-		t.Fatalf("register auth: %v", errRegister)
+	registry.GetGlobalRegistry().RegisterClient("ag-ordinary-refusal", "antigravity", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient("ag-ordinary-refusal") })
+	if _, err := manager.Register(context.Background(), &Auth{ID: "ag-ordinary-refusal", Provider: "antigravity"}); err != nil {
+		t.Fatal(err)
 	}
-
-	streamResult, errExecute := manager.ExecuteStream(context.Background(), []string{"antigravity"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
-	if errExecute != nil {
-		t.Fatalf("execute stream: %v", errExecute)
-	}
-
-	var payload []byte
-	for chunk := range streamResult.Chunks {
-		if chunk.Err != nil {
-			t.Fatalf("unexpected stream error: %v", chunk.Err)
+	stream, err := manager.ExecuteStream(context.Background(), []string{"antigravity"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if err == nil {
+		for chunk := range stream.Chunks {
+			if len(chunk.Payload) != 0 || err != nil || chunk.Err == nil {
+				t.Fatalf("unexpected chunk: %+v", chunk)
+			}
+			err = chunk.Err
 		}
-		payload = append(payload, chunk.Payload...)
 	}
-	if string(payload) != "credits fallback" {
-		t.Fatalf("payload = %q, want %q", string(payload), "credits fallback")
+	if statusCodeFromError(err) != http.StatusTooManyRequests || !strings.Contains(err.Error(), "quota exhausted") {
+		t.Fatalf("want original 429, got %v", err)
 	}
-	if got := streamResult.Headers.Get("X-Credits"); got != model {
-		t.Fatalf("X-Credits header = %q, want routed model", got)
-	}
-	if len(executor.streamCreditsRequested) != 2 {
-		t.Fatalf("stream calls = %d, want 2", len(executor.streamCreditsRequested))
-	}
-	if executor.streamCreditsRequested[0] || !executor.streamCreditsRequested[1] {
-		t.Fatalf("credits flags = %v, want [false true]", executor.streamCreditsRequested)
+	if calls := executor.streamCreditsRequested; len(calls) != 1 || calls[0] {
+		t.Fatalf("want one standard call, got %v", calls)
 	}
 }
 
@@ -276,7 +263,7 @@ func TestIsAuthBlockedForModel_KeepsGeminiBlockedWithoutCreditsBypass(t *testing
 	}
 }
 
-func TestManagerExecuteAndStream_ExpiredNegativeCreditsHintRecoversDuringModelCooldown(t *testing.T) {
+func TestManagerExecuteAndStream_ExpiredNegativeCreditsHintRespectsModelCooldown(t *testing.T) {
 	for _, stream := range []bool{false, true} {
 		name := "execute"
 		if stream {
@@ -334,41 +321,24 @@ func TestManagerExecuteAndStream_ExpiredNegativeCreditsHintRecoversDuringModelCo
 				t.Fatalf("executor calls during fresh negative hint = (%d, %d), want (0, 0)", len(executor.executeCreditsRequested), len(executor.streamCreditsRequested))
 			}
 
-			// Once the negative hint expires, execution must enter credits fallback even while model cooldown is active.
+			// An expired hint leaves the existing cooldown in force.
 			SetAntigravityCreditsHint(authID, AntigravityCreditsHint{
 				Known:     true,
 				Available: false,
 				UpdatedAt: time.Now().Add(-AntigravityCreditsHintRefreshInterval - time.Second),
 			})
+			var err error
+			req := cliproxyexecutor.Request{Model: model}
 			if stream {
-				streamResult, errStream := manager.ExecuteStream(context.Background(), []string{"antigravity"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
-				if errStream != nil {
-					t.Fatalf("ExecuteStream() after negative hint expiry error = %v", errStream)
-				}
-				var streamed []byte
-				for chunk := range streamResult.Chunks {
-					if chunk.Err != nil {
-						t.Fatalf("unexpected stream chunk error: %v", chunk.Err)
-					}
-					streamed = append(streamed, chunk.Payload...)
-				}
-				if string(streamed) != "credits fallback" {
-					t.Fatalf("ExecuteStream() payload = %q, want %q", string(streamed), "credits fallback")
-				}
-				if len(executor.streamCreditsRequested) != 1 || !executor.streamCreditsRequested[0] {
-					t.Fatalf("streamCreditsRequested = %v, want [true]", executor.streamCreditsRequested)
-				}
+				_, err = manager.ExecuteStream(context.Background(), []string{"antigravity"}, req, cliproxyexecutor.Options{})
 			} else {
-				resp, errExec := manager.Execute(context.Background(), []string{"antigravity"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
-				if errExec != nil {
-					t.Fatalf("Execute() after negative hint expiry error = %v", errExec)
-				}
-				if string(resp.Payload) != "credits fallback" {
-					t.Fatalf("Execute() payload = %q, want %q", string(resp.Payload), "credits fallback")
-				}
-				if len(executor.executeCreditsRequested) != 1 || !executor.executeCreditsRequested[0] {
-					t.Fatalf("executeCreditsRequested = %v, want [true]", executor.executeCreditsRequested)
-				}
+				_, err = manager.Execute(context.Background(), []string{"antigravity"}, req, cliproxyexecutor.Options{})
+			}
+			if statusCodeFromError(err) != http.StatusTooManyRequests || SafeResponseHeaders(err).Get("Retry-After") == "" {
+				t.Fatalf("want original cooldown and deadline, got %v", err)
+			}
+			if len(executor.executeCreditsRequested) != 0 || len(executor.streamCreditsRequested) != 0 {
+				t.Fatalf("cooldown dispatched: execute=%v stream=%v", executor.executeCreditsRequested, executor.streamCreditsRequested)
 			}
 		})
 	}

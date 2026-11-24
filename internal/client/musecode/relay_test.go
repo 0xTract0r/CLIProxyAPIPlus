@@ -304,74 +304,6 @@ func TestRelayDCAOnlyMintsOnceAndUsesMintedOrigin(t *testing.T) {
 	}
 }
 
-func TestRelayRefreshesOnceOn401AndRetiresOnSecond401(t *testing.T) {
-	var mintCalls atomic.Int32
-	var seenTokens []string
-
-	var apiURL string
-	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		tok := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-		seenTokens = append(seenTokens, tok)
-		w.WriteHeader(http.StatusUnauthorized)
-		_, _ = io.WriteString(w, `{"error":"invalid_api_key"}`)
-	}))
-	defer apiServer.Close()
-	apiURL = apiServer.URL
-
-	mintServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mintCalls.Add(1)
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"api_key":"fresh-minted-key","base_url":"`+apiURL+`/v1"}`)
-	}))
-	defer mintServer.Close()
-	t.Setenv("META_MINT_URL", mintServer.URL)
-
-	cfg := &config.Config{}
-	manager := auth.NewManager(nil, nil, nil)
-	manager.RegisterExecutor(executor.NewMetaExecutor(cfg))
-	cred := &auth.Auth{
-		ID:       "meta-refresh-test",
-		Provider: "meta",
-		Status:   auth.StatusActive,
-		Metadata: map[string]any{
-			"type":         "meta",
-			"access_token": "stale-key",
-			"api_key":      "stale-key",
-			"dca_token":    "dca:valid",
-			"base_url":     apiURL + "/v1",
-		},
-		Attributes: map[string]string{
-			"api_key":  "stale-key",
-			"base_url": apiURL + "/v1",
-		},
-	}
-	registerMetaTestCred(t, manager, cred, "muse-wonder-1.0")
-	router := newTestRouter(NewHandler(manager, cfg))
-
-	// First request gets 401 -> refreshes once -> retries -> gets 401 -> retires credential.
-	rec1 := httptest.NewRecorder()
-	router.ServeHTTP(rec1, httptest.NewRequest(http.MethodGet, "/muse-code/config", nil))
-	if rec1.Code != http.StatusUnauthorized {
-		t.Fatalf("first status = %d, want 401", rec1.Code)
-	}
-	if mintCalls.Load() != 1 {
-		t.Fatalf("mintCalls = %d, want 1", mintCalls.Load())
-	}
-	if len(seenTokens) != 2 || seenTokens[0] != "stale-key" || seenTokens[1] != "fresh-minted-key" {
-		t.Fatalf("seenTokens = %#v, want [stale-key fresh-minted-key]", seenTokens)
-	}
-
-	// Subsequent requests must NOT re-mint on every request once retired.
-	rec2 := httptest.NewRecorder()
-	router.ServeHTTP(rec2, httptest.NewRequest(http.MethodGet, "/muse-code/config", nil))
-	if rec2.Code == http.StatusOK {
-		t.Fatalf("second request unexpectedly succeeded")
-	}
-	if mintCalls.Load() != 1 {
-		t.Fatalf("second request triggered extra mint: mintCalls = %d, want 1", mintCalls.Load())
-	}
-}
-
 func TestRelaySkipsRateLimitedCredentialAndPassesRetryAfter(t *testing.T) {
 	var badCalls atomic.Int32
 	badUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -793,6 +725,7 @@ func TestRelayRespectsRequestScopedErrorRulesOn401And429(t *testing.T) {
 	manager.SetConfig(cfg)
 	manager.RegisterExecutor(executor.NewMetaExecutor(cfg))
 	cred := &auth.Auth{
+		ProxyURL: "direct",
 		ID:       "meta-request-scoped-test",
 		Provider: "meta",
 		Status:   auth.StatusActive,
@@ -837,7 +770,7 @@ func TestRelayRespectsRequestScopedErrorRulesOn401And429(t *testing.T) {
 	}
 	assertHealthy(t)
 
-	// 2. 429 matching request-scoped stop skips quota cooldown and keeps credential active.
+	// An explicit provider limit is recorded even when a local rule says stop.
 	upstreamStatus.Store(http.StatusTooManyRequests)
 	upstreamBody.Store(`{"error":"scoped_rate_limit"}`)
 	rec429 := httptest.NewRecorder()
@@ -845,17 +778,18 @@ func TestRelayRespectsRequestScopedErrorRulesOn401And429(t *testing.T) {
 	if rec429.Code != http.StatusTooManyRequests {
 		t.Fatalf("429 status = %d, want 429", rec429.Code)
 	}
-	assertHealthy(t)
+	snapshot, ok := manager.GetByID(cred.ID)
+	if !ok || snapshot == nil || !snapshot.Quota.Exceeded || !snapshot.NextRetryAfter.After(time.Now()) {
+		t.Fatalf("provider cooldown missing: %+v", snapshot)
+	}
 
-	// 3. Subsequent request still uses the same credential without cooldown blocking.
 	upstreamStatus.Store(http.StatusOK)
 	upstreamBody.Store(`{"models":[]}`)
-	rec200 := httptest.NewRecorder()
-	router.ServeHTTP(rec200, httptest.NewRequest(http.MethodGet, "/muse-code/config", nil))
-	if rec200.Code != http.StatusOK {
-		t.Fatalf("follow-up status = %d, want 200; body=%s", rec200.Code, rec200.Body.String())
+	followup := httptest.NewRecorder()
+	router.ServeHTTP(followup, httptest.NewRequest(http.MethodGet, "/muse-code/config", nil))
+	if followup.Code != http.StatusTooManyRequests || followup.Header().Get("Retry-After") == "" {
+		t.Fatalf("follow-up = %d Retry-After=%q, want stored cooldown", followup.Code, followup.Header().Get("Retry-After"))
 	}
-	assertHealthy(t)
 }
 
 func TestRelay429AfterPriorGenerationModelStateFailsOverToBackup(t *testing.T) {
@@ -1019,82 +953,61 @@ func TestRelayNon429CredentialCooldownBlocksAllModelsEvenStatelessOnes(t *testin
 	}
 }
 
-func TestRelayRequestScopedContinueAndCooldownFailover(t *testing.T) {
-	t.Run("continue_fails_over_without_cooling_primary", func(t *testing.T) {
-		var primaryCalls atomic.Int32
-		primaryUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			primaryCalls.Add(1)
-			w.WriteHeader(http.StatusUnauthorized)
-			_, _ = io.WriteString(w, `{"error":"scoped_continue_401"}`)
-		}))
-		defer primaryUpstream.Close()
+func TestRelayProviderRefusalStopsScopedContinuation(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		action string
+		retry  string
+	}{
+		{"unauthorized", http.StatusUnauthorized, auth.RequestScopedActionContinue, ""},
+		{"forbidden", http.StatusForbidden, auth.RequestScopedActionContinue, ""},
+		{"rate_limited", http.StatusTooManyRequests, auth.RequestScopedActionContinueAndCooldown, "60"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var primaryCalls, backupCalls atomic.Int32
+			primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				primaryCalls.Add(1)
+				if tc.retry != "" {
+					w.Header().Set("Retry-After", tc.retry)
+				}
+				w.WriteHeader(tc.status)
+				_, _ = io.WriteString(w, `{"error":"fixture_refusal"}`)
+			}))
+			defer primary.Close()
+			backup := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				backupCalls.Add(1)
+				w.WriteHeader(http.StatusInternalServerError)
+			}))
+			defer backup.Close()
+			cfg := &config.Config{OAuthRequestScopedErrors: map[string][]config.RequestScopedErrorRule{
+				"meta": {{Status: tc.status, Match: []string{"fixture_refusal"}, Action: tc.action}},
+			}}
+			manager := auth.NewManager(nil, &auth.FillFirstSelector{}, nil)
+			manager.SetConfig(cfg)
+			manager.RegisterExecutor(executor.NewMetaExecutor(cfg))
+			for _, item := range []struct{ id, url, priority string }{
+				{"fixture-primary", primary.URL, "10"}, {"fixture-backup", backup.URL, "1"},
+			} {
+				registerMetaTestCred(t, manager, &auth.Auth{
+					ProxyURL: "direct",
+					ID:       item.id, Provider: "meta", Status: auth.StatusActive,
+					Attributes: map[string]string{"auth_kind": "oauth", "api_key": "fixture", "base_url": item.url + "/v1", "priority": item.priority},
+				}, "muse-wonder-1.0")
+			}
+			rec := httptest.NewRecorder()
+			newTestRouter(NewHandler(manager, cfg)).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/muse-code/config", nil))
+			if rec.Code != tc.status || rec.Header().Get("Retry-After") != tc.retry || !strings.Contains(rec.Body.String(), "fixture_refusal") {
+				t.Fatalf("status=%d Retry-After=%q body=%q", rec.Code, rec.Header().Get("Retry-After"), rec.Body.String())
+			}
+			if primaryCalls.Load() != 1 || backupCalls.Load() != 0 {
+				t.Fatalf("calls primary=%d backup=%d, want 1 and 0", primaryCalls.Load(), backupCalls.Load())
+			}
+		})
+	}
+}
 
-		var backupCalls atomic.Int32
-		backupUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			backupCalls.Add(1)
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
-			_, _ = io.WriteString(w, `{"models":["from-backup"]}`)
-		}))
-		defer backupUpstream.Close()
-
-		cfg := &config.Config{
-			OAuthRequestScopedErrors: map[string][]config.RequestScopedErrorRule{
-				"meta": {
-					{
-						Status: 401,
-						Match:  []string{"scoped_continue_401"},
-						Action: auth.RequestScopedActionContinue,
-					},
-				},
-			},
-		}
-		manager := auth.NewManager(nil, &auth.FillFirstSelector{}, nil)
-		manager.SetConfig(cfg)
-		manager.RegisterExecutor(executor.NewMetaExecutor(cfg))
-
-		credPrimary := &auth.Auth{
-			ID:       "meta-continue-primary",
-			Provider: "meta",
-			Status:   auth.StatusActive,
-			Metadata: map[string]any{"type": "meta", "access_token": "p-key", "api_key": "p-key", "dca_token": "dca:p", "base_url": primaryUpstream.URL + "/v1"},
-			Attributes: map[string]string{
-				"auth_kind": "oauth",
-				"api_key":   "p-key",
-				"base_url":  primaryUpstream.URL + "/v1",
-				"priority":  "10",
-			},
-		}
-		credBackup := &auth.Auth{
-			ID:       "meta-continue-backup",
-			Provider: "meta",
-			Status:   auth.StatusActive,
-			Metadata: map[string]any{"type": "meta", "access_token": "b-key", "api_key": "b-key", "base_url": backupUpstream.URL + "/v1"},
-			Attributes: map[string]string{
-				"auth_kind": "oauth",
-				"api_key":   "b-key",
-				"base_url":  backupUpstream.URL + "/v1",
-				"priority":  "1",
-			},
-		}
-		registerMetaTestCred(t, manager, credPrimary, "muse-wonder-1.0")
-		registerMetaTestCred(t, manager, credBackup, "muse-wonder-1.0")
-		router := newTestRouter(NewHandler(manager, cfg))
-
-		rec := httptest.NewRecorder()
-		router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/muse-code/config", nil))
-		if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "from-backup") {
-			t.Fatalf("status=%d body=%q, want 200 from backup", rec.Code, rec.Body.String())
-		}
-		if primaryCalls.Load() != 1 || backupCalls.Load() != 1 {
-			t.Fatalf("calls primary=%d backup=%d, want 1 and 1", primaryCalls.Load(), backupCalls.Load())
-		}
-		snap, _ := manager.GetByID(credPrimary.ID)
-		if snap == nil || snap.Unavailable || snap.Status != auth.StatusActive || snap.RejectedAccessToken != "" {
-			t.Fatalf("continue must not cool or reject primary credential: %+v", snap)
-		}
-	})
-
+func TestRelayBoundedCredentialRefusal(t *testing.T) {
 	t.Run("continue_bounded_by_max_retry_credentials", func(t *testing.T) {
 		var primaryCalls, backupCalls atomic.Int32
 		primaryUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1121,11 +1034,13 @@ func TestRelayRequestScopedContinueAndCooldownFailover(t *testing.T) {
 		manager.RegisterExecutor(executor.NewMetaExecutor(cfg))
 
 		registerMetaTestCred(t, manager, &auth.Auth{
-			ID: "meta-bound-p", Provider: "meta", Status: auth.StatusActive,
+			ProxyURL: "direct",
+			ID:       "meta-bound-p", Provider: "meta", Status: auth.StatusActive,
 			Attributes: map[string]string{"auth_kind": "oauth", "api_key": "p-key", "base_url": primaryUpstream.URL + "/v1", "priority": "10"},
 		}, "muse-wonder-1.0")
 		registerMetaTestCred(t, manager, &auth.Auth{
-			ID: "meta-bound-b", Provider: "meta", Status: auth.StatusActive,
+			ProxyURL: "direct",
+			ID:       "meta-bound-b", Provider: "meta", Status: auth.StatusActive,
 			Attributes: map[string]string{"auth_kind": "oauth", "api_key": "b-key", "base_url": backupUpstream.URL + "/v1", "priority": "1"},
 		}, "muse-wonder-1.0")
 		router := newTestRouter(NewHandler(manager, cfg))
@@ -1137,104 +1052,6 @@ func TestRelayRequestScopedContinueAndCooldownFailover(t *testing.T) {
 		}
 		if primaryCalls.Load() != 1 || backupCalls.Load() != 0 {
 			t.Fatalf("calls primary=%d backup=%d, want 1 and 0", primaryCalls.Load(), backupCalls.Load())
-		}
-	})
-
-	t.Run("continue_and_cooldown_cools_primary_and_fails_over_to_backup", func(t *testing.T) {
-		var primaryCalls, backupCalls atomic.Int32
-		primaryUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			primaryCalls.Add(1)
-			w.Header().Set("Retry-After", "60")
-			w.WriteHeader(http.StatusTooManyRequests)
-			_, _ = io.WriteString(w, `{"error":"scoped_continue_cooldown"}`)
-		}))
-		defer primaryUpstream.Close()
-		backupUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			backupCalls.Add(1)
-			w.WriteHeader(http.StatusOK)
-			_, _ = io.WriteString(w, `{"models":["from-backup"]}`)
-		}))
-		defer backupUpstream.Close()
-
-		cfg := &config.Config{
-			DisableCooling: true,
-			OAuthRequestScopedErrors: map[string][]config.RequestScopedErrorRule{
-				"meta": {{Status: 429, Match: []string{"scoped_continue_cooldown"}, Action: auth.RequestScopedActionContinueAndCooldown}},
-			},
-		}
-		manager := auth.NewManager(nil, &auth.FillFirstSelector{}, nil)
-		manager.SetConfig(cfg)
-		manager.RegisterExecutor(executor.NewMetaExecutor(cfg))
-
-		credPrimary := &auth.Auth{
-			ID: "meta-cc-primary", Provider: "meta", Status: auth.StatusActive,
-			Attributes: map[string]string{"auth_kind": "oauth", "api_key": "p-key", "base_url": primaryUpstream.URL + "/v1", "priority": "10"},
-		}
-		credBackup := &auth.Auth{
-			ID: "meta-cc-backup", Provider: "meta", Status: auth.StatusActive,
-			Attributes: map[string]string{"auth_kind": "oauth", "api_key": "b-key", "base_url": backupUpstream.URL + "/v1", "priority": "1"},
-		}
-		registerMetaTestCred(t, manager, credPrimary, "muse-wonder-1.0")
-		registerMetaTestCred(t, manager, credBackup, "muse-wonder-1.0")
-		router := newTestRouter(NewHandler(manager, cfg))
-
-		// First request fails over from primary to backup and force-cools primary.
-		rec1 := httptest.NewRecorder()
-		router.ServeHTTP(rec1, httptest.NewRequest(http.MethodGet, "/muse-code/config", nil))
-		if rec1.Code != http.StatusOK || !strings.Contains(rec1.Body.String(), "from-backup") {
-			t.Fatalf("first status=%d body=%q, want 200 from backup", rec1.Code, rec1.Body.String())
-		}
-		snap, _ := manager.GetByID(credPrimary.ID)
-		if snap == nil || !snap.Unavailable || !snap.Quota.Exceeded || snap.Quota.Reason != auth.ErrorCodeCredentialQuota {
-			t.Fatalf("expected primary to be force-cooled, got %+v", snap)
-		}
-
-		// Second request skips cooled primary and goes directly to backup.
-		rec2 := httptest.NewRecorder()
-		router.ServeHTTP(rec2, httptest.NewRequest(http.MethodGet, "/muse-code/config", nil))
-		if rec2.Code != http.StatusOK {
-			t.Fatalf("second status=%d, want 200", rec2.Code)
-		}
-		if primaryCalls.Load() != 1 || backupCalls.Load() != 2 {
-			t.Fatalf("calls primary=%d backup=%d, want 1 and 2", primaryCalls.Load(), backupCalls.Load())
-		}
-	})
-
-	t.Run("continue_exhausts_all_tried_credentials_once_and_returns_last_response", func(t *testing.T) {
-		var calls atomic.Int32
-		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			calls.Add(1)
-			w.WriteHeader(http.StatusUnauthorized)
-			_, _ = io.WriteString(w, `{"error":"scoped_continue_401"}`)
-		}))
-		defer upstream.Close()
-
-		cfg := &config.Config{
-			OAuthRequestScopedErrors: map[string][]config.RequestScopedErrorRule{
-				"meta": {{Status: 401, Match: []string{"scoped_continue_401"}, Action: auth.RequestScopedActionContinue}},
-			},
-		}
-		manager := auth.NewManager(nil, &auth.FillFirstSelector{}, nil)
-		manager.SetConfig(cfg)
-		manager.RegisterExecutor(executor.NewMetaExecutor(cfg))
-
-		registerMetaTestCred(t, manager, &auth.Auth{
-			ID: "meta-exhaust-1", Provider: "meta", Status: auth.StatusActive,
-			Attributes: map[string]string{"auth_kind": "oauth", "api_key": "k1", "base_url": upstream.URL + "/v1", "priority": "10"},
-		}, "muse-wonder-1.0")
-		registerMetaTestCred(t, manager, &auth.Auth{
-			ID: "meta-exhaust-2", Provider: "meta", Status: auth.StatusActive,
-			Attributes: map[string]string{"auth_kind": "oauth", "api_key": "k2", "base_url": upstream.URL + "/v1", "priority": "1"},
-		}, "muse-wonder-1.0")
-		router := newTestRouter(NewHandler(manager, cfg))
-
-		rec := httptest.NewRecorder()
-		router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/muse-code/config", nil))
-		if rec.Code != http.StatusUnauthorized || !strings.Contains(rec.Body.String(), "scoped_continue_401") {
-			t.Fatalf("status=%d body=%q, want final 401 upstream error", rec.Code, rec.Body.String())
-		}
-		if calls.Load() != 2 {
-			t.Fatalf("calls = %d, want 2 (each credential tried once)", calls.Load())
 		}
 	})
 }

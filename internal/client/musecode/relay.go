@@ -108,6 +108,15 @@ func writeRelayAttemptResponse(c *gin.Context, resp *relayAttemptResponse) {
 	}
 }
 
+func isRelayProviderRefusal(status int) bool {
+	switch status {
+	case http.StatusUnauthorized, http.StatusForbidden, http.StatusTooManyRequests:
+		return true
+	default:
+		return false
+	}
+}
+
 func isRequestScopedContinue(action string, okAction bool) bool {
 	return okAction && (action == auth.RequestScopedActionContinue || action == auth.RequestScopedActionContinueAndCooldown)
 }
@@ -203,7 +212,7 @@ func (h *Handler) Handle(c *gin.Context) {
 						return
 					}
 					action, okAction := h.markFailure(ctx, selected, errPrep, nil, prepareSeq)
-					if isRequestScopedContinue(action, okAction) {
+					if isRequestScopedContinue(action, okAction) && !isRelayProviderRefusal(clienterror.HTTPStatusFromErrorOr(errPrep, 0)) {
 						lastResp = nil
 						lastErr = errPrep
 						continue
@@ -218,13 +227,13 @@ func (h *Handler) Handle(c *gin.Context) {
 		}
 
 		logging.SetGinCPATraceID(c, selected.EnsureIndex())
-		respAttempt, action, okAction, errAttempt := h.forwardWithCredential(ctx, cfg, selected, c.Request.Method, c.Request.URL.Path, sanitizedQuery, reqBody, baseReqHeaders, c.Request.Header)
+		respAttempt, action, okAction, errAttempt := h.forwardWithCredential(ctx, cfg, selected, c.Request.Method, c.Request.URL.Path, sanitizedQuery, reqBody, baseReqHeaders)
 		if errAttempt != nil {
 			if errCtx := ctx.Err(); errCtx != nil {
 				c.JSON(clienterror.HTTPStatusFromErrorOr(errCtx, http.StatusBadGateway), gin.H{"error": errCtx.Error()})
 				return
 			}
-			if isRequestScopedContinue(action, okAction) {
+			if isRequestScopedContinue(action, okAction) && !isRelayProviderRefusal(clienterror.HTTPStatusFromErrorOr(errAttempt, 0)) {
 				lastResp = nil
 				lastErr = errAttempt
 				continue
@@ -232,7 +241,7 @@ func (h *Handler) Handle(c *gin.Context) {
 			c.JSON(clienterror.HTTPStatusFromErrorOr(errAttempt, http.StatusBadGateway), gin.H{"error": errAttempt.Error()})
 			return
 		}
-		if isRequestScopedContinue(action, okAction) {
+		if isRequestScopedContinue(action, okAction) && !isRelayProviderRefusal(respAttempt.statusCode) {
 			lastResp = respAttempt
 			lastErr = nil
 			continue
@@ -261,92 +270,79 @@ func (h *Handler) forwardWithCredential(
 	sanitizedQuery string,
 	reqBody []byte,
 	baseReqHeaders http.Header,
-	clientHeaders http.Header,
 ) (*relayAttemptResponse, string, bool, error) {
-	alreadyRefreshed := false
-	for {
-		origin, errOrigin := originFromAuth(selected)
-		if errOrigin != nil {
-			return nil, "", false, errOrigin
-		}
-
-		upstreamURL := origin + requestPath
-		if sanitizedQuery != "" {
-			upstreamURL += "?" + sanitizedQuery
-		}
-
-		upstreamReq, errReq := h.authManager.NewHttpRequest(ctx, selected, method, upstreamURL, reqBody, baseReqHeaders)
-		if errReq != nil {
-			return nil, "", false, errReq
-		}
-
-		authType, authValue := selected.AccountInfo()
-		helps.RecordAPIRequest(ctx, cfg, helps.UpstreamRequestLog{
-			URL:       upstreamURL,
-			Method:    method,
-			Headers:   upstreamReq.Header.Clone(),
-			Body:      reqBody,
-			Provider:  "meta",
-			AuthID:    selected.ID,
-			AuthLabel: selected.Label,
-			AuthType:  authType,
-			AuthValue: authValue,
-		})
-
-		executionSeq := h.authManager.NextExecutionSeq()
-		resp, errDo := h.authManager.HttpRequest(ctx, selected, upstreamReq)
-		if errDo != nil {
-			helps.RecordAPIResponseError(ctx, cfg, errDo)
-			if errCtx := ctx.Err(); errCtx != nil {
-				return nil, "", false, errCtx
-			}
-			action, okAction := h.markFailure(ctx, selected, errDo, nil, executionSeq)
-			return nil, action, okAction, errDo
-		}
-
-		respBody, errRespRead := readLimitedBody(resp.Body)
-		if errClose := resp.Body.Close(); errClose != nil {
-			log.Errorf("muse code relay: close response body error: %v", errClose)
-		}
-		helps.RecordAPIResponseMetadata(ctx, cfg, resp.StatusCode, resp.Header.Clone())
-		helps.AppendAPIResponseChunk(ctx, cfg, respBody)
-		if errRespRead != nil {
-			helps.RecordAPIResponseError(ctx, cfg, errRespRead)
-			if errCtx := ctx.Err(); errCtx != nil {
-				return nil, "", false, errCtx
-			}
-			if errors.Is(errRespRead, errBodyTooLarge) {
-				return nil, "", false, errors.New("Meta response body exceeds 16 MiB limit")
-			}
-			action, okAction := h.markFailure(ctx, selected, errRespRead, nil, executionSeq)
-			return nil, action, okAction, errors.New("Failed to read Meta response")
-		}
-
-		if resp.StatusCode == http.StatusUnauthorized && !alreadyRefreshed {
-			unauthErr := &auth.Error{HTTPStatus: resp.StatusCode, Message: string(respBody)}
-			if refreshed, okRefresh := h.authManager.RefreshAfterUnauthorized(ctx, selected, unauthErr, false, clientHeaders); okRefresh && refreshed != nil {
-				selected = refreshed
-				alreadyRefreshed = true
-				continue
-			}
-		}
-
-		var action string
-		var okAction bool
-		if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusBadRequest {
-			h.markSuccess(ctx, selected, executionSeq)
-		} else if resp.StatusCode >= http.StatusBadRequest {
-			logging.SetResponseHeaders(ctx, resp.Header.Clone())
-			retryAfter := parseRetryAfterHeader(resp.Header, time.Now())
-			action, okAction = h.markHTTPResponseFailure(ctx, selected, resp.StatusCode, string(respBody), retryAfter, executionSeq)
-		}
-
-		return &relayAttemptResponse{
-			statusCode: resp.StatusCode,
-			headers:    resp.Header.Clone(),
-			body:       respBody,
-		}, action, okAction, nil
+	origin, errOrigin := originFromAuth(selected)
+	if errOrigin != nil {
+		return nil, "", false, errOrigin
 	}
+
+	upstreamURL := origin + requestPath
+	if sanitizedQuery != "" {
+		upstreamURL += "?" + sanitizedQuery
+	}
+
+	upstreamReq, errReq := h.authManager.NewHttpRequest(ctx, selected, method, upstreamURL, reqBody, baseReqHeaders)
+	if errReq != nil {
+		return nil, "", false, errReq
+	}
+
+	authType, authValue := selected.AccountInfo()
+	helps.RecordAPIRequest(ctx, cfg, helps.UpstreamRequestLog{
+		URL:       upstreamURL,
+		Method:    method,
+		Headers:   upstreamReq.Header.Clone(),
+		Body:      reqBody,
+		Provider:  "meta",
+		AuthID:    selected.ID,
+		AuthLabel: selected.Label,
+		AuthType:  authType,
+		AuthValue: authValue,
+	})
+
+	executionSeq := h.authManager.NextExecutionSeq()
+	resp, errDo := h.authManager.HttpRequest(ctx, selected, upstreamReq)
+	if errDo != nil {
+		helps.RecordAPIResponseError(ctx, cfg, errDo)
+		if errCtx := ctx.Err(); errCtx != nil {
+			return nil, "", false, errCtx
+		}
+		action, okAction := h.markFailure(ctx, selected, errDo, nil, executionSeq)
+		return nil, action, okAction, errDo
+	}
+
+	respBody, errRespRead := readLimitedBody(resp.Body)
+	if errClose := resp.Body.Close(); errClose != nil {
+		log.Errorf("muse code relay: close response body error: %v", errClose)
+	}
+	helps.RecordAPIResponseMetadata(ctx, cfg, resp.StatusCode, resp.Header.Clone())
+	helps.AppendAPIResponseChunk(ctx, cfg, respBody)
+	if errRespRead != nil {
+		helps.RecordAPIResponseError(ctx, cfg, errRespRead)
+		if errCtx := ctx.Err(); errCtx != nil {
+			return nil, "", false, errCtx
+		}
+		if errors.Is(errRespRead, errBodyTooLarge) {
+			return nil, "", false, errors.New("Meta response body exceeds 16 MiB limit")
+		}
+		action, okAction := h.markFailure(ctx, selected, errRespRead, nil, executionSeq)
+		return nil, action, okAction, errors.New("Failed to read Meta response")
+	}
+
+	var action string
+	var okAction bool
+	if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusBadRequest {
+		h.markSuccess(ctx, selected, executionSeq)
+	} else if resp.StatusCode >= http.StatusBadRequest {
+		logging.SetResponseHeaders(ctx, resp.Header.Clone())
+		retryAfter := parseRetryAfterHeader(resp.Header, time.Now())
+		action, okAction = h.markHTTPResponseFailure(ctx, selected, resp.StatusCode, string(respBody), retryAfter, executionSeq)
+	}
+
+	return &relayAttemptResponse{
+		statusCode: resp.StatusCode,
+		headers:    resp.Header.Clone(),
+		body:       respBody,
+	}, action, okAction, nil
 }
 
 func (h *Handler) selectMetaAuthExcluding(ctx context.Context, opts coreexecutor.Options, tried map[string]struct{}) (*auth.Auth, error) {

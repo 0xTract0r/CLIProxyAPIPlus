@@ -398,6 +398,12 @@ func shouldExposeResponsesUpstreamError(errMsg *interfaces.ErrorMessage) bool {
 		return true
 	}
 	status := responsesWebsocketErrorStatus(errMsg)
+	if status == http.StatusForbidden {
+		var refusal interface{ IsUpstreamWebsocketRefusal() bool }
+		if errors.As(errMsg.Error, &refusal) && refusal.IsUpstreamWebsocketRefusal() {
+			return true
+		}
+	}
 	if status == http.StatusTooManyRequests || isResponsesWebsocketQuotaOrCooldownError(errMsg.Error) {
 		return true
 	}

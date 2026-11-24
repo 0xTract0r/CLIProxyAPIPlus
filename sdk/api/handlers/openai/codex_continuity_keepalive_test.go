@@ -3,6 +3,7 @@ package openai
 import (
 	"bufio"
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -1655,17 +1656,14 @@ func (e *wsPinnedFailoverQuotaExecutor) ExecuteStream(_ context.Context, auth *c
 		close(ch)
 		return &coreexecutor.StreamResult{Chunks: ch}, nil
 	}
-	// Call 3 (failoverInPlace replay after ready) succeeds on the alternative auth.
-	ch <- coreexecutor.StreamChunk{Payload: []byte("data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_ws_turn2_failover\"}}\n\n")}
-	ch <- coreexecutor.StreamChunk{Payload: []byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_ws_turn2_failover\",\"output\":[]}}\n\n")}
 	close(ch)
-	return &coreexecutor.StreamResult{Chunks: ch}, nil
+	return nil, errors.New("unexpected extra execution after provider refusal")
 }
 
-func TestResponsesWebsocketFailoverInPlaceRespectsPreOutput429GateWithZeroBootstrapRetries(t *testing.T) {
+func TestResponsesWebsocketPinnedProviderRefusalStaysTerminal(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	runCase := func(t *testing.T, disableCooling bool, retryLimit int, continuityDecision pluginapi.SchedulerContinuityDecision, wantContinuityCalls int32, wantExecCalls int32, wantTurn2Success bool) {
+	runCase := func(t *testing.T, disableCooling bool, retryLimit int, continuityDecision pluginapi.SchedulerContinuityDecision) {
 		t.Helper()
 		manager := coreauth.NewManager(nil, nil, nil)
 		manager.SetRetryConfig(retryLimit, 0, 0)
@@ -1718,7 +1716,10 @@ func TestResponsesWebsocketFailoverInPlaceRespectsPreOutput429GateWithZeroBootst
 			}
 		}()
 
-		// Turn 1 pins auth A.
+		if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		// Turn 1 pins the selected grant.
 		if errWrite := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gpt-5-codex","input":[{"type":"message","role":"user","content":"turn1"}]}`)); errWrite != nil {
 			t.Fatalf("write turn1: %v", errWrite)
 		}
@@ -1733,7 +1734,7 @@ func TestResponsesWebsocketFailoverInPlaceRespectsPreOutput429GateWithZeroBootst
 		}
 
 		// Turn 2 gets partial frame + quota 429 on pinned auth A while auth B is available.
-		// With bootstrap-retries=0, failoverInPlace must NOT bypass pre_output_429 gate or zero retry budget.
+		// A partial frame must never cause a rejected turn to execute again.
 		if errWrite := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gpt-5-codex","input":[{"type":"message","role":"user","content":"turn2"}]}`)); errWrite != nil {
 			t.Fatalf("write turn2: %v", errWrite)
 		}
@@ -1742,269 +1743,29 @@ func TestResponsesWebsocketFailoverInPlaceRespectsPreOutput429GateWithZeroBootst
 			if errRead2 != nil {
 				t.Fatalf("read turn2: %v", errRead2)
 			}
-			if wantTurn2Success {
-				if strings.Contains(string(turn2Msg), "response.completed") {
-					break
-				}
-				continue
-			}
-			if !strings.Contains(string(turn2Msg), "usage_limit_reached") && !strings.Contains(string(turn2Msg), "rate_limit") {
+			if !strings.Contains(string(turn2Msg), `"status":429`) || !strings.Contains(string(turn2Msg), "usage_limit_reached") {
 				t.Fatalf("turn2 msg = %s, want quota error", string(turn2Msg))
 			}
 			break
 		}
-		if exec.calls.Load() != wantExecCalls {
-			t.Fatalf("exec calls = %d, want %d", exec.calls.Load(), wantExecCalls)
+		exec.mu.Lock()
+		ids := append([]string(nil), exec.authIDs...)
+		exec.mu.Unlock()
+		if len(ids) != 2 || ids[0] != ids[1] || exec.calls.Load() != 2 {
+			t.Fatalf("dispatch IDs = %v, want exactly two user turns on one grant", ids)
 		}
-		if continuityCalls.Load() != wantContinuityCalls {
-			t.Fatalf("continuityCalls = %d, want %d", continuityCalls.Load(), wantContinuityCalls)
+		if got := continuityCalls.Load(); got != 0 {
+			t.Fatalf("provider refusal entered continuity scheduler (%d calls)", got)
 		}
 	}
 
-	t.Run("disable_cooling zero retry budget blocks failoverInPlace", func(t *testing.T) {
-		runCase(t, true, 0, pluginapi.SchedulerContinuityReady, 0, 2, false)
+	t.Run("zero_budget_disable_cooling", func(t *testing.T) {
+		runCase(t, true, 0, pluginapi.SchedulerContinuityReady)
 	})
-
-	t.Run("non-ready pre_output_429 gate blocks failoverInPlace", func(t *testing.T) {
-		runCase(t, false, 1, pluginapi.SchedulerContinuityDisabled, 1, 2, false)
+	t.Run("scheduler_disabled", func(t *testing.T) {
+		runCase(t, false, 1, pluginapi.SchedulerContinuityDisabled)
 	})
-
-	t.Run("ready pre_output_429 gate allows failoverInPlace", func(t *testing.T) {
-		runCase(t, false, 1, pluginapi.SchedulerContinuityReady, 1, 3, true)
-	})
-
-	t.Run("failoverInPlace gate unpins and excludes failed auth from candidate set", func(t *testing.T) {
-		manager := coreauth.NewManager(nil, nil, nil)
-		manager.SetRetryConfig(1, 0, 0)
-		exec := &wsPinnedFailoverQuotaExecutor{}
-		manager.RegisterExecutor(exec)
-
-		// Register only Auth A initially so Turn 1 deterministically pins Auth A,
-		// then register active Auth B before Turn 2 so failoverInPlace has an alternative target.
-		authA := &coreauth.Auth{ID: "codex-ws-failover-a", Provider: "codex", Status: coreauth.StatusActive, Attributes: map[string]string{"websockets": "true"}}
-		if _, errReg := manager.Register(context.Background(), authA); errReg != nil {
-			t.Fatalf("register %s: %v", authA.ID, errReg)
-		}
-		registry.GetGlobalRegistry().RegisterClient(authA.ID, "codex", []*registry.ModelInfo{{ID: "gpt-5-codex"}})
-		t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(authA.ID) })
-
-		var sawFailedAuthInCandidates atomic.Bool
-		var sawAlternativeCandidate atomic.Bool
-		var sawPinnedPolicy atomic.Bool
-		var continuityCalls atomic.Int32
-		manager.SetPluginScheduler(&sseContinuityScheduler{
-			continuityFn: func(_ context.Context, req pluginapi.SchedulerContinuityRequest) (pluginapi.SchedulerContinuityResponse, bool, error) {
-				continuityCalls.Add(1)
-				if len(req.Options.Metadata) > 0 {
-					if pinned, ok := req.Options.Metadata[coreexecutor.PinnedAuthMetadataKey].(string); ok && pinned != "" {
-						sawPinnedPolicy.Store(true)
-					}
-				}
-				for _, cand := range req.Candidates {
-					if cand.ID == "codex-ws-failover-a" {
-						sawFailedAuthInCandidates.Store(true)
-					}
-					if cand.ID == "codex-ws-failover-b" && !cand.InCooldown {
-						sawAlternativeCandidate.Store(true)
-					}
-				}
-				if sawFailedAuthInCandidates.Load() || !sawAlternativeCandidate.Load() || sawPinnedPolicy.Load() {
-					return pluginapi.SchedulerContinuityResponse{Decision: pluginapi.SchedulerContinuityDisabled}, true, nil
-				}
-				return pluginapi.SchedulerContinuityResponse{Decision: pluginapi.SchedulerContinuityReady}, true, nil
-			},
-		})
-
-		cfg := &sdkconfig.SDKConfig{Streaming: sdkconfig.StreamingConfig{BootstrapRetries: 0}}
-		h := NewOpenAIResponsesAPIHandler(handlers.NewBaseAPIHandlers(cfg, manager))
-		router := gin.New()
-		router.GET("/v1/responses", h.ResponsesWebsocket)
-		server := httptest.NewServer(router)
-		defer server.Close()
-
-		wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/v1/responses"
-		conn, _, errDial := websocket.DefaultDialer.Dial(wsURL, nil)
-		if errDial != nil {
-			t.Fatalf("dial: %v", errDial)
-		}
-		defer func() {
-			if errClose := conn.Close(); errClose != nil && !strings.Contains(errClose.Error(), "use of closed network connection") {
-				t.Logf("websocket close: %v", errClose)
-			}
-		}()
-
-		// Turn 1 pins auth A.
-		if errWrite := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gpt-5-codex","input":[{"type":"message","role":"user","content":"turn1"}]}`)); errWrite != nil {
-			t.Fatalf("write turn1: %v", errWrite)
-		}
-		for {
-			_, msg, errRead := conn.ReadMessage()
-			if errRead != nil {
-				t.Fatalf("read turn1: %v", errRead)
-			}
-			if strings.Contains(string(msg), "response.completed") {
-				break
-			}
-		}
-
-		// Register active Auth B before Turn 2.
-		authB := &coreauth.Auth{ID: "codex-ws-failover-b", Provider: "codex", Status: coreauth.StatusActive, Attributes: map[string]string{"websockets": "true"}}
-		if _, errReg := manager.Register(context.Background(), authB); errReg != nil {
-			t.Fatalf("register %s: %v", authB.ID, errReg)
-		}
-		registry.GetGlobalRegistry().RegisterClient(authB.ID, "codex", []*registry.ModelInfo{{ID: "gpt-5-codex"}})
-		t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(authB.ID) })
-
-		// Turn 2 fails on A -> gate must unpin and exclude A, seeing only active B.
-		if errWrite := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gpt-5-codex","input":[{"type":"message","role":"user","content":"turn2"}]}`)); errWrite != nil {
-			t.Fatalf("write turn2: %v", errWrite)
-		}
-		for {
-			_, msg, errRead := conn.ReadMessage()
-			if errRead != nil {
-				t.Fatalf("read turn2: %v", errRead)
-			}
-			if strings.Contains(string(msg), "response.completed") {
-				break
-			}
-		}
-		if continuityCalls.Load() != 1 || sawFailedAuthInCandidates.Load() || !sawAlternativeCandidate.Load() || sawPinnedPolicy.Load() {
-			t.Fatalf("continuityCalls=%d sawFailed=%v sawAlt=%v sawPinned=%v, want 1, false, true, false",
-				continuityCalls.Load(), sawFailedAuthInCandidates.Load(), sawAlternativeCandidate.Load(), sawPinnedPolicy.Load())
-		}
-		if exec.calls.Load() != 3 {
-			t.Fatalf("exec calls = %d, want 3 (turn1 A, turn2 A fail, turn2 B replay)", exec.calls.Load())
-		}
-	})
-
-	t.Run("failoverInPlace_gate_waits_and_recovers_when_alternative_auth_starts_in_quota_cooldown", func(t *testing.T) {
-		gin.SetMode(gin.TestMode)
-		exec := &wsPinnedFailoverQuotaExecutor{}
-		manager := coreauth.NewManager(nil, nil, nil)
-		manager.RegisterExecutor(exec)
-		manager.SetRetryConfig(1, 500*time.Millisecond, 0)
-
-		authA := &coreauth.Auth{ID: "codex-ws-cooldown-a", Provider: "codex", Status: coreauth.StatusActive, Attributes: map[string]string{"websockets": "true"}}
-		if _, errReg := manager.Register(context.Background(), authA); errReg != nil {
-			t.Fatalf("register %s: %v", authA.ID, errReg)
-		}
-		registry.GetGlobalRegistry().RegisterClient(authA.ID, "codex", []*registry.ModelInfo{{ID: "gpt-5-codex"}})
-		t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(authA.ID) })
-
-		var mu sync.Mutex
-		var pickRequestIDs []string
-		var continuityRequestIDs []string
-		var continuityCalls atomic.Int32
-		manager.SetPluginScheduler(&sseContinuityScheduler{
-			pickFn: func(_ context.Context, req pluginapi.SchedulerPickRequest) (pluginapi.SchedulerPickResponse, bool, error) {
-				reqID, _ := req.Options.Metadata[coreexecutor.RequestIDMetadataKey].(string)
-				mu.Lock()
-				pickRequestIDs = append(pickRequestIDs, reqID)
-				mu.Unlock()
-				return pluginapi.SchedulerPickResponse{}, false, nil
-			},
-			continuityFn: func(_ context.Context, req pluginapi.SchedulerContinuityRequest) (pluginapi.SchedulerContinuityResponse, bool, error) {
-				mu.Lock()
-				continuityRequestIDs = append(continuityRequestIDs, req.RequestID)
-				mu.Unlock()
-				n := continuityCalls.Add(1)
-				if n == 1 {
-					return pluginapi.SchedulerContinuityResponse{
-						Decision:       pluginapi.SchedulerContinuityWait,
-						PollIntervalMs: 10,
-					}, true, nil
-				}
-				// Recover alternative auth B from quota cooldown during wait.
-				_, _ = manager.Update(context.Background(), &coreauth.Auth{
-					ID:         "codex-ws-cooldown-b",
-					Provider:   "codex",
-					Status:     coreauth.StatusActive,
-					Attributes: map[string]string{"websockets": "true"},
-				})
-				return pluginapi.SchedulerContinuityResponse{Decision: pluginapi.SchedulerContinuityReady}, true, nil
-			},
-		})
-
-		cfg := &sdkconfig.SDKConfig{Streaming: sdkconfig.StreamingConfig{BootstrapRetries: 0}}
-		h := NewOpenAIResponsesAPIHandler(handlers.NewBaseAPIHandlers(cfg, manager))
-		router := gin.New()
-		router.GET("/v1/responses", h.ResponsesWebsocket)
-		server := httptest.NewServer(router)
-		defer server.Close()
-
-		wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/v1/responses"
-		conn, _, errDial := websocket.DefaultDialer.Dial(wsURL, nil)
-		if errDial != nil {
-			t.Fatalf("dial: %v", errDial)
-		}
-		defer func() {
-			if errClose := conn.Close(); errClose != nil && !strings.Contains(errClose.Error(), "use of closed network connection") {
-				t.Logf("websocket close: %v", errClose)
-			}
-		}()
-
-		// Turn 1 pins auth A.
-		if errWrite := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gpt-5-codex","input":[{"type":"message","role":"user","content":"turn1"}]}`)); errWrite != nil {
-			t.Fatalf("write turn1: %v", errWrite)
-		}
-		for {
-			_, msg, errRead := conn.ReadMessage()
-			if errRead != nil {
-				t.Fatalf("read turn1: %v", errRead)
-			}
-			if strings.Contains(string(msg), "response.completed") {
-				break
-			}
-		}
-
-		// Register Auth B in quota cooldown before Turn 2.
-		recoverAt := time.Now().Add(time.Minute)
-		authB := &coreauth.Auth{
-			ID:             "codex-ws-cooldown-b",
-			Provider:       "codex",
-			Status:         coreauth.StatusActive,
-			Attributes:     map[string]string{"websockets": "true"},
-			Quota:          coreauth.QuotaState{Exceeded: true, Reason: "quota", NextRecoverAt: recoverAt},
-			NextRetryAfter: recoverAt,
-		}
-		if _, errReg := manager.Register(context.Background(), authB); errReg != nil {
-			t.Fatalf("register %s: %v", authB.ID, errReg)
-		}
-		registry.GetGlobalRegistry().RegisterClient(authB.ID, "codex", []*registry.ModelInfo{{ID: "gpt-5-codex"}})
-		t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(authB.ID) })
-
-		// Turn 2 fails on A -> gate must run BEFORE alternative-target check, wait, recover B, and failover in place.
-		if errWrite := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gpt-5-codex","input":[{"type":"message","role":"user","content":"turn2"}]}`)); errWrite != nil {
-			t.Fatalf("write turn2: %v", errWrite)
-		}
-		for {
-			_, msg, errRead := conn.ReadMessage()
-			if errRead != nil {
-				t.Fatalf("read turn2: %v", errRead)
-			}
-			if strings.Contains(string(msg), "response.completed") {
-				break
-			}
-		}
-
-		if continuityCalls.Load() != 2 {
-			t.Fatalf("continuityCalls = %d, want 2 (wait + ready)", continuityCalls.Load())
-		}
-		if exec.calls.Load() != 3 {
-			t.Fatalf("exec calls = %d, want 3 (turn1 A, turn2 A fail, turn2 B replay)", exec.calls.Load())
-		}
-		mu.Lock()
-		picks := append([]string(nil), pickRequestIDs...)
-		conts := append([]string(nil), continuityRequestIDs...)
-		mu.Unlock()
-		if len(picks) != 3 || len(conts) != 2 {
-			t.Fatalf("pickRequestIDs=%v continuityRequestIDs=%v, want 3 picks and 2 continuity calls", picks, conts)
-		}
-		if picks[0] == "" || picks[1] == "" || picks[0] == picks[1] {
-			t.Fatalf("turn1 vs turn2 pick RequestIDs = %v, want distinct non-empty IDs", picks)
-		}
-		if picks[1] != conts[0] || picks[1] != conts[1] || picks[1] != picks[2] {
-			t.Fatalf("turn2 RequestIDs mismatched across initial pick, continuity gate, and failover replay: picks=%v conts=%v", picks, conts)
-		}
+	t.Run("scheduler_ready", func(t *testing.T) {
+		runCase(t, false, 1, pluginapi.SchedulerContinuityReady)
 	})
 }

@@ -1148,6 +1148,15 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 				if !nativeWebsocketPassthrough || !pinnedAuthAttempted {
 					return false
 				}
+				// A provider refusal is the outcome of this turn. Never ask the
+				// scheduler for a replacement grant or signal a client replay.
+				switch responsesWebsocketErrorStatus(errMsg) {
+				case http.StatusUnauthorized, http.StatusForbidden, http.StatusTooManyRequests:
+					return false
+				}
+				if isResponsesWebsocketQuotaOrCooldownError(errMsg.Error) {
+					return false
+				}
 				if !shouldReplayResponsesWebsocketPinnedAuthFailure(errMsg) &&
 					!isResponsesWebsocketQuotaOrCooldownError(errMsg.Error) {
 					return false

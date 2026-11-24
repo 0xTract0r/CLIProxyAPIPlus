@@ -12,7 +12,7 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 )
 
-func TestManagerAliasQuotaFailoverWithUnobservedTargetModel(t *testing.T) {
+func TestManagerAliasPreservesQuotaRefusalWithUnobservedTargetModel(t *testing.T) {
 	withQuotaCooldownEnabled(t)
 	for name, newSelector := range map[string]func() Selector{
 		"round-robin":          func() Selector { return &RoundRobinSelector{} },
@@ -84,27 +84,20 @@ func TestManagerAliasQuotaFailoverWithUnobservedTargetModel(t *testing.T) {
 						t.Fatalf("selection must preserve the selected auth's actual state: %+v", selected)
 					}
 					return
-				case "execute":
-					response, errExecute := manager.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: routeModel}, cliproxyexecutor.Options{})
-					if errExecute != nil {
-						t.Fatal(errExecute)
+				case "execute", "stream":
+					var err error
+					req := cliproxyexecutor.Request{Model: routeModel}
+					if path == "execute" {
+						_, err = manager.Execute(context.Background(), []string{"codex"}, req, cliproxyexecutor.Options{})
+					} else {
+						_, err = manager.ExecuteStream(context.Background(), []string{"codex"}, req, cliproxyexecutor.Options{Stream: true})
 					}
-					if string(response.Payload) != lowID {
-						t.Fatalf("response = %s, want healthy lower-priority account", response.Payload)
-					}
-				case "stream":
-					result, errStream := manager.ExecuteStream(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: routeModel}, cliproxyexecutor.Options{Stream: true})
-					if errStream != nil {
-						t.Fatal(errStream)
-					}
-					for chunk := range result.Chunks {
-						if chunk.Err != nil || string(chunk.Payload) != lowID {
-							t.Fatalf("chunk = %+v, want healthy lower-priority account", chunk)
-						}
+					if statusCodeFromError(err) != http.StatusTooManyRequests || SafeResponseHeaders(err).Get("Retry-After") == "" {
+						t.Fatalf("want original provider refusal and deadline, got %v", err)
 					}
 				}
-				if len(attempts) != 2 || attempts[0] != highID || attempts[1] != lowID {
-					t.Fatalf("attempts = %v, want exhausted account then healthy account", attempts)
+				if len(attempts) != 1 || attempts[0] != highID {
+					t.Fatalf("attempts = %v, want only selected credential", attempts)
 				}
 			})
 		}
