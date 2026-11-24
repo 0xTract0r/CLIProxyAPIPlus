@@ -11,6 +11,7 @@ API = "github.com/router-for-me/CLIProxyAPI/v8/internal/api"
 REFUSAL = "TestOrdinarySelectedCredentialRefusalIsTerminal"
 REQUIRED = {
     SDK: {
+        "TestOrdinarySchedulerSelectionIDContract",
         REFUSAL,
         "TestOrdinaryClaudeLongContextNeverRewritesRequestedModel",
         "TestOrdinaryClaudeAliasedOneMillionRequiresSubscription",
