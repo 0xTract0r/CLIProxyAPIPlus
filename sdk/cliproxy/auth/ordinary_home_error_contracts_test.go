@@ -19,6 +19,7 @@ type ordinaryHomeErrorDispatch struct {
 	homeExecutionDispatcher
 	t            *testing.T
 	err          error
+	payload      []byte
 	requestRetry *int
 	calls        int
 }
@@ -31,6 +32,9 @@ func (d *ordinaryHomeErrorDispatch) RPopAuth(ctx context.Context, model, session
 	}
 	if d.err != nil {
 		return nil, d.err
+	}
+	if d.payload != nil {
+		return d.payload, nil
 	}
 	if d.requestRetry != nil {
 		return json.Marshal(homeAuthDispatchResponse{
@@ -98,6 +102,52 @@ func TestOrdinaryHomeSelectionErrorContract(t *testing.T) {
 			}
 			if d.calls != 1 || e.calls != 0 || e.streamCalls != 0 {
 				t.Fatalf("select calls=%d non-stream calls=%d stream calls=%d", d.calls, e.calls, e.streamCalls)
+			}
+		})
+	}
+}
+
+// Initial selection failures never reach an executor. This does not cover
+// selection errors after an earlier execution or assert any retry semantics.
+func TestOrdinaryHomeInitialSelectionFailures(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		selectionErr error
+		payload      []byte
+		status       int
+	}{
+		{name: "home_unavailable", selectionErr: errors.New("synthetic local selection unavailable"), status: http.StatusServiceUnavailable},
+		{name: "invalid_auth", payload: []byte(`{}`), status: http.StatusBadGateway},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, mode := range []string{"execute", "count", "stream"} {
+				t.Run(mode, func(t *testing.T) {
+					m, d, e := fixtureOrdinaryHomeErrorManager(t, tc.selectionErr, nil)
+					d.payload = tc.payload
+					ctx := context.Background()
+					providers := []string{"home-execution"}
+					req := ce.Request{Model: "test"}
+					var err error
+					switch mode {
+					case "execute":
+						_, err = m.Execute(ctx, providers, req, ce.Options{})
+					case "count":
+						_, err = m.ExecuteCount(ctx, providers, req, ce.Options{})
+					case "stream":
+						var stream *ce.StreamResult
+						stream, err = m.ExecuteStream(ctx, providers, req, ce.Options{Stream: true})
+						if stream != nil {
+							t.Fatal("initial selection failure exposed a stream")
+						}
+					}
+					failure, ok := err.(*Error)
+					if !ok || failure.ErrorCode() != tc.name || failure.StatusCode() != tc.status {
+						t.Fatalf("selection error = %T %v, want *Error %s (%d)", err, err, tc.name, tc.status)
+					}
+					if d.calls != 1 || e.calls != 0 || e.streamCalls != 0 {
+						t.Fatalf("select calls=%d non-stream calls=%d stream calls=%d", d.calls, e.calls, e.streamCalls)
+					}
+				})
 			}
 		})
 	}

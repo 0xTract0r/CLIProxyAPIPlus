@@ -31,6 +31,10 @@ REQUIRED = {
         *(f"TestHomeReturnsFirstProviderRefusal/{code}-count-{count}"
           for code in (401, 403, 429) for count in ("false", "true")),
         "TestOrdinaryHomeSelectionErrorContract",
+        "TestOrdinaryHomeInitialSelectionFailures",
+        *(f"TestOrdinaryHomeInitialSelectionFailures/{case}" for case in ("home_unavailable", "invalid_auth")),
+        *(f"TestOrdinaryHomeInitialSelectionFailures/{case}/{method}"
+          for case in ("home_unavailable", "invalid_auth") for method in ("execute", "count", "stream")),
         *(f"TestOrdinaryHomeSelectionErrorContract/{method}" for method in ("execute", "count", "stream")),
         "TestOrdinaryHomeExecuteRefusalKeepsPublicIdentity",
         "TestOrdinaryHomeFirstStreamFrameRefusalIsTerminal",
