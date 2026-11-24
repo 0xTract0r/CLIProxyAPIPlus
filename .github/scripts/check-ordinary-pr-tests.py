@@ -69,7 +69,18 @@ REQUIRED = {
         "TestOrdinaryServiceHTTPAdmissionPreservesRetryAfter",
         "TestOrdinaryExternallyImplementedLegacyProviderKeepsExecutableCatalog",
     },
+    "github.com/router-for-me/CLIProxyAPI/v8/internal/translator/claude/openai/chat-completions": {
+        "TestOrdinaryClaudeBufferedChatTextBoundary",
+        "TestOrdinaryClaudeStreamingChatTextStarts",
+    },
+    "github.com/router-for-me/CLIProxyAPI/v8/internal/translator/claude/openai/responses": {
+        "TestOrdinaryClaudeResponsesPreservesInitialText",
+        "TestOrdinaryClaudeResponsesIgnoresNonStringInitialText",
+    },
     "github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor": {
+        "TestOrdinaryClaudeExecutePublishesUpstreamTTFT",
+        "TestOrdinaryClaudeNearSSEMIMEUsesFirstByte",
+        "TestOrdinaryClaudeBufferedChatTextStarts",
         "TestOrdinaryClaudeIndependentPublicMessages",
         "TestOrdinaryClaudeIndependentPublicMessages/json",
         "TestOrdinaryClaudeIndependentPublicMessages/stream",
