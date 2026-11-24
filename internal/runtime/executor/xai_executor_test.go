@@ -5831,170 +5831,98 @@ func TestXAIExecutorDropsInvalidCompactionItem(t *testing.T) {
 	}
 }
 
-func TestXAIExecutorReasoningReplayCacheStoresFinalDoneAndInjectsNextClaudeRequest(t *testing.T) {
-	internalcache.ClearXAIReasoningReplayCache()
-	t.Cleanup(internalcache.ClearXAIReasoningReplayCache)
-
-	addedEncryptedContent := testValidGrokEncryptedContentForSeed(1)
-	doneEncryptedContent := testValidGrokEncryptedContentForSeed(2)
-	var bodies [][]byte
+func TestOrdinaryXAIResponsesPreserveExplicitReasoningAndToolResults(t *testing.T) {
+	opaque := testValidGrokEncryptedContent()
+	upstream := make(chan []byte, 2)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, errRead := io.ReadAll(r.Body)
-		if errRead != nil {
-			t.Fatalf("read body: %v", errRead)
-		}
-		bodies = append(bodies, body)
-
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = w.Write([]byte(`data: {"type":"response.output_item.added","item":{"id":"rs_added","type":"reasoning","status":"in_progress","summary":[],"encrypted_content":"` + addedEncryptedContent + `"},"output_index":0}` + "\n"))
-		_, _ = w.Write([]byte(`data: {"type":"response.output_item.done","item":{"id":"rs_done","type":"reasoning","summary":[],"encrypted_content":"` + doneEncryptedContent + `"},"output_index":0}` + "\n"))
-		_, _ = w.Write([]byte(`data: {"type":"response.completed","response":{"id":"resp_1","object":"response","created_at":0,"status":"completed","model":"grok-4.3","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}` + "\n\n"))
-	}))
-	defer server.Close()
-
-	executor := NewXAIExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{
-		ID:       "xai-auth-replay-1",
-		Provider: "xai",
-		Attributes: map[string]string{
-			"base_url":  server.URL,
-			"auth_kind": "oauth",
-		},
-		Metadata: map[string]any{
-			"access_token": "xai-token",
-		},
-	}
-	opts := cliproxyexecutor.Options{
-		SourceFormat: sdktranslator.FormatClaude,
-		Stream:       false,
-	}
-	ctx := testContextWithAPIKey("xai-replay-caller")
-
-	_, err := executor.Execute(ctx, auth, cliproxyexecutor.Request{
-		Model:   "grok-4.3",
-		Payload: []byte(`{"model":"grok-4.3","metadata":{"user_id":"{\"device_id\":\"device-test\",\"account_uuid\":\"\",\"session_id\":\"xai-session-1\"}"},"messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}]}`),
-	}, opts)
-	if err != nil {
-		t.Fatalf("first Execute error: %v", err)
-	}
-
-	_, err = executor.Execute(ctx, auth, cliproxyexecutor.Request{
-		Model:   "grok-4.3",
-		Payload: []byte(`{"model":"grok-4.3","metadata":{"user_id":"{\"device_id\":\"device-test\",\"account_uuid\":\"\",\"session_id\":\"xai-session-1\"}"},"messages":[{"role":"user","content":[{"type":"text","text":"next"}]}]}`),
-	}, opts)
-	if err != nil {
-		t.Fatalf("second Execute error: %v", err)
-	}
-
-	if len(bodies) != 2 {
-		t.Fatalf("upstream request count = %d, want 2", len(bodies))
-	}
-	secondBody := bodies[1]
-	if got := ojson.GetBytes(secondBody, "input.0.type").String(); got != "reasoning" {
-		t.Fatalf("input.0.type = %q, want reasoning; body=%s", got, string(secondBody))
-	}
-	if got := ojson.GetBytes(secondBody, "input.0.encrypted_content").String(); got != doneEncryptedContent {
-		t.Fatalf("injected encrypted_content = %q, want final done %q; body=%s", got, doneEncryptedContent, string(secondBody))
-	}
-	if got := ojson.GetBytes(secondBody, "input.1.role").String(); got != "user" {
-		t.Fatalf("input.1.role = %q, want user; body=%s", got, string(secondBody))
-	}
-}
-
-func TestXAIExecutorResponsesSSEReplaysEncryptedReasoningAndAssistantMessage(t *testing.T) {
-	internalcache.ClearXAIReasoningReplayCache()
-	t.Cleanup(internalcache.ClearXAIReasoningReplayCache)
-
-	encryptedContent := testValidGrokEncryptedContentForSeed(9)
-	var bodies [][]byte
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, errRead := io.ReadAll(r.Body)
-		if errRead != nil {
-			t.Fatalf("read body: %v", errRead)
-		}
-		bodies = append(bodies, body)
-
-		w.Header().Set("Content-Type", "text/event-stream")
-		if len(bodies) == 1 {
-			_, _ = w.Write([]byte(`data: {"type":"response.output_item.done","item":{"id":"rs_1","type":"reasoning","summary":[],"encrypted_content":"` + encryptedContent + `"},"output_index":0}` + "\n"))
-			_, _ = w.Write([]byte(`data: {"type":"response.output_item.done","item":{"id":"msg_1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"first answer"}]},"output_index":1}` + "\n"))
-			_, _ = w.Write([]byte(`data: {"type":"response.completed","response":{"id":"resp_1","status":"completed","model":"grok-4.5","output":[]}}` + "\n\n"))
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/responses" {
+			http.Error(w, "unexpected request", http.StatusNotFound)
 			return
 		}
-		_, _ = w.Write([]byte(`data: {"type":"response.completed","response":{"id":"resp_2","status":"completed","model":"grok-4.5","output":[]}}` + "\n\n"))
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "invalid fixture request", http.StatusBadRequest)
+			return
+		}
+		select {
+		case upstream <- body:
+		default:
+			http.Error(w, "extra request", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		if ojson.GetBytes(body, "input.0.type").String() == "reasoning" {
+			_, _ = fmt.Fprintf(w, "event: response.output_item.done\ndata: %s\n\n", `{"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs_fixture","summary":[],"encrypted_content":"`+opaque+`"}}`)
+		}
+		const message = `{"type":"message","id":"msg_fixture","role":"assistant","content":[{"type":"output_text","text":"fixture reply"}]}`
+		_, _ = fmt.Fprintf(w, "event: response.completed\ndata: %s\n\n", `{"type":"response.completed","response":{"id":"resp_fixture","status":"completed","model":"grok-4.5","output":[`+message+`]}}`)
 	}))
 	defer server.Close()
 
 	executor := NewXAIExecutor(&config.Config{})
 	auth := &cliproxyauth.Auth{
-		ID:       "xai-auth-responses-sse-replay",
-		Provider: "xai",
-		Attributes: map[string]string{
-			"base_url": server.URL,
-		},
-		Metadata: map[string]any{"access_token": "xai-token"},
+		Provider: "xai", ProxyURL: "direct",
+		Attributes: map[string]string{"base_url": server.URL + "/v1"},
+		Metadata:   map[string]any{"access_token": "synthetic-token"},
 	}
-	opts := cliproxyexecutor.Options{
+	options := cliproxyexecutor.Options{
 		SourceFormat:   sdktranslator.FormatOpenAIResponse,
 		ResponseFormat: sdktranslator.FormatOpenAIResponse,
 		Stream:         true,
 	}
-	firstPayload := []byte(`{"model":"grok-4.5","stream":true,"store":false,"prompt_cache_key":"codex-sse-session","include":["reasoning.encrypted_content"],"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"first"}]}]}`)
-	secondPayload := []byte(`{"model":"grok-4.5","stream":true,"store":false,"prompt_cache_key":"codex-sse-session","include":["reasoning.encrypted_content"],"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"second"}]}]}`)
-
-	streamedResponses := make([][]byte, 0, 2)
-	ctx := testContextWithAPIKey("codex-sse-api-key")
-	for _, payload := range [][]byte{firstPayload, secondPayload} {
-		result, err := executor.ExecuteStream(ctx, auth, cliproxyexecutor.Request{Model: "grok-4.5", Payload: payload}, opts)
+	request := func(payload string) (ojson.Result, string) {
+		t.Helper()
+		result, err := executor.ExecuteStream(t.Context(), auth, cliproxyexecutor.Request{Model: "grok-4.5", Payload: []byte(payload)}, options)
 		if err != nil {
-			t.Fatalf("ExecuteStream error: %v", err)
+			t.Fatal(err)
 		}
-		var streamed bytes.Buffer
+		var streamed strings.Builder
 		for chunk := range result.Chunks {
 			if chunk.Err != nil {
-				t.Fatalf("stream chunk error: %v", chunk.Err)
+				t.Fatal(chunk.Err)
 			}
 			streamed.Write(chunk.Payload)
+			if len(chunk.Payload) > 0 && chunk.Payload[len(chunk.Payload)-1] != '\n' {
+				streamed.WriteByte('\n')
+			}
 		}
-		streamedResponses = append(streamedResponses, bytes.Clone(streamed.Bytes()))
+		select {
+		case body := <-upstream:
+			return ojson.ParseBytes(body), streamed.String()
+		default:
+			t.Fatal("expected a loopback request")
+			return ojson.Result{}, ""
+		}
 	}
-
-	if len(bodies) != 2 {
-		t.Fatalf("upstream request count = %d, want 2", len(bodies))
+	body, stream := request(`{"model":"grok-4.5","store":false,"include":["reasoning.encrypted_content"],"input":[{"type":"reasoning","id":"rs_input","summary":[],"encrypted_content":"` + opaque + `"},{"type":"function_call","call_id":"call_fixture","name":"fixture_lookup","arguments":"{}"},{"type":"function_call_output","call_id":"call_fixture","output":"explicit result"},{"type":"message","role":"user","content":[{"type":"input_text","text":"use the result"}]}]}`)
+	if body.Get("include.0").String() != "reasoning.encrypted_content" || body.Get("input.0.encrypted_content").String() != opaque ||
+		body.Get("input.1.type").String() != "function_call" || body.Get("input.1.name").String() != "fixture_lookup" ||
+		body.Get("input.1.call_id").String() != "call_fixture" || body.Get("input.2.type").String() != "function_call_output" ||
+		body.Get("input.2.call_id").String() != "call_fixture" || body.Get("input.2.output").String() != "explicit result" {
+		t.Fatal("explicit reasoning or tool call/result was changed")
 	}
-	if includes := ojson.GetBytes(bodies[0], "include").Array(); len(includes) != 1 || includes[0].String() != "reasoning.encrypted_content" {
-		t.Fatalf("first request include was not preserved: %s", bodies[0])
-	}
-	var downstreamEncryptedContent string
-	for _, line := range bytes.Split(streamedResponses[0], []byte("\n")) {
-		if !bytes.HasPrefix(line, xaiDataTag) {
+	var opaqueDone, terminal int
+	for _, line := range strings.Split(stream, "\n") {
+		if !strings.HasPrefix(line, "data:") {
 			continue
 		}
-		eventData := bytes.TrimSpace(line[len(xaiDataTag):])
-		if ojson.GetBytes(eventData, "type").String() != "response.output_item.done" ||
-			ojson.GetBytes(eventData, "item.type").String() != "reasoning" {
-			continue
+		event := ojson.Parse(strings.TrimSpace(strings.TrimPrefix(line, "data:")))
+		switch event.Get("type").String() {
+		case "response.output_item.done":
+			if event.Get("item.type").String() == "reasoning" && event.Get("item.encrypted_content").String() == opaque {
+				opaqueDone++
+			}
+		case "response.completed":
+			terminal++
 		}
-		downstreamEncryptedContent = ojson.GetBytes(eventData, "item.encrypted_content").String()
-		break
 	}
-	if downstreamEncryptedContent != encryptedContent {
-		t.Fatalf("downstream encrypted_content = %q, want upstream Grok blob; stream=%s", downstreamEncryptedContent, streamedResponses[0])
+	if opaqueDone != 1 || terminal != 1 {
+		t.Fatalf("reasoning events=%d completed events=%d", opaqueDone, terminal)
 	}
-	if got := ojson.GetBytes(bodies[1], "input.0.type").String(); got != "reasoning" {
-		t.Fatalf("second input.0.type = %q, want reasoning; body=%s", got, bodies[1])
-	}
-	if got := ojson.GetBytes(bodies[1], "input.0.encrypted_content").String(); got != encryptedContent {
-		t.Fatalf("replayed encrypted_content = %q, want cached Grok blob; body=%s", got, bodies[1])
-	}
-	if got := ojson.GetBytes(bodies[1], "input.1.type").String(); got != "message" {
-		t.Fatalf("second input.1.type = %q, want assistant message; body=%s", got, bodies[1])
-	}
-	if got := ojson.GetBytes(bodies[1], "input.1.content.0.text").String(); got != "first answer" {
-		t.Fatalf("replayed assistant text = %q, want first answer; body=%s", got, bodies[1])
-	}
-	if got := ojson.GetBytes(bodies[1], "input.2.content.0.text").String(); got != "second" {
-		t.Fatalf("new user text = %q, want second; body=%s", got, bodies[1])
+	fresh, freshStream := request(`{"model":"grok-4.5","store":false,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"independent request"}]}]}`)
+	if len(fresh.Get("input").Array()) != 1 || fresh.Get("input.0.content.0.text").String() != "independent request" ||
+		strings.Contains(fresh.Raw, opaque) || strings.Contains(fresh.Raw, "call_fixture") || strings.Contains(freshStream, opaque) || len(upstream) != 0 {
+		t.Fatal("independent request unexpectedly carried earlier state")
 	}
 }
 
@@ -6114,109 +6042,6 @@ func TestFilterXAIReasoningReplayItemsSkipsAmbiguousTurnWhenLastAssistantTextDri
 // Scenario #2: Claude multi-turn where the client resends older thinking signature
 // but drops the latest turn's signature. Cache holds the latest R(+M); upstream
 // must receive the latest encrypted blob, not only the older client-provided one.
-func TestXAIExecutorClaudeInjectsLatestCachedReasoningWhenHistoryHasOnlyOlderSignature(t *testing.T) {
-	internalcache.ClearXAIReasoningReplayCache()
-	t.Cleanup(internalcache.ClearXAIReasoningReplayCache)
-
-	oldEncrypted := testValidGrokEncryptedContentForSeed(21)
-	latestEncrypted := testValidGrokEncryptedContentForSeed(22)
-	var bodies [][]byte
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, errRead := io.ReadAll(r.Body)
-		if errRead != nil {
-			t.Fatalf("read body: %v", errRead)
-		}
-		bodies = append(bodies, body)
-		w.Header().Set("Content-Type", "text/event-stream")
-		if len(bodies) == 1 {
-			_, _ = w.Write([]byte(`data: {"type":"response.output_item.done","item":{"id":"rs_latest","type":"reasoning","summary":[],"encrypted_content":"` + latestEncrypted + `"},"output_index":0}` + "\n"))
-			_, _ = w.Write([]byte(`data: {"type":"response.output_item.done","item":{"id":"msg_1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"latest answer"}]},"output_index":1}` + "\n"))
-			_, _ = w.Write([]byte(`data: {"type":"response.completed","response":{"id":"resp_1","status":"completed","model":"grok-4.5","output":[]}}` + "\n\n"))
-			return
-		}
-		_, _ = w.Write([]byte(`data: {"type":"response.completed","response":{"id":"resp_2","status":"completed","model":"grok-4.5","output":[]}}` + "\n\n"))
-	}))
-	defer server.Close()
-
-	executor := NewXAIExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{
-		ID:         "xai-auth-claude-missing-latest-sig",
-		Provider:   "xai",
-		Attributes: map[string]string{"base_url": server.URL},
-		Metadata:   map[string]any{"access_token": "xai-token"},
-	}
-	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatClaude, Stream: false}
-	ctx := testContextWithAPIKey("claude-missing-sig-key")
-
-	// Turn 1: user only -> cache latest R+M
-	_, err := executor.Execute(ctx, auth, cliproxyexecutor.Request{
-		Model:   "grok-4.5",
-		Payload: []byte(`{"model":"grok-4.5","metadata":{"user_id":"{\"session_id\":\"claude-missing-latest\"}"},"messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}]}`),
-	}, opts)
-	if err != nil {
-		t.Fatalf("first Execute: %v", err)
-	}
-
-	// Turn 2 (actual failure shape): client keeps an OLDER thinking signature and the
-	// assistant text, but does not resend the latest encrypted/signature blob.
-	secondPayload := []byte(`{
-		"model":"grok-4.5",
-		"metadata":{"user_id":"{\"session_id\":\"claude-missing-latest\"}"},
-		"messages":[
-			{"role":"user","content":[{"type":"text","text":"hello"}]},
-			{"role":"assistant","content":[
-				{"type":"thinking","thinking":"older summary","signature":""},
-				{"type":"text","text":"latest answer"}
-			]},
-			{"role":"user","content":[{"type":"text","text":"next"}]}
-		]
-	}`)
-	secondPayload, _ = ojson.SetBytes(secondPayload, "messages.1.content.0.signature", oldEncrypted)
-
-	_, err = executor.Execute(ctx, auth, cliproxyexecutor.Request{
-		Model:   "grok-4.5",
-		Payload: secondPayload,
-	}, opts)
-	if err != nil {
-		t.Fatalf("second Execute: %v", err)
-	}
-	if len(bodies) != 2 {
-		t.Fatalf("upstream requests = %d, want 2", len(bodies))
-	}
-
-	// Upstream must include BOTH older client signature (as reasoning) and latest cached blob.
-	// At minimum the latest cached encrypted_content must be present for continuity.
-	second := bodies[1]
-	foundLatest := false
-	foundOld := false
-	assistantCount := 0
-	for _, item := range ojson.GetBytes(second, "input").Array() {
-		switch item.Get("type").String() {
-		case "reasoning":
-			enc := item.Get("encrypted_content").String()
-			if enc == latestEncrypted {
-				foundLatest = true
-			}
-			if enc == oldEncrypted {
-				foundOld = true
-			}
-		case "message":
-			if item.Get("role").String() == "assistant" {
-				assistantCount++
-			}
-		}
-	}
-	if !foundLatest {
-		t.Fatalf("latest cached encrypted_content missing from upstream body (broken Claude missing-signature scenario): %s", second)
-	}
-	if !foundOld {
-		t.Fatalf("older client signature/reasoning missing after translate: %s", second)
-	}
-	if assistantCount != 1 {
-		t.Fatalf("assistant messages = %d, want 1 (no partial double-message inject); body=%s", assistantCount, second)
-	}
-}
-
 func TestCacheXAIReasoningReplayFromCompletedClearsPreviousEntryWhenNoReplayableState(t *testing.T) {
 	internalcache.ClearXAIReasoningReplayCache()
 	t.Cleanup(internalcache.ClearXAIReasoningReplayCache)
@@ -6388,98 +6213,6 @@ func TestXAIReasoningReplayCacheReplaysFunctionCallWithoutReasoning(t *testing.T
 	}
 	if got := input[1].Get("call_id").String(); got != "call_1" {
 		t.Fatalf("replayed call_id = %q, want call_1; body=%s", got, updated)
-	}
-}
-
-func TestXAIExecutorReasoningReplayCacheReplaysFunctionCallForClaudeToolResult(t *testing.T) {
-	internalcache.ClearXAIReasoningReplayCache()
-	t.Cleanup(internalcache.ClearXAIReasoningReplayCache)
-
-	reasoningEncryptedContent := testValidGrokEncryptedContentForSeed(3)
-	var bodies [][]byte
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, errRead := io.ReadAll(r.Body)
-		if errRead != nil {
-			t.Fatalf("read body: %v", errRead)
-		}
-		bodies = append(bodies, body)
-
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = w.Write([]byte(`data: {"type":"response.output_item.done","item":{"id":"rs_1","type":"reasoning","summary":[],"encrypted_content":"` + reasoningEncryptedContent + `"},"output_index":0}` + "\n"))
-		_, _ = w.Write([]byte(`data: {"type":"response.output_item.added","item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"lookup","arguments":"{\"q\":\"weather\"}","status":"in_progress"},"output_index":1}` + "\n"))
-		_, _ = w.Write([]byte(`data: {"type":"response.output_item.done","item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"lookup","arguments":"{\"q\":\"weather\"}","status":"completed"},"output_index":1}` + "\n"))
-		_, _ = w.Write([]byte(`data: {"type":"response.completed","response":{"id":"resp_1","object":"response","created_at":0,"status":"completed","model":"grok-4.3","output":[]}}` + "\n\n"))
-	}))
-	defer server.Close()
-
-	executor := NewXAIExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{
-		ID:       "xai-auth-replay-tool",
-		Provider: "xai",
-		Attributes: map[string]string{
-			"base_url":  server.URL,
-			"auth_kind": "oauth",
-		},
-		Metadata: map[string]any{
-			"access_token": "xai-token",
-		},
-	}
-	opts := cliproxyexecutor.Options{
-		SourceFormat: sdktranslator.FormatClaude,
-		Stream:       false,
-	}
-	ctx := testContextWithAPIKey("xai-tool-replay-caller")
-
-	_, err := executor.Execute(ctx, auth, cliproxyexecutor.Request{
-		Model: "grok-4.3",
-		Payload: []byte(`{
-			"model":"grok-4.3",
-			"metadata":{"user_id":"{\"device_id\":\"device-test\",\"account_uuid\":\"\",\"session_id\":\"xai-session-tool\"}"},
-			"messages":[{"role":"user","content":[{"type":"text","text":"call lookup"}]}],
-			"tools":[{"name":"lookup","input_schema":{"type":"object","properties":{"q":{"type":"string"}}}}]
-		}`),
-	}, opts)
-	if err != nil {
-		t.Fatalf("first Execute error: %v", err)
-	}
-
-	_, err = executor.Execute(ctx, auth, cliproxyexecutor.Request{
-		Model: "grok-4.3",
-		Payload: []byte(`{
-			"model":"grok-4.3",
-			"metadata":{"user_id":"{\"device_id\":\"device-test\",\"account_uuid\":\"\",\"session_id\":\"xai-session-tool\"}"},
-			"messages":[
-				{"role":"user","content":[{"type":"text","text":"call lookup"}]},
-				{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"sunny"}]}
-			],
-			"tools":[{"name":"lookup","input_schema":{"type":"object","properties":{"q":{"type":"string"}}}}]
-		}`),
-	}, opts)
-	if err != nil {
-		t.Fatalf("second Execute error: %v", err)
-	}
-
-	if len(bodies) != 2 {
-		t.Fatalf("upstream request count = %d, want 2", len(bodies))
-	}
-	secondBody := bodies[1]
-	if got := ojson.GetBytes(secondBody, "input.0.type").String(); got != "message" {
-		t.Fatalf("input.0.type = %q, want initial user message; body=%s", got, string(secondBody))
-	}
-	if got := ojson.GetBytes(secondBody, "input.1.type").String(); got != "reasoning" {
-		t.Fatalf("input.1.type = %q, want cached reasoning; body=%s", got, string(secondBody))
-	}
-	if got := ojson.GetBytes(secondBody, "input.2.type").String(); got != "function_call" {
-		t.Fatalf("input.2.type = %q, want cached function_call; body=%s", got, string(secondBody))
-	}
-	if got := ojson.GetBytes(secondBody, "input.2.call_id").String(); got != "call_1" {
-		t.Fatalf("input.2.call_id = %q, want call_1; body=%s", got, string(secondBody))
-	}
-	if got := ojson.GetBytes(secondBody, "input.3.type").String(); got != "function_call_output" {
-		t.Fatalf("input.3.type = %q, want function_call_output after cached call; body=%s", got, string(secondBody))
-	}
-	if got := ojson.GetBytes(secondBody, "input.3.call_id").String(); got != "call_1" {
-		t.Fatalf("input.3.call_id = %q, want call_1; body=%s", got, string(secondBody))
 	}
 }
 

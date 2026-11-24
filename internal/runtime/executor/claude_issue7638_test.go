@@ -7,13 +7,11 @@ import (
 	"net/http"
 	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
 
 	"github.com/MoeForge/moego/ojson"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/kvstore"
-	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
@@ -264,117 +262,6 @@ func TestClaudeIssue7638_ExecuteStreamTracksMintedAdvisorAndStripsOnRebind(t *te
 		if content.IsArray() && len(content.Array()) == 0 {
 			t.Fatalf("turn 2 stream left empty content array in messages: %s", captured[1])
 		}
-	}
-}
-
-func TestClaudeIssue7638_InRequestFailover429StripsForeignAdvisorOnRetry(t *testing.T) {
-	if errShutdown := kvstore.ShutdownLocal(); errShutdown != nil {
-		t.Fatal(errShutdown)
-	}
-	var mu sync.Mutex
-	var attempts []struct {
-		authHeader string
-		body       []byte
-	}
-	turn := 0
-	transport := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
-		body, _ := io.ReadAll(req.Body)
-		authHeader := req.Header.Get("Authorization")
-		mu.Lock()
-		attempts = append(attempts, struct {
-			authHeader string
-			body       []byte
-		}{authHeader: authHeader, body: body})
-		turn++
-		cur := turn
-		mu.Unlock()
-		switch cur {
-		case 1:
-			// Turn 1 on A mints srvtoolu_failover.
-			return claudeIssue7638JSONResponse(req, claudeIssue7638AdvisorMintJSON("srvtoolu_failover", "advice")), nil
-		case 2:
-			// Turn 2 first lands on A, which returns 429 to trigger in-request failover to B.
-			return &http.Response{
-				StatusCode: http.StatusTooManyRequests,
-				Header:     http.Header{"Content-Type": []string{"application/json"}},
-				Body:       io.NopCloser(strings.NewReader(`{"type":"error","error":{"type":"rate_limit_error","message":"rate limited"}}`)),
-				Request:    req,
-			}, nil
-		default:
-			// Retry on B must receive cleaned body without srvtoolu_failover.
-			if strings.Contains(string(body), "srvtoolu_failover") {
-				return &http.Response{
-					StatusCode: http.StatusBadRequest,
-					Header:     http.Header{"Content-Type": []string{"application/json"}},
-					Body:       io.NopCloser(strings.NewReader(`{"type":"error","error":{"type":"invalid_request_error","message":"Advisor tool result content could not be processed."}}`)),
-					Request:    req,
-				}, nil
-			}
-			return claudeIssue7638JSONResponse(req, `{"id":"msg_ok","type":"message","role":"assistant","model":"claude-opus-5-5","content":[{"type":"text","text":"recovered"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`), nil
-		}
-	})
-
-	manager := cliproxyauth.NewManager(nil, &cliproxyauth.FillFirstSelector{}, nil)
-	manager.SetRetryConfig(2, 0, 0)
-	manager.RegisterExecutor(NewClaudeExecutor(&config.Config{}))
-	authA := claudeIssue7638OAuthAuth("cred-issue7638-a", "sk-ant-oat-a", "11111111-1111-4111-8111-111111111111")
-	authB := claudeIssue7638OAuthAuth("cred-issue7638-b", "sk-ant-oat-b", "22222222-2222-4222-8222-222222222222")
-	reg := registry.GetGlobalRegistry()
-	reg.RegisterClient(authA.ID, "claude", []*registry.ModelInfo{{ID: "claude-opus-5-5"}})
-	reg.RegisterClient(authB.ID, "claude", []*registry.ModelInfo{{ID: "claude-opus-5-5"}})
-	t.Cleanup(func() {
-		reg.UnregisterClient(authA.ID)
-		reg.UnregisterClient(authB.ID)
-	})
-	if _, err := manager.Register(context.Background(), authA); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := manager.Register(context.Background(), authB); err != nil {
-		t.Fatal(err)
-	}
-
-	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", http.RoundTripper(transport))
-	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatClaude}
-
-	// Turn 1: A serves and mints srvtoolu_failover.
-	if _, err := manager.Execute(ctx, []string{"claude"}, cliproxyexecutor.Request{
-		Model:   "claude-opus-5-5",
-		Payload: []byte(`{"model":"claude-opus-5-5","max_tokens":256,"messages":[{"role":"user","content":"turn 1"}]}`),
-	}, opts); err != nil {
-		t.Fatalf("turn 1 manager.Execute() error = %v", err)
-	}
-
-	// Turn 2: A returns 429 -> Manager fails over to B -> B must succeed with stripped body.
-	turn2 := []byte(`{
-		"model": "claude-opus-5-5",
-		"max_tokens": 256,
-		"messages": [
-			{"role": "user", "content": "turn 1"},
-			{
-				"role": "assistant",
-				"content": [
-					{"type": "server_tool_use", "id": "srvtoolu_failover", "name": "advisor", "input": {}},
-					{"type": "advisor_tool_result", "tool_use_id": "srvtoolu_failover", "content": {"type": "advisor_redacted_result", "encrypted_content": "enc_f"}},
-					{"type": "text", "text": "advice"}
-				]
-			},
-			{"role": "user", "content": "turn 2"}
-		]
-	}`)
-	if _, err := manager.Execute(ctx, []string{"claude"}, cliproxyexecutor.Request{Model: "claude-opus-5-5", Payload: turn2}, opts); err != nil {
-		t.Fatalf("turn 2 failover manager.Execute() error = %v", err)
-	}
-
-	mu.Lock()
-	defer mu.Unlock()
-	if len(attempts) != 3 {
-		t.Fatalf("expected 3 upstream attempts (turn1-A, turn2-A-429, turn2-B-200), got %d", len(attempts))
-	}
-	if !strings.Contains(string(attempts[1].body), "srvtoolu_failover") {
-		t.Fatalf("attempt on original owner A unexpectedly stripped its own advisor block: %s", attempts[1].body)
-	}
-	if strings.Contains(string(attempts[2].body), "srvtoolu_failover") {
-		t.Fatalf("failover attempt on B still contained foreign advisor block: %s", attempts[2].body)
 	}
 }
 

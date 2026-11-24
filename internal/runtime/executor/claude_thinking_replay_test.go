@@ -1,374 +1,113 @@
 package executor
 
 import (
-	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"sync"
+	"strings"
 	"testing"
 
 	"github.com/MoeForge/moego/ojson"
-	internalcache "github.com/router-for-me/CLIProxyAPI/v8/internal/cache"
-	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 )
 
-const claudeReplayResolvedModelInfoKey = "cliproxy.resolved_api_key_model_info"
+func TestOrdinaryClaudeRefusedRequestDoesNotChangeNextRequest(t *testing.T) {
+	for _, mode := range []string{"nonstream", "stream"} {
+		t.Run(mode, func(t *testing.T) {
+			const opaque = "c3ludGhldGljLW9wYXF1ZS1maXh0dXJl"
+			upstream := make(chan []byte, 2)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodPost || r.URL.Path != "/v1/messages" {
+					http.Error(w, "unexpected request", http.StatusNotFound)
+					return
+				}
+				body, err := io.ReadAll(r.Body)
+				if err != nil {
+					http.Error(w, "invalid fixture request", http.StatusBadRequest)
+					return
+				}
+				select {
+				case upstream <- body:
+				default:
+					http.Error(w, "extra request", http.StatusInternalServerError)
+					return
+				}
+				if len(ojson.GetBytes(body, "messages").Array()) > 1 {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusBadRequest)
+					_, _ = io.WriteString(w, `{"type":"error","error":{"type":"invalid_request_error","message":"fixture refusal"}}`)
+					return
+				}
+				if mode == "stream" {
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = io.WriteString(w, "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_fixture\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-opus-5\",\"content\":[]}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"id":"msg_fixture","type":"message","role":"assistant","model":"claude-opus-5","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn"}`)
+			}))
+			defer server.Close()
 
-func claudeReplayTestAuth(baseURL string) *cliproxyauth.Auth {
-	return &cliproxyauth.Auth{
-		ID:       "claude-replay-auth",
-		Provider: "claude",
-		Attributes: map[string]string{
-			cliproxyauth.AttributeAPIKey:   "key-claude-replay",
-			cliproxyauth.AttributeAuthKind: cliproxyauth.AuthKindAPIKey,
-			"base_url":                     baseURL,
-		},
-	}
-}
+			executor := NewClaudeExecutor(&config.Config{})
+			auth := &cliproxyauth.Auth{
+				Provider: "claude", ProxyURL: "direct",
+				Attributes: map[string]string{"api_key": "fixture", "base_url": server.URL},
+			}
+			options := cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatClaude, Stream: mode == "stream"}
+			call := func(ctx context.Context, payload string) error {
+				req := cliproxyexecutor.Request{Model: "claude-opus-5", Payload: []byte(payload)}
+				if mode == "stream" {
+					response, err := executor.ExecuteStream(ctx, auth, req, options)
+					if err != nil {
+						return err
+					}
+					var output strings.Builder
+					for chunk := range response.Chunks {
+						if chunk.Err != nil {
+							return chunk.Err
+						}
+						output.Write(chunk.Payload)
+					}
+					if strings.Count(output.String(), `"type":"message_stop"`) != 1 {
+						t.Fatal("stream did not complete exactly once")
+					}
+					return nil
+				}
+				_, err := executor.Execute(ctx, auth, req, options)
+				return err
+			}
+			wire := func() ojson.Result {
+				t.Helper()
+				select {
+				case body := <-upstream:
+					return ojson.ParseBytes(body)
+				default:
+					t.Fatal("expected a loopback request")
+					return ojson.Result{}
+				}
+			}
 
-func claudeReplayTestRequest(payload []byte, sessionID string, isCompat bool, source sdktranslator.Format) (cliproxyexecutor.Request, cliproxyexecutor.Options) {
-	return cliproxyexecutor.Request{
-			Model:   "claude-synthetic-4772",
-			Payload: payload,
-			Metadata: map[string]any{
-				claudeReplayResolvedModelInfoKey: &registry.ModelInfo{IsCompat: isCompat},
-			},
-		}, cliproxyexecutor.Options{
-			SourceFormat: source,
-			Metadata: map[string]any{
-				cliproxyexecutor.ExecutionSessionMetadataKey: sessionID,
-			},
-		}
-}
-
-func TestClaudeThinkingReplayEnabledRequiresCompatClaudeAPIKey(t *testing.T) {
-	baseRequest, baseOptions := claudeReplayTestRequest([]byte(`{"messages":[]}`), "scope", true, sdktranslator.FormatClaude)
-	baseAuth := claudeReplayTestAuth("http://127.0.0.1")
-
-	tests := []struct {
-		name       string
-		auth       *cliproxyauth.Auth
-		request    cliproxyexecutor.Request
-		options    cliproxyexecutor.Options
-		wantEnable bool
-	}{
-		{
-			name:       "compat Claude API key",
-			auth:       baseAuth,
-			request:    baseRequest,
-			options:    baseOptions,
-			wantEnable: true,
-		},
-		{
-			name: "non compat model",
-			auth: baseAuth,
-			request: func() cliproxyexecutor.Request {
-				request, _ := claudeReplayTestRequest([]byte(`{"messages":[]}`), "scope-non-compat", false, sdktranslator.FormatClaude)
-				return request
-			}(),
-			options:    baseOptions,
-			wantEnable: false,
-		},
-		{
-			name: "OAuth credential",
-			auth: func() *cliproxyauth.Auth {
-				auth := baseAuth.Clone()
-				auth.Attributes[cliproxyauth.AttributeAuthKind] = cliproxyauth.AuthKindOAuth
-				auth.Attributes[cliproxyauth.AttributeAPIKey] = "sk-ant-oat-replay"
-				return auth
-			}(),
-			request:    baseRequest,
-			options:    baseOptions,
-			wantEnable: false,
-		},
-		{
-			name: "other provider",
-			auth: func() *cliproxyauth.Auth {
-				auth := baseAuth.Clone()
-				auth.Provider = "kimi"
-				return auth
-			}(),
-			request:    baseRequest,
-			options:    baseOptions,
-			wantEnable: false,
-		},
-		{
-			name:    "OpenAI source format",
-			auth:    baseAuth,
-			request: baseRequest,
-			options: func() cliproxyexecutor.Options {
-				options := baseOptions
-				options.SourceFormat = sdktranslator.FormatOpenAI
-				return options
-			}(),
-			wantEnable: false,
-		},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			if got := claudeThinkingReplayEnabled(test.auth, test.request, test.options); got != test.wantEnable {
-				t.Fatalf("claudeThinkingReplayEnabled() = %v, want %v", got, test.wantEnable)
+			first := `{"max_tokens":64,"messages":[{"role":"user","content":"previous request"},{"role":"assistant","content":[{"type":"thinking","thinking":"caller supplied","signature":"` + opaque + `"},{"type":"text","text":"previous answer"}]},{"role":"user","content":"refused turn"}]}`
+			var status interface{ StatusCode() int }
+			if err := call(t.Context(), first); !errors.As(err, &status) || status.StatusCode() != http.StatusBadRequest || !strings.Contains(err.Error(), "fixture refusal") {
+				t.Fatalf("expected upstream 400, got %v", err)
+			}
+			if got := wire().Get("messages.1.content.0.signature").String(); got != opaque || len(upstream) != 0 {
+				t.Fatal("caller opaque value changed or refused request ran again")
+			}
+			if err := call(t.Context(), `{"max_tokens":64,"messages":[{"role":"user","content":"independent request"}]}`); err != nil {
+				t.Fatal(err)
+			}
+			fresh := wire()
+			if len(fresh.Get("messages").Array()) != 1 || !strings.Contains(fresh.Get("messages.0.content").Raw, "independent request") ||
+				strings.Contains(fresh.Raw, opaque) || strings.Contains(fresh.Raw, "previous answer") || len(upstream) != 0 {
+				t.Fatal("independent request carried earlier state")
 			}
 		})
 	}
-}
-
-func TestClaudeExecutorCompatThinkingReplayRestoresOmittedBlock(t *testing.T) {
-	internalcacheClearClaudeThinkingReplay(t)
-
-	var mu sync.Mutex
-	var requestBodies [][]byte
-	callCount := 0
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, errRead := io.ReadAll(r.Body)
-		if errRead != nil {
-			t.Errorf("read request body: %v", errRead)
-			return
-		}
-		mu.Lock()
-		requestBodies = append(requestBodies, bytes.Clone(body))
-		callCount++
-		call := callCount
-		mu.Unlock()
-
-		w.Header().Set("Content-Type", "application/json")
-		if call == 1 {
-			_, _ = w.Write([]byte(`{"id":"msg-1","type":"message","role":"assistant","model":"claude-synthetic-4772","content":[{"type":"thinking","thinking":"provider reasoning","signature":"EgI="},{"type":"tool_use","id":"toolu_1","name":"Read","input":{"path":"README.md"}}],"stop_reason":"tool_use"}`))
-			return
-		}
-		_, _ = w.Write([]byte(`{"id":"msg-2","type":"message","role":"assistant","model":"claude-synthetic-4772","content":[{"type":"text","text":"done"}],"stop_reason":"end_turn"}`))
-	}))
-	defer server.Close()
-
-	executor := NewClaudeExecutor(nil)
-	auth := claudeReplayTestAuth(server.URL)
-	firstPayload := []byte(`{"messages":[{"role":"user","content":"inspect"}]}`)
-	firstRequest, firstOptions := claudeReplayTestRequest(firstPayload, "nonstream-replay", true, sdktranslator.FormatClaude)
-	if _, errExecute := executor.Execute(context.Background(), auth, firstRequest, firstOptions); errExecute != nil {
-		t.Fatalf("first Execute() error = %v", errExecute)
-	}
-
-	secondPayload := []byte(`{"messages":[{"role":"user","content":"inspect"},{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{"path":"README.md"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok"}]}]}`)
-	secondRequest, secondOptions := claudeReplayTestRequest(secondPayload, "nonstream-replay", true, sdktranslator.FormatClaude)
-	if _, errExecute := executor.Execute(context.Background(), auth, secondRequest, secondOptions); errExecute != nil {
-		t.Fatalf("second Execute() error = %v", errExecute)
-	}
-
-	mu.Lock()
-	defer mu.Unlock()
-	if len(requestBodies) != 2 {
-		t.Fatalf("upstream request count = %d, want 2", len(requestBodies))
-	}
-	content := ojson.GetBytes(requestBodies[1], "messages.1.content").Array()
-	if len(content) != 2 {
-		t.Fatalf("second assistant content = %s, want thinking and tool_use", ojson.GetBytes(requestBodies[1], "messages.1.content").Raw)
-	}
-	if got := content[0].Get("type").String(); got != "thinking" {
-		t.Fatalf("restored first content type = %q, want thinking", got)
-	}
-	if got := content[0].Get("signature").String(); got != "EgI=" {
-		t.Fatalf("restored signature = %q, want EgI=", got)
-	}
-}
-
-func TestClaudeExecutorCompatThinkingReplayRestoresOmittedBlockInStream(t *testing.T) {
-	internalcacheClearClaudeThinkingReplay(t)
-
-	var mu sync.Mutex
-	var requestBodies [][]byte
-	callCount := 0
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, errRead := io.ReadAll(r.Body)
-		if errRead != nil {
-			t.Errorf("read request body: %v", errRead)
-			return
-		}
-		mu.Lock()
-		requestBodies = append(requestBodies, bytes.Clone(body))
-		callCount++
-		call := callCount
-		mu.Unlock()
-
-		w.Header().Set("Content-Type", "text/event-stream")
-		if call == 1 {
-			_, _ = w.Write([]byte(claudeReplayThinkingStream()))
-			return
-		}
-		_, _ = w.Write([]byte("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg-2\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[]}}\n\n" +
-			"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"))
-	}))
-	defer server.Close()
-
-	executor := NewClaudeExecutor(nil)
-	auth := claudeReplayTestAuth(server.URL)
-	firstPayload := []byte(`{"messages":[{"role":"user","content":"inspect"}]}`)
-	firstRequest, firstOptions := claudeReplayTestRequest(firstPayload, "stream-replay", true, sdktranslator.FormatClaude)
-	firstResult, errExecute := executor.ExecuteStream(context.Background(), auth, firstRequest, firstOptions)
-	if errExecute != nil {
-		t.Fatalf("first ExecuteStream() error = %v", errExecute)
-	}
-	for chunk := range firstResult.Chunks {
-		if chunk.Err != nil {
-			t.Fatalf("first stream error: %v", chunk.Err)
-		}
-	}
-
-	secondPayload := []byte(`{"messages":[{"role":"user","content":"inspect"},{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{"path":"README.md"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok"}]}]}`)
-	secondRequest, secondOptions := claudeReplayTestRequest(secondPayload, "stream-replay", true, sdktranslator.FormatClaude)
-	secondResult, errExecute := executor.ExecuteStream(context.Background(), auth, secondRequest, secondOptions)
-	if errExecute != nil {
-		t.Fatalf("second ExecuteStream() error = %v", errExecute)
-	}
-	for chunk := range secondResult.Chunks {
-		if chunk.Err != nil {
-			t.Fatalf("second stream error: %v", chunk.Err)
-		}
-	}
-
-	mu.Lock()
-	defer mu.Unlock()
-	if len(requestBodies) != 2 {
-		t.Fatalf("upstream request count = %d, want 2", len(requestBodies))
-	}
-	content := ojson.GetBytes(requestBodies[1], "messages.1.content").Array()
-	if len(content) != 2 || content[0].Get("type").String() != "thinking" {
-		t.Fatalf("second streamed assistant content = %s, want restored thinking and tool_use", ojson.GetBytes(requestBodies[1], "messages.1.content").Raw)
-	}
-	if got := content[0].Get("signature").String(); got != "EgI=" {
-		t.Fatalf("restored streamed signature = %q, want EgI=", got)
-	}
-}
-
-func claudeReplayThinkingStream() string {
-	return "event: message_start\n" +
-		"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg-1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[]}}\n\n" +
-		"event: content_block_start\n" +
-		"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}}\n\n" +
-		"event: content_block_delta\n" +
-		"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"provider reasoning\"}}\n\n" +
-		"event: content_block_delta\n" +
-		"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"EgI=\"}}\n\n" +
-		"event: content_block_stop\n" +
-		"data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" +
-		"event: content_block_start\n" +
-		"data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"Read\",\"input\":{}}}\n\n" +
-		"event: content_block_delta\n" +
-		"data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\\\"README.md\\\"}\"}}\n\n" +
-		"event: content_block_stop\n" +
-		"data: {\"type\":\"content_block_stop\",\"index\":1}\n\n" +
-		"event: message_stop\n" +
-		"data: {\"type\":\"message_stop\"}\n\n"
-}
-
-func TestClaudeExecutorCompatThinkingReplayClearsAfterUpstreamBadRequest(t *testing.T) {
-	internalcacheClearClaudeThinkingReplay(t)
-
-	callCount := 0
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		callCount++
-		if callCount == 1 {
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"id":"msg-1","type":"message","role":"assistant","model":"claude-synthetic-4772","content":[{"type":"thinking","thinking":"reasoning","signature":"EgI="},{"type":"tool_use","id":"toolu-1","name":"Read","input":{"path":"README.md"}}],"stop_reason":"tool_use"}`))
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		_, _ = w.Write([]byte(`{"type":"error","error":{"type":"invalid_request_error","message":"invalid thinking signature"}}`))
-	}))
-	defer server.Close()
-
-	executor := NewClaudeExecutor(nil)
-	auth := claudeReplayTestAuth(server.URL)
-	firstRequest, firstOptions := claudeReplayTestRequest([]byte(`{"messages":[{"role":"user","content":"inspect"}]}`), "bad-request-replay", true, sdktranslator.FormatClaude)
-	if _, errExecute := executor.Execute(context.Background(), auth, firstRequest, firstOptions); errExecute != nil {
-		t.Fatalf("first Execute() error = %v", errExecute)
-	}
-
-	secondPayload := []byte(`{"messages":[{"role":"user","content":"inspect"},{"role":"assistant","content":[{"type":"tool_use","id":"toolu-1","name":"Read","input":{"path":"README.md"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu-1","content":"ok"}]}]}`)
-	secondRequest, secondOptions := claudeReplayTestRequest(secondPayload, "bad-request-replay", true, sdktranslator.FormatClaude)
-	if _, errExecute := executor.Execute(context.Background(), auth, secondRequest, secondOptions); errExecute == nil {
-		t.Fatal("second Execute() error = nil, want upstream bad request")
-	}
-
-	scope := claudeThinkingReplayScopeFromRequest(context.Background(), auth, firstRequest, firstOptions)
-	_, found, errGet := internalcache.GetClaudeThinkingReplayRequired(context.Background(), scope.modelFamily, scope.sessionKey)
-	if errGet != nil || found {
-		t.Fatalf("replay after upstream bad request = found %v, error %v; want cleared state", found, errGet)
-	}
-}
-
-func TestClaudeExecutorCompatThinkingReplayRestoresMultipleOmittedBlocks(t *testing.T) {
-	internalcacheClearClaudeThinkingReplay(t)
-
-	var mu sync.Mutex
-	var requestBodies [][]byte
-	callCount := 0
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, errRead := io.ReadAll(r.Body)
-		if errRead != nil {
-			t.Errorf("read request body: %v", errRead)
-			return
-		}
-		mu.Lock()
-		requestBodies = append(requestBodies, bytes.Clone(body))
-		callCount++
-		call := callCount
-		mu.Unlock()
-
-		w.Header().Set("Content-Type", "application/json")
-		switch call {
-		case 1:
-			_, _ = w.Write([]byte(`{"id":"msg-1","type":"message","role":"assistant","model":"claude-synthetic-4772","content":[{"type":"thinking","thinking":"first","signature":"EgI="},{"type":"tool_use","id":"toolu-1","name":"Read","input":{"path":"one"}}],"stop_reason":"tool_use"}`))
-		case 2:
-			_, _ = w.Write([]byte(`{"id":"msg-2","type":"message","role":"assistant","model":"claude-synthetic-4772","content":[{"type":"thinking","thinking":"second","signature":"EgM="},{"type":"tool_use","id":"toolu-2","name":"Read","input":{"path":"two"}}],"stop_reason":"tool_use"}`))
-		default:
-			_, _ = w.Write([]byte(`{"id":"msg-3","type":"message","role":"assistant","model":"claude-synthetic-4772","content":[{"type":"text","text":"done"}],"stop_reason":"end_turn"}`))
-		}
-	}))
-	defer server.Close()
-
-	executor := NewClaudeExecutor(nil)
-	auth := claudeReplayTestAuth(server.URL)
-	firstRequest, firstOptions := claudeReplayTestRequest([]byte(`{"messages":[{"role":"user","content":"inspect"}]}`), "multi-turn-replay", true, sdktranslator.FormatClaude)
-	if _, errExecute := executor.Execute(context.Background(), auth, firstRequest, firstOptions); errExecute != nil {
-		t.Fatalf("first Execute() error = %v", errExecute)
-	}
-
-	secondPayload := []byte(`{"messages":[{"role":"user","content":"inspect"},{"role":"assistant","content":[{"type":"tool_use","id":"toolu-1","name":"Read","input":{"path":"one"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu-1","content":"one result"}]}]}`)
-	secondRequest, secondOptions := claudeReplayTestRequest(secondPayload, "multi-turn-replay", true, sdktranslator.FormatClaude)
-	if _, errExecute := executor.Execute(context.Background(), auth, secondRequest, secondOptions); errExecute != nil {
-		t.Fatalf("second Execute() error = %v", errExecute)
-	}
-
-	thirdPayload := []byte(`{"messages":[{"role":"user","content":"inspect"},{"role":"assistant","content":[{"type":"tool_use","id":"toolu-1","name":"Read","input":{"path":"one"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu-1","content":"one result"}]},{"role":"assistant","content":[{"type":"tool_use","id":"toolu-2","name":"Read","input":{"path":"two"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu-2","content":"two result"}]}]}`)
-	thirdRequest, thirdOptions := claudeReplayTestRequest(thirdPayload, "multi-turn-replay", true, sdktranslator.FormatClaude)
-	if _, errExecute := executor.Execute(context.Background(), auth, thirdRequest, thirdOptions); errExecute != nil {
-		t.Fatalf("third Execute() error = %v", errExecute)
-	}
-
-	mu.Lock()
-	defer mu.Unlock()
-	if len(requestBodies) != 3 {
-		t.Fatalf("upstream request count = %d, want 3", len(requestBodies))
-	}
-	firstContent := ojson.GetBytes(requestBodies[2], "messages.1.content").Array()
-	secondContent := ojson.GetBytes(requestBodies[2], "messages.3.content").Array()
-	if len(firstContent) != 2 || firstContent[0].Get("type").String() != "thinking" || firstContent[0].Get("signature").String() != "EgI=" {
-		t.Fatalf("first omitted turn was not restored: %s", ojson.GetBytes(requestBodies[2], "messages.1.content").Raw)
-	}
-	if len(secondContent) != 2 || secondContent[0].Get("type").String() != "thinking" || secondContent[0].Get("signature").String() != "EgM=" {
-		t.Fatalf("second omitted turn was not restored: %s", ojson.GetBytes(requestBodies[2], "messages.3.content").Raw)
-	}
-}
-
-func internalcacheClearClaudeThinkingReplay(t *testing.T) {
-	t.Helper()
-	internalcache.ClearClaudeThinkingReplayCache()
-	t.Cleanup(internalcache.ClearClaudeThinkingReplayCache)
 }
