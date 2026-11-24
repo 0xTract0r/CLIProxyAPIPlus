@@ -116,17 +116,33 @@ func TestGetOAuthCallbackDoesNotAliasPluginProvider(t *testing.T) {
 	}
 }
 
-func TestWriteOAuthCallbackFileForPendingSessionCreatesMissingAuthDirForCallbackProviders(t *testing.T) {
+func TestScopedOAuthCallbackRequiresExistingAuthRootForCallbackProviders(t *testing.T) {
 	// xAI uses device-code flow and no longer writes callback files.
 	providers := []string{"anthropic", "codex", "gemini", "antigravity"}
 	for _, provider := range providers {
 		t.Run(provider, func(t *testing.T) {
 			authDir := filepath.Join(t.TempDir(), "missing-auth")
 			state := provider + "-state"
-			RegisterOAuthSession(state, provider)
+			h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, nil)
+			if err := h.RegisterFileOAuthSession(state, provider, authDir); err == nil {
+				t.Fatal("registered missing root")
+			}
+			if _, err := os.Stat(authDir); !os.IsNotExist(err) {
+				t.Fatal("untrusted callback root was created")
+			}
+			if err := os.Mkdir(authDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := h.RegisterFileOAuthSession(state, provider, authDir); err != nil {
+				t.Fatal(err)
+			}
 			defer CompleteOAuthSession(state)
 
-			path, errWrite := WriteOAuthCallbackFileForPendingSession(authDir, provider, state, "code-"+provider, "")
+			other := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, nil)
+			if _, err := other.WriteFileOAuthCallback(provider, state, "foreign-fixture", ""); err == nil {
+				t.Fatal("foreign handler accepted callback")
+			}
+			path, errWrite := h.WriteFileOAuthCallback(provider, state, "code-"+provider, "")
 			if errWrite != nil {
 				t.Fatalf("expected callback file write to succeed: %v", errWrite)
 			}

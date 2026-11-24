@@ -18,6 +18,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	sdkauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 )
@@ -1297,11 +1298,14 @@ func (e *failingRefreshManagementExecutor) Refresh(_ context.Context, auth *core
 		return nil, e.err
 	}
 	if e.rotateTokens && auth != nil {
+		baseline := auth.Clone().Metadata
 		if auth.Metadata == nil {
 			auth.Metadata = make(map[string]any)
 		}
 		auth.Metadata["access_token"] = "rotated-access-token"
 		auth.Metadata["refresh_token"] = "rotated-refresh-token"
+		auth.CodexRefreshPatch = codex.NewCredentialRefreshPatchWithDiskBaseline(baseline, baseline, auth.Metadata, true, false)
+		auth.CodexRefreshPatch.SetUpstreamRefreshed(true)
 	}
 	return auth, nil
 }
@@ -1318,7 +1322,9 @@ func TestRefreshAuthFilesV8_SignInRequiredAndRedaction_Issue7135(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	authDir := t.TempDir()
 	cfg := &config.Config{AuthDir: authDir}
-	manager := coreauth.NewManager(nil, nil, nil)
+	store := sdkauth.NewFileTokenStore()
+	store.SetBaseDir(authDir)
+	manager := coreauth.NewManager(store, nil, nil)
 
 	exec := &failingRefreshManagementExecutor{
 		provider: "codex",
@@ -1393,6 +1399,15 @@ func TestRefreshAuthFilesV8_SignInRequiredAndRedaction_Issue7135(t *testing.T) {
 		t.Fatalf("expected status=error unavailable=true requires_sign_in=true recovery_stage=sign_in_required, got %#v", deadEntry)
 	}
 
+	// Replace the rejected grant through the normal manager update before
+	// exercising a fresh rotation. The old grant remains fail-closed.
+	replacement := &coreauth.Auth{ID: "codex-dead.json", Index: "idx-codex-dead", FileName: "codex-dead.json", Provider: "codex", Status: coreauth.StatusActive,
+		Attributes: map[string]string{"path": credPath, "source": credPath},
+		Metadata:   map[string]any{"type": "codex", "email": "dead@example.com", "access_token": "synthetic-new-access", "refresh_token": "synthetic-new-refresh", "expired": futureExpiry.Format(time.RFC3339)},
+	}
+	if _, err := manager.Update(context.Background(), replacement); err != nil {
+		t.Fatalf("update selected credential: %v", err)
+	}
 	// 2. When a credential refresh genuinely rotates tokens on v8 /credentials/refresh, the response must use the redacted entry view.
 	exec.rotateTokens = true
 	wRefreshOK := httptest.NewRecorder()
@@ -1408,4 +1423,14 @@ func TestRefreshAuthFilesV8_SignInRequiredAndRedaction_Issue7135(t *testing.T) {
 			t.Fatalf("POST /v8/management/credentials/refresh leaked plaintext token %q in response: %s", secret, rawOK)
 		}
 	}
+	after, ok := manager.GetByID("codex-dead.json")
+	if !ok || after.RequiresSignIn || after.Metadata["access_token"] != "rotated-access-token" {
+		t.Fatalf("selected credential result: found=%t requires_sign_in=%t rotated=%t", ok, ok && after.RequiresSignIn, ok && after.Metadata["access_token"] == "rotated-access-token")
+	}
+	var persisted map[string]any
+	raw, err := os.ReadFile(credPath)
+	if err != nil || json.Unmarshal(raw, &persisted) != nil || persisted["refresh_token"] != "rotated-refresh-token" || persisted["email"] != "dead@example.com" {
+		t.Fatal("selected credential did not persist the rotated grant")
+	}
+
 }

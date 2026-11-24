@@ -405,7 +405,7 @@ func TestTargetedOAuthReloginAntigravityRejectsMismatchedAccountAndUpdatesMatchi
 	if mismatchStart.TargetAuthID != targetFile {
 		t.Fatalf("target_auth_id = %q, want %q", mismatchStart.TargetAuthID, targetFile)
 	}
-	if _, errCb := WriteOAuthCallbackFileForPendingSession(authDir, "antigravity", mismatchStart.State, "code-mismatch", ""); errCb != nil {
+	if _, errCb := h.WriteFileOAuthCallback("antigravity", mismatchStart.State, "code-mismatch", ""); errCb != nil {
 		t.Fatalf("write callback: %v", errCb)
 	}
 	mismatchStatus := pollOAuthStatusUntilDone(t, router, mismatchStart.State)
@@ -435,7 +435,7 @@ func TestTargetedOAuthReloginAntigravityRejectsMismatchedAccountAndUpdatesMatchi
 	}
 	_ = json.Unmarshal(wMatch.Body.Bytes(), &matchStart)
 	t.Cleanup(func() { CancelOAuthSession(matchStart.State) })
-	if _, errCb := WriteOAuthCallbackFileForPendingSession(authDir, "antigravity", matchStart.State, "code-match", ""); errCb != nil {
+	if _, errCb := h.WriteFileOAuthCallback("antigravity", matchStart.State, "code-match", ""); errCb != nil {
 		t.Fatalf("write match callback: %v", errCb)
 	}
 	matchStatus := pollOAuthStatusUntilDone(t, router, matchStart.State)
@@ -723,7 +723,9 @@ func TestTargetedOAuthReloginClaudeXAIMetaDevinAndAuthIndexVerify(t *testing.T) 
 	router.ServeHTTP(wDevinMismatch, httptest.NewRequest(http.MethodPost, "/v8/management/oauth/auth-url", strings.NewReader(`{"provider":"devin","name":"devin-custom.json"}`)))
 	var devinMismatchStart struct{ State string }
 	_ = json.Unmarshal(wDevinMismatch.Body.Bytes(), &devinMismatchStart)
-	_, _ = WriteOAuthCallbackFileForPendingSession(authDir, "devin", devinMismatchStart.State, "devin-code-1", "")
+	if _, err := h.WriteFileOAuthCallback("devin", devinMismatchStart.State, "devin-code-1", ""); err != nil {
+		t.Fatalf("scoped Devin mismatch fixture callback: %v", err)
+	}
 	if st := pollOAuthStatusUntilDone(t, router, devinMismatchStart.State); st["status"] != "error" {
 		t.Fatalf("devin mismatch status = %#v, want error", st)
 	}
@@ -733,7 +735,9 @@ func TestTargetedOAuthReloginClaudeXAIMetaDevinAndAuthIndexVerify(t *testing.T) 
 	router.ServeHTTP(wDevinMatch, httptest.NewRequest(http.MethodPost, "/v8/management/oauth/auth-url", strings.NewReader(`{"provider":"devin","name":"devin-custom.json"}`)))
 	var devinMatchStart struct{ State string }
 	_ = json.Unmarshal(wDevinMatch.Body.Bytes(), &devinMatchStart)
-	_, _ = WriteOAuthCallbackFileForPendingSession(authDir, "devin", devinMatchStart.State, "devin-code-2", "")
+	if _, err := h.WriteFileOAuthCallback("devin", devinMatchStart.State, "devin-code-2", ""); err != nil {
+		t.Fatalf("scoped Devin match fixture callback: %v", err)
+	}
 	if st := pollOAuthStatusUntilDone(t, router, devinMatchStart.State); st["status"] != "ok" || st["auth_id"] != "devin-custom.json" || st["adopted"] != true {
 		t.Fatalf("devin match status = %#v, want ok & adopted", st)
 	}

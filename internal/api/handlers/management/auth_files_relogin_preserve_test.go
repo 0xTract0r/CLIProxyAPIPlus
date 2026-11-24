@@ -453,12 +453,10 @@ func TestSaveTokenRecord_SubjectOnlyReloginKeepsEmailCredential(t *testing.T) {
 	if saved["access_token"] != "new-token" || saved["prefix"] != "team" || saved["weight"] != float64(5) || saved["email"] != "a+b@example.com" {
 		t.Fatalf("saved credential = %#v, want new token with preserved settings and email", saved)
 	}
-	entries, errReadDir := os.ReadDir(authDir)
-	if errReadDir != nil {
-		t.Fatalf("ReadDir error: %v", errReadDir)
-	}
-	if len(entries) != 1 {
-		t.Fatalf("auth dir holds %d files, want the single canonical credential", len(entries))
+	// Credential-root bookkeeping files are not credential records.
+	paths, errGlob := filepath.Glob(filepath.Join(authDir, "*.json"))
+	if errGlob != nil || len(paths) != 1 || paths[0] != emailPath {
+		t.Fatalf("expected only the canonical credential in root: %v", paths)
 	}
 }
 
