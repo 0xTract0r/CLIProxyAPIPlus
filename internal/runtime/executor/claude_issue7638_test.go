@@ -5,652 +5,274 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/MoeForge/moego/ojson"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v8/internal/kvstore"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 )
 
-func claudeIssue7638OAuthAuth(id, token, accountUUID string) *cliproxyauth.Auth {
-	return &cliproxyauth.Auth{
-		ID:       id,
-		Provider: "claude",
-		Status:   cliproxyauth.StatusActive,
-		Metadata: map[string]any{
-			"access_token": token,
-			"account_uuid": accountUUID,
-		},
-	}
-}
+const ordinaryClaudeMessageScopeModel = "claude-opus-5-5"
 
-func claudeIssue7638JSONResponse(req *http.Request, body string) *http.Response {
-	return &http.Response{
-		StatusCode: http.StatusOK,
-		Header:     http.Header{"Content-Type": []string{"application/json"}},
-		Body:       io.NopCloser(strings.NewReader(body)),
-		Request:    req,
-	}
-}
-
-func claudeIssue7638SSEResponse(req *http.Request, events string) *http.Response {
-	return &http.Response{
-		StatusCode: http.StatusOK,
-		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
-		Body:       io.NopCloser(strings.NewReader(events)),
-		Request:    req,
-	}
-}
-
-func claudeIssue7638AdvisorMintJSON(id, text string) string {
-	return fmt.Sprintf(`{
-		"id": "msg_%s",
-		"type": "message",
-		"role": "assistant",
-		"model": "claude-opus-5-5",
-		"content": [
-			{"type": "server_tool_use", "id": %q, "name": "advisor", "input": {}},
-			{"type": "advisor_tool_result", "tool_use_id": %q, "content": {"type": "advisor_redacted_result", "encrypted_content": "enc_%s"}},
-			{"type": "text", "text": %q}
+func TestOrdinaryClaudeIndependentPublicMessages(t *testing.T) {
+	const first = `{
+		"max_tokens":32,
+		"tools":[
+			{"type":"web_search_20250305","name":"web_search"},
+			{"name":"fixture_lookup","input_schema":{"type":"object","properties":{"topic":{"type":"string"}}}}
 		],
-		"stop_reason": "end_turn",
-		"usage": {"input_tokens": 10, "output_tokens": 20}
-	}`, id, id, id, id, text)
-}
-
-func claudeIssue7638AdvisorMintSSE(id, text string) string {
-	return fmt.Sprintf(
-		"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_%s\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-opus-5-5\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\n"+
-			"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"server_tool_use\",\"id\":%q,\"name\":\"advisor\",\"input\":{}}}\n\n"+
-			"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n"+
-			"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"advisor_tool_result\",\"tool_use_id\":%q,\"content\":{\"type\":\"advisor_redacted_result\",\"encrypted_content\":\"enc_%s\"}}}\n\n"+
-			"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n"+
-			"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n"+
-			"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"text_delta\",\"text\":%q}}\n\n"+
-			"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":2}\n\n"+
-			"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":20}}\n\n"+
-			"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
-		id, id, id, id, text,
-	)
-}
-
-func TestClaudeIssue7638_ExecuteStripsForeignAdvisorBlocksAndPreservesOwn(t *testing.T) {
-	if errShutdown := kvstore.ShutdownLocal(); errShutdown != nil {
-		t.Fatal(errShutdown)
-	}
-	var captured [][]byte
-	callIdx := 0
-	transport := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
-		body, _ := io.ReadAll(req.Body)
-		captured = append(captured, body)
-		callIdx++
-		switch callIdx {
-		case 1:
-			return claudeIssue7638JSONResponse(req, claudeIssue7638AdvisorMintJSON("srvtoolu_adv_a", "from A")), nil
-		case 2:
-			return claudeIssue7638JSONResponse(req, claudeIssue7638AdvisorMintJSON("srvtoolu_adv_b", "from B")), nil
-		default:
-			return claudeIssue7638JSONResponse(req, `{"id":"msg_3","type":"message","role":"assistant","model":"claude-opus-5-5","content":[{"type":"text","text":"done"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`), nil
-		}
-	})
-
-	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", http.RoundTripper(transport))
-	exec := NewClaudeExecutor(&config.Config{})
-	authA := claudeIssue7638OAuthAuth("cred-a", "sk-ant-oat-a", "11111111-1111-4111-8111-111111111111")
-	authB := claudeIssue7638OAuthAuth("cred-b", "sk-ant-oat-b", "22222222-2222-4222-8222-222222222222")
-	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatClaude}
-
-	// Turn 1 on A: mints srvtoolu_adv_a.
-	turn1 := []byte(`{"model":"claude-opus-5-5","max_tokens":256,"messages":[{"role":"user","content":"turn 1"}]}`)
-	if _, err := exec.Execute(ctx, authA, cliproxyexecutor.Request{Model: "claude-opus-5-5", Payload: turn1}, opts); err != nil {
-		t.Fatalf("turn 1 Execute() error = %v", err)
-	}
-
-	// Turn 2 on B: replays A's advisor blocks (must be stripped) and mints srvtoolu_adv_b.
-	turn2 := []byte(`{
-		"model": "claude-opus-5-5",
-		"max_tokens": 256,
-		"messages": [
-			{"role": "user", "content": "turn 1"},
-			{
-				"role": "assistant",
-				"content": [
-					{"type": "server_tool_use", "id": "srvtoolu_adv_a", "name": "advisor", "input": {}},
-					{"type": "advisor_tool_result", "tool_use_id": "srvtoolu_adv_a", "content": {"type": "advisor_redacted_result", "encrypted_content": "enc_a"}},
-					{"type": "text", "text": "from A"}
-				]
-			},
-			{"role": "user", "content": "turn 2"}
+		"messages":[
+			{"role":"user","content":[{"type":"text","text":"first request only"}]},
+			{"role":"assistant","content":[
+				{"type":"server_tool_use","id":"srvtoolu_fixture_search","name":"web_search","input":{"query":"fixture"}},
+				{"type":"web_search_tool_result","tool_use_id":"srvtoolu_fixture_search","content":[]},
+				{"type":"tool_use","id":"toolu_fixture_lookup","name":"fixture_lookup","input":{"topic":"explicit lookup topic"}}
+			]},
+			{"role":"user","content":[
+				{"type":"tool_result","tool_use_id":"toolu_fixture_lookup","content":[{"type":"text","text":"explicit tool output"}]},
+				{"type":"text","text":"ordinary user text"}
+			]}
 		]
-	}`)
-	if _, err := exec.Execute(ctx, authB, cliproxyexecutor.Request{Model: "claude-opus-5-5", Payload: turn2}, opts); err != nil {
-		t.Fatalf("turn 2 Execute() error = %v", err)
-	}
-
-	if strings.Contains(string(captured[1]), "srvtoolu_adv_a") {
-		t.Fatalf("turn 2 sent foreign advisor block srvtoolu_adv_a to cred-b: %s", captured[1])
-	}
-	if !strings.Contains(string(captured[1]), "from A") {
-		t.Fatalf("turn 2 dropped non-advisor text block: %s", captured[1])
-	}
-
-	// Turn 3 on B: replays both A's (foreign) and B's (own) advisor blocks.
-	turn3 := []byte(`{
-		"model": "claude-opus-5-5",
-		"max_tokens": 256,
-		"messages": [
-			{"role": "user", "content": "turn 1"},
-			{
-				"role": "assistant",
-				"content": [
-					{"type": "server_tool_use", "id": "srvtoolu_adv_a", "name": "advisor", "input": {}},
-					{"type": "advisor_tool_result", "tool_use_id": "srvtoolu_adv_a", "content": {"type": "advisor_redacted_result", "encrypted_content": "enc_a"}},
-					{"type": "text", "text": "from A"}
-				]
-			},
-			{"role": "user", "content": "turn 2"},
-			{
-				"role": "assistant",
-				"content": [
-					{"type": "server_tool_use", "id": "srvtoolu_adv_b", "name": "advisor", "input": {}},
-					{"type": "advisor_tool_result", "tool_use_id": "srvtoolu_adv_b", "content": {"type": "advisor_redacted_result", "encrypted_content": "enc_b"}},
-					{"type": "text", "text": "from B"}
-				]
-			},
-			{"role": "user", "content": "turn 3"}
-		]
-	}`)
-	if _, err := exec.Execute(ctx, authB, cliproxyexecutor.Request{Model: "claude-opus-5-5", Payload: turn3}, opts); err != nil {
-		t.Fatalf("turn 3 Execute() error = %v", err)
-	}
-
-	if strings.Contains(string(captured[2]), "srvtoolu_adv_a") {
-		t.Fatalf("turn 3 sent foreign advisor block srvtoolu_adv_a to cred-b: %s", captured[2])
-	}
-	if !strings.Contains(string(captured[2]), "srvtoolu_adv_b") {
-		t.Fatalf("turn 3 stripped cred-b's own advisor block srvtoolu_adv_b: %s", captured[2])
-	}
-}
-
-func TestClaudeIssue7638_ExecuteStreamTracksMintedAdvisorAndStripsOnRebind(t *testing.T) {
-	if errShutdown := kvstore.ShutdownLocal(); errShutdown != nil {
-		t.Fatal(errShutdown)
-	}
-	var captured [][]byte
-	callIdx := 0
-	transport := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
-		body, _ := io.ReadAll(req.Body)
-		captured = append(captured, body)
-		callIdx++
-		if callIdx == 1 {
-			return claudeIssue7638SSEResponse(req, claudeIssue7638AdvisorMintSSE("srvtoolu_stream_a", "stream from A")), nil
-		}
-		return claudeIssue7638SSEResponse(req,
-			"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_s2\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-opus-5-5\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n"+
-				"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n"+
-				"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n"+
-				"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n"+
-				"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":1}}\n\n"+
-				"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
-		), nil
-	})
-
-	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", http.RoundTripper(transport))
-	exec := NewClaudeExecutor(&config.Config{})
-	authA := claudeIssue7638OAuthAuth("cred-stream-a", "sk-ant-oat-sa", "11111111-1111-4111-8111-111111111112")
-	authB := claudeIssue7638OAuthAuth("cred-stream-b", "sk-ant-oat-sb", "22222222-2222-4222-8222-222222222223")
-	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatClaude, Stream: true}
-
-	// Turn 1 streaming on A: mints srvtoolu_stream_a.
-	res1, err := exec.ExecuteStream(ctx, authA, cliproxyexecutor.Request{
-		Model:   "claude-opus-5-5",
-		Payload: []byte(`{"model":"claude-opus-5-5","max_tokens":256,"stream":true,"messages":[{"role":"user","content":"turn 1"}]}`),
-	}, opts)
-	if err != nil {
-		t.Fatalf("turn 1 ExecuteStream() error = %v", err)
-	}
-	for chunk := range res1.Chunks {
-		if chunk.Err != nil {
-			t.Fatalf("turn 1 chunk error = %v", chunk.Err)
-		}
-	}
-
-	// Turn 2 streaming on B: foreign advisor turns (containing ONLY advisor blocks) must be dropped completely.
-	turn2 := []byte(`{
-		"model": "claude-opus-5-5",
-		"max_tokens": 256,
-		"stream": true,
-		"messages": [
-			{"role": "user", "content": "turn 1"},
-			{
-				"role": "assistant",
-				"content": [
-					{"type": "server_tool_use", "id": "srvtoolu_stream_a", "name": "advisor", "input": {}}
-				]
-			},
-			{
-				"role": "user",
-				"content": [
-					{"type": "advisor_tool_result", "tool_use_id": "srvtoolu_stream_a", "content": {"type": "advisor_redacted_result", "encrypted_content": "enc_sa"}}
-				]
-			},
-			{"role": "assistant", "content": "stream from A"},
-			{"role": "user", "content": "turn 2"}
-		]
-	}`)
-	res2, err := exec.ExecuteStream(ctx, authB, cliproxyexecutor.Request{Model: "claude-opus-5-5", Payload: turn2}, opts)
-	if err != nil {
-		t.Fatalf("turn 2 ExecuteStream() error = %v", err)
-	}
-	for chunk := range res2.Chunks {
-		if chunk.Err != nil {
-			t.Fatalf("turn 2 chunk error = %v", chunk.Err)
-		}
-	}
-
-	if strings.Contains(string(captured[1]), "srvtoolu_stream_a") {
-		t.Fatalf("turn 2 stream sent foreign advisor block to cred-stream-b: %s", captured[1])
-	}
-	// The two advisor-only turns must be dropped rather than leaving empty content arrays.
-	for _, msg := range ojson.GetBytes(captured[1], "messages").Array() {
-		content := msg.Get("content")
-		if content.IsArray() && len(content.Array()) == 0 {
-			t.Fatalf("turn 2 stream left empty content array in messages: %s", captured[1])
-		}
-	}
-}
-
-func TestClaudeIssue7638_CountTokensAndKVPersistenceAcrossRestart(t *testing.T) {
-	if errShutdown := kvstore.ShutdownLocal(); errShutdown != nil {
-		t.Fatal(errShutdown)
-	}
-	kvPath := filepath.Join(t.TempDir(), "kv.db")
-	if errCfg := kvstore.ConfigureLocal(true, kvPath); errCfg != nil {
-		t.Fatal(errCfg)
-	}
-	t.Cleanup(func() {
-		if errShutdown := kvstore.ShutdownLocal(); errShutdown != nil {
-			t.Error(errShutdown)
-		}
-	})
-
-	var captured [][]byte
-	transport := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
-		body, _ := io.ReadAll(req.Body)
-		captured = append(captured, body)
-		if strings.Contains(req.URL.Path, "count_tokens") {
-			return claudeIssue7638JSONResponse(req, `{"input_tokens":42}`), nil
-		}
-		return claudeIssue7638JSONResponse(req, claudeIssue7638AdvisorMintJSON("srvtoolu_persist", "persisted")), nil
-	})
-
-	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", http.RoundTripper(transport))
-	authA := claudeIssue7638OAuthAuth("cred-persist-a", "sk-ant-oat-pa", "11111111-1111-4111-8111-111111111113")
-	authB := claudeIssue7638OAuthAuth("cred-persist-b", "sk-ant-oat-pb", "22222222-2222-4222-8222-222222222224")
-	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatClaude}
-
-	exec1 := NewClaudeExecutor(&config.Config{})
-	if _, err := exec1.Execute(ctx, authA, cliproxyexecutor.Request{
-		Model:   "claude-opus-5-5",
-		Payload: []byte(`{"model":"claude-opus-5-5","max_tokens":256,"messages":[{"role":"user","content":"turn 1"}]}`),
-	}, opts); err != nil {
-		t.Fatalf("exec1.Execute() error = %v", err)
-	}
-
-	// Simulate proxy restart: close & reopen KV store and allocate a brand-new ClaudeExecutor.
-	if errShutdown := kvstore.ShutdownLocal(); errShutdown != nil {
-		t.Fatal(errShutdown)
-	}
-	if errCfg := kvstore.ConfigureLocal(true, kvPath); errCfg != nil {
-		t.Fatal(errCfg)
-	}
-	exec2 := NewClaudeExecutor(&config.Config{})
-
-	replayPayload := []byte(`{
-		"model": "claude-opus-5-5",
-		"max_tokens": 256,
-		"messages": [
-			{"role": "user", "content": "turn 1"},
-			{
-				"role": "assistant",
-				"content": [
-					{"type": "server_tool_use", "id": "srvtoolu_persist", "name": "advisor", "input": {}},
-					{"type": "advisor_tool_result", "tool_use_id": "srvtoolu_persist", "content": {"type": "advisor_redacted_result", "encrypted_content": "enc_p"}},
-					{"type": "text", "text": "persisted"}
-				]
-			},
-			{"role": "user", "content": "turn 2"}
-		]
-	}`)
-
-	if _, err := exec2.CountTokens(ctx, authB, cliproxyexecutor.Request{Model: "claude-opus-5-5", Payload: replayPayload}, opts); err != nil {
-		t.Fatalf("exec2.CountTokens() error = %v", err)
-	}
-	if strings.Contains(string(captured[1]), "srvtoolu_persist") {
-		t.Fatalf("post-restart CountTokens on cred-persist-b still contained foreign advisor block: %s", captured[1])
-	}
-
-	if _, err := exec2.Execute(ctx, authB, cliproxyexecutor.Request{Model: "claude-opus-5-5", Payload: replayPayload}, opts); err != nil {
-		t.Fatalf("exec2.Execute() error = %v", err)
-	}
-	if strings.Contains(string(captured[2]), "srvtoolu_persist") {
-		t.Fatalf("post-restart Execute on cred-persist-b still contained foreign advisor block: %s", captured[2])
-	}
-}
-
-func TestClaudeIssue7638_AllAdvisorBlockShapesAndRequestFallbackLearning(t *testing.T) {
-	if errShutdown := kvstore.ShutdownLocal(); errShutdown != nil {
-		t.Fatal(errShutdown)
-	}
-	var captured [][]byte
-	callIdx := 0
-	transport := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
-		body, _ := io.ReadAll(req.Body)
-		captured = append(captured, body)
-		callIdx++
-		if callIdx == 1 {
-			// Failed 400 on B must NOT record B as the owner of srvtoolu_pre.
-			return &http.Response{
-				StatusCode: http.StatusBadRequest,
-				Header:     http.Header{"Content-Type": []string{"application/json"}},
-				Body:       io.NopCloser(strings.NewReader(`{"type":"error","error":{"type":"invalid_request_error","message":"Advisor tool result content could not be processed."}}`)),
-				Request:    req,
-			}, nil
-		}
-		return claudeIssue7638JSONResponse(req, `{"id":"msg_ok","type":"message","role":"assistant","model":"claude-opus-5-5","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`), nil
-	})
-
-	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", http.RoundTripper(transport))
-	exec := NewClaudeExecutor(&config.Config{})
-	authA := claudeIssue7638OAuthAuth("cred-shape-a", "sk-ant-oat-sha", "11111111-1111-4111-8111-111111111114")
-	authB := claudeIssue7638OAuthAuth("cred-shape-b", "sk-ant-oat-shb", "22222222-2222-4222-8222-222222222225")
-	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatClaude}
-
-	payload := []byte(`{
-		"model": "claude-opus-5-5",
-		"max_tokens": 256,
-		"messages": [
-			{"role": "user", "content": "start"},
-			{
-				"role": "assistant",
-				"content": [
-					{"type": "server_tool_use", "id": "srvtoolu_pre", "name": "advisor", "input": {}},
-					{"type": "server_tool_use", "id": "srvtoolu_ws", "name": "web_search", "input": {"query": "go"}},
-					{"type": "tool_use", "id": "toolu_mix", "name": "custom_tool", "input": {}}
-				]
-			},
-			{
-				"role": "user",
-				"content": [
-					{"type": "advisor_redacted_result", "tool_use_id": "srvtoolu_pre", "encrypted_content": "enc_redacted"},
-					{"type": "tool_result", "tool_use_id": "srvtoolu_pre", "content": {"type": "advisor_redacted_result", "encrypted_content": "enc_obj"}},
-					{
-						"type": "tool_result",
-						"tool_use_id": "toolu_mix",
-						"content": [
-							{"type": "text", "text": "keep tool output"},
-							{"type": "advisor_redacted_result", "encrypted_content": "enc_mixed"}
-						]
-					}
-				]
-			},
-			{"role": "user", "content": "next"}
-		]
-	}`)
-
-	// Call 1: B fails with 400 -> must NOT claim ownership of srvtoolu_pre or toolu_mix.
-	if _, err := exec.Execute(ctx, authB, cliproxyexecutor.Request{Model: "claude-opus-5-5", Payload: payload}, opts); err == nil {
-		t.Fatal("expected 400 error on first attempt")
-	}
-
-	// Call 2: A succeeds with 200 -> A learns ownership of srvtoolu_pre and toolu_mix via 2xx request fallback.
-	if _, err := exec.Execute(ctx, authA, cliproxyexecutor.Request{Model: "claude-opus-5-5", Payload: payload}, opts); err != nil {
-		t.Fatalf("A Execute() error = %v", err)
-	}
-
-	// Call 3: B retries -> foreign advisor blocks stripped; web_search and non-advisor tool_result text kept!
-	if _, err := exec.Execute(ctx, authB, cliproxyexecutor.Request{Model: "claude-opus-5-5", Payload: payload}, opts); err != nil {
-		t.Fatalf("B Execute() error = %v", err)
-	}
-
-	bodyB := string(captured[2])
-	if strings.Contains(bodyB, "srvtoolu_pre") || strings.Contains(bodyB, "enc_redacted") || strings.Contains(bodyB, "enc_obj") || strings.Contains(bodyB, "enc_mixed") {
-		t.Fatalf("B still received foreign advisor blocks: %s", bodyB)
-	}
-	if !strings.Contains(bodyB, "srvtoolu_ws") {
-		t.Fatalf("non-advisor web_search server_tool_use was wrongly stripped: %s", bodyB)
-	}
-	if !strings.Contains(bodyB, "toolu_mix") || !strings.Contains(bodyB, "keep tool output") {
-		t.Fatalf("mixed tool_result non-advisor text was wrongly stripped: %s", bodyB)
-	}
-}
-func TestClaudeIssue7638_ForAPIKeyAndWithConfigShareAdvisorOwnerStore(t *testing.T) {
-	if errShutdown := kvstore.ShutdownLocal(); errShutdown != nil {
-		t.Fatal(errShutdown)
-	}
-	var captured [][]byte
-	callIdx := 0
-	transport := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
-		body, _ := io.ReadAll(req.Body)
-		captured = append(captured, body)
-		callIdx++
-		if callIdx == 1 {
-			return claudeIssue7638JSONResponse(req, claudeIssue7638AdvisorMintJSON("srvtoolu_shared", "from A")), nil
-		}
-		return claudeIssue7638JSONResponse(req, `{"id":"msg_2","type":"message","role":"assistant","model":"claude-opus-5-5","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`), nil
-	})
-
-	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", http.RoundTripper(transport))
-	base := NewClaudeExecutor(&config.Config{})
-	copyA := base.ForAPIKey().(*ClaudeExecutor)
-	copyB := base.WithConfig(&config.Config{})
-	authA := claudeIssue7638OAuthAuth("cred-share-a", "sk-ant-oat-sha1", "11111111-1111-4111-8111-111111111115")
-	authB := claudeIssue7638OAuthAuth("cred-share-b", "sk-ant-oat-shb1", "22222222-2222-4222-8222-222222222226")
-	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatClaude}
-
-	if _, err := copyA.Execute(ctx, authA, cliproxyexecutor.Request{
-		Model:   "claude-opus-5-5",
-		Payload: []byte(`{"model":"claude-opus-5-5","max_tokens":256,"messages":[{"role":"user","content":"turn 1"}]}`),
-	}, opts); err != nil {
-		t.Fatalf("copyA.Execute() error = %v", err)
-	}
-
-	replay := []byte(`{
-		"model": "claude-opus-5-5",
-		"max_tokens": 256,
-		"messages": [
-			{"role": "user", "content": "turn 1"},
-			{
-				"role": "assistant",
-				"content": [
-					{"type": "server_tool_use", "id": "srvtoolu_shared", "name": "advisor", "input": {}},
-					{"type": "advisor_tool_result", "tool_use_id": "srvtoolu_shared", "content": {"type": "advisor_redacted_result", "encrypted_content": "enc_s"}},
-					{"type": "text", "text": "from A"}
-				]
-			},
-			{"role": "user", "content": "turn 2"}
-		]
-	}`)
-	if _, err := copyB.Execute(ctx, authB, cliproxyexecutor.Request{Model: "claude-opus-5-5", Payload: replay}, opts); err != nil {
-		t.Fatalf("copyB.Execute() error = %v", err)
-	}
-	if strings.Contains(string(captured[1]), "srvtoolu_shared") {
-		t.Fatalf("WithConfig/ForAPIKey copies did not share advisor owner store: %s", captured[1])
-	}
-}
-
-func TestClaudeIssue7638_PayloadRuleRemainsFinalSemanticBarrier(t *testing.T) {
-	if errShutdown := kvstore.ShutdownLocal(); errShutdown != nil {
-		t.Fatal(errShutdown)
-	}
-	var captured [][]byte
-	callIdx := 0
-	transport := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
-		body, _ := io.ReadAll(req.Body)
-		captured = append(captured, body)
-		callIdx++
-		if callIdx == 1 {
-			return claudeIssue7638JSONResponse(req, claudeIssue7638AdvisorMintJSON("srvtoolu_barrier", "from A")), nil
-		}
-		return claudeIssue7638JSONResponse(req, `{"id":"msg_2","type":"message","role":"assistant","model":"claude-opus-5-5","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`), nil
-	})
-
-	cfg := &config.Config{
-		Payload: config.PayloadConfig{
-			Override: []config.PayloadRule{
-				{
-					Models: []config.PayloadModelRule{{Name: "claude-opus-5-5", Protocol: "claude"}},
-					Params: map[string]any{"max_tokens": 999},
-				},
-			},
-		},
-	}
-	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", http.RoundTripper(transport))
-	exec := NewClaudeExecutor(cfg)
-	authA := claudeIssue7638OAuthAuth("cred-bar-a", "sk-ant-oat-ba", "11111111-1111-4111-8111-111111111116")
-	authB := claudeIssue7638OAuthAuth("cred-bar-b", "sk-ant-oat-bb", "22222222-2222-4222-8222-222222222227")
-	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatClaude}
-
-	if _, err := exec.Execute(ctx, authA, cliproxyexecutor.Request{
-		Model:   "claude-opus-5-5",
-		Payload: []byte(`{"model":"claude-opus-5-5","max_tokens":256,"messages":[{"role":"user","content":"turn 1"}]}`),
-	}, opts); err != nil {
-		t.Fatalf("turn 1 error = %v", err)
-	}
-
-	replay := []byte(`{
-		"model": "claude-opus-5-5",
-		"max_tokens": 256,
-		"messages": [
-			{"role": "user", "content": "turn 1"},
-			{
-				"role": "assistant",
-				"content": [
-					{"type": "server_tool_use", "id": "srvtoolu_barrier", "name": "advisor", "input": {}},
-					{"type": "advisor_tool_result", "tool_use_id": "srvtoolu_barrier", "content": {"type": "advisor_redacted_result", "encrypted_content": "enc_b"}},
-					{"type": "text", "text": "from A"}
-				]
-			},
-			{"role": "user", "content": "turn 2"}
-		]
-	}`)
-	if _, err := exec.Execute(ctx, authB, cliproxyexecutor.Request{Model: "claude-opus-5-5", Payload: replay}, opts); err != nil {
-		t.Fatalf("turn 2 error = %v", err)
-	}
-	if strings.Contains(string(captured[1]), "srvtoolu_barrier") {
-		t.Fatalf("foreign advisor block was not stripped: %s", captured[1])
-	}
-	if got := ojson.GetBytes(captured[1], "max_tokens").Int(); got != 999 {
-		t.Fatalf("payload override max_tokens = %d, want 999: %s", got, captured[1])
-	}
-}
-
-func TestClaudeIssue7638_PayloadRuleRemovingUnknownAdvisorDoesNotClaimOwner(t *testing.T) {
-	for _, stream := range []bool{false, true} {
-		mode := "Execute"
-		if stream {
-			mode = "ExecuteStream"
-		}
+	}`
+	const second = `{"max_tokens":32,"messages":[{"role":"user","content":[{"type":"text","text":"second request only"}]}]}`
+	priorContent := []string{"first request only", "srvtoolu_fixture_search", "toolu_fixture_lookup", "explicit lookup topic", "explicit tool output", "ordinary user text", "message reply 1"}
+	for _, mode := range []string{"json", "stream"} {
 		t.Run(mode, func(t *testing.T) {
-			if errShutdown := kvstore.ShutdownLocal(); errShutdown != nil {
-				t.Fatal(errShutdown)
-			}
-			var captured [][]byte
-			transport := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
-				body, _ := io.ReadAll(req.Body)
-				captured = append(captured, body)
-				if stream {
-					return claudeIssue7638SSEResponse(req,
-						"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_f\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-opus-5-5\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n"+
-							"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n"+
-							"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n"+
-							"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n"+
-							"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":1}}\n\n"+
-							"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
-					), nil
-				}
-				return claudeIssue7638JSONResponse(req, `{"id":"msg_f","type":"message","role":"assistant","model":"claude-opus-5-5","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`), nil
+			stream := mode == "stream"
+			var sent [][]byte
+			ctx, auth := ordinaryClaudeMessageScopeFixture(t, "/v1/messages", func(b []byte) (string, string) {
+				sent = append(sent, b)
+				reply := fmt.Sprintf("message reply %d", len(sent))
+				return ordinaryClaudeMessageScopeReply(stream, reply)
 			})
-
-			ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", http.RoundTripper(transport))
-			authA := claudeIssue7638OAuthAuth("cred-filt-a", "sk-ant-oat-fa", "11111111-1111-4111-8111-111111111117")
-			authB := claudeIssue7638OAuthAuth("cred-filt-b", "sk-ant-oat-fb", "22222222-2222-4222-8222-222222222228")
-
-			// Override replaces messages so srvtoolu_filtered never reaches upstream B.
-			overrideCfg := &config.Config{
-				Payload: config.PayloadConfig{
-					Override: []config.PayloadRule{
-						{
-							Models: []config.PayloadModelRule{{Name: "claude-opus-5-5", Protocol: "claude"}},
-							Params: map[string]any{
-								"messages": []any{map[string]any{"role": "user", "content": "sanitized by rule"}},
-							},
-						},
-					},
-				},
+			base := NewClaudeExecutor(&config.Config{})
+			e := base.ForAPIKey().(*ClaudeExecutor)
+			ordinaryClaudeMessageScopeExecute(t, ctx, e, auth, stream, first, "message reply 1")
+			secondReply := ordinaryClaudeMessageScopeExecute(t, ctx, e, auth, stream, second, "message reply 2")
+			if len(sent) != 2 {
+				t.Fatalf("upstream calls = %d, want 2", len(sent))
 			}
-			exec := NewClaudeExecutor(overrideCfg)
-			opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatClaude, Stream: stream}
-
-			streamField := ""
-			if stream {
-				streamField = `"stream":true,`
-			}
-			payload := []byte(fmt.Sprintf(`{
-				"model": "claude-opus-5-5",
-				"max_tokens": 256,
-				%s
-				"messages": [
-					{"role": "user", "content": "turn 1"},
-					{
-						"role": "assistant",
-						"content": [
-							{"type": "server_tool_use", "id": "srvtoolu_filtered", "name": "advisor", "input": {}},
-							{"type": "advisor_tool_result", "tool_use_id": "srvtoolu_filtered", "content": {"type": "advisor_redacted_result", "encrypted_content": "enc_filt"}},
-							{"type": "text", "text": "from A"}
-						]
-					},
-					{"role": "user", "content": "turn 2"}
-				]
-			}`, streamField))
-
-			runReq := func(e *ClaudeExecutor, auth *cliproxyauth.Auth) {
-				if stream {
-					res, err := e.ExecuteStream(ctx, auth, cliproxyexecutor.Request{Model: "claude-opus-5-5", Payload: payload}, opts)
-					if err != nil {
-						t.Fatalf("ExecuteStream() error = %v", err)
-					}
-					for chunk := range res.Chunks {
-						if chunk.Err != nil {
-							t.Fatalf("ExecuteStream() chunk error = %v", chunk.Err)
-						}
-					}
-					return
+			for i, body := range sent {
+				if ojson.GetBytesNoCopy(body, "stream").Bool() != stream {
+					t.Fatalf("request %d has unexpected stream flag: %s", i+1, body)
 				}
-				if _, err := e.Execute(ctx, auth, cliproxyexecutor.Request{Model: "claude-opus-5-5", Payload: payload}, opts); err != nil {
-					t.Fatalf("Execute() error = %v", err)
+				for _, message := range ojson.GetBytesNoCopy(body, "messages").Array() {
+					if content := message.Get("content"); content.IsArray() && len(content.Array()) == 0 {
+						t.Fatalf("request %d sent an empty message content array: %s", i+1, body)
+					}
 				}
 			}
-
-			// Call 1 on B with payload rule removing srvtoolu_filtered: B succeeds,
-			// but MUST NOT claim ownership of srvtoolu_filtered.
-			runReq(exec, authB)
-			if strings.Contains(string(captured[0]), "srvtoolu_filtered") {
-				t.Fatalf("expected payload rule to remove srvtoolu_filtered before upstream B: %s", captured[0])
+			assistant := ojson.GetBytesNoCopy(sent[0], "messages.1")
+			if blocks := assistant.Get("content").Array(); len(blocks) != 3 {
+				t.Fatalf("assistant sent %d tool-related blocks, want 3: %s", len(blocks), assistant.Raw)
 			}
-
-			// Call 2 on A without the payload rule (sharing the same store via WithConfig):
-			// srvtoolu_filtered must NOT be stripped for A!
-			plainExec := exec.WithConfig(&config.Config{})
-			runReq(plainExec, authA)
-			if !strings.Contains(string(captured[1]), "srvtoolu_filtered") {
-				t.Fatalf("cred-filt-a had srvtoolu_filtered stripped because cred-filt-b falsely claimed ownership after payload removal: %s", captured[1])
+			if results := assistant.Get("content.1.content"); !results.IsArray() || len(results.Array()) != 0 {
+				t.Errorf("search result content = %s, want the explicit empty result array", results.Raw)
+			}
+			for path, want := range map[string]string{
+				"messages.0.content.0.text":           "first request only",
+				"messages.1.role":                     "assistant",
+				"messages.1.content.0.type":           "server_tool_use",
+				"messages.1.content.0.id":             "srvtoolu_fixture_search",
+				"messages.1.content.0.name":           "web_search",
+				"messages.1.content.0.input.query":    "fixture",
+				"messages.1.content.1.type":           "web_search_tool_result",
+				"messages.1.content.1.tool_use_id":    "srvtoolu_fixture_search",
+				"messages.1.content.2.type":           "tool_use",
+				"messages.1.content.2.id":             "toolu_fixture_lookup",
+				"messages.1.content.2.name":           "fixture_lookup",
+				"messages.1.content.2.input.topic":    "explicit lookup topic",
+				"messages.2.role":                     "user",
+				"messages.2.content.0.type":           "tool_result",
+				"messages.2.content.0.tool_use_id":    "toolu_fixture_lookup",
+				"messages.2.content.0.content.0.type": "text",
+				"messages.2.content.0.content.0.text": "explicit tool output",
+				"messages.2.content.1.text":           "ordinary user text",
+			} {
+				if got := ojson.GetBytesNoCopy(sent[0], path).String(); got != want {
+					t.Errorf("first request %s = %q, want %q", path, got, want)
+				}
+			}
+			if got := ojson.GetBytesNoCopy(sent[1], "messages").Array(); len(got) != 1 ||
+				got[0].Get("content.0.text").String() != "second request only" {
+				t.Fatalf("second request messages = %s, want the one explicit user message", sent[1])
+			}
+			for _, prior := range priorContent {
+				if strings.Contains(string(sent[1]), prior) {
+					t.Errorf("second wire request included %q from the earlier request or response", prior)
+				}
+				if strings.Contains(secondReply, prior) {
+					t.Errorf("second response echoed %q from the earlier request or response", prior)
+				}
 			}
 		})
 	}
+}
+
+func TestOrdinaryClaudePayloadRulesOnPublicMessages(t *testing.T) {
+	const first = `{"max_tokens":32,"messages":[{"role":"user","content":[{"type":"text","text":"caller input before rule"}]}]}`
+	const second = `{"max_tokens":32,"messages":[{"role":"user","content":[{"type":"text","text":"fresh caller input"}]}]}`
+	cfg := &config.Config{Payload: config.PayloadConfig{Override: []config.PayloadRule{{
+		Models: []config.PayloadModelRule{{Name: ordinaryClaudeMessageScopeModel, Protocol: "claude"}},
+		Params: map[string]any{
+			"max_tokens": 999,
+			"messages": []any{map[string]any{"role": "user", "content": []any{
+				map[string]any{"type": "text", "text": "configured replacement"},
+			}}},
+		},
+	}}}}
+	for _, mode := range []string{"json", "stream"} {
+		t.Run(mode, func(t *testing.T) {
+			stream := mode == "stream"
+			var sent [][]byte
+			ctx, auth := ordinaryClaudeMessageScopeFixture(t, "/v1/messages", func(b []byte) (string, string) {
+				sent = append(sent, b)
+				return ordinaryClaudeMessageScopeReply(stream, "ok")
+			})
+			base := NewClaudeExecutor(cfg)
+			ordinaryClaudeMessageScopeExecute(t, ctx, base.ForAPIKey().(*ClaudeExecutor), auth, stream, first, "ok")
+			ordinaryClaudeMessageScopeExecute(t, ctx, base.WithConfig(&config.Config{}), auth, stream, second, "ok")
+			if len(sent) != 2 {
+				t.Fatalf("upstream calls = %d, want 2", len(sent))
+			}
+			for i, want := range []struct {
+				text    string
+				tokens  int64
+				exclude string
+			}{
+				{"configured replacement", 999, "caller input before rule"},
+				{"fresh caller input", 32, "configured replacement"},
+			} {
+				body := sent[i]
+				if messages := ojson.GetBytesNoCopy(body, "messages").Array(); len(messages) != 1 || messages[0].Get("content.0.text").String() != want.text ||
+					ojson.GetBytesNoCopy(body, "max_tokens").Int() != want.tokens || strings.Contains(string(body), want.exclude) {
+					t.Errorf("request %d did not use the current payload rule and current messages: %s", i+1, body)
+				}
+			}
+		})
+	}
+}
+
+func TestOrdinaryClaudePublicTokenCountUsesOnlyCurrentInput(t *testing.T) {
+	var sent [][]byte
+	ctx, auth := ordinaryClaudeMessageScopeFixture(t, "/v1/messages/count_tokens", func(b []byte) (string, string) {
+		sent = append(sent, b)
+		n := 11
+		if len(sent) == 1 {
+			n = 7
+		}
+		return "application/json", fmt.Sprintf(`{"input_tokens":%d}`, n)
+	})
+	e := NewClaudeExecutor(&config.Config{})
+	for i, tc := range []struct {
+		executor *ClaudeExecutor
+		input    string
+		count    int64
+	}{
+		{e, "first counting input", 7},
+		{e, "independent counting input", 11},
+		{NewClaudeExecutor(&config.Config{}), "independent counting input", 11},
+	} {
+		req := cliproxyexecutor.Request{
+			Model:   ordinaryClaudeMessageScopeModel,
+			Payload: []byte(fmt.Sprintf(`{"max_tokens":32,"messages":[{"role":"user","content":[{"type":"text","text":%q}]}]}`, tc.input)),
+		}
+		res, err := tc.executor.CountTokens(ctx, auth, req, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatClaude})
+		if err != nil || ojson.GetBytesNoCopy(res.Payload, "input_tokens").Int() != tc.count {
+			t.Fatalf("count %d = %s, error = %v, want %d input tokens", i+1, res.Payload, err, tc.count)
+		}
+		if len(sent) != i+1 {
+			t.Fatalf("upstream count calls = %d, want %d", len(sent), i+1)
+		}
+		body := sent[i]
+		messages := ojson.GetBytesNoCopy(body, "messages").Array()
+		if len(messages) != 1 || messages[0].Get("content.0.text").String() != tc.input ||
+			(i > 0 && strings.Contains(string(body), "first counting input")) {
+			t.Fatalf("count %d included messages outside its request: %s", i+1, body)
+		}
+	}
+}
+
+func ordinaryClaudeMessageScopeFixture(t *testing.T, path string, reply func([]byte) (string, string)) (context.Context, *cliproxyauth.Auth) {
+	t.Helper()
+	tr := canonicalClaudeTestTransport(func(r *http.Request) (*http.Response, error) {
+		if r.Method != http.MethodPost || r.URL.Scheme != "https" || r.URL.Host != "api.anthropic.com" || r.URL.Path != path || r.Header.Get("x-api-key") != "fixture-message-scope" {
+			return nil, fmt.Errorf("unexpected request to fake transport: %s %s", r.Method, r.URL)
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			return nil, err
+		}
+		contentType, payload := reply(body)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": {contentType}},
+			Body:       io.NopCloser(strings.NewReader(payload)),
+			Request:    r,
+		}, nil
+	})
+	ctx := context.WithValue(t.Context(), "cliproxy.roundtripper", tr)
+	auth := &cliproxyauth.Auth{ID: "message-scope-fixture", Provider: "claude", Attributes: map[string]string{
+		"api_key":  "fixture-message-scope",
+		"base_url": "https://api.anthropic.com",
+	}}
+	return ctx, auth
+}
+
+func ordinaryClaudeMessageScopeExecute(t *testing.T, ctx context.Context, e *ClaudeExecutor, auth *cliproxyauth.Auth, stream bool, payload, want string) string {
+	t.Helper()
+	req := cliproxyexecutor.Request{Model: ordinaryClaudeMessageScopeModel, Payload: []byte(payload)}
+	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatClaude, Stream: stream}
+	if !stream {
+		out, err := e.Execute(ctx, auth, req, opts)
+		if err != nil || ojson.GetBytesNoCopy(out.Payload, "content.0.text").String() != want {
+			t.Fatalf("JSON response = %s, error = %v, want %q", out.Payload, err, want)
+		}
+		return string(out.Payload)
+	}
+	out, err := e.ExecuteStream(ctx, auth, req, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wire strings.Builder
+	for chunk := range out.Chunks {
+		if chunk.Err != nil {
+			t.Fatal(chunk.Err)
+		}
+		wire.Write(chunk.Payload)
+	}
+	deltas, stops := 0, 0
+	for _, line := range strings.Split(wire.String(), "\n") {
+		data, ok := strings.CutPrefix(line, "data:")
+		if !ok {
+			continue
+		}
+		event := ojson.Parse(strings.TrimSpace(data))
+		if event.Get("type").String() == "content_block_delta" && event.Get("delta.text").String() == want {
+			deltas++
+		}
+		if event.Get("type").String() == "message_stop" {
+			stops++
+		}
+	}
+	if deltas != 1 || stops != 1 {
+		t.Fatalf("SSE must return one matching text delta and one terminal, got %d and %d: %s", deltas, stops, wire.String())
+	}
+	return wire.String()
+}
+
+func ordinaryClaudeMessageScopeReply(stream bool, reply string) (string, string) {
+	if !stream {
+		return "application/json", fmt.Sprintf(`{"id":"msg_fixture","type":"message","role":"assistant","model":%q,"content":[{"type":"text","text":%q}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`, ordinaryClaudeMessageScopeModel, reply)
+	}
+	return "text/event-stream",
+		"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_fixture\",\"type\":\"message\",\"model\":\"" + ordinaryClaudeMessageScopeModel + "\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n" +
+			"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" +
+			fmt.Sprintf("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":%q}}\n\n", reply) +
+			"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n" +
+			"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n" +
+			"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
 }
