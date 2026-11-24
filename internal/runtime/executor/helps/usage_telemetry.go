@@ -209,9 +209,19 @@ func (r *UsageReporter) ObserveContentEvent(payload []byte) {
 		case "content_block_start":
 			recognized = true
 			block := root.Get("content_block")
-			visible = block.Get("text").String() != "" ||
-				(block.Get("type").String() == "tool_use" && len(block.Get("input").Map()) != 0)
-			content = visible || block.Get("thinking").String() != ""
+			switch block.Get("type").String() {
+			case "text":
+				text := block.Get("text")
+				visible = text.Type == gjson.String && text.String() != ""
+				content = visible
+			case "thinking":
+				thinking := block.Get("thinking")
+				content = thinking.Type == gjson.String && thinking.String() != ""
+			case "tool_use":
+				input := block.Get("input")
+				visible = input.IsObject() && len(input.Map()) != 0
+				content = visible
+			}
 		case "content_block_delta":
 			recognized = true
 			visible = root.Get("delta.text").String() != "" || root.Get("delta.partial_json").String() != ""
