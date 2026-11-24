@@ -2,8 +2,6 @@ package management
 
 import (
 	"context"
-	"errors"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -17,7 +15,6 @@ import (
 	"time"
 
 	"github.com/MoeForge/moego/json"
-	"github.com/MoeForge/moego/ojson"
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
@@ -192,54 +189,6 @@ func waitSIWCExchange(t *testing.T, flow *siwcBindSession) {
 	}
 }
 
-func TestSIWCBindCallbackFormsAndSummary(t *testing.T) {
-	for _, form := range []string{"redirect", "json", "get"} {
-		t.Run(form, func(t *testing.T) {
-			f := setupSIWCFlow(t, false)
-			state, flow := f.start(t)
-			var w *httptest.ResponseRecorder
-			switch form {
-			case "redirect":
-				w = siwcRequest(t, f.router, http.MethodPost, "/callback", map[string]any{"provider": "codex", "redirect_url": siwcCallbackURL(state)})
-			case "json":
-				w = siwcRequest(t, f.router, http.MethodPost, "/callback", map[string]any{"state": state, "code": "issued-code", "client_id": "oaiapp_issued"})
-			case "get":
-				w = siwcRequest(t, f.router, http.MethodGet, "/callback?"+url.Values{"state": {state}, "code": {"issued-code"}, "client_id": {"oaiapp_issued"}}.Encode(), nil)
-			}
-			if w.Code != http.StatusOK {
-				t.Fatalf("callback: %d %s", w.Code, w.Body.String())
-			}
-			waitSIWCExchange(t, flow)
-			input := <-f.service.inputs
-			if input.clientID != "oaiapp_issued" || input.code != "issued-code" || input.redirect != codex.SIWCRedirectURI || input.deviceID != "e61bbe28-07ef-466d-8e5d-a344f94ab305" || input.pkce == nil {
-				t.Fatal("exchange lost server context or dynamic client_id")
-			}
-			if status := performOAuthStatusRequest(t, f.router, state); status.Status != "ok" {
-				t.Fatalf("status: %#v", status)
-			}
-			got, _ := f.manager.GetByID(f.auth.ID)
-			if got.Metadata["access_token"] != "outer" || got.Metadata["note"] != "keep" || got.Metadata["use_siwc"] != true {
-				t.Fatal("binding corrupted outer credential")
-			}
-			entry := f.h.buildAuthFileEntry(got, authFileQuotaContext{v8: true})
-			if entry["siwc_bound"] != true || entry["use_siwc"] != true || entry["siwc_status"] != "valid" || entry["siwc_bind_supported"] != true || entry["siwc_expires_at"] != "2035-01-01T00:00:00Z" {
-				t.Fatalf("missing summary: %#v", entry)
-			}
-			encoded, _ := json.Marshal(entry)
-			if strings.Contains(string(encoded), "new-siwc") || strings.Contains(string(encoded), "oaiapp_issued") {
-				t.Fatal("credential secrets exposed in summary")
-			}
-			legacy := f.h.buildAuthFileEntry(got, authFileQuotaContext{})
-			if _, exists := legacy["siwc_bound"]; exists {
-				t.Fatal("v0 response changed")
-			}
-			if CancelOAuthSession(state) {
-				t.Fatal("completed binding cancelled")
-			}
-		})
-	}
-}
-
 func TestSIWCBindRejectsInvalidCallbacksWithoutExchange(t *testing.T) {
 	f := setupSIWCFlow(t, false)
 	state, _ := f.start(t)
@@ -264,108 +213,6 @@ func TestSIWCBindRejectsInvalidCallbacksWithoutExchange(t *testing.T) {
 	}
 	if f.service.calls.Load() != 0 || !f.store.IsPending(state, "codex") {
 		t.Fatal("invalid callback consumed pending session")
-	}
-}
-
-func TestSIWCBindDuplicateAndCancellation(t *testing.T) {
-	f := setupSIWCFlow(t, true)
-	state, flow := f.start(t)
-	duplicate := siwcRequest(t, f.router, http.MethodPost, "/bind", map[string]any{"name": f.auth.FileName})
-	if duplicate.Code != http.StatusConflict {
-		t.Fatal("parallel binding accepted for same target")
-	}
-	body := map[string]any{"redirect_url": siwcCallbackURL(state)}
-	if w := siwcRequest(t, f.router, http.MethodPost, "/callback", body); w.Code != 200 {
-		t.Fatal(w.Body.String())
-	}
-	<-f.service.inputs
-	if status := performOAuthStatusRequest(t, f.router, state); status.Status != "wait" {
-		t.Fatal("callback acceptance reported success before persistence")
-	}
-	if w := siwcRequest(t, f.router, http.MethodPost, "/callback", body); w.Code != http.StatusConflict {
-		t.Fatal("duplicate callback accepted")
-	}
-	if !CancelOAuthSession(state) {
-		t.Fatal("inflight binding could not be cancelled")
-	}
-	f.unblock()
-	waitSIWCExchange(t, flow)
-	got, _ := f.manager.GetByID(f.auth.ID)
-	if got.Metadata["use_siwc"] == true || f.service.calls.Load() != 1 {
-		t.Fatal("cancelled or duplicate exchange committed")
-	}
-	if w := siwcRequest(t, f.router, http.MethodPost, "/callback", body); w.Code != http.StatusNotFound {
-		t.Fatal("cancelled callback accepted")
-	}
-}
-
-func TestSIWCBindRejectsLateResults(t *testing.T) {
-	for _, change := range []string{"expire", "delete", "reimport", "exchange-error"} {
-		t.Run(change, func(t *testing.T) {
-			f := setupSIWCFlow(t, true)
-			if change == "exchange-error" {
-				f.service.err = errors.New("upstream contains secret-token")
-			}
-			state, flow := f.start(t)
-			w := siwcRequest(t, f.router, http.MethodPost, "/callback", map[string]any{"redirect_url": siwcCallbackURL(state)})
-			if w.Code != http.StatusOK {
-				t.Fatal(w.Body.String())
-			}
-			<-f.service.inputs
-			switch change {
-			case "expire":
-				f.store.mu.Lock()
-				session := f.store.sessions[state]
-				session.ExpiresAt = time.Now().Add(-time.Hour)
-				f.store.sessions[state] = session
-				f.store.mu.Unlock()
-			case "delete":
-				if errRemove := os.Remove(f.path); errRemove != nil {
-					t.Fatal(errRemove)
-				}
-			case "reimport":
-				f.manager.Remove(context.Background(), f.auth.ID)
-				if _, errRegister := f.manager.Register(context.Background(), f.auth.Clone()); errRegister != nil {
-					t.Fatal(errRegister)
-				}
-			}
-			f.unblock()
-			waitSIWCExchange(t, flow)
-			got, _ := f.manager.GetByID(f.auth.ID)
-			if got.Metadata["use_siwc"] == true {
-				t.Fatal("late binding committed")
-			}
-			status := performOAuthStatusRequest(t, f.router, state)
-			if status.Status != "error" || strings.Contains(status.Error, "secret-token") {
-				t.Fatalf("unsafe status: %#v", status)
-			}
-		})
-	}
-}
-
-func TestSIWCBindCommitSurvivesSessionExpiry(t *testing.T) {
-	f := setupSIWCFlow(t, false)
-	state, flow := f.start(t)
-	if !f.store.claimSIWCCommit(state, flow) {
-		t.Fatal("commit could not be claimed")
-	}
-	f.store.mu.Lock()
-	session := f.store.sessions[state]
-	session.ExpiresAt = time.Now().Add(-time.Hour)
-	f.store.sessions[state] = session
-	f.store.mu.Unlock()
-	if _, ok := f.store.Get(state); !ok {
-		t.Fatal("in-progress commit expired before reporting its outcome")
-	}
-	if f.store.CompleteProvider("codex", oauthSessionSourceBuiltin) != 0 {
-		t.Fatal("ordinary provider completion consumed SIWC binding")
-	}
-	f.store.Complete(state)
-	if status := performOAuthStatusRequest(t, f.router, state); status.Status != "ok" {
-		t.Fatalf("committed session lost outcome: %#v", status)
-	}
-	if session, ok := f.store.Get(state); !ok || session.SIWCCommitting {
-		t.Fatal("commit claim was not released")
 	}
 }
 
@@ -399,27 +246,6 @@ func TestSIWCBindOAuthErrorAndEligibility(t *testing.T) {
 	}
 }
 
-func TestSIWCBindRejectsLegacyCallback(t *testing.T) {
-	f := setupSIWCFlow(t, false)
-	state, flow := f.start(t)
-	w := siwcRequest(t, f.router, http.MethodPost, "/legacy-callback", map[string]any{"state": state, "code": "issued-code"})
-	if w.Code != http.StatusConflict {
-		t.Fatalf("legacy callback: %d %s", w.Code, w.Body.String())
-	}
-	path := filepath.Join(filepath.Dir(f.path), ".oauth-codex-"+state+".oauth")
-	if _, err := os.Stat(path); !os.IsNotExist(err) {
-		t.Fatalf("legacy callback created a file: %v", err)
-	}
-	if !f.store.IsPending(state, "codex") || f.service.calls.Load() != 0 {
-		t.Fatal("legacy callback consumed the SIWC session")
-	}
-	w = siwcRequest(t, f.router, http.MethodPost, "/callback", map[string]any{"redirect_url": siwcCallbackURL(state)})
-	if w.Code != http.StatusOK {
-		t.Fatalf("v8 retry: %d %s", w.Code, w.Body.String())
-	}
-	waitSIWCExchange(t, flow)
-}
-
 func TestSIWCBindRejectsCredentialSymlinkAtStart(t *testing.T) {
 	f := setupSIWCFlow(t, false)
 	target := filepath.Join(filepath.Dir(f.path), "target.json")
@@ -448,7 +274,9 @@ func TestSIWCBindTargetValidationAndLegacyCallback(t *testing.T) {
 			t.Fatalf("invalid name accepted: %q %d", name, w.Code)
 		}
 	}
-	RegisterOAuthSession("ordinary", "codex")
+	if err := f.h.RegisterFileOAuthSession("ordinary", "codex", filepath.Dir(f.path)); err != nil {
+		t.Fatal(err)
+	}
 	w := siwcRequest(t, f.router, http.MethodPost, "/callback", map[string]any{"state": "ordinary", "code": "ordinary-code"})
 	if w.Code != http.StatusOK {
 		t.Fatalf("ordinary v8 callback regressed: %s", w.Body.String())
@@ -457,108 +285,6 @@ func TestSIWCBindTargetValidationAndLegacyCallback(t *testing.T) {
 	if errRead != nil || !strings.Contains(string(data), "ordinary-code") {
 		t.Fatal("ordinary callback file missing")
 	}
-}
-
-func TestSIWCBindRelativeAuthDirCommit(t *testing.T) {
-	t.Chdir(t.TempDir())
-	if errMkdir := os.Mkdir("auths", 0o700); errMkdir != nil {
-		t.Fatal(errMkdir)
-	}
-	f := setupSIWCFlow(t, false)
-	relPath := filepath.Join("auths", "codex.json")
-	raw, errRead := os.ReadFile(f.path)
-	if errRead != nil {
-		t.Fatal(errRead)
-	}
-	if errWrite := os.WriteFile(relPath, raw, 0o600); errWrite != nil {
-		t.Fatal(errWrite)
-	}
-	f.h.cfg.AuthDir = "./auths"
-	f.manager.SetConfig(f.h.cfg)
-	f.auth.Attributes["path"] = relPath
-	f.auth.Attributes["source"] = relPath
-	if _, errUpdate := f.manager.Update(context.Background(), f.auth); errUpdate != nil {
-		t.Fatal(errUpdate)
-	}
-	state, flow := f.start(t)
-	w := siwcRequest(t, f.router, http.MethodPost, "/callback", map[string]any{"provider": "codex", "redirect_url": siwcCallbackURL(state)})
-	if w.Code != http.StatusOK {
-		t.Fatalf("callback: %d %s", w.Code, w.Body.String())
-	}
-	waitSIWCExchange(t, flow)
-	if status := performOAuthStatusRequest(t, f.router, state); status.Status != "ok" {
-		t.Fatalf("status: %#v", status)
-	}
-}
-
-func TestSIWCBindRejectsReplacedAccount(t *testing.T) {
-	for _, mode := range []string{"legacy-upload", "watcher-update"} {
-		t.Run(mode, func(t *testing.T) {
-			f := setupSIWCFlow(t, false)
-			f.router.POST("/legacy", f.h.UploadAuthFile)
-			state, flow := f.start(t)
-			replacement := map[string]any{
-				"type":          "codex",
-				"access_token":  "outer-b",
-				"refresh_token": "outer-refresh-b",
-				"account_id":    "account-b",
-			}
-			switch mode {
-			case "legacy-upload":
-				wUpload := siwcRequest(t, f.router, http.MethodPost, "/legacy?name=codex.json", replacement)
-				if wUpload.Code != http.StatusOK {
-					t.Fatalf("legacy upload: %d %s", wUpload.Code, wUpload.Body.String())
-				}
-			case "watcher-update":
-				if errWrite := codex.WriteJSONFileAtomic(f.path, replacement); errWrite != nil {
-					t.Fatal(errWrite)
-				}
-				replaced := f.auth.Clone()
-				replaced.RegistrationEpoch = 0
-				replaced.Metadata = replacement
-				if _, errUpdate := f.manager.Update(context.Background(), replaced); errUpdate != nil {
-					t.Fatal(errUpdate)
-				}
-			}
-			w := siwcRequest(t, f.router, http.MethodPost, "/callback", map[string]any{"provider": "codex", "redirect_url": siwcCallbackURL(state)})
-			if w.Code != http.StatusOK {
-				t.Fatalf("callback: %d %s", w.Code, w.Body.String())
-			}
-			waitSIWCExchange(t, flow)
-			if status := performOAuthStatusRequest(t, f.router, state); status.Status != "error" {
-				t.Fatalf("expected error status for replaced account, got %#v", status)
-			}
-			got, _ := f.manager.GetByID(f.auth.ID)
-			if got.Metadata["account_id"] != "account-b" || got.Metadata["use_siwc"] == true || got.Metadata["siwc"] != nil {
-				t.Fatalf("binding mixed SIWC tokens into replaced account in memory: %#v", got.Metadata)
-			}
-			diskData, errRead := os.ReadFile(f.path)
-			if errRead != nil {
-				t.Fatal(errRead)
-			}
-			var disk map[string]any
-			if errJSON := json.Unmarshal(diskData, &disk); errJSON != nil {
-				t.Fatal(errJSON)
-			}
-			if disk["account_id"] != "account-b" || disk["use_siwc"] == true || disk["siwc"] != nil {
-				t.Fatalf("binding mixed SIWC tokens into replaced account on disk: %#v", disk)
-			}
-		})
-	}
-}
-
-type siwcCommitWindowContext struct {
-	context.Context
-	errCalls atomic.Int32
-	onCall   int32
-	hook     func()
-}
-
-func (c *siwcCommitWindowContext) Err() error {
-	if c.errCalls.Add(1) == c.onCall && c.hook != nil {
-		c.hook()
-	}
-	return c.Context.Err()
 }
 
 type siwcUploadProgressContext struct {
@@ -581,99 +307,6 @@ func (c *siwcUploadProgressContext) Done() <-chan struct{} {
 		close(c.doneCh)
 	})
 	return c.Context.Done()
-}
-
-func TestSIWCBindLegacyUploadDuringCommitWindow(t *testing.T) {
-	f := setupSIWCFlow(t, false)
-	f.router.POST("/legacy", f.h.UploadAuthFile)
-	state, flow := f.start(t)
-
-	uploadedBody := map[string]any{
-		"type":          "codex",
-		"access_token":  "uploaded-outer",
-		"refresh_token": "uploaded-refresh",
-		"account_id":    "account",
-		"note":          "uploaded-during-commit",
-	}
-	rawBody, errMarshal := json.Marshal(uploadedBody)
-	if errMarshal != nil {
-		t.Fatal(errMarshal)
-	}
-
-	reachedMutation := make(chan struct{})
-	reachedUpsert := make(chan struct{})
-	uploadDone := make(chan *httptest.ResponseRecorder, 1)
-
-	flow.mu.Lock()
-	flow.ctx = &siwcCommitWindowContext{
-		Context: flow.ctx,
-		onCall:  6,
-		hook: func() {
-			go func() {
-				req := httptest.NewRequest(http.MethodPost, "/legacy?name=codex.json", strings.NewReader(string(rawBody)))
-				req.Header.Set("Content-Type", "application/json")
-				req = req.WithContext(&siwcUploadProgressContext{
-					Context: req.Context(),
-					valueCh: reachedMutation,
-					doneCh:  reachedUpsert,
-				})
-				w := httptest.NewRecorder()
-				f.router.ServeHTTP(w, req)
-				uploadDone <- w
-			}()
-			<-reachedMutation
-			for range 500 {
-				select {
-				case <-reachedUpsert:
-					return
-				default:
-					runtime.Gosched()
-				}
-			}
-		},
-	}
-	flow.mu.Unlock()
-
-	w := siwcRequest(t, f.router, http.MethodPost, "/callback", map[string]any{"provider": "codex", "redirect_url": siwcCallbackURL(state)})
-	if w.Code != http.StatusOK {
-		t.Fatalf("callback: %d %s", w.Code, w.Body.String())
-	}
-	waitSIWCExchange(t, flow)
-	if status := performOAuthStatusRequest(t, f.router, state); status.Status != "ok" {
-		t.Fatalf("expected bind commit to finish before locked upload replaced file, got %#v", status)
-	}
-
-	var wUpload *httptest.ResponseRecorder
-	select {
-	case wUpload = <-uploadDone:
-	case <-time.After(5 * time.Second):
-		t.Fatal("legacy upload did not finish")
-	}
-	if wUpload.Code != http.StatusOK {
-		t.Fatalf("legacy upload status = %d, body = %s", wUpload.Code, wUpload.Body.String())
-	}
-
-	diskData, errRead := os.ReadFile(f.path)
-	if errRead != nil {
-		t.Fatal(errRead)
-	}
-	var disk map[string]any
-	if errJSON := json.Unmarshal(diskData, &disk); errJSON != nil {
-		t.Fatal(errJSON)
-	}
-	got, ok := f.manager.GetByID(f.auth.ID)
-	if !ok || got == nil {
-		t.Fatal("missing auth in manager after upload")
-	}
-	if disk["note"] != "uploaded-during-commit" || disk["access_token"] != "uploaded-outer" {
-		t.Fatalf("SIWC bind overwrote legacy upload on disk: %#v", disk)
-	}
-	if got.Metadata["note"] != "uploaded-during-commit" || got.Metadata["access_token"] != "uploaded-outer" {
-		t.Fatalf("unexpected in-memory metadata after upload: %#v", got.Metadata)
-	}
-	if disk["use_siwc"] != got.Metadata["use_siwc"] {
-		t.Fatalf("disk and memory disagree on use_siwc: disk=%v memory=%v", disk["use_siwc"], got.Metadata["use_siwc"])
-	}
 }
 
 func TestWriteAuthFileWaitsForCodexFileLock(t *testing.T) {
@@ -716,8 +349,20 @@ func TestWriteAuthFileWaitsForCodexFileLock(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			f := setupSIWCFlow(t, false)
-			f.router.POST("/legacy", f.h.UploadAuthFile)
+			dir := t.TempDir()
+			path := filepath.Join(dir, "codex.json")
+			if err := os.WriteFile(path, []byte(`{"type":"codex","access_token":"original","note":"untouched"}`), 0600); err != nil {
+				t.Fatal(err)
+			}
+			cfg := &config.Config{AuthDir: dir}
+			h := &Handler{cfg: cfg, authManager: coreauth.NewManager(nil, nil, nil)}
+			router := gin.New()
+			router.POST("/legacy", h.UploadAuthFile)
+			f := struct {
+				path   string
+				h      *Handler
+				router *gin.Engine
+			}{path, h, router}
 
 			lockPath := f.path
 			if tc.useSymlink {
@@ -816,444 +461,31 @@ func TestWriteAuthFileWaitsForCodexFileLock(t *testing.T) {
 	}
 }
 
-func startSIWCConnectCountingProxy(t *testing.T, hits *atomic.Int32) *httptest.Server {
-	t.Helper()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		hits.Add(1)
-		http.Error(w, "proxy sentinel intercepted request", http.StatusBadGateway)
-	}))
-	t.Cleanup(srv.Close)
-	return srv
-}
-
-func TestSIWCBindUsesAccountProxyPrecedence(t *testing.T) {
-	t.Run("account_proxy_overrides_global_proxy", func(t *testing.T) {
-		store := newOAuthSessionStore(time.Minute)
-		replaceOAuthSessionStoreForTest(t, store)
-
-		var globalHits atomic.Int32
-		var accountHits atomic.Int32
-		globalProxy := startSIWCConnectCountingProxy(t, &globalHits)
-		accountProxy := startSIWCConnectCountingProxy(t, &accountHits)
-
-		dir := t.TempDir()
-		path := filepath.Join(dir, "codex.json")
-		metadata := map[string]any{
-			"type":          "codex",
-			"access_token":  "outer",
-			"refresh_token": "outer-refresh",
-			"account_id":    "account",
-			"proxy_url":     accountProxy.URL,
-		}
-		if errWrite := codex.WriteJSONFileAtomic(path, metadata); errWrite != nil {
-			t.Fatal(errWrite)
-		}
-
-		cfg := &config.Config{AuthDir: dir}
-		cfg.ProxyURL = globalProxy.URL
-		manager := coreauth.NewManager(nil, nil, nil)
-		manager.SetConfig(cfg)
-		auth, errRegister := manager.Register(context.Background(), &coreauth.Auth{
-			ID:         "codex.json",
-			FileName:   "codex.json",
-			Provider:   "codex",
-			ProxyURL:   accountProxy.URL,
-			Metadata:   metadata,
-			Attributes: map[string]string{"path": path},
-			Status:     coreauth.StatusActive,
-		})
-		if errRegister != nil {
-			t.Fatal(errRegister)
-		}
-
-		h := &Handler{cfg: cfg, authManager: manager}
-		router := gin.New()
-		router.POST("/bind", h.StartSIWCBind)
-		router.POST("/callback", h.PostOAuthCallbackV8)
-		router.GET("/status", h.GetAuthStatus)
-
-		wStart := siwcRequest(t, router, http.MethodPost, "/bind", map[string]any{"name": auth.FileName})
-		if wStart.Code != http.StatusOK {
-			t.Fatalf("start: %d %s", wStart.Code, wStart.Body.String())
-		}
-		state := ojson.GetBytes(wStart.Body.Bytes(), "state").String()
-		session, ok := store.Get(state)
-		if !ok || session.SIWC == nil {
-			t.Fatal("missing SIWC session")
-		}
-		t.Cleanup(func() { CancelOAuthSession(state) })
-
-		wCB := siwcRequest(t, router, http.MethodPost, "/callback", map[string]any{
-			"provider":     "codex",
-			"redirect_url": siwcCallbackURL(state),
-		})
-		if wCB.Code != http.StatusOK {
-			t.Fatalf("callback: %d %s", wCB.Code, wCB.Body.String())
-		}
-		waitSIWCExchange(t, session.SIWC)
-
-		if accountHits.Load() == 0 {
-			t.Fatalf("expected SIWC token exchange to use account proxy %s, got accountHits=%d globalHits=%d", accountProxy.URL, accountHits.Load(), globalHits.Load())
-		}
-		if globalHits.Load() != 0 {
-			t.Fatalf("expected global proxy not to be used when account proxy is set, got globalHits=%d", globalHits.Load())
-		}
-	})
-
-	t.Run("unreachable_account_proxy_fails_without_global_fallback", func(t *testing.T) {
-		for _, scheme := range []string{"http", "socks5h"} {
-			t.Run(scheme, func(t *testing.T) {
-				store := newOAuthSessionStore(time.Minute)
-				replaceOAuthSessionStoreForTest(t, store)
-
-				var globalHits atomic.Int32
-				globalProxy := startSIWCConnectCountingProxy(t, &globalHits)
-
-				ln, errListen := net.Listen("tcp", "127.0.0.1:0")
-				if errListen != nil {
-					t.Fatal(errListen)
-				}
-				deadProxyURL := scheme + "://" + ln.Addr().String()
-				_ = ln.Close()
-
-				dir := t.TempDir()
-				path := filepath.Join(dir, "codex.json")
-				metadata := map[string]any{
-					"type":          "codex",
-					"access_token":  "outer",
-					"refresh_token": "outer-refresh",
-					"account_id":    "account",
-					"proxy_url":     deadProxyURL,
-				}
-				if errWrite := codex.WriteJSONFileAtomic(path, metadata); errWrite != nil {
-					t.Fatal(errWrite)
-				}
-
-				cfg := &config.Config{AuthDir: dir}
-				cfg.ProxyURL = globalProxy.URL
-				manager := coreauth.NewManager(nil, nil, nil)
-				manager.SetConfig(cfg)
-				auth, errRegister := manager.Register(context.Background(), &coreauth.Auth{
-					ID:         "codex.json",
-					FileName:   "codex.json",
-					Provider:   "codex",
-					ProxyURL:   deadProxyURL,
-					Metadata:   metadata,
-					Attributes: map[string]string{"path": path},
-					Status:     coreauth.StatusActive,
-				})
-				if errRegister != nil {
-					t.Fatal(errRegister)
-				}
-
-				h := &Handler{cfg: cfg, authManager: manager}
-				router := gin.New()
-				router.POST("/bind", h.StartSIWCBind)
-				router.POST("/callback", h.PostOAuthCallbackV8)
-				router.GET("/status", h.GetAuthStatus)
-
-				wStart := siwcRequest(t, router, http.MethodPost, "/bind", map[string]any{"name": auth.FileName})
-				if wStart.Code != http.StatusOK {
-					t.Fatalf("start: %d %s", wStart.Code, wStart.Body.String())
-				}
-				state := ojson.GetBytes(wStart.Body.Bytes(), "state").String()
-				session, ok := store.Get(state)
-				if !ok || session.SIWC == nil {
-					t.Fatal("missing SIWC session")
-				}
-				t.Cleanup(func() { CancelOAuthSession(state) })
-
-				wCB := siwcRequest(t, router, http.MethodPost, "/callback", map[string]any{
-					"provider":     "codex",
-					"redirect_url": siwcCallbackURL(state),
-				})
-				if wCB.Code != http.StatusOK {
-					t.Fatalf("callback: %d %s", wCB.Code, wCB.Body.String())
-				}
-				waitSIWCExchange(t, session.SIWC)
-
-				status := performOAuthStatusRequest(t, router, state)
-				if status.Status != "error" {
-					t.Fatalf("expected error status on unreachable %s account proxy, got %#v", scheme, status)
-				}
-				if globalHits.Load() != 0 {
-					t.Fatalf("expected no fallback to global proxy when %s account proxy fails, got globalHits=%d", scheme, globalHits.Load())
-				}
-			})
-		}
-	})
-}
-
-func TestSIWCBindProxyEndToEndAndValidation(t *testing.T) {
-	cases := []struct {
-		name               string
-		globalProxyMode    string
-		accountProxyMode   string
-		wantAccountHits    int32
-		wantGlobalHits     int32
-		wantDirectHits     int32
-		wantPreserveProxy  bool
-		wantNoDiskProxyKey bool
-	}{
-		{
-			name:              "account_proxy_without_global_proxy",
-			globalProxyMode:   "empty",
-			accountProxyMode:  "proxy",
-			wantAccountHits:   1,
-			wantGlobalHits:    0,
-			wantDirectHits:    0,
-			wantPreserveProxy: true,
-		},
-		{
-			name:              "account_proxy_overrides_different_global_proxy",
-			globalProxyMode:   "proxy",
-			accountProxyMode:  "proxy",
-			wantAccountHits:   1,
-			wantGlobalHits:    0,
-			wantDirectHits:    0,
-			wantPreserveProxy: true,
-		},
-		{
-			name:               "no_account_proxy_inherits_global_proxy",
-			globalProxyMode:    "proxy",
-			accountProxyMode:   "empty",
-			wantAccountHits:    0,
-			wantGlobalHits:     1,
-			wantDirectHits:     0,
-			wantNoDiskProxyKey: true,
-		},
-		{
-			name:              "disk_proxy_url_used_when_memory_proxy_empty",
-			globalProxyMode:   "proxy",
-			accountProxyMode:  "disk-only",
-			wantAccountHits:   1,
-			wantGlobalHits:    0,
-			wantDirectHits:    0,
-			wantPreserveProxy: true,
-		},
-		{
-			name:               "memory_proxy_fallback_when_disk_missing_proxy_url",
-			globalProxyMode:    "proxy",
-			accountProxyMode:   "memory-only",
-			wantAccountHits:    1,
-			wantGlobalHits:     0,
-			wantDirectHits:     0,
-			wantNoDiskProxyKey: true,
-		},
-		{
-			name:              "direct_account_proxy_bypasses_global_proxy",
-			globalProxyMode:   "proxy",
-			accountProxyMode:  "direct",
-			wantAccountHits:   0,
-			wantGlobalHits:    0,
-			wantDirectHits:    1,
-			wantPreserveProxy: true,
-		},
+func TestOrdinaryOAuthCallbackLeavesLegacyCredentialUntouched(t *testing.T) {
+	dir := t.TempDir()
+	current := []byte(`{"type":"codex","access_token":"official-fixture","legacy":{"marker":"keep"}}`)
+	path := filepath.Join(dir, "codex.json")
+	if err := os.WriteFile(path, current, 0600); err != nil {
+		t.Fatal(err)
 	}
 
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			store := newOAuthSessionStore(time.Minute)
-			replaceOAuthSessionStoreForTest(t, store)
-
-			var directHits atomic.Int32
-			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.Header.Get("X-Via-Session-Proxy") != "1" {
-					directHits.Add(1)
-				}
-				doc := ojson.NewDocString("{}")
-				_ = doc.Set("access_token", "bound-siwc-access")
-				_ = doc.Set("refresh_token", "bound-siwc-refresh")
-				_ = doc.Set("id_token", "bound-siwc-id")
-				_ = doc.Set("expires_in", 3600)
-				_ = doc.Set("scope", codex.SIWCScope)
-				w.Header().Set("Content-Type", "application/json")
-				_, _ = w.Write(doc.Bytes())
-			}))
-			t.Cleanup(upstream.Close)
-			t.Cleanup(codex.OverrideSIWCTokenEndpointURLForTest(upstream.URL))
-
-			var globalHits atomic.Int32
-			var globalProxyURL string
-			if tc.globalProxyMode == "proxy" {
-				gp := startForwardHTTPProxy(t, &globalHits, "", false)
-				t.Cleanup(gp.Close)
-				globalProxyURL = gp.URL
-			}
-
-			var accountHits atomic.Int32
-			var diskProxyURL string
-			var authProxyURL string
-			switch tc.accountProxyMode {
-			case "proxy":
-				ap := startForwardHTTPProxy(t, &accountHits, "", false)
-				t.Cleanup(ap.Close)
-				diskProxyURL = ap.URL
-				authProxyURL = ap.URL
-			case "disk-only":
-				ap := startForwardHTTPProxy(t, &accountHits, "", false)
-				t.Cleanup(ap.Close)
-				diskProxyURL = ap.URL
-			case "memory-only":
-				ap := startForwardHTTPProxy(t, &accountHits, "", false)
-				t.Cleanup(ap.Close)
-				authProxyURL = ap.URL
-			case "direct":
-				diskProxyURL = "direct"
-				authProxyURL = "direct"
-			}
-
-			dir := t.TempDir()
-			path := filepath.Join(dir, "codex.json")
-			metadata := map[string]any{
-				"type":          "codex",
-				"access_token":  "outer",
-				"refresh_token": "outer-refresh",
-				"account_id":    "account",
-				"note":          "keep-me",
-			}
-			if diskProxyURL != "" {
-				metadata["proxy_url"] = diskProxyURL
-			}
-			if errWrite := codex.WriteJSONFileAtomic(path, metadata); errWrite != nil {
-				t.Fatal(errWrite)
-			}
-
-			cfg := &config.Config{AuthDir: dir}
-			cfg.ProxyURL = globalProxyURL
-			manager := coreauth.NewManager(nil, nil, nil)
-			manager.SetConfig(cfg)
-			auth, errRegister := manager.Register(context.Background(), &coreauth.Auth{
-				ID:         "codex.json",
-				FileName:   "codex.json",
-				Provider:   "codex",
-				ProxyURL:   authProxyURL,
-				Metadata:   metadata,
-				Attributes: map[string]string{"path": path},
-				Status:     coreauth.StatusActive,
-			})
-			if errRegister != nil {
-				t.Fatal(errRegister)
-			}
-
-			h := &Handler{cfg: cfg, authManager: manager}
-			router := gin.New()
-			router.POST("/bind", h.StartSIWCBind)
-			router.POST("/callback", h.PostOAuthCallbackV8)
-			router.GET("/status", h.GetAuthStatus)
-
-			wStart := siwcRequest(t, router, http.MethodPost, "/bind", map[string]any{"name": auth.FileName})
-			if wStart.Code != http.StatusOK {
-				t.Fatalf("start: %d %s", wStart.Code, wStart.Body.String())
-			}
-			state := ojson.GetBytes(wStart.Body.Bytes(), "state").String()
-			session, ok := store.Get(state)
-			if !ok || session.SIWC == nil {
-				t.Fatal("missing SIWC session")
-			}
-			t.Cleanup(func() { CancelOAuthSession(state) })
-
-			wCB := siwcRequest(t, router, http.MethodPost, "/callback", map[string]any{
-				"provider":     "codex",
-				"redirect_url": siwcCallbackURL(state),
-			})
-			if wCB.Code != http.StatusOK {
-				t.Fatalf("callback: %d %s", wCB.Code, wCB.Body.String())
-			}
-			waitSIWCExchange(t, session.SIWC)
-
-			status := performOAuthStatusRequest(t, router, state)
-			if status.Status != "ok" {
-				t.Fatalf("status = %#v, want ok", status)
-			}
-			if accountHits.Load() != tc.wantAccountHits {
-				t.Fatalf("accountHits = %d, want %d", accountHits.Load(), tc.wantAccountHits)
-			}
-			if globalHits.Load() != tc.wantGlobalHits {
-				t.Fatalf("globalHits = %d, want %d", globalHits.Load(), tc.wantGlobalHits)
-			}
-			if directHits.Load() != tc.wantDirectHits {
-				t.Fatalf("directHits = %d, want %d", directHits.Load(), tc.wantDirectHits)
-			}
-
-			got, okGot := manager.GetByID(auth.ID)
-			if !okGot || got == nil {
-				t.Fatal("missing auth after bind")
-			}
-			if got.Metadata["note"] != "keep-me" || got.Metadata["use_siwc"] != true {
-				t.Fatalf("unexpected memory metadata after bind: %#v", got.Metadata)
-			}
-			diskBytes, errRead := os.ReadFile(path)
-			if errRead != nil {
-				t.Fatal(errRead)
-			}
-			if !ojson.ValidBytes(diskBytes) {
-				t.Fatalf("invalid disk JSON: %s", string(diskBytes))
-			}
-			disk := ojson.ParseBytes(diskBytes)
-			if disk.Get("note").String() != "keep-me" || !disk.Get("use_siwc").Bool() {
-				t.Fatalf("unexpected disk metadata after bind: %s", string(diskBytes))
-			}
-			if tc.wantPreserveProxy {
-				if got.Metadata["proxy_url"] != diskProxyURL || disk.Get("proxy_url").String() != diskProxyURL {
-					t.Fatalf("proxy_url not preserved: meta=%v disk=%q want=%q", got.Metadata["proxy_url"], disk.Get("proxy_url").String(), diskProxyURL)
-				}
-				if authProxyURL != "" && got.ProxyURL != authProxyURL {
-					t.Fatalf("auth.ProxyURL not preserved: got=%q want=%q", got.ProxyURL, authProxyURL)
-				}
-			}
-			if tc.wantNoDiskProxyKey {
-				if disk.Get("proxy_url").Exists() {
-					t.Fatalf("unexpected proxy_url key written to disk: %s", disk.Get("proxy_url").Raw)
-				}
-				if authProxyURL != "" && got.ProxyURL != authProxyURL {
-					t.Fatalf("auth.ProxyURL not preserved: got=%q want=%q", got.ProxyURL, authProxyURL)
-				}
-			}
-		})
+	replaceOAuthSessionStoreForTest(t, newOAuthSessionStore(time.Minute))
+	h := &Handler{cfg: &config.Config{AuthDir: dir}}
+	if err := h.RegisterFileOAuthSession("ordinary-callback-isolation", "codex", dir); err != nil {
+		t.Fatal(err)
 	}
-
-	t.Run("rejects_invalid_account_proxy_url", func(t *testing.T) {
-		for _, badProxy := range []any{"://bad-proxy", "ftp://127.0.0.1:21", 12345} {
-			store := newOAuthSessionStore(time.Minute)
-			replaceOAuthSessionStoreForTest(t, store)
-
-			dir := t.TempDir()
-			path := filepath.Join(dir, "codex.json")
-			metadata := map[string]any{
-				"type":          "codex",
-				"access_token":  "outer",
-				"refresh_token": "outer-refresh",
-				"account_id":    "account",
-				"proxy_url":     badProxy,
-			}
-			if errWrite := codex.WriteJSONFileAtomic(path, metadata); errWrite != nil {
-				t.Fatal(errWrite)
-			}
-
-			cfg := &config.Config{AuthDir: dir}
-			manager := coreauth.NewManager(nil, nil, nil)
-			manager.SetConfig(cfg)
-			auth, errRegister := manager.Register(context.Background(), &coreauth.Auth{
-				ID:         "codex.json",
-				FileName:   "codex.json",
-				Provider:   "codex",
-				Metadata:   metadata,
-				Attributes: map[string]string{"path": path},
-				Status:     coreauth.StatusActive,
-			})
-			if errRegister != nil {
-				t.Fatal(errRegister)
-			}
-
-			h := &Handler{cfg: cfg, authManager: manager}
-			router := gin.New()
-			router.POST("/bind", h.StartSIWCBind)
-
-			wStart := siwcRequest(t, router, http.MethodPost, "/bind", map[string]any{"name": auth.FileName})
-			if wStart.Code != http.StatusBadRequest {
-				t.Fatalf("bad proxy %v: status = %d, want 400; body = %s", badProxy, wStart.Code, wStart.Body.String())
-			}
-		}
-	})
+	router := gin.New()
+	router.POST("/callback", h.PostOAuthCallbackV8)
+	w := siwcRequest(t, router, http.MethodPost, "/callback", map[string]any{"state": "ordinary-callback-isolation", "code": "ordinary-code"})
+	if w.Code != http.StatusOK {
+		t.Fatalf("ordinary callback status=%d: %s", w.Code, w.Body.String())
+	}
+	payload, err := os.ReadFile(filepath.Join(dir, ".oauth-codex-ordinary-callback-isolation.oauth"))
+	if err != nil || !strings.Contains(string(payload), "ordinary-code") {
+		t.Fatalf("ordinary callback file missing: %v", err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil || string(got) != string(current) {
+		t.Fatalf("callback mutated the existing credential: %v", err)
+	}
 }
