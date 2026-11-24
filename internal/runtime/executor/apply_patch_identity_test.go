@@ -215,7 +215,7 @@ func applyPatchIdentityExecutor(t *testing.T, transport string, source [][]byte)
 		exec = wsExec
 	}
 	auth := &cliproxyauth.Auth{ID: t.Name(), Provider: exec.Identifier(), Attributes: map[string]string{"api_key": "test", "base_url": server.URL, "websockets": "true"}}
-	return exec, auth
+	return exec, applyPatchLoopbackFixtureAuth(t, server, auth)
 }
 
 func TestApplyPatchNamedLateIdentityActualFailures(t *testing.T) {

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -384,6 +385,18 @@ func (s *applyPatchTestLifecycle) assert(t *testing.T) {
 	}
 }
 
+// Credentials for apply-patch protocol fixtures must use only the local
+// httptest server. The production egress guard still requires an explicit route.
+func applyPatchLoopbackFixtureAuth(t *testing.T, server *httptest.Server, auth *cliproxyauth.Auth) *cliproxyauth.Auth {
+	t.Helper()
+	addr, ok := server.Listener.Addr().(*net.TCPAddr)
+	if !ok || !addr.IP.IsLoopback() {
+		t.Fatal("apply-patch fixture requires a loopback listener")
+	}
+	auth.ProxyURL = "direct"
+	return auth
+}
+
 func newApplyPatchCompatTestExecutor(t *testing.T, reply string) (*OpenAICompatExecutor, *cliproxyauth.Auth, <-chan []byte) {
 	t.Helper()
 	bodies := make(chan []byte, 4)
@@ -402,7 +415,10 @@ func newApplyPatchCompatTestExecutor(t *testing.T, reply string) (*OpenAICompatE
 		_, _ = io.WriteString(w, reply)
 	}))
 	t.Cleanup(server.Close)
-	return NewOpenAICompatExecutor("custom-compat", &config.Config{}), &cliproxyauth.Auth{Provider: "custom-compat", Attributes: map[string]string{"base_url": server.URL + "/v1", "api_key": "test"}}, bodies
+	auth := applyPatchLoopbackFixtureAuth(t, server, &cliproxyauth.Auth{
+		Provider: "custom-compat", Attributes: map[string]string{"base_url": server.URL + "/v1", "api_key": "test"},
+	})
+	return NewOpenAICompatExecutor("custom-compat", &config.Config{}), auth, bodies
 }
 
 func applyPatchTestChatReply(arguments string) string {

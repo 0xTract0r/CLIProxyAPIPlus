@@ -165,10 +165,19 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 					}
 				}
 			} else {
-				for _, chunk := range sdktranslator.TranslateStream(ctx, claude, responseFormat, req.Model, opts.OriginalRequest, body, line, &translation) {
+				chunks := sdktranslator.TranslateStream(ctx, claude, responseFormat, req.Model, opts.OriginalRequest, body, line, &translation)
+				// A valid upstream terminal may translate into a protocol failure.
+				// Record it before delivery so cancellation cannot publish success.
+				gatewayErr := statusErr{code: http.StatusBadGateway, msg: helps.ApplyPatchUpstreamErrorMessage}
+				translationFailed := helps.RecordApplyPatchStreamFailureWithUsage(ctx, translation, reporter, &usage, gatewayErr)
+				for _, chunk := range chunks {
 					if !send(cliproxyexecutor.StreamChunk{Payload: chunk}) {
 						return
 					}
+				}
+				if translationFailed {
+					send(cliproxyexecutor.StreamChunk{Err: gatewayErr})
+					return
 				}
 				if done {
 					completed = true

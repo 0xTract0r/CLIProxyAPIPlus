@@ -83,7 +83,7 @@ func TestApplyPatchRepairResponsesSourceTerminalHTTP(t *testing.T) {
 				}))
 				defer server.Close()
 				exec := task6RepairExecutor(provider)
-				auth := &cliproxyauth.Auth{ID: t.Name(), Provider: provider, Attributes: map[string]string{"api_key": "test", "base_url": server.URL}}
+				auth := applyPatchLoopbackFixtureAuth(t, server, &cliproxyauth.Auth{ID: t.Name(), Provider: provider, Attributes: map[string]string{"api_key": "test", "base_url": server.URL}})
 				req := cliproxyexecutor.Request{Model: "grok-4", Payload: []byte(task6PatchRequest)}
 				opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse}
 				if !strings.HasPrefix(mode, "response.") {
@@ -441,7 +441,7 @@ func TestApplyPatchRepairGatewayInitializesGinTestMode(t *testing.T) {
 	}))
 	defer server.Close()
 	exec := NewOpenAICompatExecutor("custom-compat", &config.Config{})
-	auth := &cliproxyauth.Auth{ID: t.Name(), Provider: exec.Identifier(), Attributes: map[string]string{"api_key": "test", "base_url": server.URL}}
+	auth := applyPatchLoopbackFixtureAuth(t, server, &cliproxyauth.Auth{ID: t.Name(), Provider: exec.Identifier(), Attributes: map[string]string{"api_key": "test", "base_url": server.URL}})
 	result := task6Gateway(t, exec, auth, false)
 	if result.Code != http.StatusBadGateway {
 		t.Fatalf("expected fixture error path, got %d", result.Code)
@@ -464,7 +464,7 @@ func TestApplyPatchRepairResponsesSourceTerminalNonStream(t *testing.T) {
 				}))
 				defer server.Close()
 				exec := task6RepairExecutor(provider)
-				auth := &cliproxyauth.Auth{ID: t.Name(), Provider: provider, Attributes: map[string]string{"api_key": "test", "base_url": server.URL}}
+				auth := applyPatchLoopbackFixtureAuth(t, server, &cliproxyauth.Auth{ID: t.Name(), Provider: provider, Attributes: map[string]string{"api_key": "test", "base_url": server.URL}})
 				checkUsage := task6CaptureFailureUsage(t, auth.ID)
 				response, errExecute := exec.Execute(t.Context(), auth, cliproxyexecutor.Request{Model: "grok-4", Payload: []byte(task6PatchRequest)}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse})
 				if len(response.Payload) != 0 {
@@ -617,7 +617,7 @@ func TestApplyPatchRepairOrdinaryEmptyHTTPPassthrough(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
 			defer server.Close()
 			exec := task6RepairExecutor(provider)
-			auth := &cliproxyauth.Auth{Provider: provider, Attributes: map[string]string{"api_key": "test", "base_url": server.URL}}
+			auth := applyPatchLoopbackFixtureAuth(t, server, &cliproxyauth.Auth{Provider: provider, Attributes: map[string]string{"api_key": "test", "base_url": server.URL}})
 			response, errExecute := exec.Execute(t.Context(), auth, cliproxyexecutor.Request{Model: "grok-4", Payload: []byte(`{"input":"ordinary","tools":[{"type":"function","name":"apply_patch"}]}`)}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse})
 			if provider == "kimi" {
 				if errExecute != nil || len(response.Payload) != 0 {

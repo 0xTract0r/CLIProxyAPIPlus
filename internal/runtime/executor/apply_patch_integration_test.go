@@ -136,6 +136,16 @@ func assertTask6FailedStream(t *testing.T, chunks <-chan cliproxyexecutor.Stream
 	}
 }
 
+// Only these test matrix entries use the ordinary API-key path to the
+// synthetic server. Other provider variants keep their existing route setup.
+func task6AllowOrdinaryFixtureRoute(t *testing.T, server *httptest.Server, variant string, auth *cliproxyauth.Auth) {
+	t.Helper()
+	switch variant {
+	case "custom-compat", "claude", "gemini", "gemini-interactions", "vertex", "kimi-chat", "kimi", "xai", "meta":
+		applyPatchLoopbackFixtureAuth(t, server, auth)
+	}
+}
+
 func TestApplyPatchActualProviderErrorAndEOF(t *testing.T) {
 	for _, provider := range []string{"custom-compat", "claude", "claude-oauth", "gemini", "gemini-interactions", "vertex", "antigravity", "kimi-chat"} {
 		for _, mode := range []string{"nonstream", "stream", "eof", "empty", "scanner"} {
@@ -169,6 +179,7 @@ func TestApplyPatchActualProviderErrorAndEOF(t *testing.T) {
 				defer server.Close()
 				exec := task6Executor(provider)
 				auth := &cliproxyauth.Auth{ID: "task6", Provider: exec.Identifier(), Attributes: map[string]string{"api_key": "test", "base_url": server.URL}}
+				task6AllowOrdinaryFixtureRoute(t, server, provider, auth)
 				if provider == "claude-oauth" {
 					auth.Attributes["api_key"] = "sk-ant-oat-test"
 					auth.Metadata = map[string]any{"account_uuid": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}
@@ -332,7 +343,7 @@ func TestApplyPatchResponsesInvalidTerminalUsage(t *testing.T) {
 			case "kimi":
 				exec = NewKimiExecutor(&config.Config{})
 			}
-			auth := &cliproxyauth.Auth{ID: "task6-invalid-terminal", Provider: provider, Attributes: map[string]string{"api_key": "test", "base_url": server.URL}}
+			auth := applyPatchLoopbackFixtureAuth(t, server, &cliproxyauth.Auth{ID: "task6-invalid-terminal", Provider: provider, Attributes: map[string]string{"api_key": "test", "base_url": server.URL}})
 			checkUsage := task6CaptureFailureUsage(t, auth.ID)
 			defer checkUsage()
 			req := cliproxyexecutor.Request{Model: "grok-4", Payload: []byte(task6PatchRequest)}
@@ -406,7 +417,7 @@ data: {"type":"response.completed","response":{"output":[{"type":"function_call"
 			} else {
 				exec = NewXAIExecutor(&config.Config{})
 			}
-			auth := &cliproxyauth.Auth{ID: "task6-usage-" + tc.name, Provider: tc.provider, Attributes: map[string]string{"api_key": "test", "base_url": server.URL}}
+			auth := applyPatchLoopbackFixtureAuth(t, server, &cliproxyauth.Auth{ID: "task6-usage-" + tc.name, Provider: tc.provider, Attributes: map[string]string{"api_key": "test", "base_url": server.URL}})
 			checkUsage := task6CaptureFailureUsageWithCheck(t, auth.ID, func(record usage.Record) {
 				if record.Detail.InputTokens != 5 || record.Detail.OutputTokens != 3 {
 					t.Errorf("failure usage = %+v, want input/output 5/3", record.Detail)
@@ -493,6 +504,7 @@ func TestApplyPatchHTTPGatewayErrorMatrix(t *testing.T) {
 					exec = NewKimiExecutor(&config.Config{})
 				}
 				auth := &cliproxyauth.Auth{ID: "task6-http-" + provider + mode, Provider: exec.Identifier(), Attributes: map[string]string{"api_key": "test", "base_url": server.URL}}
+				task6AllowOrdinaryFixtureRoute(t, server, provider, auth)
 				if provider == "claude-oauth" {
 					auth.Attributes["api_key"] = "sk-ant-oat-test"
 					auth.Metadata = map[string]any{"account_uuid": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}
@@ -541,7 +553,7 @@ func TestApplyPatchSDKOriginalRequestFallback(t *testing.T) {
 			}))
 			defer server.Close()
 			exec := task6Executor(provider)
-			auth := &cliproxyauth.Auth{Provider: exec.Identifier(), Attributes: map[string]string{"api_key": "test", "base_url": server.URL}}
+			auth := applyPatchLoopbackFixtureAuth(t, server, &cliproxyauth.Auth{Provider: exec.Identifier(), Attributes: map[string]string{"api_key": "test", "base_url": server.URL}})
 			response, errExecute := exec.Execute(t.Context(), auth, cliproxyexecutor.Request{Model: "gemini-3.1-pro-preview", Payload: []byte(task6PatchRequest)}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse})
 			if len(response.Payload) > 0 {
 				t.Error("SDK lost original declaration and returned successful raw arguments")
@@ -568,7 +580,7 @@ func TestApplyPatchFailureStopsConsumptionAndNextAttemptIsFresh(t *testing.T) {
 	}))
 	defer server.Close()
 	exec := NewOpenAICompatExecutor("custom-compat", &config.Config{})
-	auth := &cliproxyauth.Auth{Provider: "custom-compat", Attributes: map[string]string{"api_key": "test", "base_url": server.URL}}
+	auth := applyPatchLoopbackFixtureAuth(t, server, &cliproxyauth.Auth{Provider: "custom-compat", Attributes: map[string]string{"api_key": "test", "base_url": server.URL}})
 	req := cliproxyexecutor.Request{Model: "patch-model", Payload: []byte(task6PatchRequest)}
 	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse, OriginalRequest: req.Payload}
 	stream, errExecuteStream := exec.ExecuteStream(t.Context(), auth, req, opts)
@@ -666,7 +678,7 @@ func TestApplyPatchNonStreamNativeNilWithoutErrorIs502(t *testing.T) {
 	}))
 	defer server.Close()
 	exec := NewOpenAICompatExecutor("custom-compat", &config.Config{})
-	auth := &cliproxyauth.Auth{ID: "task6-nil-translation", Provider: "custom-compat", Attributes: map[string]string{"api_key": "test", "base_url": server.URL}}
+	auth := applyPatchLoopbackFixtureAuth(t, server, &cliproxyauth.Auth{ID: "task6-nil-translation", Provider: "custom-compat", Attributes: map[string]string{"api_key": "test", "base_url": server.URL}})
 	checkUsage := task6CaptureFailureUsage(t, auth.ID)
 	defer checkUsage()
 	response, errExecute := exec.Execute(t.Context(), auth, cliproxyexecutor.Request{Model: "m", Payload: []byte(task6PatchRequest)}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse})
@@ -735,7 +747,7 @@ func TestApplyPatchInteractionsSourceFailureIsSealed(t *testing.T) {
 			}))
 			defer server.Close()
 			exec := NewGeminiInteractionsExecutor(&config.Config{})
-			auth := &cliproxyauth.Auth{ID: "task6-source-failed", Provider: "gemini-interactions", Attributes: map[string]string{"api_key": "test", "base_url": server.URL}}
+			auth := applyPatchLoopbackFixtureAuth(t, server, &cliproxyauth.Auth{ID: "task6-source-failed", Provider: "gemini-interactions", Attributes: map[string]string{"api_key": "test", "base_url": server.URL}})
 			checkUsage := task6CaptureFailureUsage(t, auth.ID)
 			defer checkUsage()
 			if !streaming {
