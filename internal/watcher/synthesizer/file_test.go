@@ -136,13 +136,13 @@ func TestFileSynthesizer_Synthesize_ValidAuthFile(t *testing.T) {
 	}
 }
 
-func TestFileSynthesizer_Synthesize_LegacyKimiFingerprintProfile(t *testing.T) {
+func TestFileSynthesizer_Synthesize_OrdinaryKimiFileKeepsCredentialMetadata(t *testing.T) {
 	tempDir := t.TempDir()
 	authData := map[string]any{
-		"type":                "kimi",
-		"access_token":        "kimi-access-token",
-		"refresh_token":       "kimi-refresh-token",
-		"fingerprint-profile": "claude-code-cli",
+		"type":          "kimi",
+		"access_token":  "kimi-access-token",
+		"refresh_token": "kimi-refresh-token",
+		"note":          "ordinary fixture",
 	}
 	data, errMarshal := json.Marshal(authData)
 	if errMarshal != nil {
@@ -167,14 +167,9 @@ func TestFileSynthesizer_Synthesize_LegacyKimiFingerprintProfile(t *testing.T) {
 	if auths[0].Provider != "kimi" {
 		t.Fatalf("provider = %q, want kimi", auths[0].Provider)
 	}
-	if got := auths[0].Attributes["fingerprint_profile"]; got != "claude-code-cli" {
-		t.Fatalf("attributes fingerprint_profile = %q, want claude-code-cli", got)
-	}
-	if got, _ := auths[0].Metadata["fingerprint_profile"].(string); got != "claude-code-cli" {
-		t.Fatalf("metadata fingerprint_profile = %q, want claude-code-cli", got)
-	}
-	if _, exists := auths[0].Metadata["fingerprint-profile"]; exists {
-		t.Fatalf("legacy fingerprint-profile was not normalized: %#v", auths[0].Metadata)
+	if auths[0].Attributes["fingerprint_profile"] != "" || auths[0].Metadata["note"] != "ordinary fixture" ||
+		auths[0].Metadata["access_token"] != "kimi-access-token" || auths[0].Metadata["refresh_token"] != "kimi-refresh-token" {
+		t.Fatal("ordinary credential metadata was changed or a client profile was added")
 	}
 }
 

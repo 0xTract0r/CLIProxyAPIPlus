@@ -81,12 +81,12 @@ func TestConfigSynthesizer_GeminiKeys(t *testing.T) {
 		{
 			name: "gemini key disable cooling",
 			geminiKeys: []config.GeminiKey{
-				{APIKey: "test-key-123", Prefix: "team-a", DisableCooling: boolPointer(true)},
+				{APIKey: "test-key-123", Prefix: "team-a", DisableCooling: boolPointer(false)},
 			},
 			wantLen: 1,
 			validate: func(t *testing.T, auths []*coreauth.Auth) {
-				if v, ok := auths[0].Metadata["disable_cooling"].(bool); !ok || !v {
-					t.Errorf("expected disable_cooling=true, got %v", auths[0].Metadata["disable_cooling"])
+				if v, ok := auths[0].Metadata["disable_cooling"].(bool); !ok || v {
+					t.Errorf("expected disable_cooling=false, got %v", auths[0].Metadata["disable_cooling"])
 				}
 			},
 		},
@@ -218,7 +218,7 @@ func TestConfigSynthesizer_InteractionsKeys(t *testing.T) {
 	}
 }
 
-func TestConfigSynthesizer_ClaudeKeys(t *testing.T) {
+func TestConfigSynthesizer_OrdinaryClaudeKeyBinding(t *testing.T) {
 	synth := NewConfigSynthesizer()
 	ctx := &SynthesisContext{
 		Config: &config.Config{
@@ -226,11 +226,11 @@ func TestConfigSynthesizer_ClaudeKeys(t *testing.T) {
 				{
 					APIKey:                  "sk-ant-api-xxx",
 					Prefix:                  "main",
-					BaseURL:                 "https://api.anthropic.com",
-					DisableCooling:          boolPointer(true),
+					BaseURL:                 "https://fixture.invalid",
+					ProxyURL:                "http://proxy.fixture.invalid:8080",
+					DisableCooling:          boolPointer(false),
 					RebuildMidSystemMessage: true,
 					NativeToolSearch:        true,
-					FingerprintProfile:      "claude-code-cli",
 					Models: []config.ClaudeModel{
 						{Name: "claude-3-opus"},
 						{Name: "claude-3-sonnet"},
@@ -250,6 +250,9 @@ func TestConfigSynthesizer_ClaudeKeys(t *testing.T) {
 		t.Fatalf("expected 1 auth, got %d", len(auths))
 	}
 
+	if auths[0].Attributes["base_url"] != "https://fixture.invalid" || auths[0].ProxyURL != "http://proxy.fixture.invalid:8080" {
+		t.Fatal("ordinary origin and proxy must stay bound to the selected key")
+	}
 	if auths[0].Provider != "claude" {
 		t.Errorf("expected provider claude, got %s", auths[0].Provider)
 	}
@@ -271,14 +274,14 @@ func TestConfigSynthesizer_ClaudeKeys(t *testing.T) {
 	if got := auths[0].Attributes["rebuild_mid_system_message"]; got != "true" {
 		t.Errorf("expected rebuild_mid_system_message=true, got %s", got)
 	}
-	if got := auths[0].Attributes["fingerprint_profile"]; got != "claude-code-cli" {
-		t.Errorf("expected fingerprint_profile=claude-code-cli, got %s", got)
+	if got := auths[0].Attributes["fingerprint_profile"]; got != "" {
+		t.Error("ordinary credential acquired a client profile")
 	}
 	if got := auths[0].Attributes["native_tool_search"]; got != "true" {
 		t.Errorf("expected native_tool_search=true, got %s", got)
 	}
-	if v, ok := auths[0].Metadata["disable_cooling"].(bool); !ok || !v {
-		t.Errorf("expected disable_cooling=true, got %v", auths[0].Metadata["disable_cooling"])
+	if v, ok := auths[0].Metadata["disable_cooling"].(bool); !ok || v {
+		t.Errorf("expected disable_cooling=false, got %v", auths[0].Metadata["disable_cooling"])
 	}
 }
 
@@ -334,7 +337,7 @@ func TestConfigSynthesizer_CodexKeys(t *testing.T) {
 					ProxyURL:             "http://proxy.local",
 					Websockets:           true,
 					AlphaSearch:          true,
-					DisableCooling:       boolPointer(true),
+					DisableCooling:       boolPointer(false),
 					DisableCodexCloaking: boolPointer(true),
 				},
 			},
@@ -369,8 +372,8 @@ func TestConfigSynthesizer_CodexKeys(t *testing.T) {
 	if auths[0].Attributes[coreauth.AttributeCodexDisableCloaking] != "true" {
 		t.Errorf("expected codex_disable_cloaking=true, got %s", auths[0].Attributes[coreauth.AttributeCodexDisableCloaking])
 	}
-	if v, ok := auths[0].Metadata["disable_cooling"].(bool); !ok || !v {
-		t.Errorf("expected disable_cooling=true, got %v", auths[0].Metadata["disable_cooling"])
+	if v, ok := auths[0].Metadata["disable_cooling"].(bool); !ok || v {
+		t.Errorf("expected disable_cooling=false, got %v", auths[0].Metadata["disable_cooling"])
 	}
 }
 
@@ -385,7 +388,7 @@ func TestConfigSynthesizer_XAIKeys(t *testing.T) {
 				ProxyURL:       "http://proxy.local",
 				Websockets:     true,
 				AlphaSearch:    true,
-				DisableCooling: boolPointer(true),
+				DisableCooling: boolPointer(false),
 				Headers:        map[string]string{"X-Custom": "value"},
 				Models:         []config.XAIModel{{Name: "grok-4.5", Alias: "grok-latest"}},
 			}},
@@ -426,8 +429,8 @@ func TestConfigSynthesizer_XAIKeys(t *testing.T) {
 	if auth.ProxyURL != "http://proxy.local" {
 		t.Fatalf("proxy URL = %q, want http://proxy.local", auth.ProxyURL)
 	}
-	if disabled, ok := auth.Metadata["disable_cooling"].(bool); !ok || !disabled {
-		t.Fatalf("disable_cooling = %#v, want true", auth.Metadata["disable_cooling"])
+	if disabled, ok := auth.Metadata["disable_cooling"].(bool); !ok || disabled {
+		t.Fatalf("disable_cooling = %#v, want false", auth.Metadata["disable_cooling"])
 	}
 }
 
@@ -688,7 +691,7 @@ func TestConfigSynthesizer_OpenAICompat(t *testing.T) {
 				{
 					Name:           "CustomProvider",
 					BaseURL:        "https://custom.api.com",
-					DisableCooling: boolPointer(true),
+					DisableCooling: boolPointer(false),
 					APIKeyEntries: []config.OpenAICompatibilityAPIKey{
 						{APIKey: "key-1"},
 						{APIKey: "key-2"},
@@ -753,8 +756,8 @@ func TestConfigSynthesizer_OpenAICompat(t *testing.T) {
 			}
 			if tt.name == "with APIKeyEntries" {
 				for i := range auths {
-					if v, ok := auths[i].Metadata["disable_cooling"].(bool); !ok || !v {
-						t.Fatalf("expected auth[%d].disable_cooling=true, got %v", i, auths[i].Metadata["disable_cooling"])
+					if v, ok := auths[i].Metadata["disable_cooling"].(bool); !ok || v {
+						t.Fatalf("expected auth[%d].disable_cooling=false, got %v", i, auths[i].Metadata["disable_cooling"])
 					}
 				}
 			}
