@@ -36,6 +36,8 @@ REQUIRED = {
         "TestRegisteredLegacyClaudeReauthRequiresOneTargetAndAdmin",
     },
     "github.com/router-for-me/CLIProxyAPI/v8/internal/api/handlers/management": {
+        "TestLocalAPIKeySaveFailureAndRetry",
+        "TestLocalAPIKeysEmptyJSONShape",
         "TestOrdinaryAccountSettingsReenableLegacyRefreshPreference",
         "TestOrdinaryAccountSettingsKeepsOnlyRefreshBlock",
         "TestOrdinaryAccountSettingsKeepsOnlyRefreshBlock/file_reauth_lock_while_manager_is_stale",

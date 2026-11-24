@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"maps"
 	"net/http"
+	"slices"
 	"strings"
 
 	"github.com/MoeForge/moego/json"
@@ -49,8 +50,15 @@ func rejectInvalidFingerprintProfile(c *gin.Context, field, profile string) bool
 	return false
 }
 
-// Generic helpers for list[string]
-func (h *Handler) putStringList(c *gin.Context, set func([]string), after func()) {
+// api-keys
+func (h *Handler) GetAPIKeys(c *gin.Context) {
+	h.mu.Lock()
+	keys := slices.Clone(h.cfg.APIKeys)
+	h.mu.Unlock()
+	c.JSON(http.StatusOK, gin.H{"api-keys": keys})
+}
+
+func (h *Handler) PutAPIKeys(c *gin.Context) {
 	data, err := c.GetRawData()
 	if err != nil {
 		c.JSON(400, gin.H{"error": "failed to read body"})
@@ -69,16 +77,12 @@ func (h *Handler) putStringList(c *gin.Context, set func([]string), after func()
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	set(arr)
-	if after != nil {
-		after()
-	}
-	h.persistLocked(c)
+	draft := h.cfg.CloneForRuntime()
+	draft.APIKeys = append([]string(nil), arr...)
+	h.saveAPIKeysLocked(c, draft)
 }
 
-// patchStringList resolves the list through targetOf under h.mu, so it edits the
-// current config instead of one a reload has replaced.
-func (h *Handler) patchStringList(c *gin.Context, targetOf func() *[]string, after func()) {
+func (h *Handler) PatchAPIKeys(c *gin.Context) {
 	var body struct {
 		Old   *string `json:"old"`
 		New   *string `json:"new"`
@@ -91,83 +95,55 @@ func (h *Handler) patchStringList(c *gin.Context, targetOf func() *[]string, aft
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	target := targetOf()
-	if body.Index != nil && body.Value != nil && *body.Index >= 0 && *body.Index < len(*target) {
-		(*target)[*body.Index] = *body.Value
-		if after != nil {
-			after()
+	draft := h.cfg.CloneForRuntime()
+	if body.Index != nil && body.Value != nil && *body.Index >= 0 && *body.Index < len(draft.APIKeys) {
+		draft.APIKeys[*body.Index] = *body.Value
+	} else if body.Old != nil && body.New != nil {
+		if i := slices.Index(draft.APIKeys, *body.Old); i >= 0 {
+			draft.APIKeys[i] = *body.New
+		} else {
+			draft.APIKeys = append(draft.APIKeys, *body.New)
 		}
-		h.persistLocked(c)
+	} else {
+		c.JSON(400, gin.H{"error": "missing fields"})
 		return
 	}
-	if body.Old != nil && body.New != nil {
-		for i := range *target {
-			if (*target)[i] == *body.Old {
-				(*target)[i] = *body.New
-				if after != nil {
-					after()
-				}
-				h.persistLocked(c)
-				return
-			}
-		}
-		*target = append(*target, *body.New)
-		if after != nil {
-			after()
-		}
-		h.persistLocked(c)
-		return
-	}
-	c.JSON(400, gin.H{"error": "missing fields"})
+	h.saveAPIKeysLocked(c, draft)
 }
 
-// deleteFromStringList resolves the list through targetOf under h.mu, so it edits
-// the current config instead of one a reload has replaced.
-func (h *Handler) deleteFromStringList(c *gin.Context, targetOf func() *[]string, after func()) {
+func (h *Handler) DeleteAPIKeys(c *gin.Context) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	target := targetOf()
+	draft := h.cfg.CloneForRuntime()
 	if idxStr := c.Query("index"); idxStr != "" {
 		var idx int
 		_, err := fmt.Sscanf(idxStr, "%d", &idx)
-		if err == nil && idx >= 0 && idx < len(*target) {
-			*target = append((*target)[:idx], (*target)[idx+1:]...)
-			if after != nil {
-				after()
-			}
-			h.persistLocked(c)
+		if err == nil && idx >= 0 && idx < len(draft.APIKeys) {
+			draft.APIKeys = slices.Delete(draft.APIKeys, idx, idx+1)
+			h.saveAPIKeysLocked(c, draft)
 			return
 		}
 	}
 	if val := strings.TrimSpace(c.Query("value")); val != "" {
-		out := make([]string, 0, len(*target))
-		for _, v := range *target {
+		keys := make([]string, 0, len(draft.APIKeys))
+		for _, v := range draft.APIKeys {
 			if strings.TrimSpace(v) != val {
-				out = append(out, v)
+				keys = append(keys, v)
 			}
 		}
-		*target = out
-		if after != nil {
-			after()
-		}
-		h.persistLocked(c)
+		draft.APIKeys = keys
+		h.saveAPIKeysLocked(c, draft)
 		return
 	}
 	c.JSON(400, gin.H{"error": "missing index or value"})
 }
 
-// api-keys
-func (h *Handler) GetAPIKeys(c *gin.Context) { c.JSON(200, gin.H{"api-keys": h.cfg.APIKeys}) }
-func (h *Handler) PutAPIKeys(c *gin.Context) {
-	h.putStringList(c, func(v []string) {
-		h.cfg.APIKeys = append([]string(nil), v...)
-	}, nil)
-}
-func (h *Handler) PatchAPIKeys(c *gin.Context) {
-	h.patchStringList(c, func() *[]string { return &h.cfg.APIKeys }, func() {})
-}
-func (h *Handler) DeleteAPIKeys(c *gin.Context) {
-	h.deleteFromStringList(c, func() *[]string { return &h.cfg.APIKeys }, func() {})
+func (h *Handler) saveAPIKeysLocked(c *gin.Context, draft *config.Config) {
+	if err := commitConfigFieldLocked(h, c, draft, &h.cfg.APIKeys, draft.APIKeys); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to save config: %v", err)})
+		return
+	}
+	h.finishConfigSaveLocked(c)
 }
 
 // gemini-api-key: []GeminiKey
