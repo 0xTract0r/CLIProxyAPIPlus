@@ -896,88 +896,161 @@ func TestHomeLiveSessionExpiryReleasesSelection(t *testing.T) {
 
 func TestHandleSidebandPinsAuthAndRelaysBidirectionally(t *testing.T) {
 	gin.SetMode(gin.TestMode)
+	const callID = "call-sideband"
+	const path = "/v1/realtime/calls/" + callID
+	const protocol = "fixture.realtime"
+	for _, route := range []struct {
+		name, proxy string
+	}{
+		{name: "no_authorized_route"},
+		{name: "explicit_direct", proxy: "direct"},
+	} {
+		t.Run(route.name, func(t *testing.T) {
+			var upstreamCalls atomic.Int32
+			type handshake struct {
+				path, auth string
+			}
+			handshakes := make(chan handshake, 1)
+			peerClosed := make(chan error, 1)
+			upstreamServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				if upstreamCalls.Add(1) != 1 {
+					http.Error(writer, "unexpected repeated handshake", http.StatusBadRequest)
+					return
+				}
+				handshakes <- handshake{request.URL.Path, request.Header.Get("Authorization")}
+				upgrader := websocket.Upgrader{Subprotocols: []string{protocol}}
+				conn, err := upgrader.Upgrade(writer, request, nil)
+				if err != nil {
+					peerClosed <- err
+					return
+				}
+				defer conn.Close()
+				_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+				_ = conn.SetWriteDeadline(time.Now().Add(3 * time.Second))
+				for {
+					messageType, payload, err := conn.ReadMessage()
+					if err != nil {
+						peerClosed <- err
+						return
+					}
+					if err := conn.WriteMessage(messageType, payload); err != nil {
+						peerClosed <- err
+						return
+					}
+				}
+			}))
+			defer upstreamServer.Close()
 
-	upstreamHeaders := make(chan http.Header, 1)
-	upstreamServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
-		conn, errUpgrade := upgrader.Upgrade(writer, request, nil)
-		if errUpgrade != nil {
-			return
-		}
-		defer func() { _ = conn.Close() }()
-		upstreamHeaders <- request.Header.Clone()
-		messageType, payload, errRead := conn.ReadMessage()
-		if errRead != nil {
-			return
-		}
-		_ = conn.WriteMessage(messageType, append([]byte("echo:"), payload...))
-	}))
-	defer upstreamServer.Close()
+			manager := auth.NewManager(nil, nil, nil)
+			executor := &captureExecutor{}
+			manager.RegisterExecutor(executor)
+			registerCredential(t, manager, &auth.Auth{
+				ID: "pinned-oauth", Provider: "codex", Status: auth.StatusActive,
+				ProxyURL: route.proxy,
+				Metadata: map[string]any{"access_token": "fixture-selected-token"},
+			})
+			handler := NewHandler(manager, nil)
+			handler.sidebandAPIBaseURL = "ws" + strings.TrimPrefix(upstreamServer.URL, "http") + "/v1"
+			handler.sessions.put(callID, liveSession{authID: "pinned-oauth", model: defaultLiveModel})
+			finished := make(chan struct{}, 1)
+			router := gin.New()
+			router.GET("/v1/realtime/calls/:call_id", func(c *gin.Context) {
+				defer func() { finished <- struct{}{} }()
+				handler.HandleSideband(c)
+			})
+			downstreamServer := httptest.NewServer(router)
+			defer downstreamServer.Close()
 
-	manager := auth.NewManager(nil, nil, nil)
-	executor := &captureExecutor{}
-	manager.RegisterExecutor(executor)
-	registerCredential(t, manager, &auth.Auth{
-		ID:       "other-oauth",
-		Provider: "codex",
-		Status:   auth.StatusActive,
-		Metadata: map[string]any{"access_token": "other-token", "account_id": "other-account"},
-	})
-	registerCredential(t, manager, &auth.Auth{
-		ID:       "pinned-oauth",
-		Provider: "codex",
-		Status:   auth.StatusActive,
-		Metadata: map[string]any{"access_token": "pinned-token", "account_id": "pinned-account"},
-	})
+			dialer := websocket.Dialer{HandshakeTimeout: 3 * time.Second, Subprotocols: []string{protocol}}
+			client, response, err := dialer.DialContext(t.Context(), "ws"+strings.TrimPrefix(downstreamServer.URL, "http")+path, nil)
+			status, responseBody := 0, ""
+			if response != nil {
+				status = response.StatusCode
+				if response.Body != nil {
+					raw, _ := io.ReadAll(response.Body)
+					responseBody = string(raw)
+					_ = response.Body.Close()
+				}
+			}
+			if client != nil {
+				defer client.Close()
+			}
+			waitFinished := func() {
+				t.Helper()
+				select {
+				case <-finished:
+				case <-time.After(3 * time.Second):
+					t.Fatal("sideband handler did not finish")
+				}
+			}
+			if route.proxy == "" {
+				if err == nil || status != http.StatusBadGateway || upstreamCalls.Load() != 0 {
+					t.Fatalf("unauthorized route: status=%d upstream calls=%d error=%v", status, upstreamCalls.Load(), err)
+				}
+				waitFinished()
+				if _, ok := handler.sessions.peek(callID); !ok {
+					t.Fatal("route rejection consumed the pending call")
+				}
+				if executor.refreshCalls.Load() != 0 {
+					t.Fatal("route rejection refreshed the credential")
+				}
+				return
+			}
 
-	handler := NewHandler(manager, nil)
-	handler.sidebandAPIBaseURL = "ws" + strings.TrimPrefix(upstreamServer.URL, "http") + "/v1"
-	handler.sessions.put("call-sideband", liveSession{authID: "pinned-oauth", model: defaultLiveModel})
-	router := gin.New()
-	router.GET("/v1/live/:call_id", handler.HandleSideband)
-	downstreamServer := httptest.NewServer(router)
-	defer downstreamServer.Close()
+			if err != nil || client == nil {
+				t.Fatalf("dial downstream sideband: status=%d error=%v body=%s", status, err, responseBody)
+			}
+			if client.Subprotocol() != protocol {
+				t.Fatalf("negotiated subprotocol=%q, want %q", client.Subprotocol(), protocol)
+			}
+			_ = client.SetReadDeadline(time.Now().Add(3 * time.Second))
+			_ = client.SetWriteDeadline(time.Now().Add(3 * time.Second))
+			for _, frame := range []struct {
+				kind int
+				data string
+			}{
+				{websocket.TextMessage, "sideband text"},
+				{websocket.BinaryMessage, "\x00\xff\x01"},
+			} {
+				if err := client.WriteMessage(frame.kind, []byte(frame.data)); err != nil {
+					t.Fatal(err)
+				}
+				kind, payload, err := client.ReadMessage()
+				if err != nil || kind != frame.kind || string(payload) != frame.data {
+					t.Fatalf("round trip: kind=%d size=%d error=%v", kind, len(payload), err)
+				}
+			}
+			select {
+			case got := <-handshakes:
+				if got.path != path || got.auth != "Bearer fixture-selected-token" {
+					t.Fatal("upstream did not receive the selected call and its bearer")
+				}
+			default:
+				t.Fatal("upstream handshake was not recorded")
+			}
 
-	wsURL := "ws" + strings.TrimPrefix(downstreamServer.URL, "http") + "/v1/live/call-sideband"
-	headers := http.Header{
-		"OpenAI-Alpha":      []string{"quicksilver=v2"},
-		"X-Oai-Attestation": []string{"attestation-token"},
-	}
-	client, response, errDial := websocket.DefaultDialer.Dial(wsURL, headers)
-	if errDial != nil {
-		if response != nil && response.Body != nil {
-			_ = response.Body.Close()
-		}
-		t.Fatalf("dial downstream sideband: %v", errDial)
-	}
-	if response != nil && response.Body != nil {
-		_ = response.Body.Close()
-	}
-	defer func() { _ = client.Close() }()
-	if errWrite := client.WriteMessage(websocket.TextMessage, []byte("ping")); errWrite != nil {
-		t.Fatalf("write sideband message: %v", errWrite)
-	}
-	_, payload, errRead := client.ReadMessage()
-	if errRead != nil {
-		t.Fatalf("read sideband message: %v", errRead)
-	}
-	if got := string(payload); got != "echo:ping" {
-		t.Fatalf("sideband payload = %q, want echo:ping", got)
-	}
-
-	select {
-	case captured := <-upstreamHeaders:
-		if got := captured.Get("Authorization"); got != "Bearer pinned-token" {
-			t.Fatalf("upstream Authorization = %q, want pinned OAuth token", got)
-		}
-		if got := captured.Get("Chatgpt-Account-Id"); got != "pinned-account" {
-			t.Fatalf("upstream Chatgpt-Account-Id = %q, want pinned-account", got)
-		}
-		if got := captured.Get("OpenAI-Alpha"); got != "quicksilver=v2" {
-			t.Fatalf("upstream OpenAI-Alpha = %q", got)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("upstream sideband headers were not captured")
+			const closeReason = "caller canceled"
+			if err := client.WriteControl(websocket.CloseMessage,
+				websocket.FormatCloseMessage(websocket.CloseNormalClosure, closeReason), time.Now().Add(time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case err := <-peerClosed:
+				var closeErr *websocket.CloseError
+				if !errors.As(err, &closeErr) || closeErr.Code != websocket.CloseNormalClosure || closeErr.Text != closeReason {
+					t.Fatalf("upstream did not receive the caller's close frame: %v", err)
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatal("upstream did not close after caller cancellation")
+			}
+			waitFinished()
+			if _, ok := handler.sessions.peek(callID); ok {
+				t.Fatal("closed sideband kept its live call")
+			}
+			if upstreamCalls.Load() != 1 || executor.refreshCalls.Load() != 0 {
+				t.Fatalf("upstream calls=%d refreshes=%d", upstreamCalls.Load(), executor.refreshCalls.Load())
+			}
+		})
 	}
 }
 
