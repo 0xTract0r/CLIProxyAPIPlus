@@ -190,6 +190,16 @@ func ConvertClaudeResponseToOpenAI(_ context.Context, modelName string, original
 		if contentBlock := root.Get("content_block"); contentBlock.Exists() {
 			blockType := contentBlock.Get("type").String()
 
+			if blockType == "text" {
+				if text := contentBlock.Get("text"); text.Type == ojson.String {
+					if fragment := text.String(); fragment != "" {
+						_ = templateDoc.Set("choices.0.delta.content", fragment)
+						return [][]byte{templateDoc.Bytes()}
+					}
+				}
+				return [][]byte{}
+			}
+
 			if blockType == "fallback" {
 				toModel := strings.TrimSpace(contentBlock.Get("to.model").String())
 				fromModel := strings.TrimSpace(contentBlock.Get("from.model").String())
@@ -434,10 +444,16 @@ func ConvertClaudeResponseToOpenAINonStream(_ context.Context, modelName string,
 	var model string
 	var createdAt int64
 	var stopReason string
-	var contentParts []string
+	type contentPart struct {
+		text        string
+		deltas      *strings.Builder
+		fallbackHop int // One-based index in fallbacks.Entries for a boundary.
+	}
+	var contentParts []contentPart
+	textBlocks := make(map[int]*strings.Builder)
 	var reasoningParts []string
 	var fallbacks translatorcommon.ClaudeFallbackChain
-	currentContentLen := 0
+	contentLen := 0
 	usageTokens := claudeUsageTokens{}
 	toolCallsAccumulator := make(map[int]*ToolCallAccumulator)
 
@@ -465,7 +481,19 @@ func ConvertClaudeResponseToOpenAINonStream(_ context.Context, modelName string,
 			// Handle different content block types at the beginning
 			if contentBlock := root.Get("content_block"); contentBlock.Exists() {
 				blockType := contentBlock.Get("type").String()
-				if blockType == "thinking" {
+				if blockType == "text" {
+					// Claude declares starts in index order. Reserve the block's
+					// position even when its initial text is empty.
+					deltas := &strings.Builder{}
+					textBlocks[int(root.Get("index").Int())] = deltas
+					initial := contentBlock.Get("text")
+					var text string
+					if initial.Type == ojson.String {
+						text = initial.String()
+					}
+					contentParts = append(contentParts, contentPart{text: text, deltas: deltas})
+					contentLen += len(text)
+				} else if blockType == "thinking" {
 					// Start of thinking/reasoning content - skip for now as it's handled in delta
 					continue
 				} else if blockType == "fallback" {
@@ -474,14 +502,16 @@ func ConvertClaudeResponseToOpenAINonStream(_ context.Context, modelName string,
 					if toModel != "" {
 						model = toModel
 					}
-					offset := currentContentLen
-					fallbacks.RecordBlock(
+					if fb := fallbacks.RecordBlock(
 						contentBlock,
 						effectiveChatResponseModel(fromModel, modelName),
 						effectiveChatResponseModel(toModel, model),
-						"content_offset",
-						&offset,
-					)
+						"",
+						nil,
+					); len(fb) > 0 {
+						// Resolve the boundary when earlier blocks have all their text.
+						contentParts = append(contentParts, contentPart{fallbackHop: len(fallbacks.Entries)})
+					}
 				} else if blockType == "tool_use" {
 					// Initialize tool call accumulator for this index
 					index := int(root.Get("index").Int())
@@ -500,9 +530,14 @@ func ConvertClaudeResponseToOpenAINonStream(_ context.Context, modelName string,
 				case "text_delta":
 					// Accumulate text content
 					if text := delta.Get("text"); text.Exists() {
-						textStr := text.String()
-						contentParts = append(contentParts, textStr)
-						currentContentLen += len(textStr)
+						fragment := text.String()
+						if block := textBlocks[int(root.Get("index").Int())]; block != nil {
+							block.WriteString(fragment)
+						} else {
+							// Older delta-only streams use arrival order.
+							contentParts = append(contentParts, contentPart{text: fragment})
+						}
+						contentLen += len(fragment)
 					}
 				case "thinking_delta":
 					// Accumulate reasoning/thinking content
@@ -563,8 +598,21 @@ func ConvertClaudeResponseToOpenAINonStream(_ context.Context, modelName string,
 	_ = outDoc.Set("model", effectiveChatResponseModel(model, modelName))
 
 	// Set message content by combining all text parts
-	messageContent := strings.Join(contentParts, "")
-	_ = outDoc.Set("choices.0.message.content", messageContent)
+	var messageContent strings.Builder
+	messageContent.Grow(contentLen)
+	for _, part := range contentParts {
+		if part.fallbackHop > 0 && part.fallbackHop <= len(fallbacks.Entries) {
+			hop := part.fallbackHop - 1
+			doc := ojson.NewDoc(fallbacks.Entries[hop])
+			_ = doc.Set("content_offset", messageContent.Len())
+			fallbacks.Entries[hop] = doc.Bytes()
+		}
+		messageContent.WriteString(part.text)
+		if part.deltas != nil {
+			messageContent.WriteString(part.deltas.String())
+		}
+	}
+	_ = outDoc.Set("choices.0.message.content", messageContent.String())
 	if latestFB := fallbacks.Latest(); len(latestFB) > 0 {
 		_ = outDoc.SetRawBytes("choices.0.message.fallback", latestFB)
 		_ = outDoc.SetRawBytes("choices.0.message.fallbacks", fallbacks.ArrayBytes())
