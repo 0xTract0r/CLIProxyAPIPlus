@@ -672,6 +672,13 @@ func applyOAuthRecoveryTargetToRecord(target oauthRecoveryTarget, record *coreau
 	if record == nil || strings.TrimSpace(target.AuthID) == "" {
 		return false
 	}
+	if target.ClaudePublication != nil {
+		grant, ok := record.Storage.(*claude.ClaudeTokenStorage)
+		if !ok || grant == nil || !sdkAuth.EqualClaudeOwnerID(target.AccountID, grant.AccountUUID) ||
+			(target.OrganizationID != "" && !sdkAuth.EqualClaudeOwnerID(target.OrganizationID, grant.OrganizationUUID)) {
+			return false
+		}
+	}
 	gotEmail, gotAccountID := authIdentityEmailAndAccountID(record)
 	gotOrgID := authIdentityOrganizationID(record)
 	candidateFileName := firstNonEmpty(strings.TrimSpace(record.FileName), strings.TrimSpace(record.ID))

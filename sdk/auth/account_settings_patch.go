@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/google/uuid"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/claude"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/copilot"
@@ -224,12 +225,31 @@ func matchesClaudeLoginOwner(raw []byte, email, account, organization string) bo
 	if json.Unmarshal(raw, &prior) != nil || !strings.EqualFold(strings.TrimSpace(prior.Type), "claude") {
 		return false
 	}
-	priorEmail, priorAccount, priorOrg := strings.TrimSpace(prior.Email), strings.TrimSpace(prior.Account), strings.TrimSpace(prior.Organization)
+	priorEmail := strings.TrimSpace(prior.Email)
 	// A provider's email can be reused or shared. Only the stable account
 	// recorded before this session can authorize replacing the saved grant.
-	return priorAccount != "" && priorAccount == strings.TrimSpace(account) &&
+	return strings.TrimSpace(prior.Account) != "" && EqualClaudeOwnerID(prior.Account, account) &&
 		(priorEmail == "" || strings.EqualFold(priorEmail, strings.TrimSpace(email))) &&
-		(priorOrg == "" || priorOrg == strings.TrimSpace(organization))
+		(strings.TrimSpace(prior.Organization) == "" || EqualClaudeOwnerID(prior.Organization, organization))
+}
+
+// EqualClaudeOwnerID trims surrounding whitespace and accepts hex case
+// differences only for standard UUIDs. Trimmed opaque IDs remain case-sensitive.
+func EqualClaudeOwnerID(left, right string) bool {
+	left, right = strings.TrimSpace(left), strings.TrimSpace(right)
+	if left == right {
+		return true
+	}
+	const uuidTextLength = 36
+	if len(left) != uuidTextLength || len(right) != uuidTextLength {
+		return false
+	}
+	leftUUID, err := uuid.Parse(left)
+	if err != nil {
+		return false
+	}
+	rightUUID, err := uuid.Parse(right)
+	return err == nil && leftUUID == rightUUID
 }
 
 func (patch accountSettingsPatch) selectedLogin() bool {

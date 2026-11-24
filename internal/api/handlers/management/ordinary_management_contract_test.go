@@ -233,6 +233,12 @@ func TestOrdinaryCredentialListProjectsStoredWarningsWithoutPrivateData(t *testi
 	}
 }
 
+const (
+	fixtureClaudeAccountUUID = "ab12cdef-1234-4abc-8def-abcdefabcdef"
+	fixtureClaudeOrgUUID     = "ed34abcd-1234-4def-8abc-abcdefabcdef"
+	fixtureOtherUUID         = "0012cdef-1234-4abc-8def-abcdefabcdef"
+)
+
 type ordinaryClaudeReauthFixture struct{}
 
 func (ordinaryClaudeReauthFixture) GenerateAuthURL(state string, _ *claude.PKCECodes) (string, string, error) {
@@ -244,12 +250,18 @@ func (ordinaryClaudeReauthFixture) ExchangeCodeForTokens(_ context.Context, code
 }
 
 func (ordinaryClaudeReauthFixture) CreateTokenStorage(bundle *claude.ClaudeAuthBundle) *claude.ClaudeTokenStorage {
-	account, organization := "fixture-subject", "fixture-org"
+	account, organization := fixtureClaudeAccountUUID, fixtureClaudeOrgUUID
 	switch bundle.APIKey {
 	case "different-account":
-		account = "another-subject"
+		account = strings.ToUpper(fixtureOtherUUID)
 	case "different-organization":
-		organization = "another-org"
+		organization = strings.ToUpper(fixtureOtherUUID)
+	case "same-uuid-uppercase":
+		account, organization = strings.ToUpper(account), strings.ToUpper(organization)
+	case "opaque-account-case":
+		account, organization = "FIXTURE-SUBJECT", "fixture-org"
+	case "opaque-organization-case":
+		account, organization = "fixture-subject", "FIXTURE-ORG"
 	}
 	return &claude.ClaudeTokenStorage{AccessToken: "new-fake-access", RefreshToken: "new-fake-refresh",
 		Email: "fixture@example.invalid", AccountUUID: account, OrganizationUUID: organization,
@@ -258,18 +270,22 @@ func (ordinaryClaudeReauthFixture) CreateTokenStorage(bundle *claude.ClaudeAuthB
 
 func TestOrdinaryLegacyClaudeReauthUsesSelectedFileAndAdmin(t *testing.T) {
 	const name = "selected + original.json"
-	const old = `{"type":"claude","email":"fixture@example.invalid","account_uuid":"fixture-subject","organization_uuid":"fixture-org","access_token":"old-fake-access","refresh_token":"old-fake-refresh","note":"preserve me","legacy":9007199254740993,"disabled":true,"reauth_required":true,"refresh_status":"reauth_required","refresh_disabled":true,"account_settings":{"refresh_enabled":false},"auto_quarantined":true,"quarantine_reason":"terminal_auth_failure","reauth_url":"https://foreign.example.invalid/synthetic-private-url"}`
+	const old = `{"type":"claude","email":"fixture@example.invalid","account_uuid":"` + fixtureClaudeAccountUUID + `","organization_uuid":"` + fixtureClaudeOrgUUID + `","access_token":"old-fake-access","refresh_token":"old-fake-refresh","note":"preserve me","legacy":9007199254740993,"disabled":true,"reauth_required":true,"refresh_status":"reauth_required","refresh_disabled":true,"account_settings":{"refresh_enabled":false},"auto_quarantined":true,"quarantine_reason":"terminal_auth_failure","reauth_url":"https://foreign.example.invalid/synthetic-private-url"}`
 	const mgmt = "/v0/management"
 	const key = "test-only-admin"
 	dir := t.TempDir()
 	targetPath := filepath.Join(dir, name)
 	siblingPath := filepath.Join(dir, "sibling.json")
 	emailOnlyPath := filepath.Join(dir, "legacy-email-only.json")
+	const opaqueName = "legacy-opaque.json"
+	const opaque = `{"type":"claude","email":"fixture@example.invalid","account_uuid":"fixture-subject","organization_uuid":"fixture-org","access_token":"opaque-fake-access"}`
+	opaquePath := filepath.Join(dir, opaqueName)
 	const emailOnly = `{"type":"claude","email":"fixture@example.invalid","reauth_required":true,"access_token":"legacy-fake-access"}`
 	for path, content := range map[string]string{
 		emailOnlyPath:                        emailOnly,
+		opaquePath:                           opaque,
 		targetPath:                           old,
-		siblingPath:                          strings.Replace(old, "fixture-subject", "sibling-subject", 1),
+		siblingPath:                          strings.Replace(old, fixtureClaudeAccountUUID, fixtureOtherUUID, 1),
 		filepath.Join(dir, "ownerless.json"): `{"type":"claude","reauth_required":true}`,
 		filepath.Join(dir, "other-provider.json"): `{"type":"codex","reauth_required":true}`,
 	} {
@@ -376,19 +392,20 @@ func TestOrdinaryLegacyClaudeReauthUsesSelectedFileAndAdmin(t *testing.T) {
 	if len(started) != 0 {
 		t.Fatal("rejected requests started an authorization")
 	}
-	start := func() string {
+	startSelected := func(authName, authID string) string {
 		t.Helper()
-		code, body := call(http.MethodGet, link, "", key)
+		code, body := call(http.MethodGet, mgmt+"/anthropic-auth-url?auth_name="+url.QueryEscape(authName), "", key)
 		var start struct {
 			State, URL string
 			AuthID     string `json:"target_auth_id"`
 		}
-		if code != http.StatusOK || json.Unmarshal([]byte(body), &start) != nil || start.AuthID != selectedID || start.State == "" || start.URL != "https://oauth.example.invalid/authorize" {
+		if code != http.StatusOK || json.Unmarshal([]byte(body), &start) != nil || start.AuthID != authID || start.State == "" || start.URL != "https://oauth.example.invalid/authorize" {
 			t.Fatalf("selected start did not return the bound session, status %d", code)
 		}
 		t.Cleanup(func() { CancelOAuthSession(start.State) })
 		return start.State
 	}
+	start := func() string { return startSelected(name, selectedID) }
 	complete := func(state, grant string, expectAdopted ...bool) string {
 		t.Helper()
 		payload, _ := json.Marshal(map[string]string{"provider": "anthropic", "redirect_url": "http://localhost/callback?state=" + url.QueryEscape(state) + "&code=" + url.QueryEscape(grant)})
@@ -438,7 +455,7 @@ func TestOrdinaryLegacyClaudeReauthUsesSelectedFileAndAdmin(t *testing.T) {
 
 	// A listing hint comes from the already loaded row. The authenticated
 	// click still consults disk and refuses a file whose subject has changed.
-	stale := strings.Replace(old, "fixture-subject", "sibling-subject", 1)
+	stale := strings.Replace(old, fixtureClaudeAccountUUID, fixtureOtherUUID, 1)
 	if err := os.WriteFile(targetPath, []byte(stale), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -558,8 +575,8 @@ func TestOrdinaryLegacyClaudeReauthUsesSelectedFileAndAdmin(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if got := complete(start(), "selected-account"); got != "ok" {
-		t.Fatalf("selected completion outcome = %q", got)
+	if got := complete(start(), "same-uuid-uppercase"); got != "ok" {
+		t.Fatalf("same UUID with different hexadecimal case: selected completion outcome = %q", got)
 	}
 	raw, err := os.ReadFile(targetPath)
 	var saved map[string]json.RawMessage
@@ -570,7 +587,7 @@ func TestOrdinaryLegacyClaudeReauthUsesSelectedFileAndAdmin(t *testing.T) {
 		len(saved["auto_quarantined"]) != 0 || len(saved["reauth_required"]) != 0 || len(saved["refresh_disabled"]) != 0 {
 		t.Fatal("selected replacement did not preserve operator fields and clear the terminal credential warning")
 	}
-	checkBytes(siblingPath, strings.Replace(old, "fixture-subject", "sibling-subject", 1))
+	checkBytes(siblingPath, strings.Replace(old, fixtureClaudeAccountUUID, fixtureOtherUUID, 1))
 	checkBytes(moved, old)
 	cold := coreauth.NewManager(store, nil, nil)
 	if err := cold.Load(context.Background()); err != nil {
@@ -583,5 +600,21 @@ func TestOrdinaryLegacyClaudeReauthUsesSelectedFileAndAdmin(t *testing.T) {
 	}
 	if info, err := os.Stat(targetPath); err != nil || info.Mode().Perm() != 0600 {
 		t.Fatalf("credential permissions changed: %v", err)
+	}
+
+	saveHook := make(chan struct{}, 2)
+	h.SetPostAuthHook(func(context.Context, *coreauth.Auth) error {
+		saveHook <- struct{}{}
+		return nil
+	})
+	defer h.SetPostAuthHook(nil)
+	for _, grant := range []string{"opaque-account-case", "opaque-organization-case"} {
+		if got := complete(startSelected(opaqueName, opaqueName), grant); got != "error" {
+			t.Fatalf("%s outcome = %q", grant, got)
+		}
+		checkBytes(opaquePath, opaque)
+	}
+	if len(saveHook) != 0 {
+		t.Fatal("a different opaque identity reached the save hook")
 	}
 }
