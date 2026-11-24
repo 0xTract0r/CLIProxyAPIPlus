@@ -13,6 +13,13 @@ REQUIRED = {
     SDK: {
         "TestOrdinarySchedulerSelectionIDContract",
         "TestOrdinarySchedulerRefusalContract",
+        "TestHomeReturnsFirstProviderRefusal",
+        *(f"TestHomeReturnsFirstProviderRefusal/{code}-count-{count}"
+          for code in (401, 403, 429) for count in ("false", "true")),
+        "TestOrdinaryHomeSelectionErrorContract",
+        *(f"TestOrdinaryHomeSelectionErrorContract/{method}" for method in ("execute", "count", "stream")),
+        "TestOrdinaryHomeExecuteRefusalKeepsPublicIdentity",
+        "TestOrdinaryHomeFirstStreamFrameRefusalIsTerminal",
         "TestOrdinaryHomeSingleCredentialRetryConfiguration",
         *(f"TestOrdinaryHomeSingleCredentialRetryConfiguration/{case}/wait={wait}"
           for case in ("aggregate_overrides_credential_zero", "explicit_aggregate_zero_is_authoritative",

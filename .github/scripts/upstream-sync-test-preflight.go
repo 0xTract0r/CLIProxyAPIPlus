@@ -202,7 +202,7 @@ func ignoredPackage(name string) bool {
 func run() error {
 	force := flag.Bool("required", false, "inspect the automated upstream-sync checkout")
 	event := flag.String("pr-event", "", "GitHub pull_request event JSON")
-	listPath := flag.String("inventory", ".github/scripts/upstream-sync-retired-tests.tsv", "reviewed excluded test functions")
+	listPath := flag.String("inventory", ".github/scripts/upstream-sync-retired-tests.tsv", "reviewed test functions with default-run restrictions")
 	flag.Parse()
 	if !*force {
 		active, err := shouldInspect(*event)
@@ -223,9 +223,9 @@ func run() error {
 		return err
 	}
 	if blocked != 0 {
-		return fmt.Errorf("%d excluded test functions would enter the default build; migrate just those cases before running go test", blocked)
+		return fmt.Errorf("%d test functions are outside the approved default run; see the per-test reasons above", blocked)
 	}
-	fmt.Printf("Upstream-sync preflight passed for %d reviewed exclusions.\n", len(list))
+	fmt.Printf("Upstream-sync preflight passed for %d reviewed inventory entries.\n", len(list))
 	return nil
 }
 

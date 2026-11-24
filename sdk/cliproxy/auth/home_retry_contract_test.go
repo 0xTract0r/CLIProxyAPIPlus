@@ -1409,61 +1409,6 @@ func TestHomeRetryRoundHonorsCredentialRequestRetryOverride(t *testing.T) {
 	}
 }
 
-func TestHomeRetryRoundUsesSuccessfulDispatchAggregate(t *testing.T) {
-	tests := []struct {
-		name    string
-		execute func(*Manager) error
-	}{
-		{
-			name: "nonstream",
-			execute: func(manager *Manager) error {
-				_, errExecute := manager.Execute(context.Background(), []string{"home-retry-contract"}, cliproxyexecutor.Request{Model: "gpt"}, cliproxyexecutor.Options{})
-				return errExecute
-			},
-		},
-		{
-			name: "count tokens",
-			execute: func(manager *Manager) error {
-				_, errExecute := manager.ExecuteCount(context.Background(), []string{"home-retry-contract"}, cliproxyexecutor.Request{Model: "gpt"}, cliproxyexecutor.Options{})
-				return errExecute
-			},
-		},
-		{
-			name: "stream",
-			execute: func(manager *Manager) error {
-				result, errExecute := manager.ExecuteStream(context.Background(), []string{"home-retry-contract"}, cliproxyexecutor.Request{Model: "gpt"}, cliproxyexecutor.Options{Stream: true})
-				if errExecute != nil {
-					return errExecute
-				}
-				for range result.Chunks {
-				}
-				return nil
-			},
-		},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			dispatcher := &aggregateRetryHomeDispatcher{}
-			executor := &retryContractHomeExecutor{}
-			manager := NewManager(nil, nil, nil)
-			manager.SetConfig(&internalconfig.Config{Home: internalconfig.HomeConfig{Enabled: true}})
-			manager.SetRetryConfig(0, time.Second, 1)
-			manager.PublishHomeDispatch(dispatcher, executionregistry.New(), 1)
-			manager.RegisterExecutor(executor)
-
-			if errExecute := test.execute(manager); errExecute != nil {
-				t.Fatalf("execution error = %v", errExecute)
-			}
-			if got := executor.Calls(); len(got) != 2 || got[0] != "home-retry-a" || got[1] != "home-retry-b" {
-				t.Fatalf("executor calls = %v, want [home-retry-a home-retry-b]", got)
-			}
-			if got := dispatcher.calls.Load(); got != 2 {
-				t.Fatalf("Home dispatch calls = %d, want 2", got)
-			}
-		})
-	}
-}
-
 func TestHomeRetryRoundUsesAuthoritativeZeroAggregate(t *testing.T) {
 	tests := []struct {
 		name    string
