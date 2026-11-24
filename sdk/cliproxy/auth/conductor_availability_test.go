@@ -217,12 +217,12 @@ func TestManager_AvailableProvidersAndHasProviderAuth_ExcludeDisabled(t *testing
 	}
 }
 
-func TestManager_ResetQuotaClearsRuntimeAndRegistryState(t *testing.T) {
+func TestManager_ResetQuotaClearsExpiredRuntimeAndRegistryState(t *testing.T) {
 	manager := NewManager(nil, nil, nil)
 	ctx := context.Background()
 	authID := "reset-quota-auth"
 	model := "reset-quota-model"
-	next := time.Now().Add(time.Hour)
+	next := time.Now().Add(-time.Hour)
 
 	reg := registry.GetGlobalRegistry()
 	reg.RegisterClient(authID, "claude", []*registry.ModelInfo{{ID: model}})

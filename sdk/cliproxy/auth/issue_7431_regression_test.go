@@ -2,6 +2,8 @@ package auth
 
 import (
 	"context"
+	"errors"
+
 	"fmt"
 	"net/http"
 	"sync"
@@ -457,7 +459,7 @@ func TestIssue7431_LargeWeightedPoolEdgeCases(t *testing.T) {
 	})
 }
 
-func TestIssue7431_ForceCooldownEdgeCases(t *testing.T) {
+func TestIssue7431_ForceCooldownEdgeCasesPreserveManualGuard(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now()
 
@@ -542,20 +544,24 @@ func TestIssue7431_ForceCooldownEdgeCases(t *testing.T) {
 		if IsAuthAvailableForModel(got, "model-force", now) {
 			t.Fatal("expected wrapped active ErrorCodeForceCooldown shadow on model-force to survive Register under disable-cooling")
 		}
-		if !IsAuthAvailableForModel(got, "model-ordinary", now) {
-			t.Fatal("expected ordinary non-force cooldown on model-ordinary to be cleared under disable-cooling")
+		if IsAuthAvailableForModel(got, "model-ordinary", now) {
+			t.Fatal("disable-cooling cleared a recorded provider 429 window")
 		}
-		if !IsAuthAvailableForModel(got, "model-expired-force", now) {
-			t.Fatal("expected expired ErrorCodeForceCooldown on model-expired-force to be cleared")
+		if state := got.ModelStates["model-expired-force"]; state != nil && state.credentialQuotaShadow != nil {
+			shadow := state.credentialQuotaShadow
+			if shadow.NextRetryAfter.After(now) || shadow.Quota.NextRecoverAt.After(now) {
+				t.Fatal("expired model-specific force cooldown was extended during reload")
+			}
 		}
 
-		// Explicit admin ResetQuota must still clear ErrorCodeForceCooldown.
-		if _, _, errReset := manager.ResetQuota(ctx, auth.ID); errReset != nil {
-			t.Fatalf("ResetQuota: %v", errReset)
+		// Manual reset must preserve an active upstream retry window, including
+		// one wrapped in a credential-quota shadow.
+		if _, _, errReset := manager.ResetQuota(ctx, auth.ID); !errors.Is(errReset, ErrQuotaResetProtected) {
+			t.Fatalf("ResetQuota should refuse an active window: %v", errReset)
 		}
 		gotAfterReset, _ := manager.GetByID(auth.ID)
-		if !IsAuthAvailableForModel(gotAfterReset, "model-force", now) {
-			t.Fatal("expected explicit ResetQuota to clear ErrorCodeForceCooldown")
+		if IsAuthAvailableForModel(gotAfterReset, "model-force", now) {
+			t.Fatal("active model window disappeared after refused reset")
 		}
 
 		// Auth-level (Model == "") ErrorCodeForceCooldown recorded alongside existing ModelStates
@@ -666,11 +672,11 @@ func TestIssue7431_ForceCooldownEdgeCases(t *testing.T) {
 		mgrB.SetConfig(cfgCoolingOff)
 		gotB, _ := mgrB.GetByID(authB.ID)
 		checkTimeB := time.Now()
-		if !IsAuthAvailableForModel(gotB, "model-1", checkTimeB) {
-			t.Fatalf("model-scoped force error overwrote auth.LastError and falsely preserved ordinary credential_quota on model-1: quota=%+v", gotB.Quota)
+		if IsAuthAvailableForModel(gotB, "model-1", checkTimeB) {
+			t.Fatalf("reload or later model result cleared active credential quota: quota=%+v", gotB.Quota)
 		}
 		if IsAuthAvailableForModel(gotB, "model-2", checkTimeB) {
-			t.Fatal("expected model-2's independent force cooldown to survive after ordinary credential_quota was cleared")
+			t.Fatal("expected model-2's independent force cooldown to survive reload")
 		}
 
 		// Persistence + restore after auth.LastError was overwritten in Order A must also preserve force credential_quota.

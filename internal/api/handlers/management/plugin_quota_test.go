@@ -200,9 +200,9 @@ func TestFetchCredentialQuota_Endpoint(t *testing.T) {
 	}
 }
 
-func TestResetCredentialQuota_Endpoint(t *testing.T) {
+func TestResetCredentialQuota_ExpiredWindow(t *testing.T) {
 	manager := coreauth.NewManager(nil, nil, nil)
-	next := time.Now().Add(time.Hour)
+	next := time.Now().Add(-time.Hour)
 	auth := &coreauth.Auth{
 		ID:             "opencode-auth-2",
 		FileName:       "opencode-key-2.json",
@@ -211,7 +211,7 @@ func TestResetCredentialQuota_Endpoint(t *testing.T) {
 		StatusMessage:  "exhausted",
 		Unavailable:    true,
 		NextRetryAfter: next,
-		Quota:          coreauth.QuotaState{Exceeded: true, Reason: "quota"},
+		Quota:          coreauth.QuotaState{Exceeded: true, Reason: "quota", NextRecoverAt: next},
 	}
 	authIndex := auth.EnsureIndex()
 	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
@@ -253,7 +253,7 @@ func TestResetCredentialQuota_Endpoint(t *testing.T) {
 	}
 }
 
-func TestPluginSpecificQuotaEndpoints(t *testing.T) {
+func TestPluginSpecificQuotaFetchAndExternalResetUnavailable(t *testing.T) {
 	manager := coreauth.NewManager(nil, nil, nil)
 	auth := &coreauth.Auth{
 		ID:       "workbuddy-auth",
@@ -303,8 +303,8 @@ func TestPluginSpecificQuotaEndpoints(t *testing.T) {
 	ctxDel.Params = gin.Params{{Key: "id", Value: "workbuddy-plugin"}}
 	ctxDel.Request = httptest.NewRequest(http.MethodDelete, "/v0/management/plugins/workbuddy-plugin/quota?auth_index="+authIndex, nil)
 	h.ResetPluginQuota(ctxDel)
-	if recDel.Code != http.StatusOK {
-		t.Fatalf("expected DELETE status 200, got %d: %s", recDel.Code, recDel.Body.String())
+	if recDel.Code != http.StatusNotImplemented {
+		t.Fatalf("expected DELETE status 501, got %d: %s", recDel.Code, recDel.Body.String())
 	}
 }
 
@@ -487,18 +487,15 @@ func TestAuthFilesListV8_QuotaPluginIDAndNoQuotaProbe(t *testing.T) {
 	}
 }
 
-func TestResetCredentialQuota_FailureDoesNotClearCooldown(t *testing.T) {
+func TestResetCredentialQuota_ExternalUnavailableKeepsLocalState(t *testing.T) {
 	manager := coreauth.NewManager(nil, nil, nil)
-	next := time.Now().Add(time.Hour)
 	auth := &coreauth.Auth{
-		ID:             "fail-reset-auth",
-		FileName:       "fail-reset.json",
-		Provider:       "fail-reset-provider",
-		Status:         coreauth.StatusError,
-		StatusMessage:  "exhausted",
-		Unavailable:    true,
-		NextRetryAfter: next,
-		Quota:          coreauth.QuotaState{Exceeded: true, Reason: "quota"},
+		ID:            "fail-reset-auth",
+		FileName:      "fail-reset.json",
+		Provider:      "fail-reset-provider",
+		Status:        coreauth.StatusError,
+		StatusMessage: "recoverable local state",
+		Unavailable:   true,
 	}
 	authIndex := auth.EnsureIndex()
 	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
@@ -514,7 +511,7 @@ func TestResetCredentialQuota_FailureDoesNotClearCooldown(t *testing.T) {
 				resetFn: func(context.Context, pluginapi.QuotaResetRequest) (pluginapi.QuotaResetResponse, error) {
 					return pluginapi.QuotaResetResponse{
 						Success: false,
-						Message: "rate limit reset window has not arrived",
+						Message: "external reset unavailable",
 					}, nil
 				},
 			},
@@ -526,12 +523,12 @@ func TestResetCredentialQuota_FailureDoesNotClearCooldown(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(rec)
-	ctx.Request = httptest.NewRequest(http.MethodPost, "/v0/management/quota/reset", strings.NewReader(`{"auth_index":"`+authIndex+`"}`))
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v0/management/quota/reset", strings.NewReader(`{"auth_index":"`+authIndex+`","plugin_id":"fail-plugin"}`))
 	ctx.Request.Header.Set("Content-Type", "application/json")
 	h.ResetCredentialQuota(ctx)
 
-	if rec.Code != http.StatusBadGateway {
-		t.Fatalf("expected status 502, got %d: %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusNotImplemented {
+		t.Fatalf("expected status 501, got %d: %s", rec.Code, rec.Body.String())
 	}
 
 	// Verify local coreauth manager quota was NOT cleared

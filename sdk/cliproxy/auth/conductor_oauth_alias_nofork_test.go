@@ -614,7 +614,7 @@ func TestManager_NoForkAlias_ExpiredCooldownResetClean(t *testing.T) {
 }
 
 // Test 8: MarkResult and ResetQuota projection on no-fork alias
-func TestManager_NoForkAlias_MarkResultAndResetQuotaProjection(t *testing.T) {
+func TestManager_NoForkAlias_ManualResetPreservesActiveQuotaProjection(t *testing.T) {
 	const (
 		provider    = "antigravity"
 		routeModel  = "[ant]gemini-3.7-flash-high"
@@ -670,17 +670,11 @@ func TestManager_NoForkAlias_MarkResultAndResetQuotaProjection(t *testing.T) {
 		t.Fatalf("routeModel %q was not suspended in registry", routeModel)
 	}
 
-	// Reset quota
-	if _, _, errReset := manager.ResetQuota(context.Background(), auth.ID); errReset != nil {
-		t.Fatalf("ResetQuota failed: %v", errReset)
+	if _, _, err := manager.ResetQuota(context.Background(), auth.ID); !errors.Is(err, ErrQuotaResetProtected) {
+		t.Fatalf("active alias quota reset was not refused: %v", err)
 	}
-
-	// Verify routeModel in registry is cleared
-	if reg.IsModelQuotaExceededForClient(auth.ID, routeModel) {
-		t.Fatalf("routeModel %q is still marked quota exceeded after ResetQuota", routeModel)
-	}
-	if reg.IsModelSuspendedForClient(auth.ID, routeModel) {
-		t.Fatalf("routeModel %q is still suspended after ResetQuota", routeModel)
+	if !reg.IsModelQuotaExceededForClient(auth.ID, routeModel) || !reg.IsModelSuspendedForClient(auth.ID, routeModel) {
+		t.Fatal("refused reset changed the alias projection")
 	}
 }
 
@@ -2500,7 +2494,7 @@ func TestManager_NoForkAlias_HistoricalRouteStateOnly_MigratedToTargetCooldown(t
 }
 
 // Test 27: ResetQuota reliably clears CooldownStateStore even when outer context is cancelled
-func TestManager_NoForkAlias_ResetQuota_CancelledContextCleansCooldownStore(t *testing.T) {
+func TestManager_NoForkAlias_ResetQuota_CancelledContextKeepsActiveCooldownStore(t *testing.T) {
 	const (
 		provider    = "antigravity"
 		routeModel  = "[ant]gemini-3.7-flash-rq-test"
@@ -2569,19 +2563,12 @@ func TestManager_NoForkAlias_ResetQuota_CancelledContextCleansCooldownStore(t *t
 	cancelledCtx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	_, _, _ = manager.ResetQuota(cancelledCtx, auth.ID)
-
-	// Cooldown store MUST have no records remaining for this auth/model
-	recordsAfter := store.savedRecords()
-	for _, rec := range recordsAfter {
-		if rec.AuthID == auth.ID && rec.Model == targetModel {
-			t.Fatalf("cooldown record for %q was not cleared from store after cancelled-context ResetQuota", targetModel)
-		}
+	if _, _, err := manager.ResetQuota(cancelledCtx, auth.ID); !errors.Is(err, ErrQuotaResetProtected) {
+		t.Fatalf("cancelled manual reset did not preserve active limit: %v", err)
 	}
-
-	// Memory and registry must be clean
-	if reg.IsModelSuspendedForClient(auth.ID, routeModel) {
-		t.Fatalf("routeModel %q should no longer be suspended in registry after ResetQuota", routeModel)
+	recordsAfter := store.savedRecords()
+	if !cooldownStateRecordsEqual(recordsBefore, recordsAfter) || !reg.IsModelSuspendedForClient(auth.ID, routeModel) {
+		t.Fatal("refused reset changed stored cooldown or alias projection")
 	}
 }
 
@@ -3241,7 +3228,7 @@ func (s *mockFailingAuthStoreForResetQuota) Delete(ctx context.Context, id strin
 }
 
 // Test 35: ResetQuota reliably clears CooldownStore via defer even when Auth Store.Save returns error
-func TestManager_NoForkAlias_ResetQuota_ErrorPersistCleansCooldownStore(t *testing.T) {
+func TestManager_NoForkAlias_ResetQuota_ProtectedBeforeFailingPersistence(t *testing.T) {
 	const (
 		provider    = "antigravity"
 		routeModel  = "route-model-err-persist"
@@ -3307,24 +3294,12 @@ func TestManager_NoForkAlias_ResetQuota_ErrorPersistCleansCooldownStore(t *testi
 		t.Fatalf("expected cooldown records in store before ResetQuota, got: %#v, err: %v", recordsBefore, errLoadBefore)
 	}
 
-	// ResetQuota will encounter failingStore error on persist
-	_, _, errReset := manager.ResetQuota(context.Background(), auth.ID)
-	if errReset == nil {
-		t.Fatal("expected ResetQuota to return simulated error from auth store, got nil")
+	if _, _, err := manager.ResetQuota(context.Background(), auth.ID); !errors.Is(err, ErrQuotaResetProtected) {
+		t.Fatalf("provider window did not take precedence over persistence: %v", err)
 	}
-
-	// Verify cooldown store is nevertheless cleanly cleared via defer
-	recordsAfter, errLoadAfter := cooldownStore.Load(context.Background())
-	if errLoadAfter != nil {
-		t.Fatalf("failed to load cooldown store: %v", errLoadAfter)
-	}
-	if len(recordsAfter) != 0 {
-		t.Fatalf("expected cooldown store to be cleared after ResetQuota, got: %#v", recordsAfter)
-	}
-
-	// Verify registry projection is also resumed
-	if reg.IsModelSuspendedForClient(auth.ID, routeModel) {
-		t.Fatalf("routeModel %q should no longer be suspended in registry after ResetQuota", routeModel)
+	recordsAfter, err := cooldownStore.Load(context.Background())
+	if err != nil || !cooldownStateRecordsEqual(recordsBefore, recordsAfter) || !reg.IsModelSuspendedForClient(auth.ID, routeModel) {
+		t.Fatalf("protected cooldown changed: %v", err)
 	}
 }
 

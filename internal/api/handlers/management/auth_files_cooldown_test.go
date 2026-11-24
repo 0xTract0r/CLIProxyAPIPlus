@@ -2,6 +2,7 @@ package management
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -767,7 +768,7 @@ func TestListAuthFiles_SparseModelState_BlockedModelDoesNotMakeAuthUnavailable(t
 	}
 }
 
-func TestListAuthFiles_V8CodexTerminalRenewalRecoveryWorkflow_Issue5783(t *testing.T) {
+func TestListAuthFiles_V8CodexTerminalRenewalRecoveryWorkflowRespectsRecordedCooldown_Issue5783(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
 	now := time.Now().UTC()
 	futureExpiry := now.Add(24 * time.Hour).Truncate(time.Second)
@@ -1053,11 +1054,19 @@ func TestListAuthFiles_V8CodexTerminalRenewalRecoveryWorkflow_Issue5783(t *testi
 		t.Fatalf("expected codex-a.json repaired in manager, got RequiresSignIn=%v RefreshError=%+v", repaired.RequiresSignIn, repaired.RefreshError)
 	}
 
+	// Use independently selected credentials for synthetic error cases. The
+	// successfully renewed credential is reserved for the positive case.
+	for _, name := range []string{"verify-incomplete.json", "verify-unavailable.json", "verify-quota.json"} {
+		credential := repaired.Clone()
+		credential.ID, credential.FileName, credential.Index = name, name, ""
+		registerAuthForLookupTest(t, manager, credential)
+	}
+
 	// Operator-triggered POST /v8/management/credentials/verify:
 	// 1) response.incomplete must fail (HTTP 502) and NOT mark inference_verified=true.
 	exec.streamPayloads = [][]byte{[]byte(`data: {"type":"response.incomplete","response":{"status":"incomplete"}}` + "\n\n")}
 	wVerifyIncomp := httptest.NewRecorder()
-	reqVerifyIncomp := httptest.NewRequest(http.MethodPost, "/v8/management/credentials/verify", strings.NewReader(`{"name":"codex-a.json","model":"gpt-5.5"}`))
+	reqVerifyIncomp := httptest.NewRequest(http.MethodPost, "/v8/management/credentials/verify", strings.NewReader(`{"name":"verify-incomplete.json","model":"gpt-5.5"}`))
 	reqVerifyIncomp.Header.Set("Content-Type", "application/json")
 	router.ServeHTTP(wVerifyIncomp, reqVerifyIncomp)
 	if wVerifyIncomp.Code != http.StatusBadGateway {
@@ -1068,7 +1077,7 @@ func TestListAuthFiles_V8CodexTerminalRenewalRecoveryWorkflow_Issue5783(t *testi
 	exec.streamPayloads = nil
 	exec.streamErr = &coreauth.Error{Code: "service_unavailable", Message: "upstream 503", HTTPStatus: http.StatusServiceUnavailable, Retryable: true}
 	wVerify503 := httptest.NewRecorder()
-	reqVerify503 := httptest.NewRequest(http.MethodPost, "/v8/management/credentials/verify", strings.NewReader(`{"name":"codex-a.json","model":"gpt-5.5"}`))
+	reqVerify503 := httptest.NewRequest(http.MethodPost, "/v8/management/credentials/verify", strings.NewReader(`{"name":"verify-unavailable.json","model":"gpt-5.5"}`))
 	reqVerify503.Header.Set("Content-Type", "application/json")
 	router.ServeHTTP(wVerify503, reqVerify503)
 	if wVerify503.Code != http.StatusServiceUnavailable {
@@ -1081,7 +1090,6 @@ func TestListAuthFiles_V8CodexTerminalRenewalRecoveryWorkflow_Issue5783(t *testi
 	if verify503Resp["quota_blocked"] != false || verify503Resp["recovery_stage"] == coreauth.RecoveryStageQuotaBlocked {
 		t.Fatalf("503 transient failure must not be classified as quota_blocked, got %#v", verify503Resp)
 	}
-	_, _, _ = manager.ResetQuota(context.Background(), "codex-a.json")
 
 	// 2) 429 quota error after valid auth must transition recovery_stage to quota_blocked and sanitize any secrets in the error message.
 	exec.streamPayloads = nil
@@ -1091,7 +1099,7 @@ func TestListAuthFiles_V8CodexTerminalRenewalRecoveryWorkflow_Issue5783(t *testi
 		HTTPStatus: http.StatusTooManyRequests,
 	}
 	wVerifyQuota := httptest.NewRecorder()
-	reqVerifyQuota := httptest.NewRequest(http.MethodPost, "/v8/management/credentials/verify", strings.NewReader(`{"name":"codex-a.json","model":"gpt-5.5"}`))
+	reqVerifyQuota := httptest.NewRequest(http.MethodPost, "/v8/management/credentials/verify", strings.NewReader(`{"name":"verify-quota.json","model":"gpt-5.5"}`))
 	reqVerifyQuota.Header.Set("Content-Type", "application/json")
 	router.ServeHTTP(wVerifyQuota, reqVerifyQuota)
 	if wVerifyQuota.Code != http.StatusTooManyRequests {
@@ -1109,7 +1117,9 @@ func TestListAuthFiles_V8CodexTerminalRenewalRecoveryWorkflow_Issue5783(t *testi
 	if quotaVerifyResp["recovery_stage"] != coreauth.RecoveryStageQuotaBlocked || quotaVerifyResp["quota_blocked"] != true {
 		t.Fatalf("expected recovery_stage=quota_blocked and quota_blocked=true, got %#v", quotaVerifyResp)
 	}
-	_, _, _ = manager.ResetQuota(context.Background(), "codex-a.json")
+	if _, _, err := manager.ResetQuota(context.Background(), "verify-quota.json"); !errors.Is(err, coreauth.ErrQuotaResetProtected) {
+		t.Fatalf("reset of recorded provider limit should be refused: %v", err)
+	}
 
 	// 3) Completed stream transitions recovery_stage to inference_verified.
 	exec.streamErr = nil

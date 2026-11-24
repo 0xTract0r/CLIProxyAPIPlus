@@ -412,7 +412,7 @@ func TestScheduler_LargeCredentialSet_CooldownDoesNotLockStarve(t *testing.T) {
 // TestScheduler_RebuildDuringConcurrentMarkResult_PreservesLatestState verifies
 // that when rebuild runs with an earlier snapshot, in-flight MarkResult state mutations
 // (e.g. cooldown or recovery) are preserved and never reverted (Reviewer Finding P1).
-func TestScheduler_RebuildDuringConcurrentMarkResult_PreservesLatestState(t *testing.T) {
+func TestScheduler_RebuildDuringConcurrentMarkResult_PreservesProtectedState(t *testing.T) {
 	ctx := context.Background()
 	manager := NewManager(nil, &RoundRobinSelector{}, nil)
 	manager.RegisterExecutor(schedulerProviderTestExecutor{provider: "gemini"})
@@ -451,23 +451,12 @@ func TestScheduler_RebuildDuringConcurrentMarkResult_PreservesLatestState(t *tes
 		t.Fatalf("rebuild with stale snapshot reverted cooldown state; expected *modelCooldownError, got: %v", errPickCooldown)
 	}
 
-	// Case B: Snapshot G is in cooldown, concurrent MarkResult restores/recovers auth (G+2).
-	manager.mu.RLock()
-	cooledSnapshot := manager.auths[auth.ID].Clone()
-	manager.mu.RUnlock()
-
-	// Clear cooldown via ResetQuota.
-	if _, _, errReset := manager.ResetQuota(ctx, auth.ID); errReset != nil {
-		t.Fatalf("reset quota: %v", errReset)
+	if _, _, err := manager.ResetQuota(ctx, auth.ID); !errors.Is(err, ErrQuotaResetProtected) {
+		t.Fatalf("active retry window was not protected: %v", err)
 	}
-
-	// Rebuild with older cooled snapshot.
-	manager.scheduler.rebuild([]*Auth{cooledSnapshot})
-
-	// Recovered state must be preserved (must NOT revert to cooldown).
-	pickedRecovered, errPickRecovered := manager.scheduler.pickSingle(ctx, "gemini", model, cliproxyexecutor.Options{}, nil)
-	if errPickRecovered != nil || pickedRecovered == nil || pickedRecovered.ID != auth.ID {
-		t.Fatalf("rebuild with stale snapshot reverted recovered state: picked=%v, err=%v", pickedRecovered, errPickRecovered)
+	manager.scheduler.rebuild([]*Auth{healthySnapshot})
+	if _, err := manager.scheduler.pickSingle(ctx, "gemini", model, cliproxyexecutor.Options{}, nil); !errors.As(err, &targetCooldownErr) {
+		t.Fatalf("active retry window lost after refusal and rebuild: %v", err)
 	}
 }
 

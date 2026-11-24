@@ -831,7 +831,7 @@ func reloginSnapshot(t *testing.T, path, token string, expiry time.Time) *Auth {
 	return a
 }
 
-func TestManager_CodexTerminalRenewalRecoveryLifecycle_Issue5783(t *testing.T) {
+func TestManager_CodexTerminalRenewalRecoveryLifecyclePreservesQuota_Issue5783(t *testing.T) {
 	ctx := WithSkipPersist(context.Background())
 	model := "gpt-5.5"
 	now := time.Now().UTC()
@@ -878,7 +878,7 @@ func TestManager_CodexTerminalRenewalRecoveryLifecycle_Issue5783(t *testing.T) {
 	reg.RegisterClient(primary.ID, "codex", []*registry.ModelInfo{{ID: model}})
 	reg.RegisterClient(backup.ID, "codex", []*registry.ModelInfo{{ID: model}})
 	t.Cleanup(func() {
-		reg.UnregisterClient(primary.ID)
+		reg.UnregisterClient("aa-codex-primary.json")
 		reg.UnregisterClient(backup.ID)
 	})
 
@@ -920,7 +920,7 @@ func TestManager_CodexTerminalRenewalRecoveryLifecycle_Issue5783(t *testing.T) {
 	}
 
 	// 3. Ordinary inference on primary remains usable while access_token is unexpired, and does not clear RequiresSignIn/RefreshError.
-	resp, errExec := m.Execute(ctx, []string{"codex"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	resp, errExec := m.Execute(ctx, []string{"codex"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{Metadata: map[string]any{cliproxyexecutor.PinnedAuthMetadataKey: primary.ID}})
 	if errExec != nil {
 		t.Fatalf("Execute error = %v, want success on primary", errExec)
 	}
@@ -956,7 +956,7 @@ func TestManager_CodexTerminalRenewalRecoveryLifecycle_Issue5783(t *testing.T) {
 		Error:           &Error{HTTPStatus: http.StatusTooManyRequests, Message: "quota exceeded"},
 	})
 
-	// At access expiry, the unrenewable primary credential becomes unavailable without extra upstream refresh calls, and backup serves traffic.
+	// At access expiry, the unrenewable primary credential becomes unavailable without extra upstream refresh calls, without dispatching traffic under a different authorization.
 	m.mu.Lock()
 	if cur := m.auths[primary.ID]; cur != nil {
 		cur.Metadata["expired"] = now.Add(-time.Minute).Format(time.RFC3339)
@@ -972,13 +972,6 @@ func TestManager_CodexTerminalRenewalRecoveryLifecycle_Issue5783(t *testing.T) {
 	if !afterExpiry.Unavailable || afterExpiry.Status != StatusError || !afterExpiry.RequiresSignIn || afterExpiry.RenewalStateAt(now) != RenewalStateExpiredSignInRequired {
 		t.Fatalf("expected unavailable expired_sign_in_required at expiry, got unavailable=%v status=%s requires_sign_in=%v state=%q",
 			afterExpiry.Unavailable, afterExpiry.Status, afterExpiry.RequiresSignIn, afterExpiry.RenewalStateAt(now))
-	}
-	respAtExpiry, errAtExpiry := m.Execute(ctx, []string{"codex"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
-	if errAtExpiry != nil {
-		t.Fatalf("Execute at primary expiry error = %v, want success on backup", errAtExpiry)
-	}
-	if got := string(respAtExpiry.Payload); got != backup.ID+":backup-access-token" {
-		t.Fatalf("Execute at primary expiry payload = %q, want backup", got)
 	}
 
 	// 6. Fresh sign-in clears superseded auth failures while preserving active quota cooldown, and distinguishes awaiting_first_renewal from renewal_verified.
@@ -1000,11 +993,12 @@ func TestManager_CodexTerminalRenewalRecoveryLifecycle_Issue5783(t *testing.T) {
 		t.Fatalf("expected active quota cooldown preserved after relogin, got unavailable=%v stage=%q", afterRelogin.Unavailable, afterRelogin.RecoveryStageAt(now))
 	}
 
-	// Release quota cooldown and verify streaming completion vs incomplete stream.
-	_, _, _ = m.ResetQuota(ctx, primary.ID)
+	if _, _, err := m.ResetQuota(ctx, primary.ID); !errors.Is(err, ErrQuotaResetProtected) {
+		t.Fatalf("expected reset to preserve active provider quota: %v", err)
+	}
 	afterReset, _ := m.GetByID(primary.ID)
-	if afterReset.InferenceVerified || afterReset.RecoveryStageAt(now) != RecoveryStageLoaded {
-		t.Fatalf("expected stage loaded before inference verification, got Verified=%v stage=%q", afterReset.InferenceVerified, afterReset.RecoveryStageAt(now))
+	if afterReset.InferenceVerified || afterReset.RecoveryStageAt(now) != RecoveryStageQuotaBlocked {
+		t.Fatalf("refused reset changed quota stage: verified=%v stage=%q", afterReset.InferenceVerified, afterReset.RecoveryStageAt(now))
 	}
 
 	// Another account's completed response does not verify primary.
@@ -1013,6 +1007,28 @@ func TestManager_CodexTerminalRenewalRecoveryLifecycle_Issue5783(t *testing.T) {
 	if afterOtherSuccess.InferenceVerified {
 		t.Fatal("another account's inference success must not verify primary")
 	}
+
+	// The positive stream cases exercise a separate manager with one synthetic
+	// credential so the original recorded provider deadline remains intact.
+	newVerificationFixture := func(suffix string) {
+		t.Helper()
+		id := "codex-verification-" + suffix + ".json"
+		primary = &Auth{
+			ID: id, FileName: id, Provider: "codex", Status: StatusActive,
+			Metadata: map[string]any{
+				"type": "codex", "access_token": "verification-access-token",
+				"refresh_token": "verification-refresh-token", "expired": futureExpiry.Format(time.RFC3339),
+			},
+		}
+		m = NewManager(nil, &FillFirstSelector{}, nil)
+		m.RegisterExecutor(executor)
+		reg.RegisterClient(id, "codex", []*registry.ModelInfo{{ID: model}})
+		t.Cleanup(func() { reg.UnregisterClient(id) })
+		if _, err := m.Register(ctx, primary); err != nil {
+			t.Fatalf("register verification fixture: %v", err)
+		}
+	}
+	newVerificationFixture("initial")
 
 	// Local ExecuteCount (CountTokens) on primary must NOT verify inference.
 	if _, errCount := m.ExecuteCount(ctx, []string{"codex"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{}); errCount != nil {
@@ -1037,8 +1053,8 @@ func TestManager_CodexTerminalRenewalRecoveryLifecycle_Issue5783(t *testing.T) {
 	if afterIncomplete.InferenceVerified {
 		t.Fatal("HTTP 200 stream without terminal completion must not mark InferenceVerified=true")
 	}
-	_, _, _ = m.ResetQuota(ctx, primary.ID)
 
+	newVerificationFixture("eof")
 	// A stream that closes cleanly at EOF after response.created without a completion event must NOT verify inference.
 	executor.mu.Lock()
 	executor.streamChunkErr = nil
@@ -1068,6 +1084,7 @@ func TestManager_CodexTerminalRenewalRecoveryLifecycle_Issue5783(t *testing.T) {
 		t.Fatal("non-generation model list JSON must not be treated as a completed execution payload")
 	}
 
+	newVerificationFixture("incomplete")
 	// A stream that finishes with response.incomplete must NOT verify inference.
 	executor.mu.Lock()
 	executor.streamPayloads = [][]byte{[]byte(`data: {"type":"response.incomplete","response":{"status":"incomplete"}}` + "\n\n")}
@@ -1082,10 +1099,12 @@ func TestManager_CodexTerminalRenewalRecoveryLifecycle_Issue5783(t *testing.T) {
 	if afterRespIncomplete.InferenceVerified {
 		t.Fatal("response.incomplete stream must not mark InferenceVerified=true")
 	}
+	newVerificationFixture("verify-incomplete")
 	if _, errVerifyIncomplete := m.VerifyInference(ctx, primary.ID, model); errVerifyIncomplete == nil {
 		t.Fatal("VerifyInference must fail when stream ends with response.incomplete")
 	}
 
+	newVerificationFixture("verify-complete")
 	// Operator-triggered VerifyInference pins to primary, uses an isolated session and a minimal 16-token (Codex floor) prompt, and marks InferenceVerified = true upon response.completed.
 	executor.mu.Lock()
 	executor.streamPayloads = nil

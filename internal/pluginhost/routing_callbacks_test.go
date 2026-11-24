@@ -25,7 +25,7 @@ func (s *recordingTokenStore) Save(ctx context.Context, auth *coreauth.Auth) (st
 }
 func (s *recordingTokenStore) Delete(ctx context.Context, id string) error { return nil }
 
-func TestHostRoutingResetCooldownClearsCredentialCooldown(t *testing.T) {
+func TestHostRoutingResetCooldownRefusesActiveCredentialCooldown(t *testing.T) {
 	const model = "claude-sonnet-5-5"
 	next := time.Now().Add(65 * time.Hour)
 	auth := &coreauth.Auth{
@@ -63,40 +63,20 @@ func TestHostRoutingResetCooldownClearsCredentialCooldown(t *testing.T) {
 	if errMarshal != nil {
 		t.Fatalf("marshal request: %v", errMarshal)
 	}
-	rawResp, errCall := host.callFromPlugin(context.Background(), pluginabi.MethodHostRoutingResetCooldown, request)
-	if errCall != nil {
-		t.Fatalf("callFromPlugin() error = %v", errCall)
+	if _, errCall := host.callFromPlugin(context.Background(), pluginabi.MethodHostRoutingResetCooldown, request); errCall == nil || !strings.Contains(errCall.Error(), coreauth.ErrQuotaResetProtected.Error()) {
+		t.Fatalf("plugin RPC did not refuse protected cooldown: %v", errCall)
 	}
-	resp, errDecode := decodeRPCEnvelope[pluginapi.HostRoutingResetCooldownResponse](rawResp)
-	if errDecode != nil {
-		t.Fatalf("decode response: %v", errDecode)
-	}
-	if resp.AuthIndex != auth.Index {
-		t.Fatalf("auth_index = %q, want %q", resp.AuthIndex, auth.Index)
-	}
-	if len(resp.Models) != 1 || resp.Models[0] != model {
-		t.Fatalf("models = %v, want [%s]", resp.Models, model)
-	}
-
 	updated, ok := manager.GetByID(auth.ID)
-	if !ok || updated == nil {
-		t.Fatalf("auth %s missing after reset", auth.ID)
-	}
-	if updated.Status != coreauth.StatusActive || updated.Unavailable || !updated.NextRetryAfter.IsZero() {
-		t.Fatalf("auth state = status %q unavailable %v next %v, want active and available", updated.Status, updated.Unavailable, updated.NextRetryAfter)
-	}
-	if updated.Quota.Exceeded || updated.Quota.Reason != "" || !updated.Quota.NextRecoverAt.IsZero() {
-		t.Fatalf("auth quota = %+v, want cleared", updated.Quota)
-	}
-	state := updated.ModelStates[model]
-	if state == nil || state.Unavailable || !state.NextRetryAfter.IsZero() || state.Quota.Exceeded {
-		t.Fatalf("model state = %+v, want cleared", state)
+	modelState := updated.ModelStates[model]
+	if !ok || !updated.Quota.Exceeded || !updated.NextRetryAfter.Equal(next) ||
+		modelState == nil || !modelState.Quota.Exceeded || !modelState.NextRetryAfter.Equal(next) {
+		t.Fatal("plugin RPC changed protected credential or model cooldown")
 	}
 }
 
-func TestHostRoutingResetCooldownLeavesTokenFilesAlone(t *testing.T) {
+func TestHostRoutingResetExpiredCooldownLeavesTokenFilesAlone(t *testing.T) {
 	const model = "claude-sonnet-5-5"
-	next := time.Now().Add(48 * time.Hour)
+	next := time.Now().Add(-48 * time.Hour)
 	auth := &coreauth.Auth{
 		ID:             "claude-token-test.json",
 		Provider:       "claude",
