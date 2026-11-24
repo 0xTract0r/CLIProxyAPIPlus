@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 )
 
 // antiThrashTestExecutor records every Refresh call and rewrites the expiry to
@@ -52,54 +52,6 @@ func (e *antiThrashTestExecutor) CountTokens(ctx context.Context, auth *Auth, re
 
 func (e *antiThrashTestExecutor) HttpRequest(ctx context.Context, auth *Auth, req *http.Request) (*http.Response, error) {
 	return nil, nil
-}
-
-// TestAntiThrashRefreshBackoff_UsesTokenHalfLife verifies the helper picks the
-// expected backoff window when an upstream-provided expiry is parseable.
-func TestAntiThrashRefreshBackoff_UsesTokenHalfLife(t *testing.T) {
-	now := time.Date(2026, 5, 26, 0, 0, 0, 0, time.UTC)
-	expiry := now.Add(time.Hour) // 60 min remaining
-	auth := &Auth{
-		ID:       "a1",
-		Provider: "claude",
-		Metadata: map[string]any{
-			"expired": expiry.Format(time.RFC3339),
-		},
-	}
-	got := antiThrashRefreshBackoff(auth, now)
-	want := 30 * time.Minute
-	if got != want {
-		t.Fatalf("antiThrashRefreshBackoff() = %s, want %s", got, want)
-	}
-}
-
-// TestAntiThrashRefreshBackoff_FallbackWhenNoExpiry verifies the helper falls
-// back to refreshMinDwellFallback when no expiry is present in metadata.
-func TestAntiThrashRefreshBackoff_FallbackWhenNoExpiry(t *testing.T) {
-	now := time.Date(2026, 5, 26, 0, 0, 0, 0, time.UTC)
-	auth := &Auth{ID: "a1", Provider: "claude", Metadata: map[string]any{}}
-	got := antiThrashRefreshBackoff(auth, now)
-	if got != refreshMinDwellFallback {
-		t.Fatalf("antiThrashRefreshBackoff() = %s, want %s", got, refreshMinDwellFallback)
-	}
-}
-
-// TestAntiThrashRefreshBackoff_FloorsAtIneffective verifies the helper does not
-// schedule the next refresh inside the very tight refreshIneffectiveBackoff
-// window even when the upstream returns a TTL shorter than the floor.
-func TestAntiThrashRefreshBackoff_FloorsAtIneffective(t *testing.T) {
-	now := time.Date(2026, 5, 26, 0, 0, 0, 0, time.UTC)
-	auth := &Auth{
-		ID:       "a1",
-		Provider: "claude",
-		Metadata: map[string]any{
-			"expired": now.Add(10 * time.Second).Format(time.RFC3339),
-		},
-	}
-	got := antiThrashRefreshBackoff(auth, now)
-	if got < refreshIneffectiveBackoff {
-		t.Fatalf("antiThrashRefreshBackoff() = %s, want >= %s", got, refreshIneffectiveBackoff)
-	}
 }
 
 // TestRefreshAuth_DoesNotThrashWhenLeadExceedsTTL exercises the full

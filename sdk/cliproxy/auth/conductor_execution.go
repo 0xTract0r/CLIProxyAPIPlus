@@ -3461,6 +3461,7 @@ func syncMetadataSessionToContext(ctx context.Context, metadata map[string]any) 
 		clientMeta.IsCompaction = false
 	}
 	ctx = logging.WithClientRequestMetadata(ctx, clientMeta)
+	ctx = WithSessionID(ctx, clientMeta.SessionID)
 	return util.WithSessionID(ctx, clientMeta.SessionID)
 }
 
