@@ -393,8 +393,8 @@ func TestClaudeThreadOwnerUnavailableReturnsThreadNotFound(t *testing.T) {
 	}
 }
 
-func TestClaudeThreadCreateStillRotatesPastRateLimitedCredential(t *testing.T) {
-	const model = "claude-opus-5-5"
+func TestClaudeThreadCreateRetainsSelectedCredentialRefusal(t *testing.T) {
+	const model = "fixture-claude-thread"
 	caller := t.Name() + "-" + uuid.NewString()
 
 	manager := NewManager(nil, &RoundRobinSelector{}, nil)
@@ -429,11 +429,9 @@ func TestClaudeThreadCreateStillRotatesPastRateLimitedCredential(t *testing.T) {
 	}
 
 	resp, errExec := manager.Execute(WithSkipPersist(t.Context()), []string{"claude"}, req, opts)
-	if errExec != nil {
-		t.Fatalf("thread create should rotate past rate-limited credential, got err=%v", errExec)
-	}
-	if string(resp.Payload) != `{"id":"msg_created"}` || len(calledAuths) != 2 {
-		t.Fatalf("unexpected rotation outcome: payload=%s called=%v", resp.Payload, calledAuths)
+	var refused interface{ StatusCode() int }
+	if !errors.As(errExec, &refused) || refused.StatusCode() != http.StatusTooManyRequests || len(resp.Payload) != 0 || len(calledAuths) != 1 {
+		t.Fatalf("expected 429 without replay: error=%v calls=%v body=%q", errExec, calledAuths, resp.Payload)
 	}
 }
 

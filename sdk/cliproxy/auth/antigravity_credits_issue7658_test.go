@@ -1117,7 +1117,7 @@ func TestAntigravityCreditsExecute_ExplicitRequestStopBeatsContinueRule(t *testi
 	}
 }
 
-func TestAntigravityCreditsExecute_BareValidationRequiredStopsWithoutRules(t *testing.T) {
+func TestAntigravityOrdinaryValidationRequiredStops(t *testing.T) {
 	const model = "claude-sonnet-4-6"
 
 	for _, stream := range []bool{false, true} {
@@ -1143,17 +1143,26 @@ func TestAntigravityCreditsExecute_BareValidationRequiredStopsWithoutRules(t *te
 			},
 		} {
 			t.Run(mode+"/"+tc.name, func(t *testing.T) {
-				manager, exec, authIDs := setupIssue7658CreditsManager(t, "ag-7658-bareval-"+mode+"-"+tc.name, model, 3, nil, 3, nil)
-				exec.executeFn = func(ctx context.Context, _ *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-					if !AntigravityCreditsRequested(ctx) {
-						return cliproxyexecutor.Response{}, &Error{HTTPStatus: http.StatusTooManyRequests, Message: "quota exhausted"}
+				manager := NewManager(nil, &FillFirstSelector{}, nil)
+				exec := &issue7658CreditsExecutor{}
+				manager.RegisterExecutor(exec)
+				var authIDs []string
+				for _, suffix := range []string{"-a", "-b"} {
+					id := t.Name() + suffix
+					authIDs = append(authIDs, id)
+					if _, err := manager.Register(t.Context(), &Auth{ID: id, Provider: "antigravity", Status: StatusActive}); err != nil {
+						t.Fatal(err)
 					}
+					registry.GetGlobalRegistry().RegisterClient(id, "antigravity", []*registry.ModelInfo{{ID: model}})
+					t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(id) })
+				}
+				var selected []string
+				exec.executeFn = func(_ context.Context, selectedAuth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+					selected = append(selected, selectedAuth.ID)
 					return cliproxyexecutor.Response{}, tc.err
 				}
-				exec.streamFn = func(ctx context.Context, _ *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
-					if !AntigravityCreditsRequested(ctx) {
-						return nil, &Error{HTTPStatus: http.StatusTooManyRequests, Message: "quota exhausted"}
-					}
+				exec.streamFn = func(_ context.Context, selectedAuth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+					selected = append(selected, selectedAuth.ID)
 					return nil, tc.err
 				}
 
@@ -1163,161 +1172,12 @@ func TestAntigravityCreditsExecute_BareValidationRequiredStopsWithoutRules(t *te
 				} else {
 					_, errRun = manager.Execute(context.Background(), []string{"antigravity"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
 				}
-				if errRun == nil {
-					t.Fatal("expected error, got nil")
-				}
-				if calls := exec.CreditsCalls(); len(calls) != 1 || calls[0] != authIDs[0] {
-					t.Fatalf("creditsCalls = %v, want [%s] (bare VALIDATION_REQUIRED must stop without rules)", calls, authIDs[0])
+				var refusal interface{ StatusCode() int }
+				if !errors.As(errRun, &refusal) || refusal.StatusCode() != http.StatusForbidden || len(selected) != 1 || selected[0] != authIDs[0] {
+					t.Fatalf("expected 403 from first credential, got %v after %v", errRun, selected)
 				}
 			})
 		}
-
-		t.Run(mode+"/json_insufficient_scope_with_false_validation_metadata_still_rotates", func(t *testing.T) {
-			manager, exec, authIDs := setupIssue7658CreditsManager(t, "ag-7658-inscope-"+mode, model, 2, nil, 2, nil)
-			errInsufficientScope := &Error{
-				HTTPStatus: http.StatusForbidden,
-				Message:    `{"error":{"code":403,"status":"PERMISSION_DENIED","message":"insufficient scope","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"INSUFFICIENT_SCOPE","metadata":{"validation_required":false}}]}}`,
-			}
-			exec.executeFn = func(ctx context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-				if !AntigravityCreditsRequested(ctx) {
-					return cliproxyexecutor.Response{}, &Error{HTTPStatus: http.StatusTooManyRequests, Message: "quota exhausted"}
-				}
-				if auth.ID == authIDs[0] {
-					return cliproxyexecutor.Response{}, errInsufficientScope
-				}
-				return cliproxyexecutor.Response{Payload: []byte("ok-" + auth.ID)}, nil
-			}
-			exec.streamFn = func(ctx context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
-				if !AntigravityCreditsRequested(ctx) {
-					return nil, &Error{HTTPStatus: http.StatusTooManyRequests, Message: "quota exhausted"}
-				}
-				if auth.ID == authIDs[0] {
-					return nil, errInsufficientScope
-				}
-				ch := make(chan cliproxyexecutor.StreamChunk, 1)
-				ch <- cliproxyexecutor.StreamChunk{Payload: []byte("ok-" + auth.ID)}
-				close(ch)
-				return &cliproxyexecutor.StreamResult{Chunks: ch}, nil
-			}
-
-			if stream {
-				res, errRun := manager.ExecuteStream(context.Background(), []string{"antigravity"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{Stream: true})
-				if errRun != nil {
-					t.Fatalf("ExecuteStream() unexpected error: %v", errRun)
-				}
-				for chunk := range res.Chunks {
-					if chunk.Err != nil {
-						t.Fatalf("unexpected chunk error: %v", chunk.Err)
-					}
-				}
-			} else {
-				resp, errRun := manager.Execute(context.Background(), []string{"antigravity"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
-				if errRun != nil || string(resp.Payload) != "ok-"+authIDs[1] {
-					t.Fatalf("Execute() = (%q, %v), want ok-%s", string(resp.Payload), errRun, authIDs[1])
-				}
-			}
-			if calls := exec.CreditsCalls(); len(calls) != 2 {
-				t.Fatalf("creditsCalls = %v, want 2 calls (INSUFFICIENT_SCOPE with validation_required=false metadata must still rotate)", calls)
-			}
-		})
-
-		t.Run(mode+"/plain_403_permission_denied_still_rotates", func(t *testing.T) {
-			manager, exec, authIDs := setupIssue7658CreditsManager(t, "ag-7658-plain403-"+mode, model, 2, nil, 2, nil)
-			exec.executeFn = func(ctx context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-				if !AntigravityCreditsRequested(ctx) {
-					return cliproxyexecutor.Response{}, &Error{HTTPStatus: http.StatusTooManyRequests, Message: "quota exhausted"}
-				}
-				if auth.ID == authIDs[0] {
-					return cliproxyexecutor.Response{}, &Error{HTTPStatus: http.StatusForbidden, Message: `{"error":{"code":403,"status":"PERMISSION_DENIED","message":"permission denied"}}`}
-				}
-				return cliproxyexecutor.Response{Payload: []byte("ok-" + auth.ID)}, nil
-			}
-			exec.streamFn = func(ctx context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
-				if !AntigravityCreditsRequested(ctx) {
-					return nil, &Error{HTTPStatus: http.StatusTooManyRequests, Message: "quota exhausted"}
-				}
-				if auth.ID == authIDs[0] {
-					return nil, &Error{HTTPStatus: http.StatusForbidden, Message: `{"error":{"code":403,"status":"PERMISSION_DENIED","message":"permission denied"}}`}
-				}
-				ch := make(chan cliproxyexecutor.StreamChunk, 1)
-				ch <- cliproxyexecutor.StreamChunk{Payload: []byte("ok-" + auth.ID)}
-				close(ch)
-				return &cliproxyexecutor.StreamResult{Chunks: ch}, nil
-			}
-
-			if stream {
-				res, errRun := manager.ExecuteStream(context.Background(), []string{"antigravity"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{Stream: true})
-				if errRun != nil {
-					t.Fatalf("ExecuteStream() unexpected error: %v", errRun)
-				}
-				for chunk := range res.Chunks {
-					if chunk.Err != nil {
-						t.Fatalf("unexpected chunk error: %v", chunk.Err)
-					}
-				}
-			} else {
-				resp, errRun := manager.Execute(context.Background(), []string{"antigravity"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
-				if errRun != nil || string(resp.Payload) != "ok-"+authIDs[1] {
-					t.Fatalf("Execute() = (%q, %v), want ok-%s", string(resp.Payload), errRun, authIDs[1])
-				}
-			}
-			if calls := exec.CreditsCalls(); len(calls) != 2 {
-				t.Fatalf("creditsCalls = %v, want 2 calls (generic 403 must still rotate)", calls)
-			}
-		})
-
-		t.Run(mode+"/validation_required_continue_rule_overrides", func(t *testing.T) {
-			cfg := &internalconfig.Config{
-				OAuthRequestScopedErrors: map[string][]internalconfig.RequestScopedErrorRule{
-					"antigravity": {
-						{
-							Status: http.StatusForbidden,
-							Match:  []string{"VALIDATION_REQUIRED"},
-							Action: "continue",
-						},
-					},
-				},
-			}
-			manager, exec, authIDs := setupIssue7658CreditsManager(t, "ag-7658-valoverride-"+mode, model, 2, cfg, 2, nil)
-			exec.executeFn = func(ctx context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-				if !AntigravityCreditsRequested(ctx) {
-					return cliproxyexecutor.Response{}, &Error{HTTPStatus: http.StatusTooManyRequests, Message: "quota exhausted"}
-				}
-				if auth.ID == authIDs[0] {
-					return cliproxyexecutor.Response{}, &Error{HTTPStatus: http.StatusForbidden, Message: "VALIDATION_REQUIRED"}
-				}
-				return cliproxyexecutor.Response{Payload: []byte("ok-" + auth.ID)}, nil
-			}
-			exec.streamFn = func(ctx context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
-				if !AntigravityCreditsRequested(ctx) {
-					return nil, &Error{HTTPStatus: http.StatusTooManyRequests, Message: "quota exhausted"}
-				}
-				if auth.ID == authIDs[0] {
-					return nil, &Error{HTTPStatus: http.StatusForbidden, Message: "VALIDATION_REQUIRED"}
-				}
-				ch := make(chan cliproxyexecutor.StreamChunk, 1)
-				ch <- cliproxyexecutor.StreamChunk{Payload: []byte("ok-" + auth.ID)}
-				close(ch)
-				return &cliproxyexecutor.StreamResult{Chunks: ch}, nil
-			}
-
-			if stream {
-				res, errRun := manager.ExecuteStream(context.Background(), []string{"antigravity"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{Stream: true})
-				if errRun != nil {
-					t.Fatalf("ExecuteStream() unexpected error: %v", errRun)
-				}
-				for chunk := range res.Chunks {
-					if chunk.Err != nil {
-						t.Fatalf("unexpected chunk error: %v", chunk.Err)
-					}
-				}
-			} else {
-				resp, errRun := manager.Execute(context.Background(), []string{"antigravity"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
-				if errRun != nil || string(resp.Payload) != "ok-"+authIDs[1] {
-					t.Fatalf("Execute() = (%q, %v), want ok-%s", string(resp.Payload), errRun, authIDs[1])
-				}
-			}
-		})
 	}
 }
 

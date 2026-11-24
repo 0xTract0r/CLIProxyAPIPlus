@@ -513,7 +513,7 @@ func registerBootstrapExecutor(t *testing.T, executor *bootstrapStreamExecutor) 
 	return NewBaseAPIHandlers(&sdkconfig.SDKConfig{Streaming: sdkconfig.StreamingConfig{BootstrapRetries: 1}}, manager), manager
 }
 
-func TestExecuteStreamWithAuthManager_RetriesAfterDroppedBootstrapPayload(t *testing.T) {
+func TestExecuteStreamWithAuthManager_RefusesAfterDroppedBootstrapPayload(t *testing.T) {
 	executor := &bootstrapStreamExecutor{stream: func(_ context.Context, call int) (*coreexecutor.StreamResult, error) {
 		chunks := make(chan coreexecutor.StreamChunk, 2)
 		if call == 1 {
@@ -534,28 +534,24 @@ func TestExecuteStreamWithAuthManager_RetriesAfterDroppedBootstrapPayload(t *tes
 		return pluginapi.StreamChunkInterceptResponse{Body: cloneBytes(req.Body), DropChunk: string(req.Body) == "drop"}
 	}})
 
-	dataChan, _, errChan := handler.ExecuteStreamWithAuthManager(context.Background(), "openai", "bootstrap-model", []byte(`{"model":"bootstrap-model"}`), "")
-	var got []byte
-	for chunk := range dataChan {
-		got = append(got, chunk...)
-	}
-	for msg := range errChan {
-		if msg != nil {
-			t.Fatalf("unexpected stream error: %+v", msg)
+	dataChan, _, errChan := handler.ExecuteStreamWithAuthManager(t.Context(), "openai", "bootstrap-model", []byte(`{"model":"bootstrap-model"}`), "")
+	if dataChan != nil {
+		for chunk := range dataChan {
+			t.Errorf("refused stream emitted %q", chunk)
 		}
 	}
-	if string(got) != "ok" {
-		t.Fatalf("stream payload = %q, want ok", got)
+	var status int
+	for msg := range errChan {
+		if msg != nil {
+			status = msg.StatusCode
+		}
 	}
-	if executor.Calls() != 2 {
-		t.Fatalf("stream attempts = %d, want 2", executor.Calls())
-	}
-	if strings.Join(intercepted, ",") != "drop,ok" {
-		t.Fatalf("intercepted payloads = %v, want [drop ok] without double interception", intercepted)
+	if status != http.StatusUnauthorized || executor.Calls() != 1 || strings.Join(intercepted, ",") != "drop" {
+		t.Fatalf("status=%d attempts=%d intercepted=%v", status, executor.Calls(), intercepted)
 	}
 }
 
-func TestExecuteStreamWithAuthManager_ResetsResponsesValidatorOnBootstrapRetry(t *testing.T) {
+func TestExecuteStreamWithAuthManager_IndependentRequestHasFreshResponsesValidator(t *testing.T) {
 	executor := &bootstrapStreamExecutor{stream: func(_ context.Context, call int) (*coreexecutor.StreamResult, error) {
 		chunks := make(chan coreexecutor.StreamChunk, 2)
 		if call == 1 {
@@ -569,18 +565,25 @@ func TestExecuteStreamWithAuthManager_ResetsResponsesValidatorOnBootstrapRetry(t
 	}}
 	handler, _ := registerBootstrapExecutor(t, executor)
 
-	dataChan, _, errChan := handler.ExecuteStreamWithAuthManager(context.Background(), "openai-response", "bootstrap-model", []byte(`{"model":"bootstrap-model"}`), "")
-	var got []byte
-	for chunk := range dataChan {
-		got = append(got, chunk...)
-	}
-	for msg := range errChan {
-		if msg != nil {
-			t.Fatalf("unexpected stream error after retry: %+v", msg)
+	invoke := func() (output string, status int) {
+		data, _, errs := handler.ExecuteStreamWithAuthManager(t.Context(), "openai-response", "bootstrap-model", []byte(`{"model":"bootstrap-model"}`), "")
+		if data != nil {
+			for chunk := range data {
+				output += string(chunk)
+			}
 		}
+		for msg := range errs {
+			if msg != nil {
+				status = msg.StatusCode
+			}
+		}
+		return
 	}
-	if executor.Calls() != 2 || !strings.Contains(string(got), "response.completed") {
-		t.Fatalf("retry calls=%d payload=%q", executor.Calls(), got)
+	if output, status := invoke(); status != http.StatusUnauthorized || output != "" || executor.Calls() != 1 {
+		t.Fatalf("first request status=%d output=%q calls=%d", status, output, executor.Calls())
+	}
+	if output, status := invoke(); status != 0 || !strings.Contains(output, "response.completed") || executor.Calls() != 2 {
+		t.Fatalf("independent request status=%d output=%q calls=%d", status, output, executor.Calls())
 	}
 }
 

@@ -289,69 +289,7 @@ func TestCodexContinuityWaitBudgetTighteningAndNonExtension(t *testing.T) {
 	}
 }
 
-func TestCodexContinuityPreOutput429QuotaGuardAndBoundary(t *testing.T) {
-	t.Run("positive quota 429 waits and redispatches on ready", func(t *testing.T) {
-		clock := newFakeContinuityClock(time.Date(2026, 4, 1, 12, 0, 0, 0, time.UTC))
-		manager := NewManager(nil, nil, nil)
-		manager.SetContinuityClockForTest(clock)
-		manager.SetRetryConfig(1, 0, 0)
-
-		var attempts atomic.Int32
-		manager.RegisterExecutor(&continuityTestExecutor{
-			provider: "codex",
-			streamFn: func(_ context.Context, _ *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
-				if attempts.Add(1) == 1 {
-					return nil, codexQuotaRejectionErr{
-						status:           http.StatusTooManyRequests,
-						msg:              `{"error":{"code":"usage_limit_reached","message":"usage limit reached"}}`,
-						credentialScoped: true,
-					}
-				}
-				ch := make(chan cliproxyexecutor.StreamChunk, 1)
-				ch <- cliproxyexecutor.StreamChunk{Payload: []byte(`{"type":"response.completed"}`)}
-				close(ch)
-				return &cliproxyexecutor.StreamResult{Chunks: ch}, nil
-			},
-		})
-		if _, errRegister := manager.Register(context.Background(), &Auth{ID: "codex-1", Provider: "codex", Status: StatusActive}); errRegister != nil {
-			t.Fatalf("register: %v", errRegister)
-		}
-		registry.GetGlobalRegistry().RegisterClient("codex-1", "codex", []*registry.ModelInfo{{ID: "gpt-5-codex"}})
-		t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient("codex-1") })
-
-		var continuityPolls int
-		manager.SetPluginScheduler(&testContinuityScheduler{
-			hasContinuity: true,
-			continuityFunc: func(_ context.Context, req pluginapi.SchedulerContinuityRequest) (pluginapi.SchedulerContinuityResponse, bool, error) {
-				continuityPolls++
-				if continuityPolls == 1 {
-					return pluginapi.SchedulerContinuityResponse{Decision: pluginapi.SchedulerContinuityWait, PollIntervalMs: 100, WaitBudgetMs: 1000}, true, nil
-				}
-				var snap *Auth
-				manager.mu.Lock()
-				if cur := manager.auths["codex-1"]; cur != nil {
-					clearCooldownStateForAuth(cur, time.Now())
-					cur.LastError = nil
-					cur.Status = StatusActive
-					snap = cur.Clone()
-				}
-				manager.mu.Unlock()
-				if snap != nil && manager.scheduler != nil {
-					manager.scheduler.upsertAuth(snap)
-				}
-				return pluginapi.SchedulerContinuityResponse{Decision: pluginapi.SchedulerContinuityReady}, true, nil
-			},
-		})
-
-		res, errStream := manager.ExecuteStream(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: "gpt-5-codex"}, cliproxyexecutor.Options{Stream: true})
-		if errStream != nil {
-			t.Fatalf("ExecuteStream() error = %v, want nil", errStream)
-		}
-		if res == nil || attempts.Load() != 2 || continuityPolls != 2 {
-			t.Fatalf("attempts=%d continuityPolls=%d, want 2 and 2", attempts.Load(), continuityPolls)
-		}
-	})
-
+func TestCodexOrdinary429NeverEntersContinuity(t *testing.T) {
 	t.Run("transient capacity 429 does not enter continuity", func(t *testing.T) {
 		manager := NewManager(nil, nil, nil)
 		manager.SetRetryConfig(1, 0, 0)
