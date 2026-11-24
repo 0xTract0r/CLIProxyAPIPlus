@@ -11,9 +11,11 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/codex"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/copilot"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
@@ -88,13 +90,66 @@ func (f AccountSettingsFile) read() ([]byte, os.FileInfo, error) {
 	return data, info, nil
 }
 
+// CopilotAccountID reads the positive GitHub ID returned by the subject lookup.
+// Older records with only a name, email or filename do not identify a subject.
+func CopilotAccountID(value any) (string, bool) {
+	var raw string
+	switch typed := value.(type) {
+	case string:
+		raw = strings.TrimSpace(typed)
+	case json.Number:
+		raw = typed.String()
+	default:
+		return "", false
+	}
+	id, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || id <= 0 || raw != strconv.FormatInt(id, 10) {
+		return "", false
+	}
+	return raw, true
+}
+
+func copilotFileIdentity(data []byte) (string, string, error) {
+	var entry struct {
+		Type      string `json:"type"`
+		AccountID any    `json:"account_id"`
+		ProxyURL  string `json:"proxy_url"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	if !json.Valid(data) || decoder.Decode(&entry) != nil || !strings.EqualFold(strings.TrimSpace(entry.Type), copilot.Provider) {
+		return "", "", errors.New("selected file is not a Copilot credential")
+	}
+	id, ok := CopilotAccountID(entry.AccountID)
+	if !ok {
+		return "", "", errors.New("selected Copilot credential has no verified GitHub account ID")
+	}
+	return id, strings.TrimSpace(entry.ProxyURL), nil
+}
+
+// CopilotIdentity returns the subject and route of this exact inspected file.
+func (f AccountSettingsFile) CopilotIdentity() (string, string, error) {
+	if !f.Valid() {
+		return "", "", coreauth.ErrCredentialFileRemoved
+	}
+	data, info, err := f.read()
+	if err != nil {
+		return "", "", err
+	}
+	if !os.SameFile(info, f.info) || sha256.Sum256(data) != f.digest {
+		return "", "", coreauth.ErrFileRemovalBusy
+	}
+	return copilotFileIdentity(data)
+}
+
 type accountSettingsPatchKey struct{}
 
 type accountSettingsPatch struct {
-	file               AccountSettingsFile
-	note, disabled     bool
-	fields             []string
-	selectedCodexLogin bool
+	file                 AccountSettingsFile
+	note, disabled       bool
+	fields               []string
+	selectedCodexLogin   bool
+	selectedCopilotLogin bool
 }
 
 // WithAccountSettingsFilePatch lets a local store preserve unedited JSON bytes.
@@ -115,16 +170,25 @@ func WithSelectedCodexLoginFile(ctx context.Context, file AccountSettingsFile) c
 	return context.WithValue(ctx, accountSettingsPatchKey{}, accountSettingsPatch{file: file, selectedCodexLogin: true})
 }
 
+// WithSelectedCopilotLoginFile binds a verified GitHub grant to one inspected file.
+func WithSelectedCopilotLoginFile(ctx context.Context, file AccountSettingsFile) context.Context {
+	return context.WithValue(ctx, accountSettingsPatchKey{}, accountSettingsPatch{file: file, selectedCopilotLogin: true})
+}
+
+func (patch accountSettingsPatch) selectedLogin() bool {
+	return patch.selectedCodexLogin || patch.selectedCopilotLogin
+}
+
 func explicitAccountSettingsPatch(ctx context.Context) (accountSettingsPatch, bool) {
 	if ctx == nil {
 		return accountSettingsPatch{}, false
 	}
 	patch, ok := ctx.Value(accountSettingsPatchKey{}).(accountSettingsPatch)
-	return patch, ok && (patch.selectedCodexLogin || coreauth.IsExplicitCredentialEdit(ctx))
+	return patch, ok && (patch.selectedLogin() || coreauth.IsExplicitCredentialEdit(ctx))
 }
 
 func (s *FileTokenStore) saveAccountSettingsPatch(path string, auth *coreauth.Auth, patch accountSettingsPatch) (string, error) {
-	if patch.selectedCodexLogin && !patch.file.Valid() {
+	if patch.selectedLogin() && !patch.file.Valid() {
 		return "", coreauth.ErrCredentialFileRemoved
 	}
 	absolute, err := filepath.Abs(path)
@@ -202,6 +266,23 @@ func (s *FileTokenStore) saveAccountSettingsPatch(path string, auth *coreauth.Au
 				}
 			}
 		}
+		if patch.selectedCopilotLogin {
+			subject, ok := CopilotAccountID(auth.Metadata["account_id"])
+			prior, _, err := copilotFileIdentity(old)
+			if err != nil || !ok || subject != prior || !strings.EqualFold(auth.Provider, copilot.Provider) || auth.Storage != nil {
+				return coreauth.ErrFileRemovalBusy
+			}
+			for _, name := range []string{"access_token", "refresh_token", "username", "base_url", "expired"} {
+				value, ok := auth.Metadata[name].(string)
+				if !ok || strings.TrimSpace(value) == "" {
+					return errors.New("selected credential requires a complete Copilot login grant")
+				}
+				fields[name], err = json.Marshal(value)
+				if err != nil {
+					return err
+				}
+			}
+		}
 		for _, name := range patch.fields {
 			value, exists := auth.Metadata[name]
 			if name == "disabled" {
@@ -236,7 +317,7 @@ func (s *FileTokenStore) saveAccountSettingsPatch(path string, auth *coreauth.Au
 		if err != nil {
 			return err
 		}
-		if patch.selectedCodexLogin {
+		if patch.selectedLogin() {
 			dec := json.NewDecoder(bytes.NewReader(data))
 			dec.UseNumber()
 			if err := dec.Decode(&persistedMetadata); err != nil {
@@ -278,9 +359,13 @@ func (s *FileTokenStore) saveAccountSettingsPatch(path string, auth *coreauth.Au
 	if err != nil {
 		return "", err
 	}
-	if patch.selectedCodexLogin {
+	if patch.selectedLogin() {
 		auth.Metadata = persistedMetadata
 		coreauth.NormalizeCredentialMetadata(auth.Metadata)
+		if patch.selectedCopilotLogin {
+			route, _ := auth.Metadata["proxy_url"].(string)
+			auth.ProxyURL = strings.TrimSpace(route)
+		}
 		if disabled, ok := auth.Metadata["disabled"].(bool); ok {
 			auth.Disabled = disabled
 		}

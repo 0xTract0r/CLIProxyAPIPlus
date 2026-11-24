@@ -27,9 +27,14 @@ func (h *Handler) RequestCopilotDeviceOAuth(c *gin.Context) {
 			return
 		}
 	}
+	h.requestCopilotDeviceOAuth(c, "", "")
+}
+
+func (h *Handler) requestCopilotDeviceOAuth(c *gin.Context, name, index string) {
 	h.mu.Lock()
 	cfg := h.cfg.CloneForRuntime()
 	scope := oauthFileScope{owner: h, generation: h.fileOAuthGeneration}
+	store := h.tokenStore
 	h.mu.Unlock()
 	dir, err := fileOAuthDirectory(fileOAuthConfigDir(cfg))
 	if err != nil {
@@ -38,9 +43,68 @@ func (h *Handler) RequestCopilotDeviceOAuth(c *gin.Context) {
 	}
 
 	cfg.AuthDir = dir
-	transport, mode, err := proxyutil.BuildHTTPTransport(cfg.ProxyURL)
-	if err != nil || (mode == proxyutil.ModeProxy && !proxyutil.ValidRequestProxy(cfg.ProxyURL)) || (mode != proxyutil.ModeInherit && transport == nil) {
+	requestedProxy := oauthSessionProxyURLFromContext(c)
+	route := strings.TrimSpace(cfg.ProxyURL)
+	var selected oauthRecoveryTarget
+	if name != "" || index != "" {
+		if store == nil {
+			store = sdkAuth.GetTokenStore()
+		}
+		if _, ok := store.(*sdkAuth.FileTokenStore); !ok {
+			c.JSON(http.StatusConflict, gin.H{"error": "selected Copilot login requires local credential storage"})
+			return
+		}
+		target, status, message := h.ordinaryAccountSettingsTarget(ordinaryAccountSettingsRequest{name: name, index: index})
+		if status != 0 {
+			c.JSON(status, gin.H{"error": message})
+			return
+		}
+		if !strings.EqualFold(strings.TrimSpace(target.auth.Provider), copilot.Provider) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "provider does not match target credential"})
+			return
+		}
+		subject, savedRoute, errIdentity := target.file.CopilotIdentity()
+		if errIdentity != nil {
+			c.JSON(http.StatusConflict, gin.H{"error": "selected Copilot file changed or has no verified GitHub account ID"})
+			return
+		}
+		runtimeSubject, ok := sdkAuth.CopilotAccountID(target.auth.Metadata["account_id"])
+		if !ok || runtimeSubject != subject {
+			c.JSON(http.StatusConflict, gin.H{"error": "selected Copilot account identity is not current"})
+			return
+		}
+		if runtimeRoute := strings.TrimSpace(target.auth.ProxyURL); runtimeRoute != "" && runtimeRoute != savedRoute {
+			c.JSON(http.StatusConflict, gin.H{"error": "selected Copilot credential route is not current"})
+			return
+		}
+		if savedRoute != "" {
+			route = savedRoute
+		}
+		if requestedProxy != "" && requestedProxy != route {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "selected credential route does not match the requested route"})
+			return
+		}
+		selected = oauthRecoveryTarget{
+			AuthID: target.auth.ID, FileName: firstNonEmpty(target.auth.FileName, target.auth.ID),
+			Path: authAttribute(target.auth, "path"), Provider: copilot.Provider, AccountID: subject,
+			SelectedFileRevision: target.revision(), SelectedFile: target.file,
+			SelectedRegistrationEpoch: target.auth.RegistrationEpoch,
+			SelectedCredentialVersion: target.auth.CredentialVersion, SelectedDisabled: target.auth.Disabled,
+			SelectedRouteInherits: savedRoute == "", SelectedGlobalRoute: route,
+		}
+	} else if requestedProxy != "" {
+		route = requestedProxy
+	}
+	transport, mode, err := proxyutil.BuildHTTPTransport(route)
+	if err != nil || (mode == proxyutil.ModeProxy && !proxyutil.ValidRequestProxy(route)) || (mode != proxyutil.ModeInherit && transport == nil) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "invalid OAuth proxy configuration"})
+		return
+	}
+	h.mu.Lock()
+	current := h.copilotOAuthScopeCurrentLocked(scope, dir)
+	h.mu.Unlock()
+	if !current || c.Request.Context().Err() != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": "OAuth credential scope changed"})
 		return
 	}
 	client := &http.Client{Timeout: 30 * time.Second}
@@ -69,6 +133,9 @@ func (h *Handler) RequestCopilotDeviceOAuth(c *gin.Context) {
 		return
 	}
 	oauthSessions.registerBuiltin(state, copilot.Provider, "", dir, h, scope.generation)
+	if selected.AuthID != "" {
+		SetOAuthSessionTarget(state, selected)
+	}
 	h.mu.Unlock()
 
 	ctx := PopulateAuthContext(context.Background(), c)
@@ -89,6 +156,17 @@ func (h *Handler) RequestCopilotDeviceOAuth(c *gin.Context) {
 			SetOAuthSessionError(state, "Authentication failed")
 			return
 		}
+		if selected.AuthID != "" {
+			h.mu.Unlock()
+			subject, ok := sdkAuth.CopilotAccountID(record.Metadata["account_id"])
+			if !ok || subject != selected.AccountID {
+				SetOAuthSessionError(state, "Authenticated account does not match target credential")
+				return
+			}
+			h.commitAndCompleteBuiltinOAuthSession(ctx, state, copilot.Provider, "", record, "Failed to save token to file", false)
+			return
+		}
+		applySessionProxyToAuthRecord(record, requestedProxy)
 		commitErr := claimOAuthSessionCommit(state, copilot.Provider)
 		h.mu.Unlock()
 		if commitErr != nil {
@@ -102,10 +180,14 @@ func (h *Handler) RequestCopilotDeviceOAuth(c *gin.Context) {
 		}
 		CompleteOAuthSession(state)
 	}()
-	c.JSON(http.StatusOK, gin.H{
+	reply := gin.H{
 		"status": "ok", "state": state, "flow": "device", "url": device.VerificationURI,
 		"verification_uri": device.VerificationURI, "user_code": device.UserCode, "expires_in": device.ExpiresIn,
-	})
+	}
+	if selected.AuthID != "" {
+		reply["target_auth_name"] = selected.FileName
+	}
+	c.JSON(http.StatusOK, reply)
 }
 
 // copilotOAuthScopeCurrentLocked checks the exact owner and resolved directory.

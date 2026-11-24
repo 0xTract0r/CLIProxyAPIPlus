@@ -53,6 +53,10 @@ type oauthRecoveryTarget struct {
 	SelectedFileRevision      string
 	SelectedFile              sdkAuth.AccountSettingsFile
 	SelectedRegistrationEpoch uint64
+	SelectedCredentialVersion uint64
+	SelectedDisabled          bool
+	SelectedGlobalRoute       string
+	SelectedRouteInherits     bool
 }
 
 type oauthSession struct {

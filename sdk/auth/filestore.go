@@ -110,7 +110,7 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 	}
 
 	if patch, ok := explicitAccountSettingsPatch(ctx); ok &&
-		(patch.selectedCodexLogin || patch.file.Valid() || (auth.Storage == nil && !cliproxyauth.IsCodexAuthRecord(auth))) {
+		(patch.selectedLogin() || patch.file.Valid() || (auth.Storage == nil && !cliproxyauth.IsCodexAuthRecord(auth))) {
 		return s.saveAccountSettingsPatch(path, auth, patch)
 	}
 

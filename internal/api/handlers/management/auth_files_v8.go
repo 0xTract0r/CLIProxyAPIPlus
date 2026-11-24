@@ -173,6 +173,18 @@ func (h *Handler) StartOAuthV8(c *gin.Context) {
 	provider := strings.TrimSpace(c.Query("provider"))
 	targetName := firstNonEmpty(strings.TrimSpace(c.Query("name")), strings.TrimSpace(c.Query("target_auth_id")), strings.TrimSpace(c.Query("auth_id")))
 	targetAuthIndex := strings.TrimSpace(c.Query("auth_index"))
+	selectorConflict := false
+	for _, key := range []string{"name", "target_auth_id", "auth_id", "auth_index"} {
+		expected := targetName
+		if key == "auth_index" {
+			expected = targetAuthIndex
+		}
+		for _, value := range c.QueryArray(key) {
+			if value = strings.TrimSpace(value); value != "" && value != expected {
+				selectorConflict = true
+			}
+		}
+	}
 	verifyAfterLogin := strings.EqualFold(strings.TrimSpace(c.Query("verify")), "true") || strings.TrimSpace(c.Query("verify")) == "1"
 	verifyModel := strings.TrimSpace(c.Query("verify_model"))
 	if c.Request != nil && c.Request.Body != nil {
@@ -214,8 +226,12 @@ func (h *Handler) StartOAuthV8(c *gin.Context) {
 						c.JSON(http.StatusBadRequest, gin.H{"error": "invalid " + key})
 						return
 					}
-					if trimmed := strings.TrimSpace(strVal); trimmed != "" && targetName == "" {
-						targetName = trimmed
+					if trimmed := strings.TrimSpace(strVal); trimmed != "" {
+						if targetName == "" {
+							targetName = trimmed
+						} else if targetName != trimmed {
+							selectorConflict = true
+						}
 					}
 				}
 			}
@@ -225,8 +241,12 @@ func (h *Handler) StartOAuthV8(c *gin.Context) {
 					c.JSON(http.StatusBadRequest, gin.H{"error": "invalid auth_index"})
 					return
 				}
-				if trimmed := strings.TrimSpace(idxStr); trimmed != "" && targetAuthIndex == "" {
-					targetAuthIndex = trimmed
+				if trimmed := strings.TrimSpace(idxStr); trimmed != "" {
+					if targetAuthIndex == "" {
+						targetAuthIndex = trimmed
+					} else if targetAuthIndex != trimmed {
+						selectorConflict = true
+					}
 				}
 			}
 
@@ -359,12 +379,26 @@ func (h *Handler) StartOAuthV8(c *gin.Context) {
 		provider = normalizedProvider
 	}
 
+	if provider == "" && (targetName != "" || targetAuthIndex != "") {
+		if target, ok := h.lookupAuthFile(targetName, targetAuthIndex); ok && target != nil &&
+			strings.EqualFold(target.Provider, "copilot") {
+			provider = "copilot"
+		}
+	}
 	if strings.EqualFold(provider, "copilot") {
-		if targetName != "" || targetAuthIndex != "" || oauthSessionProxyURLFromContext(c) != "" || oauthSessionExtraMetadataFromContext(c)["auth_name"] != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Copilot device login does not accept a target credential or request proxy"})
+		if selectorConflict {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "conflicting credential selectors"})
 			return
 		}
-		h.RequestCopilotDeviceOAuth(c)
+		if c.Request.URL.Query().Has("auth_name") || oauthSessionExtraMetadataFromContext(c)["auth_name"] != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "use the V8 name or auth_index selector"})
+			return
+		}
+		if verifyAfterLogin || verifyModel != "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "device authorization does not support inference verification"})
+			return
+		}
+		h.requestCopilotDeviceOAuth(c, targetName, targetAuthIndex)
 		return
 	}
 

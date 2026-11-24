@@ -628,15 +628,30 @@ func (h *Handler) commitAndCompleteBuiltinOAuthSession(ctx context.Context, stat
 		return "", false
 	}
 	if isTargeted && target.SelectedFileRevision != "" {
-		current, status, _ := h.ordinaryAccountSettingsTarget(ordinaryAccountSettingsRequest{name: target.FileName})
+		name := target.FileName
+		copilotTarget := strings.EqualFold(target.Provider, "copilot")
+		if copilotTarget {
+			name = target.AuthID
+			if target.SelectedRouteInherits && strings.TrimSpace(saveConfig.ProxyURL) != target.SelectedGlobalRoute {
+				FailOAuthSessionCommit(state, "Selected credential route changed; start re-authentication again")
+				return "", false
+			}
+		}
+		current, status, _ := h.ordinaryAccountSettingsTarget(ordinaryAccountSettingsRequest{name: name})
 		if status != 0 || current.auth.ID != target.AuthID ||
 			current.auth.RegistrationEpoch != target.SelectedRegistrationEpoch ||
-			current.revision() != target.SelectedFileRevision {
+			current.revision() != target.SelectedFileRevision ||
+			(copilotTarget && (current.auth.CredentialVersion != target.SelectedCredentialVersion ||
+				current.auth.Disabled != target.SelectedDisabled)) {
 			FailOAuthSessionCommit(state, "Selected credential was removed, renamed or changed; start re-authentication again")
 			return "", false
 		}
 		if target.SelectedFile.Valid() {
-			ctx = sdkAuth.WithSelectedCodexLoginFile(ctx, target.SelectedFile)
+			if copilotTarget {
+				ctx = sdkAuth.WithSelectedCopilotLoginFile(ctx, target.SelectedFile)
+			} else {
+				ctx = sdkAuth.WithSelectedCodexLoginFile(ctx, target.SelectedFile)
+			}
 		}
 	}
 	savedPath, errSave := h.saveTokenRecordWithConfig(ctx, record, saveConfig)
