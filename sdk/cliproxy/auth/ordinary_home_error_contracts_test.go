@@ -2,7 +2,9 @@ package auth
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"testing"
 	"time"
@@ -15,9 +17,10 @@ import (
 
 type ordinaryHomeErrorDispatch struct {
 	homeExecutionDispatcher
-	t     *testing.T
-	err   error
-	calls int
+	t            *testing.T
+	err          error
+	requestRetry *int
+	calls        int
 }
 
 func (d *ordinaryHomeErrorDispatch) RPopAuth(ctx context.Context, model, session string, headers http.Header, count int) ([]byte, error) {
@@ -28,6 +31,13 @@ func (d *ordinaryHomeErrorDispatch) RPopAuth(ctx context.Context, model, session
 	}
 	if d.err != nil {
 		return nil, d.err
+	}
+	if d.requestRetry != nil {
+		return json.Marshal(homeAuthDispatchResponse{
+			RequestRetry: d.requestRetry,
+			Auth: Auth{ID: "home-auth", Provider: "home-execution", Status: StatusActive,
+				Metadata: map[string]any{"request_retry": 3}},
+		})
 	}
 	return d.homeExecutionDispatcher.RPopAuth(ctx, model, session, headers, count)
 }
@@ -147,5 +157,72 @@ func TestOrdinaryHomeFirstStreamFrameRefusalIsTerminal(t *testing.T) {
 	}
 	if d.calls != 1 || e.calls != 0 || e.streamCalls != 1 {
 		t.Fatalf("select calls=%d non-stream calls=%d stream calls=%d", d.calls, e.calls, e.streamCalls)
+	}
+}
+
+func TestOrdinaryPreferredExecutionErrorPriority(t *testing.T) {
+	upstream := &Error{Code: "fixture_upstream", Message: "synthetic provider failure", HTTPStatus: http.StatusBadGateway}
+
+	t.Run("original_provider_error_beats_internal_failure", func(t *testing.T) {
+		internal := errors.New("synthetic internal failure")
+		got := preferredExecutionAttemptError(internal, upstream)
+		if unwrapExecutionBoundaryError(got) != upstream || statusCodeFromError(got) != http.StatusBadGateway ||
+			errors.Is(got, internal) {
+			t.Fatalf("preferred error = %v, want the original provider error and status", got)
+		}
+	})
+
+	for _, tc := range []struct {
+		name  string
+		cause error
+	}{
+		{"cancellation_beats_provider_error", context.Canceled},
+		{"deadline_beats_provider_error", context.DeadlineExceeded},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fallback := fmt.Errorf("request ended: %w", tc.cause)
+			got := preferredExecutionAttemptError(fallback, upstream)
+			if got != fallback || !errors.Is(got, tc.cause) || errors.Is(got, upstream) {
+				t.Fatalf("preferred error = %v, want the original wrapped context error %v", got, fallback)
+			}
+		})
+	}
+}
+
+// The dispatcher returns a single synthetic grant with an explicit zero budget.
+// A terminal failure remains visible at each public entry point with no second call.
+func TestOrdinaryHomeAuthoritativeZeroEndsFirstAttempt(t *testing.T) {
+	for _, mode := range []string{"execute", "count", "stream"} {
+		t.Run(mode, func(t *testing.T) {
+			failure := &Error{Code: "fixture_upstream_unavailable", Message: "synthetic provider failure", HTTPStatus: http.StatusBadGateway}
+			m, d, e := fixtureOrdinaryHomeErrorManager(t, nil, failure)
+			m.SetRetryConfig(3, time.Second, 1)
+			noRetries := 0
+			d.requestRetry = &noRetries
+			ctx := context.Background()
+			providers := []string{"home-execution"}
+			req := ce.Request{Model: "test"}
+			var err error
+			wantCalls, wantStreamCalls := 1, 0
+			switch mode {
+			case "execute":
+				_, err = m.Execute(ctx, providers, req, ce.Options{})
+			case "count":
+				_, err = m.ExecuteCount(ctx, providers, req, ce.Options{})
+			case "stream":
+				wantCalls, wantStreamCalls = 0, 1
+				var stream *ce.StreamResult
+				stream, err = m.ExecuteStream(ctx, providers, req, ce.Options{Stream: true})
+				if stream != nil {
+					t.Fatal("terminal first-frame failure exposed a stream")
+				}
+			}
+			if !errors.Is(err, failure) || statusCodeFromError(err) != http.StatusBadGateway {
+				t.Fatalf("execution error = %T %v; want the original 502", err, err)
+			}
+			if d.calls != 1 || e.calls != wantCalls || e.streamCalls != wantStreamCalls {
+				t.Fatalf("select calls=%d non-stream calls=%d stream calls=%d", d.calls, e.calls, e.streamCalls)
+			}
+		})
 	}
 }

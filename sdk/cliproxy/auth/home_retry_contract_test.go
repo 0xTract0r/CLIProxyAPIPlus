@@ -691,59 +691,6 @@ func TestHomePendingRetryRoundStopsAfterRepeatedCooldown(t *testing.T) {
 	}
 }
 
-func TestHomeRetryRoundUsesEarliestCredentialRetryAfter(t *testing.T) {
-	dispatcher := &retryContractHomeDispatcher{authIDs: []string{"home-retry-a", "home-retry-b"}}
-	executor := &retryContractHomeExecutor{
-		failAll: true,
-		failures: map[string]error{
-			"home-retry-a": retryContractRateLimitError{retryAfter: 5 * time.Millisecond},
-			"home-retry-b": retryContractRateLimitError{retryAfter: 50 * time.Millisecond},
-		},
-	}
-	manager := NewManager(nil, nil, nil)
-	manager.SetConfig(&internalconfig.Config{Home: internalconfig.HomeConfig{Enabled: true}})
-	manager.SetRetryConfig(1, time.Second, 2)
-	manager.PublishHomeDispatch(dispatcher, executionregistry.New(), 1)
-	manager.RegisterExecutor(executor)
-
-	retryLimit := -1
-	_, errExecute := manager.executeHomeOnce(context.Background(), []string{"home-retry-contract"}, cliproxyexecutor.Request{Model: "gpt"}, cliproxyexecutor.Options{}, false, 2, &retryLimit)
-	if !isHomeRetryRoundExhausted(errExecute) {
-		t.Fatalf("executeHomeOnce() error = %v, want exhausted retry round", errExecute)
-	}
-	retryAfter := retryAfterFromError(errExecute)
-	if retryAfter == nil || *retryAfter != 5*time.Millisecond {
-		t.Fatalf("retry after = %v, want earliest credential delay 5ms", retryAfter)
-	}
-}
-
-func TestHomePreferredErrorIgnoresLaterInternalExecutorFailure(t *testing.T) {
-	upstreamErr := &Error{Message: "model upstream failed", HTTPStatus: http.StatusBadGateway}
-	internalErr := errors.New("Home KV lookup failed")
-	dispatcher := &retryContractHomeDispatcher{authIDs: []string{"home-retry-a", "home-retry-b"}}
-	executor := &retryContractHomeExecutor{
-		failAll: true,
-		failures: map[string]error{
-			"home-retry-a": upstreamErr,
-			"home-retry-b": internalErr,
-		},
-		internalFailures: map[string]bool{"home-retry-b": true},
-	}
-	manager := NewManager(nil, nil, nil)
-	manager.SetConfig(&internalconfig.Config{Home: internalconfig.HomeConfig{Enabled: true}})
-	manager.SetRetryConfig(0, 0, 2)
-	manager.PublishHomeDispatch(dispatcher, executionregistry.New(), 1)
-	manager.RegisterExecutor(executor)
-
-	_, errExecute := manager.Execute(context.Background(), []string{"home-retry-contract"}, cliproxyexecutor.Request{Model: "gpt"}, cliproxyexecutor.Options{})
-	if !errors.Is(errExecute, upstreamErr) {
-		t.Fatalf("Execute() error = %v, want earlier model upstream error", errExecute)
-	}
-	if errors.Is(errExecute, internalErr) {
-		t.Fatalf("Execute() error = %v, later internal executor failure replaced upstream error", errExecute)
-	}
-}
-
 func TestHomeSelectionFailureIsNotHiddenByEarlierUpstreamAttempt(t *testing.T) {
 	tests := []struct {
 		name             string
@@ -831,45 +778,6 @@ func TestHomeNextRoundSelectionFailureSupersedesEarlierUpstreamAttempt(t *testin
 				}
 			})
 		}
-	}
-}
-
-func TestHomeStreamBootstrapErrorPreservesAggregatedRetryAfter(t *testing.T) {
-	dispatcher := &retryContractHomeDispatcher{authIDs: []string{"home-retry-a", "home-retry-b"}}
-	executor := &retryContractHomeExecutor{
-		failAll:         true,
-		streamBootstrap: true,
-		streamHeaders:   http.Header{"Retry-After": {"30"}},
-		failures: map[string]error{
-			"home-retry-a": retryContractRateLimitError{retryAfter: 1500 * time.Millisecond},
-			"home-retry-b": retryContractRateLimitError{retryAfter: 5 * time.Second},
-		},
-	}
-	manager := NewManager(nil, nil, nil)
-	manager.SetConfig(&internalconfig.Config{Home: internalconfig.HomeConfig{Enabled: true}})
-	manager.SetRetryConfig(0, time.Second, 2)
-	manager.PublishHomeDispatch(dispatcher, executionregistry.New(), 1)
-	manager.RegisterExecutor(executor)
-
-	result, errExecute := manager.ExecuteStream(context.Background(), []string{"home-retry-contract"}, cliproxyexecutor.Request{Model: "gpt"}, cliproxyexecutor.Options{Stream: true})
-	if errExecute != nil {
-		t.Fatalf("ExecuteStream() error = %v", errExecute)
-	}
-	if result == nil {
-		t.Fatal("ExecuteStream() result = nil")
-	}
-	chunk, ok := <-result.Chunks
-	if !ok || chunk.Err == nil {
-		t.Fatalf("stream bootstrap chunk = %#v, %t; want terminal error", chunk, ok)
-	}
-	if !isHomeRetryRoundExhausted(chunk.Err) {
-		t.Fatalf("stream bootstrap error = %v, want exhausted retry round", chunk.Err)
-	}
-	if hasUpstreamExecutionAttempt(chunk.Err) {
-		t.Fatalf("stream bootstrap error leaked internal upstream-attempt marker: %T/%v", chunk.Err, chunk.Err)
-	}
-	if got := SafeResponseHeaders(chunk.Err).Get("Retry-After"); got != "2" {
-		t.Fatalf("safe Retry-After header = %q, want aggregated delay rounded to 2 seconds", got)
 	}
 }
 
@@ -1370,95 +1278,6 @@ func TestHomeLocalSelectionRejectionWaitsForReleaseAcknowledgement(t *testing.T)
 			var homeErr *Error
 			if !errors.As(errExecute, &homeErr) || homeErr == nil || homeErr.Code != "home_unavailable" {
 				t.Fatalf("execution error = %T %v, want Home release acknowledgement timeout", errExecute, errExecute)
-			}
-		})
-	}
-}
-
-func TestHomeRetryRoundHonorsCredentialRequestRetryOverride(t *testing.T) {
-	tests := []struct {
-		name          string
-		globalRetry   int
-		override      int
-		wantCallCount int
-	}{
-		{name: "override disables global rounds", globalRetry: 3, override: 0, wantCallCount: 2},
-		{name: "override enables rounds over global", globalRetry: 0, override: 1, wantCallCount: 4},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			dispatcher := &retryContractHomeDispatcher{
-				authIDs:  []string{"home-retry-a", "home-retry-b"},
-				metadata: map[string]any{"request_retry": tc.override},
-			}
-			executor := &retryContractHomeExecutor{failAll: true}
-			manager := NewManager(nil, nil, nil)
-			manager.SetConfig(&internalconfig.Config{Home: internalconfig.HomeConfig{Enabled: true}})
-			manager.SetRetryConfig(tc.globalRetry, time.Second, 2)
-			manager.PublishHomeDispatch(dispatcher, executionregistry.New(), 1)
-			manager.RegisterExecutor(executor)
-
-			_, errExecute := manager.Execute(context.Background(), []string{"home-retry-contract"}, cliproxyexecutor.Request{Model: "gpt"}, cliproxyexecutor.Options{})
-			if errExecute == nil {
-				t.Fatal("Execute() error = nil, want terminal rate-limit error")
-			}
-			if got := len(executor.Calls()); got != tc.wantCallCount {
-				t.Fatalf("executor call count = %d, want %d", got, tc.wantCallCount)
-			}
-		})
-	}
-}
-
-func TestHomeRetryRoundUsesAuthoritativeZeroAggregate(t *testing.T) {
-	tests := []struct {
-		name    string
-		execute func(*Manager) error
-	}{
-		{
-			name: "nonstream",
-			execute: func(manager *Manager) error {
-				_, errExecute := manager.Execute(context.Background(), []string{"home-retry-contract"}, cliproxyexecutor.Request{Model: "gpt"}, cliproxyexecutor.Options{})
-				return errExecute
-			},
-		},
-		{
-			name: "count tokens",
-			execute: func(manager *Manager) error {
-				_, errExecute := manager.ExecuteCount(context.Background(), []string{"home-retry-contract"}, cliproxyexecutor.Request{Model: "gpt"}, cliproxyexecutor.Options{})
-				return errExecute
-			},
-		},
-		{
-			name: "stream",
-			execute: func(manager *Manager) error {
-				_, errExecute := manager.ExecuteStream(context.Background(), []string{"home-retry-contract"}, cliproxyexecutor.Request{Model: "gpt"}, cliproxyexecutor.Options{Stream: true})
-				return errExecute
-			},
-		},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			remoteRetry := 0
-			dispatcher := &retryContractHomeDispatcher{
-				authIDs:      []string{"home-retry-a", "home-retry-b"},
-				metadata:     map[string]any{"request_retry": 3},
-				requestRetry: &remoteRetry,
-			}
-			executor := &retryContractHomeExecutor{
-				failAll: true,
-				failure: &Error{HTTPStatus: http.StatusBadGateway, Message: "upstream unavailable"},
-			}
-			manager := NewManager(nil, nil, nil)
-			manager.SetConfig(&internalconfig.Config{Home: internalconfig.HomeConfig{Enabled: true}})
-			manager.SetRetryConfig(3, time.Second, 2)
-			manager.PublishHomeDispatch(dispatcher, executionregistry.New(), 1)
-			manager.RegisterExecutor(executor)
-
-			if errExecute := test.execute(manager); errExecute == nil {
-				t.Fatal("execution error = nil, want terminal first-round error")
-			}
-			if got := executor.Calls(); len(got) != 2 {
-				t.Fatalf("executor calls = %v, want only the two first-round credentials", got)
 			}
 		})
 	}

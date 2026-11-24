@@ -13,6 +13,10 @@ REQUIRED = {
     SDK: {
         "TestOrdinarySchedulerSelectionIDContract",
         "TestOrdinarySchedulerRefusalContract",
+        "TestOrdinaryPreferredExecutionErrorPriority",
+        "TestOrdinaryHomeAuthoritativeZeroEndsFirstAttempt",
+        "TestOrdinaryPreDispatchSelectionErrorPrecedence",
+        "TestOrdinaryPreDispatchWaitBounds",
         "TestHomeReturnsFirstProviderRefusal",
         *(f"TestHomeReturnsFirstProviderRefusal/{code}-count-{count}"
           for code in (401, 403, 429) for count in ("false", "true")),

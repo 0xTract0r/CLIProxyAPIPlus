@@ -20,6 +20,7 @@ func TestOrdinaryHomeSingleCredentialRetryConfiguration(t *testing.T) {
 		{"aggregate_overrides_credential_zero", 0, map[string]any{"request_retry": float64(0)}, true, 2, 2},
 		{"explicit_aggregate_zero_is_authoritative", 3, map[string]any{"request_retry": float64(3)}, true, 0, 0},
 		{"absent_aggregate_uses_credential_override", 3, map[string]any{"request_retry": float64(1)}, false, 99, 1},
+		{"absent_aggregate_uses_explicit_credential_zero", 3, map[string]any{"request_retry": float64(0)}, false, 99, 0},
 		{"absent_aggregate_and_override_use_global", 3, nil, false, 99, 3},
 	} {
 		for _, maxWait := range []time.Duration{0, 30 * time.Millisecond} {
