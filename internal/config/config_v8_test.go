@@ -548,7 +548,7 @@ some-concurrent-legacy-block:
 func TestV8SaveCommentsObsoleteSections(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	raw := `auth: {old: true}
-ampcode: {old: true}
+ampcode: {upstream-url: "https://amp.fixture.invalid", old: true}
 amp-upstream-url: https://old.example
 amp-upstream-api-key: old-secret
 generative-language-api-key: old-key
@@ -572,7 +572,14 @@ proxy-url: old
 	if err = ValidateV8Config(saved); err != nil {
 		t.Fatalf("saved migration is invalid: %v", err)
 	}
-	for _, key := range []string{"auth", "ampcode", "amp-upstream-url", "amp-upstream-api-key", "generative-language-api-key", "home"} {
+	reloaded, err := LoadConfig(path)
+	if err != nil || reloaded.AmpCode.UpstreamURL != "https://amp.fixture.invalid" {
+		t.Fatalf("active Amp settings did not survive migration: %v", err)
+	}
+	if !strings.Contains(string(saved), "# ampcode.old: true") {
+		t.Fatal("migration lost the unrecognized nested Amp setting")
+	}
+	for _, key := range []string{"auth", "amp-upstream-url", "amp-upstream-api-key", "generative-language-api-key", "home"} {
 		if !strings.Contains(string(saved), "# "+key+":") {
 			t.Errorf("obsolete setting %s was discarded rather than commented", key)
 		}
