@@ -1611,6 +1611,17 @@ func (m *Manager) refreshAuthForRequestAtVersion(ctx context.Context, id, failed
 	if credentialVersion != 0 && failedAccessToken != "" {
 		m.markRejectedAccessToken(id, failedAccessToken)
 	}
+	if ctx.Value(selectedForceRefreshKey{}) != nil {
+		if auth.Disabled || auth.Status == StatusDisabled || ordinaryRefreshBlocked(auth) || !hasOrdinaryRefreshGrant(auth) {
+			return nil, ErrSelectedRefreshUnavailable
+		}
+		if auth.RefreshError != nil && auth.RefreshError.HTTPStatus == http.StatusTooManyRequests && auth.NextRefreshAfter.After(time.Now()) {
+			return nil, selectedRefreshWait{until: auth.NextRefreshAfter}
+		}
+		if authHasUnchangedRejectedRefreshToken(auth) {
+			return nil, &Error{Code: "unauthorized", Message: "credential requires reauthentication", HTTPStatus: http.StatusUnauthorized}
+		}
+	}
 	if ordinaryRefreshBlocked(auth) {
 		return nil, errors.New("credential refresh disabled")
 	}
@@ -1990,6 +2001,12 @@ func (m *Manager) refreshAuthForRequestAtVersion(ctx context.Context, id, failed
 
 				if !current.Unavailable {
 					log.Warnf("credential refresh failed for %s (%s): %s; retaining active credential as access token is unexpired", current.Provider, current.ID, sanitizedRefreshErr.Message)
+				}
+			}
+			if ctx.Value(selectedForceRefreshKey{}) != nil {
+				if retryUntil := selectedUpstreamWaitUntil(err, now); retryUntil.After(current.NextRefreshAfter) {
+					current.NextRefreshAfter = retryUntil
+					shouldReschedule = true
 				}
 			}
 			m.auths[id] = current

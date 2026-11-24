@@ -211,6 +211,25 @@ func (o *CodexAuth) ExchangeCodeForTokensWithRedirect(ctx context.Context, code,
 	return bundle, nil
 }
 
+type refreshResponseError struct {
+	status     int
+	code       string
+	retryAfter string
+}
+
+func (e *refreshResponseError) Error() string {
+	return fmt.Sprintf("token refresh failed with status %d: %s", e.status, e.code)
+}
+
+func (e *refreshResponseError) StatusCode() int { return e.status }
+
+func (e *refreshResponseError) Headers() http.Header {
+	if e.retryAfter == "" {
+		return nil
+	}
+	return http.Header{"Retry-After": {e.retryAfter}}
+}
+
 // RefreshTokens refreshes an access token using a refresh token.
 // This method is called when an access token has expired. It makes a request to the
 // token endpoint to obtain a new set of tokens.
@@ -274,7 +293,7 @@ func (o *CodexAuth) refreshTokensSingleFlight(ctx context.Context, refreshToken 
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		errResponse := fmt.Errorf("token refresh failed with status %d: %s", resp.StatusCode, publicTokenErrorCode(body))
+		errResponse := &refreshResponseError{status: resp.StatusCode, code: publicTokenErrorCode(body), retryAfter: resp.Header.Get("Retry-After")}
 		if isNonRetryableRefreshErr(errResponse) {
 			return nil, errResponse
 		}

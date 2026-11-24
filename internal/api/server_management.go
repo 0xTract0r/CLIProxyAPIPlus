@@ -98,6 +98,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PATCH("/api-keys", s.mgmt.PatchAPIKeys)
 		mgmt.DELETE("/api-keys", s.mgmt.DeleteAPIKeys)
 		mgmt.GET("/quota/snapshots", s.mgmt.GetStoredQuotaSnapshots)
+		mgmt.POST("/quota/refresh", s.mgmt.RefreshOrdinaryQuota)
 
 		mgmt.GET("/usage", s.mgmt.GetUsageStatistics)
 		mgmt.GET("/usage/export", s.mgmt.ExportUsageStatistics)
@@ -234,6 +235,8 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PATCH("/auth-files/account-scheduling", s.mgmt.PatchAuthFileAccountScheduling)
 		mgmt.POST("/auth-files/account-scheduling/preview", s.mgmt.PreviewAuthFileAccountScheduling)
 		mgmt.POST("/auth-files/refresh", s.mgmt.RefreshAuthFiles)
+		mgmt.POST("/auth-files/refresh-status", s.mgmt.RefreshOrdinaryAuthFileStatus)
+		mgmt.POST("/auth-files/test-message", s.mgmt.TestOrdinaryAuthFileMessage)
 		mgmt.POST("/vertex/import", s.mgmt.ImportVertexCredential)
 
 		mgmt.GET("/anthropic-auth-url", s.mgmt.RequestAnthropicToken)
