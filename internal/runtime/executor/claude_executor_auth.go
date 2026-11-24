@@ -59,7 +59,7 @@ func (e *ClaudeExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (
 		return auth, nil
 	}
 
-	client := *helps.NewProxyAwareHTTPClient(ctx, e.cfg, nil, 30*time.Second)
+	client := *helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 30*time.Second)
 	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	// Do not replay a refresh whose token may already have been rotated.
 	td, err := claudeauth.NewClaudeAuthWithHTTPClient(&client).RefreshTokens(ctx, token)

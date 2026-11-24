@@ -24,15 +24,19 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 	if err != nil {
 		return cliproxyexecutor.Response{}, err
 	}
-	if err := validateClaudeTokenCountRequest(body); err != nil {
+	key, base, _ := ordinaryClaudeCredential(auth)
+	useUpstream := shouldUseClaudeUpstreamTokenCount(key, base)
+	// Local estimates also accept translated Responses developer text in its
+	// original position. The native count endpoint still requires user/assistant.
+	allowSystemTurns := !useUpstream && opts.SourceFormat == sdktranslator.FormatOpenAIResponse
+	if err := validateClaudeTokenCountRequest(body, allowSystemTurns); err != nil {
 		return cliproxyexecutor.Response{}, err
 	}
 	if len(body) > ordinaryClaudeMaxRequestBytes {
 		return cliproxyexecutor.Response{}, statusErr{code: http.StatusRequestEntityTooLarge, msg: "Claude request exceeds size limit", requestScoped: true}
 	}
 
-	key, base, _ := ordinaryClaudeCredential(auth)
-	if shouldUseClaudeUpstreamTokenCount(key, base) {
+	if useUpstream {
 		return e.sendOrdinaryClaudeTokenCount(ctx, auth, body, opts)
 	}
 	count, err := helps.CountClaudeInputTokens(body)
@@ -50,7 +54,7 @@ func (e *ClaudeExecutor) countTokensUpstream(ctx context.Context, auth *cliproxy
 	if err != nil {
 		return cliproxyexecutor.Response{}, err
 	}
-	if err = validateClaudeTokenCountRequest(body); err != nil {
+	if err = validateClaudeTokenCountRequest(body, false); err != nil {
 		return cliproxyexecutor.Response{}, err
 	}
 	return e.sendOrdinaryClaudeTokenCount(ctx, auth, body, opts)
@@ -111,7 +115,7 @@ func newClaudeTokenCountValidationError(message string) error {
 	return claudeTokenCountValidationError{statusErr{code: http.StatusBadRequest, msg: message}}
 }
 
-func validateClaudeTokenCountRequest(body []byte) error {
+func validateClaudeTokenCountRequest(body []byte, allowSystemTurns bool) error {
 	if !ojson.ValidBytes(body) {
 		return newClaudeTokenCountValidationError("invalid Claude token count request JSON")
 	}
@@ -139,7 +143,8 @@ func validateClaudeTokenCountRequest(body []byte) error {
 			return newClaudeTokenCountValidationError("Claude token count request messages must contain objects")
 		}
 		role := message.Get("role").String()
-		if role != "user" && role != "assistant" {
+		systemTurn := allowSystemTurns && role == "system"
+		if role != "user" && role != "assistant" && !systemTurn {
 			return newClaudeTokenCountValidationError("Claude token count request message role must be user or assistant")
 		}
 		content := message.Get("content")
@@ -150,6 +155,9 @@ func validateClaudeTokenCountRequest(body []byte) error {
 			return newClaudeTokenCountValidationError("Claude token count request message content must be a string or array")
 		}
 		for _, block := range content.Array() {
+			if systemTurn && (block.Get("type").String() != "text" || block.Get("text").Type != ojson.String) {
+				return newClaudeTokenCountValidationError("Claude token count request system blocks must be text")
+			}
 			if !block.IsObject() || block.Get("type").Type != ojson.String || block.Get("type").String() == "" {
 				return newClaudeTokenCountValidationError("Claude token count request content blocks must be typed objects")
 			}

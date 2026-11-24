@@ -1,93 +1,73 @@
 package executor
 
 import (
+	"context"
 	"errors"
+	"io"
 	"net/http"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	authsdk "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	executorapi "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	translation "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 )
 
-func TestNewClaudeStatusErrDetectsUsageLimitRetryAfter(t *testing.T) {
-	now := time.Date(2026, 5, 20, 16, 30, 0, 0, time.Local)
-	body := []byte(`{"error":{"message":"Usage limit reached. Please try again at 5:03 PM."}}`)
-
-	err := newClaudeStatusErr(http.StatusTooManyRequests, body, nil, now)
-
-	if err.StatusCode() != http.StatusTooManyRequests {
-		t.Fatalf("status = %d, want 429", err.StatusCode())
-	}
-	retryAfter := err.RetryAfter()
-	if retryAfter == nil {
-		t.Fatalf("expected retryAfter, got nil")
-	}
-	if *retryAfter != 33*time.Minute {
-		t.Fatalf("retryAfter = %v, want 33m", *retryAfter)
-	}
-}
-
-func TestNewClaudeStatusErrIgnoresTransient429(t *testing.T) {
-	body := []byte(`{"error":{"message":"model is overloaded, please retry"}}`)
-
-	err := newClaudeStatusErr(http.StatusTooManyRequests, body, nil, time.Now())
-
-	if err.RetryAfter() != nil {
-		t.Fatalf("expected nil retryAfter for transient 429, got %v", *err.RetryAfter())
-	}
-}
-
-func TestNewClaudeStatusErrUsesRetryAfterHeaderForUsageLimit(t *testing.T) {
-	headers := http.Header{"Retry-After": []string{"123"}}
-	body := []byte(`{"error":{"message":"usage limit reached"}}`)
-
-	err := newClaudeStatusErr(http.StatusTooManyRequests, body, headers, time.Now())
-
-	retryAfter := err.RetryAfter()
-	if retryAfter == nil {
-		t.Fatalf("expected retryAfter, got nil")
-	}
-	if *retryAfter != 123*time.Second {
-		t.Fatalf("retryAfter = %v, want 123s", *retryAfter)
-	}
-}
-
-func TestClaudeUpstreamTransportErrorRedactsNetworkDetails(t *testing.T) {
-	rawErr := errors.New(`Post "https://api.anthropic.com/v1/messages": read tcp 172.25.0.2:37824->80.174.217.1:12324: read: connection reset by peer; proxy=http://user:pass@80.174.217.1:12324`)
-
-	err := claudeUpstreamTransportError(rawErr)
-	if err == nil {
-		t.Fatal("expected transport error, got nil")
-	}
-	statusErr, ok := err.(interface{ StatusCode() int })
-	if !ok {
-		t.Fatalf("expected status error, got %T", err)
-	}
-	if got := statusErr.StatusCode(); got != http.StatusBadGateway {
-		t.Fatalf("status = %d, want %d", got, http.StatusBadGateway)
-	}
-	if got := err.Error(); got != claudeClientSafeTransportErrorMessage {
-		t.Fatalf("message = %q, want %q", got, claudeClientSafeTransportErrorMessage)
-	}
-
-	for _, forbidden := range []string{
-		"172.25.0.2",
-		"80.174.217.1",
-		"37824",
-		"12324",
-		"user",
-		"pass",
-		"read tcp",
-		"->",
-		"api.anthropic.com",
+func TestOrdinaryClaudeRefusalRetainsHeaderAndNeverRepeatsRequest(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		code  int
+		retry string
+		body  string
+	}{
+		{"usage-limit-header", 429, "123", `{"error":{"message":"usage limit reached"}}`},
+		{"overload-without-header", 429, "", `{"error":{"message":"model overloaded"}}`},
+		{"forbidden", 403, "13", `{"error":{"message":"explicit refusal"}}`},
 	} {
-		if strings.Contains(err.Error(), forbidden) {
-			t.Fatalf("client error leaked %q in %q", forbidden, err.Error())
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			ctx := context.WithValue(t.Context(), "cliproxy.roundtripper", ordinaryClaudeTestRoundTripper(func(r *http.Request) (*http.Response, error) {
+				calls++
+				h := make(http.Header)
+				if tc.retry != "" {
+					h.Set("Retry-After", tc.retry)
+				}
+				return &http.Response{StatusCode: tc.code, Header: h, Body: io.NopCloser(strings.NewReader(tc.body)), Request: r}, nil
+			}))
+			auth := &authsdk.Auth{Attributes: map[string]string{"base_url": "https://fixture.invalid", "api_key": "fixture"}}
+			req := executorapi.Request{Model: "claude-fixture", Payload: []byte(`{"max_tokens":10,"messages":[{"role":"user","content":"ordinary input"}]}`)}
+			_, err := NewClaudeExecutor(&config.Config{}).Execute(ctx, auth, req, executorapi.Options{SourceFormat: translation.FormatClaude})
+			var refused statusErr
+			if !errors.As(err, &refused) || refused.StatusCode() != tc.code || calls != 1 {
+				t.Fatalf("attempts=%d err=%v", calls, err)
+			}
+			if tc.retry == "" {
+				if refused.RetryAfter() != nil {
+					t.Fatalf("invented retry time: %v", refused.RetryAfter())
+				}
+			} else {
+				want, _ := time.ParseDuration(tc.retry + "s")
+				if refused.RetryAfter() == nil || *refused.RetryAfter() != want {
+					t.Fatalf("retry=%v want %v", refused.RetryAfter(), want)
+				}
+			}
+		})
 	}
 }
 
-func TestClaudeUpstreamTransportErrorNil(t *testing.T) {
-	if err := claudeUpstreamTransportError(nil); err != nil {
-		t.Fatalf("expected nil error, got %v", err)
+func TestOrdinaryClaudeTransportErrorDoesNotExposePrivateRoute(t *testing.T) {
+	const private = "https://fixture-user:fixture-pass@private-route.invalid"
+	calls := 0
+	ctx := context.WithValue(t.Context(), "cliproxy.roundtripper", ordinaryClaudeTestRoundTripper(func(*http.Request) (*http.Response, error) {
+		calls++
+		return nil, errors.New("failure contacting " + private)
+	}))
+	auth := &authsdk.Auth{Attributes: map[string]string{"base_url": "https://fixture.invalid", "api_key": "fixture"}}
+	req := executorapi.Request{Model: "claude-fixture", Payload: []byte(`{"max_tokens":10,"messages":[{"role":"user","content":"ordinary input"}]}`)}
+	_, err := NewClaudeExecutor(&config.Config{}).Execute(ctx, auth, req, executorapi.Options{SourceFormat: translation.FormatClaude})
+	if err == nil || calls != 1 || strings.Contains(err.Error(), "fixture-pass") || strings.Contains(err.Error(), "private-route.invalid") {
+		t.Fatalf("ordinary transport did not return a safe terminal error: attempts=%d", calls)
 	}
 }

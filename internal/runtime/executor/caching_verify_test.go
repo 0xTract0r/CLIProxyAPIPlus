@@ -3,11 +3,9 @@ package executor
 import (
 	"bytes"
 	"fmt"
-	"strings"
 	"testing"
 
 	"github.com/MoeForge/moego/ojson"
-	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 )
 
 func TestEnsureCacheControl(t *testing.T) {
@@ -648,59 +646,6 @@ func TestUpgradeClaudeCacheControlTTL(t *testing.T) {
 // section, freezing the rolling breakpoint on messages[0] for the whole
 // conversation. Section-independent ensure has to keep that breakpoint advancing
 // as the history grows, so a reintroduced global short-circuit fails here.
-func TestClaudeExecutorCloakedRollingCacheBreakpointAdvances(t *testing.T) {
-	buildConversation := func(exchanges int) []byte {
-		messages := make([]string, 0, exchanges*2)
-		for i := 0; i < exchanges; i++ {
-			messages = append(messages,
-				fmt.Sprintf(`{"role":"user","content":"question number %d"}`, i),
-				fmt.Sprintf(`{"role":"assistant","content":"answer number %d"}`, i),
-			)
-		}
-		return []byte(`{"model":"claude-opus-5","max_tokens":100,` +
-			`"system":"You are a helpful assistant.",` +
-			`"messages":[` + strings.Join(messages, ",") + `]}`)
-	}
-
-	// lastMarkedMessage reports the highest message index carrying a breakpoint.
-	lastMarkedMessage := func(body []byte) int {
-		last := -1
-		ojson.GetBytes(body, "messages").ForEach(func(msgIdx, message ojson.Result) bool {
-			message.Get("content").ForEach(func(_, block ojson.Result) bool {
-				if block.Get("cache_control").Exists() {
-					last = int(msgIdx.Int())
-				}
-				return true
-			})
-			return true
-		})
-		return last
-	}
-
-	cfg := &config.Config{}
-	shortBody := executeClaudeContextManagementRequest(t, cfg, buildConversation(2), false)
-	longBody := executeClaudeContextManagementRequest(t, cfg, buildConversation(6), false)
-
-	shortMarked := lastMarkedMessage(shortBody)
-	longMarked := lastMarkedMessage(longBody)
-	if shortMarked <= 0 {
-		t.Fatalf("short conversation kept its only breakpoint at index %d: %s", shortMarked, shortBody)
-	}
-	if longMarked <= shortMarked {
-		t.Fatalf("rolling breakpoint did not advance with history: short=%d long=%d\n%s", shortMarked, longMarked, longBody)
-	}
-	// The rolling marker must land on the final turn, not an early frozen prefix.
-	if want := int(ojson.GetBytes(longBody, "messages.#").Int()) - 1; longMarked != want {
-		t.Fatalf("rolling breakpoint at message %d, want final message %d: %s", longMarked, want, longBody)
-	}
-	// Cloaking's own first-user marker must still be present alongside it.
-	if !ojson.GetBytes(longBody, "messages.0.content.1.cache_control").Exists() {
-		t.Fatalf("cloak first-user breakpoint lost: %s", longBody)
-	}
-	if total := countCacheControls(longBody); total > 4 {
-		t.Fatalf("cache_control count = %d, want at most 4: %s", total, longBody)
-	}
-}
 
 func TestEnsureCacheControlSkipsEmptyAndWhitespaceTextBlocks(t *testing.T) {
 	t.Run("Message With Trailing Empty And Whitespace Text Blocks", func(t *testing.T) {
@@ -792,23 +737,4 @@ func TestEnsureCacheControlSkipsEmptyAndWhitespaceTextBlocks(t *testing.T) {
 		}
 	})
 
-	t.Run("Cloaking CurrentDate Injection Skips Empty Text Blocks", func(t *testing.T) {
-		input := []byte(`{
-			"model": "claude-sonnet-5",
-			"messages": [{
-				"role": "user",
-				"content": [
-					{"type": "text", "text": ""},
-					{"type": "text", "text": "Actual user prompt"}
-				]
-			}]
-		}`)
-		output := injectClaudeCodeCurrentDate(input, "2026-10-20")
-		if ojson.GetBytes(output, "messages.0.content.1.cache_control").Exists() {
-			t.Fatalf("empty text block at index 1 must not receive cloaking cache_control: %s", output)
-		}
-		if got := ojson.GetBytes(output, "messages.0.content.2.cache_control.type").String(); got != "ephemeral" {
-			t.Fatalf("first non-empty user text block at index 2 should receive cloaking cache_control, got %q: %s", got, output)
-		}
-	})
 }

@@ -2,6 +2,8 @@ package executor
 
 import (
 	"context"
+	"io"
+	"net/http"
 	"reflect"
 	"strings"
 	"testing"
@@ -18,13 +20,7 @@ func TestClaudeExecutor_OpenAIStructuredOutputReachesOutputConfigFormat(t *testi
 	responsesPayload := []byte(`{"model":"claude-sonnet-5-5","instructions":"You are a coding agent.","input":[{"role":"user","content":[{"type":"input_text","text":"Suggest a recipe."}]}],"reasoning":{"effort":"high"},"tools":[{"type":"function","name":"shell","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}],"tool_choice":"auto","parallel_tool_calls":false,"text":{"format":{"type":"json_schema","name":"recipe","description":"A dish for two.","strict":true,"schema":` + schema + `}}}`)
 	chatPayload := []byte(`{"model":"claude-sonnet-5-5","reasoning_effort":"high","messages":[{"role":"system","content":"You are a coding agent."},{"role":"user","content":"Suggest a recipe."}],"tools":[{"type":"function","function":{"name":"shell","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}}],"tool_choice":"auto","parallel_tool_calls":false,"response_format":{"type":"json_schema","json_schema":{"name":"recipe","description":"A dish for two.","strict":true,"schema":` + schema + `}}}`)
 
-	oauth := func() *cliproxyauth.Auth {
-		metadata := claudeOAuthTestMetadata()
-		metadata["access_token"] = "sk-ant-oat01-structured"
-		return &cliproxyauth.Auth{Provider: "claude", Metadata: metadata}
-	}
-	cloakOff := &config.Config{}
-	cloakOff.DisableClaudeCloakMode = true
+	bearer := &cliproxyauth.Auth{Provider: "claude", Attributes: map[string]string{"base_url": "https://fixture.invalid"}, Metadata: map[string]any{"access_token": "fixture"}}
 
 	for _, source := range []struct {
 		name    string
@@ -41,8 +37,7 @@ func TestClaudeExecutor_OpenAIStructuredOutputReachesOutputConfigFormat(t *testi
 			countTokens bool
 		}{
 			{name: "api key", cfg: &config.Config{}, auth: &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "key-structured"}}, countTokens: true},
-			{name: "oauth, cloaking off", cfg: cloakOff, auth: oauth()},
-			{name: "oauth, cloaking auto", cfg: &config.Config{}, auth: oauth()},
+			{name: "Bearer", cfg: &config.Config{}, auth: bearer},
 		} {
 			methods := []string{"Execute", "ExecuteStream"}
 			if tc.countTokens {
@@ -50,7 +45,7 @@ func TestClaudeExecutor_OpenAIStructuredOutputReachesOutputConfigFormat(t *testi
 			}
 			for _, method := range methods {
 				t.Run(source.name+"/"+tc.name+"/"+method, func(t *testing.T) {
-					body, _ := captureClaudeIssue7000(t, NewClaudeExecutor(tc.cfg), tc.auth, cliproxyexecutor.Request{Model: "claude-sonnet-5-5", Payload: source.payload}, cliproxyexecutor.Options{SourceFormat: source.format}, method)
+					body, _ := captureOrdinaryClaudeStructuredOutput(t, NewClaudeExecutor(tc.cfg), tc.auth, cliproxyexecutor.Request{Model: "claude-sonnet-5-5", Payload: source.payload}, cliproxyexecutor.Options{SourceFormat: source.format}, method)
 					if got := ojson.GetBytes(body, "output_config.format").Value(); !reflect.DeepEqual(got, ojson.Parse(`{"type":"json_schema","schema":`+schema+`}`).Value()) {
 						t.Fatalf("output_config.format = %#v; body=%s", got, body)
 					}
@@ -91,7 +86,7 @@ func TestClaudeExecutor_OpenAIStructuredOutputLegacyModelKeepsInstruction(t *tes
 		} {
 			for _, method := range []string{"Execute", "ExecuteStream", "CountTokens"} {
 				t.Run(model+"/"+source.name+"/"+method, func(t *testing.T) {
-					body, _ := captureClaudeIssue7000(t, NewClaudeExecutor(&config.Config{}), auth, cliproxyexecutor.Request{Model: model, Payload: source.payload}, cliproxyexecutor.Options{SourceFormat: source.format}, method)
+					body, _ := captureOrdinaryClaudeStructuredOutput(t, NewClaudeExecutor(&config.Config{}), auth, cliproxyexecutor.Request{Model: model, Payload: source.payload}, cliproxyexecutor.Options{SourceFormat: source.format}, method)
 					if ojson.GetBytes(body, "output_config.format").Exists() {
 						t.Fatalf("output_config.format sent to legacy model %q: %s", model, body)
 					}
@@ -122,7 +117,7 @@ func TestClaudeExecutor_OpenAIStructuredOutputLocalCountAndPayloadFinal(t *testi
 			if filter {
 				cfg.Payload = config.PayloadConfig{Filter: []config.PayloadFilterRule{{Models: models, Params: []string{"output_config.format"}}}}
 			}
-			body, _ := captureClaudeIssue7000(t, NewClaudeExecutor(cfg), auth, cliproxyexecutor.Request{Model: model, Payload: payload}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse}, "Execute")
+			body, _ := captureOrdinaryClaudeStructuredOutput(t, NewClaudeExecutor(cfg), auth, cliproxyexecutor.Request{Model: model, Payload: payload}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse}, "Execute")
 			if filter {
 				if ojson.GetBytes(body, "output_config.format").Exists() {
 					t.Fatalf("filtered output_config.format survived: %s", body)
@@ -150,4 +145,46 @@ func TestClaudeExecutor_OpenAIStructuredOutputLocalCountAndPayloadFinal(t *testi
 	if plainTokens <= 0 || schemaTokens <= plainTokens {
 		t.Fatalf("expected schema local input_tokens > plain (%d > %d)", schemaTokens, plainTokens)
 	}
+}
+
+func captureOrdinaryClaudeStructuredOutput(t *testing.T, exec *ClaudeExecutor, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, method string) ([]byte, error) {
+	t.Helper()
+	var body []byte
+	ctx := context.WithValue(t.Context(), "cliproxy.roundtripper", ordinaryClaudeTestRoundTripper(func(r *http.Request) (*http.Response, error) {
+		var err error
+		body, err = io.ReadAll(r.Body)
+		if err != nil {
+			return nil, err
+		}
+		h := http.Header{"Content-Type": {"application/json"}}
+		payload := `{"id":"fixture","type":"message","role":"assistant","model":"claude-fixture","content":[{"type":"text","text":"ok"}]}`
+		if r.URL.Path == "/v1/messages/count_tokens" {
+			payload = `{"input_tokens":15}`
+		} else if method == "ExecuteStream" {
+			h.Set("Content-Type", "text/event-stream")
+			payload = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"fixture\",\"model\":\"claude-fixture\"}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: h, Body: io.NopCloser(strings.NewReader(payload)), Request: r}, nil
+	}))
+	var err error
+	switch method {
+	case "Execute":
+		_, err = exec.Execute(ctx, auth, req, opts)
+	case "CountTokens":
+		_, err = exec.CountTokens(ctx, auth, req, opts)
+	case "ExecuteStream":
+		var stream *cliproxyexecutor.StreamResult
+		stream, err = exec.ExecuteStream(ctx, auth, req, opts)
+		if err == nil {
+			for c := range stream.Chunks {
+				if c.Err != nil {
+					err = c.Err
+				}
+			}
+		}
+	}
+	if err != nil || len(body) == 0 {
+		t.Fatalf("ordinary %s did not reach fixture: %v", method, err)
+	}
+	return body, nil
 }

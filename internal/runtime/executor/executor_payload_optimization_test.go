@@ -218,33 +218,20 @@ func TestObserveClaudeStreamJSONPayloadClonesMessageID(t *testing.T) {
 func TestExecutorPayloadSingleDocPipelinesByteConsistency(t *testing.T) {
 	ctx := context.Background()
 
-	t.Run("claude doc pipeline matches byte pipeline", func(t *testing.T) {
-		raw := []byte(`{"model":"claude-sonnet-4-5","betas":["custom-beta-1"],"prompt_cache_options":{"ttl":"5m"},"tool_choice":{"type":"any"},"thinking":{"type":"enabled","budget_tokens":2048},"messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}]}`)
-
-		byteOut := bytes.Clone(raw)
-		byteOut = checkSystemInstructionsWithMode(byteOut, false)
-		byteOut = ensureModelMaxTokens(byteOut, "claude-sonnet-4-5")
-		byteOut = disableThinkingIfToolChoiceForced(byteOut)
+	t.Run("claude public cache byte and doc helpers match", func(t *testing.T) {
+		raw := []byte(`{"model":"claude-sonnet-4-5","prompt_cache_options":{"ttl":"5m"},"messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}]}`)
+		byteOut := ensureModelMaxTokens(bytes.Clone(raw), "claude-sonnet-4-5")
 		byteOut = ensureCacheControl(byteOut)
 		byteOut = enforceCacheControlLimit(byteOut, 4)
 		byteOut = stripPromptCacheOptions(byteOut)
-		betasByte, byteOut := extractAndRemoveBetas(byteOut)
 
 		doc := ojson.NewDoc(bytes.Clone(raw))
-		checkSystemInstructionsWithModeDoc(doc, false)
 		ensureModelMaxTokensDoc(doc, "claude-sonnet-4-5")
-		disableThinkingIfToolChoiceForcedDoc(doc)
 		ensureCacheControlDoc(doc)
 		enforceCacheControlLimitDoc(doc, 4)
 		stripPromptCacheOptionsDoc(doc)
-		betasDoc, _ := extractAndRemoveBetasDoc(doc)
-		docOut := doc.Bytes()
-
-		if !bytes.Equal(docOut, byteOut) {
+		if docOut := doc.Bytes(); !bytes.Equal(docOut, byteOut) {
 			t.Fatalf("claude doc output mismatch:\ndoc:  %s\nbyte: %s", docOut, byteOut)
-		}
-		if strings.Join(betasDoc, ",") != strings.Join(betasByte, ",") {
-			t.Fatalf("claude betas mismatch: doc=%v byte=%v", betasDoc, betasByte)
 		}
 	})
 

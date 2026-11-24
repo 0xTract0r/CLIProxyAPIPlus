@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"net/http/httptrace"
 	"net/url"
+	"slices"
+	"sort"
 	"strings"
 	"sync/atomic"
 
@@ -17,6 +19,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
+	"golang.org/x/net/http/httpguts"
 )
 
 const ordinaryClaudeMaxRequestBytes = 32 << 20
@@ -140,6 +143,28 @@ func (e *ClaudeExecutor) sendOrdinaryClaudeRequest(ctx context.Context, auth *cl
 	if err != nil {
 		return nil, err
 	}
+	gatewayBeta, hasGatewayBeta := applyOrdinaryClaudeConfiguredHeaders(httpReq, auth)
+	if hasGatewayBeta {
+		betas = nil
+		clear(seen)
+		add(gatewayBeta)
+	} else if e.cfg != nil {
+		defaults := e.cfg.ClaudeHeaderDefaults
+		strip := make(map[string]bool, len(defaults.AnthropicBetaStrip))
+		for _, beta := range defaults.AnthropicBetaStrip {
+			strip[strings.TrimSpace(beta)] = true
+		}
+		betas = slices.DeleteFunc(betas, func(beta string) bool {
+			if !strip[beta] {
+				return false
+			}
+			delete(seen, beta)
+			return true
+		})
+		for _, beta := range defaults.AnthropicBetaAppend {
+			add(beta)
+		}
+	}
 	if len(betas) > 0 {
 		httpReq.Header.Set("Anthropic-Beta", strings.Join(betas, ","))
 	}
@@ -150,7 +175,82 @@ func (e *ClaudeExecutor) sendOrdinaryClaudeRequest(ctx context.Context, auth *cl
 	}
 	// Never forward either Authorization or X-API-Key to a redirected host.
 	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-	return doOrdinaryClaudeMessagesRequest(&client, httpReq)
+	resp, err := doOrdinaryClaudeMessagesRequest(&client, httpReq)
+	if err == nil {
+		return resp, nil
+	}
+	if errors.Is(err, context.Canceled) {
+		return nil, context.Canceled
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return nil, context.DeadlineExceeded
+	}
+	// Transport diagnostics can contain proxy userinfo and internal endpoints.
+	return nil, statusErr{code: http.StatusBadGateway, msg: "Claude upstream transport request failed", requestScoped: true}
+}
+
+// applyOrdinaryClaudeConfiguredHeaders accepts static per-credential headers
+// without delegating authority, authentication, or client identity to config.
+// The provider itself owns its Beta policy; an explicitly configured gateway
+// may supply its own Beta header instead, as in the legacy configuration.
+func applyOrdinaryClaudeConfiguredHeaders(req *http.Request, auth *cliproxyauth.Auth) (string, bool) {
+	if auth == nil {
+		return "", false
+	}
+	var keys []string
+	for key := range auth.Attributes {
+		if strings.HasPrefix(key, "header:") {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	gateway := !helps.IsAnthropicUpstreamURL(req.URL)
+	var beta string
+	var override bool
+	for _, key := range keys {
+		name := strings.TrimSpace(strings.TrimPrefix(key, "header:"))
+		value := strings.TrimSpace(auth.Attributes[key])
+		if value == "" || strings.HasPrefix(value, "$") || !httpguts.ValidHeaderFieldName(name) || !httpguts.ValidHeaderFieldValue(value) {
+			continue
+		}
+		if strings.EqualFold(name, "Anthropic-Beta") {
+			if gateway {
+				beta, override = value, true
+			}
+			continue
+		}
+		if validOrdinaryClaudeConfiguredHeader(name) {
+			req.Header.Set(name, value)
+		}
+	}
+	return beta, override
+}
+
+func validOrdinaryClaudeConfiguredHeader(name string) bool {
+	lower := strings.ToLower(name)
+	switch lower {
+	case "accept-language", "cache-control", "prefer":
+		return true
+	case "x-api-key", "x-app", "x-real-ip", "x-remote-user", "x-host", "x-original-url", "x-rewrite-url",
+		"x-http-method", "x-http-method-override", "x-method-override", "x-access-token", "x-auth-token":
+		return false
+	}
+	if !strings.HasPrefix(lower, "x-") {
+		return false
+	}
+	for _, reserved := range []string{"x-anthropic-", "x-claude-", "x-stainless-", "x-forwarded-", "x-proxy-", "x-auth-",
+		"x-client-version", "x-client-platform", "x-client-device", "x-device-"} {
+		if strings.HasPrefix(lower, reserved) {
+			return false
+		}
+	}
+	for _, reserved := range []string{"-api-key", "-access-token", "-authorization", "-session-id", "-account-id", "-subscription-key", "-fingerprint"} {
+		if strings.HasSuffix(lower, reserved) {
+			return false
+		}
+	}
+
+	return true
 }
 
 func doOrdinaryClaudeMessagesRequest(client *http.Client, req *http.Request) (*http.Response, error) {

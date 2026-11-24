@@ -46,7 +46,7 @@ func (u *midSystemUpstream) context(t *testing.T, headers http.Header) context.C
 	if ginCtx.Request.Header == nil {
 		ginCtx.Request.Header = make(http.Header)
 	}
-	transport := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+	transport := ordinaryClaudeTestRoundTripper(func(req *http.Request) (*http.Response, error) {
 		payload, errRead := io.ReadAll(req.Body)
 		if errRead != nil {
 			t.Fatal(errRead)
@@ -89,7 +89,7 @@ func httptest_NewRequest() *http.Request {
 
 func midSystemAuth() *cliproxyauth.Auth {
 	// No base_url, so the executor keeps Anthropic's first-party origin.
-	return &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "key-123", "cloak_mode": "always"}}
+	return &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "key-123"}}
 }
 
 func midSystemConfig() *config.Config {
@@ -112,7 +112,7 @@ func assertMidSystemRejected(t *testing.T, err error, upstream *midSystemUpstrea
 	if !errors.As(err, &scoped) || !scoped.IsRequestScoped() {
 		t.Fatalf("error = %v, want a request-scoped error so no credential is retried", err)
 	}
-	if !strings.Contains(err.Error(), "role 'system' is not supported on this model") {
+	if !strings.Contains(err.Error(), "mid-conversation system messages are not supported on this Claude model") {
 		t.Fatalf("error = %v, want Anthropic's wording preserved", err)
 	}
 }
@@ -264,25 +264,6 @@ func TestClaudeExecutor_PayloadOverrideDoesNotRerunSystemPlacement(t *testing.T)
 	}
 }
 
-func TestClaudeExecutor_ConfirmedNativeLegacyMidSystemMessageForwarded(t *testing.T) {
-	upstream := &midSystemUpstream{}
-	ex := NewClaudeExecutor(midSystemConfig())
-	headers := claudeNativeHelperHeaders("claude-code-20250219,"+claudeNativeHelperCoreBetas, "gzip, deflate, br, zstd")
-
-	if _, err := ex.Execute(upstream.context(t, headers), midSystemAuth(), cliproxyexecutor.Request{
-		Model:   "claude-haiku-4-5-20251001",
-		Payload: midSystemLegacyPayload("claude-haiku-4-5-20251001"),
-	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatClaude, Headers: headers}); err != nil {
-		t.Fatalf("Execute() error = %v, want the native body forwarded", err)
-	}
-	if !upstream.called {
-		t.Fatal("expected the native request to reach the upstream")
-	}
-	if !ojson.GetBytes(upstream.body, `messages.#(role=="system")`).Exists() {
-		t.Fatalf("confirmed native caller lost its role=system turn; body=%s", upstream.body)
-	}
-}
-
 // The rejection was measured against api.anthropic.com. A third-party gateway
 // may map the same model ID onto something that accepts the turn, and answering
 // locally would also stop failover to another credential or base URL.
@@ -327,25 +308,6 @@ func TestClaudeExecutor_SupportedModelMidSystemMessageForwarded(t *testing.T) {
 
 // The opt-in rescues the pairing by folding the turn into the system slot, so
 // the guard must run after it rather than rejecting the request outright.
-func TestClaudeExecutor_LegacyMidSystemMessageOptInStillRebuilds(t *testing.T) {
-	upstream := &midSystemUpstream{}
-	ex := NewClaudeExecutor(midSystemConfig())
-	auth := midSystemAuth()
-	auth.Attributes["rebuild_mid_system_message"] = "true"
-
-	if _, err := ex.Execute(upstream.context(t, nil), auth, cliproxyexecutor.Request{
-		Model:   "claude-haiku-4-5-20251001",
-		Payload: midSystemLegacyPayload("claude-haiku-4-5-20251001"),
-	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatClaude}); err != nil {
-		t.Fatalf("Execute() error = %v, want the opt-in rebuild to rescue the request", err)
-	}
-	if !upstream.called {
-		t.Fatal("expected the rebuilt request to reach the upstream")
-	}
-	if ojson.GetBytes(upstream.body, `messages.#(role=="system")`).Exists() {
-		t.Fatalf("opt-in rebuild left a role=system turn; body=%s", upstream.body)
-	}
-}
 
 // The pairing must never originate inside CPA. A non-Claude caller reaches the
 // Claude executor through a translator, and every translator hoists system
@@ -395,76 +357,6 @@ func TestTranslatedRequestNeverPairsLegacyModelWithMidSystemMessage(t *testing.T
 				if strings.EqualFold(role.String(), "system") {
 					t.Fatalf("translated body carries a system role; body=%s", upstream.body)
 				}
-			}
-		})
-	}
-}
-
-func TestClaudePayloadHasMidSystemMessage(t *testing.T) {
-	for _, test := range []struct {
-		name    string
-		payload string
-		want    bool
-	}{
-		{name: "mid conversation turn", want: true,
-			payload: `{"messages":[{"role":"user","content":"a"},{"role":"system","content":"s"}]}`},
-		{name: "role casing is ignored", want: true,
-			payload: `{"messages":[{"role":"SySTeM","content":"s"}]}`},
-		{name: "surrounding whitespace is ignored", want: true,
-			payload: `{"messages":[{"role":" system ","content":"s"}]}`},
-		{name: "only user and assistant turns",
-			payload: `{"messages":[{"role":"user","content":"a"},{"role":"assistant","content":"b"}]}`},
-		{name: "top level system field is not a turn",
-			payload: `{"system":[{"type":"text","text":"s"}],"messages":[{"role":"user","content":"a"}]}`},
-		{name: "messages missing", payload: `{"model":"claude-haiku-4-5"}`},
-		{name: "messages is not an array", payload: `{"messages":"system"}`},
-		{name: "messages holds a bare string", payload: `{"messages":["system"]}`},
-		{name: "system appears only in content", payload: `{"messages":[{"role":"user","content":"role: system"}]}`},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			if got := claudePayloadHasMidSystemMessage([]byte(test.payload)); got != test.want {
-				t.Fatalf("claudePayloadHasMidSystemMessage = %v, want %v", got, test.want)
-			}
-		})
-	}
-}
-
-func TestValidateClaudeMidSystemMessageModel(t *testing.T) {
-	const turn = `,"messages":[{"role":"user","content":"a"},{"role":"system","content":"s"}]}`
-	for _, test := range []struct {
-		name       string
-		payload    string
-		confirmed  bool
-		thirdParty bool
-		wantError  bool
-	}{
-		{name: "legacy model is rejected", wantError: true,
-			payload: `{"model":"claude-haiku-4-5-20251001"` + turn},
-		{name: "vendor prefixed legacy model is rejected", wantError: true,
-			payload: `{"model":"anthropic/claude-sonnet-4-6"` + turn},
-		{name: "model casing is ignored", wantError: true,
-			payload: `{"model":"Claude-Haiku-4-5-20251001"` + turn},
-		{name: "confirmed native keeps the passthrough", confirmed: true,
-			payload: `{"model":"claude-haiku-4-5-20251001"` + turn},
-		{name: "third party gateway decides for itself", thirdParty: true,
-			payload: `{"model":"claude-haiku-4-5-20251001"` + turn},
-		{name: "supported model is forwarded",
-			payload: `{"model":"claude-sonnet-5"` + turn},
-		{name: "unknown model stays optimistic",
-			payload: `{"model":"claude-sonnet-9"` + turn},
-		{name: "legacy model without the turn is forwarded",
-			payload: `{"model":"claude-haiku-4-5-20251001","messages":[{"role":"user","content":"a"}]}`},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			err := validateClaudeMidSystemMessageModel([]byte(test.payload), test.confirmed, !test.thirdParty)
-			if test.wantError != (err != nil) {
-				t.Fatalf("validateClaudeMidSystemMessageModel error = %v, want error %v", err, test.wantError)
-			}
-			if err == nil {
-				return
-			}
-			if !strings.Contains(err.Error(), ojson.Get(test.payload, "model").String()) {
-				t.Fatalf("error = %v, want the offending model named", err)
 			}
 		})
 	}
