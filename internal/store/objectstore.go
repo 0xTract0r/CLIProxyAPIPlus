@@ -49,6 +49,7 @@ type ObjectTokenStore struct {
 	spoolRoot         string
 	configPath        string
 	configMirror      remoteConfigMirror
+	authUploads       authUploadRecovery
 	authDir           string
 	mu                sync.Mutex
 	putObjectFn       func(ctx context.Context, key string, data []byte, contentType string) error
@@ -198,6 +199,9 @@ func (s *ObjectTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (s
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if err := s.guardAuthUpload(path); err != nil {
+		return "", err
+	}
 	if err = os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return "", fmt.Errorf("object store: create auth directory: %w", err)
 	}
@@ -296,6 +300,15 @@ func (s *ObjectTokenStore) List(_ context.Context) ([]*cliproxyauth.Auth, error)
 
 // Delete removes an auth file locally and remotely.
 func (s *ObjectTokenStore) Delete(ctx context.Context, id string) error {
+	return s.deleteAuth(ctx, id, false)
+}
+
+// DeleteExistingAuthFile owns both the pending-upload guard and local unlink.
+func (s *ObjectTokenStore) DeleteExistingAuthFile(ctx context.Context, path string) error {
+	return s.deleteAuth(ctx, path, true)
+}
+
+func (s *ObjectTokenStore) deleteAuth(ctx context.Context, id string, requireExisting bool) error {
 	id = strings.TrimSpace(id)
 	if id == "" {
 		return fmt.Errorf("object store: id is empty")
@@ -308,7 +321,10 @@ func (s *ObjectTokenStore) Delete(ctx context.Context, id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if err = os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+	if err := s.guardAuthUpload(path); err != nil {
+		return err
+	}
+	if err = os.Remove(path); err != nil && (requireExisting || !errors.Is(err, fs.ErrNotExist)) {
 		return fmt.Errorf("object store: delete auth file: %w", err)
 	}
 	if err = s.deleteAuthObject(ctx, path); err != nil {
@@ -335,11 +351,44 @@ func (s *ObjectTokenStore) PersistAuthFiles(ctx context.Context, _ string, paths
 		if !filepath.IsAbs(abs) {
 			abs = filepath.Join(s.authDir, trimmed)
 		}
+		if err := s.guardAuthUpload(abs); err != nil {
+			return err
+		}
 		if err := s.uploadAuth(ctx, abs); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func (s *ObjectTokenStore) authUploadID(path string) (string, error) {
+	rel, err := filepath.Rel(s.authDir, path)
+	if err != nil || !filepath.IsLocal(rel) || rel == "." {
+		return "", errors.New("object store: upload path outside managed directory")
+	}
+	return filepath.ToSlash(rel), nil
+}
+
+func (s *ObjectTokenStore) guardAuthUpload(path string) error {
+	id, err := s.authUploadID(path)
+	if err != nil {
+		return err
+	}
+	return s.authUploads.guard(id)
+}
+
+// PersistAuthUpload uses the same store mutex as Save, outside the scoped
+// installer and its credential lock.
+func (s *ObjectTokenStore) PersistAuthUpload(ctx context.Context, path string, data []byte, install func(func() error) error) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	id, err := s.authUploadID(path)
+	if err != nil {
+		return err
+	}
+	return s.authUploads.run(id, data, install, func() error {
+		return s.putObject(ctx, objectStoreAuthPrefix+"/"+id, data, "application/json")
+	})
 }
 
 // PersistConfig uploads the local configuration file to the object storage backend.

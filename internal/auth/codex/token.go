@@ -18,7 +18,10 @@ import (
 var codexFileLocks sync.Map
 
 func lockForFilePath(authFilePath string) *sync.Mutex {
-	cleaned := canonicalLockPath(authFilePath)
+	return lockForCanonicalFilePath(canonicalLockPath(authFilePath))
+}
+
+func lockForCanonicalFilePath(cleaned string) *sync.Mutex {
 	if actual, ok := codexFileLocks.Load(cleaned); ok {
 		return actual.(*sync.Mutex)
 	}

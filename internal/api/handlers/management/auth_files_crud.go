@@ -20,7 +20,6 @@ import (
 	"github.com/MoeForge/moego/json"
 	"github.com/MoeForge/moego/ojson"
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
@@ -28,7 +27,6 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/watcher/synthesizer"
 	sdkauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
-	log "github.com/sirupsen/logrus"
 )
 
 // Download single auth file by name
@@ -79,7 +77,7 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
 		return
 	}
-	ctx := c.Request.Context()
+	ctx := h.withAuthUploadSelection(c.Request.Context())
 
 	fileHeaders, errMultipart := h.multipartAuthFileHeaders(c)
 	if errMultipart != nil {
@@ -88,15 +86,8 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 	}
 	if len(fileHeaders) == 1 {
 		if _, errUpload := h.storeUploadedAuthFile(ctx, fileHeaders[0]); errUpload != nil {
-			if errors.Is(errUpload, errAuthFileMustBeJSON) {
-				c.JSON(http.StatusBadRequest, gin.H{"error": "file must be .json"})
-				return
-			}
-			if errors.Is(errUpload, errInvalidAuthFile) {
-				c.JSON(http.StatusBadRequest, gin.H{"error": errUpload.Error()})
-				return
-			}
-			c.JSON(http.StatusInternalServerError, gin.H{"error": errUpload.Error()})
+			status, failure := authUploadFailure(errUpload)
+			c.JSON(status, failure)
 			return
 		}
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
@@ -112,11 +103,10 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 				if file != nil {
 					failureName = filepath.Base(file.Filename)
 				}
-				msg := errUpload.Error()
-				if errors.Is(errUpload, errAuthFileMustBeJSON) {
-					msg = "file must be .json"
-				}
-				failed = append(failed, gin.H{"name": failureName, "error": msg})
+				status, failure := authUploadFailure(errUpload)
+				failure["name"] = failureName
+				failure["status"] = status
+				failed = append(failed, failure)
 				continue
 			}
 			uploaded = append(uploaded, name)
@@ -152,11 +142,8 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 		return
 	}
 	if err = h.writeAuthFile(ctx, filepath.Base(name), data); err != nil {
-		status := http.StatusInternalServerError
-		if errors.Is(err, errInvalidAuthFile) {
-			status = http.StatusBadRequest
-		}
-		c.JSON(status, gin.H{"error": err.Error()})
+		status, failure := authUploadFailure(err)
+		c.JSON(status, failure)
 		return
 	}
 	c.JSON(200, gin.H{"status": "ok"})
@@ -178,6 +165,7 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 		}
 		v8Mode := isV8AuthFileMutation(ctx)
 		deleted := 0
+		var failed []gin.H
 		for _, e := range entries {
 			if e.IsDir() {
 				continue
@@ -197,17 +185,14 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 				if v8Mode {
 					resolvedFull = canonicalV8AuthFilePath(full)
 				}
-				release := h.beginSIWCFileMutation(ctx, full)
-				defer release()
-				localFile, errRemove := h.unlinkAuthFileOnDisk(full)
-				if errRemove != nil {
-					return nil
-				}
-				if !localFile {
-					if errDel := h.deleteTokenRecord(ctx, full); errDel != nil {
-						return errDel
+				release, unlinkFailed, err := h.deleteAuthFileStorage(ctx, full)
+				if err != nil {
+					if unlinkFailed || authFileDeleteStorageStatus(err) == http.StatusNotFound {
+						return nil
 					}
+					return err
 				}
+				defer release()
 				deleted++
 				if v8Mode {
 					h.reconcileRemovedV8SourceAuths(ctx, full, resolvedFull, "")
@@ -217,9 +202,13 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 				return nil
 			}()
 			if errDelete != nil {
-				c.JSON(500, gin.H{"error": errDelete.Error()})
-				return
+				status := authFileDeleteStorageStatus(errDelete)
+				failed = append(failed, authFileDeleteEntryFailure(name, status, errDelete))
 			}
+		}
+		if len(failed) != 0 {
+			c.JSON(http.StatusMultiStatus, gin.H{"status": "partial", "deleted": deleted, "failed": failed})
+			return
 		}
 		c.JSON(200, gin.H{"status": "ok", "deleted": deleted})
 		return
@@ -236,7 +225,7 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 	}
 	if len(names) == 1 {
 		if _, status, errDelete := h.deleteAuthFileByName(ctx, names[0], true); errDelete != nil {
-			c.JSON(status, gin.H{"error": errDelete.Error()})
+			c.JSON(status, authFileDeleteFailure(status, errDelete))
 			return
 		}
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
@@ -246,9 +235,9 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 	deletedFiles := make([]string, 0, len(names))
 	failed := make([]gin.H, 0)
 	for _, name := range names {
-		deletedName, _, errDelete := h.deleteAuthFileByName(ctx, name, false)
+		deletedName, status, errDelete := h.deleteAuthFileByName(ctx, name, false)
 		if errDelete != nil {
-			failed = append(failed, gin.H{"name": name, "error": errDelete.Error()})
+			failed = append(failed, authFileDeleteEntryFailure(name, status, errDelete))
 			continue
 		}
 		deletedFiles = append(deletedFiles, deletedName)
@@ -330,25 +319,35 @@ func (h *Handler) writeAuthFile(ctx context.Context, name string, data []byte) e
 			return fmt.Errorf("%w: invalid proxy_url", errInvalidAuthFile)
 		}
 	}
-	if isV8AuthFileMutation(ctx) {
-		return h.writeAuthFileV8(ctx, name, data)
+	// Serialize both upload routes through disk commit and manager publication.
+	h.v8AuthUploadMu.Lock()
+	defer h.v8AuthUploadMu.Unlock()
+	ctx = h.withAuthUploadSelection(ctx)
+	selection := ctx.Value(authUploadSelectionKey{}).(authUploadSelection)
+	if err := selection.check(); err != nil {
+		return err
 	}
-	dst := filepath.Join(h.currentHandlerAuthDir(), filepath.Base(name))
-	if !filepath.IsAbs(dst) {
-		if abs, errAbs := filepath.Abs(dst); errAbs == nil {
-			dst = abs
-		}
-	}
-	auth, err := h.buildAuthFromFileData(dst, data)
+	target, err := openAuthUploadTarget(selection.dir, name)
 	if err != nil {
 		return err
 	}
-	release := h.beginSIWCFileMutation(ctx, dst)
-	defer release()
-	if errWrite := h.writeAuthFileBytes(dst, data, auth); errWrite != nil {
-		return fmt.Errorf("failed to write file: %w", errWrite)
+	defer target.root.Close()
+	target.selection = selection
+
+	if isV8AuthFileMutation(ctx) {
+		return h.writeAuthFileV8(ctx, target, data)
 	}
-	if err := h.upsertAuthRecord(ctx, auth); err != nil {
+	auth, err := h.buildAuthFromFileData(target.path, data)
+	if err != nil {
+		return err
+	}
+	if errWrite := h.commitUploadedAuth(ctx, target, data, h.shouldLockCodexAuthFile(auth)); errWrite != nil {
+		return errWrite
+	}
+	if err := h.upsertAuthRecord(target.publicationContext(ctx), auth); err != nil {
+		return err
+	}
+	if err := target.selection.check(); err != nil {
 		return err
 	}
 	if h.postAuthPersistHook != nil {
@@ -359,32 +358,31 @@ func (h *Handler) writeAuthFile(ctx context.Context, name string, data []byte) e
 	return nil
 }
 
-func (h *Handler) writeAuthFileV8(ctx context.Context, name string, data []byte) error {
-	h.v8AuthUploadMu.Lock()
-	defer h.v8AuthUploadMu.Unlock()
-
-	dst := filepath.Join(h.currentHandlerAuthDir(), filepath.Base(name))
-	if !filepath.IsAbs(dst) {
-		if abs, errAbs := filepath.Abs(dst); errAbs == nil {
-			dst = abs
-		}
-	}
-	dst = filepath.Clean(dst)
-
-	auths, metadata, errBuild := h.buildAuthsFromFileDataV8(dst, data)
+func (h *Handler) writeAuthFileV8(ctx context.Context, target *authUploadTarget, data []byte) error {
+	auths, metadata, errBuild := h.buildAuthsFromFileDataV8(target.path, data)
 	if errBuild != nil {
 		return errBuild
 	}
-	needCodexLock := h.shouldLockCodexAuthFileV8(dst, metadata, auths)
+	needCodexLock := h.shouldLockCodexAuthFileV8(target.path, metadata, auths)
 
-	release := h.beginSIWCFileMutation(ctx, dst)
-	defer release()
-
-	if errWrite := h.writeAuthFileBytesV8(dst, data, needCodexLock); errWrite != nil {
-		return fmt.Errorf("failed to write file: %w", errWrite)
+	// The callback commit gate spans replacement and publication. Invalidation
+	// happens only after a successful write, while the gate is still held.
+	h.siwcCommitMu.Lock()
+	defer h.siwcCommitMu.Unlock()
+	if errWrite := h.commitUploadedAuth(ctx, target, data, needCodexLock); errWrite != nil {
+		return errWrite
 	}
-	if errReconcile := h.reconcileV8UploadedAuths(ctx, dst, auths); errReconcile != nil {
-		return errReconcile
+	release, eligible := target.selection.begin()
+	if !eligible {
+		return coreauth.ErrAuthPublicationOutOfScope
+	}
+	h.invalidateSIWCFileMutation(target.matches)
+	release()
+	if err := h.reconcileV8UploadedAuths(target.publicationContext(ctx), target.path, auths); err != nil {
+		return err
+	}
+	if err := target.selection.check(); err != nil {
+		return err
 	}
 	if h.postAuthPersistHook != nil {
 		for _, auth := range auths {
@@ -396,63 +394,6 @@ func (h *Handler) writeAuthFileV8(ctx context.Context, name string, data []byte)
 			}
 		}
 	}
-	return nil
-}
-
-func (h *Handler) writeAuthFileBytesV8(dst string, data []byte, lockCodex bool) error {
-	if lockCodex {
-		return codex.WithFileLock(dst, func() error {
-			return writeV8AuthFilePayload(dst, data)
-		})
-	}
-	return writeV8AuthFilePayload(dst, data)
-}
-
-func writeV8AuthFilePayload(dst string, data []byte) error {
-	if info, errLstat := os.Lstat(dst); errLstat == nil && info.Mode()&os.ModeSymlink != 0 {
-		return os.WriteFile(dst, data, 0o600)
-	}
-	dir := filepath.Dir(dst)
-	if errMkdir := os.MkdirAll(dir, 0o700); errMkdir != nil {
-		return errMkdir
-	}
-	tmp, errTemp := os.CreateTemp(dir, "."+filepath.Base(dst)+".tmp-*")
-	if errTemp != nil {
-		return errTemp
-	}
-	tmpPath := tmp.Name()
-	cleanupTmp := true
-	defer func() {
-		if cleanupTmp {
-			if errRemove := os.Remove(tmpPath); errRemove != nil && !os.IsNotExist(errRemove) {
-				log.Errorf("failed to remove temporary auth file %s: %v", filepath.Base(tmpPath), errRemove)
-			}
-		}
-	}()
-	if errChmod := tmp.Chmod(0o600); errChmod != nil {
-		if errClose := tmp.Close(); errClose != nil {
-			log.Errorf("failed to close temporary auth file %s: %v", filepath.Base(tmpPath), errClose)
-		}
-		return errChmod
-	}
-	if n, errWrite := tmp.Write(data); errWrite != nil {
-		if errClose := tmp.Close(); errClose != nil {
-			log.Errorf("failed to close temporary auth file %s: %v", filepath.Base(tmpPath), errClose)
-		}
-		return errWrite
-	} else if n != len(data) {
-		if errClose := tmp.Close(); errClose != nil {
-			log.Errorf("failed to close temporary auth file %s: %v", filepath.Base(tmpPath), errClose)
-		}
-		return io.ErrShortWrite
-	}
-	if errClose := tmp.Close(); errClose != nil {
-		return errClose
-	}
-	if errRename := os.Rename(tmpPath, dst); errRename != nil {
-		return errRename
-	}
-	cleanupTmp = false
 	return nil
 }
 
@@ -478,15 +419,6 @@ func (h *Handler) shouldLockCodexAuthFileV8(dst string, metadata map[string]any,
 		}
 	}
 	return false
-}
-
-func (h *Handler) writeAuthFileBytes(dst string, data []byte, auth *coreauth.Auth) error {
-	if h.shouldLockCodexAuthFile(auth) {
-		return codex.WithFileLock(dst, func() error {
-			return os.WriteFile(dst, data, 0o600)
-		})
-	}
-	return os.WriteFile(dst, data, 0o600)
 }
 
 func (h *Handler) shouldLockCodexAuthFile(auth *coreauth.Auth) bool {
@@ -634,29 +566,96 @@ func (h *Handler) deleteAuthFileByName(ctx context.Context, name string, protect
 		status, err := h.deleteObservedLocalAuth(ctx, authDir, targetPath, observation, expected)
 		return filepath.Base(name), status, err
 	}
-	release := h.beginSIWCFileMutation(ctx, targetPath)
-	defer release()
-	localFile, errRemove := h.unlinkAuthFileOnDisk(targetPath)
+	release, _, errRemove := h.deleteAuthFileStorage(ctx, targetPath)
 	if errRemove != nil {
-		if os.IsNotExist(errRemove) {
-			return filepath.Base(name), http.StatusNotFound, errAuthFileNotFound
+		status := authFileDeleteStorageStatus(errRemove)
+		switch status {
+		case http.StatusNotFound:
+			errRemove = errAuthFileNotFound
+		case http.StatusInternalServerError:
+			errRemove = fmt.Errorf("failed to remove file: %w", errRemove)
 		}
-		if errors.Is(errRemove, coreauth.ErrFileRemovalBusy) {
-			return filepath.Base(name), http.StatusConflict, errRemove
-		}
-		return filepath.Base(name), http.StatusInternalServerError, fmt.Errorf("failed to remove file: %w", errRemove)
+		return filepath.Base(name), status, errRemove
 	}
-	if !localFile {
-		if errDeleteRecord := h.deleteTokenRecord(ctx, targetPath); errDeleteRecord != nil {
-			return filepath.Base(name), http.StatusInternalServerError, errDeleteRecord
-		}
-	}
+	defer release()
 	if isV8AuthFileMutation(ctx) {
 		h.reconcileRemovedV8SourceAuths(ctx, targetPath, resolvedTargetPath, targetID)
 	} else {
 		h.removeAuthsForPath(ctx, targetPath, targetID)
 	}
 	return filepath.Base(name), http.StatusOK, nil
+}
+
+func authFileDeleteStorageStatus(err error) int {
+	switch {
+	case errors.Is(err, coreauth.ErrFileRemovalBusy), errors.Is(err, coreauth.ErrAuthUploadPayloadConflict):
+		return http.StatusConflict
+	case errors.Is(err, coreauth.ErrAuthUploadLocalPending):
+		return http.StatusServiceUnavailable
+	case errors.Is(err, os.ErrNotExist):
+		return http.StatusNotFound
+	default:
+		return http.StatusInternalServerError
+	}
+}
+
+func authFileDeleteFailure(status int, err error) gin.H {
+	switch {
+	case status == http.StatusConflict && errors.Is(err, coreauth.ErrAuthUploadPayloadConflict):
+		return gin.H{"error": coreauth.ErrAuthUploadPayloadConflict.Error(), "code": "auth_upload_pending"}
+	case status == http.StatusServiceUnavailable && errors.Is(err, coreauth.ErrAuthUploadLocalPending):
+		return gin.H{"error": coreauth.ErrAuthUploadLocalPending.Error(), "code": "upload_local_pending"}
+	default:
+		return gin.H{"error": err.Error()}
+	}
+}
+
+func authFileDeleteEntryFailure(name string, status int, err error) gin.H {
+	failure := authFileDeleteFailure(status, err)
+	failure["name"] = name
+	failure["status"] = status
+	return failure
+}
+
+// deleteAuthFileStorage holds the existing callback gate through retirement.
+// An owning remote store checks upload state and unlinks under one lock.
+func (h *Handler) deleteAuthFileStorage(ctx context.Context, path string) (release func(), unlinkFailed bool, err error) {
+	store := h.tokenStore
+	if store == nil {
+		store = sdkauth.GetTokenStore()
+	}
+	if deleter, ok := store.(interface {
+		DeleteExistingAuthFile(context.Context, string) error
+	}); ok {
+		hasCallbackGate := ctx.Value(siwcFileMutationKey{}) == true
+		release = func() {}
+		if hasCallbackGate {
+			h.siwcCommitMu.Lock()
+			release = h.siwcCommitMu.Unlock
+		}
+		if err := deleter.DeleteExistingAuthFile(ctx, path); err != nil {
+			release()
+			return nil, false, err
+		}
+		if hasCallbackGate {
+			h.invalidateSIWCFileMutation(func(candidate string) bool { return sameSIWCMutationPath(path, candidate) })
+		}
+		return release, false, nil
+	}
+
+	release = h.beginSIWCFileMutation(ctx, path)
+	local, err := h.unlinkAuthFileOnDisk(path)
+	if err != nil {
+		release()
+		return nil, true, err
+	}
+	if !local {
+		if err := h.deleteTokenRecord(ctx, path); err != nil {
+			release()
+			return nil, false, err
+		}
+	}
+	return release, false, nil
 }
 
 // A local file store has no independent record to delete after the unlink.
@@ -1180,15 +1179,6 @@ func (h *Handler) reconcileV8UploadedAuths(ctx context.Context, dst string, auth
 			h.removeAuthAndUnregister(skipPersistCtx, existing.ID)
 		}
 	}
-	if store := h.tokenStoreWithBaseDir(); store != nil {
-		if persister, ok := store.(interface {
-			PersistAuthFiles(context.Context, string, ...string) error
-		}); ok {
-			if errPersist := persister.PersistAuthFiles(ctx, fmt.Sprintf("Upload auth %s", filepath.Base(dst)), dst); errPersist != nil {
-				log.WithError(errPersist).Warnf("failed to persist uploaded auth file %s to backing store", filepath.Base(dst))
-			}
-		}
-	}
 	return nil
 }
 
@@ -1228,16 +1218,18 @@ func (h *Handler) removeAuthAndUnregister(ctx context.Context, id string) {
 		return
 	}
 	if _, ok := h.authManager.GetByID(id); ok {
-		h.authManager.Remove(ctx, id)
-		registry.GetGlobalRegistry().UnregisterClient(id)
+		if h.authManager.RemoveIf(ctx, id, nil) {
+			registry.GetGlobalRegistry().UnregisterClient(id)
+		}
 		return
 	}
 	authID := h.authIDForPath(id)
 	if authID == "" {
 		return
 	}
-	h.authManager.Remove(ctx, authID)
-	registry.GetGlobalRegistry().UnregisterClient(authID)
+	if h.authManager.RemoveIf(ctx, authID, nil) {
+		registry.GetGlobalRegistry().UnregisterClient(authID)
+	}
 }
 
 func isReconcilableV8FileAuth(auth *coreauth.Auth) bool {

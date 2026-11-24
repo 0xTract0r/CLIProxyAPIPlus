@@ -198,6 +198,53 @@ retain the corresponding business operation's fields.
 | `/plugins/store/<id>/install` | POST | Install or update a plugin. |
 | `/plugins/<id>/quota` | GET, POST, DELETE | `GET` reads plugin quota metadata; `POST` fetches quota. `DELETE` does not call an external reset. It returns `409` for protected state or a changed selection, otherwise `501` for an eligible selected credential. |
 
+### Credential file uploads
+
+Both the v8 `POST /credentials` route and legacy `POST /v0/management/auth-files`
+atomically place uploads inside the configured credential directory. The
+configured directory can be a symlink to its intended location. A symlink
+at the credential filename is rejected with HTTP `400`.
+
+The built-in file, PostgreSQL, object and Git stores support scoped uploads.
+PostgreSQL and object storage rebuild their local mirror from the authoritative
+remote record at startup. Git publishes the verified bytes using its existing
+push lease. After an acknowledged push, a retry with the same filename and
+bytes completes outstanding local installation or index updates without
+pushing the payload again. Unrelated staged files are preserved. A conflicting
+local index entry must be resolved before that file can finish syncing.
+
+For a single file, including a multipart request containing one file, the
+status codes describe the stage that needs attention.
+
+- `502 upload_remote_unconfirmed` means the backend did not confirm the write.
+  A transport error can make the result unknown. The handler leaves the old
+  local file and active credential in place.
+- `503 upload_local_pending` means the backend confirmed the write but the
+  handler could not finish installation. Restore the selected directory if it
+  changed and retry the same filename and bytes. The store retains a digest
+  while running and completes a matching retry without another remote write.
+  Startup synchronization recovers the mirror if the process restarted.
+- `409 upload_payload_conflict` means another payload is awaiting local
+  installation for that filename. A changed credential directory is reported
+  as `409 upload_scope_changed` if no remote write was acknowledged.
+- `501` means the configured store lacks scoped upload support. The handler
+  leaves the existing credential unchanged.
+
+Multipart batches keep HTTP `207` when any file fails. Each `failed` entry
+carries its own `name`, `status`, and `error`, plus a recovery `code` when
+applicable. Retry the pending files individually or as another batch.
+
+A credential with an acknowledged upload awaiting local installation cannot be
+deleted yet. A single DELETE returns `409 auth_upload_pending` and leaves the
+old mirror and active credential in place. A store whose local state is still
+recovering can temporarily block deletion of another credential with
+`503 upload_local_pending`. Retrying the pending upload to finish installation
+allows a later DELETE to proceed.
+
+Batch DELETE, including `?all=true`, reports per-file store failures in a
+`207` response and retains the count of successful deletions. Failure to
+enumerate the directory prevents the batch from starting.
+
 ### Quota and local cooldown
 
 Quota reads and fetches report provider state. They do not reset it. The

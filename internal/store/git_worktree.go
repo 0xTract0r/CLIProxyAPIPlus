@@ -250,7 +250,7 @@ func recordGitSync(repo *git.Repository, branch plumbing.ReferenceName, oid plum
 // updateGitWorktree changes only index entries belonging to the transition.
 // A staged user edit is never replaced, even on a path selected for upload.
 // A rejected upload never calls this function at all.
-func updateGitWorktree(repo *git.Repository, repoDir string, from, to plumbing.ReferenceName, oldOID, targetOldOID, newOID plumbing.Hash, checkout bool, seed *config.ConfigFileSnapshot) error {
+func updateGitWorktree(repo *git.Repository, repoDir string, from, to plumbing.ReferenceName, oldOID, targetOldOID, newOID plumbing.Hash, checkout bool, seed *config.ConfigFileSnapshot, credentialDir string) error {
 	if errValidate := to.Validate(); errValidate != nil {
 		return errValidate
 	}
@@ -317,7 +317,7 @@ func updateGitWorktree(repo *git.Repository, repoDir string, from, to plumbing.R
 		entries := livePaths[path]
 		if sameGitEntries(oldPaths[path], entries) {
 			entries = nextPaths[path]
-		} else if checkout {
+		} else if checkout && !(gitCredentialPath(path, credentialDir) && sameGitEntries(nextPaths[path], entries)) {
 			return fmt.Errorf("remote path %s conflicts with local staged change", path)
 		}
 		liveIndex.Entries = append(liveIndex.Entries, entries...)
@@ -338,7 +338,7 @@ func updateGitWorktree(repo *git.Repository, repoDir string, from, to plumbing.R
 		}
 	}
 	if checkout {
-		if errApply := checkoutGitPaths(repo, repoDir, base, next, changed, oldPaths, nextPaths, livePaths, seed); errApply != nil {
+		if errApply := checkoutGitPaths(repo, repoDir, base, next, changed, oldPaths, nextPaths, livePaths, seed, credentialDir); errApply != nil {
 			return errApply
 		}
 	}
@@ -358,7 +358,7 @@ func updateGitWorktree(repo *git.Repository, repoDir string, from, to plumbing.R
 	return nil
 }
 
-func checkoutGitPaths(repo *git.Repository, repoDir string, base, next *object.Tree, changed []string, oldPaths, nextPaths, live map[string][]*gitindex.Entry, seed *config.ConfigFileSnapshot) (errResult error) {
+func checkoutGitPaths(repo *git.Repository, repoDir string, base, next *object.Tree, changed []string, oldPaths, nextPaths, live map[string][]*gitindex.Entry, seed *config.ConfigFileSnapshot, credentialDir string) (errResult error) {
 	before, errBefore := gitConfigBlob(base)
 	after, errAfter := gitConfigBlob(next)
 	if errConfig := errors.Join(errBefore, errAfter); errConfig != nil {
@@ -384,9 +384,20 @@ func checkoutGitPaths(repo *git.Repository, repoDir string, base, next *object.T
 		}
 	}
 	paths := make([]string, 0, len(changed))
+	var adopted []string
 	for _, path := range changed {
 		if path == gitConfigPath {
 			continue
+		}
+		if gitCredentialPath(path, credentialDir) {
+			name := filepath.FromSlash(path)
+			if matchesGitCredential(root, name, next, nextPaths[path]) {
+				adopted = append(adopted, path)
+				continue
+			}
+			if !sameGitEntries(oldPaths[path], live[path]) {
+				return gitCheckoutConflict(name)
+			}
 		}
 		// Adopt identical initialization placeholders without touching them.
 		if len(live[path]) == 0 && (path == "auths/.gitkeep" || path == "config/.gitkeep") {
@@ -415,17 +426,49 @@ func checkoutGitPaths(repo *git.Repository, repoDir string, base, next *object.T
 	if configChanged {
 		paths = append(paths, gitConfigPath)
 	}
-	for _, path := range paths {
+	for _, path := range adopted {
+		// Suppress only the exact file; keep ancestor and sibling conflicts.
+		delete(dirty, path)
+	}
+	for _, path := range append(paths, adopted...) {
 		if dirtyPath, conflict := overlappingDirtyPath(path, dirty); conflict {
 			return fmt.Errorf("remote path %s conflicts with local change %s", path, dirtyPath)
 		}
 	}
 	return applyGitCheckout(root, updates, func() error {
+		for _, path := range adopted {
+			name := filepath.FromSlash(path)
+			if !matchesGitCredential(root, name, next, nextPaths[path]) {
+				return gitCheckoutConflict(name)
+			}
+		}
 		if configChanged {
 			return applyGitConfigSnapshot(root, local, after)
 		}
 		return nil
 	})
+}
+
+// Only managed uploads at the immediate credential root can be adopted.
+func gitCredentialPath(path, credentialDir string) bool {
+	name := filepath.FromSlash(path)
+	return credentialDir != "" && validGitWorktreePath(name) && filepath.Dir(name) == credentialDir &&
+		strings.EqualFold(filepath.Ext(name), ".json")
+}
+
+// Compare bytes with the fetched tree. Keep permissions and the inode by
+// omitting the already-installed file from the checkout.
+func matchesGitCredential(root *os.Root, name string, tree *object.Tree, entries []*gitindex.Entry) bool {
+	if len(entries) != 1 || entries[0].Mode != filemode.Regular || gitPathParents(root, name, false) != nil {
+		return false
+	}
+	expected, err := gitCheckoutBlob(tree, entries)
+	if err != nil {
+		return false
+	}
+	current, err := readGitCheckoutState(root, name)
+	return err == nil && current != nil && current.mode.IsRegular() &&
+		current.mode.Perm()&0o111 == 0 && bytes.Equal(current.data, expected.data)
 }
 
 func validGitWorktreePath(path string) bool {

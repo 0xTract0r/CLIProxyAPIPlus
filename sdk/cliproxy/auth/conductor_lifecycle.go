@@ -193,7 +193,7 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 		return nil, errMutation
 	}
 	defer releaseMutation()
-	if auth.HasFileSnapshot() && !auth.FileSnapshotMatchesDisk() {
+	if auth.HasFileSnapshot() && !auth.fileSnapshotMatchesContext(ctx) {
 		return nil, ErrStaleRegistrationSnapshot
 	}
 	now := time.Now()
@@ -465,7 +465,7 @@ func (m *Manager) updateInternalLockedWithOptions(ctx context.Context, base, aut
 		}
 		// Validate file snapshot freshness under the per-auth mutation gate
 		// without holding m.mu across filesystem I/O.
-		if !auth.FileSnapshotMatchesDisk() {
+		if !auth.fileSnapshotMatchesContext(ctx) {
 			m.mu.RLock()
 			current := m.auths[auth.ID].Clone()
 			m.mu.RUnlock()
@@ -931,7 +931,14 @@ func (m *Manager) RemoveIf(ctx context.Context, id string, predicate func(*Auth)
 		return false
 	}
 	m.mu.Lock()
+	releasePublication, eligible := authPublicationFence(ctx).Begin()
+	if !eligible {
+		m.mu.Unlock()
+		persist.unlock()
+		return false
+	}
 	epoch, after := m.retireAuthLocked(ctx, id)
+	releasePublication()
 	persist.markRetired(epoch)
 	m.mu.Unlock()
 	persist.unlock()

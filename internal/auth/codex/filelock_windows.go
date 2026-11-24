@@ -19,9 +19,12 @@ const lockfileExclusiveLock = 0x00000002
 
 func acquireInterProcessLockFile(authFilePath string) (func(), error) {
 	lockPath := canonicalLockPath(authFilePath) + ".lock"
-	f, errOpen := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	return lockOpenedFile(os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600))
+}
+
+func lockOpenedFile(f *os.File, errOpen error) (func(), error) {
 	if errOpen != nil {
-		return nil, fmt.Errorf("failed to open credential lock file %s: %w", lockPath, errOpen)
+		return nil, fmt.Errorf("failed to open credential lock file: %w", errOpen)
 	}
 	var overlapped syscall.Overlapped
 	r1, _, errLock := procLockFileEx.Call(
@@ -34,7 +37,7 @@ func acquireInterProcessLockFile(authFilePath string) (func(), error) {
 	)
 	if r1 == 0 {
 		_ = f.Close()
-		return nil, fmt.Errorf("failed to lock credential file %s: %w", lockPath, errLock)
+		return nil, fmt.Errorf("failed to lock credential file %s: %w", f.Name(), errLock)
 	}
 	return func() {
 		var ov syscall.Overlapped

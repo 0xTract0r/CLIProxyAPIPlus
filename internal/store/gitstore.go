@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -17,6 +18,7 @@ import (
 	"github.com/go-git/go-git/v6/config"
 	"github.com/go-git/go-git/v6/plumbing"
 	"github.com/go-git/go-git/v6/plumbing/client"
+	"github.com/go-git/go-git/v6/plumbing/filemode"
 	gitindex "github.com/go-git/go-git/v6/plumbing/format/index"
 	"github.com/go-git/go-git/v6/plumbing/object"
 	"github.com/go-git/go-git/v6/plumbing/transport"
@@ -37,21 +39,23 @@ const (
 
 // GitTokenStore persists token records and auth metadata using git as the backing storage.
 type GitTokenStore struct {
-	mu             sync.Mutex
-	dirLock        sync.RWMutex
-	baseDir        string
-	repoDir        string
-	configDir      string
-	optionalConfig bool
-	remote         string
-	branch         string
-	username       string
-	password       string
-	lastGC         time.Time
-	syncBase       resolvedRemoteBranch
-	pullFn         func(ctx context.Context, worktree *git.Worktree, pullOpts *git.PullOptions) error
-	pushFn         func(ctx context.Context, repo *git.Repository, pushOpts *git.PushOptions) error
-	refreshClaims  sync.Map
+	uploadRecovery     authUploadRecovery
+	authUploadFinalize func() error
+	mu                 sync.Mutex
+	dirLock            sync.RWMutex
+	baseDir            string
+	repoDir            string
+	configDir          string
+	optionalConfig     bool
+	remote             string
+	branch             string
+	username           string
+	password           string
+	lastGC             time.Time
+	syncBase           resolvedRemoteBranch
+	pullFn             func(ctx context.Context, worktree *git.Worktree, pullOpts *git.PullOptions) error
+	pushFn             func(ctx context.Context, repo *git.Repository, pushOpts *git.PushOptions) error
+	refreshClaims      sync.Map
 }
 
 type resolvedRemoteBranch struct {
@@ -137,6 +141,9 @@ func (s *GitTokenStore) syncRepositoryLocked(ctx context.Context, seed *runtimec
 	if errCtx := ctx.Err(); errCtx != nil {
 		return errCtx
 	}
+	if len(s.uploadRecovery.pending) != 0 {
+		return cliproxyauth.ErrAuthUploadLocalPending
+	}
 	s.syncBase = resolvedRemoteBranch{}
 	repoDir := s.repoDirSnapshot()
 	if s.remote == "" || repoDir == "" {
@@ -216,7 +223,7 @@ func (s *GitTokenStore) syncRepositoryLocked(ctx context.Context, seed *runtimec
 			return fmt.Errorf("git token store: remote branch %s not found", target)
 		}
 		if current != target {
-			if errSwitch := updateGitWorktree(repo, repoDir, current, target, localOID, plumbing.ZeroHash, plumbing.ZeroHash, false, nil); errSwitch != nil {
+			if errSwitch := updateGitWorktree(repo, repoDir, current, target, localOID, plumbing.ZeroHash, plumbing.ZeroHash, false, nil, ""); errSwitch != nil {
 				return errSwitch
 			}
 		}
@@ -243,7 +250,7 @@ func (s *GitTokenStore) syncRepositoryLocked(ctx context.Context, seed *runtimec
 		if switchOID.IsZero() {
 			switchOID = remoteOID
 		}
-		if errCheckout := updateGitWorktree(repo, repoDir, current, target, localOID, targetOID, switchOID, true, seed); errCheckout != nil {
+		if errCheckout := updateGitWorktree(repo, repoDir, current, target, localOID, targetOID, switchOID, true, seed, ""); errCheckout != nil {
 			return errCheckout
 		}
 		localOID = switchOID
@@ -254,7 +261,7 @@ func (s *GitTokenStore) syncRepositoryLocked(ctx context.Context, seed *runtimec
 			return errAdvance
 		}
 		if advance {
-			if errCheckout := updateGitWorktree(repo, repoDir, target, target, localOID, localOID, remoteOID, true, seed); errCheckout != nil {
+			if errCheckout := updateGitWorktree(repo, repoDir, target, target, localOID, localOID, remoteOID, true, seed, filepath.Base(s.baseDirSnapshot())); errCheckout != nil {
 				return errCheckout
 			}
 			localOID = remoteOID
@@ -327,6 +334,10 @@ func (s *GitTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (stri
 	}
 	if path == "" {
 		return "", fmt.Errorf("auth filestore: missing file path attribute for %s", auth.ID)
+	}
+
+	if err := s.uploadRecovery.guard(filepath.Clean(path)); err != nil {
+		return "", err
 	}
 
 	// Runtime updates must not recreate a disabled credential whose source file
@@ -418,8 +429,12 @@ func (s *GitTokenStore) List(_ context.Context) ([]*cliproxyauth.Auth, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if err := s.ensureRepositoryLocked(); err != nil {
-		return nil, err
+	// Listing the replica is read-only. Do not synchronize shared Git
+	// metadata until a confirmed upload has completed its local installation.
+	if len(s.uploadRecovery.pending) == 0 {
+		if err := s.ensureRepositoryLocked(); err != nil {
+			return nil, err
+		}
 	}
 	dir := s.baseDirSnapshot()
 	if dir == "" {
@@ -452,7 +467,16 @@ func (s *GitTokenStore) List(_ context.Context) ([]*cliproxyauth.Auth, error) {
 }
 
 // Delete removes the auth file.
-func (s *GitTokenStore) Delete(_ context.Context, id string) error {
+func (s *GitTokenStore) Delete(ctx context.Context, id string) error {
+	return s.deleteAuth(ctx, id, false)
+}
+
+// DeleteExistingAuthFile owns both the pending-upload guard and local unlink.
+func (s *GitTokenStore) DeleteExistingAuthFile(ctx context.Context, path string) error {
+	return s.deleteAuth(ctx, path, true)
+}
+
+func (s *GitTokenStore) deleteAuth(_ context.Context, id string, requireExisting bool) error {
 	id = strings.TrimSpace(id)
 	if id == "" {
 		return fmt.Errorf("auth filestore: id is empty")
@@ -465,6 +489,15 @@ func (s *GitTokenStore) Delete(_ context.Context, id string) error {
 	if err != nil {
 		return err
 	}
+	if err := s.uploadRecovery.guard(filepath.Clean(path)); err != nil {
+		return err
+	}
+
+	if requireExisting {
+		if _, err := os.Lstat(path); err != nil {
+			return err
+		}
+	}
 	if err = s.ensureRepositoryLocked(); err != nil {
 		return err
 	}
@@ -472,7 +505,7 @@ func (s *GitTokenStore) Delete(_ context.Context, id string) error {
 	if errRel != nil {
 		return errRel
 	}
-	if err = os.Remove(path); err != nil && !os.IsNotExist(err) {
+	if err = os.Remove(path); err != nil && (requireExisting || !os.IsNotExist(err)) {
 		return fmt.Errorf("auth filestore: delete failed: %w", err)
 	}
 	messageID := id
@@ -500,6 +533,9 @@ func (s *GitTokenStore) PersistAuthFiles(_ context.Context, message string, path
 		}
 		rel, err := s.relativeToRepo(trimmed)
 		if err != nil {
+			return err
+		}
+		if err := s.uploadRecovery.guard(filepath.Join(s.repoDirSnapshot(), filepath.FromSlash(rel))); err != nil {
 			return err
 		}
 		filtered = append(filtered, rel)
@@ -1456,6 +1492,26 @@ func (s *GitTokenStore) commitAndPushSnapshotLocked(ctx context.Context, message
 	}
 	for _, path := range managedPaths {
 		switch {
+		case upload != nil && upload.path != "" && upload.path == path:
+			parent, errParent := tree.FindEntry(filepath.ToSlash(filepath.Dir(path)))
+			if errParent == nil && parent.Mode != filemode.Dir {
+				return fmt.Errorf("git token store: credential parent is not a tree")
+			}
+			if errParent != nil && !errors.Is(errParent, object.ErrEntryNotFound) {
+				return errParent
+			}
+			if errParent == nil {
+				entry, errEntry := tree.FindEntry(path)
+				if errEntry == nil && entry.Mode != filemode.Regular {
+					return fmt.Errorf("git token store: credential target is not a regular file")
+				}
+				if errEntry != nil && !errors.Is(errEntry, object.ErrEntryNotFound) {
+					return errEntry
+				}
+			}
+			if _, errStage := stageGitSnapshotBlob(candidateRepo, path, upload.data); errStage != nil {
+				return errStage
+			}
 		case path == gitConfigPath:
 			if errLocal != nil {
 				return errLocal
@@ -1497,7 +1553,8 @@ func (s *GitTokenStore) commitAndPushSnapshotLocked(ctx context.Context, message
 		if actual != expected.hash {
 			return errGitRemoteAdvanced
 		}
-		upload.hash, errCommit = verifyGitConfigBlob(repo, base, upload)
+		upload.hash, errCommit = verifyGitUpload(repo, base, upload)
+		upload.confirmed = errCommit == nil
 		return errCommit
 	}
 	if errCommit != nil {
@@ -1528,8 +1585,62 @@ func (s *GitTokenStore) commitAndPushSnapshotLocked(ctx context.Context, message
 	}
 	if upload != nil {
 		upload.hash = hash
+		upload.confirmed = true
+		if upload.path != "" {
+			upload.finalize = func() error {
+				if err := withGitRoot(repoDir, func(root *os.Root) error {
+					local, err := root.ReadFile(filepath.FromSlash(upload.path))
+					if err != nil {
+						return err
+					}
+					if !bytes.Equal(local, upload.data) {
+						return cliproxyauth.ErrAuthUploadPayloadConflict
+					}
+					return nil
+				}); err != nil {
+					return err
+				}
+				reopened, err := git.PlainOpen(repoDir)
+				if err != nil {
+					return err
+				}
+				defer reopened.Close()
+				newOID := candidate.Hash()
+				currentBranch, currentOID, err := gitHeadBranch(reopened)
+				if err != nil || currentBranch != branch {
+					return errors.Join(errGitLocalAdvanced, err)
+				}
+				if currentOID != newOID {
+					if err := updateGitWorktree(reopened, repoDir, branch, branch, base, base, newOID, false, nil, ""); err != nil {
+						return err
+					}
+				}
+				tree, err := gitTreeAt(reopened, newOID)
+				if err != nil {
+					return err
+				}
+				expected, err := tree.FindEntry(upload.path)
+				if err != nil {
+					return err
+				}
+				idx, err := reopened.Storer.Index()
+				if err != nil {
+					return err
+				}
+				actual, err := idx.Entry(upload.path)
+				if err != nil || actual.Hash != expected.Hash || actual.Mode != expected.Mode {
+					return errors.Join(errGitLocalAdvanced, err)
+				}
+				if err := recordGitSync(reopened, branch, newOID); err != nil {
+					return err
+				}
+				s.syncBase = resolvedRemoteBranch{name: branch, hash: newOID}
+				return nil
+			}
+			return nil
+		}
 	}
-	if errUpdate := updateGitWorktree(repo, repoDir, branch, branch, base, base, candidate.Hash(), false, nil); errUpdate != nil {
+	if errUpdate := updateGitWorktree(repo, repoDir, branch, branch, base, base, candidate.Hash(), false, nil, ""); errUpdate != nil {
 		// The push succeeded. Leave any concurrently committed branch alone; the
 		// next sync recognizes it as user-owned, not the previous replica tip.
 		if errors.Is(errUpdate, errGitLocalAdvanced) {
@@ -1620,7 +1731,7 @@ func (s *GitTokenStore) pushRepositoryLocked(ctx context.Context, repo *git.Repo
 	}
 	// Validate the immutable blob of the actual candidate, including when an
 	// auth-only push inherits a config or a caller stages it via another API.
-	hash, errVerify := verifyGitConfigBlob(repo, headRef.Hash(), upload)
+	hash, errVerify := verifyGitUpload(repo, headRef.Hash(), upload)
 	if errVerify != nil {
 		return "", errVerify
 	}
@@ -1632,8 +1743,13 @@ func (s *GitTokenStore) pushRepositoryLocked(ctx context.Context, repo *git.Repo
 	}
 	if errPush != nil {
 		if !errors.Is(errPush, git.NoErrAlreadyUpToDate) {
-			if actual, errList := s.refreshRemoteRef(ctx, repo, branchName); errList == nil && actual != expected {
-				return "", errors.Join(errGitRemoteAdvanced, fmt.Errorf("git token store: push: %w", errPush))
+			if actual, errList := s.refreshRemoteRef(ctx, repo, branchName); errList == nil {
+				if upload != nil && upload.path != "" && actual == headRef.Hash() {
+					return hash, nil
+				}
+				if actual != expected {
+					return "", errors.Join(errGitRemoteAdvanced, fmt.Errorf("git token store: push: %w", errPush))
+				}
 			}
 			return "", fmt.Errorf("git token store: push: %w", errPush)
 		}

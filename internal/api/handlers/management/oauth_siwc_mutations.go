@@ -47,11 +47,17 @@ func (h *Handler) beginSIWCFileMutation(ctx context.Context, path string) func()
 		return func() {}
 	}
 	h.siwcCommitMu.Lock()
+	h.invalidateSIWCFileMutation(func(candidate string) bool { return sameSIWCMutationPath(path, candidate) })
+	return h.siwcCommitMu.Unlock
+}
+
+func (h *Handler) invalidateSIWCFileMutation(matches func(string) bool) {
 	oauthSessions.mu.Lock()
+	defer oauthSessions.mu.Unlock()
 	now := time.Now()
 	for state, session := range oauthSessions.sessions {
 		flow := session.SIWC
-		if flow == nil || flow.owner != h || session.Completed || session.Status != "" || !sameSIWCMutationPath(path, flow.path) {
+		if flow == nil || flow.owner != h || session.Completed || session.Status != "" || !matches(flow.path) {
 			continue
 		}
 		// Even identical reuploads invalidate the old authorization intent.
@@ -60,8 +66,6 @@ func (h *Handler) beginSIWCFileMutation(ctx context.Context, path string) func()
 		oauthSessions.sessions[state] = session
 		flow.cancel()
 	}
-	oauthSessions.mu.Unlock()
-	return h.siwcCommitMu.Unlock
 }
 
 func sameSIWCMutationPath(a, b string) bool {

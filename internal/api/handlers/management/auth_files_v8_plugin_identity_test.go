@@ -596,7 +596,7 @@ func TestUploadAuthFileV8_FileNameMatchesWatcherSynthesisAndEmptyDefaults(t *tes
 	})
 }
 
-func TestUploadAuthFileV8_AtomicReplacementSerializationAndSymlinkDestination(t *testing.T) {
+func TestUploadAuthFileV8_AtomicReplacementAndSerialization(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
 
 	host := pluginhost.New()
@@ -622,7 +622,7 @@ func TestUploadAuthFileV8_AtomicReplacementSerializationAndSymlinkDestination(t 
 		},
 	})
 
-	t.Run("atomic-replace-regular-file-vs-v0-direct-write", func(t *testing.T) {
+	t.Run("atomic-replace-regular-file", func(t *testing.T) {
 		if runtime.GOOS == "windows" {
 			t.Skip("open-handle inode replacement check uses POSIX unlink/rename semantics")
 		}
@@ -667,42 +667,6 @@ func TestUploadAuthFileV8_AtomicReplacementSerializationAndSymlinkDestination(t 
 		oldBytes, errReadOld := io.ReadAll(oldHandle)
 		if errReadOld != nil || string(oldBytes) != initial {
 			t.Fatalf("open reader on previous inode observed mutated/partial content: %q (err=%v)", string(oldBytes), errReadOld)
-		}
-	})
-
-	t.Run("symlink-destination-retains-direct-write", func(t *testing.T) {
-		authDir := t.TempDir()
-		targetDir := t.TempDir()
-		targetPath := filepath.Join(targetDir, "real-target.json")
-		if errWrite := os.WriteFile(targetPath, []byte(`{"type":"vendor","cred_id":"vendor-before"}`), 0o600); errWrite != nil {
-			t.Fatalf("write target: %v", errWrite)
-		}
-		linkPath := filepath.Join(authDir, "linked.json")
-		if errSymlink := os.Symlink(targetPath, linkPath); errSymlink != nil {
-			t.Skipf("symlinks unavailable: %v", errSymlink)
-		}
-
-		manager := coreauth.NewManager(nil, nil, nil)
-		h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
-		h.tokenStore = &memoryAuthStore{}
-		h.SetPluginHost(host)
-		router := newV8AndV0AuthRouter(h)
-
-		updated := `{"type":"vendor","cred_id":"vendor-after"}`
-		rec := performUploadRequest(t, router, "/v8/management/credentials", false, map[string]string{"linked.json": updated}, []string{"linked.json"})
-		if rec.Code != http.StatusOK {
-			t.Fatalf("symlink v8 upload status = %d, body = %s", rec.Code, rec.Body.String())
-		}
-		lstatInfo, errLstat := os.Lstat(linkPath)
-		if errLstat != nil {
-			t.Fatalf("lstat symlink: %v", errLstat)
-		}
-		if lstatInfo.Mode()&os.ModeSymlink == 0 {
-			t.Fatal("v8 upload replaced symlink destination with regular file instead of preserving symlink")
-		}
-		targetData, errReadTarget := os.ReadFile(targetPath)
-		if errReadTarget != nil || string(targetData) != updated {
-			t.Fatalf("target file = %q (err=%v), want %q", string(targetData), errReadTarget, updated)
 		}
 	})
 
@@ -1012,7 +976,7 @@ func TestAuthFilesV8_SymlinkAuthDirUploadReconcileAndVersionedDeleteAll(t *testi
 	})
 }
 
-func TestUploadAuthFileV8_WithRealFileTokenStorePreservesSymlinkAndUploadedBytes(t *testing.T) {
+func TestUploadAuthFileV8_WithRealFileTokenStorePreservesUploadedBytes(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
 
 	t.Run("regular_file_not_rewritten_in_place_by_filestore", func(t *testing.T) {
@@ -1044,76 +1008,6 @@ func TestUploadAuthFileV8_WithRealFileTokenStorePreservesSymlinkAndUploadedBytes
 		}
 		if !bytes.Equal(diskBytes, uploadedBytes) {
 			t.Fatalf("regular.json was rewritten after upload: got %s, want exact %s", string(diskBytes), string(uploadedBytes))
-		}
-	})
-
-	t.Run("plugin_symlink_destination_preserved_with_real_filestore", func(t *testing.T) {
-		authDir := t.TempDir()
-		targetDir := t.TempDir()
-		targetPath := filepath.Join(targetDir, "real-linked.json")
-		if errWrite := os.WriteFile(targetPath, []byte(`{"type":"vendor","cred_id":"vendor:old"}`), 0o600); errWrite != nil {
-			t.Fatalf("seed symlink target: %v", errWrite)
-		}
-		symPath := filepath.Join(authDir, "linked.json")
-		if errSym := os.Symlink(targetPath, symPath); errSym != nil {
-			t.Skipf("symlinks unavailable: %v", errSym)
-		}
-
-		store := sdkAuth.NewFileTokenStore()
-		store.SetBaseDir(authDir)
-		cfg := &config.Config{AuthDir: authDir}
-		manager := coreauth.NewManager(store, nil, nil)
-		manager.SetConfig(cfg)
-
-		host := pluginhost.New()
-		host.RegisterPluginForTest("vendor-plugin", pluginapi.Plugin{
-			Capabilities: pluginapi.Capabilities{
-				AuthProvider: &v8UploadTestAuthProvider{
-					testAuthProvider: testAuthProvider{
-						identifier:  "vendor",
-						identifiers: []string{"vendor"},
-					},
-					parseFn: func(_ context.Context, req pluginapi.AuthParseRequest) (pluginapi.AuthParseResponse, error) {
-						credID := ojson.ParseBytes(req.RawJSON).Get("cred_id").String()
-						return pluginapi.AuthParseResponse{
-							Handled: true,
-							Auth: pluginapi.AuthData{
-								Provider:    "vendor",
-								ID:          credID,
-								FileName:    req.FileName,
-								StorageJSON: bytes.Clone(req.RawJSON),
-							},
-						}, nil
-					},
-				},
-			},
-		})
-
-		h := NewHandlerWithoutConfigFilePath(cfg, manager)
-		h.tokenStore = store
-		h.SetPluginHost(host)
-		router := newV8AndV0AuthRouter(h)
-
-		uploadedBytes := []byte(`{"type":"vendor","cred_id":"vendor:new-sym"}`)
-		rec := performUploadRequest(t, router, "/v8/management/credentials", false, map[string]string{
-			"linked.json": string(uploadedBytes),
-		}, []string{"linked.json"})
-		if rec.Code != http.StatusOK {
-			t.Fatalf("upload status=%d body=%s", rec.Code, rec.Body.String())
-		}
-		info, errLstat := os.Lstat(symPath)
-		if errLstat != nil {
-			t.Fatalf("lstat symlink: %v", errLstat)
-		}
-		if info.Mode()&os.ModeSymlink == 0 {
-			t.Fatalf("expected %s to remain a symlink even with FileTokenStore, got mode %v", symPath, info.Mode())
-		}
-		targetBytes, errRead := os.ReadFile(targetPath)
-		if errRead != nil {
-			t.Fatalf("read symlink target: %v", errRead)
-		}
-		if !bytes.Equal(targetBytes, uploadedBytes) {
-			t.Fatalf("symlink target bytes = %s, want %s", string(targetBytes), string(uploadedBytes))
 		}
 	})
 

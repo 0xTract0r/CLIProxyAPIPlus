@@ -938,6 +938,8 @@ func (s *oauthSessionStore) pollScoped(state string, scope oauthFileScope) (oaut
 
 // publishFileOAuthConfigLocked requires h.mu and invalidates callbacks across directory changes.
 func (h *Handler) publishFileOAuthConfigLocked(next *config.Config) {
+	h.authUploadScopeMu.Lock()
+	defer h.authUploadScopeMu.Unlock()
 	if fileOAuthConfigDir(h.cfg) != fileOAuthConfigDir(next) {
 		h.fileOAuthGeneration++
 	}

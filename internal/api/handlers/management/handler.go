@@ -71,6 +71,7 @@ type Handler struct {
 	siwcOAuthFactory        func(*config.Config, string) siwcOAuthService
 	siwcCommitMu            sync.Mutex
 	v8AuthUploadMu          sync.Mutex
+	authUploadScopeMu       sync.RWMutex
 	pluginLoginSaveMu       sync.Mutex
 }
 

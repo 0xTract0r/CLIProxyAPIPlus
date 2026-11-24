@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/go-git/go-git/v6"
 	"github.com/go-git/go-git/v6/plumbing"
@@ -24,8 +25,11 @@ var (
 )
 
 type gitConfigUpload struct {
-	data []byte
-	hash string
+	path      string
+	confirmed bool
+	finalize  func() error
+	data      []byte
+	hash      string
 }
 
 // SetOptionalConfig enables standby behavior when the config cannot be decoded
@@ -183,12 +187,16 @@ func (s *GitTokenStore) persistPreparedConfigLocked(ctx context.Context, prepare
 }
 
 func stageGitConfig(repo *git.Repository, data []byte) (bool, error) {
+	return stageGitSnapshotBlob(repo, gitConfigPath, data)
+}
+
+func stageGitSnapshotBlob(repo *git.Repository, path string, data []byte) (bool, error) {
 	index, errIndex := repo.Storer.Index()
 	if errIndex != nil {
 		return false, errIndex
 	}
 	if data == nil {
-		if _, errRemove := index.Remove(gitConfigPath); errRemove != nil {
+		if _, errRemove := index.Remove(path); errRemove != nil {
 			if errors.Is(errRemove, gitindex.ErrEntryNotFound) {
 				return false, nil
 			}
@@ -211,14 +219,14 @@ func stageGitConfig(repo *git.Repository, data []byte) (bool, error) {
 	if errStore != nil {
 		return false, errStore
 	}
-	entry, errEntry := index.Entry(gitConfigPath)
+	entry, errEntry := index.Entry(path)
 	if errors.Is(errEntry, gitindex.ErrEntryNotFound) {
-		entry, errEntry = index.Add(gitConfigPath)
+		entry, errEntry = index.Add(path)
 	}
 	if errEntry != nil {
 		return false, errEntry
 	}
-	*entry = gitindex.Entry{Name: gitConfigPath, Hash: hash, Mode: filemode.Regular, Size: uint32(len(data))}
+	*entry = gitindex.Entry{Name: path, Hash: hash, Mode: filemode.Regular, Size: uint32(len(data))}
 	return true, repo.Storer.SetIndex(index)
 }
 
@@ -340,4 +348,78 @@ func ensureGitConfigDir(repoDir string) error {
 	return withGitRoot(repoDir, func(root *os.Root) error {
 		return gitPathParents(root, filepath.FromSlash(gitConfigPath), true)
 	})
+}
+
+// PersistAuthUpload publishes the exact bytes prepared by the upload handler.
+func (s *GitTokenStore) PersistAuthUpload(ctx context.Context, path string, data []byte, install func(commitRemote func() error) error) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	dir := s.baseDirSnapshot()
+	if dir == "" || filepath.Dir(filepath.Clean(path)) != dir ||
+		!strings.EqualFold(filepath.Ext(path), ".json") || len(data) == 0 {
+		return fmt.Errorf("git token store: invalid prepared credential snapshot")
+	}
+	rel, err := s.relativeToRepo(path)
+	if err != nil {
+		return err
+	}
+	if err = s.uploadRecovery.guard(filepath.Clean(path)); err == nil {
+		if err = s.ensureRepositoryContextLocked(ctx); err != nil {
+			return err
+		}
+	}
+	rel = filepath.ToSlash(rel)
+	upload := &gitConfigUpload{path: rel, data: bytes.Clone(data)}
+	installAndFinalize := func(commitRemote func() error) error {
+		if err := install(commitRemote); err != nil {
+			return err
+		}
+		if s.authUploadFinalize != nil {
+			if err := s.authUploadFinalize(); err != nil {
+				return fmt.Errorf("finalize confirmed Git credential upload: %w", err)
+			}
+			s.authUploadFinalize = nil
+		}
+		return nil
+	}
+	return s.uploadRecovery.run(filepath.Clean(path), data, installAndFinalize, func() error {
+		err := s.commitAndPushSnapshotLocked(ctx, "Upload auth credential", false, upload, rel)
+		if upload.confirmed {
+			s.authUploadFinalize = upload.finalize
+			// The remote already has this exact blob. Let the scoped caller
+			// install it even when replica HEAD bookkeeping failed.
+			return nil
+		}
+		return err
+	})
+}
+
+func verifyGitUpload(repo *git.Repository, oid plumbing.Hash, upload *gitConfigUpload) (string, error) {
+	if upload == nil || upload.path == "" {
+		return verifyGitConfigBlob(repo, oid, upload)
+	}
+	hash, err := verifyGitConfigBlob(repo, oid, nil)
+	if err != nil {
+		return "", err
+	}
+	commit, err := repo.CommitObject(oid)
+	if err != nil {
+		return "", err
+	}
+	tree, err := commit.Tree()
+	if err != nil {
+		return "", err
+	}
+	file, err := tree.File(upload.path)
+	if err != nil {
+		return "", err
+	}
+	content, err := file.Contents()
+	if err != nil {
+		return "", err
+	}
+	if file.Mode != filemode.Regular || !bytes.Equal([]byte(content), upload.data) {
+		return "", fmt.Errorf("git credential blob differs from the prepared snapshot")
+	}
+	return hash, nil
 }

@@ -47,6 +47,7 @@ type PostgresStore struct {
 	spoolRoot          string
 	configPath         string
 	configMirror       remoteConfigMirror
+	authUploads        authUploadRecovery
 	authDir            string
 	cooldownStore      *postgresCooldownStateStore
 	mu                 sync.Mutex
@@ -267,6 +268,13 @@ func (s *PostgresStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (stri
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	relID, err := s.relativeAuthID(path)
+	if err != nil {
+		return "", err
+	}
+	if err := s.authUploads.guard(relID); err != nil {
+		return "", err
+	}
 	if err = os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return "", fmt.Errorf("postgres store: create auth directory: %w", err)
 	}
@@ -324,10 +332,6 @@ func (s *PostgresStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (stri
 		auth.FileName = auth.ID
 	}
 
-	relID, err := s.relativeAuthID(path)
-	if err != nil {
-		return "", err
-	}
 	if err = s.upsertAuthRecord(ctx, relID, path); err != nil {
 		return "", err
 	}
@@ -416,6 +420,15 @@ func (s *PostgresStore) List(ctx context.Context) ([]*cliproxyauth.Auth, error) 
 
 // Delete removes an auth file and the corresponding database record.
 func (s *PostgresStore) Delete(ctx context.Context, id string) error {
+	return s.deleteAuth(ctx, id, false)
+}
+
+// DeleteExistingAuthFile owns both the pending-upload guard and local unlink.
+func (s *PostgresStore) DeleteExistingAuthFile(ctx context.Context, path string) error {
+	return s.deleteAuth(ctx, path, true)
+}
+
+func (s *PostgresStore) deleteAuth(ctx context.Context, id string, requireExisting bool) error {
 	id = strings.TrimSpace(id)
 	if id == "" {
 		return fmt.Errorf("postgres store: id is empty")
@@ -428,12 +441,15 @@ func (s *PostgresStore) Delete(ctx context.Context, id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if err = os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return fmt.Errorf("postgres store: delete auth file: %w", err)
-	}
 	relID, err := s.relativeAuthID(path)
 	if err != nil {
 		return err
+	}
+	if err := s.authUploads.guard(relID); err != nil {
+		return err
+	}
+	if err = os.Remove(path); err != nil && (requireExisting || !errors.Is(err, fs.ErrNotExist)) {
+		return fmt.Errorf("postgres store: delete auth file: %w", err)
 	}
 	return s.deleteAuthRecord(ctx, relID)
 }
@@ -465,11 +481,26 @@ func (s *PostgresStore) PersistAuthFiles(ctx context.Context, _ string, paths ..
 			}
 			trimmed = abs
 		}
+		if err := s.authUploads.guard(relID); err != nil {
+			return err
+		}
 		if err = s.syncAuthFile(ctx, relID, trimmed); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// PersistAuthUpload commits the exact upload while holding the same store
+// mutex as Save. The scoped installer acquires any per-credential lock.
+func (s *PostgresStore) PersistAuthUpload(ctx context.Context, path string, data []byte, install func(func() error) error) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rel, err := s.relativeAuthID(path)
+	if err != nil {
+		return err
+	}
+	return s.authUploads.run(rel, data, install, func() error { return s.persistAuth(ctx, rel, data) })
 }
 
 // PersistConfig mirrors the local configuration file to PostgreSQL.
