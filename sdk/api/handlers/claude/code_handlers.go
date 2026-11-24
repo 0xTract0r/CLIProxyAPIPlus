@@ -124,6 +124,9 @@ func (h *ClaudeCodeAPIHandler) ClaudeCountTokens(c *gin.Context) {
 
 	alt := h.GetAlt(c)
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
+	if handlers.PassthroughHeadersEnabled(h.CurrentConfig()) {
+		cliCtx = coreauth.WithSelectedUpstreamResponseHeaders(cliCtx)
+	}
 
 	modelName := strings.Clone(ojson.GetBytesNoCopy(rawJSON, "model").String())
 
@@ -177,6 +180,9 @@ func (h *ClaudeCodeAPIHandler) handleNonStreamingResponse(c *gin.Context, rawJSO
 	c.Header("Content-Type", "application/json")
 	alt := h.GetAlt(c)
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
+	if handlers.PassthroughHeadersEnabled(h.CurrentConfig()) {
+		cliCtx = coreauth.WithSelectedUpstreamResponseHeaders(cliCtx)
+	}
 	stopKeepAlive := h.StartNonStreamingKeepAlive(c, cliCtx)
 
 	modelName := strings.Clone(ojson.GetBytesNoCopy(rawJSON, "model").String())
@@ -241,6 +247,9 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 	// Create a cancellable context for the backend client request
 	// This allows proper cleanup and cancellation of ongoing requests
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
+	if handlers.PassthroughHeadersEnabled(h.CurrentConfig()) {
+		cliCtx = coreauth.WithSelectedUpstreamResponseHeaders(cliCtx)
+	}
 
 	setSSEHeaders := func() {
 		c.Header("Content-Type", "text/event-stream")
@@ -661,6 +670,16 @@ func (h *ClaudeCodeAPIHandler) WriteErrorResponse(c *gin.Context, msg *interface
 		retryAfter = safeHeaders.Get("Retry-After")
 		for _, value := range safeHeaders.Values("Retry-After") {
 			c.Writer.Header().Add("Retry-After", value)
+		}
+	}
+	if msg != nil && !c.Writer.Written() && (status == http.StatusForbidden || status == http.StatusTooManyRequests) && handlers.PassthroughHeadersEnabled(h.CurrentConfig()) {
+		const traceHeader = "X-Upstream-Trace"
+		values := handlers.FilterUpstreamHeaders(coreauth.SelectedUpstreamTraceHeaders(msg.Error)).Values(traceHeader)
+		if len(values) == 1 && values[0] != "" && len(values[0]) <= 128 &&
+			strings.IndexFunc(values[0], func(r rune) bool {
+				return !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_' || r == '.' || r == ':')
+			}) == -1 && c.Writer.Header().Get(traceHeader) == "" {
+			c.Writer.Header().Set(traceHeader, values[0])
 		}
 	}
 	if msg != nil && msg.Addon != nil && handlers.PassthroughHeadersEnabled(h.CurrentConfig()) {

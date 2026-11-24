@@ -117,6 +117,46 @@ func (e *upstreamExecutionAttemptError) Headers() http.Header {
 	return nil
 }
 
+type retainSelectedResponseHeadersKey struct{}
+
+// WithSelectedUpstreamResponseHeaders lets the designated HTTP handler
+// retain provenance on provider refusals without changing SDK defaults.
+func WithSelectedUpstreamResponseHeaders(ctx context.Context) context.Context {
+	return context.WithValue(ctx, retainSelectedResponseHeadersKey{}, true)
+}
+
+func retainsSelectedRefusalHeaders(ctx context.Context, err error) bool {
+	if ctx == nil || ctx.Value(retainSelectedResponseHeadersKey{}) != true {
+		return false
+	}
+	var status interface{ StatusCode() int }
+	if !errors.As(err, &status) || !hasUpstreamExecutionAttempt(err) {
+		return false
+	}
+	return status.StatusCode() == http.StatusForbidden || status.StatusCode() == http.StatusTooManyRequests
+}
+
+// SelectedUpstreamTraceHeaders returns only the trace field and Connection
+// nominations needed to filter it, from the actual selected execution attempt.
+func SelectedUpstreamTraceHeaders(err error) http.Header {
+	var attempt *upstreamExecutionAttemptError
+	if !errors.As(err, &attempt) {
+		return nil
+	}
+	var trace http.Header
+	for key, values := range attempt.Headers() {
+		key = http.CanonicalHeaderKey(key)
+		if key != "X-Upstream-Trace" && key != "Connection" {
+			continue
+		}
+		if trace == nil {
+			trace = make(http.Header)
+		}
+		trace[key] = append(trace[key], values...)
+	}
+	return trace
+}
+
 func markUpstreamExecutionAttempt(err error) error {
 	return markUpstreamExecutionAttemptWithProvider(err, "")
 }
@@ -405,7 +445,9 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 	if pinnedThread && !ordinaryRefusal && !isRequestStopError(lastErr) {
 		lastErr = claudeThreadReplayError(lastErr)
 	}
-	lastErr = unwrapExecutionBoundaryError(lastErr)
+	if !retainsSelectedRefusalHeaders(ctx, lastErr) {
+		lastErr = unwrapExecutionBoundaryError(lastErr)
+	}
 	return cliproxyexecutor.Response{}, lastErr
 }
 
@@ -464,7 +506,9 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 			lastErr = m.annotatePoolCooldownTerminalError(ctx, normalized, retryModel, opts, lastErr, selectionCooldownDeadline)
 		}
 	}
-	lastErr = unwrapExecutionBoundaryError(lastErr)
+	if !retainsSelectedRefusalHeaders(ctx, lastErr) {
+		lastErr = unwrapExecutionBoundaryError(lastErr)
+	}
 	return cliproxyexecutor.Response{}, lastErr
 }
 
@@ -544,7 +588,9 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 		lastErr = claudeThreadReplayError(lastErr)
 	}
 	heldTerminal := isTerminalRequestStopError(lastErr)
-	lastErr = unwrapStoppedStreamError(lastErr)
+	if !retainsSelectedRefusalHeaders(ctx, lastErr) {
+		lastErr = unwrapStoppedStreamError(lastErr)
+	}
 
 	if !ordinaryRefusal && !heldTerminal {
 		var bootstrap *streamBootstrapError
