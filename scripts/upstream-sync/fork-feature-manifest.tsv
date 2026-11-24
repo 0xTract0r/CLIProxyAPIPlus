@@ -135,7 +135,7 @@ fork文件-反关联支撑	conductor_auto_quarantine.go	file	-	sdk/cliproxy/auth
 fork文件-反关联支撑	farm_pin.go	file	-	sdk/api/handlers/farm_pin.go
 fork文件-反关联支撑	provisioned_gate.go	file	-	sdk/cliproxy/auth/provisioned_gate.go
 fork文件-反关联支撑	farm_enrolled.go	file	-	sdk/cliproxy/auth/farm_enrolled.go
-fork文件-反关联支撑	tls_transport_probe/main.go	file	-	cmd/tls_transport_probe/main.go
+# The retired transport diagnostic is recorded in Git history; ordinary TLS verification has separate coverage.
 fork文件-反关联支撑	disable_image_generation_mode.go	file	-	internal/config/disable_image_generation_mode.go
 
 # === WS 出站接线【调用点】守护(2) ===
