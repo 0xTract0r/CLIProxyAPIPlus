@@ -58,6 +58,30 @@ func TestOrdinaryCodexRefreshHonorsCurrentFileSettings(t *testing.T) {
 	}
 }
 
+func TestOrdinaryCodexRefreshWithoutFileBinding(t *testing.T) {
+	dir := t.TempDir()
+	record := &coreauth.Auth{ID: "memory-only", Provider: "codex", Metadata: map[string]any{
+		"account_id": "fixture-account", "refresh_token": "fixture-refresh",
+	}}
+	calls := 0
+	grant := ordinaryCodexGrantFunc(func(_ context.Context, token string) (*codexauth.CodexTokenData, error) {
+		calls++
+		if token != "fixture-refresh" {
+			t.Fatal("unexpected grant")
+		}
+		return &codexauth.CodexTokenData{AccessToken: "fixture-updated", AccountID: "fixture-account"}, nil
+	})
+	ctx := context.WithValue(t.Context(), ordinaryCodexGrantKey{}, grant)
+	updated, err := NewCodexExecutor(&config.Config{AuthDir: dir}).Refresh(ctx, record)
+	if err != nil || calls != 1 || updated == nil || updated.Metadata["access_token"] != "fixture-updated" {
+		t.Fatalf("memory credential refresh: calls=%d err=%v", calls, err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("memory credential wrote files: count=%d err=%v", len(entries), err)
+	}
+}
+
 func TestOrdinaryClaudePausedRefreshIsANoop(t *testing.T) {
 	auth := &coreauth.Auth{Provider: "claude", Metadata: map[string]any{"refresh_token": "fixture-refresh", "account_settings": map[string]any{"refresh_enabled": false}}}
 	got, err := NewClaudeExecutor(&config.Config{}).Refresh(t.Context(), auth)

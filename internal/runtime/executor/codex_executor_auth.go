@@ -16,9 +16,11 @@ func resolveCodexAuthDiskPath(cfg *config.Config, auth *cliproxyauth.Auth) (stri
 		return "", nil
 	}
 	var candidates []string
+	fileBound := false
 	if len(auth.Attributes) > 0 {
 		if p := strings.TrimSpace(auth.Attributes[cliproxyauth.AttributePath]); p != "" {
 			candidates = append(candidates, p)
+			fileBound = true
 		}
 		if s := strings.TrimSpace(auth.Attributes[cliproxyauth.AttributeSource]); s != "" && !strings.Contains(s, ":") {
 			candidates = append(candidates, s)
@@ -34,13 +36,20 @@ func resolveCodexAuthDiskPath(cfg *config.Config, auth *cliproxyauth.Auth) (stri
 			candidates = append(candidates, filepath.Join(strings.TrimSpace(cfg.AuthDir), name))
 		}
 	}
-	for _, candidate := range candidates {
+	for i, candidate := range candidates {
+		boundPath := fileBound && i == 0
 		info, errStat := os.Stat(candidate)
 		if errStat != nil {
 			if os.IsNotExist(errStat) {
+				if boundPath {
+					return "", cliproxyauth.ErrSelectedRefreshUnavailable
+				}
 				continue
 			}
 			return "", fmt.Errorf("codex executor: stat credential file %s: %w", candidate, errStat)
+		}
+		if boundPath && !info.Mode().IsRegular() {
+			return "", cliproxyauth.ErrSelectedRefreshUnavailable
 		}
 		if !info.IsDir() {
 			canonical, errCanonical := filepath.EvalSymlinks(candidate)

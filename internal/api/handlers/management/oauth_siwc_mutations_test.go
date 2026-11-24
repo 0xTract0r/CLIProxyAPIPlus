@@ -2,67 +2,100 @@ package management
 
 import (
 	"context"
+	"errors"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/MoeForge/moego/json"
+	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
-func TestSIWCFileMutationRejectsLateExchange(t *testing.T) {
-	for _, operation := range []string{"upload", "delete", "delete-all", "delete-batch"} {
+type delayedRefreshTransport func(*http.Request) (*http.Response, error)
+
+func (rt delayedRefreshTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	return rt(req)
+}
+
+func TestOrdinaryCredentialMutationRejectsStaleOfficialRefresh(t *testing.T) {
+	for _, operation := range []string{"replace", "delete", "delete-all", "delete-batch"} {
 		t.Run(operation, func(t *testing.T) {
-			f := setupSIWCFlow(t, true)
-			f.router.POST("/credentials", f.h.UploadAuthFileV8)
-			f.router.DELETE("/credentials", f.h.DeleteAuthFileV8)
-			state, flow := f.start(t)
-			w := siwcRequest(t, f.router, http.MethodPost, "/callback", map[string]any{"state": state, "redirect_url": siwcCallbackURL(state), "provider": "codex"})
-			if w.Code != http.StatusOK {
-				t.Fatalf("callback: %d %s", w.Code, w.Body.String())
+			dir := t.TempDir()
+			path := filepath.Join(dir, "codex.json")
+			cfg := &config.Config{AuthDir: dir}
+			manager := coreauth.NewManager(nil, nil, nil)
+			manager.SetConfig(cfg)
+			h := &Handler{cfg: cfg, authManager: manager}
+			router := gin.New()
+			router.POST("/credentials", h.UploadAuthFileV8)
+			router.DELETE("/credentials", h.DeleteAuthFileV8)
+			original := []byte(`{"type":"codex","access_token":"first-access","refresh_token":"first-grant","account_id":"fixture","note":"original"}`)
+			original = []byte(strings.Replace(string(original), "first-grant", "first-grant-"+operation, 1))
+			replacement := []byte(`{"type":"codex","access_token":"second-access","refresh_token":"second-grant","account_id":"fixture","note":"replacement"}`)
+			if err := h.writeAuthFile(t.Context(), "codex.json", original); err != nil {
+				t.Fatal(err)
 			}
-			<-f.service.inputs
-			original, errRead := os.ReadFile(f.path)
-			if errRead != nil {
-				t.Fatal(errRead)
+			old, ok := manager.GetByID("codex.json")
+			if !ok {
+				t.Fatal("ordinary credential was not registered")
 			}
+			old = old.Clone()
+			if old.Attributes[coreauth.AttributePath] == "" {
+				t.Fatal("fixture credential was not bound to a file")
+			}
+
+			var response *httptest.ResponseRecorder
 			switch operation {
-			case "upload":
-				w = siwcRequest(t, f.router, http.MethodPost, "/credentials?name=codex.json", json.RawMessage(original))
+			case "replace":
+				response = siwcRequest(t, router, http.MethodPost, "/credentials?name=codex.json", json.RawMessage(replacement))
 			case "delete":
-				w = siwcRequest(t, f.router, http.MethodDelete, "/credentials?name=codex.json", nil)
+				response = siwcRequest(t, router, http.MethodDelete, "/credentials?name=codex.json", nil)
 			case "delete-all":
-				if errWrite := f.h.writeAuthFile(context.Background(), "other.json", original); errWrite != nil {
-					t.Fatal(errWrite)
+				if err := h.writeAuthFile(t.Context(), "other.json", original); err != nil {
+					t.Fatal(err)
 				}
-				w = siwcRequest(t, f.router, http.MethodDelete, "/credentials?all=true", nil)
+				response = siwcRequest(t, router, http.MethodDelete, "/credentials?all=true", nil)
 			case "delete-batch":
-				if errWrite := f.h.writeAuthFile(context.Background(), "other.json", original); errWrite != nil {
-					t.Fatal(errWrite)
+				if err := h.writeAuthFile(t.Context(), "other.json", original); err != nil {
+					t.Fatal(err)
 				}
-				w = siwcRequest(t, f.router, http.MethodDelete, "/credentials", []string{"codex.json", "other.json"})
+				response = siwcRequest(t, router, http.MethodDelete, "/credentials", []string{"codex.json", "other.json"})
 			}
-			if w.Code != http.StatusOK {
-				t.Fatalf("mutation: %d %s", w.Code, w.Body.String())
+			if response.Code != http.StatusOK {
+				t.Fatalf("mutation failed: %d %s", response.Code, response.Body.String())
 			}
-			session, ok := f.store.Get(state)
-			if !ok || session.Status == "" || session.Completed || flow.ctx.Err() == nil {
-				t.Fatal("mutation did not invalidate pending binding")
+
+			calls := 0
+			ctx := context.WithValue(t.Context(), "cliproxy.roundtripper", delayedRefreshTransport(func(*http.Request) (*http.Response, error) {
+				calls++
+				return nil, errors.New("unexpected network attempt")
+			}))
+			fresh, err := executor.NewCodexExecutor(cfg).Refresh(ctx, old)
+			if err == nil || fresh != nil || calls != 0 {
+				t.Fatalf("stale refresh: unexpectedly available=%t calls=%d error=%v", fresh != nil, calls, err)
 			}
-			f.unblock()
-			waitSIWCExchange(t, flow)
-			if operation == "upload" {
-				data, err := os.ReadFile(f.path)
-				if err != nil || string(data) != string(original) {
-					t.Fatalf("late exchange changed reupload: %s, %v", data, err)
+
+			after, readErr := os.ReadFile(path)
+			if operation == "replace" {
+				if readErr != nil || string(after) != string(replacement) {
+					t.Fatalf("stale write changed replacement: %v", readErr)
+				}
+				selected, ok := manager.GetByID("codex.json")
+				if !ok || selected.Metadata["refresh_token"] != "second-grant" {
+					t.Fatal("selected credential registration changed")
 				}
 			} else {
-				if _, err := os.Stat(f.path); !os.IsNotExist(err) {
-					t.Fatalf("deleted file resurrected: %v", err)
+				if !errors.Is(readErr, os.ErrNotExist) {
+					t.Fatalf("deleted credential reappeared: %v", readErr)
 				}
-				if _, ok := f.manager.GetByID(f.auth.ID); ok {
-					t.Fatal("deleted registration resurrected")
+				if _, ok := manager.GetByID("codex.json"); ok {
+					t.Fatal("deleted credential registration reappeared")
 				}
 			}
 		})
