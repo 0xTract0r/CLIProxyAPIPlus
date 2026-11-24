@@ -155,7 +155,7 @@ func (s *Server) setupRoutes() {
 		v1beta.GET("/models/*action", s.geminiGetHandler(geminiHandlers))
 	}
 
-	s.registerAmpModelRoutes(openaiHandlers, claudeCodeHandlers, geminiHandlers)
+	s.registerAmpModelRoutes(openaiHandlers, openaiResponsesHandlers, claudeCodeHandlers, geminiHandlers)
 
 	// Root endpoint
 	s.engine.GET("/", func(c *gin.Context) {
@@ -601,8 +601,9 @@ func isAnthropicModelsRequest(c *gin.Context) bool {
 	return strings.HasPrefix(c.GetHeader("User-Agent"), "claude-cli")
 }
 
-// registerAmpModelRoutes exposes the read-only model catalog paths used by Amp.
-func (s *Server) registerAmpModelRoutes(openaiHandler *openai.OpenAIAPIHandler, claudeHandler *claude.ClaudeCodeAPIHandler, geminiHandler *gemini.GeminiAPIHandler) {
+// registerAmpModelRoutes mounts the standard model and inference APIs under Amp's provider URLs.
+func (s *Server) registerAmpModelRoutes(openaiHandler *openai.OpenAIAPIHandler, responsesHandler *openai.OpenAIResponsesAPIHandler,
+	claudeHandler *claude.ClaudeCodeAPIHandler, geminiHandler *gemini.GeminiAPIHandler) {
 	providers := s.engine.Group("/api/provider/:provider", AuthMiddleware(s.accessManager))
 	geminiModels := s.geminiModelsHandler(geminiHandler)
 	list := func(c *gin.Context) {
@@ -631,6 +632,16 @@ func (s *Server) registerAmpModelRoutes(openaiHandler *openai.OpenAIAPIHandler, 
 	providers.GET("/v1/models", list)
 	providers.GET("/v1beta/models", geminiModels)
 	providers.GET("/v1beta/models/*action", s.geminiGetHandler(geminiHandler))
+
+	for _, prefix := range []string{"", "/v1"} {
+		providers.POST(prefix+"/chat/completions", s.ampJSONInference(openaiHandler.ChatCompletions))
+		providers.POST(prefix+"/completions", s.ampJSONInference(openaiHandler.Completions))
+		providers.POST(prefix+"/responses", s.ampJSONInference(responsesHandler.Responses))
+	}
+	providers.POST("/v1/messages", s.ampJSONInference(claudeHandler.ClaudeMessages))
+	providers.POST("/v1/messages/count_tokens", s.ampJSONInference(claudeHandler.ClaudeCountTokens))
+	providers.POST("/v1beta/models/*action", s.ampGeminiInference(geminiHandler.GeminiHandler, false))
+	providers.POST("/v1beta1/*action", s.ampGeminiInference(geminiHandler.GeminiHandler, true))
 }
 
 // unifiedModelsHandler creates a unified handler for the /v1/models endpoint

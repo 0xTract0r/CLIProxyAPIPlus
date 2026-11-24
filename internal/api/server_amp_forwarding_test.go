@@ -103,7 +103,6 @@ func TestOrdinaryAmpForwardingAndReload(t *testing.T) {
 		{http.MethodGet, "/api/user", "127.0.0.1:5300", "", 401},
 		{http.MethodGet, "/api/user", "127.0.0.1:5300", "wrong-synthetic-key", 401},
 		{http.MethodGet, "/docs", "127.0.0.1:5300", "", 401},
-		{http.MethodPost, "/api/provider/openai/v1/chat/completions", "127.0.0.1:5300", ampInboundFixture, 404},
 		{http.MethodOptions, "/api/user", "127.0.0.1:5300", "", 204},
 	} {
 		w := call(c.method, c.path, "", c.remote, c.key)

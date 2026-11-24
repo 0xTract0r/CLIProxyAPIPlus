@@ -130,42 +130,52 @@ func removeAmpCORSHeaders(h http.Header) {
 	}
 }
 
+func readyAmpForward(c *gin.Context, state *ampForwardState) bool {
+	removeAmpCORSHeaders(c.Writer.Header())
+	if state == nil || state.proxy == nil {
+		logging.SkipGinRequestLogging(c)
+		c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{"error": "Amp upstream unavailable"})
+		return false
+	}
+	if state.localhostOnly {
+		host, _, err := net.SplitHostPort(c.Request.RemoteAddr)
+		if err != nil {
+			host = c.Request.RemoteAddr
+		}
+		if ip := net.ParseIP(host); ip == nil || !ip.IsLoopback() {
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "Amp management is restricted to localhost"})
+			return false
+		}
+	}
+	return true
+}
+
+func serveAmpForward(c *gin.Context, state *ampForwardState) {
+	if c.GetString("userApiKey") == "" {
+		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Amp forwarding requires a configured API key"})
+		return
+	}
+	defer func() {
+		if recovered := recover(); recovered != nil && recovered != http.ErrAbortHandler {
+			panic(recovered)
+		}
+	}()
+	state.proxy.ServeHTTP(c.Writer, c.Request)
+}
+
 func (s *Server) registerAmpForwardRoutes() {
 	auth := AuthMiddleware(s.accessManager)
 	surface := func(c *gin.Context) {
-		removeAmpCORSHeaders(c.Writer.Header())
 		state := s.ampForward.Load()
-		if state == nil || state.proxy == nil {
-			logging.SkipGinRequestLogging(c)
-			c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{"error": "Amp upstream unavailable"})
+		if !readyAmpForward(c, state) {
 			return
-		}
-		if state.localhostOnly {
-			host, _, err := net.SplitHostPort(c.Request.RemoteAddr)
-			if err != nil {
-				host = c.Request.RemoteAddr
-			}
-			if ip := net.ParseIP(host); ip == nil || !ip.IsLoopback() {
-				c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "Amp management is restricted to localhost"})
-				return
-			}
 		}
 		// Keep the same target and locality decision for this request across hot reload.
 		c.Set("amp-forward-state", state)
 		c.Next()
 	}
 	proxy := func(c *gin.Context) {
-		if c.GetString("userApiKey") == "" {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Amp forwarding requires a configured API key"})
-			return
-		}
-		state := c.MustGet("amp-forward-state").(*ampForwardState)
-		defer func() {
-			if recovered := recover(); recovered != nil && recovered != http.ErrAbortHandler {
-				panic(recovered)
-			}
-		}()
-		state.proxy.ServeHTTP(c.Writer, c.Request)
+		serveAmpForward(c, c.MustGet("amp-forward-state").(*ampForwardState))
 	}
 	api := s.engine.Group("/api", surface, auth, proxy)
 	for _, path := range ampForwardAPIBranches {

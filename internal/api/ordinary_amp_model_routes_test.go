@@ -143,7 +143,7 @@ func TestOrdinaryAmpConnectedHomeCatalogWithServerFixture(t *testing.T) {
 	// Route through the production registration and access middleware, as the
 	// catalog fixture only simulates GET and does not run a heartbeat lifecycle.
 	server.engine = gin.New()
-	server.registerAmpModelRoutes(openai.NewOpenAIAPIHandler(server.handlers),
+	server.registerAmpModelRoutes(openai.NewOpenAIAPIHandler(server.handlers), openai.NewOpenAIResponsesAPIHandler(server.handlers),
 		claude.NewClaudeCodeAPIHandler(server.handlers), gemini.NewGeminiAPIHandler(server.handlers))
 
 	for _, row := range []struct{ path, required, excluded string }{
