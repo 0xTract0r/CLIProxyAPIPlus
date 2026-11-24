@@ -791,7 +791,15 @@ func (m *Manager) updateInternalLockedWithOptions(ctx context.Context, base, aut
 	refreshPatchBeforeSave := auth.CodexRefreshPatch
 	persistMetaMint := (mode == updateModePrepare || mode == updateModeRefresh) && strings.EqualFold(strings.TrimSpace(auth.Provider), "meta")
 	if errPersist := m.persistLocked(ctx, auth); errPersist != nil {
-		if IsExplicitCredentialEdit(ctx) {
+		if commit, ok := ctx.Value(observedRefreshCommitKey{}).(*observedRefreshCommit); ok {
+			if observedRefreshStoreConflict(errPersist) {
+				m.mu.Unlock()
+				return nil, false, baseSuperseded, false, ErrSelectedRefreshChanged
+			}
+			// The provider may already have rotated the grant. Preserve that
+			// result for this same registration, but never report durable success.
+			commit.persistErr = errPersist
+		} else if IsExplicitCredentialEdit(ctx) {
 			m.mu.Unlock()
 			return nil, false, baseSuperseded, false, &storeWriteError{cause: errPersist}
 		}
@@ -1235,6 +1243,16 @@ func (m *Manager) persist(ctx context.Context, auth *Auth) (persistErr error) {
 		return errWait
 	}
 	defer releaseFg()
+	// persistLocked has released m.mu, and persistence/foreground gates have
+	// already been acquired. Release this lease before returning to its m.mu
+	// reacquisition; no manager lock is held while waiting for scope ownership.
+	if commit, ok := ctx.Value(observedRefreshCommitKey{}).(*observedRefreshCommit); ok {
+		release, eligible := commit.begin()
+		if !eligible {
+			return ErrSelectedRefreshChanged
+		}
+		defer release()
+	}
 	_, err := store.Save(ctx, auth)
 	return err
 }

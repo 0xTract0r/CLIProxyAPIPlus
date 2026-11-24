@@ -73,6 +73,21 @@ REQUIRED = {
         "TestRegisteredLegacyClaudeReauthRequiresOneTargetAndAdmin",
     },
     "github.com/router-for-me/CLIProxyAPI/v8/internal/api/handlers/management": {
+        "TestNamedRefreshPersistenceAndVersion",
+        *(f"TestNamedRefreshPersistenceAndVersion/{version}/{case}" for version in ("v0", "v8")
+          for case in ("write_failure", "replacement", "manager_swap", "manager_shared_file",
+                       "success_query", "success_json", "success_chunked", "unauthorized")),
+        "TestNamedRefreshCommitScope",
+        *(f"TestNamedRefreshCommitScope/{version}/{case}" for version in ("v0", "v8")
+          for case in ("shared_store", "manager_ABA", "directory_ABA")),
+        "TestNamedRefreshStoreLease",
+        "TestNamedRefreshFinalBoundaries",
+        "TestNamedRefreshFinalBoundaries/nil_context",
+        "TestNamedRefreshFinalBoundaries/ordinary_io_keeps_rotated_ram",
+        *(f"TestNamedRefreshFinalBoundaries/{version}_{case}" for version in ("v0", "v8")
+          for case in ("removed", "removal_busy", "publication_scope", "payload_owner")),
+        "TestNamedRefreshNoLockCycle",
+        "TestBulkRefreshDoesNotDispatchAnObsoleteScope",
         "TestRequestRetrySaveFailurePreservesUnrelatedSave",
         "TestLocalAPIKeySaveFailureAndRetry",
         "TestLocalAPIKeysEmptyJSONShape",

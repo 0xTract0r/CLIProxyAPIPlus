@@ -321,15 +321,21 @@ func matchesAuthFileLookup(auth *coreauth.Auth, name string, authIndex string) b
 }
 
 func (h *Handler) lookupAuthFile(name string, authIndex string) (*coreauth.Auth, bool) {
-	name = strings.TrimSpace(name)
-	authIndex = strings.TrimSpace(authIndex)
-	if h == nil || (name == "" && authIndex == "") {
+	if h == nil {
 		return nil, false
 	}
 	h.mu.Lock()
 	manager := h.authManager
 	h.mu.Unlock()
-	if manager == nil {
+	return lookupAuthFileInManager(manager, name, authIndex)
+}
+
+// lookupAuthFileInManager keeps selection bound to the caller's observed manager.
+// The legacy lookup wrapper retains exactly the same matching rules.
+func lookupAuthFileInManager(manager *coreauth.Manager, name string, authIndex string) (*coreauth.Auth, bool) {
+	name = strings.TrimSpace(name)
+	authIndex = strings.TrimSpace(authIndex)
+	if manager == nil || (name == "" && authIndex == "") {
 		return nil, false
 	}
 	if authIndex == "" {

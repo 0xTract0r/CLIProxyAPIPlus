@@ -45,6 +45,45 @@ func (m *Manager) ForceRefreshSelectedAuth(ctx context.Context, observed *Auth) 
 	return refreshed, err
 }
 
+type observedRefreshCommitKey struct{}
+type observedRefreshCommit struct {
+	begin      func() (func(), bool)
+	persistErr error
+}
+
+// ForceRefreshObservedAuth refreshes the observed registration and credential
+// version. Store failures retain the rotated RAM grant and are reported to the
+// caller; provider-owned eligibility and background best-effort behavior stay
+// unchanged. beginCommit fences store I/O only, with the manager lock released.
+// Callers separately provide a nonblocking AuthPublicationFence for RAM publication.
+func (m *Manager) ForceRefreshObservedAuth(ctx context.Context, observed *Auth, beginCommit func() (func(), bool)) (*Auth, error) {
+	if m == nil || observed == nil || observed.ID == "" || observed.RegistrationEpoch == 0 || observed.CredentialVersion == 0 {
+		return nil, ErrSelectedRefreshChanged
+	}
+	if beginCommit == nil {
+		return nil, ErrSelectedRefreshChanged
+	}
+	ctx = WithForceRefresh(ctx)
+	commit := &observedRefreshCommit{begin: beginCommit}
+	ctx = context.WithValue(ctx, observedRefreshCommitKey{}, commit)
+	ctx = context.WithValue(WithoutSkipPersist(ctx), checkedStoreWriteKey{}, true)
+	refreshed, err := m.refreshAuthForRequestAtVersion(ctx, observed.ID, "", observed.RegistrationEpoch, observed.CredentialVersion)
+	if errors.Is(err, errVerifyCredentialRemoved) || errors.Is(err, errVerifyCredentialSuperseded) || observedRefreshStoreConflict(err) {
+		return nil, ErrSelectedRefreshChanged
+	}
+	if err == nil && commit.persistErr != nil {
+		return refreshed, &storeWriteError{cause: commit.persistErr}
+	}
+	return refreshed, err
+}
+
+// observedRefreshStoreConflict identifies ownership/removal conflicts, not
+// transport or disk I/O failures for the still-observed credential.
+func observedRefreshStoreConflict(err error) bool {
+	return errors.Is(err, ErrSelectedRefreshChanged) || errors.Is(err, ErrCredentialFileRemoved) || errors.Is(err, ErrFileRemovalBusy) ||
+		errors.Is(err, ErrAuthPublicationOutOfScope) || errors.Is(err, ErrAuthUploadPayloadConflict)
+}
+
 // HasSingleRefreshGrant reports whether the entry contains a single ordinary refresh grant.
 func (a *Auth) HasSingleRefreshGrant() bool { return a != nil && hasOrdinaryRefreshGrant(a) }
 

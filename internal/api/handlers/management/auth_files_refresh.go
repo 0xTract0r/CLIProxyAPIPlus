@@ -8,12 +8,21 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
 // RefreshAuthFiles triggers active refresh for a single auth file or all auth files.
 // Accepts query parameters (?all=true, ?name=file.json) or JSON body ({"all": true, "name": "file.json"}).
 func (h *Handler) RefreshAuthFiles(c *gin.Context) {
-	if h.authManager == nil {
+	if h == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
+		return
+	}
+	h.mu.Lock()
+	manager := h.authManager
+	managerGeneration, directoryGeneration := h.authManagerGeneration, h.fileOAuthGeneration
+	h.mu.Unlock()
+	if manager == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
 		return
 	}
@@ -41,8 +50,18 @@ func (h *Handler) RefreshAuthFiles(c *gin.Context) {
 
 	ctx := c.Request.Context()
 
+	sameScope := func() bool {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		return h.authManager == manager && h.authManagerGeneration == managerGeneration && h.fileOAuthGeneration == directoryGeneration
+	}
+
 	if req.All {
-		results := h.authManager.ForceRefreshAll(ctx)
+		if !sameScope() {
+			c.JSON(http.StatusConflict, gin.H{"error": "credential scope changed during refresh"})
+			return
+		}
+		results := manager.ForceRefreshAll(ctx)
 		c.JSON(http.StatusOK, gin.H{
 			"ok":      true,
 			"results": results,
@@ -56,17 +75,56 @@ func (h *Handler) RefreshAuthFiles(c *gin.Context) {
 		return
 	}
 
-	targetAuth, ok := h.lookupAuthFile(name, req.AuthIndex)
+	targetAuth, ok := lookupAuthFileInManager(manager, name, req.AuthIndex)
 	if !ok || targetAuth == nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "auth file not found"})
 		return
 	}
 
-	refreshed, err := h.authManager.ForceRefreshAuth(ctx, targetAuth.ID)
+	if !sameScope() {
+		c.JSON(http.StatusConflict, gin.H{"error": "auth file changed during refresh"})
+		return
+	}
+	beginCommit := func() (func(), bool) {
+		h.authUploadScopeMu.RLock()
+		if h.authManager != manager || h.authManagerGeneration != managerGeneration || h.fileOAuthGeneration != directoryGeneration {
+			h.authUploadScopeMu.RUnlock()
+			return nil, false
+		}
+		return h.authUploadScopeMu.RUnlock, true
+	}
+	ctx = coreauth.WithAuthPublicationFence(ctx, &coreauth.AuthPublicationFence{
+		BeginPublication: func() (func(), bool) {
+			// Publication holds manager.mu: never queue behind a scope writer.
+			if !h.authUploadScopeMu.TryRLock() {
+				return nil, false
+			}
+			if h.authManager != manager || h.authManagerGeneration != managerGeneration || h.fileOAuthGeneration != directoryGeneration {
+				h.authUploadScopeMu.RUnlock()
+				return nil, false
+			}
+			return h.authUploadScopeMu.RUnlock, true
+		},
+	})
+	refreshed, err := manager.ForceRefreshObservedAuth(ctx, targetAuth, beginCommit)
+	if errors.Is(err, coreauth.ErrSelectedRefreshChanged) {
+		c.JSON(http.StatusConflict, gin.H{"error": "auth file changed during refresh"})
+		return
+	}
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"error": err.Error(),
 		})
+		return
+	}
+
+	if refreshed == nil || !sameScope() {
+		c.JSON(http.StatusConflict, gin.H{"error": "auth file changed during refresh"})
+		return
+	}
+	current, exists := manager.GetByID(refreshed.ID)
+	if !exists || current.RegistrationEpoch != refreshed.RegistrationEpoch || current.CredentialVersion != refreshed.CredentialVersion {
+		c.JSON(http.StatusConflict, gin.H{"error": "auth file changed during refresh"})
 		return
 	}
 
