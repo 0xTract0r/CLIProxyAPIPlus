@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"compress/gzip"
 	"errors"
 	"io"
 	"net/http"
@@ -33,9 +34,24 @@ func protectAmpForwardResponse(resp *http.Response, caller, upstreamKey string) 
 	if resp.StatusCode == http.StatusSwitchingProtocols {
 		return errors.New("Amp upstream protocol upgrade is unsupported with credential forwarding")
 	}
-	for _, value := range resp.Header.Values("Content-Encoding") {
-		if encoding := strings.TrimSpace(value); encoding != "" && !strings.EqualFold(encoding, "identity") {
+	encodings := resp.Header.Values("Content-Encoding")
+	for _, value := range encodings {
+		encoding := strings.TrimSpace(value)
+		if encoding == "" || strings.EqualFold(encoding, "identity") {
+			continue
+		}
+		if len(encodings) != 1 || !strings.EqualFold(encoding, "gzip") {
 			return errors.New("unexpected Amp upstream content encoding")
+		}
+		if resp.Body != nil && resp.Body != http.NoBody {
+			decoded, err := gzip.NewReader(resp.Body)
+			if err != nil {
+				return errors.New("invalid Amp upstream gzip body")
+			}
+			resp.Body = &ampForwardGzipBody{Reader: decoded, original: resp.Body}
+			resp.ContentLength = -1
+			resp.Header.Del("Content-Encoding")
+			resp.Header.Del("Content-Length")
 		}
 	}
 	for _, secret := range []string{caller, upstreamKey} {
@@ -57,6 +73,15 @@ func protectAmpForwardResponse(resp *http.Response, caller, upstreamKey string) 
 		resp.Body = body
 	}
 	return nil
+}
+
+type ampForwardGzipBody struct {
+	*gzip.Reader
+	original io.ReadCloser
+}
+
+func (b *ampForwardGzipBody) Close() error {
+	return errors.Join(b.Reader.Close(), b.original.Close())
 }
 
 func redactAmpForwardHeaders(headers http.Header, secret string) {

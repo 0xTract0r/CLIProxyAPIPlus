@@ -7,11 +7,10 @@ import (
 	"io"
 	"maps"
 	"net/http"
-	"regexp"
 	"strings"
 
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/api/modules/amp"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
@@ -65,23 +64,10 @@ func (s *Server) ampJSONInference(handler gin.HandlerFunc) gin.HandlerFunc {
 	}
 }
 
-func (s *Server) ampGeminiInference(handler gin.HandlerFunc, vertexPath bool) gin.HandlerFunc {
+func (s *Server) ampGeminiInference(handler gin.HandlerFunc) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		action := strings.TrimPrefix(c.Param("action"), "/")
-		if vertexPath {
-			if !strings.EqualFold(c.Param("provider"), "google") {
-				c.AbortWithStatus(http.StatusNotFound)
-				return
-			}
-			_, tail, found := strings.Cut("/"+action, "/models/")
-			if !found {
-				c.AbortWithStatus(http.StatusNotFound)
-				return
-			}
-			action = tail
-		}
-		model, method, valid := strings.Cut(action, ":")
-		if !valid || model == "" || (method != "generateContent" && method != "streamGenerateContent" && method != "countTokens") {
+		model, method, valid := amp.GeminiModelAction(c.Param("action"))
+		if !valid {
 			writeAmpInferenceError(c, http.StatusNotFound, "unknown Gemini model action")
 			return
 		}
@@ -126,6 +112,41 @@ func (s *Server) ampGeminiInference(handler gin.HandlerFunc, vertexPath bool) gi
 	}
 }
 
+func (s *Server) ampGoogleV1Beta1(geminiHandler gin.HandlerFunc) gin.HandlerFunc {
+	inference := s.ampGeminiInference(geminiHandler)
+	return func(c *gin.Context) {
+		if !strings.EqualFold(c.Param("provider"), "google") {
+			c.AbortWithStatus(http.StatusNotFound)
+			return
+		}
+		if c.GetString("userApiKey") == "" {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Amp Google requires a configured API key"})
+			return
+		}
+		resource := c.Param("action")
+		if !amp.ValidGoogleResourcePath(resource) {
+			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "invalid Amp Google resource path"})
+			return
+		}
+		if c.Request.Method == http.MethodPost {
+			if action, found := amp.GoogleInferenceAction(resource); found {
+				for i := range c.Params {
+					if c.Params[i].Key == "action" {
+						c.Params[i].Value = "/" + action
+						break
+					}
+				}
+				inference(c)
+				return
+			}
+		}
+		state := s.ampForward.Load()
+		if readyAmpForward(c, state) {
+			serveAmpForward(c, state, true)
+		}
+	}
+}
+
 // Resolve from the configured catalog, independent of transient provider
 // health, authorization failures, and quota. The dispatch path is never retried
 // or changed after the ordinary handler begins processing the request.
@@ -140,7 +161,7 @@ func (s *Server) resolveAmpInference(model string) (resolved string, forward boo
 	}
 	known := ampRegisteredModel(requested)
 	if !known || cfg.AmpCode.ForceModelMappings {
-		if target := ampMappedModel(requested, cfg.AmpCode.ModelMappings); target != "" {
+		if target := amp.MatchModel(requested, cfg.AmpCode.ModelMappings); target != "" {
 			// An explicit mapping is the only chosen route; an absent target is
 			// handled by the standard endpoint, never sent to a second upstream.
 			return target, false
@@ -156,36 +177,6 @@ func ampRegisteredModel(model string) bool {
 	}
 	base := thinking.ParseSuffix(model).ModelName
 	return base != model && len(models.GetModelProviders(base)) > 0
-}
-
-func ampMappedModel(requested string, mappings []config.AmpModelMapping) string {
-	input := thinking.ParseSuffix(requested)
-	apply := func(to string) string {
-		if input.HasSuffix && !thinking.ParseSuffix(to).HasSuffix {
-			return to + "(" + input.RawSuffix + ")"
-		}
-		return to
-	}
-	for _, name := range []string{requested, input.ModelName} {
-		for _, mapping := range mappings {
-			if !mapping.Regex && strings.EqualFold(strings.TrimSpace(mapping.From), name) {
-				if to := strings.TrimSpace(mapping.To); to != "" {
-					return apply(to)
-				}
-			}
-		}
-	}
-	for _, mapping := range mappings {
-		from, to := strings.TrimSpace(mapping.From), strings.TrimSpace(mapping.To)
-		if !mapping.Regex || from == "" || to == "" {
-			continue
-		}
-		expression, err := regexp.Compile(from)
-		if err == nil && (expression.MatchString(requested) || expression.MatchString(input.ModelName)) {
-			return apply(to)
-		}
-	}
-	return ""
 }
 
 func (s *Server) forwardUnresolvedAmpInference(c *gin.Context) bool {

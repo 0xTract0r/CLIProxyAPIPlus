@@ -37,6 +37,8 @@ var ampForwardTransport = &http.Transport{
 	ExpectContinueTimeout: time.Second,
 }
 
+var ampForwardMethods = []string{http.MethodGet, http.MethodHead, http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete}
+
 var ampForwardAPIBranches = []string{"/internal", "/user", "/auth", "/meta", "/telemetry", "/threads", "/otel", "/tab"}
 var ampForwardAPIPaths = []string{"/ads", "/thread-actors"}
 var ampForwardRootBranches = []string{"/threads", "/docs", "/settings", "/auth"}
@@ -82,13 +84,17 @@ func (s *Server) reloadAmpForwarding(settings config.AmpCode, clientKeys []strin
 			req.SetURL(target)
 			for _, header := range []string{
 				"Authorization", "X-Api-Key", "X-Goog-Api-Key", "Proxy-Authorization", "Cookie",
+				"X-Auth-Token", "X-Goog-Auth-Token", "X-Serverless-Authorization", "X-Goog-Iam-Authorization-Token",
 				"Forwarded", "X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto", "X-Real-Ip",
 			} {
 				req.Out.Header.Del(header)
 			}
 			query := req.Out.URL.Query()
-			for _, name := range []string{"key", "auth_token", "api_key", "access_token"} {
-				query.Del(name)
+			for name := range query {
+				switch strings.ToLower(name) {
+				case "key", "auth_token", "access_token", "oauth_token", "authorization", "api_key", "api-key", "apikey", "x-api-key", "x-goog-api-key":
+					query.Del(name)
+				}
 			}
 			req.Out.URL.RawQuery = query.Encode()
 		},
@@ -204,11 +210,14 @@ func serveAmpForward(c *gin.Context, state *ampForwardState, requireBinding bool
 		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Amp forwarding requires a configured API key"})
 		return
 	}
+	if !configaccess.RequestPresentsInlineKey(c.Request, caller) {
+		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "Amp forwarding requires possession of the authenticated API key"})
+		return
+	}
 	key := state.serviceKey
 	if requireBinding || state.tenantControl {
 		key = state.bindings[caller]
-		if key == "" || c.GetString("accessProvider") != sdkaccess.DefaultAccessProviderName ||
-			!configaccess.RequestPresentsInlineKey(c.Request, caller) {
+		if key == "" || c.GetString("accessProvider") != sdkaccess.DefaultAccessProviderName {
 			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "Amp upstream access is not configured for this API key"})
 			return
 		}
@@ -251,17 +260,21 @@ func (s *Server) registerAmpForwardRoutes() {
 		}
 	}
 	api := s.engine.Group("/api", surface, auth, proxy)
-	for _, path := range ampForwardAPIBranches {
-		api.Any(path)
-		api.Any(path + "/*path")
-	}
-	for _, path := range ampForwardAPIPaths {
-		api.Any(path)
+	for _, method := range ampForwardMethods {
+		for _, path := range ampForwardAPIBranches {
+			api.Handle(method, path)
+			api.Handle(method, path+"/*path")
+		}
+		for _, path := range ampForwardAPIPaths {
+			api.Handle(method, path)
+		}
 	}
 	for _, path := range ampForwardRootBranches {
 		if path == "/auth" {
-			s.engine.Any(path, surface, auth, proxy)
-			s.engine.Any(path+"/*path", surface, auth, proxy)
+			for _, method := range ampForwardMethods {
+				s.engine.Handle(method, path, surface, auth, proxy)
+				s.engine.Handle(method, path+"/*path", surface, auth, proxy)
+			}
 		} else {
 			s.engine.GET(path, surface, auth, proxy)
 			s.engine.GET(path+"/*path", surface, auth, proxy)

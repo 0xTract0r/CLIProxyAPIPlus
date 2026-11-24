@@ -118,7 +118,13 @@ fork路由-管理端点	logs-compress-after-days	route	/logs-compress-after-days
 反关联-内建OAuth代理接线	proxy写落库record	pattern	applyOAuthAccountSetupToRecord\(record, setup\)	internal/api/handlers/management/auth_files_provider_oauth.go
 
 # === fork 自定义模块/反关联支撑文件存在性(19) ===
-fork文件-amp模块	internal/api/modules/amp/	file	-	internal/api/modules/amp
+Amp-active	model-alias-mapper	symbol	^func MatchModel\(	internal/api/modules/amp/model_mapping.go
+Amp-active	model-alias-wiring	pattern	amp\.MatchModel\(requested,	internal/api/server_amp_inference.go
+Amp-active	google-v1beta1-resource-route	route	providers\.Handle\(method, "/v1beta1/\*action", googleResource\)	internal/api/server_routes.go
+Amp-active	google-v1beta1-resource-regression	symbol	^func TestOrdinaryAmpGoogleResourceMethodsRequireBoundCaller\(	internal/api/server_amp_google_resources_test.go
+Amp-active	forward-route-regression	symbol	^func TestOrdinaryAmpRegisteredRoutesHaveHandlers\(	internal/api/server_amp_routes_contract_test.go
+Amp-active	bound-caller-cold-revocation	symbol	^func TestOrdinaryAmpBindingRevocationSurvivesManagementSaveAndRestart\(	internal/api/server_amp_tenant_test.go
+Amp-active	ordinary-response-names	symbol	^func TestOrdinaryAmpClientResponseNames\(	internal/api/server_amp_response_names_test.go
 fork文件-反关联支撑	provider_tls_probe.go(helps)	file	-	internal/runtime/executor/helps/provider_tls_probe.go
 fork文件-反关联支撑	tls_evidence_capture.go	file	-	internal/runtime/executor/helps/tls_evidence_capture.go
 fork文件-反关联支撑	codex_client_profile.go	file	-	internal/runtime/executor/helps/codex_client_profile.go

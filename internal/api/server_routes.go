@@ -640,8 +640,11 @@ func (s *Server) registerAmpModelRoutes(openaiHandler *openai.OpenAIAPIHandler, 
 	}
 	providers.POST("/v1/messages", s.ampJSONInference(claudeHandler.ClaudeMessages))
 	providers.POST("/v1/messages/count_tokens", s.ampJSONInference(claudeHandler.ClaudeCountTokens))
-	providers.POST("/v1beta/models/*action", s.ampGeminiInference(geminiHandler.GeminiHandler, false))
-	providers.POST("/v1beta1/*action", s.ampGeminiInference(geminiHandler.GeminiHandler, true))
+	providers.POST("/v1beta/models/*action", s.ampGeminiInference(geminiHandler.GeminiHandler))
+	googleResource := s.ampGoogleV1Beta1(geminiHandler.GeminiHandler)
+	for _, method := range ampForwardMethods {
+		providers.Handle(method, "/v1beta1/*action", googleResource)
+	}
 }
 
 // unifiedModelsHandler creates a unified handler for the /v1/models endpoint

@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/api/modules/amp"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v8/sdk/access"
@@ -215,13 +216,13 @@ func TestOrdinaryAmpMappingExactBeatsRegexAndPreservesThinkingSuffix(t *testing.
 		{From: "custom/source", To: "custom/exact-target"},
 		{From: "custom/source(high)", To: "custom/override-low(low)"},
 	}
-	if got := ampMappedModel("custom/source(high)", configured); got != "custom/override-low(low)" {
+	if got := amp.MatchModel("custom/source(high)", configured); got != "custom/override-low(low)" {
 		t.Fatalf("specific mapping was not preferred: %s", got)
 	}
-	if got := ampMappedModel("custom/source(medium)", configured); got != "custom/exact-target(medium)" {
+	if got := amp.MatchModel("custom/source(medium)", configured); got != "custom/exact-target(medium)" {
 		t.Fatalf("thinking selection did not round-trip: %s", got)
 	}
-	if got := ampMappedModel("custom/next", configured); got != "custom/regex-target" {
+	if got := amp.MatchModel("custom/next", configured); got != "custom/regex-target" {
 		t.Fatalf("regular expression routing not used: %s", got)
 	}
 }

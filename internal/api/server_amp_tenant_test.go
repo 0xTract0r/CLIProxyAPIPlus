@@ -341,6 +341,8 @@ ampcode:
 	})
 	call(cold, http.MethodGet, controlPath, client, "", http.StatusForbidden)
 	call(cold, http.MethodPost, fallbackPath, client, `{"model":"synthetic-unresolved"}`, http.StatusForbidden)
+	call(cold, http.MethodPost, "/api/provider/google/v1beta1/projects/fixture/files", client,
+		`{"displayName":"revoked after restart"}`, http.StatusForbidden)
 	if !coldConfig.AmpCode.RequireUpstreamAPIKeyBinding || len(coldConfig.AmpCode.UpstreamAPIKeys) != 0 || coldConfig.AmpCode.UpstreamAPIKey != legacy {
 		t.Fatal("saved configuration did not retain tenant mode and the legacy setting while removing the binding")
 	}

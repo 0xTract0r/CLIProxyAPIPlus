@@ -5,7 +5,13 @@ fork路由-管理端点	proxy-connectivity-probe	route	/diagnostics/proxy-connec
 fork路由-管理端点	usage/pricing	route	"/usage/pricing"	internal/api/server_management.go
 fork路由-管理端点	quota/snapshots	route	/quota/snapshots	internal/api/server_management.go
 fork路由-管理端点	logs-compress-after-days	route	/logs-compress-after-days	internal/api/server_management.go
-fork文件-amp模块	internal/api/modules/amp/	file	-	internal/api/modules/amp
+Amp-active	model-alias-mapper	symbol	^func MatchModel\(	internal/api/modules/amp/model_mapping.go
+Amp-active	model-alias-wiring	pattern	amp\.MatchModel\(requested,	internal/api/server_amp_inference.go
+Amp-active	google-v1beta1-resource-route	route	providers\.Handle\(method, "/v1beta1/\*action", googleResource\)	internal/api/server_routes.go
+Amp-active	google-v1beta1-resource-regression	symbol	^func TestOrdinaryAmpGoogleResourceMethodsRequireBoundCaller\(	internal/api/server_amp_google_resources_test.go
+Amp-active	forward-route-regression	symbol	^func TestOrdinaryAmpRegisteredRoutesHaveHandlers\(	internal/api/server_amp_routes_contract_test.go
+Amp-active	bound-caller-cold-revocation	symbol	^func TestOrdinaryAmpBindingRevocationSurvivesManagementSaveAndRestart\(	internal/api/server_amp_tenant_test.go
+Amp-active	ordinary-response-names	symbol	^func TestOrdinaryAmpClientResponseNames\(	internal/api/server_amp_response_names_test.go
 fork文件-反关联支撑	proxy_helpers.go	file	-	internal/runtime/executor/helps/proxy_helpers.go
 fork文件-反关联支撑	disable_image_generation_mode.go	file	-	internal/config/disable_image_generation_mode.go
 fork路由-Amp管理	ampcode(base)	route	mgmt\.GET\("/ampcode", s\.mgmt\.GetAmpCode\)	internal/api/server_management.go
