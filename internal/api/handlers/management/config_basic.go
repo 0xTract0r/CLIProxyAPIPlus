@@ -235,7 +235,7 @@ func (h *Handler) PutUsageStatisticsEnabled(c *gin.Context) {
 
 // LoggingToFile
 func (h *Handler) GetLoggingToFile(c *gin.Context) {
-	readLogConfigField(h, c, "logging-to-file", func(cfg *config.Config) bool { return cfg.LoggingToFile })
+	readConfigField(h, c, "logging-to-file", func(cfg *config.Config) bool { return cfg.LoggingToFile })
 }
 func (h *Handler) PutLoggingToFile(c *gin.Context) {
 	putLogBoolField(h, c, func(cfg *config.Config) *bool { return &cfg.LoggingToFile })
@@ -243,7 +243,7 @@ func (h *Handler) PutLoggingToFile(c *gin.Context) {
 
 // LogsMaxTotalSizeMB
 func (h *Handler) GetLogsMaxTotalSizeMB(c *gin.Context) {
-	readLogConfigField(h, c, "logs-max-total-size-mb", func(cfg *config.Config) int { return cfg.LogsMaxTotalSizeMB })
+	readConfigField(h, c, "logs-max-total-size-mb", func(cfg *config.Config) int { return cfg.LogsMaxTotalSizeMB })
 }
 func (h *Handler) PutLogsMaxTotalSizeMB(c *gin.Context) {
 	var body struct {
@@ -257,12 +257,12 @@ func (h *Handler) PutLogsMaxTotalSizeMB(c *gin.Context) {
 	if value < 0 {
 		value = 0
 	}
-	saveLogConfigField(h, c, func(cfg *config.Config) *int { return &cfg.LogsMaxTotalSizeMB }, value)
+	saveConfigField(h, c, func(cfg *config.Config) *int { return &cfg.LogsMaxTotalSizeMB }, value)
 }
 
 // ErrorLogsMaxFiles
 func (h *Handler) GetErrorLogsMaxFiles(c *gin.Context) {
-	readLogConfigField(h, c, "error-logs-max-files", func(cfg *config.Config) int { return cfg.ErrorLogsMaxFiles })
+	readConfigField(h, c, "error-logs-max-files", func(cfg *config.Config) int { return cfg.ErrorLogsMaxFiles })
 }
 func (h *Handler) PutErrorLogsMaxFiles(c *gin.Context) {
 	var body struct {
@@ -276,18 +276,18 @@ func (h *Handler) PutErrorLogsMaxFiles(c *gin.Context) {
 	if value < 0 {
 		value = 10
 	}
-	saveLogConfigField(h, c, func(cfg *config.Config) *int { return &cfg.ErrorLogsMaxFiles }, value)
+	saveConfigField(h, c, func(cfg *config.Config) *int { return &cfg.ErrorLogsMaxFiles }, value)
 }
 
 // Request log
 func (h *Handler) GetRequestLog(c *gin.Context) {
-	readLogConfigField(h, c, "request-log", func(cfg *config.Config) bool { return cfg.RequestLog })
+	readConfigField(h, c, "request-log", func(cfg *config.Config) bool { return cfg.RequestLog })
 }
 func (h *Handler) PutRequestLog(c *gin.Context) {
 	putLogBoolField(h, c, func(cfg *config.Config) *bool { return &cfg.RequestLog })
 }
 
-func readLogConfigField[T any](h *Handler, c *gin.Context, key string, field func(*config.Config) T) {
+func readConfigField[T any](h *Handler, c *gin.Context, key string, field func(*config.Config) T) {
 	h.mu.Lock()
 	if h.cfg == nil {
 		h.mu.Unlock()
@@ -307,10 +307,10 @@ func putLogBoolField(h *Handler, c *gin.Context, field func(*config.Config) *boo
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
 		return
 	}
-	saveLogConfigField(h, c, field, *body.Value)
+	saveConfigField(h, c, field, *body.Value)
 }
 
-func saveLogConfigField[T any](h *Handler, c *gin.Context, field func(*config.Config) *T, value T) {
+func saveConfigField[T any](h *Handler, c *gin.Context, field func(*config.Config) *T, value T) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.cfg == nil {
@@ -336,10 +336,17 @@ func (h *Handler) PutWebsocketAuth(c *gin.Context) {
 
 // Request retry
 func (h *Handler) GetRequestRetry(c *gin.Context) {
-	c.JSON(200, gin.H{"request-retry": h.cfg.RequestRetry})
+	readConfigField(h, c, "request-retry", func(cfg *config.Config) int { return cfg.RequestRetry })
 }
 func (h *Handler) PutRequestRetry(c *gin.Context) {
-	h.updateIntField(c, func(v int) { h.cfg.RequestRetry = v })
+	var body struct {
+		Value *int `json:"value"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil || body.Value == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+		return
+	}
+	saveConfigField(h, c, func(cfg *config.Config) *int { return &cfg.RequestRetry }, *body.Value)
 }
 
 // Max retry credentials

@@ -147,3 +147,28 @@ func TestManagementWritesSurviveConcurrentReloadPublications_Issue6631(t *testin
 		t.Fatalf("config.yaml = request-retry %d, max-retry-credentials %d; want %d, %d", disk.RequestRetry, disk.MaxRetryCredentials, writes, writes)
 	}
 }
+
+func TestRequestRetrySaveFailurePreservesUnrelatedSave(t *testing.T) {
+	const route = "/v0/management/request-retry"
+	h, path, router := newIssue6631Handler(t, "request-retry: 3\n")
+	router.GET(route, h.GetRequestRetry)
+	router.PUT("/v0/management/logging-to-file", h.PutLoggingToFile)
+	before := h.cfg.SourceHash
+	h.configFilePath = t.TempDir()
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodPut, route, strings.NewReader(`{"value":0}`)))
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("expected save failure, got %d", rec.Code)
+	}
+	h.configFilePath = path
+	rec = httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, route, nil))
+	if rec.Code != http.StatusOK || rec.Body.String() != `{"request-retry":3}` || h.cfg.SourceHash != before {
+		t.Fatal("failed write changed the published retry count or config revision")
+	}
+	putIssue6631Value(t, router, "/v0/management/logging-to-file", `{"value":true}`)
+	disk := readIssue6631Disk(t, path)
+	if !disk.LoggingToFile || disk.RequestRetry != 3 {
+		t.Fatal("unrelated save persisted the rejected retry count")
+	}
+}
