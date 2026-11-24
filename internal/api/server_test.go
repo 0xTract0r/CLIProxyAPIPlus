@@ -3104,49 +3104,44 @@ func TestInteractionsRouteRegistered(t *testing.T) {
 
 func TestUpdateClientsContext_AntigravityConnectionPoolPurgesTransports(t *testing.T) {
 	server := newTestServer(t)
+	runtimehelps.ResetProxyTransports()
+	t.Cleanup(runtimehelps.ResetProxyTransports)
 
 	enabled := true
 	disabled := false
-
 	cfg1 := *server.cfg
 	cfg1.Antigravity.ConnectionPool.Enabled = &enabled
 	cfg1.Antigravity.ConnectionPool.IdleConnTimeout = "30s"
 	server.oldConfigYaml, _ = yaml.Marshal(&cfg1)
 
-	// Pre-populate the cache before reload
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer srv.Close()
-
-	testAuth := &auth.Auth{
-		ID:         "hot-reload-test-auth",
-		Provider:   "antigravity",
-		Attributes: map[string]string{"base_url": srv.URL},
-		Metadata: map[string]any{
-			"access_token": "token",
-			"project_id":   "proj",
-			"expired":      time.Now().Add(time.Hour).Format(time.RFC3339),
-		},
+	// A separate stable snapshot keeps the transport key fixed through reload.
+	// This checks the production cache eviction without dialing any endpoint.
+	transportConfig := &proxyconfig.Config{}
+	credential := &auth.Auth{
+		ID: "reload-pool-fixture", Provider: "antigravity", ProxyURL: "direct",
+		ProxyConnectionPool: &auth.ProxyConnectionPoolOverride{Enabled: &enabled},
 	}
-	exec := executor.NewAntigravityExecutor(&cfg1)
-	req := httptest.NewRequest(http.MethodGet, srv.URL, nil)
-	_, _ = exec.HttpRequest(context.Background(), testAuth, req)
-
-	if executor.AntigravityTransportsLen() == 0 {
-		t.Fatal("expected Antigravity transports to be cached before hot reload")
+	transport := func() http.RoundTripper {
+		return runtimehelps.NewProxyAwareHTTPClient(context.Background(), transportConfig, credential, 0).Transport
+	}
+	before := transport()
+	if before == nil || before != transport() {
+		t.Fatal("standard transport was not cached before reload")
 	}
 
 	cfg2 := cfg1
 	cfg2.Antigravity.ConnectionPool.Enabled = &disabled
 	cfg2.Antigravity.ConnectionPool.IdleConnTimeout = "10s"
-
 	if ok := server.UpdateClientsContext(context.Background(), &cfg2); !ok {
 		t.Fatal("UpdateClientsContext returned false")
 	}
 
-	if got := executor.AntigravityTransportsLen(); got != 0 {
-		t.Fatalf("AntigravityTransportsLen() after reload = %d, want 0", got)
+	after := transport()
+	if after == nil || after == before {
+		t.Fatal("hot reload retained the old cached transport")
+	}
+	if after != transport() {
+		t.Fatal("new standard transport was not cached")
 	}
 }
 

@@ -986,7 +986,10 @@ func TestSynthesizeFileAuths_RestoresQuarantineStateOnColdLoad(t *testing.T) {
 		IDGenerator: NewStableIDGenerator(),
 	}
 
-	auths := SynthesizeAuthFile(ctx, fullPath, data)
+	auths, err := SynthesizeAuthFile(ctx, fullPath, data)
+	if err != nil {
+		t.Fatalf("SynthesizeAuthFile() error: %v", err)
+	}
 	if len(auths) != 1 {
 		t.Fatalf("SynthesizeAuthFile() len = %d, want 1", len(auths))
 	}
@@ -1036,7 +1039,10 @@ func TestSynthesizeFileAuths_DisabledTakesPriorityOverQuarantinedStatus(t *testi
 		IDGenerator: NewStableIDGenerator(),
 	}
 
-	auths := SynthesizeAuthFile(ctx, fullPath, data)
+	auths, err := SynthesizeAuthFile(ctx, fullPath, data)
+	if err != nil {
+		t.Fatalf("SynthesizeAuthFile() error: %v", err)
+	}
 	if len(auths) != 1 {
 		t.Fatalf("SynthesizeAuthFile() len = %d, want 1", len(auths))
 	}
