@@ -689,8 +689,9 @@ type RealtimeRateWindow struct {
 	// Name is the window token verbatim from the header (e.g. "5h", "7d",
 	// "7d_oi" for Claude; "codex_primary" / "codex_secondary" for Codex).
 	Name string
-	// UtilizationPercent is the upstream-reported utilization as a 0-100
-	// percentage, clamped defensively.
+	// UtilizationPercent is the upstream-reported utilization normalised to a
+	// 0-100 percentage, clamped defensively. Claude reports a 0-1 fraction
+	// (scaled x100 in parseClaudeRealtimeWindows); Codex already reports 0-100.
 	UtilizationPercent float64
 	// Status is the upstream status token lowercased (e.g. "allowed",
 	// "rejected"), empty when the response carried none.
@@ -828,8 +829,17 @@ func parseClaudeRealtimeWindows(headers http.Header, now time.Time) map[string]*
 		raw := strings.TrimSpace(vals[0])
 		switch field {
 		case "utilization":
+			// Unit: the upstream anthropic-ratelimit-unified-<window>-utilization
+			// value is a 0-1 FRACTION, not a 0-100 percentage. Scale by 100 here so
+			// UtilizationPercent matches the snapshot's percent scale and
+			// Headroom()'s 1-v/100; IngestServingRateHeaders still clamps via
+			// clampUtilizationPercent on store. Production evidence: one account
+			// returned 0.62-0.66 while its quota snapshot read five_hour=62% at the
+			// same moment; another returned 0.02. Storing the raw value read 0.66
+			// as 0.66%, so a busy account looked ~99% free and adaptive weighting
+			// favoured exactly the accounts already carrying traffic.
 			if f, err := strconv.ParseFloat(raw, 64); err == nil {
-				entry.UtilizationPercent = f
+				entry.UtilizationPercent = f * 100
 				entry.hasUtil = true
 			}
 		case "status":
