@@ -23,6 +23,7 @@ import (
 	"github.com/MoeForge/moego/json"
 	"github.com/MoeForge/moego/ojson"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/ordinaryconnect"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
@@ -1100,7 +1101,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			defer releaseAdmission()
 		}
 		didRefreshOnUnauthorized := false
-		for _, upstreamModel := range models {
+		for modelIndex, upstreamModel := range models {
 			execCtx = m.newUpstreamAttemptContext(execCtx)
 			resultModel := m.stateModelForExecution(auth, routeModel, upstreamModel, pooled)
 			execReq := req
@@ -1167,7 +1168,11 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			executionSeq := m.nextExecutionSeq()
 			startExec := time.Now()
 			var preRefreshExecErr error
-			resp, errExec := executor.Execute(execCtx, auth, execReq, execOpts)
+			executeCtx := execCtx
+			if retryRound == 0 && !homeMode && len(attempted) == 1 && !execOpts.Stream && modelIndex == 0 {
+				executeCtx = ordinaryconnect.Allow(execCtx, auth.ID, effectiveRequestRetryLimit(auth, defaultRequestRetry))
+			}
+			resp, errExec := executor.Execute(executeCtx, auth, execReq, execOpts)
 			syncActiveAuth()
 			errExec = markUpstreamExecutionAttemptFromContext(execCtx, errExec)
 			durationExec := time.Since(startExec)
@@ -1230,7 +1235,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				} else if preRefreshExecErr != nil {
 					syncPreferredUpstreamError(&upstreamErr, preRefreshExecErr)
 				}
-				if isRequestStopError(errExec) || isOrdinaryUpstreamRefusal(errExec) {
+				if ordinaryconnect.Exhausted(executeCtx) || isRequestStopError(errExec) || isOrdinaryUpstreamRefusal(errExec) {
 					return cliproxyexecutor.Response{}, errExec
 				}
 				if isExecutorHTTPRejection(errExec) {

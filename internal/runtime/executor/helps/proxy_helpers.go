@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/ordinaryconnect"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/httptransport"
@@ -77,6 +78,10 @@ func NewProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 	// Priority 1 & 2: Explicit proxy URL takes precedence over context RoundTripper.
 	if proxyURL != "" {
 		if transport := pooledProxyTransport(proxyURL, cfg, auth); transport != nil {
+			settings, _ := proxyutil.Parse(proxyURL)
+			if _, pooled := resolveProxyPoolSettings(auth); settings.Mode == proxyutil.ModeDirect && !pooled {
+				ordinaryconnect.Wrap(ctx, transport)
+			}
 			httpClient.Transport = transport
 			return httpClient
 		}

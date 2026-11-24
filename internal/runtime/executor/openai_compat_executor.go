@@ -20,6 +20,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/misc"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/ordinaryconnect"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
@@ -216,6 +217,10 @@ func (e *OpenAICompatExecutor) executeWithCredentials(ctx context.Context, auth 
 		AuthValue: authValue,
 	})
 
+	if auth != nil && !opts.Stream && endpoint == "/chat/completions" {
+		ctx = ordinaryconnect.Bind(ctx, auth.ID, httpReq.URL)
+		httpReq = httpReq.WithContext(ctx)
+	}
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
 	httpClient = reporter.TrackHTTPClient(httpClient)
 	httpResp, err := httpClient.Do(httpReq)
