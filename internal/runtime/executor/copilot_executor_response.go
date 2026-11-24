@@ -3,10 +3,12 @@ package executor
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net/http"
 
 	"github.com/MoeForge/moego/ojson"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/translator/common"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
@@ -21,6 +23,11 @@ func (e *CopilotExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, 
 	}
 	reporter := helps.NewExecutorUsageReporter(ctx, e, prepared.route.Info.ID, auth)
 	defer reporter.TrackFailure(ctx, &err)
+	defer func() {
+		if err != nil {
+			helps.RecordAPIResponseError(ctx, e.cfg, errors.New("copilot: upstream response did not complete"))
+		}
+	}()
 	resp, err := e.send(ctx, auth, opts, &prepared, reporter)
 	if err != nil {
 		return cliproxyexecutor.Response{}, err
@@ -82,11 +89,11 @@ func (e *CopilotExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.
 		return nil, err
 	}
 	out := make(chan cliproxyexecutor.StreamChunk)
-	go e.copilotStream(ctx, req, opts, prepared, resp.Body, reporter, out)
+	go e.copilotStream(ctx, req, opts, prepared, resp.Body, reporter, logging.DeferredAPICaptureFromContext(ctx), out)
 	return &cliproxyexecutor.StreamResult{Headers: resp.Header.Clone(), Chunks: out}, nil
 }
 
-func (e *CopilotExecutor) copilotStream(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, prepared copilotPreparedRequest, body io.ReadCloser, reporter *helps.UsageReporter, out chan<- cliproxyexecutor.StreamChunk) {
+func (e *CopilotExecutor) copilotStream(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, prepared copilotPreparedRequest, body io.ReadCloser, reporter *helps.UsageReporter, capture *logging.DeferredAPICapture, out chan<- cliproxyexecutor.StreamChunk) {
 	defer close(out)
 	defer closeCopilotResponse(body)
 	scanner := helps.NewCodexSSEScanner(ctx, body, 16<<20)
@@ -112,6 +119,7 @@ func (e *CopilotExecutor) copilotStream(ctx context.Context, req cliproxyexecuto
 		}
 	}
 	fail := func(err error) {
+		capture.RecordResponseError(errors.New("copilot: upstream stream did not complete"))
 		usage.PublishFailure(ctx, reporter, err)
 		emit(cliproxyexecutor.StreamChunk{Err: err})
 	}

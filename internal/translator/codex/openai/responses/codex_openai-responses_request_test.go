@@ -507,8 +507,11 @@ func TestConvertOpenAIResponsesRequestToCodex_ServiceTierCompatibility(t *testin
 				"input": [{"role":"user","content":"hello"}]
 			}`)
 
-			output := ConvertOpenAIResponsesRequestToCodex("gpt-5.2", inputJSON, false)
-			got := gjson.GetBytes(output, "service_tier")
+			output, err := ConvertOpenAIResponsesRequestToCodex("gpt-5.2", inputJSON, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := ojson.GetBytes(output, "service_tier")
 
 			if got.Exists() != tt.wantExists {
 				t.Fatalf("service_tier exists = %v, want %v: %s", got.Exists(), tt.wantExists, string(output))

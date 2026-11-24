@@ -98,6 +98,7 @@ type Params struct {
 	CurrentToolIsParameterless bool   // Whether the open tool_use block was declared parameterless
 	CurrentToolInputEmitted    bool   // Whether cleaned input JSON was already emitted for the open tool_use block
 	CurrentToolPendingEmpty    bool   // Whether an empty "{}" input_json_delta is deferred awaiting tool_use completion
+	CurrentToolArgumentsOpen   bool
 }
 
 // toolUseIDCounter provides a process-wide unique counter for tool use identifiers.
@@ -173,12 +174,10 @@ func ConvertAntigravityResponseToClaude(ctx context.Context, _ string, originalR
 		}
 		if isAntigravityMalformedFunctionCall(params.FinishReason, params.HasVisibleOutput) {
 			if params.ResponseType != 0 {
-				if params.ResponseType == 3 && params.CurrentToolPendingEmpty && !params.CurrentToolInputEmitted {
-					deltaDoc := ojson.NewDocString(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"input_json_delta","partial_json":""}}`, params.ResponseIndex))
-					_ = deltaDoc.Set("delta.partial_json", "{}")
-					output = translatorcommon.AppendSSEEventString(output, "content_block_delta", deltaDoc.String(), 3)
-					params.CurrentToolInputEmitted = true
-					params.CurrentToolPendingEmpty = false
+				if params.ResponseType == 3 {
+					flushOrdinaryClaudeToolArguments(params, func(event, payload string) {
+						output = translatorcommon.AppendSSEEventString(output, event, payload, 3)
+					})
 				}
 				output = translatorcommon.AppendSSEEventString(output, "content_block_stop", fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, params.ResponseIndex), 3)
 				params.ResponseType = 0
@@ -235,11 +234,8 @@ func ConvertAntigravityResponseToClaude(ctx context.Context, _ string, originalR
 		params.HasContent = true
 	}
 	flushPendingToolInput := func() {
-		if params.ResponseType == 3 && params.CurrentToolPendingEmpty && !params.CurrentToolInputEmitted {
-			data, _ := ojson.SetBytes([]byte(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"input_json_delta","partial_json":""}}`, params.ResponseIndex)), "delta.partial_json", "{}")
-			appendEvent("content_block_delta", string(data))
-			params.CurrentToolInputEmitted = true
-			params.CurrentToolPendingEmpty = false
+		if params.ResponseType == 3 {
+			flushOrdinaryClaudeToolArguments(params, appendEvent)
 		}
 	}
 	closeCurrentBlock := func() {
@@ -463,7 +459,10 @@ func ConvertAntigravityResponseToClaude(ctx context.Context, _ string, originalR
 							params.CurrentToolInputEmitted = true
 							params.CurrentToolPendingEmpty = false
 						}
-						if partialJSON != "" || !params.CurrentToolPendingEmpty {
+						if !params.CurrentToolIsParameterless {
+							partialJSON = ordinaryClaudeToolArgumentFragment(params, partialJSON)
+						}
+						if partialJSON != "" {
 							data, _ := ojson.SetBytes([]byte(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"input_json_delta","partial_json":""}}`, params.ResponseIndex)), "delta.partial_json", partialJSON)
 							appendEvent("content_block_delta", string(data))
 						}
@@ -501,6 +500,7 @@ func ConvertAntigravityResponseToClaude(ctx context.Context, _ string, originalR
 				params.CurrentToolIsParameterless = util.ClaudeToolIsParameterless(fcName, originalRequestRawJSON)
 				params.CurrentToolInputEmitted = false
 				params.CurrentToolPendingEmpty = false
+				params.CurrentToolArgumentsOpen = false
 				// Start a new tool use content block
 				// This creates the structure for a function call in Claude Code format
 				// Create the tool use block with unique ID and function details
@@ -527,7 +527,10 @@ func ConvertAntigravityResponseToClaude(ctx context.Context, _ string, originalR
 					} else if cleanArgs != "" {
 						params.CurrentToolInputEmitted = true
 					}
-					if cleanArgs != "" || !params.CurrentToolPendingEmpty {
+					if !params.CurrentToolIsParameterless {
+						cleanArgs = ordinaryClaudeToolArgumentFragment(params, cleanArgs)
+					}
+					if cleanArgs != "" {
 						data, _ := ojson.SetBytes([]byte(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"input_json_delta","partial_json":""}}`, params.ResponseIndex)), "delta.partial_json", cleanArgs)
 						appendEvent("content_block_delta", string(data))
 					}
@@ -630,11 +633,10 @@ func appendFinalEvents(params *Params, output *[]byte, force bool) {
 		return
 	}
 
-	if params.ResponseType == 3 && params.CurrentToolPendingEmpty && !params.CurrentToolInputEmitted {
-		data, _ := ojson.SetBytes([]byte(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"input_json_delta","partial_json":""}}`, params.ResponseIndex)), "delta.partial_json", "{}")
-		*output = translatorcommon.AppendSSEEventString(*output, "content_block_delta", string(data), 3)
-		params.CurrentToolInputEmitted = true
-		params.CurrentToolPendingEmpty = false
+	if params.ResponseType == 3 {
+		flushOrdinaryClaudeToolArguments(params, func(event, payload string) {
+			*output = translatorcommon.AppendSSEEventString(*output, event, payload, 3)
+		})
 	}
 	if params.ResponseType != 0 {
 		*output = translatorcommon.AppendSSEEventString(*output, "content_block_stop", fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, params.ResponseIndex), 3)
@@ -941,4 +943,36 @@ func ConvertAntigravityResponseToClaudeNonStream(_ context.Context, _ string, or
 
 func ClaudeTokenCount(ctx context.Context, count int64) []byte {
 	return translatorcommon.ClaudeInputTokensJSON(count)
+}
+
+func ordinaryClaudeToolArgumentFragment(params *Params, raw string) string {
+	if len(raw) < 2 || raw[0] != '{' || raw[len(raw)-1] != '}' {
+		return raw
+	}
+	fields := strings.TrimSpace(raw[1 : len(raw)-1])
+	if fields == "" {
+		return ""
+	}
+	if params.CurrentToolArgumentsOpen {
+		return "," + fields
+	}
+	params.CurrentToolArgumentsOpen = true
+	return "{" + fields
+}
+
+func flushOrdinaryClaudeToolArguments(params *Params, appendEvent func(string, string)) {
+	part := ""
+	if params.CurrentToolArgumentsOpen {
+		part = "}"
+		params.CurrentToolArgumentsOpen = false
+	} else if params.CurrentToolPendingEmpty && !params.CurrentToolInputEmitted {
+		part = "{}"
+		params.CurrentToolInputEmitted = true
+	}
+	params.CurrentToolPendingEmpty = false
+	if part == "" {
+		return
+	}
+	data, _ := ojson.SetBytes([]byte(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"input_json_delta","partial_json":""}}`, params.ResponseIndex)), "delta.partial_json", part)
+	appendEvent("content_block_delta", string(data))
 }

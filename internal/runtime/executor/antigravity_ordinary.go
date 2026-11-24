@@ -13,8 +13,10 @@ import (
 	"time"
 
 	"github.com/MoeForge/moego/ojson"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
+	antigravitythinking "github.com/router-for-me/CLIProxyAPI/v8/internal/thinking/provider/antigravity"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
@@ -119,6 +121,9 @@ func (e *AntigravityExecutor) ordinaryAntigravitySend(ctx context.Context, auth 
 	}
 	setup := helps.NewPayloadFinalizer(e.cfg, e.Identifier(), model, to.String(), "request", translatedOriginal, req, opts)
 	helps.FinalizePayloadDoc(helps.WithPayloadFinalizer(ctx, setup), doc)
+	if err := normalizeOrdinaryAntigravityLevel(doc); err != nil {
+		return nil, nil, err
+	}
 	if path != antigravityCountTokensPath {
 		project := antigravityProjectIDFromAuth(auth)
 		if project == "" {
@@ -127,8 +132,11 @@ func (e *AntigravityExecutor) ordinaryAntigravitySend(ctx context.Context, auth 
 		_ = doc.Set("project", project)
 		_ = doc.Set("model", model)
 	} else {
-		for _, key := range []string{"project", "model", "request.safetySettings", "request.toolConfig", "request.labels", "request.sessionId"} {
+		for _, key := range []string{"project", "model", "request.safetySettings", "request.toolConfig", "request.labels", "request.sessionId", "request.stream"} {
 			_ = doc.Delete(key)
+		}
+		if model != "" {
+			_ = doc.Set("request.model", "models/"+strings.TrimPrefix(model, "models/"))
 		}
 	}
 	// Provider-supplied thought signatures are opaque. Do not repair, generate,
@@ -167,7 +175,7 @@ func (e *AntigravityExecutor) ordinaryAntigravitySend(ctx context.Context, auth 
 		if msg == "" {
 			msg = http.StatusText(resp.StatusCode)
 		}
-		return nil, nil, statusErr{code: resp.StatusCode, msg: msg, retryAfter: parseRetryAfterHeader(resp.Header, time.Now())}
+		return nil, nil, statusErr{code: resp.StatusCode, msg: msg, retryAfter: ordinaryAntigravityRetryHint(resp.StatusCode, resp.Header, b)}
 	}
 	decoded, err := helps.DecodeResponseBody(resp.Body, resp.Header)
 	if err != nil {
@@ -193,12 +201,21 @@ func (e *AntigravityExecutor) Execute(ctx context.Context, auth *cliproxyauth.Au
 	if len(raw) > ordinaryAntigravityBodyLimit || !ojson.ValidBytes(raw) {
 		return cliproxyexecutor.Response{}, statusErr{code: 502, msg: "invalid Antigravity response"}
 	}
-	reporter.Publish(ctx, helps.ParseAntigravityUsage(raw))
+	if err := ordinaryAntigravityInBandError(raw, resp.Header); err != nil {
+		return cliproxyexecutor.Response{}, err
+	}
+	if message, blocked := clienterror.GeminiFilterBlockMessage(raw); blocked {
+		return cliproxyexecutor.Response{}, statusErr{code: http.StatusBadRequest, msg: message, requestScoped: true}
+	}
 	var state any
 	out := sdktranslator.TranslateNonStream(ctx, sdktranslator.FromString("antigravity"), cliproxyexecutor.ResponseFormatOrSource(opts), req.Model, opts.OriginalRequest, body, raw, &state)
+	if err := helps.ApplyPatchTranslationError(state); err != nil {
+		return cliproxyexecutor.Response{}, statusErr{code: http.StatusBadGateway, msg: helps.ApplyPatchUpstreamErrorMessage}
+	}
 	if len(out) == 0 {
 		return cliproxyexecutor.Response{}, statusErr{code: 502, msg: "empty Antigravity response"}
 	}
+	reporter.Publish(ctx, helps.ParseAntigravityUsage(raw))
 	return cliproxyexecutor.Response{Payload: out, Headers: resp.Header.Clone()}, nil
 }
 
@@ -221,7 +238,12 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 				return true
 			}
 		}
-		fail := func(err error) { reporter.PublishFailure(ctx, err); send(cliproxyexecutor.StreamChunk{Err: err}) }
+		var usage helps.StreamUsageBuffer
+		fail := func(err error) {
+			usage.PublishFailure(ctx, reporter, err)
+			send(cliproxyexecutor.StreamChunk{Err: err})
+		}
+		var pendingFilter string
 		scanner := bufio.NewScanner(resp.Body)
 		scanner.Buffer(nil, 16<<20)
 		var state any
@@ -232,24 +254,47 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 				data = bytes.TrimSpace(data)
 				if bytes.Equal(data, []byte("[DONE]")) {
 					completed = true
+					if pendingFilter == "" {
+						chunks := sdktranslator.TranslateStream(ctx, sdktranslator.FromString("antigravity"), cliproxyexecutor.ResponseFormatOrSource(opts), req.Model, opts.OriginalRequest, body, data, &state)
+						if helps.ApplyPatchTranslationError(state) != nil {
+							fail(statusErr{code: http.StatusBadGateway, msg: helps.ApplyPatchUpstreamErrorMessage})
+							return
+						}
+						for _, chunk := range chunks {
+							if len(chunk) > 0 && !send(cliproxyexecutor.StreamChunk{Payload: chunk}) {
+								return
+							}
+						}
+					}
 					break
 				}
 				if !ojson.ValidBytes(data) {
 					fail(statusErr{code: 502, msg: "invalid Antigravity SSE frame"})
 					return
 				}
-				if errorCode := ojson.GetBytesNoCopy(data, "error.code").Int(); errorCode >= 400 && errorCode <= 599 {
-					fail(statusErr{code: int(errorCode), msg: ojson.GetBytesNoCopy(data, "error.message").String()})
+				if err := ordinaryAntigravityInBandError(data, resp.Header); err != nil {
+					fail(err)
 					return
 				}
-				if ojson.GetBytesNoCopy(data, "response.candidates.0.finishReason").Exists() || ojson.GetBytesNoCopy(data, "candidates.0.finishReason").Exists() {
-					completed = true
+				completed = completed || ordinaryAntigravityHasTerminalReason(data)
+				usage.Observe(helps.ParseAntigravityStreamUsage(line))
+				if message, blocked := clienterror.GeminiFilterBlockMessage(data); blocked {
+					pendingFilter = message
+					continue
 				}
-				if usage, ok := helps.ParseAntigravityStreamUsage(line); ok {
-					reporter.Publish(ctx, usage)
+				if pendingFilter != "" {
+					if !ordinaryAntigravityHasOutput(data) {
+						continue
+					}
+					pendingFilter = ""
 				}
 			}
-			for _, chunk := range sdktranslator.TranslateStream(ctx, sdktranslator.FromString("antigravity"), cliproxyexecutor.ResponseFormatOrSource(opts), req.Model, opts.OriginalRequest, body, line, &state) {
+			chunks := sdktranslator.TranslateStream(ctx, sdktranslator.FromString("antigravity"), cliproxyexecutor.ResponseFormatOrSource(opts), req.Model, opts.OriginalRequest, body, line, &state)
+			if err := helps.ApplyPatchTranslationError(state); err != nil {
+				fail(statusErr{code: http.StatusBadGateway, msg: helps.ApplyPatchUpstreamErrorMessage})
+				return
+			}
+			for _, chunk := range chunks {
 				if len(chunk) > 0 && !send(cliproxyexecutor.StreamChunk{Payload: chunk}) {
 					return
 				}
@@ -262,11 +307,17 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 			fail(err)
 			return
 		}
+		if pendingFilter != "" {
+			fail(statusErr{code: http.StatusBadRequest, msg: pendingFilter, requestScoped: true})
+			return
+		}
 		if !completed {
 			fail(statusErr{code: 502, msg: "Antigravity stream ended before completion"})
 			return
 		}
-		reporter.EnsurePublished(ctx)
+		if !usage.Publish(ctx, reporter) {
+			reporter.EnsurePublished(ctx)
+		}
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: resp.Header.Clone(), Chunks: out}, nil
 }
@@ -281,8 +332,14 @@ func (e *AntigravityExecutor) CountTokens(ctx context.Context, auth *cliproxyaut
 	if err != nil {
 		return cliproxyexecutor.Response{}, err
 	}
+	if len(raw) > 64<<10 || !ojson.ValidBytes(raw) {
+		return cliproxyexecutor.Response{}, statusErr{code: 502, msg: "invalid Antigravity token count response"}
+	}
+	if err := ordinaryAntigravityInBandError(raw, resp.Header); err != nil {
+		return cliproxyexecutor.Response{}, err
+	}
 	total := ojson.GetBytesNoCopy(raw, "totalTokens")
-	if len(raw) > 64<<10 || !ojson.ValidBytes(raw) || total.Type != ojson.Number || total.Int() < 0 {
+	if total.Type != ojson.Number || total.Int() < 0 || total.Num != float64(total.Int()) {
 		return cliproxyexecutor.Response{}, statusErr{code: 502, msg: "invalid Antigravity token count response"}
 	}
 	return cliproxyexecutor.Response{Payload: sdktranslator.TranslateTokenCount(ctx, sdktranslator.FromString("antigravity"), cliproxyexecutor.ResponseFormatOrSource(opts), total.Int(), raw), Headers: resp.Header.Clone()}, nil
@@ -340,4 +397,85 @@ func (e *AntigravityExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Au
 		return nil, err
 	}
 	return nil, statusErr{code: http.StatusBadRequest, msg: "Antigravity refresh requires a separately configured standard OAuth flow", requestScoped: true}
+}
+
+func ordinaryAntigravityHasTerminalReason(body []byte) bool {
+	for _, path := range []string{"response.candidates.0.finishReason", "candidates.0.finishReason"} {
+		reason := ojson.GetBytesNoCopy(body, path)
+		if reason.Type == ojson.String && strings.TrimSpace(reason.String()) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func ordinaryAntigravityInBandError(body []byte, headers http.Header) error {
+	result := ojson.GetBytesNoCopy(body, "error")
+	if !result.Exists() || result.Type == ojson.Null {
+		return nil
+	}
+	code := int(result.Get("code").Int())
+	if code < 400 || code > 599 {
+		switch result.Get("status").String() {
+		case "INVALID_ARGUMENT":
+			code = http.StatusBadRequest
+		case "UNAUTHENTICATED":
+			code = http.StatusUnauthorized
+		case "PERMISSION_DENIED":
+			code = http.StatusForbidden
+		case "RESOURCE_EXHAUSTED":
+			code = http.StatusTooManyRequests
+		case "UNAVAILABLE":
+			code = http.StatusServiceUnavailable
+		default:
+			code = http.StatusBadGateway
+		}
+	}
+	message := strings.TrimSpace(result.Get("message").String())
+	if message == "" {
+		message = http.StatusText(code)
+	}
+	return statusErr{code: code, msg: message, retryAfter: ordinaryAntigravityRetryHint(code, headers, body)}
+}
+
+// Metadata and empty placeholders are not evidence of model output.
+func ordinaryAntigravityHasOutput(body []byte) bool {
+	for _, path := range []string{"response.candidates", "candidates"} {
+		for _, candidate := range ojson.GetBytesNoCopy(body, path).Array() {
+			for _, part := range candidate.Get("content.parts").Array() {
+				for _, field := range []string{"text", "functionCall.name", "inlineData.data", "inline_data.data", "executableCode.code", "codeExecutionResult.output"} {
+					if strings.TrimSpace(part.Get(field).String()) != "" {
+						return true
+					}
+				}
+			}
+		}
+	}
+	return false
+}
+
+func ordinaryAntigravityRetryHint(code int, headers http.Header, body []byte) *time.Duration {
+	now := time.Now()
+	if (code == http.StatusTooManyRequests || code == http.StatusServiceUnavailable) && len(body) <= 64<<10 {
+		if delay, err := helps.ParseRetryDelayWithHeaders(headers, body, now); err == nil {
+			return delay
+		}
+	}
+	return parseRetryAfterHeader(headers, now)
+}
+
+// Normalize only an explicitly set level on the already selected model.
+func normalizeOrdinaryAntigravityLevel(doc *ojson.Doc) error {
+	for _, path := range []string{
+		"request.generationConfig.thinkingConfig.thinkingLevel",
+		"request.generationConfig.thinkingConfig.thinking_level",
+		"request.generationConfig.thinking_config.thinkingLevel",
+		"request.generationConfig.thinking_config.thinking_level",
+	} {
+		level := strings.TrimSpace(doc.Get(path).String())
+		if level != "" {
+			return antigravitythinking.NewApplier().ApplyDoc(doc, thinking.ThinkingConfig{Mode: thinking.ModeLevel, Level: thinking.ThinkingLevel(level)}, nil)
+		}
+	}
+	return nil
 }

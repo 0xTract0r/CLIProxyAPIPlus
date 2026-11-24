@@ -118,7 +118,15 @@ func ResolveDevinChatModelUID(rawModel string, thinkingLevel string, budgetToken
 	parsedSuffix := thinking.ParseSuffix(cleanModel)
 	baseModel := strings.TrimSpace(parsedSuffix.ModelName)
 	if parsedSuffix.HasSuffix {
-		thinkingLevel = parsedSuffix.RawSuffix
+		thinkingLevel = strings.TrimSpace(parsedSuffix.RawSuffix)
+		if mode, ok := thinking.ParseSpecialSuffix(thinkingLevel); ok {
+			thinkingLevel = mode.String()
+		} else if budget, ok := thinking.ParseNumericSuffix(thinkingLevel); ok {
+			budgetTokens = budget
+			if budget == 0 {
+				thinkingLevel = "none"
+			}
+		}
 	} else if colonIdx := strings.LastIndex(cleanModel, ":"); colonIdx != -1 {
 		baseModel = strings.TrimSpace(cleanModel[:colonIdx])
 		thinkingLevel = strings.TrimSpace(cleanModel[colonIdx+1:])
@@ -155,6 +163,15 @@ func ResolveDevinChatModelUID(rawModel string, thinkingLevel string, budgetToken
 		canonicalBase = "gemini-3-8-flash"
 	}
 
+	// 6. Resolve automatic effort against the catalog before choosing a wire UID.
+	modelInfo := registry.LookupDevinModel(canonicalBase)
+	if modelInfo == nil && canonicalBase != lowerBase {
+		modelInfo = registry.LookupDevinModel(lowerBase)
+	}
+	if effort == string(thinking.LevelAuto) {
+		effort = string(thinking.ClampLevel(thinking.LevelMedium, modelInfo, "devin"))
+	}
+
 	normalizedUnder := strings.ReplaceAll(canonicalBase, "-", "_")
 	switch normalizedUnder {
 	case "model_gpt_5_2":
@@ -168,12 +185,6 @@ func ResolveDevinChatModelUID(rawModel string, thinkingLevel string, budgetToken
 			return "MODEL_CLAUDE_4_5_OPUS_THINKING"
 		}
 		return "MODEL_CLAUDE_4_5_OPUS"
-	}
-
-	// 6. Look up dynamic model metadata from the Devin catalog (devin_models.json)
-	modelInfo := registry.LookupDevinModel(canonicalBase)
-	if modelInfo == nil && canonicalBase != lowerBase {
-		modelInfo = registry.LookupDevinModel(lowerBase)
 	}
 
 	var allowedLevels []string

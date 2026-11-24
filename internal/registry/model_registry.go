@@ -1513,6 +1513,7 @@ func (r *ModelRegistry) ClientModelRoute(clientID string, modelIDs ...string) (m
 
 // ClientModelRouteInfo describes the source and alias of a registered route.
 type ClientModelRouteInfo struct {
+	ID               string
 	MetadataModelID  string
 	OAuthAlias       string
 	OAuthAliasSource string
@@ -1530,11 +1531,11 @@ func (r *ModelRegistry) LookupClientModelRoute(clientID string, modelIDs ...stri
 			continue
 		}
 		if info := models[modelID]; info != nil {
-			return ClientModelRouteInfo{info.MetadataModelID, info.OAuthAlias, info.OAuthAliasSource}
+			return ClientModelRouteInfo{info.ID, info.MetadataModelID, info.OAuthAlias, info.OAuthAliasSource}
 		}
 		for _, id := range r.clientModels[clientID] {
 			if info := models[id]; info != nil && strings.EqualFold(id, modelID) {
-				return ClientModelRouteInfo{info.MetadataModelID, info.OAuthAlias, info.OAuthAliasSource}
+				return ClientModelRouteInfo{info.ID, info.MetadataModelID, info.OAuthAlias, info.OAuthAliasSource}
 			}
 		}
 	}

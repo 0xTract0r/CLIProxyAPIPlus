@@ -22,8 +22,9 @@ type websocketTimelineAppender interface {
 }
 
 type responsesWebsocketPinnedAuthState struct {
-	authID   string
-	modelKey string
+	authID     string
+	modelKey   string
+	localDevin bool
 }
 
 type websocketTimelineLog struct {

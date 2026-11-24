@@ -2510,8 +2510,8 @@ func (m *Manager) recordAvailabilityNeutralResult(ctx context.Context, result Re
 }
 
 func modelStateKey(auth *Auth, model string) string {
-	if isCopilotAuth(auth) {
-		// Keep restored route IDs intact until the Copilot catalog can resolve them.
+	if isCopilotAuth(auth) || auth != nil && strings.EqualFold(strings.TrimSpace(auth.Provider), "devin") {
+		// Keep restored route IDs intact until their published catalog can resolve them.
 		return strings.TrimSpace(model)
 	}
 	return canonicalModelKey(model)

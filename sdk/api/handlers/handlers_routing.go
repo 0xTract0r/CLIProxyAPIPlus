@@ -205,7 +205,7 @@ func (h *BaseAPIHandler) getRequestDetailsWithOptions(modelName string, allowIma
 		exactProviders := util.GetProviderName(resolvedModelName)
 		// An explicitly registered Copilot route takes precedence over base
 		// inference. Otherwise retain base-first routing for existing providers.
-		if len(providers) == 0 || slices.Contains(exactProviders, copilot.Provider) {
+		if len(providers) == 0 || slices.Contains(exactProviders, copilot.Provider) || slices.Contains(exactProviders, "devin") {
 			providers = exactProviders
 		}
 	}

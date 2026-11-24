@@ -442,6 +442,21 @@ func (m *Manager) buildAliasMigrationMapsLocked(auth *Auth, supportedModels []*r
 	if isCopilotAuth(auth) {
 		return buildCopilotMigrationMaps(supportedModels)
 	}
+	if m.usesLocalDevinRoutes(auth) {
+		native, aliases := make(map[string]string), make(map[string]string)
+		for _, model := range supportedModels {
+			if model == nil || strings.TrimSpace(model.ID) == "" {
+				continue
+			}
+			key := canonicalModelKey(model.MetadataModelID)
+			if key == "" {
+				key = canonicalModelKey(model.ID)
+			}
+			native[strings.ToLower(key)] = key
+			aliases[strings.ToLower(strings.TrimSpace(model.ID))] = key
+		}
+		return native, aliases
+	}
 
 	allRegistered := make(map[string]struct{}, len(supportedModels))
 	nativeRegistered := make(map[string]struct{}, len(supportedModels))
@@ -538,7 +553,7 @@ func (m *Manager) resolveMarkResultModelKeyLocked(auth *Auth, modelKey, routeMod
 		return authTarget
 	}
 	targetKey := routeToTarget[lookupKey]
-	if targetKey == "" && !isCopilotAuth(auth) {
+	if targetKey == "" && !isCopilotAuth(auth) && !m.usesLocalDevinRoutes(auth) {
 		targetKey = m.selectionModelKeyForAuth(auth, canonicalModel)
 	}
 	if targetLookup := modelStateLookupKey(auth, targetKey); targetKey != "" && lookupKey != targetLookup {
@@ -593,7 +608,7 @@ func (m *Manager) migrateAuthAliasModelStatesLocked(auth *Auth, supportedModels 
 			continue
 		}
 		targetKey := routeToTarget[routeLookup]
-		if targetKey == "" && !isCopilot {
+		if targetKey == "" && !isCopilot && !m.usesLocalDevinRoutes(auth) {
 			targetKey = m.selectionModelKeyForAuth(auth, stateKey)
 		}
 		targetLookup := modelStateLookupKey(auth, targetKey)
@@ -1483,6 +1498,11 @@ func (m *Manager) authSupportsRouteModel(registryRef *registry.ModelRegistry, au
 	if registryRef == nil || auth == nil {
 		return true
 	}
+	if m.usesLocalDevinRoutes(auth) {
+		source := ResolvePublishedDevinModel(auth, routeModel)
+		return strings.TrimSpace(routeModel) == "" || source != "" &&
+			schedulerModelEntitled(auth, routeModel) && schedulerModelEntitled(auth, source)
+	}
 	if m.usesPublishedCopilotRoutes(auth) {
 		model, _ := copilotRouteForAuth(registryRef, auth.ID, routeModel)
 		return strings.TrimSpace(routeModel) == "" || model != ""
@@ -2366,7 +2386,7 @@ func (m *Manager) routeAwareSelectionRequired(auth *Auth, routeModel string) boo
 	}
 	// The scheduler's base-model shards cannot distinguish exact Copilot routes
 	// that contain suffixes from requests that fall back to their base route.
-	return m.usesPublishedCopilotRoutes(auth) || !sameCanonicalModelKey(m.selectionModelForAuth(auth, routeModel), routeModel)
+	return m.usesPublishedCopilotRoutes(auth) || m.usesLocalDevinRoutes(auth) || !sameCanonicalModelKey(m.selectionModelForAuth(auth, routeModel), routeModel)
 }
 
 func requestAwareCredSelectionRequired(ctx context.Context, auth *Auth, clientHeaders ...http.Header) bool {

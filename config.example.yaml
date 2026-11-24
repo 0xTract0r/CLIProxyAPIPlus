@@ -949,7 +949,7 @@ oauth:
   # These aliases rename model IDs for both model listing and request routing.
   # Management saves update the corresponding provider group in this configuration.
   # An empty list for a built-in alias group suppresses its default aliases.
-  # Supported channels include vertex, aistudio, antigravity, claude, codex, kimi, xai, meta, and copilot.
+  # Supported channels include vertex, aistudio, antigravity, claude, codex, kimi, xai, meta, copilot, and devin.
   # NOTE: These aliases do not apply to any of the upstream groups under api-keys.
   # NOTE: Because aliases affect the merged /v1 model list and merged request routing, overlapping
   # client-visible names can become ambiguous across providers. For strict backend pinning, use
@@ -1000,15 +1000,24 @@ oauth:
   #       alias: "muse-latest"
   #   copilot:
   #     - name: "copilot/claude-sonnet-5" # use the listed Copilot model ID, before any auth prefix
-  #       alias: "copilot-sonnet"
+  #       alias: "copilot-sonnet" # published verbatim; no automatic copilot/ prefix
+  #   devin:
+  #     - name: "devin/claude-fable-5-1" # use the listed Devin model ID, before any auth prefix
+  #       alias: "devin-fable"
   #   sample-provider:                  # plugin provider keys are supported for OAuth plugins
   #     - name: "sample-model-latest"
   #       alias: "sample-latest"
 
   # OAuth provider model settings (per channel)
   # Allows overriding model-level capabilities (such as context window) for OAuth credentials.
-  # Supported channels: vertex, aistudio, antigravity, claude, codex, kimi, xai, meta.
+  # Supported channels include vertex, aistudio, antigravity, claude, codex, kimi, xai, meta, and copilot.
   # settings:
+  #   copilot:
+  #     - name: "gpt-5.3-codex" # Copilot native model ID, shared by its published aliases
+  #       max-context-length: 131072
+  #     - name: "gpt-5.3-codex"
+  #       alias: "coding" # exact public alias before any credential prefix
+  #       max-context-length: 262144
   #   codex:
   #     - name: "gpt-6-sol"
   #       max-context-length: 524288 # overrides context window advertised to Codex clients
@@ -1040,6 +1049,8 @@ oauth:
   #     - "muse-spark-1.1"
   #   copilot:
   #     - "copilot/claude-haiku-*" # match Copilot model IDs before aliases and auth prefixes
+  #   devin:
+  #     - "devin/swe-2-flash" # match Devin model IDs before aliases and auth prefixes
 
   # OAuth provider request-scoped error rules (custom error classification for OAuth credentials)
   # request-scoped-errors:

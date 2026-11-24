@@ -163,6 +163,61 @@ func ordinaryCodexPromptCache(ctx context.Context, doc *ojson.Doc, auth *cliprox
 	_ = doc.Set("prompt_cache_key", hex.EncodeToString(mac.Sum(nil)))
 }
 
+// The selected credential must be an explicit API key on a non-ChatGPT origin
+// to opt into the platform Responses fields. No inbound field chooses the origin.
+func ordinaryCodexPlatformIncludes(auth *cliproxyauth.Auth) bool {
+	if auth == nil || auth.Disabled || strings.TrimSpace(auth.Attributes["api_key"]) == "" {
+		return false
+	}
+	_, base := ordinaryCodexImageCredential(auth)
+	origin, err := ordinaryCodexOrigin(base)
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(strings.TrimRight(origin.Hostname(), "."))
+	return host != "chatgpt.com" && !strings.HasSuffix(host, ".chatgpt.com")
+}
+
+func restoreOrdinaryCodexResponseIncludes(doc *ojson.Doc, source []byte, platform bool) {
+	include := ojson.GetBytesNoCopy(source, "include")
+	if !include.IsArray() {
+		return
+	}
+	allowed := [...]string{
+		"web_search_call.action.sources", "web_search_call.results",
+		"file_search_call.results", "message.input_image.image_url",
+		"computer_call_output.output.image_url", "code_interpreter_call.outputs",
+		"message.output_text.logprobs",
+	}
+	var requested [len(allowed)]bool
+	for _, item := range include.Array() {
+		if item.Type != ojson.String {
+			continue
+		}
+		for i, field := range allowed {
+			if (i < 2 || platform) && item.String() == field {
+				requested[i] = true
+				break
+			}
+		}
+	}
+	// Preserve the existing converter byte path when no newly supported field was requested.
+	var optIn bool
+	for _, yes := range requested[1:] {
+		optIn = optIn || yes
+	}
+	if !optIn {
+		return
+	}
+	values := []string{"reasoning.encrypted_content"}
+	for i, field := range allowed {
+		if requested[i] {
+			values = append(values, field)
+		}
+	}
+	_ = doc.Set("include", values)
+}
+
 func (e *CodexExecutor) prepareOrdinaryCodexBody(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, stream, compat bool) ([]byte, error) {
 	if len(req.Payload) > maxOrdinaryCodexRequestBytes || len(opts.OriginalRequest) > maxOrdinaryCodexRequestBytes {
 		return nil, statusErr{code: 413, msg: "Codex request exceeds size limit", requestScoped: true}
@@ -192,6 +247,15 @@ func (e *CodexExecutor) prepareOrdinaryCodexBody(ctx context.Context, auth *clip
 	}
 	if opts.SourceFormat == sdktranslator.FormatOpenAIResponse || opts.SourceFormat == sdktranslator.FormatCodex {
 		restoreOrdinaryCodexUpdates(doc, req.Payload)
+	}
+	// Both ordinary HTTP and WebSocket use streaming /responses upstream.
+	// The compact endpoint does not use this Responses include contract.
+	if stream && opts.SourceFormat == sdktranslator.FormatOpenAIResponse {
+		platform := ordinaryCodexPlatformIncludes(auth)
+		restoreOrdinaryCodexResponseIncludes(doc, original, platform)
+		originalDoc := ojson.NewDoc(originalTranslated)
+		restoreOrdinaryCodexResponseIncludes(originalDoc, original, platform)
+		originalTranslated = originalDoc.Bytes()
 	}
 	ctx = helps.WithPayloadFinalizer(ctx, helps.NewPayloadFinalizer(e.cfg, e.Identifier(), model, to.String(), "", originalTranslated, req, opts, auth))
 	helps.FinalizePayloadDoc(ctx, doc)

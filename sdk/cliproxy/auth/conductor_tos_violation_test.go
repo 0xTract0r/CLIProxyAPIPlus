@@ -4,7 +4,43 @@ import (
 	"context"
 	"net/http"
 	"testing"
+	"time"
 )
+
+func TestApplyAuthFailureState_TOSViolationIsAlwaysTerminal(t *testing.T) {
+	now := time.Now()
+	tests := []struct {
+		name           string
+		httpStatus     int
+		disableCooling bool
+	}{
+		{name: "disabled cooling", httpStatus: http.StatusForbidden, disableCooling: true},
+		{name: "service unavailable", httpStatus: http.StatusServiceUnavailable},
+		{name: "request error status", httpStatus: http.StatusBadRequest},
+		{name: "missing http status"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			auth := &Auth{Status: StatusActive}
+			applyAuthFailureState(auth, &Error{
+				HTTPStatus: tt.httpStatus,
+				Code:       "tos_violation",
+				Message:    "TOS_VIOLATION",
+			}, nil, now, tt.disableCooling)
+
+			if !auth.Disabled || auth.Status != StatusDisabled {
+				t.Fatalf("disabled=%v status=%q, want true / %q", auth.Disabled, auth.Status, StatusDisabled)
+			}
+			if !auth.Unavailable {
+				t.Fatal("auth.Unavailable = false, want true")
+			}
+			if !auth.NextRetryAfter.IsZero() {
+				t.Fatalf("auth.NextRetryAfter = %v, want zero", auth.NextRetryAfter)
+			}
+		})
+	}
+}
 
 // TestMarkResult_TOSViolation_DisablesCredential verifies that a 403
 // PERMISSION_DENIED carrying the tos_violation error code (produced by the
@@ -431,5 +467,81 @@ func TestMarkResult_TOSViolation_DisableCoolingPreservesUnavailable(t *testing.T
 	}
 	if state := updated.ModelStates["gemini-4-neon"]; state == nil || state.Status != StatusDisabled || !state.Unavailable {
 		t.Fatalf("gemini-4-neon state = %+v, want StatusDisabled and Unavailable=true", state)
+	}
+}
+
+// A temporary 429 and a typed policy refusal use the same local availability
+// check, but only the temporary wait has a deadline.
+func TestMarkResult_TerminalPolicyDoesNotExpireAfterOrdinaryRetryWindow(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		model  string
+		status int
+	}{
+		{name: "same model", model: "synthetic-model", status: http.StatusForbidden},
+		{name: "credential scope with a known model", status: http.StatusServiceUnavailable},
+		{name: "terminal code wins over HTTP 429", model: "synthetic-model", status: http.StatusTooManyRequests},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const model = "synthetic-model"
+			ctx := context.Background()
+			manager := NewManager(nil, nil, nil)
+			record, err := manager.Register(ctx, &Auth{
+				ID: "synthetic-one-credential", Provider: "antigravity", Status: StatusActive,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			result := Result{
+				AuthID: record.ID, Provider: record.Provider, Model: model,
+				RegistrationEpoch: record.RegistrationEpoch, CredentialVersion: record.CredentialVersion,
+			}
+			retry := 2 * time.Minute
+			result.RetryAfter = &retry
+			result.Error = &Error{HTTPStatus: http.StatusTooManyRequests, Message: "temporary rate limit"}
+			before := time.Now()
+			manager.MarkResult(ctx, result)
+			temporary, ok := manager.GetByID(record.ID)
+			if !ok || temporary == nil || temporary.Disabled || temporary.Status == StatusDisabled {
+				t.Fatal("ordinary temporary 429 changed the credential's enabled state")
+			}
+			blocked, reason, deadline := isAuthBlockedForModel(temporary, model, time.Now())
+			if !blocked || reason != blockReasonCooldown || deadline.Before(before.Add(retry)) {
+				t.Fatalf("ordinary 429 lost its Retry-After window: blocked=%v reason=%v deadline=%v", blocked, reason, deadline)
+			}
+			if blocked, _, _ := isAuthBlockedForModel(temporary, model, deadline.Add(-time.Second)); !blocked {
+				t.Fatal("ordinary 429 became eligible before the deadline")
+			}
+			if blocked, _, _ := isAuthBlockedForModel(temporary, model, deadline.Add(time.Second)); blocked {
+				t.Fatal("ordinary 429 remained blocked after the deadline")
+			}
+
+			terminal := result
+			terminal.Model = tc.model
+			terminal.CredentialScope = true
+			terminal.Error = &Error{HTTPStatus: tc.status, Code: "tos_violation", Message: "TOS_VIOLATION"}
+			manager.MarkResult(ctx, terminal)
+
+			assertTerminal := func() {
+				t.Helper()
+				record, ok := manager.GetByID(record.ID)
+				if !ok || record == nil || !record.Disabled || !record.Unavailable ||
+					record.Status != StatusDisabled || record.StatusMessage != "tos_violation" || !record.NextRetryAfter.IsZero() {
+					t.Fatal("the selected credential did not retain its terminal refusal")
+				}
+				for _, now := range []time.Time{time.Now(), deadline.Add(time.Second), deadline.Add(48 * time.Hour)} {
+					blocked, reason, next := isAuthBlockedForModel(record, model, now)
+					if !blocked || reason != blockReasonDisabled || !next.IsZero() {
+						t.Fatalf("terminal state expired: blocked=%v reason=%v next=%v", blocked, reason, next)
+					}
+				}
+			}
+			assertTerminal()
+			// Simulate a delayed successful result for work that began before the refusal.
+			result.Error, result.RetryAfter = nil, nil
+			result.Success, result.CompletedResponse = true, true
+			manager.MarkResult(ctx, result)
+			assertTerminal()
+		})
 	}
 }

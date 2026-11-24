@@ -651,15 +651,20 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 	}
 	rememberPinnedAuth := func(authID string, modelName string) {
 		authID = strings.TrimSpace(authID)
-		auth, ok := sessionAuthByID(authID)
+		auth, homeRuntime, ok := sessionAuthByIDWithSource(authID)
 		if authID == "" || !ok || auth == nil {
 			return
 		}
 		pinnedAuthID = authID
 		providerKey := strings.ToLower(strings.TrimSpace(auth.Provider))
-		_, modelKey := responsesWebsocketProviderSetForModel(responsesWebsocketResolvedModelName(modelName))
+		resolvedModel := responsesWebsocketResolvedModelName(modelName)
+		_, modelKey := responsesWebsocketProviderSetForModel(resolvedModel)
+		localDevin := providerKey == "devin" && !homeRuntime
+		if localDevin {
+			modelKey = resolvedModel
+		}
 		if providerKey != "" {
-			pinnedAuthByProvider[providerKey] = responsesWebsocketPinnedAuthState{authID: authID, modelKey: modelKey}
+			pinnedAuthByProvider[providerKey] = responsesWebsocketPinnedAuthState{authID: authID, modelKey: modelKey, localDevin: localDevin}
 		}
 	}
 	forgetPinnedAuth := func() {
@@ -766,7 +771,13 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		)
 		pluginExecutorID := handlers.PreparedStreamPluginExecutor(executionParent)
 		isPluginExecutorRoute := pluginExecutorID != ""
-		if pinnedAuthID != "" {
+		devinPin := responsesWebsocketRetainedDevinPin(pinnedAuthByProvider, requestModelName)
+		keepDevinPin := devinPin != "" && !routeOverridesModelResolution
+		if keepDevinPin {
+			// The manager reports the original availability or authorization error
+			// for this credential. A failed match must not trigger a new selection.
+			pinnedAuthID = devinPin
+		} else if pinnedAuthID != "" {
 			pinnedAuth, homeRuntime, ok := sessionAuthByIDWithSource(pinnedAuthID)
 			providerKey := ""
 			if pinnedAuth != nil {
@@ -1105,6 +1116,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			// full response.create that fails before committing any downstream output, unpin
 			// and fail over in place on the existing downstream socket.
 			var lossWriteErr error
+			var devinRefusalWriteErr error
 			var replayedPinnedAuthFailure bool
 			var failoverInPlace bool
 			var downstreamCommitted atomic.Bool
@@ -1123,6 +1135,11 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 						}
 					}
 					lossWriteErr = writeResponsesWebsocketUpstreamLoss(writer, wsTimelineLog, errMsg)
+					return true
+				}
+				if keepDevinPin {
+					markAPIResponseTimestamp(c)
+					_, devinRefusalWriteErr = writeResponsesWebsocketError(writer, wsTimelineLog, errMsg)
 					return true
 				}
 				if coreauth.IsContinuityTerminatedError(errMsg.Error) {
@@ -1186,6 +1203,10 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 				},
 			)
 			cliCancel(nil)
+			if devinRefusalWriteErr != nil {
+				wsTerminateErr = devinRefusalWriteErr
+				return
+			}
 			if errForward != nil {
 				wsTerminateErr = errForward
 				switch {
@@ -1232,7 +1253,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 					nextLastRequest = requestJSON
 					continue
 				}
-				if pinnedAuthAttempted && shouldReleaseResponsesWebsocketPinnedAuth(forwardErrMsg) {
+				if !keepDevinPin && pinnedAuthAttempted && shouldReleaseResponsesWebsocketPinnedAuth(forwardErrMsg) {
 					forgetPinnedAuth()
 				}
 				if replayedPinnedAuthFailure {
@@ -1279,6 +1300,10 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			lastResponsePendingToolCallIDs = nil
 		} else {
 			upstreamWebsocketAuthID = ""
+			if auth, homeRuntime, ok := sessionAuthByIDWithSource(lastAttemptedAuthID); ok && auth != nil &&
+				!homeRuntime && strings.EqualFold(auth.Provider, "devin") {
+				rememberPinnedAuth(lastAttemptedAuthID, modelName)
+			}
 			lastRequest = nextLastRequest
 			lastResponseOutput = completedOutput
 			if inputContainsFullTranscript(util.ParseGJSONBytesNoCopy(completedOutput)) {

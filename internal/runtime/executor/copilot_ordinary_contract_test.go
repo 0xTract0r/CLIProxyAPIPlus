@@ -154,3 +154,33 @@ func TestCopilotOrdinaryRejectionLogsOnlyAllowedMetadata(t *testing.T) {
 		}
 	}
 }
+
+func TestCopilotOrdinaryInBandErrorLogsClassWithoutPayload(t *testing.T) {
+	g, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx := context.WithValue(t.Context(), "gin", g)
+	ctx = context.WithValue(ctx, "cliproxy.roundtripper", copilotOrdinaryFixtureTransport(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(`{"error":{"message":"fixture-secret-response","code":"server_error"}}`)), Request: r}, nil
+	}))
+	model := "claude-opus-5"
+	auth := copilotOrdinaryFixtureAuth(t, "account", model, copilot.Chat)
+	req := cliproxyexecutor.Request{Model: model, Payload: []byte(`{"messages":[{"role":"user","content":"fixture-secret-request"}]}`)}
+	_, err := NewCopilotExecutor(&config.Config{}).Execute(ctx, auth, req, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAI})
+	if err == nil {
+		t.Fatal("in-band error lost")
+	}
+	value, ok := g.Get(logging.DeferredAPIResponseContextKey)
+	if !ok {
+		t.Fatal("missing bounded response log")
+	}
+	capture := value.(*logging.DeferredAPICapture)
+	msg := string(capture.RenderAPIResponse())
+	diagnostics := capture.ResponseDiagnostics()
+	if len(diagnostics) != 1 || !strings.Contains(diagnostics[0].Error.Error(), "did not complete") {
+		t.Fatal("missing bounded error classification")
+	}
+	for _, text := range []string{msg, diagnostics[0].Error.Error()} {
+		if strings.Contains(text, "fixture-secret-response") || strings.Contains(text, "fixture-secret-request") {
+			t.Fatal("private request or response content leaked")
+		}
+	}
+}

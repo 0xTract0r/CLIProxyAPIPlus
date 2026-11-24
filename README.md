@@ -6,7 +6,7 @@ This is the Plus version of [CLIProxyAPI](https://github.com/router-for-me/CLIPr
 
 All third-party provider support is maintained by community contributors; CLIProxyAPI does not provide technical support. Please contact the corresponding community maintainer if you need assistance.
 
-See the [upstream README for this revision](https://github.com/router-for-me/CLIProxyAPI/blob/6960763455c4ac3d4828fb1736aa5de2183ccecf/README.md) for the provider list, sponsors and project overview. The [SDK guide](docs/sdk-usage.md) and [watcher guide](docs/sdk-watcher.md) are included in this checkout.
+See the [upstream README for this revision](https://github.com/router-for-me/CLIProxyAPI/blob/85225381d89915595598ed13766cd79890c03a84/README.md) for the provider list, sponsors and project overview. The [SDK guide](docs/sdk-usage.md) and [watcher guide](docs/sdk-watcher.md) are included in this checkout.
 
 ## Contributing
 

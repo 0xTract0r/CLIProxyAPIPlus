@@ -3,6 +3,7 @@ package openai
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -80,7 +81,7 @@ func (h *OpenAIResponsesAPIHandler) responsesWebsocketAvailableAuthsForModel(mod
 	auths := h.AuthManager.List()
 	available := make([]*coreauth.Auth, 0, len(auths))
 	for _, auth := range auths {
-		if !responsesWebsocketAuthMatchesModel(auth, providerSet, modelKey, registryRef, now) {
+		if !responsesWebsocketAuthMatchesResolvedModel(auth, providerSet, resolvedModelName, modelKey, registryRef, now) {
 			continue
 		}
 		available = append(available, auth)
@@ -139,6 +140,22 @@ func responsesWebsocketAuthSupportsIncrementalInput(auth *coreauth.Auth) bool {
 	return websocketUpstreamSupportsIncrementalInput(auth.Attributes, auth.Metadata)
 }
 
+func responsesWebsocketRetainedDevinPin(pins map[string]responsesWebsocketPinnedAuthState, model string) string {
+	pin := pins["devin"]
+	if !pin.localDevin {
+		return ""
+	}
+	resolved := responsesWebsocketResolvedModelName(model)
+	if resolved != "" && strings.EqualFold(resolved, pin.modelKey) {
+		return pin.authID
+	}
+	providers, _ := responsesWebsocketProviderSetForModel(resolved)
+	if _, ok := providers["devin"]; ok {
+		return pin.authID
+	}
+	return ""
+}
+
 func responsesWebsocketPinnedAuthMatchesModel(auth *coreauth.Auth, modelName string, pinnedModelKey string, homeRuntime bool) bool {
 	if auth == nil {
 		return false
@@ -149,6 +166,10 @@ func responsesWebsocketPinnedAuthMatchesModel(auth *coreauth.Auth, modelName str
 		if _, ok := providerSet[providerKey]; !ok {
 			return false
 		}
+	}
+	if !homeRuntime && providerKey == "devin" {
+		source := coreauth.ResolvePublishedDevinModel(auth, responsesWebsocketResolvedModelName(modelName))
+		return source != "" && responsesWebsocketAuthAvailableForModel(auth, source, time.Now())
 	}
 	if !responsesWebsocketAuthAvailableForModel(auth, modelKey, time.Now()) {
 		return false
@@ -176,8 +197,11 @@ func responsesWebsocketProviderSetForModel(resolvedModelName string) (map[string
 	parsed := thinking.ParseSuffix(resolvedModelName)
 	baseModel := strings.TrimSpace(parsed.ModelName)
 	providers := util.GetProviderName(baseModel)
-	if len(providers) == 0 && baseModel != resolvedModelName {
-		providers = util.GetProviderName(resolvedModelName)
+	if baseModel != resolvedModelName {
+		exact := util.GetProviderName(resolvedModelName)
+		if len(providers) == 0 || slices.Contains(exact, "devin") {
+			providers = exact
+		}
 	}
 	providerSet := make(map[string]struct{}, len(providers))
 	for _, provider := range providers {
@@ -192,6 +216,15 @@ func responsesWebsocketProviderSetForModel(resolvedModelName string) (map[string
 		modelKey = strings.TrimSpace(resolvedModelName)
 	}
 	return providerSet, modelKey
+}
+
+func responsesWebsocketAuthMatchesResolvedModel(auth *coreauth.Auth, providerSet map[string]struct{}, resolved, modelKey string, registryRef *registry.ModelRegistry, now time.Time) bool {
+	if auth != nil && strings.EqualFold(strings.TrimSpace(auth.Provider), "devin") {
+		_, providerMatches := providerSet["devin"]
+		source := coreauth.ResolvePublishedDevinModel(auth, resolved)
+		return providerMatches && source != "" && responsesWebsocketAuthAvailableForModel(auth, source, now)
+	}
+	return responsesWebsocketAuthMatchesModel(auth, providerSet, modelKey, registryRef, now)
 }
 
 func responsesWebsocketAuthMatchesModel(auth *coreauth.Auth, providerSet map[string]struct{}, modelKey string, registryRef *registry.ModelRegistry, now time.Time) bool {
