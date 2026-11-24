@@ -53,7 +53,7 @@ func TestRealtimeHeadroomPreferredOverSnapshot(t *testing.T) {
 	}
 
 	h := http.Header{}
-	h.Set("anthropic-ratelimit-unified-5h-utilization", "90")
+	h.Set("anthropic-ratelimit-unified-5h-utilization", "0.9")
 	h.Set("anthropic-ratelimit-unified-5h-status", "allowed")
 	h.Set("anthropic-ratelimit-unified-5h-reset", strconv.FormatInt(now.Add(3*time.Hour).Unix(), 10))
 	IngestServingRateHeaders("claude", authID, h, now)
@@ -79,7 +79,7 @@ func TestRealtimeRejectedResetClampedToOneHour(t *testing.T) {
 	defer realtimeRateStore.Delete(authID)
 
 	h := http.Header{}
-	h.Set("anthropic-ratelimit-unified-7d-utilization", "100")
+	h.Set("anthropic-ratelimit-unified-7d-utilization", "1.0")
 	h.Set("anthropic-ratelimit-unified-7d-status", "rejected")
 	h.Set("anthropic-ratelimit-unified-7d-reset", strconv.FormatInt(now.Add(5*time.Hour).Unix(), 10))
 	IngestServingRateHeaders("claude", authID, h, now)
@@ -101,7 +101,7 @@ func TestRealtimeStaleWindowIgnored(t *testing.T) {
 	defer realtimeRateStore.Delete(authID)
 
 	h := http.Header{}
-	h.Set("anthropic-ratelimit-unified-5h-utilization", "90")
+	h.Set("anthropic-ratelimit-unified-5h-utilization", "0.9")
 	h.Set("anthropic-ratelimit-unified-5h-reset", strconv.FormatInt(now.Add(5*time.Hour).Unix(), 10))
 	IngestServingRateHeaders("claude", authID, h, now.Add(-30*time.Minute))
 
