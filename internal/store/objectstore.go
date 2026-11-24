@@ -672,8 +672,8 @@ func (s *ObjectTokenStore) readAuthFile(path, baseDir string) (*cliproxyauth.Aut
 	if len(data) == 0 {
 		return nil, nil
 	}
-	metadata := make(map[string]any)
-	if err = json.Unmarshal(data, &metadata); err != nil {
+	metadata, err := cliproxyauth.DecodeCredentialMetadata(data)
+	if err != nil {
 		return nil, fmt.Errorf("unmarshal auth json: %w", err)
 	}
 	cliproxyauth.NormalizeCredentialMetadata(metadata)

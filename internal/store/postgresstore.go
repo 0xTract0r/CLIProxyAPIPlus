@@ -363,8 +363,8 @@ func (s *PostgresStore) List(ctx context.Context) ([]*cliproxyauth.Auth, error) 
 			log.WithError(errPath).Warnf("postgres store: skipping auth %s outside spool", id)
 			continue
 		}
-		metadata := make(map[string]any)
-		if err = json.Unmarshal([]byte(payload), &metadata); err != nil {
+		metadata, err := cliproxyauth.DecodeCredentialMetadata([]byte(payload))
+		if err != nil {
 			log.WithError(err).Warnf("postgres store: skipping auth %s with invalid json", id)
 			continue
 		}

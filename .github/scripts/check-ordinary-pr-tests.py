@@ -10,7 +10,17 @@ SDK = "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 API = "github.com/router-for-me/CLIProxyAPI/v8/internal/api"
 REFUSAL = "TestOrdinarySelectedCredentialRefusalIsTerminal"
 REQUIRED = {
+    "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth": {
+        "TestOrdinaryFileStoreNumericMetadataUpdate",
+        "TestOrdinaryFileStoreEquivalentNumbersDoNotRewrite",
+    },
+    "github.com/router-for-me/CLIProxyAPI/v8/internal/store": {
+        "TestOrdinaryStoreNumericMetadataRoundTrip",
+        "TestOrdinaryRemoteNumericSaveRetainsRemoteFailure",
+        "TestOrdinaryPostgresListPreservesNumbersAndRejectsTrailing",
+    },
     SDK: {
+        "TestCredentialJSONExactDecimalEquality",
         "TestOrdinarySchedulerSelectionIDContract",
         "TestOrdinarySchedulerRefusalContract",
         "TestOrdinaryPreferredExecutionErrorPriority",
