@@ -324,6 +324,18 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 			return
 		}
 	}
+	for key, raw := range req {
+		if rootAuthFileField(key) != "priority" {
+			continue
+		}
+		value, errDecode := decodeAuthFileFieldValue(raw)
+		_, valid := authFileIntValue(value)
+		if key != "priority" || errDecode != nil || (value != nil && !valid) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "priority must be an integer or null"})
+			return
+		}
+	}
+
 	requestRetryPatch, errRequestRetry := decodeAuthFileRequestRetryPatch(req)
 	if errRequestRetry != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": errRequestRetry.Error()})
@@ -832,8 +844,8 @@ func authFileIntValue(value any) (int, bool) {
 	case float64:
 		return int(typed), true
 	case json.Number:
-		if i, err := typed.Int64(); err == nil {
-			return int(i), true
+		if i, err := strconv.Atoi(typed.String()); err == nil {
+			return i, true
 		}
 	case string:
 		if i, err := strconv.Atoi(strings.TrimSpace(typed)); err == nil {
