@@ -2,6 +2,7 @@ package codex
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -106,22 +107,29 @@ func TestRefreshReceiptFollowsLaterRotation(t *testing.T) {
 	}
 }
 
-func TestSIWCUnknownOutcomeMustNotReplay(t *testing.T) {
-	resetCodexRefreshGroupForTest()
-	t.Cleanup(resetCodexRefreshGroupForTest)
+func TestOrdinaryRefreshBodyReadFailureRecordsUnknownAndNeverReplays(t *testing.T) {
+	const grant = "ordinary-response-read-fixture"
+	journalDir := t.TempDir()
 	calls := 0
-	auth := &CodexAuth{httpClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-		calls++
-		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: &qualificationLostBody{}, Request: req}, nil
-	})}}
-	for i := 0; i < 2; i++ {
-		_, errRefresh := auth.RefreshSIWCTokensWithRetry(context.Background(), "unresolved-siwc", "issued-client", "device", 3)
-		if errRefresh == nil {
-			t.Fatal("expected unknown SIWC outcome")
+	for attempt := 0; attempt < 2; attempt++ {
+		auth := NewCodexAuthWithHTTPClient(&http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			calls++
+			if r.URL.String() != TokenURL || r.Method != http.MethodPost {
+				t.Fatal("unexpected official refresh route")
+			}
+			return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: &qualificationLostBody{}, Request: r}, nil
+		})})
+		auth.SetRefreshJournal(&FileRefreshJournal{Dir: journalDir})
+		token, err := auth.RefreshTokensWithRetry(t.Context(), grant, 3)
+		var outcome *RefreshOutcomeUnknownError
+		if token != nil || !errors.As(err, &outcome) || outcome.Stage != "response-read" || calls != 1 {
+			t.Fatalf("attempt=%d error=%v transport calls=%d", attempt, err, calls)
 		}
 	}
-	if calls != 1 {
-		t.Fatalf("SIWC unresolved grant calls = %d, want 1", calls)
+	raw, err := (&FileRefreshJournal{Dir: journalDir}).RefreshRead(t.Context(), refreshGrantKey(ClientID, grant))
+	var receipt struct{ Stage string }
+	if err != nil || json.Unmarshal(raw, &receipt) != nil || receipt.Stage != "response-read" || strings.Contains(string(raw), grant) {
+		t.Fatalf("could not confirm safe recorded failure: %v", err)
 	}
 }
 

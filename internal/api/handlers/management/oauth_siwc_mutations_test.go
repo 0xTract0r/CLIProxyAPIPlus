@@ -106,7 +106,8 @@ func TestSIWCFileMutationScopeAndValidation(t *testing.T) {
 	f := setupSIWCFlow(t, false)
 	f.router.POST("/credentials", f.h.UploadAuthFileV8)
 	f.router.POST("/legacy", f.h.UploadAuthFile)
-	state, flow := f.start(t)
+	state, flow := f.seedPendingRecord(t)
+	before := f.readFixtureBytes(t)
 	for _, test := range []struct {
 		path   string
 		body   any
@@ -123,6 +124,9 @@ func TestSIWCFileMutationScopeAndValidation(t *testing.T) {
 		if flow.ctx.Err() != nil || !f.store.IsPending(state, "codex") {
 			t.Fatalf("%s invalidated unrelated or legacy binding", test.path)
 		}
+		if test.status == http.StatusBadRequest && string(f.readFixtureBytes(t)) != string(before) {
+			t.Fatal("invalid upload rewrote the selected credential")
+		}
 	}
 	f.h.postAuthPersistHook = func(_ context.Context, _ *coreauth.Auth) error {
 		if f.h.siwcCommitMu.TryLock() {
@@ -134,6 +138,9 @@ func TestSIWCFileMutationScopeAndValidation(t *testing.T) {
 	w := siwcRequest(t, f.router, http.MethodPost, "/credentials?name=codex.json", f.auth.Metadata)
 	if w.Code != http.StatusOK || flow.ctx.Err() == nil {
 		t.Fatalf("reupload failed to invalidate binding: %d", w.Code)
+	}
+	if f.service.calls.Load() != 0 {
+		t.Fatal("file mutations initiated an exchange")
 	}
 }
 

@@ -378,7 +378,8 @@ func TestUploadAuthFile_V8VsV0_PluginSingleMultiHandledEmptyAndParserError(t *te
 		f := setupSIWCFlow(t, false)
 		f.h.SetPluginHost(newPluginHost())
 		f.router.POST("/credentials", f.h.UploadAuthFileV8)
-		state, flow := f.start(t)
+		state, flow := f.seedPendingRecord(t)
+		before := f.readFixtureBytes(t)
 
 		w := siwcRequest(t, f.router, http.MethodPost, "/credentials?name=codex.json", map[string]any{
 			"type": "vendor",
@@ -389,6 +390,9 @@ func TestUploadAuthFile_V8VsV0_PluginSingleMultiHandledEmptyAndParserError(t *te
 		}
 		if flow.ctx.Err() != nil || !f.store.IsPending(state, "codex") {
 			t.Fatal("plugin parser error invalidated pending SIWC binding")
+		}
+		if f.service.calls.Load() != 0 || string(f.readFixtureBytes(t)) != string(before) {
+			t.Fatal("parser rejection initiated exchange or rewrote the credential")
 		}
 	})
 }

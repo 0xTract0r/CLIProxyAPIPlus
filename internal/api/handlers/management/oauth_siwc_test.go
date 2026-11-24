@@ -136,38 +136,30 @@ func siwcRequest(t *testing.T, router http.Handler, method, path string, body an
 	return w
 }
 
-func (f *siwcFixture) start(t *testing.T) (string, *siwcBindSession) {
+// These rejection tests need a pending record, not an authorization URL or token exchange.
+func (f *siwcFixture) seedPendingRecord(t *testing.T) (string, *siwcBindSession) {
 	t.Helper()
-	w := siwcRequest(t, f.router, http.MethodPost, "/bind", map[string]any{"name": f.auth.FileName})
-	if w.Code != http.StatusOK {
-		t.Fatalf("start: %d %s", w.Code, w.Body.String())
+	const state = "fixture-pending"
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	flow := &siwcBindSession{
+		owner: f.h, manager: f.manager, service: f.service, targetID: f.auth.ID,
+		path: f.path, authDir: filepath.Dir(f.path), redirect: codex.SIWCRedirectURI,
+		ctx: ctx, cancel: cancel,
 	}
-	var response struct {
-		URL, State, Flow string
-		ExpiresIn        int `json:"expires_in"`
+	if !f.store.registerSIWC(state, flow) {
+		t.Fatal("cannot seed pending test record")
 	}
-	if errJSON := json.Unmarshal(w.Body.Bytes(), &response); errJSON != nil {
-		t.Fatal(errJSON)
+	return state, flow
+}
+
+func (f *siwcFixture) readFixtureBytes(t *testing.T) []byte {
+	t.Helper()
+	raw, err := os.ReadFile(f.path)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if response.Flow != "siwc_bind" || response.ExpiresIn != 300 {
-		t.Fatalf("unexpected response: %s", w.Body.String())
-	}
-	u, errURL := url.Parse(response.URL)
-	if errURL != nil {
-		t.Fatal(errURL)
-	}
-	q := u.Query()
-	if q.Get("client_id") != codex.SIWCDynamicClientID || q.Get("redirect_uri") != codex.SIWCRedirectURI || q.Get("nonce") == "" || q.Get("code_challenge") == "" {
-		t.Fatal("missing SIWC authorization parameters")
-	}
-	session, ok := f.store.Get(response.State)
-	if !ok || session.SIWC == nil {
-		t.Fatal("missing SIWC session")
-	}
-	if strings.Contains(w.Body.String(), session.SIWC.pkce.CodeVerifier) {
-		t.Fatal("PKCE verifier exposed")
-	}
-	return response.State, session.SIWC
+	return raw
 }
 
 func siwcCallbackURL(state string) string {
@@ -191,7 +183,8 @@ func waitSIWCExchange(t *testing.T, flow *siwcBindSession) {
 
 func TestSIWCBindRejectsInvalidCallbacksWithoutExchange(t *testing.T) {
 	f := setupSIWCFlow(t, false)
-	state, _ := f.start(t)
+	state, _ := f.seedPendingRecord(t)
+	before := f.readFixtureBytes(t)
 	cases := []map[string]any{
 		{"state": state, "code": "code"},
 		{"state": state, "client_id": "client"},
@@ -213,6 +206,9 @@ func TestSIWCBindRejectsInvalidCallbacksWithoutExchange(t *testing.T) {
 	}
 	if f.service.calls.Load() != 0 || !f.store.IsPending(state, "codex") {
 		t.Fatal("invalid callback consumed pending session")
+	}
+	if string(f.readFixtureBytes(t)) != string(before) {
+		t.Fatal("rejected callback rewrote credential")
 	}
 }
 
@@ -236,13 +232,17 @@ func TestSIWCBindOAuthErrorAndEligibility(t *testing.T) {
 			t.Fatalf("%s unexpectedly eligible", kind)
 		}
 	}
-	state, _ := f.start(t)
+	state, _ := f.seedPendingRecord(t)
+	before := f.readFixtureBytes(t)
 	w := siwcRequest(t, f.router, http.MethodPost, "/callback", map[string]any{"state": state, "error": "access_denied: secret-data"})
 	if w.Code != http.StatusOK || f.service.calls.Load() != 0 {
 		t.Fatalf("error callback triggered exchange: %d", w.Code)
 	}
 	if status := performOAuthStatusRequest(t, f.router, state); status.Status != "error" || strings.Contains(status.Error, "secret-data") {
 		t.Fatalf("unsafe OAuth error: %#v", status)
+	}
+	if string(f.readFixtureBytes(t)) != string(before) {
+		t.Fatal("rejected callback rewrote credential")
 	}
 }
 
