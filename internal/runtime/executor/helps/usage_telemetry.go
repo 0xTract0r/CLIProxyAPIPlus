@@ -100,9 +100,7 @@ func (r *UsageReporter) UseDecodedContentTelemetry() {
 	}
 	r.telemetryMu.Lock()
 	r.decodedContentTelemetry = true
-	if r.telemetry.Version >= 2 {
-		r.telemetry.VisibleContentObserved = false
-	}
+	r.telemetry.VisibleContentObserved = false
 	r.telemetryMu.Unlock()
 }
 
@@ -259,7 +257,7 @@ func (r *UsageReporter) ObserveContentEvent(payload []byte) {
 	r.telemetryMu.Lock()
 	defer r.telemetryMu.Unlock()
 	t := &r.telemetry
-	if t.Version >= 2 {
+	if t.Version >= 2 || r.decodedContentTelemetry {
 		if unsupportedVisible {
 			r.visibleContentIncomplete = true
 			t.VisibleContentObserved = false
@@ -268,7 +266,7 @@ func (r *UsageReporter) ObserveContentEvent(payload []byte) {
 			recognized = true
 			t.VisibleContentObserved = true
 		}
-		if subset {
+		if t.Version >= 2 && subset {
 			t.OutputReasoningSubset = true
 		}
 		if visible {

@@ -57,14 +57,15 @@ func (c *websocketConnectionCloser) Close() error {
 }
 
 type codexWebsocketSession struct {
-	ordinaryOwner       string
-	ordinaryTurn        chan struct{}
-	closed              bool
-	closedContext       context.Context
-	closeCancel         context.CancelFunc
-	ordinaryAuthID      string
-	sessionInstructions helps.CodexInstructionChain
-	sessionID           string
+	ordinaryOwner         string
+	ordinaryTransportLost bool // guarded by connMu; true until a new connection is installed
+	ordinaryTurn          chan struct{}
+	closed                bool
+	closedContext         context.Context
+	closeCancel           context.CancelFunc
+	ordinaryAuthID        string
+	sessionInstructions   helps.CodexInstructionChain
+	sessionID             string
 
 	reqMu sync.Mutex
 
@@ -779,8 +780,15 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *
 	closer := sess.connCloser
 	readerConn := sess.readerConn
 	closedContext := sess.closedContext
+	transportLost := sess.ordinaryTransportLost
 	sess.connMu.Unlock()
 	if requiresRetained && (conn == nil || closer == nil || sess.upstreamDisconnectError(conn) != nil) {
+		if errLoss := cliproxyexecutor.WebsocketInputLossError(ctx); errLoss != nil {
+			return nil, nil, nil, errLoss
+		}
+		if transportLost {
+			return nil, nil, nil, &cliproxyexecutor.UpstreamWebsocketTurnError{FullContextRequired: true, NotSent: true}
+		}
 		return nil, nil, nil, cliproxyexecutor.NewUpstreamWebsocketReplayRequiredError()
 	}
 	if conn != nil {
@@ -834,6 +842,7 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *
 	}
 	sess.conn = conn
 	sess.connCloser = closer
+	sess.ordinaryTransportLost = false
 	sess.connCfg = e.cfg
 	sess.hasConnCfg = true
 	sess.multiAgentV2OptimizedConn = nil
@@ -1014,6 +1023,9 @@ func (e *CodexWebsocketsExecutor) invalidateUpstreamConnWithNotify(sess *codexWe
 		sess.readerConn = nil
 	}
 	if cliproxyexecutor.IsUpstreamWebsocketTurnError(err) {
+		if sess.ordinaryOwner != "" {
+			sess.ordinaryTransportLost = true
+		}
 		cliproxyexecutor.NotifyWebsocketInputLoss(turnContext)
 	}
 	sess.connMu.Unlock()

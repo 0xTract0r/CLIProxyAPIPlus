@@ -118,7 +118,7 @@ func (e *CodexExecutor) executeOpenAIImage(ctx context.Context, auth *cliproxyau
 	ctx = helps.WithPayloadFinalizer(ctx, helps.NewPayloadFinalizer(e.cfg, e.Identifier(), mainModel, "codex", "", prepared.Body, req, payloadOpts))
 	helps.FinalizePayloadDoc(ctx, doc)
 	body := doc.Bytes()
-	httpReq, errRequest := newOrdinaryCodexImageRequest(ctx, url, apiKey, "application/json", body, true)
+	httpReq, errRequest := newOrdinaryCodexImageRequest(ctx, url, apiKey, "application/json", body, true, opts.Headers)
 	if errRequest != nil {
 		return resp, errRequest
 	}
@@ -229,7 +229,7 @@ func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *clip
 	ctx = helps.WithPayloadFinalizer(ctx, helps.NewPayloadFinalizer(e.cfg, e.Identifier(), mainModel, "codex", "", prepared.Body, req, payloadOpts))
 	helps.FinalizePayloadDoc(ctx, doc)
 	body := doc.Bytes()
-	httpReq, errRequest := newOrdinaryCodexImageRequest(ctx, url, apiKey, "application/json", body, true)
+	httpReq, errRequest := newOrdinaryCodexImageRequest(ctx, url, apiKey, "application/json", body, true, opts.Headers)
 	if errRequest != nil {
 		return nil, errRequest
 	}
@@ -369,7 +369,7 @@ func (e *CodexExecutor) executeDirectOpenAIImage(ctx context.Context, auth *clip
 	if errPrepare != nil {
 		return resp, errPrepare
 	}
-	httpReq, errRequest := newOrdinaryCodexImageRequest(ctx, url, apiKey, contentType, body, false)
+	httpReq, errRequest := newOrdinaryCodexImageRequest(ctx, url, apiKey, contentType, body, false, opts.Headers)
 	if errRequest != nil {
 		return resp, errRequest
 	}
@@ -432,7 +432,7 @@ func (e *CodexExecutor) executeDirectOpenAIImageStream(ctx context.Context, auth
 	if errPrepare != nil {
 		return nil, errPrepare
 	}
-	httpReq, errRequest := newOrdinaryCodexImageRequest(ctx, url, apiKey, contentType, body, true)
+	httpReq, errRequest := newOrdinaryCodexImageRequest(ctx, url, apiKey, contentType, body, true, opts.Headers)
 	if errRequest != nil {
 		return nil, errRequest
 	}
@@ -1211,7 +1211,7 @@ func codexMimeTypeFromOutputFormat(outputFormat string) string {
 	}
 }
 
-func newOrdinaryCodexImageRequest(ctx context.Context, url, token, contentType string, body []byte, stream bool) (*http.Request, error) {
+func newOrdinaryCodexImageRequest(ctx context.Context, url, token, contentType string, body []byte, stream bool, callerHeaders http.Header) (*http.Request, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
@@ -1223,6 +1223,7 @@ func newOrdinaryCodexImageRequest(ctx context.Context, url, token, contentType s
 		contentType = "application/json"
 	}
 	req.Header.Set("Content-Type", contentType)
+	applyOrdinaryCodexRequestID(req.Header, callerHeaders)
 	req.Header.Set("Accept", "application/json")
 	if stream {
 		req.Header.Set("Accept", "text/event-stream")

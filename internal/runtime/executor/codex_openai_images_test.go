@@ -23,8 +23,7 @@ import (
 func newCodexOpenAIImageTestAuth(serverURL string) *cliproxyauth.Auth {
 	return &cliproxyauth.Auth{
 		Provider: "codex",
-		// ProxyURL "direct" satisfies the fork anti-correlation egress guard so the
-		// request reaches the loopback httptest server instead of being blocked.
+		// Use the explicitly approved loopback route.
 		ProxyURL: "direct",
 		Attributes: map[string]string{
 			"base_url": serverURL,
@@ -247,10 +246,15 @@ func TestCodexExecutorDirectOpenAIImageGenerationUsesImagesEndpoint(t *testing.T
 		"Originator":            "Codex Desktop",
 	})
 	executor := NewCodexExecutor(&config.Config{})
+	opts := codexOpenAIImageTestOptions(codexImagesGenerationsPath, false)
+	opts.Headers = http.Header{
+		"X-Client-Request-Id": {"client-request-1"},
+		"Originator":          {"unapproved-caller-identity"},
+	}
 	resp, errExecute := executor.Execute(ctx, newCodexOpenAIImageTestAuth(server.URL), cliproxyexecutor.Request{
 		Model:   "codex/gpt-image-1.5",
 		Payload: []byte(`{"model":"codex/gpt-image-1.5","prompt":"A cute baby sea otter","n":1,"size":"1024x1024","quality":"high","background":"opaque","output_format":"jpeg","output_compression":70,"moderation":"low","extra":{"preserve":true},"stream":false}`),
-	}, codexOpenAIImageTestOptions(codexImagesGenerationsPath, false))
+	}, opts)
 	if errExecute != nil {
 		t.Fatalf("Execute() error = %v", errExecute)
 	}
@@ -264,20 +268,14 @@ func TestCodexExecutorDirectOpenAIImageGenerationUsesImagesEndpoint(t *testing.T
 	if gotAccept != "application/json" {
 		t.Fatalf("Accept = %q, want application/json", gotAccept)
 	}
-	if gotUA != codexUserAgent {
-		t.Fatalf("User-Agent = %q, want codex default %q", gotUA, codexUserAgent)
-	}
-	if gotVersion != "0.135.0" {
-		t.Fatalf("Version = %q, want %q", gotVersion, "0.135.0")
-	}
-	if gotTurnMetadata != `{"turn_id":"turn-1"}` {
-		t.Fatalf("X-Codex-Turn-Metadata = %q, want %q", gotTurnMetadata, `{"turn_id":"turn-1"}`)
+	if gotUA == "downstream-client/9.9" || gotVersion != "" || gotTurnMetadata != "" {
+		t.Fatal("upstream images request forwarded protected client identity metadata")
 	}
 	if gotClientRequestID != "client-request-1" {
 		t.Fatalf("X-Client-Request-Id = %q, want %q", gotClientRequestID, "client-request-1")
 	}
-	if gotOriginator != codexOriginator {
-		t.Fatalf("Originator = %q, want %q", gotOriginator, codexOriginator)
+	if gotOriginator != "" {
+		t.Fatal("upstream images request acquired an originator identity")
 	}
 	if got := ojson.GetBytes(gotBody, "model").String(); got != "gpt-image-1.5" {
 		t.Fatalf("model = %q, want gpt-image-1.5; body=%s", got, string(gotBody))
@@ -657,6 +655,25 @@ func TestCodexDirectOpenAIImageStreamAccountsLargeCompletedEvents(t *testing.T) 
 			record := capture.await(t)
 			if record.Detail.TotalTokens != 30 || record.Detail.ImageCount == nil || *record.Detail.ImageCount != 1 {
 				t.Fatalf("image completion usage missing: %+v", record.Detail)
+			}
+		})
+	}
+}
+
+func TestCodexImageRequestOnlyForwardsValidCallerRequestID(t *testing.T) {
+	for _, tc := range []struct{ name, id, want string }{
+		{"valid", "image-call-1", "image-call-1"},
+		{"missing", "", ""},
+		{"invalid", "bad identifier", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := http.Header{"X-Client-Request-Id": {tc.id}, "Authorization": {"caller-secret"}}
+			req, err := newOrdinaryCodexImageRequest(t.Context(), "https://fixture.invalid/images/generations", "selected", "", []byte("{}"), true, h)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if req.Header.Get("X-Client-Request-Id") != tc.want || req.Header.Get("Authorization") != "Bearer selected" {
+				t.Fatal("image request propagated an invalid request ID or caller authorization")
 			}
 		})
 	}

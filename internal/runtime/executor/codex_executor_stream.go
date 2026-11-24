@@ -33,6 +33,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		return e.executeCodexResponsesCompactionStream(ctx, auth, req, opts)
 	}
 	reporter := helps.NewExecutorUsageReporter(ctx, e, model, auth)
+	reporter.UseDecodedContentTelemetry()
 	defer reporter.TrackFailure(ctx, &err)
 	resp, body, err := e.sendOrdinaryCodex(ctx, auth, req, opts, "/responses", true, compat, reporter)
 	if err != nil {
@@ -97,6 +98,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			done := false
 			if isData {
 				data = bytes.TrimSpace(data)
+				reporter.ObserveContentEvent(data)
 				if terminal, _, failed := codexTerminalFailureErrWithCooling(data, e.modelLevelCooling()); failed {
 					e.observeOrdinaryPolicyRefusal(ctx, auth, req.Model, data)
 					fail(terminal)

@@ -23,7 +23,9 @@ import (
 // failure. The loss must still be recorded, so the next continuation is answered as "resend the
 // full input" instead of requiring a replay that closes the downstream socket.
 func TestCodexWebsocketWriteLossIsRecordedForNextContinuation(t *testing.T) {
+	var dials, frames atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		dials.Add(1)
 		conn, errUpgrade := (&websocket.Upgrader{}).Upgrade(w, r, nil)
 		if errUpgrade != nil {
 			t.Errorf("upgrade: %v", errUpgrade)
@@ -38,6 +40,7 @@ func TestCodexWebsocketWriteLossIsRecordedForNextContinuation(t *testing.T) {
 			if _, _, errRead := conn.ReadMessage(); errRead != nil {
 				return
 			}
+			frames.Add(1)
 		}
 	}))
 	defer server.Close()
@@ -63,6 +66,7 @@ func TestCodexWebsocketWriteLossIsRecordedForNextContinuation(t *testing.T) {
 	sess.connCloser = newWebsocketConnectionCloser(conn)
 	sess.authID = "auth-a"
 	sess.wsURL = wsURL
+	sess.proxyURL = "direct"
 	sess.readerConn = conn // no reader: only the write path can see the failure
 	sess.connMu.Unlock()
 	// The connection is dead but nothing has marked it: the next write fails.
@@ -70,12 +74,12 @@ func TestCodexWebsocketWriteLossIsRecordedForNextContinuation(t *testing.T) {
 		t.Fatal(errClose)
 	}
 
-	auth := &cliproxyauth.Auth{ID: "auth-a", Provider: "codex", Attributes: map[string]string{"api_key": "k", "base_url": server.URL}}
+	auth := &cliproxyauth.Auth{ID: "auth-a", Provider: "codex", ProxyURL: "direct", Attributes: map[string]string{"api_key": "k", "base_url": server.URL}}
 	opts := cliproxyexecutor.Options{
 		SourceFormat: sdktranslator.FormatOpenAIResponse,
 		Metadata:     map[string]any{cliproxyexecutor.ExecutionSessionMetadataKey: sessionID},
 	}
-	ctx := cliproxyexecutor.WithDownstreamWebsocket(context.Background())
+	ctx := fixtureCodexTenantContext(cliproxyexecutor.WithDownstreamWebsocket(context.Background()))
 	_, errCreate := exec.ExecuteStream(ctx, auth, cliproxyexecutor.Request{
 		Model:   "gpt-5.4",
 		Payload: []byte(`{"model":"gpt-5.4","input":[{"type":"message","role":"user","content":"hi"}]}`),
@@ -91,6 +95,9 @@ func TestCodexWebsocketWriteLossIsRecordedForNextContinuation(t *testing.T) {
 	var turnErr *cliproxyexecutor.UpstreamWebsocketTurnError
 	if !errors.As(errContinue, &turnErr) || !turnErr.FullContextRequired || turnErr.StatusCode() != http.StatusConflict {
 		t.Fatalf("continuation error = %v, want full context required with status 409", errContinue)
+	}
+	if dials.Load() != 1 || frames.Load() != 0 {
+		t.Fatalf("write loss redialed or replayed: dials=%d frames=%d", dials.Load(), frames.Load())
 	}
 }
 
@@ -169,6 +176,7 @@ func TestCodexWebsocketInvalidatePublishesLossEpochBeforeReleasingConnLock(t *te
 	sess.connCloser = newWebsocketConnectionCloser(conn)
 	sess.authID = "auth-a"
 	sess.wsURL = wsURL
+	sess.proxyURL = "direct"
 	sess.readerConn = conn
 	sess.turnContext = turn1Ctx
 	sess.connMu.Unlock()
@@ -193,14 +201,14 @@ func TestCodexWebsocketInvalidatePublishesLossEpochBeforeReleasingConnLock(t *te
 		&epoch,
 		0,
 	)
-	auth := &cliproxyauth.Auth{ID: "auth-a", Provider: "codex", Attributes: map[string]string{"api_key": "k", "base_url": server.URL}}
-	_, _, _, errEnsure := exec.ensureUpstreamConnWithSIWC(preLossCtx, auth, sess, "auth-a", wsURL, http.Header{}, false)
+	auth := &cliproxyauth.Auth{ID: "auth-a", Provider: "codex", ProxyURL: "direct", Attributes: map[string]string{"api_key": "k", "base_url": server.URL}}
+	_, _, _, errEnsure := exec.ensureUpstreamConn(preLossCtx, auth, sess, "auth-a", wsURL, http.Header{})
 	close(releaseLog)
 	<-invalidateDone
 
 	var turnErr *cliproxyexecutor.UpstreamWebsocketTurnError
 	if !errors.As(errEnsure, &turnErr) || !turnErr.NotSent {
-		t.Fatalf("ensureUpstreamConnWithSIWC error = %v, want NotSent turn error", errEnsure)
+		t.Fatalf("ensureUpstreamConn error = %v, want NotSent turn error", errEnsure)
 	}
 	if got := dials.Load(); got != 1 {
 		t.Fatalf("dials = %d, want 1 (no reconnect dial for pre-loss input)", got)

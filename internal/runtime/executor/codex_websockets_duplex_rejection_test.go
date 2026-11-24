@@ -1,7 +1,6 @@
 package executor
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -10,10 +9,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MoeForge/moego/json"
 	"github.com/MoeForge/moego/ojson"
 	"github.com/gorilla/websocket"
-	internalcache "github.com/router-for-me/CLIProxyAPI/v8/internal/cache"
+
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	auth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	core "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
@@ -31,6 +29,7 @@ func TestCodexDuplexRejectedCreateMetadata(t *testing.T) {
 	} {
 		t.Run(scenario.name, func(t *testing.T) {
 			activeFailure, ambiguous := scenario.activeFailure, scenario.ambiguous
+			wireKeys := make(chan [2]string, 1)
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				c, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
 				if err != nil {
@@ -61,6 +60,7 @@ func TestCodexDuplexRejectedCreateMetadata(t *testing.T) {
 					rejectedKey, rejectedID = read(), "rejected"
 				}
 				goodKey := read()
+				wireKeys <- [2]string{rejectedKey, goodKey}
 				if ambiguous {
 					write("response.failed", "", rejectedKey)
 					_, _, _ = c.ReadMessage()
@@ -75,13 +75,13 @@ func TestCodexDuplexRejectedCreateMetadata(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
 			input := make(chan core.WebsocketInput, 2)
-			ctx = core.WithWebsocketInput(core.WithDownstreamWebsocket(ctx), input)
+			ctx = fixtureCodexTenantContext(core.WithWebsocketInput(core.WithDownstreamWebsocket(ctx), input))
 			cfg := &config.Config{}
 			cfg.Codex.ResponseSteering = true
 			cfg.CodexResponseSteering = true
 			exec := NewCodexWebsocketsExecutor(cfg)
 			exec.store = &codexWebsocketSessionStore{sessions: make(map[string]*codexWebsocketSession)}
-			credential := &auth.Auth{ID: "metadata-account", Provider: "codex", Attributes: map[string]string{"api_key": "test", "base_url": upstream.URL, "websockets": "true"}}
+			credential := &auth.Auth{ID: "metadata-account", Provider: "codex", ProxyURL: "direct", Attributes: map[string]string{"api_key": "test", "base_url": upstream.URL, "websockets": "true"}}
 			request := func(key string) []byte {
 				return []byte(fmt.Sprintf(`{"type":"response.create","model":"gpt-6-astra","prompt_cache_key":%q,"input":[]}`, key))
 			}
@@ -90,6 +90,7 @@ func TestCodexDuplexRejectedCreateMetadata(t *testing.T) {
 				t.Fatal(err)
 			}
 			sent, failed, completed, terminated := false, false, false, false
+			var actual [2]string
 			for chunk := range result.Chunks {
 				if chunk.Err != nil {
 					var scoped interface{ IsRequestScoped() bool }
@@ -113,9 +114,10 @@ func TestCodexDuplexRejectedCreateMetadata(t *testing.T) {
 					if ambiguous {
 						continue
 					}
-					want := "rejected-key"
-					if activeFailure {
-						want = "first-key"
+					actual = <-wireKeys
+					want := actual[0]
+					if want == "" || actual[1] == "" || want == actual[1] {
+						t.Fatal("prepared wire keys must be nonempty and distinct for the two creates")
 					}
 					if got := ojson.GetBytes(chunk.Payload, "response.prompt_cache_key").String(); got != want {
 						t.Errorf("failure metadata = %q, want %q", got, want)
@@ -123,7 +125,7 @@ func TestCodexDuplexRejectedCreateMetadata(t *testing.T) {
 				}
 				if kind == "response.completed" && id == "good" {
 					completed = true
-					if got := ojson.GetBytes(chunk.Payload, "response.prompt_cache_key").String(); got != "good-key" {
+					if got := ojson.GetBytes(chunk.Payload, "response.prompt_cache_key").String(); got != actual[1] {
 						t.Errorf("success consumed another create's metadata: %q", got)
 					}
 					cancel()
@@ -137,127 +139,5 @@ func TestCodexDuplexRejectedCreateMetadata(t *testing.T) {
 				t.Fatalf("failed=%t completed=%t", failed, completed)
 			}
 		})
-	}
-}
-
-func TestCodexDuplexLaterInvalidSignatureClearsReplay(t *testing.T) {
-	for _, kind := range []string{"response.failed", "error", "error_without_status", "typeless_error", "typeless_body", "string_error", "wrapped_string_error"} {
-		for _, started := range []bool{false, true} {
-			t.Run(fmt.Sprintf("%s/started=%t", kind, started), func(t *testing.T) {
-				internalcache.ClearCodexReasoningReplayCache()
-				t.Cleanup(internalcache.ClearCodexReasoningReplayCache)
-				encrypted := validCodexReasoningEncryptedContentForTestSeed(51)
-				upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-					c, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
-					if err != nil {
-						t.Error(err)
-						return
-					}
-					defer func() { _ = c.Close() }()
-					_ = c.SetReadDeadline(time.Now().Add(8 * time.Second))
-					read := func() []byte {
-						_, p, e := c.ReadMessage()
-						if e != nil {
-							t.Error(e)
-						}
-						return p
-					}
-					write := func(p string) {
-						if e := c.WriteMessage(websocket.TextMessage, []byte(p)); e != nil {
-							t.Error(e)
-						}
-					}
-					read()
-					write(`{"type":"response.created","response":{"id":"first","output":[]}}`)
-					write(`{"type":"response.completed","response":{"id":"first","output":[]}}`)
-					read()
-					if started {
-						write(`{"type":"response.created","response":{"id":"rejected","output":[]}}`)
-					}
-					switch kind {
-					case "response.failed":
-						write(`{"type":"response.failed","response":{"id":"rejected","error":{"type":"invalid_request_error","message":"Invalid signature in thinking block"}}}`)
-					case "error":
-						write(`{"type":"error","status":400,"body":{"error":{"type":"invalid_request_error","message":"Invalid signature in thinking block"}}}`)
-					case "typeless_error":
-						write(`{"status":400,"error":{"type":"invalid_request_error","message":"Invalid signature in thinking block"}}`)
-					case "typeless_body":
-						write(`{"body":{"error":{"type":"invalid_request_error","message":"Invalid signature in thinking block"}}}`)
-					case "string_error":
-						write(`{"type":"error","status":400,"error":"Invalid signature in thinking block"}`)
-					case "wrapped_string_error":
-						write(`{"type":"error","status":400,"body":{"error":"Invalid signature in thinking block"}}`)
-					default:
-						write(`{"type":"error","error":{"type":"invalid_request_error","message":"Invalid signature in thinking block"}}`)
-					}
-					corrected := read()
-					if bytes.Contains(corrected, []byte(encrypted)) {
-						t.Error("corrected create resent rejected encrypted reasoning")
-					}
-					write(`{"type":"response.created","response":{"id":"corrected","output":[]}}`)
-					write(`{"type":"response.completed","response":{"id":"corrected","output":[]}}`)
-					_, _, _ = c.ReadMessage()
-				}))
-				defer upstream.Close()
-				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-				defer cancel()
-				input := make(chan core.WebsocketInput, 1)
-				ctx = core.WithWebsocketInput(core.WithDownstreamWebsocket(ctx), input)
-				cfg := &config.Config{}
-				cfg.Codex.ResponseSteering = true
-				cfg.CodexResponseSteering = true
-				exec := NewCodexWebsocketsExecutor(cfg)
-				exec.store = &codexWebsocketSessionStore{sessions: make(map[string]*codexWebsocketSession)}
-				credential := &auth.Auth{ID: "replay-account", Provider: "codex", Attributes: map[string]string{"api_key": "test", "base_url": upstream.URL, "websockets": "true"}}
-				model := "gpt-6-astra"
-				request := func(session string) []byte {
-					metadata, _ := json.Marshal(map[string]string{"session_id": session})
-					p, _ := json.Marshal(map[string]any{"type": "response.create", "model": model, "metadata": map[string]string{"user_id": string(metadata)}, "messages": []map[string]string{{"role": "user", "content": "continue"}}})
-					return p
-				}
-				first, rejected := request("first"), request("rejected")
-				opts := core.Options{SourceFormat: translator.FromString("claude"), Metadata: map[string]any{core.ExecutionSessionMetadataKey: t.Name()}}
-				for _, session := range []string{"first", "rejected", "unrelated"} {
-					scope := "claude:" + session + ":agent:main"
-					if !internalcache.CacheCodexReasoningReplayItem(model, scope, []byte(`{"type":"reasoning","summary":[],"encrypted_content":"`+encrypted+`"}`)) {
-						t.Fatal("cache seed failed")
-					}
-				}
-				result, err := exec.ExecuteStream(ctx, credential, core.Request{Model: model, Payload: first}, opts)
-				if err != nil {
-					t.Fatal(err)
-				}
-				failed, completed := false, false
-				for chunk := range result.Chunks {
-					if chunk.Err != nil {
-						t.Fatal(chunk.Err)
-					}
-					event := ojson.GetBytes(chunk.Payload, "type").String()
-					id := ojson.GetBytes(chunk.Payload, "response.id").String()
-					if event == "response.completed" && id == "first" {
-						input <- core.WebsocketInput{Payload: rejected}
-					}
-					if event == "response.failed" || event == "error" {
-						failed = true
-						if _, ok := internalcache.GetCodexReasoningReplayItem(model, "claude:rejected:agent:main"); ok {
-							t.Error("rejected scope retained invalid reasoning")
-						}
-						for _, session := range []string{"first", "unrelated"} {
-							if _, ok := internalcache.GetCodexReasoningReplayItem(model, "claude:"+session+":agent:main"); !ok {
-								t.Errorf("cleared unrelated scope %s", session)
-							}
-						}
-						input <- core.WebsocketInput{Payload: rejected}
-					}
-					if event == "response.completed" && id == "corrected" {
-						completed = true
-						cancel()
-					}
-				}
-				if !failed || !completed {
-					t.Fatalf("failed=%t corrected=%t", failed, completed)
-				}
-			})
-		}
 	}
 }

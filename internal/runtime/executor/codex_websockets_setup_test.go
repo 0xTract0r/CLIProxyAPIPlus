@@ -3,6 +3,7 @@ package executor
 import (
 	"context"
 	"errors"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"io"
 	"net"
 	"net/http"
@@ -12,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
 func TestCodexWebsocketSetupProxyEOFCoolsWithoutExtraDialRetries(t *testing.T) {
@@ -37,7 +38,7 @@ func TestCodexWebsocketSetupProxyEOFCoolsWithoutExtraDialRetries(t *testing.T) {
 	}()
 	t.Cleanup(func() { _ = listener.Close(); <-done })
 
-	exec := newCodexLeaseTestExecutor()
+	exec := newOrdinaryCodexSetupTestExecutor()
 	auth := &cliproxyauth.Auth{ProxyURL: "socks5h://" + listener.Addr().String()}
 	conn, closer, resp, errDial := exec.dialCodexWebsocket(context.Background(), auth, "wss://example.invalid/responses", nil)
 	if conn != nil || closer != nil || resp != nil || errDial == nil {
@@ -53,8 +54,8 @@ func TestCodexWebsocketSetupProxyEOFCoolsWithoutExtraDialRetries(t *testing.T) {
 	if strings.Contains(errDial.Error(), listener.Addr().String()) {
 		t.Fatal("public setup error exposed the proxy address")
 	}
-	if attempts.Load() != 3 {
-		t.Fatalf("dial attempts=%d, want existing uTLS budget of 3", attempts.Load())
+	if attempts.Load() != 1 {
+		t.Fatalf("dial attempts=%d, want one standard connection attempt", attempts.Load())
 	}
 }
 
@@ -62,7 +63,7 @@ func TestCodexWebsocketSetupPreservesCancellationAndHTTPRejection(t *testing.T) 
 	t.Run("canceled", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
-		exec := newCodexLeaseTestExecutor()
+		exec := newOrdinaryCodexSetupTestExecutor()
 		_, _, _, err := exec.dialCodexWebsocket(ctx, &cliproxyauth.Auth{ProxyURL: "direct"}, "ws://127.0.0.1:1/responses", nil)
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("caller cancellation changed: %v", err)
@@ -77,7 +78,7 @@ func TestCodexWebsocketSetupPreservesCancellationAndHTTPRejection(t *testing.T) 
 			http.Error(w, "invalid request", http.StatusBadRequest)
 		}))
 		defer server.Close()
-		exec := newCodexLeaseTestExecutor()
+		exec := newOrdinaryCodexSetupTestExecutor()
 		url, _ := buildCodexResponsesWebsocketURL(server.URL)
 		_, _, resp, err := exec.dialCodexWebsocket(context.Background(), &cliproxyauth.Auth{ProxyURL: "direct"}, url, nil)
 		if resp == nil || resp.StatusCode != http.StatusBadRequest || err == nil {
@@ -89,4 +90,10 @@ func TestCodexWebsocketSetupPreservesCancellationAndHTTPRejection(t *testing.T) 
 			t.Fatalf("explicit upstream rejection was replaced: %v", err)
 		}
 	})
+}
+
+func newOrdinaryCodexSetupTestExecutor() *CodexWebsocketsExecutor {
+	exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
+	exec.store = &codexWebsocketSessionStore{sessions: make(map[string]*codexWebsocketSession)}
+	return exec
 }

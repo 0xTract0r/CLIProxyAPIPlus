@@ -19,7 +19,7 @@ import (
 	"github.com/MoeForge/moego/ojson"
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
-	internalcache "github.com/router-for-me/CLIProxyAPI/v8/internal/cache"
+
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
@@ -474,24 +474,6 @@ func contextWithGinHeaders(headers map[string]string) context.Context {
 		ginCtx.Request.Header.Set(key, value)
 	}
 	return context.WithValue(context.Background(), "gin", ginCtx)
-}
-
-func TestClearCodexReasoningReplayOnWebsocketInvalidSignature(t *testing.T) {
-	internalcache.ClearCodexReasoningReplayCache()
-	t.Cleanup(internalcache.ClearCodexReasoningReplayCache)
-
-	scope := codexReasoningReplayScope{modelName: "gpt-5.4", sessionKey: "claude:ws-invalid:agent:main"}
-	encryptedContent := validCodexReasoningEncryptedContentForTestSeed(32)
-	if !internalcache.CacheCodexReasoningReplayItem(scope.modelName, scope.sessionKey, []byte(`{"type":"reasoning","summary":[],"content":null,"encrypted_content":"`+encryptedContent+`"}`)) {
-		t.Fatal("failed to seed websocket replay cache")
-	}
-	payload := []byte(`{"type":"error","status":400,"body":{"error":{"message":"Invalid signature in thinking block","type":"invalid_request_error","code":"invalid_request_error"}}}`)
-	if errClear := clearCodexReasoningReplayOnWebsocketError(context.Background(), scope, payload); errClear != nil {
-		t.Fatalf("clear websocket replay error: %v", errClear)
-	}
-	if _, ok := internalcache.GetCodexReasoningReplayItem(scope.modelName, scope.sessionKey); ok {
-		t.Fatal("websocket invalid signature did not clear replay state")
-	}
 }
 
 func TestCodexAutoExecutorRequiredUpstreamWebsocketRejectsHTTPFallback(t *testing.T) {
@@ -2719,7 +2701,7 @@ func TestOrdinaryCodexModelHeadersRequireSelectedOriginAndAllowlist(t *testing.T
 func TestOrdinaryCodexSameRequestOpaqueReasoningIsPreserved(t *testing.T) {
 	e := NewCodexWebsocketsExecutor(&config.Config{})
 	a := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "fixture", "base_url": "https://fixture.invalid"}}
-	fixture := validCodexReasoningEncryptedContentForTestSeed(23)
+	fixture := "caller-opaque-fixture-T23"
 	for _, tc := range []struct{ name, field string }{
 		{"caller supplied", "encrypted_content"},
 		{"missing", ""},

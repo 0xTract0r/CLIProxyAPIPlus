@@ -253,15 +253,16 @@ func writeCodexWebsocketMessage(sess *codexWebsocketSession, conn *websocket.Con
 }
 
 func mapCodexWebsocketWriteError(sess *codexWebsocketSession, conn *websocket.Conn, err error) error {
-	if err == nil || sess == nil || conn == nil {
-		return err
+	if err == nil {
+		return nil
 	}
-	upstreamErr := sess.upstreamDisconnectError(conn)
-	var closeErr *websocket.CloseError
-	if !errors.As(upstreamErr, &closeErr) || closeErr.Code != websocket.CloseMessageTooBig {
-		return err
+	if sess != nil && conn != nil {
+		var closeErr *websocket.CloseError
+		if upstreamErr := sess.upstreamDisconnectError(conn); errors.As(upstreamErr, &closeErr) && closeErr.Code == websocket.CloseMessageTooBig {
+			return mapCodexWebsocketReadError(upstreamErr)
+		}
 	}
-	return mapCodexWebsocketReadError(upstreamErr)
+	return codexWebsocketTurnTransportError(err)
 }
 
 func shouldRetryCodexWebsocketSend(err error) bool {

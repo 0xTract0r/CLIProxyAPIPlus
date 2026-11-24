@@ -339,9 +339,7 @@ func (e *CodexExecutor) sendOrdinaryCodex(ctx context.Context, auth *cliproxyaut
 		return nil, nil, err
 	}
 	e.applyOrdinaryCodexModelHeaders(httpReq, auth, req.Model)
-	if id := opts.Headers.Get("X-Client-Request-Id"); validOrdinaryCodexRequestID(id) {
-		httpReq.Header.Set("X-Client-Request-Id", id)
-	}
+	applyOrdinaryCodexRequestID(httpReq.Header, opts.Headers)
 	httpReq.Header.Set("Content-Type", "application/json")
 	if compressed {
 		httpReq.Header.Set("Content-Encoding", "zstd")
@@ -378,6 +376,12 @@ func (e *CodexExecutor) sendOrdinaryCodex(ctx context.Context, auth *cliproxyaut
 	}
 	resp.Body = decoded
 	return resp, body, nil
+}
+
+func applyOrdinaryCodexRequestID(target, caller http.Header) {
+	if id := caller.Get("X-Client-Request-Id"); validOrdinaryCodexRequestID(id) {
+		target.Set("X-Client-Request-Id", id)
+	}
 }
 
 func containsOrdinaryCodexImageTool(doc *ojson.Doc) bool {

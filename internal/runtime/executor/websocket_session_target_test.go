@@ -26,11 +26,12 @@ import (
 )
 
 type rejectSecondBindLifecycle struct {
-	binds atomic.Int32
+	binds       atomic.Int32
+	rejectFirst bool
 }
 
 func (l *rejectSecondBindLifecycle) Bind(func() error) error {
-	if l.binds.Add(1) > 1 {
+	if l.binds.Add(1) > 1 || l.rejectFirst {
 		return fmt.Errorf("retry lifecycle bind rejected")
 	}
 	return nil
@@ -131,73 +132,60 @@ func TestClearRetryActiveStateClearsOriginalConnection(t *testing.T) {
 
 func TestWebsocketRetryBindFailureClearsActiveSessionState(t *testing.T) {
 	tests := []struct {
-		name string
-		run  func(t *testing.T, baseURL string) (func(cliproxyexecutor.Options) error, *codexWebsocketSession)
+		name        string
+		rejectFirst bool
+		run         func(t *testing.T, baseURL string) (func(cliproxyexecutor.Options) error, *codexWebsocketSession)
 	}{
 		{
-			name: "Codex nonstream",
+			name: "Codex nonstream", rejectFirst: true,
 			run: func(t *testing.T, baseURL string) (func(cliproxyexecutor.Options) error, *codexWebsocketSession) {
 				executor := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
 				executor.store = &codexWebsocketSessionStore{sessions: make(map[string]*codexWebsocketSession)}
-				auth := &cliproxyauth.Auth{ID: "retry-bind-codex", Provider: "codex", Attributes: map[string]string{"api_key": "test-key", "base_url": baseURL}}
+				auth := &cliproxyauth.Auth{ID: "retry-bind-codex", Provider: "codex", ProxyURL: "direct", Attributes: map[string]string{"api_key": "test-key", "base_url": baseURL}}
 				req := cliproxyexecutor.Request{Model: "gpt-5-codex", Payload: []byte(`{"model":"gpt-5-codex","input":[{"type":"message","role":"user","content":"hello"}]}`)}
-				// Codex isolates websocket sessions per account (fork anti-corr feature):
-				// getOrCreateSession derives its store key from sessionID + auth + wsURL +
-				// proxy. Prime the SAME isolated session Execute resolves, using the exact
-				// wsURL Execute builds, so the primed (deliberately broken) connection is
-				// reused and the send-retry rebind path is exercised.
+				// Prime the ordinary authorized session so Bind rejects before the first frame.
 				wsURL, errWS := buildCodexResponsesWebsocketURL(strings.TrimSuffix(baseURL, "/") + "/responses")
 				if errWS != nil {
 					t.Fatalf("build codex websocket url: %v", errWS)
 				}
-				sess := executor.getOrCreateSession("retry-bind", auth, wsURL)
+				sess := executor.getOrCreateSession("retry-bind")
 				primed := false
 				return func(runOpts cliproxyexecutor.Options) error {
 					if !primed {
-						conn, _, _, errEnsure := executor.ensureUpstreamConn(context.Background(), auth, sess, auth.ID, wsURL, http.Header{})
+						_, _, _, errEnsure := executor.ensureUpstreamConn(context.Background(), auth, sess, auth.ID, wsURL, http.Header{})
 						if errEnsure != nil {
 							return errEnsure
 						}
-						if errDeadline := conn.SetWriteDeadline(time.Now().Add(-time.Second)); errDeadline != nil {
-							return errDeadline
-						}
 						primed = true
 					}
-					_, errExecute := executor.Execute(context.Background(), auth, req, runOpts)
+					_, errExecute := executor.Execute(fixtureCodexTenantContext(context.Background()), auth, req, runOpts)
 					return errExecute
 				}, sess
 			},
 		},
 		{
-			name: "Codex stream",
+			name: "Codex stream", rejectFirst: true,
 			run: func(t *testing.T, baseURL string) (func(cliproxyexecutor.Options) error, *codexWebsocketSession) {
 				executor := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
 				executor.store = &codexWebsocketSessionStore{sessions: make(map[string]*codexWebsocketSession)}
-				auth := &cliproxyauth.Auth{ID: "retry-bind-codex", Provider: "codex", Attributes: map[string]string{"api_key": "test-key", "base_url": baseURL}}
+				auth := &cliproxyauth.Auth{ID: "retry-bind-codex", Provider: "codex", ProxyURL: "direct", Attributes: map[string]string{"api_key": "test-key", "base_url": baseURL}}
 				req := cliproxyexecutor.Request{Model: "gpt-5-codex", Payload: []byte(`{"model":"gpt-5-codex","input":[{"type":"message","role":"user","content":"hello"}]}`)}
-				// Codex isolates websocket sessions per account (fork anti-corr feature):
-				// getOrCreateSession derives its store key from sessionID + auth + wsURL +
-				// proxy. Prime the SAME isolated session Execute resolves, using the exact
-				// wsURL Execute builds, so the primed (deliberately broken) connection is
-				// reused and the send-retry rebind path is exercised.
+				// Prime the ordinary authorized session so Bind rejects before the first frame.
 				wsURL, errWS := buildCodexResponsesWebsocketURL(strings.TrimSuffix(baseURL, "/") + "/responses")
 				if errWS != nil {
 					t.Fatalf("build codex websocket url: %v", errWS)
 				}
-				sess := executor.getOrCreateSession("retry-bind", auth, wsURL)
+				sess := executor.getOrCreateSession("retry-bind")
 				primed := false
 				return func(runOpts cliproxyexecutor.Options) error {
 					if !primed {
-						conn, _, _, errEnsure := executor.ensureUpstreamConn(context.Background(), auth, sess, auth.ID, wsURL, http.Header{})
+						_, _, _, errEnsure := executor.ensureUpstreamConn(context.Background(), auth, sess, auth.ID, wsURL, http.Header{})
 						if errEnsure != nil {
 							return errEnsure
 						}
-						if errDeadline := conn.SetWriteDeadline(time.Now().Add(-time.Second)); errDeadline != nil {
-							return errDeadline
-						}
 						primed = true
 					}
-					result, errExecute := executor.ExecuteStream(context.Background(), auth, req, runOpts)
+					result, errExecute := executor.ExecuteStream(fixtureCodexTenantContext(context.Background()), auth, req, runOpts)
 					if errExecute != nil {
 						return errExecute
 					}
@@ -265,7 +253,7 @@ func TestWebsocketRetryBindFailureClearsActiveSessionState(t *testing.T) {
 					_, _, _ = conn.ReadMessage()
 					return
 				}
-				if connection == 2 {
+				if connection == 2 && !test.rejectFirst {
 					return
 				}
 				if _, _, errRead := conn.ReadMessage(); errRead != nil {
@@ -278,14 +266,18 @@ func TestWebsocketRetryBindFailureClearsActiveSessionState(t *testing.T) {
 			}))
 			defer server.Close()
 
-			lifecycle := &rejectSecondBindLifecycle{}
+			lifecycle := &rejectSecondBindLifecycle{rejectFirst: test.rejectFirst}
 			opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse, ResponseFormat: sdktranslator.FormatOpenAIResponse, ExecutionLifecycle: lifecycle, Metadata: map[string]any{cliproxyexecutor.ExecutionSessionMetadataKey: "retry-bind"}}
 			run, sess := test.run(t, server.URL)
 			if errRun := run(opts); errRun == nil {
 				t.Fatal("first request error = nil, want retry lifecycle bind rejection")
 			}
-			if got := lifecycle.binds.Load(); got != 2 {
-				t.Fatalf("lifecycle binds = %d, want 2", got)
+			wantBinds := int32(2)
+			if test.rejectFirst {
+				wantBinds = 1
+			}
+			if got := lifecycle.binds.Load(); got != wantBinds {
+				t.Fatalf("lifecycle binds = %d, want %d", got, wantBinds)
 			}
 			sess.activeMu.Lock()
 			active := sess.activeConn != nil || sess.activeCh != nil || sess.activeDone != nil || sess.activeCancel != nil
@@ -298,8 +290,9 @@ func TestWebsocketRetryBindFailureClearsActiveSessionState(t *testing.T) {
 			if errRun := run(opts); errRun != nil {
 				t.Fatalf("second request error = %v", errRun)
 			}
-			if got := connections.Load(); got != 3 {
-				t.Fatalf("websocket connections = %d, want 3 after retry bind failure", got)
+			wantConnections := wantBinds + 1
+			if got := connections.Load(); got != wantConnections {
+				t.Fatalf("websocket connections = %d, want %d after bind failure", got, wantConnections)
 			}
 		})
 	}

@@ -38,6 +38,9 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	if directCompact {
 		endpoint += "/compact"
 	}
+	if !directCompact {
+		reporter.UseDecodedContentTelemetry()
+	}
 	resp, requestBody, err := e.sendOrdinaryCodex(ctx, auth, req, opts, endpoint, !directCompact, compat, reporter)
 	if err != nil {
 		return cliproxyexecutor.Response{}, err
@@ -65,6 +68,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 			continue
 		}
 		b = bytes.TrimSpace(b)
+		reporter.ObserveContentEvent(b)
 		if terminal, _, failed := codexTerminalFailureErrWithCooling(b, e.modelLevelCooling()); failed {
 			e.observeOrdinaryPolicyRefusal(ctx, auth, req.Model, b)
 			return cliproxyexecutor.Response{}, terminal
