@@ -39,6 +39,12 @@ jobs:
           bash .github/scripts/run-loopback-only.sh env GOTOOLCHAIN=local GOWORK=off GOPROXY=off
           python3 .github/scripts/check-ordinary-pr-tests.py --run-selected
 
+      - name: Run full usage and local key-value storage package tests
+        run: >-
+          bash .github/scripts/run-loopback-only.sh env GOTOOLCHAIN=local GOWORK=off GOPROXY=off
+          go test -mod=readonly -race -count=1 -timeout=120s -v
+          ./internal/usage ./sdk/cliproxy/usage ./internal/kvstore
+
   seaweedfs-storage:
     name: S3-compatible credential storage
     if: >-

@@ -31,6 +31,12 @@ REQUIRED = {
         "TestRegisteredLegacyClaudeReauthRequiresOneTargetAndAdmin",
     },
     "github.com/router-for-me/CLIProxyAPI/v8/internal/api/handlers/management": {
+        "TestOrdinaryAccountSettingsReenableLegacyRefreshPreference",
+        "TestOrdinaryAccountSettingsKeepsOnlyRefreshBlock",
+        "TestOrdinaryAccountSettingsKeepsOnlyRefreshBlock/file_reauth_lock_while_manager_is_stale",
+        "TestOrdinaryAccountSettingsKeepsOnlyRefreshBlock/runtime_quarantine_on_file",
+        "TestOrdinaryAccountSettingsKeepsOnlyRefreshBlock/runtime_sign-in_in_memory",
+        "TestOrdinaryAccountSettingsKeepsOnlyRefreshBlock/runtime_sign-in_on_file",
         "TestOrdinaryLegacyClaudeReauthUsesSelectedFileAndAdmin",
         "TestOrdinaryCodexV0SelectedReauth",
         "TestClaudeOAuthV8CallbackPreservesURLSafeState",
@@ -60,6 +66,24 @@ REQUIRED = {
     "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy": {
         "TestOrdinaryRetiredFallbackNotInPublicCatalog",
         "TestOrdinaryExternallyImplementedLegacyProviderKeepsExecutableCatalog",
+    },
+    "github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor": {
+        "TestOrdinaryClaudeIndependentPublicMessages",
+        "TestOrdinaryClaudeIndependentPublicMessages/json",
+        "TestOrdinaryClaudeIndependentPublicMessages/stream",
+        "TestOrdinaryClaudePayloadRulesOnPublicMessages",
+        "TestOrdinaryClaudePublicTokenCountUsesOnlyCurrentInput",
+    },
+    "github.com/router-for-me/CLIProxyAPI/v8/test": {
+        "TestOrdinarySingleGrantUpstream502AcrossPublicRoutes",
+        *(f"TestOrdinarySingleGrantUpstream502AcrossPublicRoutes/{api}/stream={stream}"
+          for api in ("claude", "chat", "responses", "gemini")
+          for stream in ("false", "true")),
+        "TestOrdinarySingleGrantGeminiOutputBoundary",
+        "TestOrdinarySingleGrantGeminiOutputBoundary/before_visible_output/responses_empty_sse_eof",
+        "TestOrdinarySingleGrantGeminiOutputBoundary/valid_empty_response_completes",
+        "TestOrdinarySingleGrantGeminiOutputBoundary/caller_cancels_before_first_frame",
+        "TestOrdinarySingleGrantGeminiOutputBoundary/transport_truncated_after_visible_text",
     },
     "github.com/router-for-me/CLIProxyAPI/v8/internal/usage": {"TestKnownUsageKeyTiesFromDisk"},
 }
