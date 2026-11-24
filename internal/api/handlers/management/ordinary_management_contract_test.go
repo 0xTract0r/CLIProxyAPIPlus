@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -50,7 +51,11 @@ func TestOrdinaryAccountSettingsPreservesOtherFields(t *testing.T) {
 	}
 
 	res := call(http.MethodGet, "/auth-files/account-settings?name="+name, "")
-	if res.Code != 200 || !strings.Contains(res.Body.String(), `"editable_fields":["note","disabled"]`) {
+	var settings struct {
+		AccountSettings ordinaryAccountSettingsView `json:"account_settings"`
+	}
+	if res.Code != http.StatusOK || json.Unmarshal(res.Body.Bytes(), &settings) != nil ||
+		!slices.Equal(settings.AccountSettings.EditableFields, []string{"note", "disabled", "refresh_enabled"}) {
 		t.Fatalf("settings GET %d: %s", res.Code, res.Body.String())
 	}
 	out := call(http.MethodPatch, "/auth-files/account-settings", `{"name":"`+name+`","note":"must not publish","unknown_setting":true}`)

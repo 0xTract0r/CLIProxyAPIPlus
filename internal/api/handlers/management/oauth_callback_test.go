@@ -13,14 +13,15 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 )
 
-func TestPostOAuthCallbackCreatesMissingAuthDir(t *testing.T) {
+func TestPostOAuthCallbackWritesToRegisteredDirectory(t *testing.T) {
 
-	authDir := filepath.Join(t.TempDir(), "missing-auth")
+	authDir := t.TempDir()
 	state := "test-antigravity-state"
-	RegisterOAuthSession(state, "antigravity")
-	defer CompleteOAuthSession(state)
-
 	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, nil)
+	if err := h.RegisterFileOAuthSession(state, "antigravity", authDir); err != nil {
+		t.Fatal(err)
+	}
+	defer CompleteOAuthSession(state)
 	router := gin.New()
 	router.POST("/v0/management/oauth-callback", h.PostOAuthCallback)
 
@@ -51,14 +52,14 @@ func TestPostOAuthCallbackCreatesMissingAuthDir(t *testing.T) {
 }
 
 func TestGetOAuthCallbackWritesPluginProviderCallback(t *testing.T) {
-	authDir := filepath.Join(t.TempDir(), "missing-auth")
+	authDir := t.TempDir()
 	state := "test-geminicli-state"
-	if errRegister := RegisterPluginOAuthSession(state, "gemini-cli", nil); errRegister != nil {
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, nil)
+	if errRegister := h.registerPluginFileOAuthSession(state, "gemini-cli", nil, "", h.oauthFileScope()); errRegister != nil {
 		t.Fatalf("register plugin oauth session: %v", errRegister)
 	}
 	defer CompleteOAuthSession(state)
 
-	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, nil)
 	router := gin.New()
 	router.GET("/v0/management/oauth-callback", h.GetOAuthCallback)
 
@@ -87,14 +88,14 @@ func TestGetOAuthCallbackWritesPluginProviderCallback(t *testing.T) {
 }
 
 func TestGetOAuthCallbackDoesNotAliasPluginProvider(t *testing.T) {
-	authDir := filepath.Join(t.TempDir(), "missing-auth")
+	authDir := t.TempDir()
 	state := "test-openai-plugin-state"
-	if errRegister := RegisterPluginOAuthSession(state, "openai", nil); errRegister != nil {
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, nil)
+	if errRegister := h.registerPluginFileOAuthSession(state, "openai", nil, "", h.oauthFileScope()); errRegister != nil {
 		t.Fatalf("register plugin oauth session: %v", errRegister)
 	}
 	defer CompleteOAuthSession(state)
 
-	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, nil)
 	router := gin.New()
 	router.GET("/v0/management/oauth-callback", h.GetOAuthCallback)
 

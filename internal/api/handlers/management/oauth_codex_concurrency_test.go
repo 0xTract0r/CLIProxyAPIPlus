@@ -65,7 +65,7 @@ func TestRequestCodexTokenCompletionKeepsConcurrentSessionPending(t *testing.T) 
 		newCodexOAuthService = originalNewCodexOAuthService
 	}()
 
-	authDir := filepath.Join(t.TempDir(), "auths")
+	authDir := t.TempDir()
 	handler := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, nil)
 	router := gin.New()
 	router.GET("/codex-auth-url", handler.RequestCodexToken)
@@ -75,7 +75,7 @@ func TestRequestCodexTokenCompletionKeepsConcurrentSessionPending(t *testing.T) 
 	defer CompleteOAuthSession(firstState)
 	defer CompleteOAuthSession(secondState)
 
-	if _, errWrite := WriteOAuthCallbackFileForPendingSession(authDir, "codex", firstState, "first-code", ""); errWrite != nil {
+	if _, errWrite := handler.WriteFileOAuthCallback("codex", firstState, "first-code", ""); errWrite != nil {
 		t.Fatalf("write first callback file: %v", errWrite)
 	}
 
@@ -206,7 +206,7 @@ func TestRequestCodexToken_PlanTypeSavedToAuthFile(t *testing.T) {
 				newCodexOAuthService = originalNewCodexOAuthService
 			}()
 
-			authDir := filepath.Join(t.TempDir(), "auths")
+			authDir := t.TempDir()
 			handler := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, nil)
 			router := gin.New()
 			router.GET("/codex-auth-url", handler.RequestCodexToken)
@@ -214,7 +214,7 @@ func TestRequestCodexToken_PlanTypeSavedToAuthFile(t *testing.T) {
 			state := requestCodexTokenState(t, router)
 			defer CompleteOAuthSession(state)
 
-			if _, errWrite := WriteOAuthCallbackFileForPendingSession(authDir, "codex", state, "test-code", ""); errWrite != nil {
+			if _, errWrite := handler.WriteFileOAuthCallback("codex", state, "test-code", ""); errWrite != nil {
 				t.Fatalf("write callback file: %v", errWrite)
 			}
 
@@ -331,7 +331,7 @@ func TestRequestCodexTokenLoginDoesNotRaceConfigV8Save(t *testing.T) {
 	defer CompleteOAuthSession(state)
 	saveRetry(`0`)
 
-	if _, errWrite := WriteOAuthCallbackFileForPendingSession(authDir, "codex", state, "race-code", ""); errWrite != nil {
+	if _, errWrite := handler.WriteFileOAuthCallback("codex", state, "race-code", ""); errWrite != nil {
 		t.Fatalf("write callback file: %v", errWrite)
 	}
 	select {

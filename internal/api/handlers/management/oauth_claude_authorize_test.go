@@ -44,7 +44,9 @@ func TestClaudeOAuthV8CallbackPreservesURLSafeState(t *testing.T) {
 			router.POST("/v8/management/oauth/callback", handler.PostOAuthCallbackV8)
 			router.GET("/v8/management/oauth/callback", handler.GetOAuthCallbackV8)
 			state := strings.Repeat("Ab9-_", 8) + "AbA"
-			RegisterOAuthSession(state, "anthropic")
+			if err := handler.RegisterFileOAuthSession(state, "anthropic", authDir); err != nil {
+				t.Fatal(err)
+			}
 			defer CancelOAuthSession(state)
 
 			callbackRequest := func(callbackState string) *http.Request {

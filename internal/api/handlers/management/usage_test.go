@@ -46,7 +46,7 @@ func TestGetUsageQueuePopsRequestedRecords(t *testing.T) {
 		ginCtx, _ := gin.CreateTestContext(rec)
 		ginCtx.Request = httptest.NewRequest(http.MethodGet, "/v0/management/usage-queue?count=2", nil)
 
-		h := &Handler{}
+		h := NewHandlerWithoutConfigFilePath(nil, nil)
 		h.GetUsageQueue(ginCtx)
 
 		if rec.Code != http.StatusOK {

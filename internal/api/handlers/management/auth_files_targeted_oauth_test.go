@@ -996,7 +996,9 @@ func TestTargetedOAuthReloginReviewEdgeCasesAndVerification(t *testing.T) {
 	}
 	var verifyStartBody struct{ State string }
 	_ = json.Unmarshal(wVerifyStart.Body.Bytes(), &verifyStartBody)
-	_, _ = WriteOAuthCallbackFileForPendingSession(authDir, "antigravity", verifyStartBody.State, "ag-code-verify", "")
+	if _, err := hVerify.WriteFileOAuthCallback("antigravity", verifyStartBody.State, "ag-code-verify", ""); err != nil {
+		t.Fatal(err)
+	}
 	verifyStatus := pollOAuthStatusUntilDone(t, routerVerify, verifyStartBody.State)
 	if verifyStatus["status"] != "ok" || verifyStatus["inference_verified"] != true || verifyStatus["recovery_stage"] != "inference_verified" {
 		t.Fatalf("antigravity verify status = %#v, want ok with inference_verified=true", verifyStatus)
