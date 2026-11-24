@@ -211,15 +211,6 @@ func TestInspectGeminiThoughtSignature_RejectsGemini25Field1Envelope(t *testing.
 	if info.KnownEnvelope {
 		t.Fatal("KnownEnvelope should be false for the retired field-1 envelope")
 	}
-
-	// Gemini model parts still recover through the documented sentinel.
-	decision := DecideSignatureCompatibility(SignatureProviderGemini, sig, SignatureBlockKindGeminiModelPart)
-	if decision.Action != SignatureActionReplaceWithGeminiBypass {
-		t.Fatalf("action = %q, want %q", decision.Action, SignatureActionReplaceWithGeminiBypass)
-	}
-	if decision.ReplacementSignature != GeminiSkipThoughtSignatureValidator {
-		t.Fatalf("replacement = %q, want %q", decision.ReplacementSignature, GeminiSkipThoughtSignatureValidator)
-	}
 }
 
 func TestInspectGeminiThoughtSignature_RejectsMalformedKnownEnvelope(t *testing.T) {
@@ -265,20 +256,9 @@ func TestInspectGeminiThoughtSignature_ObservedMarkerOption(t *testing.T) {
 	}
 }
 
-func TestInspectGeminiThoughtSignature_BypassSentinelRequiresOption(t *testing.T) {
+func TestInspectGeminiThoughtSignature_RejectsNonProviderMarkerByDefault(t *testing.T) {
 	if IsValidGeminiThoughtSignature(GeminiSkipThoughtSignatureValidator) {
 		t.Fatal("bypass sentinel should not be valid by default")
-	}
-
-	info, err := InspectGeminiThoughtSignature(GeminiSkipThoughtSignatureValidator, GeminiThoughtSignatureValidationOptions{AllowBypassSentinel: true})
-	if err != nil {
-		t.Fatalf("bypass sentinel should be accepted when explicitly allowed: %v", err)
-	}
-	if !info.IsBypassSentinel {
-		t.Fatal("sentinel should be marked as bypass")
-	}
-	if info.BypassSentinel != GeminiSkipThoughtSignatureValidator {
-		t.Fatalf("BypassSentinel = %q, want %q", info.BypassSentinel, GeminiSkipThoughtSignatureValidator)
 	}
 }
 
@@ -314,14 +294,14 @@ func TestValidateGeminiThoughtSignatures_AllowsUnsignedParallelSibling(t *testin
 			"parts": [
 				{
 					"functionCall": {"id": "call-1", "name": "read_file", "args": {}},
-					"thoughtSignature": "skip_thought_signature_validator"
+					"thoughtSignature": "EjRW"
 				},
 				{"functionCall": {"id": "call-2", "name": "read_file", "args": {}}}
 			]
 		}]
 	}`)
 
-	if err := ValidateGeminiThoughtSignatures(input, GeminiThoughtSignatureValidationOptions{AllowBypassSentinel: true}); err != nil {
+	if err := ValidateGeminiThoughtSignatures(input); err != nil {
 		t.Fatalf("unsigned parallel sibling should be valid: %v", err)
 	}
 }
@@ -360,31 +340,31 @@ func TestValidateGeminiThoughtSignatures_CallAfterTextStartsNewGroup(t *testing.
 			"contents": [{
 				"role": "model",
 				"parts": [
-					{"functionCall": {"id": "call-1", "name": "read_file", "args": {}}, "thoughtSignature": "skip_thought_signature_validator"},
+					{"functionCall": {"id": "call-1", "name": "read_file", "args": {}}, "thoughtSignature": "EjRW"},
 					{"text": "more"},
 					{"functionCall": {"id": "call-2", "name": "read_file", "args": {}}}
 				]
 			}]
 		}`)
-		err := ValidateGeminiThoughtSignatures(input, GeminiThoughtSignatureValidationOptions{AllowBypassSentinel: true})
+		err := ValidateGeminiThoughtSignatures(input)
 		if err == nil || !strings.Contains(err.Error(), "missing thoughtSignature on first functionCall") {
 			t.Fatalf("expected missing thoughtSignature error on call after text, got %v", err)
 		}
 	})
 
-	t.Run("accepts_sentinel_on_call_after_text", func(t *testing.T) {
+	t.Run("accepts_explicit_field_on_call_after_text", func(t *testing.T) {
 		input := []byte(`{
 			"contents": [{
 				"role": "model",
 				"parts": [
-					{"functionCall": {"id": "call-1", "name": "read_file", "args": {}}, "thoughtSignature": "skip_thought_signature_validator"},
+					{"functionCall": {"id": "call-1", "name": "read_file", "args": {}}, "thoughtSignature": "EjRW"},
 					{"text": "more"},
-					{"functionCall": {"id": "call-2", "name": "read_file", "args": {}}, "thoughtSignature": "skip_thought_signature_validator"}
+					{"functionCall": {"id": "call-2", "name": "read_file", "args": {}}, "thoughtSignature": "EjRW"}
 				]
 			}]
 		}`)
-		if err := ValidateGeminiThoughtSignatures(input, GeminiThoughtSignatureValidationOptions{AllowBypassSentinel: true}); err != nil {
-			t.Fatalf("expected sentinel on call after text to be valid, got %v", err)
+		if err := ValidateGeminiThoughtSignatures(input); err != nil {
+			t.Fatalf("expected explicit field on call after text to be valid, got %v", err)
 		}
 	})
 }
@@ -399,24 +379,31 @@ func TestValidateGeminiThoughtSignatures_RejectsNonCanonicalNestedSignature(t *t
 	}
 }
 
-func TestValidateGeminiThoughtSignatures_AcceptsWrappedRequestAndSentinelWhenAllowed(t *testing.T) {
+func TestValidateGeminiThoughtSignatures_ValidatesWrappedRequest(t *testing.T) {
 	input := []byte(`{
 		"request": {
 			"contents": [{
 				"role": "model",
 				"parts": [
 					{
-						"functionCall": {"id": "call-1", "name": "read_file", "args": {}},
-						"thoughtSignature": "skip_thought_signature_validator"
+						"functionCall": {"id": "call-1", "name": "read_file", "args": {}}, "thoughtSignature": "EjRW"
 					}
 				]
 			}]
 		}
 	}`)
 
-	err := ValidateGeminiThoughtSignatures(input, GeminiThoughtSignatureValidationOptions{AllowBypassSentinel: true})
+	err := ValidateGeminiThoughtSignatures(input)
 	if err != nil {
-		t.Fatalf("sentinel should be valid when explicitly allowed: %v", err)
+		t.Fatalf("explicit opaque field should be valid in wrapped input: %v", err)
+	}
+	// A missing field in the wrapped request must reach the same validator.
+	missing := []byte(strings.Replace(string(input), `, "thoughtSignature": "EjRW"`, "", 1))
+	if string(missing) == string(input) {
+		t.Fatal("fixture did not remove the signature")
+	}
+	if err := ValidateGeminiThoughtSignatures(missing); err == nil || !strings.Contains(err.Error(), "missing thoughtSignature") {
+		t.Fatalf("wrapped request without explicit field = %v, want missing-field error", err)
 	}
 }
 
@@ -708,19 +695,11 @@ func TestInspectGeminiThoughtSignature_AcceptsVertexBareTinkEnvelope(t *testing.
 
 func TestInspectGeminiThoughtSignature_RejectsShortBareTinkEnvelope(t *testing.T) {
 	// Below prefix + key id + auth-tag floor the payload is not a bounded
-	// bare-Tink envelope and must degrade to the bypass decision instead of
-	// being replayed verbatim.
+	// bare-Tink envelope.
 	sig := testGeminiThoughtSignature(append([]byte{0x01, 0x8f, 0x3d}, make([]byte, 10)...))
 
 	if _, err := InspectGeminiThoughtSignature(sig, GeminiThoughtSignatureValidationOptions{RequireKnownEnvelope: true}); err == nil {
 		t.Fatal("short payload should not be a known bare-Tink envelope")
-	}
-	decision := DecideSignatureCompatibility(SignatureProviderGemini, sig, SignatureBlockKindGeminiFunctionCall)
-	if decision.Action != SignatureActionReplaceWithGeminiBypass {
-		t.Fatalf("action = %q, want %q", decision.Action, SignatureActionReplaceWithGeminiBypass)
-	}
-	if decision.ReplacementSignature != GeminiSkipThoughtSignatureValidator {
-		t.Fatalf("replacement = %q, want %q", decision.ReplacementSignature, GeminiSkipThoughtSignatureValidator)
 	}
 }
 

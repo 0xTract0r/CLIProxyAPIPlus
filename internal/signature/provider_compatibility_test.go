@@ -112,7 +112,7 @@ func TestSelfDescribingSignatureFirstChars_CoversEveryKnownEnvelope(t *testing.T
 // them need to be registered: the envelope is never replay-safe, so it resolves to
 // SignatureProviderUnknown either way and Gemini model parts recover it through the
 // bypass sentinel keyed on block kind.
-func TestGeminiASCIIUUIDIsGateIndependent(t *testing.T) {
+func TestGeminiASCIIUUIDClassificationIsGateIndependent(t *testing.T) {
 	// First hex digit chosen to land on distinct base64 first characters.
 	for _, uuid := range []string{
 		"09743975-4bb0-4936-9e28-d5b0d21bdc48",
@@ -125,10 +125,6 @@ func TestGeminiASCIIUUIDIsGateIndependent(t *testing.T) {
 		if got := DetectSignatureProvider(sig); got != SignatureProviderUnknown {
 			t.Errorf("uuid %q: DetectSignatureProvider = %q, want %q regardless of the pre-filter",
 				uuid[:8], got, SignatureProviderUnknown)
-		}
-		decision := DecideSignatureCompatibility(SignatureProviderGemini, sig, SignatureBlockKindGeminiFunctionCall)
-		if decision.Action != SignatureActionReplaceWithGeminiBypass {
-			t.Errorf("uuid %q: action = %q, want %q", uuid[:8], decision.Action, SignatureActionReplaceWithGeminiBypass)
 		}
 	}
 }

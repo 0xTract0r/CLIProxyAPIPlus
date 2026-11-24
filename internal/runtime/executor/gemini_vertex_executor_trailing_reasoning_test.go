@@ -53,6 +53,7 @@ func issue6630VertexContents(t *testing.T, cfg *config.Config, authMode string, 
 	ctx := context.Background()
 	auth := &cliproxyauth.Auth{ID: t.Name(), Provider: "vertex"}
 	if authMode == "api_key" {
+		auth.ProxyURL = "direct"
 		auth.Attributes = map[string]string{"api_key": "test-key", "base_url": server.URL}
 	} else {
 		var serviceAccount map[string]any
@@ -134,7 +135,7 @@ func TestGeminiVertexDropsTrailingReasoningTurn(t *testing.T) {
 			name:  "trailing reasoning after tool output",
 			input: issue6630UserItem + `,{"type":"function_call","call_id":"call_1","name":"run","arguments":"{}"},{"type":"function_call_output","call_id":"call_1","output":"done"},` + issue6630ReasoningItem,
 			want: `[{"role":"user","parts":[{"text":"say hi"}]},` +
-				`{"role":"model","parts":[{"functionCall":{"name":"run","args":{}},"thoughtSignature":"skip_thought_signature_validator"}]},` +
+				`{"role":"model","parts":[{"functionCall":{"name":"run","args":{}}}]},` +
 				`{"role":"user","parts":[{"functionResponse":{"name":"run","response":{"result":"done"}}}]}]`,
 		},
 		{

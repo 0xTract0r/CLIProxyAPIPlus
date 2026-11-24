@@ -7,12 +7,13 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/MoeForge/moego/ojson"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
-	internalsignature "github.com/router-for-me/CLIProxyAPI/v8/internal/signature"
+
 	_ "github.com/router-for-me/CLIProxyAPI/v8/internal/translator"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
@@ -173,7 +174,7 @@ func TestGeminiExecutorCountTokens_SanitizesClaudeCAISSignature(t *testing.T) {
 	}
 }
 
-func TestGeminiExecutorExecute_FunctionCall_ReplacesClaudeSignatureWithBypass(t *testing.T) {
+func TestGeminiExecutorExecute_FunctionCall_RejectsForeignSignature(t *testing.T) {
 	var upstreamBody []byte
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, errRead := io.ReadAll(r.Body)
@@ -188,6 +189,7 @@ func TestGeminiExecutorExecute_FunctionCall_ReplacesClaudeSignatureWithBypass(t 
 
 	executor := NewGeminiExecutor(&config.Config{})
 	auth := &cliproxyauth.Auth{
+		ProxyURL: "direct",
 		Attributes: map[string]string{
 			"api_key":  "test-api-key",
 			"base_url": server.URL,
@@ -226,14 +228,8 @@ func TestGeminiExecutorExecute_FunctionCall_ReplacesClaudeSignatureWithBypass(t 
 	}
 
 	_, err := executor.Execute(context.Background(), auth, req, opts)
-	if err != nil {
-		t.Fatalf("Execute() error = %v", err)
-	}
-
-	gotSig := ojson.GetBytes(upstreamBody, "contents.1.parts.0.thoughtSignature").String()
-	if gotSig != internalsignature.GeminiSkipThoughtSignatureValidator {
-		t.Fatalf("first functionCall thoughtSignature = %q, want bypass sentinel %q; upstreamBody=%s",
-			gotSig, internalsignature.GeminiSkipThoughtSignatureValidator, upstreamBody)
+	if err == nil || len(upstreamBody) != 0 {
+		t.Fatalf("foreign field should be rejected before egress: err=%v; sent=%t; signature field present=%t", err, len(upstreamBody) != 0, strings.Contains(string(upstreamBody), "thoughtSignature"))
 	}
 }
 
@@ -352,7 +348,7 @@ func TestGeminiExecutorExecute_UnsignedRequestNotCorrupted(t *testing.T) {
 	}
 }
 
-func TestGeminiExecutorExecute_ClaudeToolCallsSeparatedByTextKeepBypassSignatures(t *testing.T) {
+func TestGeminiExecutorExecute_ClaudeToolCallsSeparatedByTextPreserveOrderAndStayUnsigned(t *testing.T) {
 	var upstreamBody []byte
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, errRead := io.ReadAll(r.Body)
@@ -367,6 +363,7 @@ func TestGeminiExecutorExecute_ClaudeToolCallsSeparatedByTextKeepBypassSignature
 
 	executor := NewGeminiExecutor(&config.Config{})
 	auth := &cliproxyauth.Auth{
+		ProxyURL: "direct",
 		Attributes: map[string]string{
 			"api_key":  "test-api-key",
 			"base_url": server.URL,
@@ -402,16 +399,14 @@ func TestGeminiExecutorExecute_ClaudeToolCallsSeparatedByTextKeepBypassSignature
 		t.Fatalf("Execute() error = %v", err)
 	}
 
-	if got := ojson.GetBytes(upstreamBody, "contents.1.parts.0.thoughtSignature").String(); got != internalsignature.GeminiSkipThoughtSignatureValidator {
-		t.Fatalf("first functionCall thoughtSignature = %q, want %q; upstreamBody=%s",
-			got, internalsignature.GeminiSkipThoughtSignatureValidator, upstreamBody)
+	if part := ojson.GetBytes(upstreamBody, "contents.1.parts.0"); !part.Get("functionCall").Exists() || part.Get("thoughtSignature").Exists() {
+		t.Fatal("ordinary tool call missing or given an unsolicited signature")
 	}
 	if got := ojson.GetBytes(upstreamBody, "contents.1.parts.1.text").String(); got != "more" {
 		t.Fatalf("middle text part = %q, want 'more'; upstreamBody=%s", got, upstreamBody)
 	}
-	if got := ojson.GetBytes(upstreamBody, "contents.1.parts.2.thoughtSignature").String(); got != internalsignature.GeminiSkipThoughtSignatureValidator {
-		t.Fatalf("functionCall after text thoughtSignature = %q, want %q; upstreamBody=%s",
-			got, internalsignature.GeminiSkipThoughtSignatureValidator, upstreamBody)
+	if part := ojson.GetBytes(upstreamBody, "contents.1.parts.2"); !part.Get("functionCall").Exists() || part.Get("thoughtSignature").Exists() {
+		t.Fatal("ordinary tool call missing or given an unsolicited signature")
 	}
 }
 

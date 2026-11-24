@@ -358,14 +358,13 @@ func DecideSignatureCompatibilityForModel(targetProvider SignatureProvider, targ
 	decision.Compatible = false
 	switch targetProvider {
 	case SignatureProviderGemini:
-		if blockKind == SignatureBlockKindGeminiFunctionCall || blockKind == SignatureBlockKindGeminiModelPart || blockKind == SignatureBlockKindUnknown {
-			decision.Action = SignatureActionReplaceWithGeminiBypass
-			decision.ReplacementSignature = GeminiSkipThoughtSignatureValidator
-			decision.Reason = "missing or incompatible signature"
-			return decision
+		decision.Action = SignatureActionDropSignature
+		switch blockKind {
+		case SignatureBlockKindGeminiFunctionCall, SignatureBlockKindGeminiModelPart, SignatureBlockKindUnknown:
+		default:
+			decision.Action = SignatureActionDropBlock
 		}
-		decision.Action = SignatureActionDropBlock
-		decision.Reason = "signature is not compatible with Gemini and this block is not a bypass-safe Gemini model part"
+		decision.Reason = "missing or incompatible Gemini signature"
 	case SignatureProviderClaude:
 		decision.Action = SignatureActionDropBlock
 		decision.Reason = "Claude has no cross-provider bypass sentinel for thinking blocks"

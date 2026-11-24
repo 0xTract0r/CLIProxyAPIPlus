@@ -14,7 +14,7 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-func TestRequestPairWithEmptyPluginHostSanitizesSignaturesOnce(t *testing.T) {
+func TestRequestPairWithEmptyPluginHostKeepsUnsignedCallsIndependent(t *testing.T) {
 	logger := log.StandardLogger()
 	oldOutput, oldLevel := logger.Out, logger.GetLevel()
 	var logs bytes.Buffer
@@ -53,19 +53,15 @@ func TestRequestPairWithEmptyPluginHostSanitizesSignaturesOnce(t *testing.T) {
 				} else {
 					base, work = helps.TranslateRequestPairWithAPIKeyModelCompatibility(t.Context(), nil, &config.Config{}, sdktranslator.FormatOpenAIResponse, sdktranslator.FormatAntigravity, "gemini-3.6-flash-high", payload, payload, stream, route == "api-key-compat")
 				}
-				const message = "gemini request: sanitized 9 thoughtSignatures"
-				if count := strings.Count(logs.String(), message); count != 1 {
-					t.Fatalf("host=%T stream=%v route=%s: sanitation logs = %d, want 1; logs=%s", host, stream, route, count, logs.String())
-				}
 				if !bytes.Equal(base, work) {
 					t.Fatal("same input produced different translations")
 				}
 				parts := ojson.GetBytes(work, "request.contents.0.parts").Array()
-				if len(parts) != 10 || parts[0].Get("thoughtSignature").String() != "skip_thought_signature_validator" {
+				if len(parts) != 10 {
 					t.Fatalf("unexpected parallel tool call layout: %s", work)
 				}
-				for _, part := range parts[1:] {
-					if part.Get("thoughtSignature").Exists() {
+				for _, part := range parts {
+					if !part.Get("functionCall").Exists() || part.Get("thoughtSignature").Exists() {
 						t.Fatal("sibling tool call still has a signature")
 					}
 				}

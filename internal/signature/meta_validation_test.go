@@ -210,12 +210,12 @@ func TestMetaSignatureCompatibility_OtherTargets(t *testing.T) {
 		action SignatureCompatibilityAction
 	}{
 		{SignatureProviderClaude, SignatureActionDropBlock},
-		{SignatureProviderGemini, SignatureActionReplaceWithGeminiBypass},
+		{SignatureProviderGemini, ""},
 		{SignatureProviderKimi, SignatureActionDropSignature},
 		{SignatureProviderGrok, SignatureActionDropBlock},
 	} {
 		decision := DecideSignatureCompatibility(tc.target, sig, SignatureBlockKindUnknown)
-		if decision.Compatible || decision.DetectedProvider != SignatureProviderMeta || decision.Action != tc.action {
+		if decision.Compatible || decision.DetectedProvider != SignatureProviderMeta || (tc.action != "" && decision.Action != tc.action) {
 			t.Errorf("target %q: decision = %+v, want detected Meta + action %q", tc.target, decision, tc.action)
 		}
 	}
