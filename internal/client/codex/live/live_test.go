@@ -1002,8 +1002,12 @@ func TestHandleSidebandForwardsUnauthorizedHomeHandshakeWithoutRefresh(t *testin
 			}))
 			defer upstreamServer.Close()
 
+			runtimeConfig := &config.Config{
+				Home:      config.HomeConfig{Enabled: true},
+				SDKConfig: config.SDKConfig{ProxyURL: "direct"}, // httptest provides the only upstream.
+			}
 			manager := auth.NewManager(nil, nil, nil)
-			manager.SetConfig(&config.Config{Home: config.HomeConfig{Enabled: true}})
+			manager.SetConfig(runtimeConfig)
 			registry := executionregistry.New()
 			manager.PublishHomeDispatch(&homeDispatcher{}, registry, 1)
 			executor := &captureExecutor{}
@@ -1015,7 +1019,7 @@ func TestHandleSidebandForwardsUnauthorizedHomeHandshakeWithoutRefresh(t *testin
 			selection.Retain()
 			defer selection.End("test_complete")
 
-			handler := NewHandler(manager, nil)
+			handler := NewHandler(manager, runtimeConfig)
 			handler.sidebandAPIBaseURL = "ws" + strings.TrimPrefix(upstreamServer.URL, "http") + "/v1"
 			handler.sessions.put("call-home-refresh", liveSession{authID: "home-codex-live", model: defaultLiveModel, homeSelection: selection})
 			router := gin.New()

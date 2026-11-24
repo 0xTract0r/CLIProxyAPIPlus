@@ -72,6 +72,7 @@ func TestRelayHeadersQueryAndDisallowedPaths(t *testing.T) {
 		ID:       "meta-headers-test",
 		Provider: "meta",
 		Status:   auth.StatusActive,
+		ProxyURL: "direct", // httptest provides the only upstream.
 		Attributes: map[string]string{
 			"api_key":  "meta-secret",
 			"base_url": upstream.URL + "/api/v1",
@@ -518,12 +519,14 @@ func TestRelayTransportDropsAndClientCancelDoNotCooldownCredential(t *testing.T)
 			ID:         "meta-cancel-test",
 			Provider:   "meta",
 			Status:     auth.StatusActive,
+			ProxyURL:   "direct", // httptest provides the only upstream.
 			Attributes: map[string]string{"api_key": "meta-secret", "base_url": upstream.URL + "/v1"},
 		}
 		registerMetaTestCred(t, manager, cred, "muse-wonder-1.0")
 		router := newTestRouter(NewHandler(manager, cfg))
 
-		ctx, cancel := context.WithCancel(context.Background())
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
 		req := httptest.NewRequest(http.MethodGet, "/muse-code/config", nil).WithContext(ctx)
 		rec := httptest.NewRecorder()
 		done := make(chan struct{})
@@ -531,9 +534,19 @@ func TestRelayTransportDropsAndClientCancelDoNotCooldownCredential(t *testing.T)
 			defer close(done)
 			router.ServeHTTP(rec, req)
 		}()
-		<-inFlight
+		select {
+		case <-inFlight:
+		case <-done:
+			t.Fatalf("relay returned %d before reaching the fixture upstream", rec.Code)
+		case <-time.After(5 * time.Second):
+			t.Fatal("relay did not reach the fixture upstream")
+		}
 		cancel()
-		<-done
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("relay did not return after client cancellation")
+		}
 
 		if rec.Code != 499 {
 			t.Fatalf("client cancel status = %d, want 499", rec.Code)

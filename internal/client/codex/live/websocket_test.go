@@ -63,7 +63,7 @@ func TestHandleDirectWebsocketForwardsUnauthorizedHomeHandshakeWithoutRefresh(t 
 
 			runtimeConfig := &config.Config{
 				Home:      config.HomeConfig{Enabled: true},
-				SDKConfig: config.SDKConfig{RequestLog: true},
+				SDKConfig: config.SDKConfig{RequestLog: true, ProxyURL: "direct"},
 			}
 			manager := auth.NewManager(nil, nil, nil)
 			manager.SetConfig(runtimeConfig)
@@ -146,6 +146,7 @@ func TestHandleDirectWebsocketAppliesClientSecretSession(t *testing.T) {
 		ID:       "codex-oauth",
 		Provider: "codex",
 		Status:   auth.StatusActive,
+		ProxyURL: "direct", // httptest provides the only upstream.
 		Metadata: map[string]any{"access_token": "oauth-token"},
 	})
 	handler := NewHandler(manager, nil)
@@ -218,6 +219,7 @@ func TestHandleDirectWebsocketRelaysStandardRealtimeFrames(t *testing.T) {
 		ID:       "codex-oauth",
 		Provider: "codex",
 		Status:   auth.StatusActive,
+		ProxyURL: "direct", // httptest provides the only upstream.
 		Metadata: map[string]any{
 			"access_token": "oauth-token",
 			"account_id":   "account-123",
