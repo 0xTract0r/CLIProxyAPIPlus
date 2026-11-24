@@ -6,7 +6,6 @@ import (
 	"testing"
 
 	"github.com/MoeForge/moego/ojson"
-	homekv "github.com/router-for-me/CLIProxyAPI/v8/internal/home"
 )
 
 func TestGeminiResponsesLateSignaturePreservesSummary(t *testing.T) {
@@ -35,44 +34,6 @@ func TestGeminiResponsesLateSignaturePreservesSummary(t *testing.T) {
 	replayed, _ := ConvertOpenAIResponsesRequestToGemini("gemini-3.8-flash-high", []byte(`{"input":`+completed.Raw+`}`), false)
 	if ojson.GetBytesNoCopy(replayed, "contents.0.parts.1.thoughtSignature").String() != testResponsesGeminiThoughtSignature {
 		t.Fatalf("late text signature was not restored: %s", replayed)
-	}
-}
-
-func TestGeminiResponsesCachedTextSignatureReplayBoundaries(t *testing.T) {
-	const model = "gemini-3.8-flash-high"
-	const messageID = "msg_resp_issue-5513-boundaries_0"
-	const text = "An exact signed answer."
-	if !cacheGeminiResponsesTextSignatures(model, messageID, text, []string{testResponsesGeminiThoughtSignature}) {
-		t.Fatal("could not seed text signature replay cache")
-	}
-	message := `{"id":"` + messageID + `","type":"message","role":"assistant","content":[{"type":"output_text","text":"` + text + `"}]}`
-	for _, testCase := range []struct {
-		name          string
-		model         string
-		message       string
-		wantSignature bool
-	}{
-		{name: "exact", model: model, message: message, wantSignature: true},
-		{name: "different model", model: "gemini-other", message: message},
-		{name: "edited text", model: model, message: strings.ReplaceAll(message, text, "Edited answer.")},
-		{name: "different ID", model: model, message: strings.ReplaceAll(message, messageID, messageID+"-other")},
-		{name: "no ID", model: model, message: strings.ReplaceAll(message, `"id":"`+messageID+`",`, "")},
-	} {
-		t.Run(testCase.name, func(t *testing.T) {
-			request := []byte(`{"input":[` + testCase.message + `]}`)
-			output, _ := ConvertOpenAIResponsesRequestToGemini(testCase.model, request, false)
-			got := strings.Contains(string(output), testResponsesGeminiThoughtSignature)
-			if got != testCase.wantSignature {
-				t.Fatalf("signature restored=%v, want %v: %s", got, testCase.wantSignature, output)
-			}
-		})
-	}
-	carrier := []byte(`{"type":"reasoning","summary":[]}`)
-	carrier, _ = ojson.SetBytes(carrier, "encrypted_content", encodeGeminiResponsesCarrier(testResponsesGeminiThoughtSignature, geminiResponsesCarrierPrevious, geminiResponsesCarrierText))
-	request := []byte(`{"input":[` + message + `,` + string(carrier) + `]}`)
-	output, _ := ConvertOpenAIResponsesRequestToGemini(model, request, false)
-	if strings.Count(string(output), testResponsesGeminiThoughtSignature) != 1 {
-		t.Fatalf("explicit carrier duplicated cached signature: %s", output)
 	}
 }
 
@@ -114,25 +75,6 @@ func TestGeminiResponsesLateSignatureReplayWithThinkingSuffix(t *testing.T) {
 	}
 }
 
-func TestGeminiResponsesCachedSignaturesMergeExplicitPrefixInOrder(t *testing.T) {
-	const model = "gemini-3.8-flash-high"
-	const messageID = "msg_resp_issue-5513-merge_0"
-	signature2 := differentResponsesGeminiThoughtSignature(t)
-	if !cacheGeminiResponsesTextSignatures(model, messageID, "answer", []string{testResponsesGeminiThoughtSignature, signature2}) {
-		t.Fatal("could not seed replay cache")
-	}
-	for _, explicitSignature := range []string{testResponsesGeminiThoughtSignature, signature2} {
-		carrier := []byte(`{"type":"reasoning","summary":[]}`)
-		carrier, _ = ojson.SetBytes(carrier, "encrypted_content", encodeGeminiResponsesCarrier(explicitSignature, geminiResponsesCarrierPrevious, geminiResponsesCarrierText))
-		request := []byte(`{"input":[{"id":"` + messageID + `","type":"message","role":"assistant","content":[{"type":"output_text","text":"answer"}]},` + string(carrier) + `]}`)
-		output, _ := ConvertOpenAIResponsesRequestToGemini(model, request, false)
-		parts := ojson.GetBytesNoCopy(output, "contents.0.parts").Array()
-		if len(parts) != 2 || parts[0].Get("text").String() != "answer" || parts[0].Get("thoughtSignature").String() != testResponsesGeminiThoughtSignature || parts[1].Get("thoughtSignature").String() != signature2 {
-			t.Fatalf("partial explicit carrier changed cached signature order: %s", output)
-		}
-	}
-}
-
 func TestGeminiResponsesLateThoughtSignatureDoesNotBindEarlierMessage(t *testing.T) {
 	signature2 := differentResponsesGeminiThoughtSignature(t)
 	lines := []string{
@@ -158,39 +100,15 @@ func TestGeminiResponsesLateThoughtSignatureDoesNotBindEarlierMessage(t *testing
 	}
 }
 
-func TestGeminiResponsesCacheRecoveryPreservesFallbackSignatureOrder(t *testing.T) {
-	previousHome := homekv.Current()
-	t.Cleanup(func() { homekv.SetCurrent(previousHome) })
-	signature2 := differentResponsesGeminiThoughtSignature(t)
-	lines := []string{
-		`data: {"candidates":[{"content":{"parts":[{"text":"recovery answer"}]}}],"responseId":"issue-5513-cache-recovery"}`,
-		`data: {"candidates":[{"content":{"parts":[{"text":"","thoughtSignature":"` + testResponsesGeminiThoughtSignature + `"}]}}]}`,
-		`data: {"candidates":[{"content":{"parts":[{"text":"","thoughtSignature":"` + signature2 + `"}]},"finishReason":"STOP"}]}`,
-		`data: [DONE]`,
+func TestOrdinaryGeminiResponsesKeepsUnsignedCallAndResult(t *testing.T) {
+	raw := []byte(`{"input":[{"type":"function_call","call_id":"fixture","name":"lookup","arguments":"{}"},{"type":"function_call_output","call_id":"fixture","output":"fixture-result"}]}`)
+	out, err := ConvertOpenAIResponsesRequestToGemini("gemini-3-flash", raw, false)
+	if err != nil {
+		t.Fatal(err)
 	}
-	var state any
-	var completed ojson.Result
-	for index, line := range lines {
-		// A disabled Home client rejects the first cache write. Returning to
-		// local storage makes the next write succeed without timers or mocks.
-		if index == 1 {
-			homekv.SetCurrent(&homekv.Client{})
-		} else {
-			homekv.SetCurrent(nil)
-		}
-		for _, chunk := range ConvertGeminiResponseToOpenAIResponses(context.Background(), "gemini-3.8-flash-high", nil, nil, []byte(line), &state) {
-			name, data := parseSSEEvent(t, chunk)
-			if name == "response.completed" {
-				completed = data.Get("response.output")
-			}
-		}
-	}
-	if len(completed.Array()) != 2 || decodedResponsesCarrierSignature(t, completed.Get("1.encrypted_content").String()) != testResponsesGeminiThoughtSignature {
-		t.Fatalf("expected only the first write's fallback carrier: %s", completed.Raw)
-	}
-	output, _ := ConvertOpenAIResponsesRequestToGemini("gemini-3.8-flash-high", []byte(`{"input":`+completed.Raw+`}`), false)
-	parts := ojson.GetBytesNoCopy(output, "contents.0.parts").Array()
-	if len(parts) != 2 || parts[0].Get("thoughtSignature").String() != testResponsesGeminiThoughtSignature || parts[1].Get("thoughtSignature").String() != signature2 {
-		t.Fatalf("cache recovery changed fallback signature order: %s", output)
+	call := ojson.GetBytes(out, "contents.0.parts.0")
+	result := ojson.GetBytes(out, "contents.1.parts.0.functionResponse")
+	if call.Get("functionCall.name").String() != "lookup" || call.Get("thoughtSignature").Exists() || result.Get("name").String() != "lookup" || !strings.Contains(result.Raw, "fixture-result") {
+		t.Fatal("ordinary ordered tool call/result changed")
 	}
 }

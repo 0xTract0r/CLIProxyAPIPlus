@@ -245,7 +245,7 @@ func TestDetectSignatureProvider_DoesNotClassifyArbitraryBase64AsGemini(t *testi
 	}
 }
 
-func TestGeminiASCIIUUIDSignatureUsesBypass(t *testing.T) {
+func TestGeminiASCIIUUIDSignatureClassificationRejectsCompatibility(t *testing.T) {
 	plainUUID := "e24830a7-5cd6-42fe-998b-ee539e72b9c3"
 	sig := testGeminiThoughtSignature([]byte(plainUUID))
 
@@ -270,17 +270,6 @@ func TestGeminiASCIIUUIDSignatureUsesBypass(t *testing.T) {
 	}
 	if normalized, ok := CompatibleSignatureForProviderBlock(SignatureProviderGemini, sig, SignatureBlockKindGeminiFunctionCall); ok || normalized != "" {
 		t.Fatalf("UUID tool-call signature normalized=%q ok=%v, want empty and false", normalized, ok)
-	}
-	decision := DecideSignatureCompatibility(SignatureProviderGemini, sig, SignatureBlockKindGeminiFunctionCall)
-	if decision.Action != SignatureActionReplaceWithGeminiBypass {
-		t.Fatalf("function-call UUID action = %q, want %q", decision.Action, SignatureActionReplaceWithGeminiBypass)
-	}
-	if decision.ReplacementSignature != GeminiSkipThoughtSignatureValidator {
-		t.Fatalf("function-call UUID replacement = %q, want %q", decision.ReplacementSignature, GeminiSkipThoughtSignatureValidator)
-	}
-	decision = DecideSignatureCompatibility(SignatureProviderGemini, sig, SignatureBlockKindGeminiModelPart)
-	if decision.Action != SignatureActionReplaceWithGeminiBypass {
-		t.Fatalf("model-part UUID action = %q, want %q", decision.Action, SignatureActionReplaceWithGeminiBypass)
 	}
 }
 
@@ -327,16 +316,6 @@ func TestSplitSignatureProviderPrefix_UsesStrictProviderAliases(t *testing.T) {
 	}
 	if got := DetectSignatureProvider(mislabeledPrefix); got != SignatureProviderUnknown {
 		t.Fatalf("DetectSignatureProvider(claude-cache#...) = %q, want %q", got, SignatureProviderUnknown)
-	}
-}
-
-func TestDecideSignatureCompatibility_GeminiFunctionCallUsesBypass(t *testing.T) {
-	decision := DecideSignatureCompatibility(SignatureProviderGemini, "claude#"+testClaudeThinkingSignature(), SignatureBlockKindGeminiFunctionCall)
-	if decision.Action != SignatureActionReplaceWithGeminiBypass {
-		t.Fatalf("Action = %q, want %q", decision.Action, SignatureActionReplaceWithGeminiBypass)
-	}
-	if decision.ReplacementSignature != GeminiSkipThoughtSignatureValidator {
-		t.Fatalf("ReplacementSignature = %q, want %q", decision.ReplacementSignature, GeminiSkipThoughtSignatureValidator)
 	}
 }
 

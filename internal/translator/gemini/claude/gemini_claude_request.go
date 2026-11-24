@@ -16,8 +16,6 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 )
 
-const geminiClaudeThoughtSignature = "skip_thought_signature_validator"
-
 // ConvertClaudeRequestToGemini parses a Claude API request and returns a complete
 // Gemini request body (as JSON bytes) ready to be sent via SendRawMessageStream.
 // All JSON transformations are performed using gjson/ojson.
@@ -148,13 +146,15 @@ func convertClaudeRequestToGemini(modelName string, inputRawJSON []byte, _ bool,
 						if !preserveEmptyThinkingBlocks {
 							return true
 						}
-						partDoc := ojson.NewDocString(`{"text":"","thought":true,"thoughtSignature":""}`)
+						partDoc := ojson.NewDocString(`{"text":"","thought":true}`)
 						_ = partDoc.Set("text", contentResult.Get("thinking").String())
 						signature := sigcompat.GeminiReplaySignatureOrBypass(contentResult.Get("signature").String(), sigcompat.SignatureBlockKindGeminiModelPart)
 						if carrierSignature != "" {
 							signature = carrierSignature
 						}
-						_ = partDoc.Set("thoughtSignature", signature)
+						if signature != "" {
+							_ = partDoc.Set("thoughtSignature", signature)
+						}
 						partItems = append(partItems, partDoc.Bytes())
 
 					case "tool_use":
@@ -170,12 +170,10 @@ func convertClaudeRequestToGemini(modelName string, inputRawJSON []byte, _ bool,
 						}
 						argsResult := ojson.Parse(functionArgs)
 						if argsResult.IsObject() && ojson.Valid(functionArgs) {
-							partDoc := ojson.NewDocString(`{"thoughtSignature":"","functionCall":{"name":"","args":{}}}`)
-							signature := geminiClaudeThoughtSignature
+							partDoc := ojson.NewDocString(`{"functionCall":{"name":"","args":{}}}`)
 							if carrierSignature != "" {
-								signature = carrierSignature
+								_ = partDoc.Set("thoughtSignature", carrierSignature)
 							}
-							_ = partDoc.Set("thoughtSignature", signature)
 							if toolUseID != "" {
 								_ = partDoc.Set("functionCall.id", toolUseID)
 							}

@@ -134,15 +134,16 @@ func TestIssue7279ToolResultsPrecedeUserText(t *testing.T) {
 }
 
 func TestIssue7279ClaudeThinkingSignaturesAreValidGeminiBytes(t *testing.T) {
-	const validGeminiSignature = "EjQKMgEMOdbHO0Gd+c9Mxk4ELwPGbpCEcp2mFfYYLix2UVtBH3fL8GECc4+JITVnHF4qZDsA"
+	const validGeminiSignature = "Zml4dHVyZQ=="
 	tests := []struct {
 		name      string
 		signature string
 		want      string
 	}{
 		{name: "foreign Claude signature", signature: "foreign_claude_sig_123"},
-		{name: "native Gemini signature", signature: "gemini#" + validGeminiSignature, want: validGeminiSignature},
-		{name: "unpadded native Gemini signature", signature: "gemini#EggKBgEMOdbHNA", want: "EggKBgEMOdbHNA=="},
+		{name: "malformed byte field is omitted", signature: "not valid base64!"},
+		{name: "native Gemini signature", signature: validGeminiSignature, want: validGeminiSignature},
+		{name: "unpadded native Gemini signature", signature: "Zml4dHVyZQ", want: validGeminiSignature},
 	}
 	for _, tt := range tests {
 		for _, stream := range []bool{false, true} {

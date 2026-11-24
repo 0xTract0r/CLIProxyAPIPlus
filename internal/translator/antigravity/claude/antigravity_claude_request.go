@@ -181,7 +181,7 @@ func resolveProviderCompatibleSignature(targetProvider sigcompat.SignatureProvid
 	return signature
 }
 
-func resolveToolUseThoughtSignature(modelName string, contentResult ojson.Result, allowSyntheticFallback bool) string {
+func resolveToolUseThoughtSignature(modelName string, contentResult ojson.Result) string {
 	targetProvider := sigcompat.SignatureProviderFromModelName(modelName)
 	if targetProvider == sigcompat.SignatureProviderGemini {
 		for _, path := range []string{
@@ -194,9 +194,6 @@ func resolveToolUseThoughtSignature(modelName string, contentResult ojson.Result
 					return signature
 				}
 			}
-		}
-		if allowSyntheticFallback {
-			return sigcompat.GeminiSkipThoughtSignatureValidator
 		}
 		return ""
 	}
@@ -212,10 +209,7 @@ func resolveToolUseThoughtSignature(modelName string, contentResult ojson.Result
 			}
 		}
 	}
-	if targetProvider == sigcompat.SignatureProviderClaude {
-		return ""
-	}
-	return sigcompat.GeminiSkipThoughtSignatureValidator
+	return ""
 }
 
 func firstToolUseSignatureField(contentResult ojson.Result) (string, string, bool) {
@@ -540,8 +534,7 @@ func convertClaudeRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 								break
 							}
 							partSignature := strings.TrimSpace(part.Get("thoughtSignature").String())
-							replaceFallback := bindBackward && partTargetKind == geminiClaudeCarrierFunction && partSignature == sigcompat.GeminiSkipThoughtSignatureValidator
-							if partSignature == "" || replaceFallback {
+							if partSignature == "" {
 								partItems[partIndex], _ = ojson.SetBytes(partItems[partIndex], "thoughtSignature", signature)
 								attached = true
 							}
@@ -608,10 +601,10 @@ func convertClaudeRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 						if argsRaw != "" {
 							partDoc := ojson.NewDoc([]byte(`{}`))
 
-							signature := resolveToolUseThoughtSignature(modelName, contentResult, true)
+							signature := resolveToolUseThoughtSignature(modelName, contentResult)
 							if pendingDetachedSignature != "" {
 								pendingMatchesTool := pendingDetachedTargetKind == "" || pendingDetachedTargetKind == geminiClaudeCarrierAny || pendingDetachedTargetKind == geminiClaudeCarrierFunction
-								if pendingMatchesTool && (signature == "" || signature == sigcompat.GeminiSkipThoughtSignatureValidator) {
+								if pendingMatchesTool && signature == "" {
 									signature = pendingDetachedSignature
 								} else {
 									appendDetachedCarrier(pendingDetachedSignature, true)

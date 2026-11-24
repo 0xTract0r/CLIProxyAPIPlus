@@ -10,36 +10,6 @@ import (
 	"google.golang.org/protobuf/encoding/protowire"
 )
 
-func TestConvertGeminiRequestToAntigravity_ReplacesClientSignatureOnFunctionCall(t *testing.T) {
-	// Client signatures on Gemini function calls are not portable to Antigravity.
-	validSignature := "abc123validSignature1234567890123456789012345678901234567890"
-	inputJSON := []byte(fmt.Sprintf(`{
-		"model": "gemini-3-pro-preview",
-		"contents": [
-			{
-				"role": "model",
-				"parts": [
-					{"functionCall": {"name": "test_tool", "args": {}}, "thoughtSignature": "%s"}
-				]
-			}
-		]
-	}`, validSignature))
-
-	output, _ := ConvertGeminiRequestToAntigravity("gemini-3-pro-preview", inputJSON, false)
-	outputStr := string(output)
-
-	parts := ojson.Get(outputStr, "request.contents.0.parts").Array()
-	if len(parts) != 1 {
-		t.Fatalf("Expected 1 part, got %d", len(parts))
-	}
-
-	sig := parts[0].Get("thoughtSignature").String()
-	expectedSig := "skip_thought_signature_validator"
-	if sig != expectedSig {
-		t.Errorf("Expected thoughtSignature '%s', got '%s'", expectedSig, sig)
-	}
-}
-
 func TestConvertGeminiRequestToAntigravity_DropsIncompatibleClientSignatureOnTextPart(t *testing.T) {
 	validSignature := "abc123validSignature1234567890123456789012345678901234567890"
 	inputJSON := []byte(fmt.Sprintf(`{
@@ -222,31 +192,6 @@ func TestConvertGeminiRequestToAntigravity_ClaudeModelStripsUnneededFunctionCall
 	}
 }
 
-func TestConvertGeminiRequestToAntigravity_AddSkipSentinelToFunctionCall(t *testing.T) {
-	// functionCall without signature should get skip_thought_signature_validator
-	inputJSON := []byte(`{
-		"model": "gemini-3-pro-preview",
-		"contents": [
-			{
-				"role": "model",
-				"parts": [
-					{"functionCall": {"name": "test_tool", "args": {}}}
-				]
-			}
-		]
-	}`)
-
-	output, _ := ConvertGeminiRequestToAntigravity("gemini-3-pro-preview", inputJSON, false)
-	outputStr := string(output)
-
-	// Check that skip_thought_signature_validator is added to functionCall
-	sig := ojson.Get(outputStr, "request.contents.0.parts.0.thoughtSignature").String()
-	expectedSig := "skip_thought_signature_validator"
-	if sig != expectedSig {
-		t.Errorf("Expected skip sentinel '%s', got '%s'", expectedSig, sig)
-	}
-}
-
 func testAntigravityGeminiClaudeSignature(t *testing.T) string {
 	t.Helper()
 	channelBlock := []byte{}
@@ -267,33 +212,6 @@ func testAntigravityGeminiClaudeSignature(t *testing.T) string {
 	payload = protowire.AppendTag(payload, 3, protowire.VarintType)
 	payload = protowire.AppendVarint(payload, 1)
 	return base64.StdEncoding.EncodeToString(payload)
-}
-
-func TestConvertGeminiRequestToAntigravity_ParallelFunctionCallsOnlyFirstGetsSentinel(t *testing.T) {
-	inputJSON := []byte(`{
-		"model": "gemini-3-pro-preview",
-		"contents": [
-			{
-				"role": "model",
-				"parts": [
-					{"functionCall": {"name": "tool_one", "args": {"a": "1"}}},
-					{"functionCall": {"name": "tool_two", "args": {"b": "2"}}}
-				]
-			}
-		]
-	}`)
-
-	output, _ := ConvertGeminiRequestToAntigravity("gemini-3-pro-preview", inputJSON, false)
-	parts := ojson.GetBytesNoCopy(output, "request.contents.0.parts").Array()
-	if len(parts) != 2 {
-		t.Fatalf("Expected 2 parts, got %d", len(parts))
-	}
-	if got := parts[0].Get("thoughtSignature").String(); got != signature.GeminiSkipThoughtSignatureValidator {
-		t.Fatalf("first call signature = %q, want sentinel", got)
-	}
-	if parts[1].Get("thoughtSignature").Exists() {
-		t.Fatalf("second parallel call should remain unsigned: %s", parts[1].Raw)
-	}
 }
 
 func TestFixCLIToolResponse_PreservesFunctionResponseParts(t *testing.T) {
@@ -1608,5 +1526,17 @@ func TestConvertGeminiRequestToAntigravity_NormalizesParametersNumericConstraint
 	}
 	if got := schema.Get("properties.Message.default"); got.Type != ojson.String || got.String() != "1" {
 		t.Errorf("default = %s (type %v), want string \"1\"", got.Raw, got.Type)
+	}
+}
+
+func TestOrdinaryGeminiAntigravityKeepsExplicitWireAndParallelOrder(t *testing.T) {
+	raw := []byte(`{"contents":[{"role":"model","parts":[{"functionCall":{"name":"first","args":{}},"thoughtSignature":"fixture-opaque"},{"functionCall":{"name":"second","args":{}}}]}]}`)
+	out, err := ConvertGeminiRequestToAntigravity("gemini-3-flash", raw, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parts := ojson.GetBytes(out, "request.contents.0.parts").Array()
+	if len(parts) != 2 || parts[0].Get("functionCall.name").String() != "first" || parts[0].Get("thoughtSignature").String() != "fixture-opaque" || parts[1].Get("functionCall.name").String() != "second" || parts[1].Get("thoughtSignature").Exists() {
+		t.Fatal("explicit value or call order changed")
 	}
 }

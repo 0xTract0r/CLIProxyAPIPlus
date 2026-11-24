@@ -53,7 +53,7 @@ func TestConvertOpenAIResponsesRequestToGemini_ReattachesReasoningAndSignatureTo
 	}
 }
 
-func TestConvertOpenAIResponsesRequestToGemini_SyntheticParallelCallsOnlyFirstGetsSentinel(t *testing.T) {
+func TestOrdinaryResponsesToGeminiParallelCallsStayUnsigned(t *testing.T) {
 	inputJSON := `{
 		"model":"gemini-3.6-flash-high",
 		"input":[
@@ -67,8 +67,8 @@ func TestConvertOpenAIResponsesRequestToGemini_SyntheticParallelCallsOnlyFirstGe
 	if len(parts) != 2 {
 		t.Fatalf("parts = %d, want 2 parallel calls; result=%s", len(parts), result)
 	}
-	if got := parts[0].Get("thoughtSignature").String(); got != internalsignature.GeminiSkipThoughtSignatureValidator {
-		t.Fatalf("first synthetic call signature = %q, want sentinel; result=%s", got, result)
+	if got := parts[0].Get("thoughtSignature"); got.Exists() {
+		t.Fatalf("first ordinary call must remain unsigned; unexpected field = %q; result=%s", got.Raw, result)
 	}
 	if signature := parts[1].Get("thoughtSignature"); signature.Exists() {
 		t.Fatalf("second synthetic sibling should remain unsigned; result=%s", result)
@@ -417,7 +417,7 @@ func TestConvertOpenAIResponsesRequestToGemini_ReattachesDirectionalFunctionCarr
 	}
 }
 
-func TestConvertOpenAIResponsesRequestToGemini_DoesNotRetargetExtraPreviousCarrier(t *testing.T) {
+func TestOrdinaryResponsesToGeminiDoesNotRetargetExtraPreviousCarrier(t *testing.T) {
 	signature2 := differentResponsesGeminiThoughtSignature(t)
 	for _, testCase := range []struct {
 		name       string
@@ -444,7 +444,7 @@ func TestConvertOpenAIResponsesRequestToGemini_DoesNotRetargetExtraPreviousCarri
 				return `[{"type":"reasoning","encrypted_content":"` + first + `","summary":[]},{"type":"function_call","call_id":"call-1","name":"run_command","arguments":"{}"},{"type":"reasoning","encrypted_content":"` + extra + `","summary":[]},{"type":"function_call","call_id":"call-2","name":"run_command","arguments":"{}"}]`
 			},
 			assert: func(t *testing.T, parts []ojson.Result) {
-				if len(parts) != 3 || parts[0].Get("functionCall.id").String() != "call-1" || parts[0].Get("thoughtSignature").String() != testResponsesGeminiThoughtSignature || !parts[1].Get("text").Exists() || parts[1].Get("text").String() != "" || parts[1].Get("thoughtSignature").String() != signature2 || parts[2].Get("functionCall.id").String() != "call-2" || parts[2].Get("thoughtSignature").String() != "skip_thought_signature_validator" {
+				if len(parts) != 3 || parts[0].Get("functionCall.id").String() != "call-1" || parts[0].Get("thoughtSignature").String() != testResponsesGeminiThoughtSignature || !parts[1].Get("text").Exists() || parts[1].Get("text").String() != "" || parts[1].Get("thoughtSignature").String() != signature2 || parts[2].Get("functionCall.id").String() != "call-2" || parts[2].Get("thoughtSignature").Exists() {
 					// call-2 follows a text part, so it gets the bypass sentinel rather than signature2.
 					t.Fatalf("extra previous function carrier retargeted: %v", parts)
 				}
@@ -461,17 +461,17 @@ func TestConvertOpenAIResponsesRequestToGemini_DoesNotRetargetExtraPreviousCarri
 	}
 }
 
-func TestConvertOpenAIResponsesRequestToGemini_DoesNotBindStandaloneFunctionCarrier(t *testing.T) {
+func TestOrdinaryResponsesToGeminiDoesNotBindStandaloneFunctionCarrier(t *testing.T) {
 	carrier := encodeGeminiResponsesCarrier(testResponsesGeminiThoughtSignature, geminiResponsesCarrierStandalone, geminiResponsesCarrierFunction)
 	inputJSON := []byte(`{"model":"gemini-3.6-flash-high","input":[{"type":"reasoning","encrypted_content":"` + carrier + `","summary":[]},{"type":"function_call","call_id":"call-1","name":"run_command","arguments":"{}"}]}`)
 	result, _ := ConvertOpenAIResponsesRequestToGemini("gemini-3.6-flash-high", inputJSON, false)
 	parts := ojson.GetBytesNoCopy(result, "contents.0.parts").Array()
-	if len(parts) != 2 || parts[0].Get("thoughtSignature").String() != testResponsesGeminiThoughtSignature || parts[1].Get("thoughtSignature").String() != geminiResponsesThoughtSignature {
+	if len(parts) != 2 || parts[0].Get("thoughtSignature").String() != testResponsesGeminiThoughtSignature || parts[1].Get("thoughtSignature").Exists() {
 		t.Fatalf("standalone carrier was bound to function call: %s", result)
 	}
 }
 
-func TestConvertOpenAIResponsesRequestToGemini_ReattachesUnmarkedParallelPostCallSignature(t *testing.T) {
+func TestOrdinaryResponsesToGeminiReattachesUnmarkedParallelPostCallSignature(t *testing.T) {
 	inputJSON := `{
 		"model":"gemini-3.6-flash-high",
 		"input":[
@@ -484,7 +484,7 @@ func TestConvertOpenAIResponsesRequestToGemini_ReattachesUnmarkedParallelPostCal
 	}`
 	result, _ := ConvertOpenAIResponsesRequestToGemini("gemini-3.6-flash-high", []byte(inputJSON), false)
 	parts := ojson.GetBytesNoCopy(result, "contents.0.parts").Array()
-	if len(parts) != 2 || parts[0].Get("thoughtSignature").String() != geminiResponsesThoughtSignature || parts[1].Get("thoughtSignature").String() != testResponsesGeminiThoughtSignature {
+	if len(parts) != 2 || parts[0].Get("thoughtSignature").Exists() || parts[1].Get("thoughtSignature").String() != testResponsesGeminiThoughtSignature {
 		t.Fatalf("parallel post-call signature was not attached to call-2: %s", result)
 	}
 }
@@ -527,7 +527,7 @@ func TestConvertOpenAIResponsesRequestToGemini_PreservesExtraConsecutivePostCall
 	}
 }
 
-func TestConvertOpenAIResponsesRequestToGemini_DoesNotPairUnmarkedPostCallSignatureAcrossMismatch(t *testing.T) {
+func TestOrdinaryResponsesToGeminiDoesNotPairUnmarkedPostCallSignatureAcrossMismatch(t *testing.T) {
 	inputJSON := `{
 		"model":"gemini-3.6-flash-high",
 		"input":[
@@ -537,12 +537,12 @@ func TestConvertOpenAIResponsesRequestToGemini_DoesNotPairUnmarkedPostCallSignat
 		]
 	}`
 	result, _ := ConvertOpenAIResponsesRequestToGemini("gemini-3.6-flash-high", []byte(inputJSON), false)
-	if got := ojson.GetBytesNoCopy(result, "contents.0.parts.0.thoughtSignature").String(); got != geminiResponsesThoughtSignature {
-		t.Fatalf("mismatched output paired signature %q; result=%s", got, result)
+	if got := ojson.GetBytesNoCopy(result, "contents.0.parts.0.thoughtSignature"); got.Exists() {
+		t.Fatalf("mismatched output paired signature %q; result=%s", got.Raw, result)
 	}
 }
 
-func TestConvertOpenAIResponsesRequestToGemini_DoesNotPairUnmarkedPostCallSignatureAcrossUserMessage(t *testing.T) {
+func TestOrdinaryResponsesToGeminiDoesNotPairUnmarkedPostCallSignatureAcrossUserMessage(t *testing.T) {
 	inputJSON := `{
 		"model":"gemini-3.6-flash-high",
 		"input":[
@@ -553,8 +553,8 @@ func TestConvertOpenAIResponsesRequestToGemini_DoesNotPairUnmarkedPostCallSignat
 		]
 	}`
 	result, _ := ConvertOpenAIResponsesRequestToGemini("gemini-3.6-flash-high", []byte(inputJSON), false)
-	if got := ojson.GetBytesNoCopy(result, "contents.0.parts.0.thoughtSignature").String(); got != geminiResponsesThoughtSignature {
-		t.Fatalf("user-boundary carrier paired signature %q; result=%s", got, result)
+	if got := ojson.GetBytesNoCopy(result, "contents.0.parts.0.thoughtSignature"); got.Exists() {
+		t.Fatalf("user-boundary carrier paired signature %q; result=%s", got.Raw, result)
 	}
 }
 

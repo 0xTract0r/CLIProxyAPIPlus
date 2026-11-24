@@ -97,7 +97,7 @@ func TestConvertClaudeResponseToGeminiNonStreamPreservesToolUseID(t *testing.T) 
 }
 
 func TestConvertClaudeResponseToGemini_StreamThinkingSignature(t *testing.T) {
-	const validGeminiSignature = "EjQKMgEMOdbHO0Gd+c9Mxk4ELwPGbpCEcp2mFfYYLix2UVtBH3fL8GECc4+JITVnHF4qZDsA"
+	const validGeminiSignature = "Zml4dHVyZQ=="
 
 	tests := []struct {
 		name          string
@@ -111,7 +111,7 @@ func TestConvertClaudeResponseToGemini_StreamThinkingSignature(t *testing.T) {
 		},
 		{
 			name:          "preserves valid gemini signature",
-			signature:     "gemini#" + validGeminiSignature,
+			signature:     validGeminiSignature,
 			wantSignature: validGeminiSignature,
 		},
 	}
@@ -157,7 +157,7 @@ func TestConvertClaudeResponseToGemini_StreamThinkingSignature(t *testing.T) {
 }
 
 func TestConvertClaudeResponseToGeminiNonStream_ThinkingSignature(t *testing.T) {
-	const validGeminiSignature = "EjQKMgEMOdbHO0Gd+c9Mxk4ELwPGbpCEcp2mFfYYLix2UVtBH3fL8GECc4+JITVnHF4qZDsA"
+	const validGeminiSignature = "Zml4dHVyZQ=="
 
 	tests := []struct {
 		name          string
@@ -171,7 +171,7 @@ func TestConvertClaudeResponseToGeminiNonStream_ThinkingSignature(t *testing.T) 
 		},
 		{
 			name:          "preserves valid gemini signature",
-			signature:     "gemini#" + validGeminiSignature,
+			signature:     validGeminiSignature,
 			wantSignature: validGeminiSignature,
 		},
 	}

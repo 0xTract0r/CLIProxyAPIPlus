@@ -12,7 +12,7 @@ import (
 	sigcompat "github.com/router-for-me/CLIProxyAPI/v8/internal/signature"
 )
 
-func TestGeminiClaudeCarrierPlacement(t *testing.T) {
+func TestOrdinaryGeminiClaudeCarrierPlacement(t *testing.T) {
 	signature := capturedGeminiThinkingSignature
 	carrier := `{"type":"thinking","thinking":"","signature":"` + signature + `"}`
 	tool := `{"type":"tool_use","id":"call-1","name":"lookup","input":{}}`
@@ -27,20 +27,20 @@ func TestGeminiClaudeCarrierPlacement(t *testing.T) {
 	}{
 		{"leading function", carrier + `,` + tool, []string{signature}},
 		{"trailing function", tool + `,` + carrier, []string{signature}},
-		{"signed text before tool", carrier + `,` + text + `,` + tool, []string{signature, sigcompat.GeminiSkipThoughtSignatureValidator}},
+		{"signed text before tool", carrier + `,` + text + `,` + tool, []string{signature, ""}},
 		{"text only", carrier + `,` + text, []string{signature}},
 		{"trailing text", text + `,` + carrier, []string{signature}},
 		{"standalone", carrier, []string{signature}},
 		{"marked next function", marked("next", "function") + `,` + tool, []string{signature}},
 		{"prefixed signature", `{"type":"thinking","thinking":"","signature":"gemini#` + signature + `"},` + tool, []string{signature}},
 		{"consecutive carriers", carrier + `,{"type":"thinking","thinking":"","signature":"EjQKMgEMOdbHO0Gd+c9Mxk4ELwPGbpCEcp2mFfYYLix2UVtBH3fL8GECc4+JITVnHF4qZDsE"},` + tool, []string{signature, "EjQKMgEMOdbHO0Gd+c9Mxk4ELwPGbpCEcp2mFfYYLix2UVtBH3fL8GECc4+JITVnHF4qZDsE"}},
-		{"marked previous text", text + `,` + marked("previous", "text") + `,` + tool, []string{signature, sigcompat.GeminiSkipThoughtSignatureValidator}},
-		{"marked standalone", marked("standalone", "any") + `,` + tool, []string{signature, sigcompat.GeminiSkipThoughtSignatureValidator}},
-		{"wrong target", marked("next", "function") + `,` + text + `,` + tool, []string{"", sigcompat.GeminiSkipThoughtSignatureValidator}},
-		{"foreign carrier", `{"type":"thinking","thinking":"","signature":"claude#invalid"},` + tool, []string{sigcompat.GeminiSkipThoughtSignatureValidator}},
-		{"malformed carrier", `{"type":"thinking","thinking":"","signature":"cpa-gemini-carrier-v1:next:function:invalid"},` + tool, []string{sigcompat.GeminiSkipThoughtSignatureValidator}},
-		{"no carrier", tool, []string{sigcompat.GeminiSkipThoughtSignatureValidator}},
-		{"parallel sibling", carrier + `,` + tool + `,{"type":"tool_use","id":"call-2","name":"lookup","input":{}}`, []string{signature, sigcompat.GeminiSkipThoughtSignatureValidator}},
+		{"marked previous text", text + `,` + marked("previous", "text") + `,` + tool, []string{signature, ""}},
+		{"marked standalone", marked("standalone", "any") + `,` + tool, []string{signature, ""}},
+		{"wrong target", marked("next", "function") + `,` + text + `,` + tool, []string{"", ""}},
+		{"foreign carrier", `{"type":"thinking","thinking":"","signature":"claude#invalid"},` + tool, []string{""}},
+		{"malformed carrier", `{"type":"thinking","thinking":"","signature":"cpa-gemini-carrier-v1:next:function:invalid"},` + tool, []string{""}},
+		{"no carrier", tool, []string{""}},
+		{"parallel sibling", carrier + `,` + tool + `,{"type":"tool_use","id":"call-2","name":"lookup","input":{}}`, []string{signature, ""}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			request := ojson.NewDocString(`{"messages":[{"role":"assistant","content":[` + tt.content + `]},{"role":"user","content":[]}]}`)
@@ -71,7 +71,7 @@ func TestGeminiClaudeCarrierPlacement(t *testing.T) {
 	}
 }
 
-func TestGeminiClaudeCarrierStaysInAssistantMessage(t *testing.T) {
+func TestOrdinaryGeminiClaudeCarrierStaysInAssistantMessage(t *testing.T) {
 	carrier := `{"type":"thinking","thinking":"","signature":"` + capturedGeminiThinkingSignature + `"}`
 	request := []byte(`{"messages":[{"role":"assistant","content":[` + carrier + `]},{"role":"user","content":[` + carrier + `,{"type":"text","text":"continue"}]},{"role":"assistant","content":[{"type":"tool_use","id":"call-1","name":"lookup","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"call-1","content":"ok"}]}]}`)
 	output, errConvert := ConvertClaudeRequestToGemini("gemini-4-carbon", request, false)
@@ -86,7 +86,7 @@ func TestGeminiClaudeCarrierStaysInAssistantMessage(t *testing.T) {
 			}
 			if part.Get("functionCall").Exists() {
 				sawCall = true
-				if part.Get("thoughtSignature").String() != sigcompat.GeminiSkipThoughtSignatureValidator {
+				if part.Get("thoughtSignature").Exists() {
 					t.Fatalf("carrier leaked between messages: %s", output)
 				}
 			}
@@ -277,7 +277,7 @@ func TestGeminiClaudeDroppedThoughtSignatureDoesNotReachVisibleText(t *testing.T
 	}
 }
 
-func TestGeminiClaudeCarrierDoesNotConsumeWhitespaceThinking(t *testing.T) {
+func TestOrdinaryGeminiClaudeCarrierDoesNotConsumeWhitespaceThinking(t *testing.T) {
 	request := []byte(`{"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":" ","signature":"` + capturedGeminiThinkingSignature + `"},{"type":"tool_use","id":"call-1","name":"lookup","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"call-1","content":"ok"}]}]}`)
 	for _, compat := range []bool{false, true} {
 		output, errConvert := convertClaudeRequestToGemini("gemini-4-carbon", request, false, compat)
@@ -295,13 +295,13 @@ func TestGeminiClaudeCarrierDoesNotConsumeWhitespaceThinking(t *testing.T) {
 		if compat && (parts[0].Get("text").String() != " " || !parts[0].Get("thought").Bool() || parts[0].Get("thoughtSignature").String() != capturedGeminiThinkingSignature) {
 			t.Errorf("compat thinking changed: %s", output)
 		}
-		if parts[len(parts)-1].Get("thoughtSignature").String() != sigcompat.GeminiSkipThoughtSignatureValidator {
+		if parts[len(parts)-1].Get("thoughtSignature").Exists() {
 			t.Errorf("compat=%t: nonempty thought signature leaked to tool: %s", compat, output)
 		}
 	}
 }
 
-func TestGeminiClaudeStreamingEmptyBlockDoesNotRetargetSignature(t *testing.T) {
+func TestOrdinaryGeminiClaudeStreamingEmptyBlockDoesNotRetargetSignature(t *testing.T) {
 	for _, empty := range []string{`{"text":""}`, `{"text":"","thought":true}`} {
 		chunks := []string{
 			`{"candidates":[{"content":{"parts":[{"functionCall":{"name":"first","partialArgs":[],"willContinue":false}}]}}]}`,
@@ -318,18 +318,18 @@ func TestGeminiClaudeStreamingEmptyBlockDoesNotRetargetSignature(t *testing.T) {
 		content := claudeContentFromGeminiStream(t, events)
 		output := replayGeminiClaudeContent(t, content.String())
 		parts := ojson.GetBytes(output, "contents.0.parts").Array()
-		if len(parts) != 2 || parts[0].Get("thoughtSignature").String() != capturedGeminiThinkingSignature || parts[1].Get("thoughtSignature").String() != sigcompat.GeminiSkipThoughtSignatureValidator {
+		if len(parts) != 2 || parts[0].Get("thoughtSignature").String() != capturedGeminiThinkingSignature || parts[1].Get("thoughtSignature").Exists() {
 			t.Errorf("empty block %s retargeted tool signature: %s; content=%s", empty, output, content.String())
 		}
 	}
 }
 
-func TestGeminiClaudeNonStreamSignatureOnlyThoughtPartRoundTrip(t *testing.T) {
+func TestOrdinaryGeminiClaudeNonStreamSignatureOnlyThoughtPartRoundTrip(t *testing.T) {
 	upstream := []byte(`{"candidates":[{"content":{"parts":[{"text":"answer"},{"text":"","thought":true,"thoughtSignature":"` + capturedGeminiThinkingSignature + `"},{"functionCall":{"name":"lookup","args":{}}}]},"finishReason":"STOP"}]}`)
 	response := ConvertGeminiResponseToClaudeNonStream(context.Background(), "gemini-4-carbon", nil, nil, upstream, nil)
 	output := replayGeminiClaudeContent(t, ojson.GetBytes(response, "content").Raw)
 	parts := ojson.GetBytes(output, "contents.0.parts").Array()
-	if len(parts) != 2 || parts[0].Get("text").String() != "answer" || parts[0].Get("thoughtSignature").String() != capturedGeminiThinkingSignature || parts[1].Get("thoughtSignature").String() != sigcompat.GeminiSkipThoughtSignatureValidator {
+	if len(parts) != 2 || parts[0].Get("text").String() != "answer" || parts[0].Get("thoughtSignature").String() != capturedGeminiThinkingSignature || parts[1].Get("thoughtSignature").Exists() {
 		t.Fatalf("empty thought part retargeted visible text signature: %s; response=%s", output, response)
 	}
 }
@@ -365,7 +365,7 @@ func replayGeminiClaudeContent(t *testing.T, content string) []byte {
 	return output
 }
 
-func TestGeminiClaudeStreamingCompletedToolSignatureRoundTrip(t *testing.T) {
+func TestOrdinaryGeminiClaudeStreamingCompletedToolSignatureRoundTrip(t *testing.T) {
 	chunks := []string{
 		`{"candidates":[{"content":{"parts":[{"functionCall":{"name":"first","partialArgs":[],"willContinue":false}}]}}]}`,
 		`{"candidates":[{"content":{"parts":[{"thoughtSignature":"` + capturedGeminiThinkingSignature + `"}]}}]}`,
@@ -392,12 +392,12 @@ func TestGeminiClaudeStreamingCompletedToolSignatureRoundTrip(t *testing.T) {
 		t.Fatal(errConvert)
 	}
 	parts := ojson.GetBytes(output, "contents.0.parts").Array()
-	if len(parts) != 2 || parts[0].Get("thoughtSignature").String() != capturedGeminiThinkingSignature || parts[1].Get("thoughtSignature").String() != sigcompat.GeminiSkipThoughtSignatureValidator {
+	if len(parts) != 2 || parts[0].Get("thoughtSignature").String() != capturedGeminiThinkingSignature || parts[1].Get("thoughtSignature").Exists() {
 		t.Fatalf("signature after a closed tool block must bind backward: %s; content=%s", output, content.String())
 	}
 }
 
-func TestGeminiClaudeStreamingLateSignatureRoundTrip(t *testing.T) {
+func TestOrdinaryGeminiClaudeStreamingLateSignatureRoundTrip(t *testing.T) {
 	chunks := []string{
 		`{"candidates":[{"content":{"parts":[{"functionCall":{"name":"first","partialArgs":[{"jsonPath":"$.q","stringValue":"Paris"}],"willContinue":true}}]}}]}`,
 		`{"candidates":[{"content":{"parts":[{"thoughtSignature":"` + capturedGeminiThinkingSignature + `"}]}}]}`,
@@ -425,7 +425,7 @@ func TestGeminiClaudeStreamingLateSignatureRoundTrip(t *testing.T) {
 		t.Fatal(errConvert)
 	}
 	parts := ojson.GetBytes(output, "contents.0.parts").Array()
-	if len(parts) != 2 || parts[0].Get("thoughtSignature").String() != capturedGeminiThinkingSignature || parts[1].Get("thoughtSignature").String() != sigcompat.GeminiSkipThoughtSignatureValidator {
+	if len(parts) != 2 || parts[0].Get("thoughtSignature").String() != capturedGeminiThinkingSignature || parts[1].Get("thoughtSignature").Exists() {
 		t.Fatalf("late signature must stay on first call, got %s; content=%s", output, content.String())
 	}
 }
@@ -468,7 +468,7 @@ func claudeContentFromGeminiStream(t *testing.T, events []byte) *ojson.Doc {
 	return content
 }
 
-func TestGeminiClaudeTrailingTextSignatureRoundTrip(t *testing.T) {
+func TestOrdinaryGeminiClaudeTrailingTextSignatureRoundTrip(t *testing.T) {
 	for _, stream := range []bool{false, true} {
 		upstream := []byte(`{"candidates":[{"content":{"parts":[{"text":"answer"},{"thoughtSignature":"` + capturedGeminiThinkingSignature + `"},{"functionCall":{"name":"lookup","args":{}}}]},"finishReason":"STOP"}]}`)
 		var content string
@@ -488,7 +488,7 @@ func TestGeminiClaudeTrailingTextSignatureRoundTrip(t *testing.T) {
 			t.Fatal(errConvert)
 		}
 		parts := ojson.GetBytes(output, "contents.0.parts").Array()
-		if len(parts) != 2 || parts[0].Get("text").String() != "answer" || parts[0].Get("thoughtSignature").String() != capturedGeminiThinkingSignature || parts[1].Get("thoughtSignature").String() != sigcompat.GeminiSkipThoughtSignatureValidator {
+		if len(parts) != 2 || parts[0].Get("text").String() != "answer" || parts[0].Get("thoughtSignature").String() != capturedGeminiThinkingSignature || parts[1].Get("thoughtSignature").Exists() {
 			t.Fatalf("stream=%t: text signature was rebound to a later tool: %s", stream, output)
 		}
 	}

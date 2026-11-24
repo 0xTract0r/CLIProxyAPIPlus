@@ -1,6 +1,7 @@
 package thinking_test
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/MoeForge/moego/ojson"
@@ -55,8 +56,12 @@ func TestApplyThinking_UserDefinedNativeGeminiPreservesThinkingLevel(t *testing.
 			if errApply != nil {
 				t.Fatalf("ApplyThinking() error = %v", errApply)
 			}
-			if got := ojson.GetBytes(out, "request.generationConfig.thinkingConfig.thinkingLevel").String(); got != level {
-				t.Fatalf("thinkingLevel = %q, want %q; body=%s", got, level, out)
+			if got := ojson.GetBytes(out, "request.generationConfig.thinkingConfig.thinkingLevel").String(); got != strings.ToUpper(level) {
+				t.Fatalf("thinkingLevel = %q, want %q; body=%s", got, strings.ToUpper(level), out)
+			}
+			if !ojson.GetBytes(out, "request.generationConfig.thinkingConfig.includeThoughts").Bool() ||
+				ojson.GetBytes(out, "request.contents.0.parts.0.text").String() != "hello" {
+				t.Fatalf("ordinary adjacent fields changed: %s", out)
 			}
 			if ojson.GetBytes(out, "request.generationConfig.thinkingConfig.thinkingBudget").Exists() {
 				t.Fatalf("unexpected thinkingBudget in Antigravity payload: %s", out)

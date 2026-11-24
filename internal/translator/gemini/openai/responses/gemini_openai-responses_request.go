@@ -332,7 +332,7 @@ func convertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 
 			case "function_call", "custom_tool_call":
 				hasEncounteredConversation = true
-				signature := geminiResponsesThoughtSignature
+				signature := ""
 				if rawSignature := strings.TrimSpace(item.Get("_cpa_reasoning_signature").String()); rawSignature != "" {
 					signature = sigcompat.GeminiReplaySignatureOrBypass(rawSignature, sigcompat.SignatureBlockKindGeminiFunctionCall)
 				}
@@ -449,9 +449,6 @@ func convertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 						i++
 					} else if (next.Get("type").String() == "function_call" || next.Get("type").String() == "custom_tool_call") && canBindFunction && strings.TrimSpace(next.Get("_cpa_reasoning_signature").String()) == "" {
 						funcSig := signature
-						if funcSig == "" {
-							funcSig = geminiResponsesThoughtSignature
-						}
 						contentItems = append(contentItems, buildOpenAIResponsesReasoningFunctionCallModelContent(thoughtText, next, funcSig, forwardMap))
 						if callID := extractOpenAIResponsesCallID(next); callID != "" {
 							pendingFunctionCallIDs = append(pendingFunctionCallIDs, callID)
@@ -867,7 +864,9 @@ func buildOpenAIResponsesFunctionCallPart(item ojson.Result, signature string, f
 	name = util.MapResponsesToolName(forwardMap, name)
 	fcDoc := ojson.NewDocString(`{"functionCall":{"name":"","args":{}}}`)
 	_ = fcDoc.Set("functionCall.name", name)
-	_ = fcDoc.Set("thoughtSignature", signature)
+	if signature != "" {
+		_ = fcDoc.Set("thoughtSignature", signature)
+	}
 	_ = fcDoc.Set("functionCall.id", extractOpenAIResponsesCallID(item))
 
 	if item.Get("type").String() == "custom_tool_call" {

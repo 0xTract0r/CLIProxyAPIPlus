@@ -857,7 +857,7 @@ func TestConvertClaudeRequestToAntigravity_NativeParallelToolLeavesUnsignedSibli
 	}
 }
 
-func TestConvertClaudeRequestToAntigravity_SyntheticParallelToolOnlyFirstGetsSentinel(t *testing.T) {
+func TestConvertClaudeRequestToAntigravity_OrdinaryParallelToolsStayUnsigned(t *testing.T) {
 	inputJSON := []byte(`{
 		"model":"gemini-3.6-flash-high",
 		"messages":[{"role":"assistant","content":[
@@ -871,11 +871,13 @@ func TestConvertClaudeRequestToAntigravity_SyntheticParallelToolOnlyFirstGetsSen
 	if len(parts) != 2 {
 		t.Fatalf("parts = %d, want 2 function calls; output=%s", len(parts), output)
 	}
-	if got := parts[0].Get("thoughtSignature").String(); got != "skip_thought_signature_validator" {
-		t.Fatalf("first synthetic call signature = %q, want sentinel; output=%s", got, output)
-	}
-	if signature := parts[1].Get("thoughtSignature"); signature.Exists() {
-		t.Fatalf("second synthetic sibling should remain unsigned; output=%s", output)
+	for i, want := range []string{"/tmp/a", "/tmp/b"} {
+		if got := parts[i].Get("functionCall.args.file_path").String(); got != want {
+			t.Errorf("part %d file_path = %q, want %q", i, got, want)
+		}
+		if parts[i].Get("thoughtSignature").Exists() {
+			t.Errorf("part %d unexpectedly received a signature", i)
+		}
 	}
 }
 
@@ -967,8 +969,6 @@ func TestConvertClaudeRequestToAntigravity_ThinkingBlocks(t *testing.T) {
 			}
 		]
 	}`)
-
-	cache.CacheSignature("claude-sonnet-4-5-thinking", thinkingText, nativeSignature)
 
 	output, _ := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5-thinking", inputJSON, false)
 	outputStr := string(output)
@@ -1518,20 +1518,7 @@ func TestConvertClaudeRequestToAntigravity_CacheModeDropsInvalidSignature(t *tes
 	}
 }
 
-func TestConvertClaudeRequestToAntigravity_CacheModeRecoversSignatureWhenClientOmitsSignature(t *testing.T) {
-	cache.ClearSignatureCache("")
-	previous := cache.SignatureCacheEnabled()
-	cache.SetSignatureCacheEnabled(true)
-	t.Cleanup(func() {
-		cache.SetSignatureCacheEnabled(previous)
-		cache.ClearSignatureCache("")
-	})
-
-	validNativeSig := testAnthropicNativeSignature(t)
-	expectedAntigravitySig := base64.StdEncoding.EncodeToString([]byte(validNativeSig))
-	cache.CacheSignature("claude-sonnet-4-5-thinking", "Let me think...", validNativeSig)
-
-	// Client omitted signature (signature is empty or absent).
+func TestConvertClaudeRequestToAntigravity_OmittedSignatureDoesNotCreateOpaque(t *testing.T) {
 	inputJSON := []byte(`{
 		"model": "claude-sonnet-4-5-thinking",
 		"messages": [
@@ -1547,14 +1534,11 @@ func TestConvertClaudeRequestToAntigravity_CacheModeRecoversSignatureWhenClientO
 
 	output, _ := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5-thinking", inputJSON, false)
 	parts := ojson.GetBytesNoCopy(output, "request.contents.0.parts").Array()
-	if len(parts) != 2 {
-		t.Fatalf("Expected omitted signature thinking block to be recovered from cache, got %d parts; output=%s", len(parts), output)
+	if len(parts) != 1 || parts[0].Get("text").String() != "Answer" {
+		t.Fatalf("expected visible answer only, got %d parts", len(parts))
 	}
-	if !parts[0].Get("thought").Bool() || parts[0].Get("thoughtSignature").String() != expectedAntigravitySig {
-		t.Fatalf("Expected recovered thinking part with signature %s, got %s", expectedAntigravitySig, parts[0].Raw)
-	}
-	if parts[1].Get("text").String() != "Answer" {
-		t.Fatalf("Expected remaining text part, got %s", parts[1].Raw)
+	if parts[0].Get("thoughtSignature").Exists() {
+		t.Fatal("the visible answer unexpectedly received a signature")
 	}
 }
 
@@ -2124,8 +2108,6 @@ func TestConvertClaudeRequestToAntigravity_ToolUse_DoesNotReuseThinkingSignature
 		]
 	}`)
 
-	cache.CacheSignature("claude-sonnet-4-5-thinking", thinkingText, nativeSignature)
-
 	output, _ := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5-thinking", inputJSON, false)
 	outputStr := string(output)
 
@@ -2161,8 +2143,6 @@ func TestConvertClaudeRequestToAntigravity_ReorderThinking(t *testing.T) {
 			}
 		]
 	}`)
-
-	cache.CacheSignature("claude-sonnet-4-5-thinking", thinkingText, nativeSignature)
 
 	output, _ := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5-thinking", inputJSON, false)
 	outputStr := string(output)
@@ -2369,8 +2349,6 @@ func TestConvertClaudeRequestToAntigravity_ReorderThinkingAndTextBeforeFunctionC
 		]
 	}`)
 
-	cache.CacheSignature("claude-sonnet-4-5-thinking", thinkingText, nativeSignature)
-
 	output, _ := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5-thinking", inputJSON, false)
 	outputStr := string(output)
 
@@ -2541,7 +2519,6 @@ func TestConvertClaudeRequestToAntigravity_ClaudeThinkingPreservesToolResultAdja
 	cache.ClearSignatureCache("")
 	nativeSignature, antigravitySignature := testAntigravityClaudeSignature(t)
 	thinkingText := "Let me check the file."
-	cache.CacheSignature("claude-opus-4-6-thinking", thinkingText, nativeSignature)
 
 	inputJSON := []byte(`{
 		"model":"claude-opus-4-6-thinking",
@@ -2898,8 +2875,6 @@ func TestConvertClaudeRequestToAntigravity_TrailingSignedThinking_Kept(t *testin
 			}
 		]
 	}`)
-
-	cache.CacheSignature("claude-sonnet-4-5-thinking", thinkingText, nativeSignature)
 
 	output, _ := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5-thinking", inputJSON, false)
 	outputStr := string(output)
