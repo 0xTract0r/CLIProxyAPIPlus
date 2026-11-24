@@ -19,6 +19,14 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - name: Upstream sync test preflight
+        if: >-
+          contains(github.event.pull_request.labels.*.name, 'upstream-sync') ||
+          startsWith(github.head_ref, 'bot/upstream-sync') ||
+          startsWith(github.head_ref, 'codex/upstream-sync') ||
+          startsWith(github.head_ref, 'codex/sync-core') ||
+          startsWith(github.head_ref, 'codex/integrate-prod-')
+        run: GOTOOLCHAIN=local GOWORK=off GOPROXY=off go run .github/scripts/upstream-sync-test-preflight.go -pr-event "$GITHUB_EVENT_PATH"
       - name: Test
         shell: bash
         run: |

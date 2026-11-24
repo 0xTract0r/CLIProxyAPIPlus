@@ -108,6 +108,10 @@ jobs:
           go-version-file: go.mod
           cache-dependency-path: go.sum
 
+      - name: Upstream sync test preflight
+        if: steps.merge.outputs.merged == 'true'
+        run: GOTOOLCHAIN=local GOWORK=off GOPROXY=off go run .github/scripts/upstream-sync-test-preflight.go -required
+
       - name: go test
         id: gotest
         if: steps.merge.outputs.merged == 'true'
