@@ -101,8 +101,22 @@ func TestStoredQuotaSnapshotsRegisteredReadOnly(t *testing.T) {
 	if rec := do(http.MethodGet, endpoint, "", false); rec.Code != http.StatusUnauthorized {
 		t.Fatalf("unauthenticated status=%d", rec.Code)
 	}
-	if rec := do(http.MethodPost, "/v0/management/quota/refresh", "{}", true); rec.Code != http.StatusNotFound {
-		t.Fatalf("unsupported refresh route status=%d", rec.Code)
+	const refresh = "/v0/management/quota/refresh"
+	const selected = `{"name":"codex.json","provider":"codex"}`
+	if rec := do(http.MethodPost, refresh, selected, false); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated refresh status=%d", rec.Code)
+	}
+	if rec := do(http.MethodPost, refresh, "{}", true); rec.Code != http.StatusBadRequest {
+		t.Fatalf("unselected refresh status=%d", rec.Code)
+	}
+	if rec := do(http.MethodPost, refresh, `{"name":"codex.json","provider":"claude"}`, true); rec.Code != http.StatusConflict {
+		t.Fatalf("mismatched refresh provider status=%d", rec.Code)
+	}
+	if rec := do(http.MethodPost, refresh, selected, true); rec.Code != http.StatusNotImplemented ||
+		!strings.Contains(rec.Body.String(), `"supported":false`) ||
+		!strings.Contains(rec.Body.String(), "2026-10-04T12:00:00Z") ||
+		strings.Contains(rec.Body.String(), private) {
+		t.Fatalf("explicitly unsupported refresh lost its safe snapshot: status=%d, body=%s", rec.Code, rec.Body)
 	}
 	rec := do(http.MethodGet, endpoint, "", true)
 	if rec.Code != http.StatusOK {

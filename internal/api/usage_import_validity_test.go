@@ -49,7 +49,7 @@ func TestUsageImportValidityRegisteredRoutes(t *testing.T) {
 	detail := func(second int, tokens usage.TokenStats) usage.RequestDetail {
 		return usage.RequestDetail{Timestamp: stamp.Add(time.Duration(second) * time.Second), Tokens: tokens}
 	}
-	stats.Record(t.Context(), coreusage.Record{APIKey: "fixture", Model: model, RequestedAt: stamp, Detail: coreusage.Detail{TotalTokens: 4}})
+	stats.HandleUsage(t.Context(), coreusage.Record{APIKey: "fixture", Model: model, RequestedAt: stamp, Detail: coreusage.Detail{TotalTokens: 4}})
 	for _, bad := range []usage.TokenStats{
 		{TotalTokens: -1},
 		{TotalTokens: 2, CachedTokens: -1},
@@ -72,7 +72,7 @@ func TestUsageImportValidityRegisteredRoutes(t *testing.T) {
 		if version == 2 {
 			donor := usage.NewRequestStatistics()
 			for i := range 2 {
-				donor.Record(t.Context(), coreusage.Record{APIKey: "fixture", Model: model,
+				donor.HandleUsage(t.Context(), coreusage.Record{APIKey: "fixture", Model: model,
 					RequestedAt: stamp.Add(time.Duration(12+i) * time.Second), Detail: coreusage.Detail{TotalTokens: 2}})
 			}
 			page := donor.SnapshotPageWithOptions(usage.SnapshotOptions{DetailLimit: 1})
