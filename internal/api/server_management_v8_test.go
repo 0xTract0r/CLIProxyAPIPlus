@@ -287,3 +287,32 @@ func TestManagementV8PluginsExposesRuntimePriorityOnlyOnV8(t *testing.T) {
 		t.Fatalf("deprecated v0 configured-only exposed priority = %s", p.Raw)
 	}
 }
+
+func TestRegisteredLegacyClaudeReauthRequiresOneTargetAndAdmin(t *testing.T) {
+	const admin = "fixture-registered-reauth"
+	t.Setenv("MANAGEMENT_PASSWORD", admin)
+	s := newTestServerWithOptions(t, WithIsolatedUsage())
+	t.Cleanup(func() { _ = s.Stop(context.Background()) })
+	const route = "/v0/management/anthropic-auth-url?auth_name=first.json&auth_name=second.json"
+	for _, tc := range []struct {
+		key  string
+		want int
+	}{
+		{"", http.StatusUnauthorized},
+		{admin, http.StatusBadRequest},
+	} {
+		req := httptest.NewRequest(http.MethodGet, route, nil)
+		req.RemoteAddr = "127.0.0.1:1234"
+		if tc.key != "" {
+			req.Header.Set("X-Management-Key", tc.key)
+		}
+		rec := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rec, req)
+		if rec.Code != tc.want {
+			t.Errorf("registered selected login returned %d, want %d", rec.Code, tc.want)
+		}
+		if tc.want == http.StatusBadRequest && ojson.Get(rec.Body.String(), "error").String() != "invalid auth_name" {
+			t.Error("multiple targets were not rejected by the selected-file handler")
+		}
+	}
+}

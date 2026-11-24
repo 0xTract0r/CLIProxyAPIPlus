@@ -858,6 +858,11 @@ func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth, quota authFileQu
 		entry["id_token"] = claims
 	}
 	projectOrdinaryAuthFileMetadata(entry, auth)
+	if !quota.v8 && path != "" && statErr == nil &&
+		(entry["reauth_required"] == true || entry["auto_quarantined"] == true) &&
+		h.canOfferLegacyClaudeReauthLink(auth, name) {
+		entry["reauth_url"] = "/v0/management/anthropic-auth-url?auth_name=" + url.QueryEscape(name)
+	}
 	// Expose priority from Attributes (set by synthesizer from JSON "priority" field).
 	// Fall back to Metadata for auths registered via UploadAuthFile (no synthesizer).
 	if p := strings.TrimSpace(authAttribute(auth, "priority")); p != "" {

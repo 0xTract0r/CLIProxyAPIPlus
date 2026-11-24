@@ -27,3 +27,4 @@ request-log-archive	local-first-reader	symbol	^func \(h \*Handler\) openRequestL
 request-log-archive	reader-regression	symbol	^func TestRequestLogArchiveReadAndLocalPriority\(	internal/api/handlers/management/request_log_archive_test.go
 codex-client-catalog	non-template-supported-in-api	pattern	entry\["supported_in_api"\] = true	internal/client/codex/models/models.go
 codex-client-catalog	non-template-supported-in-api-regression	symbol	^func TestCodexClientModelsResponse_NonTemplateModelsSupportedInAPI\(	internal/client/codex/models/models_test.go
+普通凭证-OAuth	selected-claude-reauth	route	mgmt[.]GET[(]"/anthropic-auth-url", s[.]mgmt[.]RequestAnthropicTokenV0[)]	internal/api/server_management.go

@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/claude"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/copilot"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
@@ -149,6 +150,8 @@ type accountSettingsPatch struct {
 	note, disabled       bool
 	refreshEnabled       bool
 	fields               []string
+	selectedClaudeLogin  bool
+	beginClaudeWrite     func() (release func(), eligible bool)
 	selectedCodexLogin   bool
 	selectedCopilotLogin bool
 }
@@ -176,8 +179,61 @@ func WithSelectedCopilotLoginFile(ctx context.Context, file AccountSettingsFile)
 	return context.WithValue(ctx, accountSettingsPatchKey{}, accountSettingsPatch{file: file, selectedCopilotLogin: true})
 }
 
+// WithSelectedClaudeLoginFile binds a replacement grant to the inspected file.
+// beginWrite fences the original directory while the local write is installed.
+func WithSelectedClaudeLoginFile(ctx context.Context, file AccountSettingsFile, beginWrite func() (func(), bool)) context.Context {
+	return context.WithValue(ctx, accountSettingsPatchKey{}, accountSettingsPatch{
+		file: file, selectedClaudeLogin: true, beginClaudeWrite: beginWrite,
+	})
+}
+
+func HasSelectedClaudeLoginFile(ctx context.Context) bool {
+	patch, ok := explicitAccountSettingsPatch(ctx)
+	return ok && patch.selectedClaudeLogin
+}
+
+// MatchesClaudeLoginOwner verifies that the inspected file still identifies
+// the selected provider account before a reauthentication session is issued.
+func (f AccountSettingsFile) MatchesClaudeLoginOwner(email, account, organization string) bool {
+	if !f.Valid() {
+		return false
+	}
+	raw, info, err := f.read()
+	return err == nil && os.SameFile(info, f.info) && sha256.Sum256(raw) == f.digest &&
+		matchesClaudeLoginOwner(raw, email, account, organization)
+}
+
+// ReadSelectedClaudeFile validates a newly committed file snapshot using the
+// same scoped path as the pre-login selection.
+func (f AccountSettingsFile) ReadSelectedClaudeFile(path string) ([]byte, error) {
+	absolute, err := filepath.Abs(path)
+	if err != nil || !f.Valid() || absolute != f.path {
+		return nil, coreauth.ErrCredentialFileRemoved
+	}
+	data, _, err := f.read()
+	return data, err
+}
+
+func matchesClaudeLoginOwner(raw []byte, email, account, organization string) bool {
+	var prior struct {
+		Type         string `json:"type"`
+		Email        string `json:"email"`
+		Account      string `json:"account_uuid"`
+		Organization string `json:"organization_uuid"`
+	}
+	if json.Unmarshal(raw, &prior) != nil || !strings.EqualFold(strings.TrimSpace(prior.Type), "claude") {
+		return false
+	}
+	priorEmail, priorAccount, priorOrg := strings.TrimSpace(prior.Email), strings.TrimSpace(prior.Account), strings.TrimSpace(prior.Organization)
+	// A provider's email can be reused or shared. Only the stable account
+	// recorded before this session can authorize replacing the saved grant.
+	return priorAccount != "" && priorAccount == strings.TrimSpace(account) &&
+		(priorEmail == "" || strings.EqualFold(priorEmail, strings.TrimSpace(email))) &&
+		(priorOrg == "" || priorOrg == strings.TrimSpace(organization))
+}
+
 func (patch accountSettingsPatch) selectedLogin() bool {
-	return patch.selectedCodexLogin || patch.selectedCopilotLogin
+	return patch.selectedClaudeLogin || patch.selectedCodexLogin || patch.selectedCopilotLogin
 }
 
 func explicitAccountSettingsPatch(ctx context.Context) (accountSettingsPatch, bool) {
@@ -191,6 +247,16 @@ func explicitAccountSettingsPatch(ctx context.Context) (accountSettingsPatch, bo
 func (s *FileTokenStore) saveAccountSettingsPatch(path string, auth *coreauth.Auth, patch accountSettingsPatch) (string, error) {
 	if patch.selectedLogin() && !patch.file.Valid() {
 		return "", coreauth.ErrCredentialFileRemoved
+	}
+	if patch.selectedClaudeLogin {
+		if patch.beginClaudeWrite == nil {
+			return "", coreauth.ErrAuthPublicationOutOfScope
+		}
+		release, eligible := patch.beginClaudeWrite()
+		if !eligible {
+			return "", coreauth.ErrAuthPublicationOutOfScope
+		}
+		release()
 	}
 	absolute, err := filepath.Abs(path)
 	if err != nil || (patch.file.Valid() && absolute != patch.file.path) {
@@ -238,6 +304,43 @@ func (s *FileTokenStore) saveAccountSettingsPatch(path string, auth *coreauth.Au
 			return err
 		}
 		fields := make(map[string]json.RawMessage, len(patch.fields)+2)
+		if patch.selectedClaudeLogin {
+			grant, ok := auth.Storage.(*claude.ClaudeTokenStorage)
+			if !ok || grant == nil || !strings.EqualFold(auth.Provider, "claude") ||
+				strings.TrimSpace(grant.AccessToken) == "" || strings.TrimSpace(grant.RefreshToken) == "" ||
+				!matchesClaudeLoginOwner(old, grant.Email, grant.AccountUUID, grant.OrganizationUUID) {
+				return coreauth.ErrFileRemovalBusy
+			}
+			for name, value := range map[string]string{
+				"id_token": grant.IDToken, "access_token": grant.AccessToken, "refresh_token": grant.RefreshToken,
+				"expired": grant.Expire, "last_refresh": grant.LastRefresh, "email": grant.Email,
+				"account_uuid": grant.AccountUUID, "organization_uuid": grant.OrganizationUUID,
+				"organization_name": grant.OrganizationName,
+			} {
+				if value == "" && name != "id_token" {
+					continue
+				}
+				fields[name], err = json.Marshal(value)
+				if err != nil {
+					return err
+				}
+			}
+			var prior map[string]any
+			if err := json.Unmarshal(old, &prior); err != nil {
+				return err
+			}
+			if coreauth.IsReauthRequiredMetadata(prior) {
+				for _, name := range []string{"reauth_required", "refresh_status", "refresh_error_code",
+					"refresh_disabled_reason", "refresh_disabled", "refresh_disabled_at", "last_refresh_error"} {
+					fields[name] = nil
+				}
+			}
+			if quarantined, _ := prior["auto_quarantined"].(bool); quarantined && prior["quarantine_reason"] == "terminal_auth_failure" {
+				for _, name := range []string{"auto_quarantined", "quarantine_reason", "quarantined_at"} {
+					fields[name] = nil
+				}
+			}
+		}
 		if patch.selectedCodexLogin {
 			grant, ok := auth.Storage.(*codex.CodexTokenStorage)
 			if !ok || grant == nil || !coreauth.IsCodexAuthRecord(auth) {
@@ -349,6 +452,15 @@ func (s *FileTokenStore) saveAccountSettingsPatch(path string, auth *coreauth.Au
 			if err := dec.Decode(&persistedMetadata); err != nil {
 				return err
 			}
+		}
+		if patch.selectedClaudeLogin {
+			// Upload takes the credential lock before its directory fence.
+			// Use the same order and hold no directory lock across callbacks.
+			release, eligible := patch.beginClaudeWrite()
+			if !eligible {
+				return coreauth.ErrAuthPublicationOutOfScope
+			}
+			defer release()
 		}
 		if bytes.Equal(data, old) {
 			return nil

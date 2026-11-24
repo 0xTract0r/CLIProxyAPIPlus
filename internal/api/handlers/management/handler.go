@@ -53,6 +53,7 @@ type Handler struct {
 	attemptsMu              sync.Mutex
 	failedAttempts          map[string]*attemptInfo // keyed by client IP
 	authManager             *coreauth.Manager
+	authManagerGeneration   uint64
 	tokenStore              coreauth.Store
 	localPassword           string
 	allowRemoteOverride     bool
@@ -238,7 +239,10 @@ func (h *Handler) SetAuthManager(manager *coreauth.Manager) {
 	}
 	h.mu.Lock()
 	if h.authManager != manager {
+		h.authUploadScopeMu.Lock()
 		h.authManager = manager
+		h.authManagerGeneration++
+		h.authUploadScopeMu.Unlock()
 	}
 	h.mu.Unlock()
 }

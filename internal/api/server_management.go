@@ -239,7 +239,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.POST("/auth-files/test-message", s.mgmt.TestOrdinaryAuthFileMessage)
 		mgmt.POST("/vertex/import", s.mgmt.ImportVertexCredential)
 
-		mgmt.GET("/anthropic-auth-url", s.mgmt.RequestAnthropicToken)
+		mgmt.GET("/anthropic-auth-url", s.mgmt.RequestAnthropicTokenV0)
 		mgmt.GET("/codex-auth-url", s.mgmt.RequestCodexTokenV0)
 		mgmt.GET("/antigravity-auth-url", s.mgmt.RequestAntigravityToken)
 		mgmt.GET("/kimi-auth-url", s.mgmt.RequestKimiToken)

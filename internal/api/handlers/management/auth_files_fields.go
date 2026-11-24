@@ -1111,7 +1111,7 @@ func (h *Handler) saveTokenRecordWithConfig(ctx context.Context, record *coreaut
 	}
 	if xaiSave != nil {
 		coreauth.MergeExistingAuthMetadata(record, xaiSave.PriorMetadata)
-	} else {
+	} else if !sdkAuth.HasSelectedClaudeLoginFile(ctx) {
 		h.mergeExistingAuthFileMetadata(record, cfg)
 	}
 	var legacyClaudeCredential *coreauth.Auth
@@ -1148,6 +1148,11 @@ func (h *Handler) saveTokenRecordWithConfig(ctx context.Context, record *coreaut
 	}
 	if err := xaiSave.Finish(ctx, savedPath); err != nil {
 		return savedPath, err
+	}
+	if sdkAuth.HasSelectedClaudeLoginFile(ctx) {
+		// A selected Claude session publishes through its captured manager and
+		// epoch after this guarded store write.
+		return savedPath, nil
 	}
 	if h.postAuthPersistHook != nil {
 		persistedRecord := record

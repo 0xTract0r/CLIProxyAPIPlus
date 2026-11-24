@@ -27,6 +27,7 @@ REQUIRED = {
         "TestUsageImportWriteFailureLeavesCommittedHistory",
         "TestUsageKnownKeyConfigurationCommit",
         "TestServerCodexAPIKeyResponsesStreamingRequestLog",
+        "TestRegisteredLegacyClaudeReauthRequiresOneTargetAndAdmin",
     },
     "github.com/router-for-me/CLIProxyAPI/v8/internal/usage": {"TestKnownUsageKeyTiesFromDisk"},
 }

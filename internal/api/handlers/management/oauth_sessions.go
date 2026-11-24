@@ -57,6 +57,7 @@ type oauthRecoveryTarget struct {
 	SelectedDisabled          bool
 	SelectedGlobalRoute       string
 	SelectedRouteInherits     bool
+	ClaudePublication         *selectedClaudePublication
 }
 
 type oauthSession struct {

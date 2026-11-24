@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -26,6 +27,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/watcher/synthesizer"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
@@ -96,7 +98,115 @@ func bindOAuthSessionTarget(c *gin.Context, state string, respPayload gin.H) (oa
 	return sessionTarget, true
 }
 
+// RequestAnthropicTokenV0 accepts the filename used by legacy reauth_url links.
+func (h *Handler) RequestAnthropicTokenV0(c *gin.Context) {
+	query, err := url.ParseQuery(c.Request.URL.RawQuery)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid query"})
+		return
+	}
+	names, selected := query["auth_name"]
+	if !selected {
+		h.RequestAnthropicToken(c)
+		return
+	}
+	if len(names) != 1 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid auth_name"})
+		return
+	}
+	h.mu.Lock()
+	publication := &selectedClaudePublication{
+		scope:   authUploadSelection{owner: h, generation: h.fileOAuthGeneration},
+		manager: h.authManager, managerGeneration: h.authManagerGeneration,
+	}
+	h.mu.Unlock()
+	target, record, status, message := h.selectedClaudeOAuthTarget(strings.TrimSpace(names[0]))
+	if status != 0 {
+		c.JSON(status, gin.H{"error": message})
+		return
+	}
+	if err := bindSelectedOAuthRoute(c, record); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if !publication.current() {
+		c.JSON(http.StatusConflict, gin.H{"error": "credential scope changed, select it again"})
+		return
+	}
+	publication.authGeneration = record.Generation
+	target.ClaudePublication = publication
+	target.SelectedCredentialVersion = record.CredentialVersion
+	c.Set(oauthSessionTargetContextKey, target)
+	h.requestAnthropicToken(c, publication)
+}
+
+func validSelectedClaudeAuthName(name string) bool {
+	return !isUnsafeAuthFileName(name) && strings.EqualFold(filepath.Ext(name), ".json") && !strings.ContainsRune(name, 0)
+}
+
+func savedClaudeAccountUUID(auth *coreauth.Auth) string {
+	raw, _ := auth.Metadata["account_uuid"].(string)
+	return strings.TrimSpace(raw)
+}
+
+func (h *Handler) hasSelectedClaudeFileStore() bool {
+	store := h.tokenStore
+	if store == nil {
+		store = sdkAuth.GetTokenStore()
+	}
+	_, local := store.(*sdkAuth.FileTokenStore)
+	return local
+}
+
+// The list only offers a hint from the current row. The start and commit paths
+// recheck the selected file itself against the administrator's request.
+func (h *Handler) canOfferLegacyClaudeReauthLink(auth *coreauth.Auth, name string) bool {
+	return strings.EqualFold(strings.TrimSpace(auth.Provider), "claude") &&
+		!isRuntimeOnlyAuth(auth) && !coreauth.IsConfigAPIKeyAuth(auth) && !coreauth.IsPluginVirtualAuth(auth) &&
+		validSelectedClaudeAuthName(name) && savedClaudeAccountUUID(auth) != "" && h.hasSelectedClaudeFileStore()
+}
+
+func (h *Handler) selectedClaudeOAuthTarget(name string) (oauthRecoveryTarget, *coreauth.Auth, int, string) {
+	var empty oauthRecoveryTarget
+	if !validSelectedClaudeAuthName(name) {
+		return empty, nil, http.StatusBadRequest, "invalid auth_name"
+	}
+	target, status, message := h.ordinaryAccountSettingsTarget(ordinaryAccountSettingsRequest{name: name})
+	if status != 0 {
+		return empty, nil, status, message
+	}
+	record := target.auth
+	if !strings.EqualFold(strings.TrimSpace(record.Provider), "claude") {
+		return empty, nil, http.StatusBadRequest, "provider does not match target credential"
+	}
+	if !h.hasSelectedClaudeFileStore() {
+		return empty, nil, http.StatusNotImplemented, "selected Claude re-authentication requires atomic credential file replacement"
+	}
+	email := authEmail(record)
+	accountID := savedClaudeAccountUUID(record)
+	orgID := authIdentityOrganizationID(record)
+	if accountID == "" || !target.file.MatchesClaudeLoginOwner(email, accountID, orgID) {
+		return empty, nil, http.StatusConflict, "selected Claude credential has no matching saved account ID; start a new sign-in"
+	}
+	return oauthRecoveryTarget{
+		AuthID:                    record.ID,
+		FileName:                  authFileListName(record),
+		Path:                      strings.TrimSpace(authAttribute(record, "path")),
+		Provider:                  "claude",
+		Email:                     email,
+		AccountID:                 accountID,
+		OrganizationID:            orgID,
+		SelectedFileRevision:      target.revision(),
+		SelectedFile:              target.file,
+		SelectedRegistrationEpoch: record.RegistrationEpoch,
+	}, record, 0, ""
+}
+
 func (h *Handler) RequestAnthropicToken(c *gin.Context) {
+	h.requestAnthropicToken(c, nil)
+}
+
+func (h *Handler) requestAnthropicToken(c *gin.Context, publication *selectedClaudePublication) {
 	ctx := context.Background()
 	ctx = PopulateAuthContext(ctx, c)
 
@@ -135,8 +245,13 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "callback directory unavailable"})
 		return
 	}
-	if errRegister := h.registerFileOAuthSession(state, "anthropic", cfg.AuthDir, sessionProxyURL); errRegister != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "callback directory unavailable"})
+	if publication == nil {
+		if errRegister := h.registerFileOAuthSession(state, "anthropic", cfg.AuthDir, sessionProxyURL); errRegister != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "callback directory unavailable"})
+			return
+		}
+	} else if !h.registerSelectedClaudeOAuthSession(state, cfg.AuthDir, sessionProxyURL, publication) {
+		c.JSON(http.StatusConflict, gin.H{"error": "OAuth credential scope changed, select it again"})
 		return
 	}
 	respPayload := gin.H{"status": "ok", "url": authURL, "state": state}
@@ -211,6 +326,10 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 		rawCode := resultMap["code"]
 		code := strings.Split(rawCode, "#")[0]
 
+		if publication != nil && !publication.current() {
+			SetOAuthSessionError(state, "Selected OAuth runtime scope changed")
+			return
+		}
 		// Exchange code for tokens using internal auth service
 		bundle, errExchange := anthropicAuth.ExchangeCodeForTokens(ctx, code, state, pkceCodes)
 		if errExchange != nil {
@@ -256,6 +375,27 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 	}()
 
 	c.JSON(200, respPayload)
+}
+
+// Register a selected file session only under the directory generation that was
+// current when the management request resolved its target.
+func (h *Handler) registerSelectedClaudeOAuthSession(state, authDir, route string, publication *selectedClaudePublication) bool {
+	if ValidateOAuthState(state) != nil {
+		return false
+	}
+	dir, err := fileOAuthDirectory(authDir)
+	if err != nil {
+		return false
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	currentDir, err := fileOAuthDirectory(fileOAuthConfigDir(h.cfg))
+	if err != nil || currentDir != dir || publication.scope.owner != h || publication.scope.generation != h.fileOAuthGeneration ||
+		h.authManager != publication.manager || h.authManagerGeneration != publication.managerGeneration {
+		return false
+	}
+	oauthSessions.registerBuiltin(state, "anthropic", route, dir, h, h.fileOAuthGeneration)
+	return true
 }
 
 // RequestCodexTokenV0 binds an explicitly selected file before starting re-authentication.
@@ -614,8 +754,14 @@ func (h *Handler) commitAndCompleteBuiltinOAuthSession(ctx context.Context, stat
 	var hadPrevAuth bool
 	var prevVersion uint64
 	var prevEpoch uint64
-	if h != nil && h.authManager != nil {
-		if existing, okExisting := h.authManager.GetByID(record.ID); okExisting && existing != nil {
+	var priorManager *coreauth.Manager
+	if target.ClaudePublication != nil {
+		priorManager = target.ClaudePublication.manager
+	} else if h != nil {
+		priorManager = h.authManager
+	}
+	if priorManager != nil {
+		if existing, okExisting := priorManager.GetByID(record.ID); okExisting && existing != nil {
 			hadPrevAuth = true
 			prevVersion = existing.CredentialVersion
 			prevEpoch = existing.RegistrationEpoch
@@ -642,14 +788,19 @@ func (h *Handler) commitAndCompleteBuiltinOAuthSession(ctx context.Context, stat
 			current.auth.RegistrationEpoch != target.SelectedRegistrationEpoch ||
 			current.revision() != target.SelectedFileRevision ||
 			(copilotTarget && (current.auth.CredentialVersion != target.SelectedCredentialVersion ||
-				current.auth.Disabled != target.SelectedDisabled)) {
+				current.auth.Disabled != target.SelectedDisabled)) ||
+			(target.ClaudePublication != nil && (current.manager != target.ClaudePublication.manager ||
+				!target.ClaudePublication.matches(current.auth, target) || !target.ClaudePublication.current())) {
 			FailOAuthSessionCommit(state, "Selected credential was removed, renamed or changed; start re-authentication again")
 			return "", false
 		}
 		if target.SelectedFile.Valid() {
-			if copilotTarget {
+			switch {
+			case copilotTarget:
 				ctx = sdkAuth.WithSelectedCopilotLoginFile(ctx, target.SelectedFile)
-			} else {
+			case target.ClaudePublication != nil:
+				ctx = sdkAuth.WithSelectedClaudeLoginFile(ctx, target.SelectedFile, target.ClaudePublication.scope.begin)
+			default:
 				ctx = sdkAuth.WithSelectedCodexLoginFile(ctx, target.SelectedFile)
 			}
 		}
@@ -666,6 +817,9 @@ func (h *Handler) commitAndCompleteBuiltinOAuthSession(ctx context.Context, stat
 	}
 
 	if errSave != nil && strings.TrimSpace(savedPath) == "" {
+		if target.ClaudePublication != nil && errors.Is(errSave, coreauth.ErrAuthPublicationOutOfScope) {
+			failSaveMessage = "Selected credential directory changed; start re-authentication again"
+		}
 		FailOAuthSessionCommit(state, failSaveMessage)
 		log.Errorf("%s: %v", failSaveMessage, errSave)
 		return "", false
@@ -679,6 +833,15 @@ func (h *Handler) commitAndCompleteBuiltinOAuthSession(ctx context.Context, stat
 	if errSave != nil {
 		adoptErr = "Credential saved to storage, but runtime adoption failed"
 		log.Errorf("%s credential saved to %s, but runtime adoption failed: %v", record.Provider, savedPath, errSave)
+	} else if target.ClaudePublication != nil {
+		runtimeAuth, errAdopt := adoptSelectedClaudeGrant(ctx, target, record, saveConfig, savedPath)
+		if errAdopt != nil {
+			adoptErr = "Credential saved to storage, but selected runtime scope changed"
+		} else {
+			adopted = true
+			adoptedVersion = runtimeAuth.CredentialVersion
+			adoptedEpoch = runtimeAuth.RegistrationEpoch
+		}
 	} else if h != nil && h.authManager != nil {
 		if runtimeAuth, okRuntime := h.authManager.GetByID(record.ID); okRuntime && runtimeAuth != nil {
 			if authGrantFingerprint(runtimeAuth) == savedGrantHash || runtimeAuth.AdoptedGrantHash == savedGrantHash {
@@ -702,6 +865,82 @@ func (h *Handler) commitAndCompleteBuiltinOAuthSession(ctx context.Context, stat
 
 	CompleteOAuthSessionWithOutcome(state, record.ID, savedGrantHash, strings.TrimSpace(savedPath) != "", adopted, hadPrevAuth, prevVersion, prevEpoch, adoptedVersion, adoptedEpoch, adoptErr, verifyErr)
 	return savedPath, true
+}
+
+type selectedClaudePublication struct {
+	scope                             authUploadSelection
+	manager                           *coreauth.Manager
+	managerGeneration, authGeneration uint64
+}
+
+func (p *selectedClaudePublication) begin() (func(), bool) {
+	release, ok := p.scope.begin()
+	if !ok {
+		return nil, false
+	}
+	if p.manager == nil || p.scope.owner.authManager != p.manager ||
+		p.scope.owner.authManagerGeneration != p.managerGeneration {
+		release()
+		return nil, false
+	}
+	return release, true
+}
+
+func (p *selectedClaudePublication) current() bool {
+	release, ok := p.begin()
+	if ok {
+		release()
+	}
+	return ok
+}
+
+func (p *selectedClaudePublication) matches(auth *coreauth.Auth, target oauthRecoveryTarget) bool {
+	return auth != nil && auth.RegistrationEpoch == target.SelectedRegistrationEpoch &&
+		auth.CredentialVersion == target.SelectedCredentialVersion && auth.Generation == p.authGeneration
+}
+
+func adoptSelectedClaudeGrant(ctx context.Context, target oauthRecoveryTarget, persisted *coreauth.Auth, cfg *config.Config, path string) (*coreauth.Auth, error) {
+	publication := target.ClaudePublication
+	if !publication.current() {
+		return nil, coreauth.ErrAuthPublicationOutOfScope
+	}
+	// Synthesize the metadata returned by the guarded write. Validate the
+	// committed snapshot within the original directory before publication.
+	data, err := json.Marshal(persisted.Metadata)
+	if err != nil {
+		return nil, err
+	}
+	records, err := synthesizer.SynthesizeAuthFile(&synthesizer.SynthesisContext{
+		Config: cfg, AuthDir: cfg.AuthDir, Now: time.Now(), IDGenerator: synthesizer.NewStableIDGenerator(),
+	}, path, data)
+	if err != nil || len(records) != 1 || records[0] == nil || records[0].Provider != "claude" {
+		return nil, coreauth.ErrAuthPublicationOutOfScope
+	}
+	next := records[0]
+	ctx = coreauth.WithAuthPublicationFence(coreauth.WithSkipPersist(ctx), &coreauth.AuthPublicationFence{
+		BeginPublication: publication.begin,
+	})
+	ctx = coreauth.WithFileSnapshotReader(ctx, target.SelectedFile.ReadSelectedClaudeFile)
+	auth, adopted, err := publication.manager.Modify(ctx, target.AuthID, target.SelectedRegistrationEpoch, func(current *coreauth.Auth) error {
+		if !publication.matches(current, target) {
+			return coreauth.ErrAuthPublicationOutOfScope
+		}
+		next.ID = current.ID
+		next.CreatedAt = current.CreatedAt
+		next.Runtime = current.Runtime
+		next.Generation = current.Generation
+		next.CredentialVersion = current.CredentialVersion
+		next.RegistrationEpoch = current.RegistrationEpoch
+		*current = *next
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if !adopted || auth == nil {
+		return nil, coreauth.ErrAuthPublicationOutOfScope
+	}
+	return auth, nil
 }
 
 func oauthGrantFingerprint(accessToken, refreshToken, email, accountID string) string {
@@ -1553,7 +1792,20 @@ func (h *Handler) writeCompletedOAuthStatus(c *gin.Context, state string, sessio
 		resp["saved"] = session.Saved
 		var adoptedAuth *coreauth.Auth
 		var adoptErr string
-		if h != nil && h.authManager != nil {
+		if session.Target != nil && session.Target.ClaudePublication != nil {
+			publication := session.Target.ClaudePublication
+			if session.Adopted && publication.current() {
+				candidate, ok := publication.manager.GetByID(session.AuthID)
+				if ok && candidate != nil && candidate.RegistrationEpoch == session.AdoptedEpoch &&
+					candidate.CredentialVersion == session.AdoptedVersion && publication.current() {
+					adoptedAuth = candidate
+				} else {
+					adoptErr = "Credential or runtime scope changed after re-authentication"
+				}
+			} else if session.Adopted {
+				adoptErr = "Runtime scope changed after re-authentication"
+			}
+		} else if h != nil && h.authManager != nil {
 			if candidate, okAuth := h.authManager.GetByID(session.AuthID); okAuth && candidate != nil {
 				if session.SavedGrantHash != "" {
 					if authGrantFingerprint(candidate) == session.SavedGrantHash ||
