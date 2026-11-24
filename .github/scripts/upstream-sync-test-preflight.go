@@ -12,6 +12,7 @@ import (
 	"go/parser"
 	"go/scanner"
 	"go/token"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -19,7 +20,7 @@ import (
 )
 
 type deniedTest struct {
-	path, name, hash, category string
+	path, name, hash, category, replacementHash string
 }
 
 type pullRequestEvent struct {
@@ -61,25 +62,44 @@ func inventory(path string) ([]deniedTest, error) {
 		return nil, err
 	}
 	var tests []deniedTest
-	seen := make(map[string]bool)
+	names := make(map[string]bool)
+	historical := make(map[string]bool)
+	replacementRows := make(map[string]int)
 	for i, line := range strings.Split(string(raw), "\n") {
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
 		p := strings.Split(line, "\t")
-		if len(p) != 4 || !strings.HasSuffix(p[0], "_test.go") || !strings.HasPrefix(p[1], "Test") || p[3] == "" {
+		if (len(p) != 4 && len(p) != 5) || !fs.ValidPath(p[0]) || !strings.HasSuffix(p[0], "_test.go") ||
+			!token.IsIdentifier(p[1]) || !strings.HasPrefix(p[1], "Test") || strings.TrimSpace(p[3]) == "" {
 			return nil, fmt.Errorf("invalid inventory row %d", i+1)
 		}
-		digest, err := hex.DecodeString(p[2])
-		key := p[0] + "\x00" + p[1]
-		if err != nil || len(digest) != sha256.Size || seen[key] {
+		test := deniedTest{path: p[0], name: p[1], hash: strings.ToLower(p[2]), category: p[3]}
+		digest, err := hex.DecodeString(test.hash)
+		key := test.path + "\x00" + test.name
+		if err != nil || len(digest) != sha256.Size || names[key] || historical[test.hash] {
 			return nil, fmt.Errorf("invalid or duplicate inventory row %d", i+1)
 		}
-		seen[key] = true
-		tests = append(tests, deniedTest{p[0], p[1], strings.ToLower(p[2]), p[3]})
+		names[key] = true
+		historical[test.hash] = true
+		if len(p) == 5 {
+			test.replacementHash = strings.ToLower(p[4])
+			digest, err := hex.DecodeString(test.replacementHash)
+			if err != nil || len(digest) != sha256.Size || replacementRows[test.replacementHash] != 0 {
+				return nil, fmt.Errorf("invalid or duplicate replacement hash in inventory row %d", i+1)
+			}
+			replacementRows[test.replacementHash] = i + 1
+		}
+		tests = append(tests, test)
 	}
 	if len(tests) == 0 {
 		return nil, fmt.Errorf("empty inventory")
+	}
+	// Historical bodies are denied globally, including rows that appear later.
+	for _, test := range tests {
+		if historical[test.replacementHash] {
+			return nil, fmt.Errorf("replacement hash in inventory row %d is a denied body", replacementRows[test.replacementHash])
+		}
 	}
 	return tests, nil
 }
@@ -102,7 +122,7 @@ func bodyHash(body []byte) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-func testBodies(name string, source []byte, visit func(string, token.Position, string)) error {
+func testBodies(name string, source []byte, visit func(string, token.Position, string, bool)) error {
 	set := token.NewFileSet()
 	file, err := parser.ParseFile(set, name, source, parser.SkipObjectResolution)
 	if err != nil {
@@ -110,11 +130,11 @@ func testBodies(name string, source []byte, visit func(string, token.Position, s
 	}
 	for _, decl := range file.Decls {
 		f, ok := decl.(*ast.FuncDecl)
-		if !ok || f.Recv != nil || f.Body == nil || !strings.HasPrefix(f.Name.Name, "Test") {
+		if !ok || f.Body == nil {
 			continue
 		}
 		start, end := set.Position(f.Body.Pos()), set.Position(f.Body.End())
-		visit(f.Name.Name, start, bodyHash(source[start.Offset:end.Offset]))
+		visit(f.Name.Name, start, bodyHash(source[start.Offset:end.Offset]), f.Recv == nil)
 	}
 	return nil
 }
@@ -148,15 +168,20 @@ func scanTests(list []deniedTest) (int, error) {
 		if err != nil {
 			return 0, err
 		}
-		if err := testBodies(name, source, func(test string, pos token.Position, digest string) {
-			entry, exact := names[name+"\x00"+test]
-			if !exact {
-				entry, exact = bodies[digest]
+		if err := testBodies(name, source, func(test string, pos token.Position, digest string, topLevel bool) {
+			entry, deniedBody := bodies[digest]
+			if !deniedBody {
+				if !topLevel {
+					return
+				}
+				var deniedName bool
+				entry, deniedName = names[name+"\x00"+test]
+				if !deniedName || digest == entry.replacementHash {
+					return
+				}
 			}
-			if exact {
-				blocked++
-				fmt.Fprintf(os.Stderr, "%s:%d %s: %s (reviewed at %s / %s)\n", name, pos.Line, test, entry.category, entry.path, entry.name)
-			}
+			blocked++
+			fmt.Fprintf(os.Stderr, "%s:%d %s: %s (reviewed at %s / %s)\n", name, pos.Line, test, entry.category, entry.path, entry.name)
 		}); err != nil {
 			return 0, err
 		}
