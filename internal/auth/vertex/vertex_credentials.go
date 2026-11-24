@@ -3,11 +3,12 @@
 package vertex
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 
-	"github.com/MoeForge/moego/json"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/misc"
 	log "github.com/sirupsen/logrus"
 )
@@ -61,7 +62,19 @@ func (s *VertexCredentialStorage) SaveTokenToFile(authFilePath string) error {
 		return fmt.Errorf("vertex credential: create directory failed: %w", err)
 	}
 
-	data, errMerge := misc.MergeMetadata(s, s.Metadata)
+	// Preserve JSON tags and decimal spelling before the map fast path merges
+	// hook metadata. The generic struct merge round-trip uses float64.
+	raw, err := json.Marshal(s)
+	if err != nil {
+		return fmt.Errorf("vertex credential: marshal failed: %w", err)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	var source map[string]any
+	if err := decoder.Decode(&source); err != nil {
+		return fmt.Errorf("vertex credential: decode failed: %w", err)
+	}
+	data, errMerge := misc.MergeMetadata(source, s.Metadata)
 	if errMerge != nil {
 		return fmt.Errorf("vertex credential: merge metadata failed: %w", errMerge)
 	}

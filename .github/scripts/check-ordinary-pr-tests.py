@@ -31,6 +31,11 @@ REQUIRED = {
         "TestTypedNilOpErrorIsReturnedUntouched",
         "TestRecoveredDialAndOtherVetoDoNotExhaust",
     },
+    "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/vertex": {
+        "TestVertexStoragePreservesNumbersAndMetadataPriority",
+        "TestVertexStoragePreservesNumbersAndMetadataPriority/without_metadata",
+        "TestVertexStoragePreservesNumbersAndMetadataPriority/metadata_wins",
+    },
     SDK: {
         "TestOrdinaryOneGrantModelPoolConnectBudget",
         *(f"TestOrdinaryOneGrantModelPoolConnectBudget/{budget}" for budget in (0, 1, 3)),
@@ -100,6 +105,9 @@ REQUIRED = {
         "TestNamedRefreshFinalBoundaries/ordinary_io_keeps_rotated_ram",
         *(f"TestNamedRefreshFinalBoundaries/{version}_{case}" for version in ("v0", "v8")
           for case in ("removed", "removal_busy", "publication_scope", "payload_owner")),
+        "TestVertexImportNumericRoundTripAndInvalidJSON",
+        *(f"TestVertexImportNumericRoundTripAndInvalidJSON/{version}/{result}"
+          for version in ("v0", "v8") for result in ("valid", "trailing", "invalid")),
         "TestNamedRefreshNoLockCycle",
         "TestNamedRefreshUploadStoreOrder",
         "TestUploadConfirmedBusyScopeKeepsPending",

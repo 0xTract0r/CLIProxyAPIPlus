@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/MoeForge/moego/json"
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/vertex"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
@@ -44,8 +43,8 @@ func (h *Handler) ImportVertexCredential(c *gin.Context) {
 		return
 	}
 
-	var serviceAccount map[string]any
-	if err := json.Unmarshal(data, &serviceAccount); err != nil {
+	serviceAccount, err := coreauth.DecodeCredentialMetadata(data)
+	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid json", "message": err.Error()})
 		return
 	}
