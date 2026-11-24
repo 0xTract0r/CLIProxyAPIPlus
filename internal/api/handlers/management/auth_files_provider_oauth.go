@@ -176,11 +176,7 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 					SetOAuthSessionError(state, "Timeout waiting for OAuth callback")
 					return nil, fmt.Errorf("timeout waiting for OAuth callback")
 				}
-				data, errRead := os.ReadFile(path)
-				if errRead == nil {
-					var m map[string]string
-					_ = json.Unmarshal(data, &m)
-					_ = os.Remove(path)
+				if m, ready := readOAuthCallbackFile(path); ready {
 					return m, nil
 				}
 				time.Sleep(500 * time.Millisecond)
@@ -289,6 +285,10 @@ func (h *Handler) RequestCodexTokenV0(c *gin.Context) {
 		return
 	}
 
+	if err := bindSelectedOAuthRoute(c, record); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
 	email, accountID := authIdentityEmailAndAccountID(record)
 	c.Set(oauthSessionTargetContextKey, oauthRecoveryTarget{
 		AuthID:                    record.ID,
@@ -390,10 +390,7 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 				SetOAuthSessionError(state, "Timeout waiting for OAuth callback")
 				return
 			}
-			if data, errR := os.ReadFile(waitFile); errR == nil {
-				var m map[string]string
-				_ = json.Unmarshal(data, &m)
-				_ = os.Remove(waitFile)
+			if m, ready := readOAuthCallbackFile(waitFile); ready {
 				if errStr := m["error"]; errStr != "" {
 					oauthErr := codex.NewOAuthError(errStr, "", http.StatusBadRequest)
 					log.Error(codex.GetUserFriendlyMessage(oauthErr))

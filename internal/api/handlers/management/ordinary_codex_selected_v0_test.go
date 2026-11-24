@@ -20,7 +20,9 @@ import (
 func TestOrdinaryCodexV0SelectedReauth(t *testing.T) {
 	previous := newCodexOAuthService
 	starts := 0
-	newCodexOAuthService = func(*config.Config) codexOAuthService {
+	var routes []string
+	newCodexOAuthService = func(cfg *config.Config) codexOAuthService {
+		routes = append(routes, cfg.ProxyURL)
 		starts++
 		return &fakeCodexOAuthService{}
 	}
@@ -38,7 +40,16 @@ func TestOrdinaryCodexV0SelectedReauth(t *testing.T) {
 		if err := os.WriteFile(path, []byte(initial), 0600); err != nil {
 			t.Fatal(err)
 		}
-		_, err := manager.Register(context.Background(), &coreauth.Auth{ID: name, FileName: name, Provider: provider,
+		route := ""
+		switch name {
+		case "selected.json":
+			route = "http://corp-proxy.example.test:8000"
+		case "other.json":
+			route = "direct"
+		case "invalid-route.json":
+			route = "bogus://do-not-use.example.test"
+		}
+		_, err := manager.Register(context.Background(), &coreauth.Auth{ID: name, FileName: name, Provider: provider, ProxyURL: route,
 			Attributes: map[string]string{coreauth.AttributePath: path},
 			Metadata:   map[string]any{"type": provider, "email": "codex-selected@example.test", "note": "keep"}})
 		if err != nil {
@@ -48,6 +59,7 @@ func TestOrdinaryCodexV0SelectedReauth(t *testing.T) {
 	add("selected.json", "codex")
 	add("other.json", "codex")
 	add("wrong-provider.json", "claude")
+	add("invalid-route.json", "codex")
 	// Simulate legacy fields that this OAuth flow does not own. The manager has
 	// already registered the credential, as it would after a watcher refresh.
 	legacy := []byte(`{"type":"codex","email":"codex-selected@example.test","note":"keep","disabled":true,"legacy":9007199254740993,"custom":{"mode":"leave unchanged"}}`)
@@ -75,6 +87,7 @@ func TestOrdinaryCodexV0SelectedReauth(t *testing.T) {
 		{"auth_name=..%2Fselected.json", "invalid auth_name", 400},
 		{"auth_name=renamed-away.json", "auth file not found", 404},
 		{"auth_name=wrong-provider.json", "provider does not match", 400},
+		{"auth_name=invalid-route.json", "invalid proxy_url", 400},
 	} {
 		resp := get("/codex-auth-url?" + caseResult.query)
 		if resp.Code != caseResult.status || !strings.Contains(resp.Body.String(), caseResult.errorText) || strings.Contains(resp.Body.String(), "\"state\"") {
@@ -196,6 +209,9 @@ func TestOrdinaryCodexV0SelectedReauth(t *testing.T) {
 		}
 	}
 	h.SetPostAuthHook(nil)
+	if len(routes) != 5 || routes[0] != "http://corp-proxy.example.test:8000" || routes[1] != "direct" || h.cfg.ProxyURL != "" {
+		t.Fatal("OAuth did not keep the selected network route isolated")
+	}
 	if starts != 5 {
 		t.Fatalf("unexpected OAuth starts: %d", starts)
 	}

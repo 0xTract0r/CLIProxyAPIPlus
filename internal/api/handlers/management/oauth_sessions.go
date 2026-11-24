@@ -822,6 +822,9 @@ func writeOAuthCallbackFile(authDir, canonicalProvider, state, code, errorMessag
 		}
 	}()
 	_, errWrite := tmp.Write(data)
+	if errWrite == nil {
+		errWrite = tmp.Sync()
+	}
 	errClose := tmp.Close()
 	if errWrite != nil {
 		return "", fmt.Errorf("write oauth callback file: %w", errWrite)
@@ -833,6 +836,23 @@ func writeOAuthCallbackFile(authDir, canonicalProvider, state, code, errorMessag
 		return "", fmt.Errorf("publish oauth callback file: %w", errRename)
 	}
 	return filePath, nil
+}
+
+// readOAuthCallbackFile consumes a complete object only. Older writers may
+// publish the filename before the JSON write is finished.
+func readOAuthCallbackFile(path string) (map[string]string, bool) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, false
+	}
+	var payload map[string]string
+	if err := json.Unmarshal(data, &payload); err != nil || payload == nil {
+		return nil, false
+	}
+	if err := os.Remove(path); err != nil {
+		return nil, false
+	}
+	return payload, true
 }
 
 // RegisterFileOAuthSession binds a standard file callback to the accepted auth directory.

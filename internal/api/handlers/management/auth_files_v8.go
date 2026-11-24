@@ -2,6 +2,7 @@ package management
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -84,6 +85,35 @@ func oauthSessionExtraMetadataFromContext(c *gin.Context) map[string]any {
 	}
 	meta, _ := val.(map[string]any)
 	return cloneOAuthSessionMetadata(meta)
+}
+
+// bindSelectedOAuthRoute applies the selected credential's operator-configured
+// network route. Reauthentication must not send the grant through a different
+// route from the one the credential owner selected.
+func bindSelectedOAuthRoute(c *gin.Context, target *coreauth.Auth) error {
+	route := strings.TrimSpace(target.ProxyURL)
+	if route == "" {
+		if saved, ok := target.Metadata["proxy_url"].(string); ok {
+			route = strings.TrimSpace(saved)
+		}
+	}
+	if route == "" {
+		return nil
+	}
+	setting, err := proxyutil.Parse(route)
+	if err != nil {
+		return errors.New("invalid proxy_url on selected credential")
+	}
+	if setting.Mode == proxyutil.ModeDirect {
+		route = "direct"
+	} else if _, err = validateOAuthSessionProxyURL(route); err != nil {
+		return errors.New("invalid proxy_url on selected credential")
+	}
+	if override := oauthSessionProxyURLFromContext(c); override != "" && route != override {
+		return errors.New("selected credential proxy_url does not match the requested route")
+	}
+	c.Set(oauthSessionProxyURLContextKey, route)
+	return nil
 }
 
 func validateOAuthSessionProxyURL(raw string) (string, error) {
@@ -386,6 +416,10 @@ func (h *Handler) StartOAuthV8(c *gin.Context) {
 		}
 		if provider != "" && !h.oauthTargetAuthMatches(effectiveTargetAuth, provider) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "provider does not match target credential"})
+			return
+		}
+		if err := bindSelectedOAuthRoute(c, effectiveTargetAuth); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
 		targetEmail, targetAccountID := authIdentityEmailAndAccountID(effectiveTargetAuth)
