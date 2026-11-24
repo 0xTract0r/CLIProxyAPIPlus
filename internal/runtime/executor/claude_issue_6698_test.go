@@ -40,7 +40,7 @@ func TestClaudeExecutor_Sonnet55ThinkingOffSendsBetweenTools(t *testing.T) {
 				}
 				t.Run(name, func(t *testing.T) {
 					var upstreamBody []byte
-					transport := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+					transport := ordinaryClaudeTestRoundTripper(func(req *http.Request) (*http.Response, error) {
 						upstreamBody, _ = io.ReadAll(req.Body)
 						contentType := "application/json"
 						body := `{"id":"msg_test","type":"message","role":"assistant","model":"claude-sonnet-5-5","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`
@@ -98,7 +98,7 @@ func TestClaudeExecutor_AdaptiveOnlyThinkingOffKeepsThinkingHidden(t *testing.T)
 		for _, source := range sources {
 			t.Run(model+" "+source.name, func(t *testing.T) {
 				var upstreamBody []byte
-				transport := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				transport := ordinaryClaudeTestRoundTripper(func(req *http.Request) (*http.Response, error) {
 					upstreamBody, _ = io.ReadAll(req.Body)
 					contentType := "application/json"
 					body := `{"id":"msg_test","type":"message","role":"assistant","model":"claude-opus-5-5","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`
@@ -135,7 +135,7 @@ func TestClaudeExecutor_AdaptiveOnlyGeminiBudgetAndAuto(t *testing.T) {
 	for _, model := range []string{"claude-opus-4-7", "claude-opus-4-8", "claude-fable-5", "claude-fable-5-1"} {
 		t.Run(model+" gemini budget 64000 maps to max", func(t *testing.T) {
 			var upstreamBody []byte
-			transport := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			transport := ordinaryClaudeTestRoundTripper(func(req *http.Request) (*http.Response, error) {
 				upstreamBody, _ = io.ReadAll(req.Body)
 				return &http.Response{
 					StatusCode: http.StatusOK,
@@ -165,7 +165,7 @@ func TestClaudeExecutor_AdaptiveOnlyGeminiBudgetAndAuto(t *testing.T) {
 
 		t.Run(model+" gemini auto budget -1 stays plain adaptive", func(t *testing.T) {
 			var upstreamBody []byte
-			transport := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			transport := ordinaryClaudeTestRoundTripper(func(req *http.Request) (*http.Response, error) {
 				upstreamBody, _ = io.ReadAll(req.Body)
 				return &http.Response{
 					StatusCode: http.StatusOK,

@@ -95,28 +95,46 @@ func TestPayloadBarrierCodexImageFilter(t *testing.T) {
 	}
 }
 
+// Capture the request prepared for the one configured origin. Each call starts
+// from the original payload so repeated preparation must apply each rule once.
+func captureOrdinaryAntigravityPayload(t *testing.T, cfg *config.Config, model string, raw []byte, stream bool) []byte {
+	t.Helper()
+	auth := &cliproxyauth.Auth{ID: "payload-fixture", Provider: "antigravity",
+		Attributes: map[string]string{"base_url": "https://fixture.invalid"},
+		Metadata:   map[string]any{"project_id": "project-fixture", "access_token": "test-token"}}
+	var wire []byte
+	ctx := context.WithValue(t.Context(), "cliproxy.roundtripper", ordinaryAntigravityRT(func(r *http.Request) (*http.Response, error) {
+		var err error
+		wire, err = io.ReadAll(r.Body)
+		if err != nil {
+			return nil, err
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: http.NoBody, Request: r}, nil
+	}))
+	path := antigravityGeneratePath
+	if stream {
+		path = antigravityStreamPath
+	}
+	resp, _, err := NewAntigravityExecutor(cfg).ordinaryAntigravitySend(ctx, auth,
+		cliproxyexecutor.Request{Model: model, Payload: raw},
+		cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("antigravity")}, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := resp.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return wire
+}
+
 func TestPayloadBarrierAntigravityRebuiltAttempts(t *testing.T) {
 	cfg := &config.Config{Payload: config.PayloadConfig{
 		Override: []config.PayloadRule{{Models: []config.PayloadModelRule{{Name: "gemini-*"}}, Params: map[string]any{"generationConfig.maxOutputTokens": 123, "toolConfig.functionCallingConfig.mode": "CUSTOM"}}},
 		Filter:   []config.PayloadFilterRule{{Models: []config.PayloadModelRule{{Name: "gemini-*"}}, Params: []string{"sessionId", "contents.0"}}},
 	}}
-	req := cliproxyexecutor.Request{Model: "gemini-3.1-pro-preview"}
-	body := []byte(`{"request":{"contents":[{"role":"user","parts":[{"text":"first"}]},{"role":"user","parts":[{"text":"second"}]}]}}`)
-	ctx := helps.WithPayloadFinalizer(context.Background(), helps.NewPayloadFinalizer(cfg, "antigravity", req.Model, "antigravity", "request", body, req, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatGemini}))
-	executor := NewAntigravityExecutor(cfg)
-	auth := &cliproxyauth.Auth{Metadata: map[string]any{"project_id": "project-test"}}
-	for attempt := 0; attempt < 2; attempt++ {
-		request, errBuild := executor.buildRequest(ctx, auth, "token", req.Model, body, attempt == 1, "", "https://example.invalid", "injected-session")
-		if errBuild != nil {
-			t.Fatal(errBuild)
-		}
-		wire, errRead := io.ReadAll(request.Body)
-		if errRead != nil {
-			t.Fatal(errRead)
-		}
-		if errClose := request.Body.Close(); errClose != nil {
-			t.Fatal(errClose)
-		}
+	body := []byte(`{"request":{"sessionId":"fixture","contents":[{"role":"user","parts":[{"text":"first"}]},{"role":"user","parts":[{"text":"second"}]}]}}`)
+	for _, stream := range []bool{false, true} {
+		wire := captureOrdinaryAntigravityPayload(t, cfg, "gemini-3.1-pro-preview", body, stream)
 		if ojson.GetBytes(wire, "request.generationConfig.maxOutputTokens").Int() != 123 {
 			t.Fatalf("built-in cleanup undid override: %s", wire)
 		}
@@ -219,8 +237,18 @@ func TestPayloadBarrierEffectiveServiceTierUsageAfterOverride(t *testing.T) {
 	}
 
 	t.Run("codex oauth chat completions override", func(t *testing.T) {
-		var captured capturedCodexRequest
-		server := newCodexRoutingHintServer(t, &captured)
+		capturedTier := make(chan string, 1)
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Error(err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			capturedTier <- ojson.GetBytes(body, "service_tier").String()
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, "data: "+`{"type":"response.completed","response":{"id":"fixture","status":"completed","service_tier":"default","output":[],"usage":{"input_tokens":1,"output_tokens":1}}}`+"\n\n")
+		}))
 		defer server.Close()
 
 		for _, stream := range []bool{false, true} {
@@ -258,8 +286,8 @@ func TestPayloadBarrierEffectiveServiceTierUsageAfterOverride(t *testing.T) {
 					t.Fatalf("Execute error: %v", errExec)
 				}
 
-				if captured.serviceTier.String() != "priority" {
-					t.Fatalf("upstream body service_tier = %q, want priority", captured.serviceTier.String())
+				if tier := <-capturedTier; tier != "priority" {
+					t.Fatalf("upstream body service_tier = %q, want priority", tier)
 				}
 				record := <-plugin.records
 				if record.ServiceTier != "auto" || record.EffectiveServiceTier != "priority" || record.ResponseServiceTier != "default" {
@@ -296,6 +324,7 @@ func TestPayloadBarrierEffectiveServiceTierUsageAfterOverride(t *testing.T) {
 
 				auth := &cliproxyauth.Auth{
 					ID:         authID,
+					ProxyURL:   "direct",
 					Provider:   "openai-compatibility",
 					Attributes: map[string]string{"base_url": server.URL, "api_key": "sk-test"},
 				}
@@ -361,6 +390,7 @@ func TestPayloadBarrierEffectiveServiceTierUsageAfterOverride(t *testing.T) {
 
 				auth := &cliproxyauth.Auth{
 					ID:         authID,
+					ProxyURL:   "direct",
 					Provider:   "xai",
 					Attributes: map[string]string{"base_url": server.URL},
 					Metadata:   map[string]any{"access_token": "xai-token"},
@@ -413,6 +443,7 @@ func TestPayloadBarrierEffectiveServiceTierUsageAfterOverride(t *testing.T) {
 
 				auth := &cliproxyauth.Auth{
 					ID:         authID,
+					ProxyURL:   "direct",
 					Provider:   "devin",
 					Attributes: map[string]string{"api_key": "test-key", "base_url": server.URL},
 				}
@@ -477,17 +508,14 @@ func TestPayloadBarrierMultiExecutorSingleDocConsistency(t *testing.T) {
 		},
 	}
 
-	t.Run("codex cacheHelperDoc applies FinalizePayloadDoc as final barrier", func(t *testing.T) {
+	t.Run("codex ordinary request applies payload rules once", func(t *testing.T) {
 		exec := NewCodexExecutor(cfg)
 		raw := []byte(`{"model":"gpt-5","filtered_out":"drop_me","input":[{"type":"message","role":"user","id":"item_1","content":[{"type":"input_text","text":"hi"}]}]}`)
 		req := cliproxyexecutor.Request{Model: "gpt-5", Payload: raw}
 		opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse}
-		reqCtx := helps.WithPayloadFinalizer(ctx, helps.NewPayloadFinalizer(cfg, exec.Identifier(), "gpt-5", "codex", "", raw, req, opts))
-
-		doc := ojson.NewDoc(bytes.Clone(raw))
-		_, out, errCache := exec.cacheHelperDoc(reqCtx, opts.SourceFormat, "https://chatgpt.com/backend-api/codex/responses", req, doc, nil, opts.Headers)
-		if errCache != nil {
-			t.Fatalf("cacheHelperDoc error: %v", errCache)
+		out, err := exec.prepareOrdinaryCodexBody(ctx, &cliproxyauth.Auth{ID: "payload-fixture"}, req, opts, true, false)
+		if err != nil {
+			t.Fatal(err)
 		}
 		if got := ojson.GetBytesNoCopy(out, "custom_override").String(); got != "barrier_won" {
 			t.Fatalf("custom_override = %q, want barrier_won", got)

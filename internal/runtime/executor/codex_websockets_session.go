@@ -864,7 +864,10 @@ func (e *CodexWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession, 
 	}
 	for {
 		_ = conn.SetReadDeadline(time.Now().Add(codexResponsesWebsocketIdleTimeout))
+		readStarted := time.Now()
 		msgType, payload, errRead := conn.ReadMessage()
+		arrival := time.Now()
+		readDuration := arrival.Sub(readStarted)
 		if errRead != nil {
 			sess.connMu.Lock()
 			recoverTransport := sess.recoverTransport
@@ -885,7 +888,7 @@ func (e *CodexWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession, 
 			}
 			ch, done := sess.activeForConn(conn)
 			if ch != nil {
-				invalidated = sendTerminalWebsocketRead(ch, done, codexWebsocketRead{conn: conn, err: errRead}, invalidate)
+				invalidated = sendTerminalWebsocketRead(ch, done, codexWebsocketRead{conn: conn, err: errRead, arrival: arrival, readDuration: readDuration}, invalidate)
 				if sess.clearActive(conn, ch) {
 					close(ch)
 				}
@@ -906,7 +909,7 @@ func (e *CodexWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession, 
 				invalidated := false
 				ch, done := sess.activeForConn(conn)
 				if ch != nil {
-					invalidated = sendTerminalWebsocketRead(ch, done, codexWebsocketRead{conn: conn, err: errBinary}, invalidate)
+					invalidated = sendTerminalWebsocketRead(ch, done, codexWebsocketRead{conn: conn, err: errBinary, arrival: arrival, readDuration: readDuration}, invalidate)
 					if sess.clearActive(conn, ch) {
 						close(ch)
 					}
@@ -980,7 +983,7 @@ func (e *CodexWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession, 
 			continue
 		}
 		select {
-		case ch <- codexWebsocketRead{conn: conn, msgType: msgType, payload: payload}:
+		case ch <- codexWebsocketRead{conn: conn, msgType: msgType, payload: payload, arrival: arrival, readDuration: readDuration}:
 		case <-done:
 		}
 	}

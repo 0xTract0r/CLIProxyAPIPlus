@@ -18,6 +18,7 @@ import (
 )
 
 func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	ctx = pinOrdinaryClaudeToolSearch(ctx, opts.SourceFormat)
 	if err := expandClaudeResponsesCompaction(&req, &opts); err != nil {
 		return cliproxyexecutor.Response{}, statusErr{code: http.StatusBadRequest, msg: err.Error(), requestScoped: true}
 	}
@@ -147,12 +148,12 @@ func readOrdinaryClaudeResponse(resp *http.Response, maxBytes int64) ([]byte, er
 	decoded, err := decodeResponseBody(resp.Body, claudeResponseContentEncoding(resp.Header))
 	if err != nil {
 		_ = resp.Body.Close()
-		return nil, err
+		return nil, ordinaryClaudeResponseReadError(err, "invalid Claude response encoding")
 	}
 	defer decoded.Close()
 	payload, err := io.ReadAll(io.LimitReader(decoded, maxBytes+1))
 	if err != nil {
-		return nil, err
+		return nil, ordinaryClaudeResponseReadError(err, "could not read Claude response")
 	}
 	if int64(len(payload)) > maxBytes {
 		return nil, statusErr{code: http.StatusBadGateway, msg: "oversized Claude response"}

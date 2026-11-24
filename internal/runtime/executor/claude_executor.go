@@ -94,6 +94,15 @@ func (e *ClaudeExecutor) supportsNativeToolSearch(toolSearch bool, auth *cliprox
 	return entry != nil && entry.NativeToolSearch
 }
 
+// Pin the public tool-search setting for the request and its response translation.
+// A reload may occur while the HTTP round trip is in progress.
+func pinOrdinaryClaudeToolSearch(ctx context.Context, source sdktranslator.Format) context.Context {
+	if source != sdktranslator.FormatOpenAIResponse {
+		return ctx
+	}
+	return responsesclaude.WithClientToolSearch(ctx, responsesclaude.ClientToolSearchEnabledFor(ctx))
+}
+
 func (e *ClaudeExecutor) applyNativeToolSearchFallback(ctx context.Context, auth *cliproxyauth.Auth, from sdktranslator.Format, upstreamModel string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (context.Context, cliproxyexecutor.Request, cliproxyexecutor.Options) {
 	if from != sdktranslator.FormatOpenAIResponse {
 		return ctx, req, opts

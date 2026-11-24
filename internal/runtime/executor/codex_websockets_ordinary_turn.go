@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/MoeForge/moego/ojson"
 	"github.com/gorilla/websocket"
@@ -28,6 +29,7 @@ type ordinaryCodexWebsocketTurn struct {
 	headers    http.Header
 	ephemeral  bool
 	reporter   *helps.UsageReporter
+	stages     *helps.CodexStreamStages
 }
 
 func ordinaryWebsocketScope(tenant, authID, token, grant, base, route string) string {
@@ -164,6 +166,10 @@ func (e *CodexWebsocketsExecutor) startOrdinaryCodexWebsocket(ctx context.Contex
 	}
 	turn := &ordinaryCodexWebsocketTurn{session: sess, connection: conn, read: ch, release: release, body: prepared.clientBody, prepared: prepared, headers: headers, ephemeral: ephemeral,
 		reporter: helps.NewExecutorUsageReporter(ctx, e.CodexExecutor, model, auth)}
+	turn.reporter.SetTranslatedRequestMetadata(prepared.clientBody, "codex")
+	turn.reporter.SetWebsocketTelemetry()
+	turn.reporter.UseDecodedContentTelemetry()
+	turn.reporter.StartResponseTTFT()
 	cliproxyexecutor.MarkUpstreamAttempt(ctx)
 	// A structured request is sent at most once, even when the peer rejects it.
 	wire := prepared.clientBody
@@ -192,6 +198,7 @@ func (e *CodexWebsocketsExecutor) finishOrdinaryCodexWebsocket(turn *ordinaryCod
 }
 
 func nextOrdinaryCodexWebsocketPayload(ctx context.Context, turn *ordinaryCodexWebsocketTurn) ([]byte, error) {
+	waitStarted := time.Now()
 	for {
 		select {
 		case <-ctx.Done():
@@ -203,6 +210,7 @@ func nextOrdinaryCodexWebsocketPayload(ctx context.Context, turn *ordinaryCodexW
 			if read.conn != turn.connection {
 				continue
 			}
+			turn.stages.ObserveRead(waitStarted, read.arrival, read.readDuration, read.err != nil)
 			if read.err != nil {
 				return nil, read.err
 			}

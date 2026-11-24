@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -33,7 +34,16 @@ func scopeOrdinaryClaudeStreamCancellation(err error) error {
 	return err
 }
 
+// Keep cancellation in the error chain while exposing a stable HTTP error for malformed upstream bodies.
+func ordinaryClaudeResponseReadError(err error, message string) error {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
+	return statusErr{code: http.StatusBadGateway, msg: message}
+}
+
 func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
+	ctx = pinOrdinaryClaudeToolSearch(ctx, opts.SourceFormat)
 	defer func() { err = scopeOrdinaryClaudeStreamCancellation(err) }()
 	if err := expandClaudeResponsesCompaction(&req, &opts); err != nil {
 		return nil, statusErr{code: http.StatusBadRequest, msg: err.Error()}
@@ -51,6 +61,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	}
 
 	reporter := helps.NewExecutorUsageReporter(ctx, e, baseModel, auth)
+	reporter.UseDecodedContentTelemetry()
 	defer reporter.TrackFailure(ctx, &err)
 	if upstreamModel != baseModel {
 		reporter.SetUpstreamModel(upstreamModel)
@@ -67,7 +78,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	decoded, err := decodeResponseBody(resp.Body, claudeResponseContentEncoding(resp.Header))
 	if err != nil {
 		_ = resp.Body.Close()
-		return nil, err
+		return nil, ordinaryClaudeResponseReadError(err, "invalid Claude response encoding")
 	}
 
 	out := make(chan cliproxyexecutor.StreamChunk, 1)
@@ -135,6 +146,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				}
 				done = done || typ == "message_stop"
 				usage.ObserveClaudeStream(line)
+				reporter.ObserveContentEvent(payload)
 				helps.ObserveClaudeTokenEvent(reporter, payload)
 				reporter.ObserveResponseModel(line)
 				line = e.restoreResponseModel(line, req.Model)
@@ -219,6 +231,7 @@ func (e *ClaudeExecutor) prepareOrdinaryClaudeMessages(ctx context.Context, auth
 		return nil, err
 	}
 	ensureModelMaxTokensDoc(doc, baseModel)
+	sanitizeClaudeAdvisorToolModelsDoc(doc)
 	disableThinkingIfToolChoiceForcedDoc(doc)
 	helps.ApplyPayloadConfigWithTrackedPathsDoc(
 		e.cfg, baseModel, claude.String(), from.String(), "", doc,
@@ -255,6 +268,37 @@ func (e *ClaudeExecutor) prepareOrdinaryClaudeMessages(ctx context.Context, auth
 	helps.SetBoolIfDifferentDoc(doc, "stream", stream)
 	return doc.Bytes(), nil
 
+}
+
+// Normalize proxy-only model suffixes on provider-native advisor declarations.
+// Operator payload rules still run last, and ordinary tool fields stay untouched.
+func sanitizeClaudeAdvisorToolModelsDoc(doc *ojson.Doc) bool {
+	if doc == nil {
+		return false
+	}
+	changed := false
+	for i, tool := range doc.Get("tools").Array() {
+		if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(tool.Get("type").String())), "advisor_") {
+			continue
+		}
+		model := tool.Get("model")
+		if model.Type != ojson.String {
+			continue
+		}
+		original := model.String()
+		trimmed := strings.TrimSpace(original)
+		if trimmed == "" {
+			continue
+		}
+		base := strings.TrimSpace(thinking.ParseSuffix(trimmed).ModelName)
+		if base == "" || base == original {
+			continue
+		}
+		if doc.Set("tools."+strconv.Itoa(i)+".model", base) == nil {
+			changed = true
+		}
+	}
+	return changed
 }
 
 func ordinaryClaudeHTTPError(resp *http.Response) error {

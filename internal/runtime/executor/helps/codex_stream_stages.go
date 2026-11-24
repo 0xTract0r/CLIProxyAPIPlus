@@ -38,6 +38,8 @@ type CodexStreamStageSnapshot struct {
 	WireRead, ConsumerWait, ConsumeLag, Timeline, Send, Write, Flush StreamStageDuration
 	Elapsed                                                          time.Duration
 	Outcome, TimelineStorage                                         string
+	FirstVisible                                                     time.Duration
+	FirstVisibleObserved                                             bool
 }
 
 // CodexStreamStages is request-local diagnostics, separate from serving usage.
@@ -140,6 +142,19 @@ func (s *CodexStreamStages) ObserveRead(waitStarted, arrival time.Time, wireRead
 	}
 }
 
+// ObserveFirstVisible records timing only, without retaining output content.
+func (s *CodexStreamStages) ObserveFirstVisible() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.running != 0 && !s.snapshot.FirstVisibleObserved {
+		s.snapshot.FirstVisibleObserved = true
+		s.snapshot.FirstVisible = time.Since(s.started)
+	}
+}
+
 func (s *CodexStreamStages) ObserveTimeline(started time.Time) {
 	if s != nil {
 		s.mu.Lock()
@@ -235,5 +250,5 @@ func (s *CodexStreamStages) emitIfFinished() {
 	v := s.snapshot
 	s.mu.Unlock()
 	ms := func(d time.Duration) float64 { return float64(d) / float64(time.Millisecond) }
-	s.logger.Infof("codex stream stages outcome=%s timeline_storage=%s main_attempts=%d frames=%d elapsed_main_ms=%.3f wire_read_count=%d wire_read_sum_ms=%.3f wire_read_max_ms=%.3f consumer_wait_sum_ms=%.3f consume_lag_count=%d consume_lag_max_ms=%.3f timeline_count=%d timeline_sum_ms=%.3f timeline_max_ms=%.3f send_count=%d send_sum_ms=%.3f send_max_ms=%.3f write_count=%d write_sum_ms=%.3f write_max_ms=%.3f flush_count=%d flush_sum_ms=%.3f flush_max_ms=%.3f upstream_ping_sent=%d upstream_ping_received=%d upstream_pong_received=%d ping_write_errors=%d upstream_data_idle_ms=%.3f upstream_control_idle_ms=%.3f downstream_flush_idle_ms=%.3f keepalive_count=%d terminal_error_attempts=%d downstream_canceled=%t", v.Outcome, v.TimelineStorage, v.MainAttempts, v.Frames, ms(v.Elapsed), v.WireRead.Count, ms(v.WireRead.Total), ms(v.WireRead.Max), ms(v.ConsumerWait.Total), v.ConsumeLag.Count, ms(v.ConsumeLag.Max), v.Timeline.Count, ms(v.Timeline.Total), ms(v.Timeline.Max), v.Send.Count, ms(v.Send.Total), ms(v.Send.Max), v.Write.Count, ms(v.Write.Total), ms(v.Write.Max), v.Flush.Count, ms(v.Flush.Total), ms(v.Flush.Max), v.Liveness.PingSent, v.Liveness.PingReceived, v.Liveness.PongReceived, v.Liveness.PingWriteErrors, ms(v.Liveness.UpstreamDataIdle), ms(v.Liveness.UpstreamControlIdle), ms(v.Liveness.DownstreamFlushIdle), v.Liveness.KeepAlives, v.Liveness.TerminalErrorAttempts, v.Liveness.DownstreamCanceled)
+	s.logger.Infof("codex stream stages outcome=%s timeline_storage=%s main_attempts=%d frames=%d elapsed_main_ms=%.3f wire_read_count=%d wire_read_sum_ms=%.3f wire_read_max_ms=%.3f consumer_wait_sum_ms=%.3f consume_lag_count=%d consume_lag_max_ms=%.3f timeline_count=%d timeline_sum_ms=%.3f timeline_max_ms=%.3f send_count=%d send_sum_ms=%.3f send_max_ms=%.3f write_count=%d write_sum_ms=%.3f write_max_ms=%.3f flush_count=%d flush_sum_ms=%.3f flush_max_ms=%.3f upstream_ping_sent=%d upstream_ping_received=%d upstream_pong_received=%d ping_write_errors=%d upstream_data_idle_ms=%.3f upstream_control_idle_ms=%.3f downstream_flush_idle_ms=%.3f keepalive_count=%d terminal_error_attempts=%d downstream_canceled=%t first_visible_observed=%t first_visible_ms=%.3f", v.Outcome, v.TimelineStorage, v.MainAttempts, v.Frames, ms(v.Elapsed), v.WireRead.Count, ms(v.WireRead.Total), ms(v.WireRead.Max), ms(v.ConsumerWait.Total), v.ConsumeLag.Count, ms(v.ConsumeLag.Max), v.Timeline.Count, ms(v.Timeline.Total), ms(v.Timeline.Max), v.Send.Count, ms(v.Send.Total), ms(v.Send.Max), v.Write.Count, ms(v.Write.Total), ms(v.Write.Max), v.Flush.Count, ms(v.Flush.Total), ms(v.Flush.Max), v.Liveness.PingSent, v.Liveness.PingReceived, v.Liveness.PongReceived, v.Liveness.PingWriteErrors, ms(v.Liveness.UpstreamDataIdle), ms(v.Liveness.UpstreamControlIdle), ms(v.Liveness.DownstreamFlushIdle), v.Liveness.KeepAlives, v.Liveness.TerminalErrorAttempts, v.Liveness.DownstreamCanceled, v.FirstVisibleObserved, ms(v.FirstVisible))
 }

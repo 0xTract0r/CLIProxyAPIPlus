@@ -310,6 +310,8 @@ func (e *CodexExecutor) sendOrdinaryCodex(ctx context.Context, auth *cliproxyaut
 		return nil, nil, err
 	}
 
+	reporter.SetTranslatedRequestMetadata(body, "codex")
+
 	_, base := ordinaryCodexImageCredential(auth)
 	origin, err := ordinaryCodexOrigin(base)
 	if err != nil {
@@ -375,6 +377,9 @@ func (e *CodexExecutor) sendOrdinaryCodex(ctx context.Context, auth *cliproxyaut
 		return nil, nil, statusErr{code: http.StatusBadGateway, msg: "invalid Codex response encoding", cause: err}
 	}
 	resp.Body = decoded
+	resp.Header.Del("Content-Encoding")
+	resp.Header.Del("Content-Length")
+	resp.ContentLength = -1
 	return resp, body, nil
 }
 

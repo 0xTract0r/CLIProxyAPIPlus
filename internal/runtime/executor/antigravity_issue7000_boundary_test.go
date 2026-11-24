@@ -1,21 +1,15 @@
 package executor
 
 import (
-	"context"
+	"errors"
 	"fmt"
-	"io"
 	"net/http"
-	"net/http/httptest"
 	"reflect"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/MoeForge/moego/json"
 	"github.com/MoeForge/moego/ojson"
-	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 )
 
@@ -64,11 +58,22 @@ func TestIssue7000AntigravityAliasesPreserveOtherFieldsAndToolChoice(t *testing.
 						setRaw("request."+systemKey, payloadDoc.Get("request.systemInstruction").Raw)
 						_ = payloadDoc.Delete("request.systemInstruction")
 					}
-					payload := payloadDoc.Bytes()
-					body := buildRequestBodyFromRawPayload(t, "claude-opus-5-5-high", payload)
-					encoded, errMarshal := json.Marshal(body)
-					if errMarshal != nil {
-						t.Fatal(errMarshal)
+					payload := append([]byte(nil), payloadDoc.Bytes()...)
+					var encoded []byte
+					if mode == "ANY" || mode == "VALIDATED" {
+						body, err := captureOrdinaryStructuredRequestWithOriginal(t, "claude-opus-5-5-high", payload, nil, sdktranslator.FormatAntigravity)
+						var status statusErr
+						if len(body) != 0 || !errors.As(err, &status) || status.StatusCode() != http.StatusBadRequest || !strings.Contains(status.Error(), "required tool choice") {
+							t.Fatalf("explicit mode %s: request was sent or unsupported combination was unclear: %v", mode, err)
+						}
+						// Only the effective request carries this adapter-generated mode.
+						_ = payloadDoc.Delete(toolPath)
+						encoded, err = captureOrdinaryStructuredRequestWithOriginal(t, "claude-opus-5-5-high", payload, payloadDoc.Bytes(), sdktranslator.FormatAntigravity)
+						if err != nil || len(encoded) == 0 {
+							t.Fatalf("adapter-generated mode was rejected: %v", err)
+						}
+					} else {
+						encoded = captureOrdinaryStructuredRequest(t, "claude-opus-5-5-high", payload, sdktranslator.FormatAntigravity)
 					}
 					request := ojson.GetBytes(encoded, "request")
 					assertIssue7000PromptSchema(t, request.Get(systemKey), issue7000LiteralSchema)
@@ -130,11 +135,7 @@ func TestIssue7000AntigravityModelAndPlainRequestBoundaries(t *testing.T) {
 	} {
 		t.Run(tc.model, func(t *testing.T) {
 			payload := []byte(`{"request":{"generationConfig":{"responseSchema":{"type":"object","properties":{"title":{"type":"string"}}},"responseMimeType":"application/json"}}}`)
-			body := buildRequestBodyFromRawPayload(t, tc.model, payload)
-			encoded, errMarshal := json.Marshal(body)
-			if errMarshal != nil {
-				t.Fatal(errMarshal)
-			}
+			encoded := captureOrdinaryStructuredRequest(t, tc.model, payload, sdktranslator.FormatAntigravity)
 			if got := ojson.GetBytes(encoded, "request.generationConfig.responseSchema").Exists(); got == tc.convert {
 				t.Errorf("native schema presence = %t, conversion = %t", got, tc.convert)
 			}
@@ -149,128 +150,33 @@ func TestIssue7000AntigravityModelAndPlainRequestBoundaries(t *testing.T) {
 	for _, configJSON := range []string{`{"temperature":0.4}`, `{"responseMimeType":"text/plain"}`} {
 		t.Run("plain/"+configJSON, func(t *testing.T) {
 			payload := []byte(`{"request":{"generationConfig":` + configJSON + `,"systemInstruction":{"parts":[{"text":"unchanged"}]},"toolConfig":{"functionCallingConfig":{"mode":"ANY","allowedFunctionNames":["lookup"]}}}}`)
-			body := buildRequestBodyFromRawPayload(t, "claude-opus-5-5-high", payload)
-			encoded, errMarshal := json.Marshal(body)
-			if errMarshal != nil {
-				t.Fatal(errMarshal)
-			}
+			encoded := captureOrdinaryStructuredRequest(t, "claude-opus-5-5-high", payload, sdktranslator.FormatAntigravity)
 			if got := ojson.GetBytes(encoded, "request.systemInstruction.parts.#").Int(); got != 1 {
 				t.Errorf("plain request gained instructions: %s", encoded)
 			}
-			if got := ojson.GetBytes(encoded, "request.toolConfig.functionCallingConfig.mode").String(); got != "VALIDATED" {
-				t.Errorf("unrelated legacy tool behavior changed: %q", got)
+			if got := ojson.GetBytes(encoded, "request.toolConfig.functionCallingConfig.mode").String(); got != "ANY" || ojson.GetBytes(encoded, "request.toolConfig.functionCallingConfig.allowedFunctionNames.0").String() != "lookup" {
+				t.Errorf("plain request lost its explicit tool selection: %q", got)
 			}
 		})
 	}
 }
 
-func TestIssue7000AntigravityExecutionAndFinalPayloadRules(t *testing.T) {
-	for _, format := range []sdktranslator.Format{sdktranslator.FormatOpenAI, sdktranslator.FormatOpenAIResponse} {
-		for _, operation := range []string{"execute", "stream", "count"} {
-			for _, rules := range []string{"none", "override", "filter"} {
-				t.Run(format.String()+"/"+operation+"/"+rules, func(t *testing.T) {
-					captured := make(chan []byte, 1)
-					server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-						body, errRead := io.ReadAll(r.Body)
-						if errRead != nil {
-							t.Error(errRead)
-							w.WriteHeader(http.StatusBadRequest)
-							return
-						}
-						captured <- body
-						if operation == "count" {
-							if r.URL.Path != antigravityCountTokensPath {
-								t.Errorf("count path = %q", r.URL.Path)
-							}
-							_, _ = w.Write([]byte(`{"totalTokens":17}`))
-							return
-						}
-						if r.URL.Path != antigravityStreamPath {
-							t.Errorf("Claude must use stream upstream, got %q", r.URL.Path)
-						}
-						w.Header().Set("Content-Type", "text/event-stream")
-						_, _ = fmt.Fprint(w, "data: {\"response\":{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"{}\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":17,\"candidatesTokenCount\":1,\"totalTokenCount\":18}}}\n\n")
-					}))
-					defer server.Close()
-					cfg := &config.Config{DisableCooling: true, Antigravity: config.AntigravityConfig{SensitiveWords: []string{"anthropic"}}}
-					models := []config.PayloadModelRule{{Name: "claude-*", Protocol: "antigravity"}}
-					switch rules {
-					case "override":
-						cfg.Payload.Override = []config.PayloadRule{{Models: models, Params: map[string]any{"systemInstruction": map[string]any{"parts": []any{map[string]any{"text": "configured anthropic"}}}, "toolConfig.functionCallingConfig.mode": "NONE", "generationConfig.responseMimeType": "configured/mime"}}}
-					case "filter":
-						cfg.Payload.Filter = []config.PayloadFilterRule{{Models: models, Params: []string{"systemInstruction", "toolConfig", "contents.0"}}}
-					}
-					model := "claude-opus-5-5-high"
-					payloadDoc := ojson.NewDoc([]byte(`{"model":"` + model + `","temperature":0.25,"tool_choice":"auto"}`))
-					if format == sdktranslator.FormatOpenAI {
-						_ = payloadDoc.SetRawBytes("messages", []byte(`[{"role":"system","content":"keep anthropic system"},{"role":"user","content":"first"},{"role":"assistant","content":"second"},{"role":"user","content":"third"}]`))
-						_ = payloadDoc.SetRawBytes("response_format", []byte(`{"type":"json_schema","json_schema":{"schema":`+issue7000LiteralSchema+`}}`))
-						_ = payloadDoc.SetRawBytes("tools", []byte(`[{"type":"function","function":{"name":"lookup","parameters":{"type":"object","properties":{"q":{"type":"string"}},"required":["q"]}}}]`))
-					} else {
-						model = "claude-sonnet-5-5-high"
-						_ = payloadDoc.Set("model", model)
-						_ = payloadDoc.Set("instructions", "keep anthropic system")
-						_ = payloadDoc.SetRawBytes("input", []byte(`[{"role":"user","content":"first"},{"role":"assistant","content":"second"},{"role":"user","content":"third"}]`))
-						_ = payloadDoc.SetRawBytes("text.format", []byte(`{"type":"json_schema","schema":`+issue7000LiteralSchema+`}`))
-						_ = payloadDoc.SetRawBytes("tools", []byte(`[{"type":"function","name":"lookup","parameters":{"type":"object","properties":{"q":{"type":"string"}},"required":["q"]}}]`))
-					}
-					payload := payloadDoc.Bytes()
-					exec := NewAntigravityExecutor(cfg)
-					auth := &cliproxyauth.Auth{ID: t.Name(), Provider: "antigravity", Attributes: map[string]string{"base_url": server.URL}, Metadata: map[string]any{"access_token": "token", "project_id": "project-test", "expired": time.Now().Add(time.Hour).Format(time.RFC3339)}}
-					req := cliproxyexecutor.Request{Model: model, Payload: payload}
-					opts := cliproxyexecutor.Options{SourceFormat: format}
-					switch operation {
-					case "execute":
-						if _, errExecute := exec.Execute(context.Background(), auth, req, opts); errExecute != nil {
-							t.Fatal(errExecute)
-						}
-					case "stream":
-						result, errStream := exec.ExecuteStream(context.Background(), auth, req, opts)
-						if errStream != nil {
-							t.Fatal(errStream)
-						}
-						for chunk := range result.Chunks {
-							if chunk.Err != nil {
-								t.Fatal(chunk.Err)
-							}
-						}
-					case "count":
-						if _, errCount := exec.CountTokens(context.Background(), auth, req, opts); errCount != nil {
-							t.Fatal(errCount)
-						}
-					}
-					body := <-captured
-					request := ojson.GetBytes(body, "request")
-					if got := request.Get("tools.0.functionDeclarations.0.name").String(); got != "lookup" {
-						t.Errorf("real tool lost: %s", body)
-					}
-					switch rules {
-					case "none":
-						assertIssue7000PromptSchema(t, request.Get("systemInstruction"), issue7000LiteralSchema)
-						if !strings.Contains(request.Get("systemInstruction.parts.0.text").String(), "a\u034fnthropic") {
-							t.Errorf("original system instruction was lost or not obfuscated: %s", body)
-						}
-						for _, key := range []string{"responseSchema", "responseMimeType"} {
-							if request.Get("generationConfig." + key).Exists() {
-								t.Errorf("native output trigger survived: %s", body)
-							}
-						}
-						if operation != "count" {
-							if mode := request.Get("toolConfig.functionCallingConfig.mode").String(); mode != "" && mode != "AUTO" {
-								t.Errorf("forced tool mode survived: %s", body)
-							}
-						}
-					case "override":
-						if request.Get("systemInstruction.parts.#").Int() != 1 || request.Get("systemInstruction.parts.0.text").String() != "configured anthropic" || request.Get("toolConfig.functionCallingConfig.mode").String() != "NONE" || request.Get("generationConfig.responseMimeType").String() != "configured/mime" {
-							t.Errorf("built-in logic changed final override: %s", body)
-						}
-					case "filter":
-						if request.Get("systemInstruction").Exists() || request.Get("toolConfig").Exists() || request.Get("contents.#").Int() != 2 {
-							t.Errorf("filter was undone or applied more than once: %s", body)
-						}
-					}
-				})
-			}
+func TestIssue7000AntigravityExplicitOpenAIAndClaudeToolChoices(t *testing.T) {
+	const model = "claude-opus-5-5-high"
+	t.Run("OpenAI required with structured output is not downgraded", func(t *testing.T) {
+		payload := []byte(`{"messages":[{"role":"user","content":"return a value"}],"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}],"tool_choice":"required","response_format":{"type":"json_schema","json_schema":{"name":"fixture","schema":{"type":"object"}}}}`)
+		body, err := captureOrdinaryStructuredRequestWithOriginal(t, model, payload, nil, sdktranslator.FormatOpenAI)
+		var status statusErr
+		if len(body) != 0 || !errors.As(err, &status) || status.StatusCode() != http.StatusBadRequest || !strings.Contains(status.Error(), "required tool choice") {
+			t.Fatalf("explicit tool choice must not be replaced by AUTO: sent=%v error=%v", len(body) != 0, err)
 		}
-	}
+	})
+	t.Run("Claude named tool without structured output retains the chosen name", func(t *testing.T) {
+		payload := []byte(`{"max_tokens":32,"messages":[{"role":"user","content":"return a value"}],"tools":[{"name":"lookup","input_schema":{"type":"object"}}],"tool_choice":{"type":"tool","name":"lookup"}}`)
+		body := captureOrdinaryStructuredRequest(t, model, payload, sdktranslator.FormatClaude)
+		choice := ojson.GetBytesNoCopy(body, "request.toolConfig.functionCallingConfig")
+		if choice.Get("mode").String() != "ANY" || choice.Get("allowedFunctionNames.0").String() != "lookup" {
+			t.Fatalf("plain request lost its explicit named tool: %s", choice.Raw)
+		}
+	})
 }

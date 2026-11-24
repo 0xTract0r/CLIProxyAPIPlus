@@ -7,6 +7,7 @@ import (
 	"io"
 	"maps"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -20,6 +21,7 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 	log "github.com/sirupsen/logrus"
+	"golang.org/x/net/http/httpguts"
 )
 
 const copilotRouteKey = "copilot_attempt_route"
@@ -77,8 +79,17 @@ func (*CopilotExecutor) RequestToFormat(_ cliproxyexecutor.Request, opts cliprox
 }
 
 func (e *CopilotExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if auth == nil {
 		return nil, statusErr{code: http.StatusUnauthorized, msg: "copilot: missing auth record"}
+	}
+	if auth.Disabled || auth.Status == cliproxyauth.StatusDisabled || auth.AutoQuarantined || auth.RefreshDisabled() {
+		return auth, nil
 	}
 	githubToken, _ := auth.Metadata["refresh_token"].(string)
 	if githubToken == "" {
@@ -132,6 +143,7 @@ func (e *CopilotExecutor) httpRequest(ctx context.Context, auth *cliproxyauth.Au
 	if req.Header == nil {
 		req.Header = make(http.Header)
 	}
+	applyCopilotConfiguredHeaders(req.Header, auth.Attributes)
 	req.Header.Set("Authorization", "Bearer "+token)
 	client := *helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
 	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
@@ -139,6 +151,31 @@ func (e *CopilotExecutor) httpRequest(ctx context.Context, auth *cliproxyauth.Au
 		return reporter.TrackHTTPClient(&client).Do(req)
 	}
 	return client.Do(req)
+}
+
+// Configured headers can carry ordinary preferences and application metadata
+// but cannot replace a caller header or the protocol, authority, or credential.
+func applyCopilotConfiguredHeaders(headers http.Header, attributes map[string]string) {
+	for _, key := range slices.Sorted(maps.Keys(attributes)) {
+		name, ok := strings.CutPrefix(key, "header:")
+		if !ok {
+			continue
+		}
+		name = strings.TrimSpace(name)
+		value := strings.TrimSpace(attributes[key])
+		if value == "" || strings.HasPrefix(value, "$") || !httpguts.ValidHeaderFieldName(name) || !httpguts.ValidHeaderFieldValue(value) || !validOrdinaryClaudeConfiguredHeader(name) || len(headers.Values(name)) > 0 {
+			continue
+		}
+		lower := strings.ToLower(name)
+		switch lower {
+		case "accept-language", "cache-control", "prefer", "x-request-id", "x-correlation-id", "x-trace-id":
+			headers.Set(name, value)
+		default:
+			if strings.HasPrefix(lower, "x-custom-") && !strings.Contains(lower, "route") && !strings.Contains(lower, "identity") {
+				headers.Set(name, value)
+			}
+		}
+	}
 }
 
 type copilotPreparedRequest struct {

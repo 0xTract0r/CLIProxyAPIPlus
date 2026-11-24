@@ -4,7 +4,7 @@ import (
 	"context"
 	"io"
 	"net/http"
-	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -32,42 +32,23 @@ func TestAntigravityStream_ClientDisconnectAfterTerminalChunkDoesNotReportFailur
 
 `
 
-	upstreamClosed := make(chan struct{})
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = io.WriteString(w, upstreamSSE)
-		if flusher, ok := w.(http.Flusher); ok {
-			flusher.Flush()
-		}
-		// Hold the upstream body open until downstream disconnects or test ends,
-		// reproducing upstream lag where body close / EOF happens after terminal event.
-		select {
-		case <-r.Context().Done():
-		case <-upstreamClosed:
-		}
-	}))
-	defer func() {
-		close(upstreamClosed)
-		server.Close()
-	}()
-
 	executor := NewAntigravityExecutor(&config.Config{
 		Antigravity:  config.AntigravityConfig{},
 		RequestRetry: 1,
 	})
 
 	deliveryCtx, finishDelivery := usage.WithStreamDelivery(context.Background())
-	ctx, cancel := context.WithCancel(deliveryCtx)
+	ctx, cancel := context.WithTimeout(deliveryCtx, 5*time.Second)
 	defer cancel()
 
-	result, errExecute := executor.ExecuteStream(ctx, &cliproxyauth.Auth{
+	result, errExecute := executor.ExecuteStream(ordinaryAntigravityTerminalContext(ctx, upstreamSSE), &cliproxyauth.Auth{
 		ID: authID,
 		Metadata: map[string]any{
 			"access_token": "token-123",
 			"expired":      time.Now().Add(24 * time.Hour).Format(time.RFC3339),
 			"project_id":   "project-1",
 		},
-		Attributes: map[string]string{"base_url": server.URL},
+		Attributes: map[string]string{"base_url": "https://fixture.invalid"},
 	}, cliproxyexecutor.Request{
 		Model:   "gemini-3.8-flash-high",
 		Payload: []byte(`{"model":"gemini-3.8-flash-high","input":"hello","stream":true}`),
@@ -126,39 +107,22 @@ func TestAntigravityStream_ClientDisconnectPlainContextAfterTerminalChunkDoesNot
 
 `
 
-	upstreamClosed := make(chan struct{})
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = io.WriteString(w, upstreamSSE)
-		if flusher, ok := w.(http.Flusher); ok {
-			flusher.Flush()
-		}
-		select {
-		case <-r.Context().Done():
-		case <-upstreamClosed:
-		}
-	}))
-	defer func() {
-		close(upstreamClosed)
-		server.Close()
-	}()
-
 	executor := NewAntigravityExecutor(&config.Config{
 		Antigravity:  config.AntigravityConfig{},
 		RequestRetry: 1,
 	})
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 
-	result, errExecute := executor.ExecuteStream(ctx, &cliproxyauth.Auth{
+	result, errExecute := executor.ExecuteStream(ordinaryAntigravityTerminalContext(ctx, upstreamSSE), &cliproxyauth.Auth{
 		ID: authID,
 		Metadata: map[string]any{
 			"access_token": "token-123",
 			"expired":      time.Now().Add(24 * time.Hour).Format(time.RFC3339),
 			"project_id":   "project-1",
 		},
-		Attributes: map[string]string{"base_url": server.URL},
+		Attributes: map[string]string{"base_url": "https://fixture.invalid"},
 	}, cliproxyexecutor.Request{
 		Model:   "gemini-3.8-flash-high",
 		Payload: []byte(`{"model":"gemini-3.8-flash-high","input":"hello","stream":true}`),
@@ -214,39 +178,22 @@ func TestAntigravityStream_OpenAIChatCompletions_ClientDisconnectAfterStopChunkD
 
 `
 
-	upstreamClosed := make(chan struct{})
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = io.WriteString(w, upstreamSSE)
-		if flusher, ok := w.(http.Flusher); ok {
-			flusher.Flush()
-		}
-		select {
-		case <-r.Context().Done():
-		case <-upstreamClosed:
-		}
-	}))
-	defer func() {
-		close(upstreamClosed)
-		server.Close()
-	}()
-
 	executor := NewAntigravityExecutor(&config.Config{
 		Antigravity:  config.AntigravityConfig{},
 		RequestRetry: 1,
 	})
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 
-	result, errExecute := executor.ExecuteStream(ctx, &cliproxyauth.Auth{
+	result, errExecute := executor.ExecuteStream(ordinaryAntigravityTerminalContext(ctx, upstreamSSE), &cliproxyauth.Auth{
 		ID: authID,
 		Metadata: map[string]any{
 			"access_token": "token-123",
 			"expired":      time.Now().Add(24 * time.Hour).Format(time.RFC3339),
 			"project_id":   "project-1",
 		},
-		Attributes: map[string]string{"base_url": server.URL},
+		Attributes: map[string]string{"base_url": "https://fixture.invalid"},
 	}, cliproxyexecutor.Request{
 		Model:   "gemini-3.8-flash-high",
 		Payload: []byte(`{"model":"gemini-3.8-flash-high","messages":[{"role":"user","content":"hello"}],"stream":true}`),
@@ -286,4 +233,18 @@ func TestAntigravityStream_OpenAIChatCompletions_ClientDisconnectAfterStopChunkD
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for usage record")
 	}
+}
+
+func ordinaryAntigravityTerminalContext(ctx context.Context, frames string) context.Context {
+	return context.WithValue(ctx, "cliproxy.roundtripper", ordinaryAntigravityRT(func(req *http.Request) (*http.Response, error) {
+		body := io.MultiReader(strings.NewReader(frames), ordinaryAntigravityCancellationReader{ctx: req.Context()})
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"text/event-stream"}}, Body: io.NopCloser(body), Request: req}, nil
+	}))
+}
+
+type ordinaryAntigravityCancellationReader struct{ ctx context.Context }
+
+func (r ordinaryAntigravityCancellationReader) Read([]byte) (int, error) {
+	<-r.ctx.Done()
+	return 0, r.ctx.Err()
 }

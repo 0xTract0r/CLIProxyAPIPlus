@@ -16,11 +16,11 @@ import (
 func TestCopilotRefreshOnlyExchangesCredentials(t *testing.T) {
 	for _, base := range []string{"https://api.individual.githubcopilot.com", "https://api.business.githubcopilot.com"} {
 		t.Run(base, func(t *testing.T) {
-			auth := copilotTestAuth(t, "a", "claude-opus-5", copilot.Chat)
+			auth := copilotOrdinaryFixtureAuth(t, "a", "claude-opus-5", copilot.Chat)
 			auth.Metadata["refresh_token"] = "github-grant"
 			previous := auth.CopilotCatalog
 			calls := 0
-			ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", copilotOrdinaryFixtureTransport(func(r *http.Request) (*http.Response, error) {
 				calls++
 				if r.URL.Path != "/copilot_internal/v2/token" || r.URL.Host != "api.github.com" || r.Header.Get("Authorization") != "Bearer github-grant" {
 					t.Fatalf("credential refresh must not fetch the directory: %s", r.URL.Path)

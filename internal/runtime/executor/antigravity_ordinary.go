@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"io"
 	"maps"
+	"mime"
 	"net/http"
 	"net/url"
 	"strings"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/MoeForge/moego/ojson"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
 	antigravitythinking "github.com/router-for-me/CLIProxyAPI/v8/internal/thinking/provider/antigravity"
@@ -101,6 +103,11 @@ func (e *AntigravityExecutor) ordinaryAntigravitySend(ctx context.Context, auth 
 	if len(req.Payload) > ordinaryAntigravityBodyLimit || len(opts.OriginalRequest) > ordinaryAntigravityBodyLimit {
 		return nil, nil, statusErr{code: 413, msg: "Antigravity request exceeds size limit", requestScoped: true}
 	}
+	if opts.Alt == "responses/compact" ||
+		(opts.SourceFormat == sdktranslator.FormatOpenAIResponse &&
+			(ordinaryAntigravityHasCompactionItem(req.Payload) || ordinaryAntigravityHasCompactionItem(opts.OriginalRequest))) {
+		return nil, nil, statusErr{code: http.StatusBadRequest, msg: "Antigravity has no supported upstream compaction protocol", requestScoped: true}
+	}
 	if opts.Alt != "" && opts.Alt != "sse" {
 		return nil, nil, statusErr{code: 400, msg: "unsupported Antigravity request extension", requestScoped: true}
 	}
@@ -118,11 +125,22 @@ func (e *AntigravityExecutor) ordinaryAntigravitySend(ctx context.Context, auth 
 		doc = ojson.NewDocString(`{}`)
 		_ = doc.SetRawBytes("request", payload)
 	}
-	setup := helps.NewPayloadFinalizer(e.cfg, e.Identifier(), model, to.String(), "request", translatedOriginal, req, opts)
-	helps.FinalizePayloadDoc(helps.WithPayloadFinalizer(ctx, setup), doc)
+	if helps.PrepareAntigravityClaudeStructuredOutputDoc(model, doc) && ordinaryAntigravityExplicitToolChoice(opts.OriginalRequest, req.Payload) {
+		return nil, nil, statusErr{code: http.StatusBadRequest, msg: "this Antigravity model does not support combining structured output with a required tool choice", requestScoped: true}
+	}
 	if err := normalizeOrdinaryAntigravityLevel(doc); err != nil {
 		return nil, nil, err
 	}
+	if path != antigravityCountTokensPath {
+		constrainOrdinaryAntigravityClaudeOutput(doc, model)
+	}
+	// Prepare the protocol payload before applying the operator's final rules.
+	ensureAntigravityGeminiBoundaryUserContentDoc(model, doc)
+	normalizeAntigravityGeminiFunctionResponseRolesDoc(doc)
+	doc = ojson.NewDoc(repairAntigravityGeminiFunctionResponseNames(doc.Bytes()))
+	setup := helps.NewPayloadFinalizer(e.cfg, e.Identifier(), model, to.String(), "request", translatedOriginal, req, opts)
+	helps.FinalizePayloadDoc(helps.WithPayloadFinalizer(ctx, setup), doc)
+	// Keep route and credential metadata authoritative after ordinary body rules.
 	if path != antigravityCountTokensPath {
 		project := antigravityProjectIDFromAuth(auth)
 		if project == "" {
@@ -140,9 +158,7 @@ func (e *AntigravityExecutor) ordinaryAntigravitySend(ctx context.Context, auth 
 	}
 	// Provider-supplied thought signatures are opaque. Do not repair, generate,
 	// replace, or replay them from another request.
-	ensureAntigravityGeminiBoundaryUserContentDoc(model, doc)
-	normalizeAntigravityGeminiFunctionResponseRolesDoc(doc)
-	payload = repairAntigravityGeminiFunctionResponseNames(doc.Bytes())
+	payload = doc.Bytes()
 	if len(payload) > ordinaryAntigravityBodyLimit {
 		return nil, nil, statusErr{code: 413, msg: "Antigravity request exceeds size limit", requestScoped: true}
 	}
@@ -174,7 +190,7 @@ func (e *AntigravityExecutor) ordinaryAntigravitySend(ctx context.Context, auth 
 		if msg == "" {
 			msg = http.StatusText(resp.StatusCode)
 		}
-		return nil, nil, statusErr{code: resp.StatusCode, msg: msg, retryAfter: ordinaryAntigravityRetryHint(resp.StatusCode, resp.Header, b)}
+		return nil, nil, ordinaryAntigravityProviderRefusal(resp.StatusCode, msg, resp.Header, b)
 	}
 	decoded, err := helps.DecodeResponseBody(resp.Body, resp.Header)
 	if err != nil {
@@ -183,6 +199,73 @@ func (e *AntigravityExecutor) ordinaryAntigravitySend(ctx context.Context, auth 
 	}
 	resp.Body = decoded
 	return resp, payload, nil
+}
+
+func ordinaryAntigravityHasCompactionItem(body []byte) bool {
+	for _, item := range ojson.GetBytesNoCopy(body, "input").Array() {
+		switch item.Get("type").String() {
+		case "compaction", "compaction_trigger":
+			return true
+		}
+	}
+	return false
+}
+
+func constrainOrdinaryAntigravityClaudeOutput(doc *ojson.Doc, model string) {
+	model = strings.ToLower(strings.TrimSpace(model))
+	if !strings.HasPrefix(model, "claude-") {
+		return
+	}
+	limit := registry.DefaultClaudeMaxOutputTokens
+	if info := registry.LookupModelInfo(model, antigravityAuthType); info != nil && info.MaxCompletionTokens > 0 {
+		limit = min(limit, info.MaxCompletionTokens)
+	}
+	const path = "request.generationConfig.maxOutputTokens"
+	if maximum := doc.Get(path); maximum.Type == ojson.Number && maximum.Int() > int64(limit) {
+		_ = doc.Set(path, limit)
+	}
+}
+
+// The SDK preserves the actual caller request separately when a protocol
+// adapter generated a wire tool mode. Without that evidence, the supplied
+// payload is the caller request.
+func ordinaryAntigravityExplicitToolChoice(original, payload []byte) bool {
+	if !ojson.ValidBytes(original) || !ojson.GetBytesNoCopy(original, "@this").IsObject() {
+		original = payload
+	}
+	for _, prefix := range []string{"", "request."} {
+		for _, field := range []string{"tool_choice", "toolChoice"} {
+			choice := ojson.GetBytesNoCopy(original, prefix+field)
+			if choice.IsObject() {
+				switch strings.ToLower(strings.TrimSpace(choice.Get("type").String())) {
+				case "tool", "function":
+					return true
+				}
+				if ordinaryAntigravityRequiredToolMode(choice.Get("type").String()) || ordinaryAntigravityRequiredToolMode(choice.Get("mode").String()) {
+					return true
+				}
+			} else if ordinaryAntigravityRequiredToolMode(choice.String()) {
+				return true
+			}
+		}
+		for _, field := range []string{"toolConfig", "tool_config"} {
+			for _, config := range []string{"functionCallingConfig", "function_calling_config"} {
+				if ordinaryAntigravityRequiredToolMode(ojson.GetBytesNoCopy(original, prefix+field+"."+config+".mode").String()) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func ordinaryAntigravityRequiredToolMode(mode string) bool {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "required", "any", "validated":
+		return true
+	default:
+		return false
+	}
 }
 
 func (e *AntigravityExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ cliproxyexecutor.Response, err error) {
@@ -197,7 +280,19 @@ func (e *AntigravityExecutor) Execute(ctx context.Context, auth *cliproxyauth.Au
 	if err != nil {
 		return cliproxyexecutor.Response{}, err
 	}
-	if len(raw) > ordinaryAntigravityBodyLimit || !ojson.ValidBytes(raw) {
+	if len(raw) > ordinaryAntigravityBodyLimit {
+		return cliproxyexecutor.Response{}, statusErr{code: 502, msg: "invalid Antigravity response"}
+	}
+	if mediaType, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type")); mediaType == "text/event-stream" {
+		raw, err = collectOrdinaryAntigravityResponse(ctx, raw, resp.Header)
+		if err != nil {
+			return cliproxyexecutor.Response{}, err
+		}
+		resp.Header = resp.Header.Clone()
+		resp.Header.Set("Content-Type", "application/json")
+		resp.Header.Del("Content-Length")
+	}
+	if !ojson.ValidBytes(raw) {
 		return cliproxyexecutor.Response{}, statusErr{code: 502, msg: "invalid Antigravity response"}
 	}
 	if err := ordinaryAntigravityInBandError(raw, resp.Header); err != nil {
@@ -246,13 +341,20 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 		scanner := helps.NewCodexSSEScanner(ctx, resp.Body, 16<<20)
 		var state any
 		completed := false
-		var malformedFrame bool
+		var malformedFrame, sawOutput bool
+		// A client may close after receiving an upstream terminal event while
+		// the upstream HTTP body remains open. Settle observed usage once.
+		defer func() {
+			if ctx.Err() != nil && completed && pendingFilter == "" {
+				usage.Publish(context.WithoutCancel(ctx), reporter)
+			}
+		}()
 		for scanner.Scan() {
 			line := bytes.Clone(scanner.Bytes())
 			if data, ok := bytes.CutPrefix(line, []byte("data:")); ok {
 				data = bytes.TrimSpace(data)
 				if bytes.Equal(data, []byte("[DONE]")) {
-					if malformedFrame && !completed {
+					if !completed && (malformedFrame || !sawOutput) {
 						break
 					}
 					completed = true
@@ -284,8 +386,10 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 					pendingFilter = message
 					continue
 				}
+				hasOutput := ordinaryAntigravityHasOutput(data)
+				sawOutput = sawOutput || hasOutput
 				if pendingFilter != "" {
-					if !ordinaryAntigravityHasOutput(data) {
+					if !hasOutput {
 						continue
 					}
 					pendingFilter = ""
@@ -441,7 +545,33 @@ func ordinaryAntigravityInBandError(body []byte, headers http.Header) error {
 	if message == "" {
 		message = http.StatusText(code)
 	}
-	return statusErr{code: code, msg: message, retryAfter: ordinaryAntigravityRetryHint(code, headers, body)}
+	return ordinaryAntigravityProviderRefusal(code, message, headers, body)
+}
+
+// Preserve explicit upstream credential and policy status for this request.
+func ordinaryAntigravityProviderRefusal(code int, message string, headers http.Header, body []byte) statusErr {
+	status := statusErr{code: code, msg: message, retryAfter: ordinaryAntigravityRetryHint(code, headers, body)}
+	if code == http.StatusUnauthorized {
+		status.credentialScoped = true
+		return status
+	}
+	if code != http.StatusForbidden || ojson.GetBytesNoCopy(body, "error.status").String() != "PERMISSION_DENIED" {
+		return status
+	}
+	for _, detail := range ojson.GetBytesNoCopy(body, "error.details").Array() {
+		if detail.Get("@type").String() != "type.googleapis.com/google.rpc.ErrorInfo" {
+			continue
+		}
+		switch detail.Get("reason").String() {
+		case "VALIDATION_REQUIRED":
+			status.credentialScoped = true
+		case "TOS_VIOLATION":
+			status.credentialScoped = true
+			status.tosViolation = true
+			return status
+		}
+	}
+	return status
 }
 
 // Metadata and empty placeholders are not evidence of model output.

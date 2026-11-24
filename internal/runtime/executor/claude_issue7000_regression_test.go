@@ -2,7 +2,9 @@ package executor
 
 import (
 	"context"
+	"errors"
 	"io"
+	"net"
 	"net/http"
 	"reflect"
 	"strings"
@@ -38,7 +40,7 @@ func captureClaudeIssue7000(t *testing.T, executor claudeIssue7000Executor, auth
 	t.Helper()
 	var captured []byte
 	var headers http.Header
-	transport := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+	transport := ordinaryClaudeTestRoundTripper(func(req *http.Request) (*http.Response, error) {
 		body, errRead := io.ReadAll(req.Body)
 		if errRead != nil {
 			return nil, errRead
@@ -96,10 +98,10 @@ func TestClaudeExecutor_Issue7000ModelAndChoiceBoundaries(t *testing.T) {
 	for _, tc := range []struct {
 		name, route, bodyModel, choice, normalized, want string
 	}{
-		{name: "opus date", route: "claude-opus-5-5-20260901", choice: forced, want: auto},
-		{name: "sonnet bracket", route: "claude-sonnet-5-5[1m]", choice: forced, want: auto},
-		{name: "high date bracket thinking suffix", route: "claude-opus-5-5-high-20260901[1m](high)", choice: forced, want: auto},
-		{name: "reasoning variant", route: "claude-sonnet-5-5-reasoning", choice: forced, want: auto},
+		{name: "opus date", route: "claude-opus-5-5-20260901", choice: forced, want: forced},
+		{name: "sonnet bracket", route: "claude-sonnet-5-5[1m]", choice: forced, want: forced},
+		{name: "high date bracket thinking suffix", route: "claude-opus-5-5-high-20260901[1m](high)", choice: forced, want: forced},
+		{name: "reasoning variant", route: "claude-sonnet-5-5-reasoning", choice: forced, want: forced},
 		{name: "old opus", route: "claude-opus-5", choice: forced, want: forced},
 		{name: "old sonnet", route: "claude-sonnet-4-6", choice: forced, want: forced},
 		{name: "haiku", route: "claude-haiku-5-5", choice: forced, want: forced},
@@ -116,8 +118,8 @@ func TestClaudeExecutor_Issue7000ModelAndChoiceBoundaries(t *testing.T) {
 		{name: "none", route: "claude-sonnet-5-5", choice: `{"type":"none"}`, want: `{"type":"none"}`},
 		{name: "omitted", route: "claude-opus-5-5"},
 		{name: "body cannot spoof target", route: "claude-opus-5", bodyModel: "claude-opus-5-5", choice: forced, want: forced},
-		{name: "body cannot hide target", route: "claude-opus-5-5", bodyModel: "custom-alias", choice: forced, want: auto},
-		{name: "alias resolved upstream", route: "custom-alias", normalized: "claude-sonnet-5-5", choice: forced, want: auto},
+		{name: "body cannot hide target", route: "claude-opus-5-5", bodyModel: "custom-alias", choice: forced, want: forced},
+		{name: "alias resolved upstream", route: "custom-alias", normalized: "claude-sonnet-5-5", choice: forced, want: forced},
 		{name: "upstream is old despite alias", route: "claude-opus-5-5", normalized: "claude-opus-5", choice: forced, want: forced},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -166,14 +168,22 @@ func TestClaudeExecutor_Issue7000OpenAITranslation(t *testing.T) {
 						payload += `,` + source.schemaField
 					}
 					body, _ := captureClaudeIssue7000(t, NewClaudeExecutor(&config.Config{}), &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "key-issue7000"}}, cliproxyexecutor.Request{Model: "claude-sonnet-5-5", Payload: []byte(payload + `}`)}, cliproxyexecutor.Options{SourceFormat: source.format}, source.method)
-					for path, want := range map[string]any{"tool_choice.type": "auto", "tool_choice.disable_parallel_tool_use": true, "tools.0.name": "lookup_weather", "tools.0.input_schema.required.0": "city", "thinking.type": "adaptive", "output_config.effort": "high"} {
+					expectedType, expectedName := "any", ""
+					if choice != `"required"` {
+						expectedType, expectedName = "tool", "lookup_weather"
+					}
+					for path, want := range map[string]any{"tool_choice.type": expectedType, "tool_choice.disable_parallel_tool_use": true, "tools.0.name": "lookup_weather", "tools.0.input_schema.required.0": "city"} {
 						if got := ojson.GetBytes(body, path).Value(); !reflect.DeepEqual(got, want) {
-							t.Errorf("%s = %#v, want %#v; body=%s", path, got, want, body)
+							t.Errorf("%s=%#v want %#v", path, got, want)
 						}
 					}
-					if ojson.GetBytes(body, "tool_choice.name").Exists() {
-						t.Errorf("forced tool name survived: %s", body)
+					if got := ojson.GetBytes(body, "tool_choice.name").String(); got != expectedName {
+						t.Errorf("tool_choice.name = %q want %q", got, expectedName)
 					}
+					if ojson.GetBytes(body, "thinking").Exists() || ojson.GetBytes(body, "output_config.effort").Exists() {
+						t.Error("incompatible thinking remained after an explicit forced tool choice")
+					}
+
 					if withSchema {
 						if got := ojson.GetBytes(body, "output_config.format").Value(); !reflect.DeepEqual(got, ojson.Parse(`{"type":"json_schema","schema":`+schema+`}`).Value()) {
 							t.Errorf("translated schema should reach output_config.format unchanged: %s", body)
@@ -200,34 +210,8 @@ func TestClaudeExecutor_Issue7000KeepsNativeOutputFormat(t *testing.T) {
 	if got := ojson.GetBytes(body, "output_config.format").Value(); !reflect.DeepEqual(got, ojson.Parse(format).Value()) {
 		t.Errorf("native output format changed: %s", body)
 	}
-	if ojson.GetBytes(body, "tool_choice.type").String() != "auto" || ojson.GetBytes(body, "output_config.effort").String() != "high" {
-		t.Errorf("native schema must not prevent tool-choice compatibility or remove effort: %s", body)
-	}
-}
-
-func TestClaudeExecutor_Issue7000OAuthPreservesThinkingHistory(t *testing.T) {
-	for _, method := range []string{"Execute", "ExecuteStream", "CountTokens"} {
-		t.Run(method, func(t *testing.T) {
-			payloadDoc := ojson.NewDoc(preservedThinkingReplayPayload("claude-opus-5-5"))
-			_ = payloadDoc.Delete("thinking")
-			_ = payloadDoc.SetRawBytes("tools", []byte(claudeIssue7000Tools))
-			_ = payloadDoc.SetRawBytes("tool_choice", []byte(`{"type":"tool","name":"lookup_weather","disable_parallel_tool_use":true}`))
-			payload := payloadDoc.Bytes()
-			metadata := claudeOAuthTestMetadata()
-			metadata["access_token"] = "sk-ant-oat01-issue7000"
-			body, headers := captureClaudeIssue7000(t, NewClaudeExecutor(&config.Config{}), &cliproxyauth.Auth{Provider: "claude", Metadata: metadata}, cliproxyexecutor.Request{Model: "claude-opus-5-5", Payload: payload}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatClaude}, method)
-			for path, want := range map[string]any{"tool_choice.type": "auto", "tool_choice.disable_parallel_tool_use": true, "thinking.type": "adaptive", "thinking.block_binding.prefix_mismatch_behavior": "drop_block"} {
-				if got := ojson.GetBytes(body, path).Value(); !reflect.DeepEqual(got, want) {
-					t.Errorf("%s = %#v, want %#v; body=%s", path, got, want, body)
-				}
-			}
-			if ojson.GetBytes(body, "tool_choice.name").Exists() || !strings.Contains(string(body), preservedThinkingTestSignature) {
-				t.Errorf("forced name survived or signed thinking was lost: %s", body)
-			}
-			if headers.Get("Authorization") != "Bearer sk-ant-oat01-issue7000" {
-				t.Error("OAuth request did not use bearer authentication")
-			}
-		})
+	if ojson.GetBytes(body, "tool_choice.type").String() != "any" || ojson.GetBytes(body, "output_config.effort").Exists() {
+		t.Errorf("native schema changed ordinary tool-choice/thinking precedence: %s", body)
 	}
 }
 
@@ -237,17 +221,17 @@ func TestClaudeExecutor_Issue7000CountTokensUpstreamAndLocal(t *testing.T) {
 		t.Run(choice, func(t *testing.T) {
 			payload := claudeIssue7000Payload("spoofed-body-model", choice)
 			body, headers := captureClaudeIssue7000(t, NewClaudeExecutor(&config.Config{}), &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "key-issue7000"}}, cliproxyexecutor.Request{Model: model, Payload: payload}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatClaude}, "CountTokens")
-			if got := ojson.GetBytes(body, "tool_choice").Value(); !reflect.DeepEqual(got, ojson.Parse(`{"type":"auto","disable_parallel_tool_use":true}`).Value()) {
-				t.Errorf("upstream count choice = %#v, want auto with parallel flag", got)
+			if got := ojson.GetBytes(body, "tool_choice").Value(); !reflect.DeepEqual(got, ojson.Parse(choice).Value()) {
+				t.Errorf("upstream count choice = %#v, want explicit choice with parallel flag", got)
 			}
 			if ojson.GetBytes(body, "model").String() != model || headers.Get("X-Api-Key") != "key-issue7000" {
 				t.Error("upstream count did not preserve routed model/API-key authentication")
 			}
 			executor := NewClaudeExecutor(&config.Config{})
 			auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "key-issue7000", "base_url": "https://gateway.invalid"}}
-			ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", http.RoundTripper(roundTripperFunc(func(*http.Request) (*http.Response, error) {
+			ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", http.RoundTripper(ordinaryClaudeTestRoundTripper(func(*http.Request) (*http.Response, error) {
 				t.Error("local count must not call upstream")
-				return nil, io.ErrUnexpectedEOF
+				return nil, &net.OpError{Op: "dial", Err: errors.New("synthetic connection failure before send")}
 			})))
 			count := func(input []byte) int64 {
 				t.Helper()
@@ -257,9 +241,9 @@ func TestClaudeExecutor_Issue7000CountTokensUpstreamAndLocal(t *testing.T) {
 				}
 				return ojson.GetBytes(response.Payload, "input_tokens").Int()
 			}
-			want := count(claudeIssue7000Payload(model, `{"type":"auto","disable_parallel_tool_use":true}`))
+			want := count(claudeIssue7000Payload(model, choice))
 			if got := count(payload); got != want || got <= 0 {
-				t.Errorf("local forced-choice count = %d, want auto count %d", got, want)
+				t.Errorf("local forced-choice count = %d, want explicit choice count %d", got, want)
 			}
 		})
 	}
@@ -274,8 +258,8 @@ func TestClaudeExecutor_Issue7000PayloadRulesRemainFinal(t *testing.T) {
 				name = method + "/filter"
 			}
 			t.Run(name, func(t *testing.T) {
-				// Conditions must see auto and surviving thinking, not the incoming forced choice.
-				models := []config.PayloadModelRule{{Name: model, Exist: []string{"thinking"}, Match: []map[string]any{{"tool_choice.type": "auto"}}}}
+				// Conditions match the observed explicit forced choice after incompatible thinking was removed.
+				models := []config.PayloadModelRule{{Name: model, NotExist: []string{"thinking"}, Match: []map[string]any{{"tool_choice.type": "tool"}}}}
 				cfg := &config.Config{Payload: config.PayloadConfig{Override: []config.PayloadRule{{Models: models, Params: map[string]any{"tool_choice": map[string]any{"type": "tool", "name": "user_override"}, "observed_builtin": true}}}}}
 				if filter {
 					cfg.Payload = config.PayloadConfig{Filter: []config.PayloadFilterRule{{Models: models, Params: []string{"tool_choice", "thinking", "output_config.effort", "tools"}}}}
@@ -291,8 +275,8 @@ func TestClaudeExecutor_Issue7000PayloadRulesRemainFinal(t *testing.T) {
 							t.Errorf("filtered %s was restored: %s", path, body)
 						}
 					}
-				} else if ojson.GetBytes(body, "tool_choice.type").String() != "tool" || ojson.GetBytes(body, "tool_choice.name").String() != "user_override" || !ojson.GetBytes(body, "observed_builtin").Bool() || ojson.GetBytes(body, "thinking.type").String() != "adaptive" {
-					t.Errorf("payload override did not remain final with thinking intact: %s", body)
+				} else if ojson.GetBytes(body, "tool_choice.type").String() != "tool" || ojson.GetBytes(body, "tool_choice.name").String() != "user_override" || !ojson.GetBytes(body, "observed_builtin").Bool() || ojson.GetBytes(body, "thinking").Exists() {
+					t.Errorf("payload override did not remain final after incompatible thinking removal: %s", body)
 				}
 			})
 		}
@@ -308,7 +292,7 @@ func TestClaudeExecutor_Issue7000LocalCountPayloadRulesRemainFinal(t *testing.T)
 			name = "filter"
 		}
 		t.Run(name, func(t *testing.T) {
-			models := []config.PayloadModelRule{{Name: model, Match: []map[string]any{{"tool_choice.type": "auto", "model": model}}}}
+			models := []config.PayloadModelRule{{Name: model, Match: []map[string]any{{"tool_choice.type": "tool", "model": model}}}}
 			cfg := &config.Config{Payload: config.PayloadConfig{Override: []config.PayloadRule{{Models: models, Params: map[string]any{"tool_choice": map[string]any{"type": "tool", "name": "explicit_user_override_name_with_extra_tokens"}}}}}}
 			controlChoice := `{"type":"tool","name":"explicit_user_override_name_with_extra_tokens"}`
 			if filter {
@@ -333,7 +317,7 @@ func TestClaudeExecutor_Issue7000LocalCountPayloadRulesRemainFinal(t *testing.T)
 	}
 }
 
-func TestClaudeExecutor_Issue7000ManagerRetryKeepsAuto(t *testing.T) {
+func TestClaudeExecutor_Issue7000ManagerRetryKeepsExplicitTool(t *testing.T) {
 	for _, stream := range []bool{false, true} {
 		name := "Execute"
 		if stream {
@@ -352,7 +336,7 @@ func TestClaudeExecutor_Issue7000ManagerRetryKeepsAuto(t *testing.T) {
 				t.Fatalf("register auth: %v", errRegister)
 			}
 			var bodies [][]byte
-			transport := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			transport := ordinaryClaudeTestRoundTripper(func(req *http.Request) (*http.Response, error) {
 				body, errRead := io.ReadAll(req.Body)
 				if errRead != nil {
 					return nil, errRead
@@ -362,7 +346,7 @@ func TestClaudeExecutor_Issue7000ManagerRetryKeepsAuto(t *testing.T) {
 				}
 				bodies = append(bodies, body)
 				if len(bodies) == 1 {
-					return nil, io.ErrUnexpectedEOF
+					return nil, &net.OpError{Op: "dial", Err: errors.New("synthetic connection failure before send")}
 				}
 				contentType := "application/json"
 				response := `{"id":"msg_retry","type":"message","role":"assistant","model":"claude-sonnet-5-5","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`
@@ -392,8 +376,8 @@ func TestClaudeExecutor_Issue7000ManagerRetryKeepsAuto(t *testing.T) {
 				t.Fatalf("upstream attempts = %d, want initial plus one retry", len(bodies))
 			}
 			for attempt, body := range bodies {
-				if got := ojson.GetBytes(body, "tool_choice").Value(); !reflect.DeepEqual(got, ojson.Parse(`{"type":"auto","disable_parallel_tool_use":true}`).Value()) {
-					t.Errorf("attempt %d restored forced choice: %s", attempt+1, body)
+				if got := ojson.GetBytes(body, "tool_choice").Value(); !reflect.DeepEqual(got, ojson.Parse(`{"type":"tool","name":"lookup_weather","disable_parallel_tool_use":true}`).Value()) {
+					t.Errorf("attempt %d changed explicit choice: %s", attempt+1, body)
 				}
 			}
 			if ojson.GetBytes(payload, "tool_choice.type").String() != "tool" {

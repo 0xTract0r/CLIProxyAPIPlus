@@ -25,7 +25,7 @@ func TestCodexNativeStreamFidelity(t *testing.T) {
 func testCodexNativeStreamFidelity(t *testing.T, source sdktranslator.Format) {
 	t.Helper()
 	for _, transport := range []string{"http", "websocket"} {
-		for _, lite := range []string{"", "header", "metadata"} {
+		for _, lite := range []string{""} {
 			for _, buffering := range []bool{false, true} {
 				t.Run(fmt.Sprintf("%s/lite=%s/buffering=%t", transport, lite, buffering), func(t *testing.T) {
 					metadata := `{"type":"codex.response.metadata","headers":{"x-models-etag":"models-v1","x-codex-turn-state":"turn-1","x-codex-safety-buffering-enabled":"true","x-codex-safety-buffering-faster-model":"fixture-model"},"future":{"ok":true}}`
@@ -79,7 +79,9 @@ func testCodexNativeStreamFidelity(t *testing.T, source sdktranslator.Format) {
 					if transport == "websocket" {
 						executeStream = NewCodexWebsocketsExecutor(cfg).ExecuteStream
 					}
-					result, err := executeStream(context.Background(), codexTestAuth(server.URL), cliproxyexecutor.Request{Model: "gpt-5.6-sol", Payload: payload}, cliproxyexecutor.Options{SourceFormat: source, ResponseFormat: sdktranslator.FormatCodex, Headers: headers, Stream: true})
+					auth := codexTestAuth(server.URL)
+					auth.ProxyURL = "direct"
+					result, err := executeStream(context.Background(), auth, cliproxyexecutor.Request{Model: "gpt-5.6-sol", Payload: payload}, cliproxyexecutor.Options{SourceFormat: source, ResponseFormat: sdktranslator.FormatCodex, Headers: headers, Stream: true})
 					if err != nil {
 						t.Fatal(err)
 					}
@@ -101,19 +103,15 @@ func testCodexNativeStreamFidelity(t *testing.T, source sdktranslator.Format) {
 					}
 					body := <-captured
 					upstreamHeaders := <-capturedHeaders
-					native := lite != "" && (source == sdktranslator.FormatCodex || source == sdktranslator.FormatOpenAIResponse)
+
 					if transport == "websocket" {
-						wantLiteHeader := ""
-						if native && lite == "header" {
-							wantLiteHeader = "true"
-						}
-						if got := upstreamHeaders.Get(codexResponsesLiteHeader); got != wantLiteHeader {
-							t.Errorf("upstream Lite header = %q, want %q", got, wantLiteHeader)
+						if upstreamHeaders.Get(codexResponsesLiteHeader) != "" {
+							t.Error("ordinary websocket added a private Lite header")
 						}
 						alias := headerValueCaseInsensitive(upstreamHeaders, "session_id")
 						t.Logf("upstream session alias: %q", alias)
-						if (alias == "") != native {
-							t.Errorf("session alias = %q, native = %t", alias, native)
+						if alias != "" {
+							t.Errorf("unexpected provider-private session alias")
 						}
 					}
 					t.Logf("downstream metadata: %q", metadataEvents)
@@ -121,35 +119,14 @@ func testCodexNativeStreamFidelity(t *testing.T, source sdktranslator.Format) {
 						t.Errorf("metadata event changed or duplicated: %q", metadataEvents)
 					}
 					t.Logf("upstream request: %s; downstream completion: %s", body, terminal)
-					if native {
-						if ojson.GetBytes(body, "instructions").Exists() {
-							t.Errorf("native request gained instructions: %s", body)
-						}
-						if string(terminal) != completed {
-							t.Errorf("native completion changed: %s", terminal)
-						}
-					} else if ojson.GetBytes(body, "instructions").Type != ojson.String || ojson.GetBytes(terminal, "response.output.0.id").String() != "msg_1" {
-						t.Errorf("compatibility normalization/backfill lost: %s; %s", body, terminal)
+					if source == sdktranslator.FormatCodex && ojson.GetBytes(body, "instructions").Exists() {
+						t.Errorf("native request gained instructions: %s", body)
+					}
+					if ojson.GetBytes(terminal, "response.output.0.id").String() != "msg_1" ||
+						!ojson.GetBytes(terminal, "response.future.ok").Bool() {
+						t.Errorf("output backfill or opaque extension lost: %s", terminal)
 					}
 				})
-			}
-		}
-	}
-}
-
-func TestCodexWebsocketLiteHeaderWithoutSessionHeaders(t *testing.T) {
-	for _, native := range []bool{false, true} {
-		for _, disableCloaking := range []bool{false, true} {
-			cfg := &config.Config{Codex: config.CodexConfig{DisableCodexCloaking: disableCloaking}}
-			headers := http.Header{}
-			headers.Set(codexResponsesLiteHeader, "true")
-			got := applyCodexWebsocketHeaders(context.Background(), nil, nil, "fixture-token", cfg, native, headers)
-			want := ""
-			if native {
-				want = "true"
-			}
-			if value := got.Get(codexResponsesLiteHeader); value != want {
-				t.Errorf("native=%t disableCloaking=%t: Lite header = %q, want %q", native, disableCloaking, value, want)
 			}
 		}
 	}

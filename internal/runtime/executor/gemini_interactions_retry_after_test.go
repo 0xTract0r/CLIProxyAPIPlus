@@ -4,10 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
-	"net/http/httptest"
-	"net/url"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -82,16 +82,14 @@ func TestGeminiInteractions429HonorsRetryAfterCooldown_Issue7565(t *testing.T) {
 		for _, mode := range modes {
 			t.Run(variant.name+"_"+mode.name, func(t *testing.T) {
 				var upstreamCalls atomic.Int32
-				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				ctx := context.WithValue(t.Context(), "cliproxy.roundtripper", ordinaryAntigravityRT(func(r *http.Request) (*http.Response, error) {
 					upstreamCalls.Add(1)
+					header := http.Header{"Content-Type": {"application/json"}}
 					if variant.retryHdr != "" {
-						w.Header().Set("Retry-After", variant.retryHdr)
+						header.Set("Retry-After", variant.retryHdr)
 					}
-					w.Header().Set("Content-Type", "application/json")
-					w.WriteHeader(http.StatusTooManyRequests)
-					_, _ = w.Write([]byte(variant.body))
+					return &http.Response{StatusCode: http.StatusTooManyRequests, Header: header, Body: io.NopCloser(strings.NewReader(variant.body)), Request: r}, nil
 				}))
-				defer server.Close()
 
 				cfg := &config.Config{DisableCooling: false}
 				manager := cliproxyauth.NewManager(nil, &cliproxyauth.RoundRobinSelector{}, nil)
@@ -109,7 +107,7 @@ func TestGeminiInteractions429HonorsRetryAfterCooldown_Issue7565(t *testing.T) {
 					Status:   cliproxyauth.StatusActive,
 					Attributes: map[string]string{
 						"api_key":  "synthetic-interactions-key",
-						"base_url": server.URL,
+						"base_url": "https://fixture.invalid",
 					},
 				})
 				if errRegister != nil {
@@ -129,7 +127,7 @@ func TestGeminiInteractions429HonorsRetryAfterCooldown_Issue7565(t *testing.T) {
 				beforeCall := time.Now()
 				var firstErr error
 				if mode.stream {
-					res, errStream := manager.ExecuteStream(context.Background(), []string{"gemini-interactions"}, req, opts)
+					res, errStream := manager.ExecuteStream(ctx, []string{"gemini-interactions"}, req, opts)
 					firstErr = errStream
 					if res != nil {
 						for chunk := range res.Chunks {
@@ -139,7 +137,7 @@ func TestGeminiInteractions429HonorsRetryAfterCooldown_Issue7565(t *testing.T) {
 						}
 					}
 				} else {
-					_, firstErr = manager.Execute(context.Background(), []string{"gemini-interactions"}, req, opts)
+					_, firstErr = manager.Execute(ctx, []string{"gemini-interactions"}, req, opts)
 				}
 				if firstErr == nil {
 					t.Fatal("expected HTTP 429 error on first call, got nil")
@@ -177,12 +175,12 @@ func TestGeminiInteractions429HonorsRetryAfterCooldown_Issue7565(t *testing.T) {
 
 				// Subsequent dispatch before cooldown expiry must not hit the upstream server again.
 				if mode.stream {
-					_, errSecond := manager.ExecuteStream(context.Background(), []string{"gemini-interactions"}, req, opts)
+					_, errSecond := manager.ExecuteStream(ctx, []string{"gemini-interactions"}, req, opts)
 					if errSecond == nil {
 						t.Fatal("expected cooldown error on second stream call, got nil")
 					}
 				} else {
-					_, errSecond := manager.Execute(context.Background(), []string{"gemini-interactions"}, req, opts)
+					_, errSecond := manager.Execute(ctx, []string{"gemini-interactions"}, req, opts)
 					if errSecond == nil {
 						t.Fatal("expected cooldown error on second call, got nil")
 					}
@@ -214,32 +212,17 @@ func assertRetryAfterDuration(t *testing.T, err error, want time.Duration) {
 }
 
 func TestGeminiAndVertexExecutors429PropagateRetryAfter_Issue7565(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/token" {
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"access_token":"mock-vertex-sa-token","token_type":"Bearer","expires_in":3600}`))
-			return
+	const fixture = "https://fixture.invalid"
+	redirectCtx := context.WithValue(t.Context(), "cliproxy.roundtripper", ordinaryAntigravityRT(func(r *http.Request) (*http.Response, error) {
+		headers := http.Header{"Content-Type": {"application/json"}}
+		if r.URL.Host == "fixture.invalid" && r.URL.Path == "/token" {
+			return &http.Response{StatusCode: http.StatusOK, Header: headers,
+				Body: io.NopCloser(strings.NewReader(`{"access_token":"mock-vertex-sa-token","token_type":"Bearer","expires_in":3600}`)), Request: r}, nil
 		}
-		w.Header().Set("Retry-After", "2190")
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusTooManyRequests)
-		_, _ = w.Write([]byte(issue7565RetryInfoBody))
+		headers.Set("Retry-After", "2190")
+		return &http.Response{StatusCode: http.StatusTooManyRequests, Header: headers, Body: io.NopCloser(strings.NewReader(issue7565RetryInfoBody)), Request: r}, nil
 	}))
-	defer server.Close()
-
-	targetURL, errParse := url.Parse(server.URL)
-	if errParse != nil {
-		t.Fatal(errParse)
-	}
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.Proxy = nil
-	t.Cleanup(transport.CloseIdleConnections)
-	redirectCtx := context.WithValue(context.Background(), "cliproxy.roundtripper", issue6258RedirectTransport{
-		target: targetURL,
-		base:   transport,
-	})
-
-	saRaw := testVertexServiceAccountJSON(t, server.URL+"/token")
+	saRaw := testVertexServiceAccountJSON(t, fixture+"/token")
 	saMap := map[string]any{
 		"type":           ojson.GetBytes(saRaw, "type").String(),
 		"project_id":     ojson.GetBytes(saRaw, "project_id").String(),
@@ -253,7 +236,7 @@ func TestGeminiAndVertexExecutors429PropagateRetryAfter_Issue7565(t *testing.T) 
 	gemAuth := &cliproxyauth.Auth{
 		ID:         "gem-apikey",
 		Provider:   "gemini",
-		Attributes: map[string]string{"api_key": "k", "base_url": server.URL},
+		Attributes: map[string]string{"api_key": "k", "base_url": fixture},
 	}
 	gemReq := cliproxyexecutor.Request{
 		Model:   "gemini-2.5-pro",
@@ -267,15 +250,15 @@ func TestGeminiAndVertexExecutors429PropagateRetryAfter_Issue7565(t *testing.T) 
 	want := 2190 * time.Second
 
 	t.Run("gemini_execute", func(t *testing.T) {
-		_, errExec := gemExec.Execute(context.Background(), gemAuth, gemReq, gemOpts)
+		_, errExec := gemExec.Execute(redirectCtx, gemAuth, gemReq, gemOpts)
 		assertRetryAfterDuration(t, errExec, want)
 	})
 	t.Run("gemini_execute_stream", func(t *testing.T) {
-		_, errStream := gemExec.ExecuteStream(context.Background(), gemAuth, gemReq, gemOpts)
+		_, errStream := gemExec.ExecuteStream(redirectCtx, gemAuth, gemReq, gemOpts)
 		assertRetryAfterDuration(t, errStream, want)
 	})
 	t.Run("gemini_count_tokens", func(t *testing.T) {
-		_, errCount := gemExec.CountTokens(context.Background(), gemAuth, gemReq, gemOpts)
+		_, errCount := gemExec.CountTokens(redirectCtx, gemAuth, gemReq, gemOpts)
 		assertRetryAfterDuration(t, errCount, want)
 	})
 
@@ -283,7 +266,7 @@ func TestGeminiAndVertexExecutors429PropagateRetryAfter_Issue7565(t *testing.T) 
 	vtxKeyAuth := &cliproxyauth.Auth{
 		ID:         "vtx-apikey",
 		Provider:   "vertex",
-		Attributes: map[string]string{"api_key": "vk", "base_url": server.URL, "interactions": "true"},
+		Attributes: map[string]string{"api_key": "vk", "base_url": fixture, "interactions": "true"},
 	}
 	vtxSAAuth := &cliproxyauth.Auth{
 		ID:       "vtx-sa",
@@ -305,15 +288,15 @@ func TestGeminiAndVertexExecutors429PropagateRetryAfter_Issue7565(t *testing.T) 
 	}
 
 	t.Run("vertex_apikey_execute", func(t *testing.T) {
-		_, errExec := vtxExec.Execute(context.Background(), vtxKeyAuth, gemReq, gemOpts)
+		_, errExec := vtxExec.Execute(redirectCtx, vtxKeyAuth, gemReq, gemOpts)
 		assertRetryAfterDuration(t, errExec, want)
 	})
 	t.Run("vertex_apikey_stream", func(t *testing.T) {
-		_, errStream := vtxExec.ExecuteStream(context.Background(), vtxKeyAuth, gemReq, gemOpts)
+		_, errStream := vtxExec.ExecuteStream(redirectCtx, vtxKeyAuth, gemReq, gemOpts)
 		assertRetryAfterDuration(t, errStream, want)
 	})
 	t.Run("vertex_apikey_count_tokens", func(t *testing.T) {
-		_, errCount := vtxExec.CountTokens(context.Background(), vtxKeyAuth, gemReq, gemOpts)
+		_, errCount := vtxExec.CountTokens(redirectCtx, vtxKeyAuth, gemReq, gemOpts)
 		assertRetryAfterDuration(t, errCount, want)
 	})
 	t.Run("vertex_sa_execute", func(t *testing.T) {
@@ -339,16 +322,19 @@ func TestGeminiAndVertexExecutors429PropagateRetryAfter_Issue7565(t *testing.T) 
 }
 
 func TestAntigravityZeroRetryDelayPreservesSemantics_Issue7565(t *testing.T) {
-	body := []byte(`{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"RATE_LIMIT_EXCEEDED"},{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"0s"}]}}`)
-
-	decision := decideAntigravity429(body)
-	if decision.kind != antigravity429DecisionInstantRetrySameAuth {
-		t.Fatalf("decideAntigravity429 kind = %v, want %v", decision.kind, antigravity429DecisionInstantRetrySameAuth)
+	const response = `{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"0s"}]}}`
+	sends := 0
+	ctx := context.WithValue(t.Context(), "cliproxy.roundtripper", ordinaryAntigravityRT(func(req *http.Request) (*http.Response, error) {
+		sends++
+		return &http.Response{StatusCode: http.StatusTooManyRequests, Body: io.NopCloser(strings.NewReader(response)), Request: req}, nil
+	}))
+	exec := NewAntigravityExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Metadata: map[string]any{"access_token": "fixture", "project_id": "fixture-project"},
+		Attributes: map[string]string{"base_url": "https://fixture.invalid"}}
+	req := cliproxyexecutor.Request{Model: "fixture-model", Payload: []byte(`{"contents":[{"role":"user","parts":[{"text":"fixture"}]}]}`)}
+	_, err := exec.Execute(ctx, auth, req, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatGemini})
+	assertRetryAfterDuration(t, err, 0)
+	if sends != 1 {
+		t.Fatalf("expected one upstream request, got %d", sends)
 	}
-	if decision.retryAfter == nil || *decision.retryAfter != 0 {
-		t.Fatalf("decideAntigravity429 retryAfter = %v, want 0s", decision.retryAfter)
-	}
-
-	sErr := newAntigravityStatusErr(http.StatusTooManyRequests, body)
-	assertRetryAfterDuration(t, sErr, 0)
 }

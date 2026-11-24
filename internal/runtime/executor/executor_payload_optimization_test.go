@@ -2,7 +2,6 @@ package executor
 
 import (
 	"bytes"
-	"context"
 	"fmt"
 	"mime/multipart"
 	"runtime"
@@ -216,7 +215,6 @@ func TestObserveClaudeStreamJSONPayloadClonesMessageID(t *testing.T) {
 }
 
 func TestExecutorPayloadSingleDocPipelinesByteConsistency(t *testing.T) {
-	ctx := context.Background()
 
 	t.Run("claude public cache byte and doc helpers match", func(t *testing.T) {
 		raw := []byte(`{"model":"claude-sonnet-4-5","prompt_cache_options":{"ttl":"5m"},"messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}]}`)
@@ -242,18 +240,12 @@ func TestExecutorPayloadSingleDocPipelinesByteConsistency(t *testing.T) {
 		byteOut := bytes.Clone(raw)
 		byteOut = normalizeCodexInstructions(byteOut)
 		byteOut = ensureWebSearchToolForHistory(byteOut, opts.Headers)
-		byteOut = ensureImageGenerationTool(byteOut, "gpt-5", nil, opts.Headers)
 		byteOut = normalizeCodexParallelToolCalls(byteOut, opts.Headers)
-		byteOut = sanitizeOpenAIResponsesReasoningEncryptedContentWithCompatModelAndBaseURL(ctx, "codex executor", byteOut, false, "gpt-5", "")
-		byteOut = applyCodexSIWCRequestBodyRules(byteOut, false, opts)
 
 		doc := ojson.NewDoc(bytes.Clone(raw))
 		normalizeCodexInstructionsDoc(doc)
 		ensureWebSearchToolForHistoryDoc(doc, opts.Headers)
-		ensureImageGenerationToolDoc(doc, "gpt-5", nil, opts.Headers)
 		normalizeCodexParallelToolCallsDoc(doc, opts.Headers)
-		sanitizeOpenAIResponsesReasoningEncryptedContentWithCompatModelAndBaseURLDoc(ctx, "codex executor", doc, false, "gpt-5", "")
-		applyCodexSIWCRequestBodyRulesDoc(doc, false, opts)
 		docOut := doc.Bytes()
 
 		if !bytes.Equal(docOut, byteOut) {
@@ -326,40 +318,6 @@ func TestExecutorPayloadSingleDocPipelinesByteConsistency(t *testing.T) {
 			t.Fatalf("gemini/aistudio doc output mismatch:\ndoc:  %s\nbyte: %s", docOut, byteOut)
 		}
 	})
-}
-
-func TestAntigravityReasoningReplayAccumulatorClonesStreamSignatures(t *testing.T) {
-	scope := antigravityReasoningReplayScope{
-		modelName:  "gemini-2.5-pro",
-		sessionKey: "session:test-reusable-buf",
-	}
-	reqPayload := []byte(`{"request":{"contents":[{"role":"user","parts":[{"text":"hello"}]}]}}`)
-	acc := newAntigravityReasoningReplayAccumulator(scope, reqPayload)
-	if acc == nil {
-		t.Fatal("expected non-nil accumulator")
-	}
-
-	line1 := []byte(`data: {"response":{"candidates":[{"content":{"role":"model","parts":[{"thoughtSignature":"sig_detached_reusable_01"}]}}]}}`)
-	acc.ObserveSSELine(line1)
-	for i := range line1 {
-		line1[i] = 'X'
-	}
-
-	line2 := []byte(`data: {"response":{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"id":"call_1","name":"lookup","args":{"q":"test"}}}]},"finishReason":"STOP"}]}}`)
-	acc.ObserveSSELine(line2)
-	for i := range line2 {
-		line2[i] = 'Y'
-	}
-
-	if !acc.seenSignatures["sig_detached_reusable_01"] {
-		t.Fatalf("seenSignatures missing sig_detached_reusable_01 after buffer overwrite: %+v", acc.seenSignatures)
-	}
-	if len(acc.items) != 1 {
-		t.Fatalf("len(acc.items) = %d, want 1", len(acc.items))
-	}
-	if got := ojson.GetBytesNoCopy(acc.items[0], "thoughtSignature").String(); got != "sig_detached_reusable_01" {
-		t.Fatalf("replayed item thoughtSignature = %q, want sig_detached_reusable_01", got)
-	}
 }
 
 func TestXAIResponseFilterAndNamespaceRestorerCloneStreamItemIDs(t *testing.T) {

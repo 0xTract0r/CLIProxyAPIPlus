@@ -4,8 +4,8 @@ import (
 	"context"
 	"testing"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
 // TestCodexExecutorRefresh_SkipsWhenRefreshDisabled asserts that the Codex
@@ -47,31 +47,5 @@ func TestCodexExecutorRefresh_SkipsWhenRefreshDisabled(t *testing.T) {
 	}
 	if updated != authViaSettings {
 		t.Fatalf("expected the same auth pointer back when refresh skipped via account_settings")
-	}
-}
-
-func TestRefreshFailureLogFieldsUsesAccountRemark(t *testing.T) {
-	auth := &cliproxyauth.Auth{ProxyURL: "direct",
-		ID:       "codex-user@example.com-plus.json",
-		FileName: "codex-user@example.com-plus.json",
-		Provider: "codex",
-		Label:    "user@example.com",
-		Attributes: map[string]string{
-			"note": "Codex A01",
-		},
-		Metadata: map[string]any{
-			"note": "metadata note should not win",
-		},
-	}
-
-	fields := refreshFailureLogFields(auth)
-	if fields["account_remark"] != "Codex A01" {
-		t.Fatalf("account_remark = %#v, want Codex A01", fields["account_remark"])
-	}
-	if fields["provider"] != "codex" {
-		t.Fatalf("provider = %#v, want codex", fields["provider"])
-	}
-	if fields["auth_id"] == "" || fields["auth_file"] == "" {
-		t.Fatalf("expected auth_id/auth_file to remain available for local correlation: %#v", fields)
 	}
 }

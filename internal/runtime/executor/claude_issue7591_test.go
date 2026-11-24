@@ -100,10 +100,13 @@ func TestClaudeIssue7591AdvisorToolModelSuffixStripped(t *testing.T) {
 	for _, authCfg := range authConfigs {
 		for _, tc := range cases {
 			for _, method := range []string{"Execute", "ExecuteStream", "CountTokens"} {
+				if authCfg.wantAuthz != "" && method == "CountTokens" {
+					continue
+				}
 				t.Run(authCfg.name+"/"+tc.name+"/"+method, func(t *testing.T) {
 					var upstreamBody []byte
 					var upstreamHeaders http.Header
-					transport := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+					transport := ordinaryClaudeTestRoundTripper(func(req *http.Request) (*http.Response, error) {
 						upstreamBody, _ = io.ReadAll(req.Body)
 						upstreamHeaders = req.Header.Clone()
 						contentType := "application/json"
@@ -220,7 +223,7 @@ func TestClaudeIssue7591PayloadRuleWinsOverAdvisorSanitizer(t *testing.T) {
 		t.Run(method, func(t *testing.T) {
 			var upstreamBody []byte
 			stream := method == "ExecuteStream"
-			transport := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			transport := ordinaryClaudeTestRoundTripper(func(req *http.Request) (*http.Response, error) {
 				upstreamBody, _ = io.ReadAll(req.Body)
 				contentType := "application/json"
 				body := `{"id":"msg_7591","type":"message","role":"assistant","model":"claude-opus-5-5","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`

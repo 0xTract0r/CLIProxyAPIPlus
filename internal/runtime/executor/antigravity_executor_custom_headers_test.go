@@ -3,38 +3,28 @@ package executor
 import (
 	"net/http"
 	"testing"
-	"time"
 
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
-func TestAntigravityPrepareRequest_AppliesCustomHeaders(t *testing.T) {
-	req, err := http.NewRequest(http.MethodGet, "https://cloudcode-pa.googleapis.com/v1/models", nil)
+func TestOrdinaryAntigravitySDKUsesBoundAuthorizationAndProtocolHeaders(t *testing.T) {
+	executor := NewAntigravityExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{"base_url": "https://fixture.invalid"},
+		Metadata: map[string]any{"access_token": "fixture-bearer", "project_id": "explicit-project"}}
+	request, err := http.NewRequest(http.MethodPost, "https://fixture.invalid/ordinary", nil)
 	if err != nil {
-		t.Fatalf("new request: %v", err)
+		t.Fatal(err)
 	}
-	auth := &cliproxyauth.Auth{ProxyURL: "direct",
-		Provider: "antigravity",
-		Metadata: map[string]any{
-			"access_token": "fake_token",
-			"expired":      time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
-		},
-		Attributes: map[string]string{
-			"header:X-Custom-Foo":  "bar",
-			"header:X-Account-Tag": "antigravity-a",
-		},
+	request.Header.Set("Accept", "application/json")
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer caller-override")
+	request.Header.Set("X-Fixture-Private-Header", "ignored")
+	if err := executor.PrepareRequest(request, auth); err != nil {
+		t.Fatal(err)
 	}
-
-	if err := NewAntigravityExecutor(nil).PrepareRequest(req, auth); err != nil {
-		t.Fatalf("prepare request: %v", err)
-	}
-	if got := req.Header.Get("Authorization"); got != "Bearer fake_token" {
-		t.Fatalf("expected Authorization=Bearer fake_token, got %q", got)
-	}
-	if got := req.Header.Get("X-Custom-Foo"); got != "bar" {
-		t.Fatalf("expected X-Custom-Foo=bar, got %q", got)
-	}
-	if got := req.Header.Get("X-Account-Tag"); got != "antigravity-a" {
-		t.Fatalf("expected X-Account-Tag=antigravity-a, got %q", got)
+	if request.Header.Get("Accept") != "application/json" || request.Header.Get("Content-Type") != "application/json" ||
+		request.Header.Get("Authorization") != "Bearer fixture-bearer" || request.Header.Get("X-Fixture-Private-Header") != "" {
+		t.Fatal("standard headers or selected credential changed")
 	}
 }

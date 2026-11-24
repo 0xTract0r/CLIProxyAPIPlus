@@ -4,7 +4,7 @@ import (
 	"context"
 	"io"
 	"net/http"
-	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -50,26 +50,22 @@ data: {"response":{"candidates":[{"content":{"role":"model","parts":[{"text":""}
 // finishReason and its usage arriving in separate chunks: the stream must carry
 // exactly one finish_reason, on the last chunk, together with the token counts.
 func TestAntigravityStreamFinalizesSplitTerminalUsageOnce(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = io.WriteString(w, antigravitySplitTerminalSSE)
-		if flusher, ok := w.(http.Flusher); ok {
-			flusher.Flush()
-		}
+	ctx := context.WithValue(t.Context(), "cliproxy.roundtripper", ordinaryAntigravityRT(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"text/event-stream"}},
+			Body: io.NopCloser(strings.NewReader(antigravitySplitTerminalSSE)), Request: req}, nil
 	}))
-	defer server.Close()
 
 	executor := NewAntigravityExecutor(&config.Config{
 		Antigravity:  config.AntigravityConfig{},
 		RequestRetry: 1,
 	})
-	result, errExecute := executor.ExecuteStream(context.Background(), &cliproxyauth.Auth{
+	result, errExecute := executor.ExecuteStream(ctx, &cliproxyauth.Auth{
 		Metadata: map[string]any{
 			"access_token": "token-123",
 			"expired":      time.Now().Add(24 * time.Hour).Format(time.RFC3339),
 			"project_id":   "project-1",
 		},
-		Attributes: map[string]string{"base_url": server.URL},
+		Attributes: map[string]string{"base_url": "https://fixture.invalid"},
 	}, cliproxyexecutor.Request{
 		Model:   "gemini-3.7-flash",
 		Payload: []byte(`{"model":"gemini-3.7-flash","messages":[{"role":"user","content":"hello"}],"stream":true}`),
@@ -127,27 +123,23 @@ func TestAntigravityStreamReportsSplitTerminalUsage(t *testing.T) {
 		usage.RegisterNamedPlugin(t.Name(), antigravityUsageNoop{})
 	})
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = io.WriteString(w, antigravitySplitTerminalSSE)
-		if flusher, ok := w.(http.Flusher); ok {
-			flusher.Flush()
-		}
+	ctx := context.WithValue(t.Context(), "cliproxy.roundtripper", ordinaryAntigravityRT(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"text/event-stream"}},
+			Body: io.NopCloser(strings.NewReader(antigravitySplitTerminalSSE)), Request: req}, nil
 	}))
-	defer server.Close()
 
 	executor := NewAntigravityExecutor(&config.Config{
 		Antigravity:  config.AntigravityConfig{},
 		RequestRetry: 1,
 	})
-	result, errExecute := executor.ExecuteStream(context.Background(), &cliproxyauth.Auth{
+	result, errExecute := executor.ExecuteStream(ctx, &cliproxyauth.Auth{
 		ID: authID,
 		Metadata: map[string]any{
 			"access_token": "token-123",
 			"expired":      time.Now().Add(24 * time.Hour).Format(time.RFC3339),
 			"project_id":   "project-1",
 		},
-		Attributes: map[string]string{"base_url": server.URL},
+		Attributes: map[string]string{"base_url": "https://fixture.invalid"},
 	}, cliproxyexecutor.Request{
 		Model:   "gemini-3.7-flash",
 		Payload: []byte(`{"model":"gemini-3.7-flash","messages":[{"role":"user","content":"hello"}],"stream":true}`),

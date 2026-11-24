@@ -208,6 +208,7 @@ func (r *UsageReporter) ObserveContentEvent(payload []byte) {
 			visible = content && (kind == "response.output_text.delta" || kind == "response.function_call_arguments.delta")
 		case "content_block_delta":
 			recognized = true
+			visible = root.Get("delta.text").String() != "" || root.Get("delta.partial_json").String() != ""
 			for _, p := range []string{"delta.text", "delta.thinking", "delta.partial_json"} {
 				content = content || root.Get(p).String() != ""
 			}

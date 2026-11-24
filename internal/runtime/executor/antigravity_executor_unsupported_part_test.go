@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"net/http"
-	"net/http/httptest"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -21,11 +20,10 @@ import (
 // (Gemini models and Claude-on-Antigravity models), even after earlier turns.
 func TestAntigravityExecutorRefusesAFileOnlyTurnBeforeCallingUpstream(t *testing.T) {
 	var upstreamCalls atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	ctx := context.WithValue(t.Context(), "cliproxy.roundtripper", ordinaryAntigravityRT(func(*http.Request) (*http.Response, error) {
 		upstreamCalls.Add(1)
-		w.WriteHeader(http.StatusOK)
+		return nil, errors.New("unsupported attachment reached upstream")
 	}))
-	defer server.Close()
 
 	const (
 		claudeFile = `{"max_tokens":8,"messages":[{"role":"user","content":"hello"},{"role":"assistant","content":"hi"},{"role":"user","content":[{"type":"container_upload","file_id":"file_not_stored"}]}]}`
@@ -56,7 +54,7 @@ func TestAntigravityExecutorRefusesAFileOnlyTurnBeforeCallingUpstream(t *testing
 				"expired":      time.Now().Add(24 * time.Hour).Format(time.RFC3339),
 				"project_id":   "project-1",
 			},
-			Attributes: map[string]string{"base_url": server.URL},
+			Attributes: map[string]string{"base_url": "https://fixture.invalid"},
 		}
 		exec := NewAntigravityExecutor(&config.Config{})
 		req := cliproxyexecutor.Request{Model: tc.model, Payload: []byte(tc.payload)}
@@ -65,15 +63,15 @@ func TestAntigravityExecutorRefusesAFileOnlyTurnBeforeCallingUpstream(t *testing
 		}
 		calls := map[string]func() error{
 			"Execute": func() error {
-				_, err := exec.Execute(context.Background(), auth, req, opts(false))
+				_, err := exec.Execute(ctx, auth, req, opts(false))
 				return err
 			},
 			"ExecuteStream": func() error {
-				_, err := exec.ExecuteStream(context.Background(), auth, req, opts(true))
+				_, err := exec.ExecuteStream(ctx, auth, req, opts(true))
 				return err
 			},
 			"CountTokens": func() error {
-				_, err := exec.CountTokens(context.Background(), auth, req, opts(false))
+				_, err := exec.CountTokens(ctx, auth, req, opts(false))
 				return err
 			},
 		}
