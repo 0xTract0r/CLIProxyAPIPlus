@@ -191,7 +191,7 @@ func TestOrdinaryPreferredExecutionErrorPriority(t *testing.T) {
 
 // The dispatcher returns a single synthetic grant with an explicit zero budget.
 // A terminal failure remains visible at each public entry point with no second call.
-func TestOrdinaryHomeAuthoritativeZeroEndsFirstAttempt(t *testing.T) {
+func TestOrdinaryHomeSingleCredentialTerminalErrorWithZeroBudget(t *testing.T) {
 	for _, mode := range []string{"execute", "count", "stream"} {
 		t.Run(mode, func(t *testing.T) {
 			failure := &Error{Code: "fixture_upstream_unavailable", Message: "synthetic provider failure", HTTPStatus: http.StatusBadGateway}

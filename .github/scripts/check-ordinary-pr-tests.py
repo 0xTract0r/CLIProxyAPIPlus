@@ -24,7 +24,7 @@ REQUIRED = {
         "TestOrdinarySchedulerSelectionIDContract",
         "TestOrdinarySchedulerRefusalContract",
         "TestOrdinaryPreferredExecutionErrorPriority",
-        "TestOrdinaryHomeAuthoritativeZeroEndsFirstAttempt",
+        "TestOrdinaryHomeSingleCredentialTerminalErrorWithZeroBudget",
         "TestOrdinaryPreDispatchSelectionErrorPrecedence",
         "TestOrdinaryPreDispatchWaitBounds",
         "TestHomeReturnsFirstProviderRefusal",
