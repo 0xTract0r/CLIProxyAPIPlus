@@ -341,5 +341,8 @@ func (h *Handler) updateAmpCode(c *gin.Context, apply func(*config.AmpCode)) {
 	}
 	draft := h.cfg.CloneForRuntime()
 	apply(&draft.AmpCode)
+	if len(h.cfg.AmpCode.UpstreamAPIKeys) > 0 || len(draft.AmpCode.UpstreamAPIKeys) > 0 {
+		draft.AmpCode.RequireUpstreamAPIKeyBinding = true
+	}
 	persistProviderFieldLocked(h, c, draft, &h.cfg.AmpCode, draft.AmpCode)
 }

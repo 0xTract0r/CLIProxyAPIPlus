@@ -2,6 +2,8 @@ package api
 
 import (
 	"errors"
+	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -10,13 +12,19 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	configaccess "github.com/router-for-me/CLIProxyAPI/v8/internal/access/config_access"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
+	sdkaccess "github.com/router-for-me/CLIProxyAPI/v8/sdk/access"
+	"golang.org/x/net/http/httpguts"
 )
 
 type ampForwardState struct {
 	proxy         *httputil.ReverseProxy
 	localhostOnly bool
+	serviceKey    string
+	bindings      map[string]string
+	tenantControl bool
 }
 
 var ampForwardTransport = &http.Transport{
@@ -34,8 +42,14 @@ var ampForwardAPIPaths = []string{"/ads", "/thread-actors"}
 var ampForwardRootBranches = []string{"/threads", "/docs", "/settings", "/auth"}
 var ampForwardRootPaths = []string{"/threads.rss", "/news.rss"}
 
-func (s *Server) reloadAmpForwarding(settings config.AmpCode) error {
-	next := &ampForwardState{localhostOnly: settings.RestrictManagementToLocalhost}
+func (s *Server) reloadAmpForwarding(settings config.AmpCode, clientKeys []string) error {
+	current := s.ampForward.Load()
+	next := &ampForwardState{
+		localhostOnly: settings.RestrictManagementToLocalhost,
+		bindings:      ampClientBindings(settings.UpstreamAPIKeys, clientKeys),
+		tenantControl: settings.RequireUpstreamAPIKeyBinding || len(settings.UpstreamAPIKeys) > 0 ||
+			(current != nil && current.tenantControl),
+	}
 	rawURL := strings.TrimSpace(settings.UpstreamURL)
 	if rawURL == "" {
 		s.ampForward.Store(next)
@@ -44,15 +58,26 @@ func (s *Server) reloadAmpForwarding(settings config.AmpCode) error {
 	target, err := url.Parse(rawURL)
 	if err != nil || target.Hostname() == "" || target.User != nil || target.RawQuery != "" || target.ForceQuery || target.Fragment != "" ||
 		(target.Scheme != "http" && target.Scheme != "https") {
-		// Keep the working target and allow an invalid reload to tighten local access.
-		if current := s.ampForward.Load(); current != nil && next.localhostOnly && !current.localhostOnly {
-			s.ampForward.Store(&ampForwardState{proxy: current.proxy, localhostOnly: true})
+		// Retain the working target. An invalid target must neither defer a revocation
+		// nor authorize a new credential against the previous service.
+		if current != nil {
+			for caller, key := range next.bindings {
+				if current.bindings[caller] != key {
+					delete(next.bindings, caller)
+				}
+			}
+			next.proxy = current.proxy
+			next.serviceKey = current.serviceKey
+			next.localhostOnly = next.localhostOnly || current.localhostOnly
+			s.ampForward.Store(next)
 		}
 		return errors.New("invalid Amp upstream URL (expected an HTTP(S) service URL)")
 	}
-	serviceKey := strings.TrimSpace(settings.UpstreamAPIKey)
+	next.serviceKey = strings.TrimSpace(settings.UpstreamAPIKey)
 	next.proxy = &httputil.ReverseProxy{
 		Transport: ampForwardTransport,
+		// Body-copy errors may contain arbitrary upstream-provided strings.
+		ErrorLog: log.New(io.Discard, "", 0),
 		Rewrite: func(req *httputil.ProxyRequest) {
 			req.SetURL(target)
 			for _, header := range []string{
@@ -66,10 +91,6 @@ func (s *Server) reloadAmpForwarding(settings config.AmpCode) error {
 				query.Del(name)
 			}
 			req.Out.URL.RawQuery = query.Encode()
-			if serviceKey != "" {
-				req.Out.Header.Set("Authorization", "Bearer "+serviceKey)
-				req.Out.Header.Set("X-Api-Key", serviceKey)
-			}
 		},
 		ModifyResponse: func(resp *http.Response) error {
 			removeAmpCORSHeaders(resp.Header)
@@ -84,6 +105,33 @@ func (s *Server) reloadAmpForwarding(settings config.AmpCode) error {
 	}
 	s.ampForward.Store(next)
 	return nil
+}
+
+func ampClientBindings(entries []config.AmpUpstreamAPIKeyEntry, clientKeys []string) map[string]string {
+	active := make(map[string]struct{}, len(clientKeys))
+	for _, caller := range clientKeys {
+		active[strings.TrimSpace(caller)] = struct{}{}
+	}
+	bindings := make(map[string]string)
+	for _, entry := range entries {
+		key := strings.TrimSpace(entry.UpstreamAPIKey)
+		if !httpguts.ValidHeaderFieldValue(key) {
+			key = ""
+		}
+		for _, caller := range entry.APIKeys {
+			caller = strings.TrimSpace(caller)
+			if _, exists := active[caller]; !exists || caller == "" {
+				continue
+			}
+			if previous, exists := bindings[caller]; exists && previous != key {
+				// An ambiguous binding denies this caller regardless of entry order.
+				bindings[caller] = ""
+			} else {
+				bindings[caller] = key
+			}
+		}
+	}
+	return bindings
 }
 
 func isAmpForwardBranch(path, branch string) bool {
@@ -150,32 +198,57 @@ func readyAmpForward(c *gin.Context, state *ampForwardState) bool {
 	return true
 }
 
-func serveAmpForward(c *gin.Context, state *ampForwardState) {
-	if c.GetString("userApiKey") == "" {
+func serveAmpForward(c *gin.Context, state *ampForwardState, requireBinding bool) {
+	caller := c.GetString("userApiKey")
+	if caller == "" {
 		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Amp forwarding requires a configured API key"})
 		return
+	}
+	key := state.serviceKey
+	if requireBinding || state.tenantControl {
+		key = state.bindings[caller]
+		if key == "" || c.GetString("accessProvider") != sdkaccess.DefaultAccessProviderName ||
+			!configaccess.RequestPresentsInlineKey(c.Request, caller) {
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "Amp upstream access is not configured for this API key"})
+			return
+		}
+	}
+	proxy := *state.proxy
+	if key != "" {
+		proxy.Transport = ampProtectedTransport{RoundTripper: state.proxy.Transport, caller: caller, upstreamKey: key}
+		proxy.Rewrite = func(req *httputil.ProxyRequest) {
+			state.proxy.Rewrite(req)
+			req.Out.Header.Set("Authorization", "Bearer "+key)
+			req.Out.Header.Set("X-Api-Key", key)
+			req.Out.Header.Set("Accept-Encoding", "identity")
+		}
+		proxy.ModifyResponse = func(resp *http.Response) error {
+			if err := state.proxy.ModifyResponse(resp); err != nil {
+				return err
+			}
+			return protectAmpForwardResponse(resp, caller, key)
+		}
 	}
 	defer func() {
 		if recovered := recover(); recovered != nil && recovered != http.ErrAbortHandler {
 			panic(recovered)
 		}
 	}()
-	state.proxy.ServeHTTP(c.Writer, c.Request)
+	proxy.ServeHTTP(c.Writer, c.Request)
 }
 
 func (s *Server) registerAmpForwardRoutes() {
 	auth := AuthMiddleware(s.accessManager)
 	surface := func(c *gin.Context) {
-		state := s.ampForward.Load()
-		if !readyAmpForward(c, state) {
-			return
+		if readyAmpForward(c, s.ampForward.Load()) {
+			c.Next()
 		}
-		// Keep the same target and locality decision for this request across hot reload.
-		c.Set("amp-forward-state", state)
-		c.Next()
 	}
 	proxy := func(c *gin.Context) {
-		serveAmpForward(c, c.MustGet("amp-forward-state").(*ampForwardState))
+		state := s.ampForward.Load()
+		if readyAmpForward(c, state) {
+			serveAmpForward(c, state, false)
+		}
 	}
 	api := s.engine.Group("/api", surface, auth, proxy)
 	for _, path := range ampForwardAPIBranches {

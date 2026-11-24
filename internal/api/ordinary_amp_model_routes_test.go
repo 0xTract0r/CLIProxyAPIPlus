@@ -91,12 +91,15 @@ func TestOrdinaryAmpModelRoutes(t *testing.T) {
 			}
 		})
 	}
-	for _, item := range []struct{ method, path string }{
-		{http.MethodGet, "/api/provider/google/v1beta/models/missing"},
-		{http.MethodPost, "/api/provider/openai/v1/models"},
-		{http.MethodPost, "/api/provider/openai/v1/chat/completions"},
+	for _, item := range []struct {
+		method, path string
+		status       int
+	}{
+		{http.MethodGet, "/api/provider/google/v1beta/models/missing", http.StatusNotFound},
+		{http.MethodPost, "/api/provider/openai/v1/models", http.StatusNotFound},
+		{http.MethodPost, "/api/provider/openai/v1/chat/completions", http.StatusBadRequest},
 	} {
-		if got := call(server, item.method, item.path, "test-key").Code; got != http.StatusNotFound {
+		if got := call(server, item.method, item.path, "test-key").Code; got != item.status {
 			t.Errorf("%s %s: status=%d", item.method, item.path, got)
 		}
 	}

@@ -193,7 +193,7 @@ func (s *Server) forwardUnresolvedAmpInference(c *gin.Context) bool {
 		return false
 	}
 	if readyAmpForward(c, state) {
-		serveAmpForward(c, state)
+		serveAmpForward(c, state, true)
 	}
 	return true
 }

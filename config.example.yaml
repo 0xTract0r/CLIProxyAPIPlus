@@ -1281,8 +1281,13 @@ logging-display-timezone-offset-hours: 8
 #   startup-catch-up: false
 
 # Existing Amp configuration can be edited in place. Keep this example commented.
+# Amp inference forwarded upstream requires an explicit client API key binding.
+# Keep the binding mode enabled in tenant configurations even when every binding is revoked.
+# Management mapping changes persist this mode automatically.
 # ampcode:
 #   upstream-url: ""
+#   require-upstream-api-key-binding: true
+#   upstream-api-keys: []
 
 # Standard dynamic library plugins are trusted in-process code. They are disabled by default.
 # Build Go examples with go build -buildmode=c-shared for the target GOOS/GOARCH.

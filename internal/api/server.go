@@ -300,7 +300,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 
 	// Setup routes
 	s.setupRoutes()
-	if errAmp := s.reloadAmpForwarding(cfg.AmpCode); errAmp != nil {
+	if errAmp := s.reloadAmpForwarding(cfg.AmpCode, cfg.APIKeys); errAmp != nil {
 		log.Warn("Amp forwarding disabled: invalid upstream configuration")
 	}
 	s.registerAmpForwardRoutes()

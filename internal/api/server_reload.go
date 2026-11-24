@@ -194,8 +194,11 @@ func (s *Server) UpdateClientsContext(ctx context.Context, cfg *config.Config) b
 	var errAmp error
 	if previousCfg == nil || previousCfg.AmpCode.UpstreamURL != cfg.AmpCode.UpstreamURL ||
 		previousCfg.AmpCode.UpstreamAPIKey != cfg.AmpCode.UpstreamAPIKey ||
+		previousCfg.AmpCode.RequireUpstreamAPIKeyBinding != cfg.AmpCode.RequireUpstreamAPIKeyBinding ||
+		!reflect.DeepEqual(previousCfg.AmpCode.UpstreamAPIKeys, cfg.AmpCode.UpstreamAPIKeys) ||
+		!reflect.DeepEqual(previousCfg.APIKeys, cfg.APIKeys) ||
 		previousCfg.AmpCode.RestrictManagementToLocalhost != cfg.AmpCode.RestrictManagementToLocalhost {
-		errAmp = s.reloadAmpForwarding(cfg.AmpCode)
+		errAmp = s.reloadAmpForwarding(cfg.AmpCode, cfg.APIKeys)
 	}
 	s.cfgMu.Unlock()
 	if errAmp != nil {

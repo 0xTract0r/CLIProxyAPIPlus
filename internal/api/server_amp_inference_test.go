@@ -54,7 +54,8 @@ func TestOrdinaryAmpProviderInferenceUsesSelectedCredential(t *testing.T) {
 	const id = "amp-ordinary-credential"
 	const localhost = "127.0.0.1:5300"
 	s := newAmpForwardingFixture(t, config.AmpCode{
-		UpstreamURL: "http://amp-ordinary.example.invalid/fixture-base", UpstreamAPIKey: "synthetic-service-key",
+		UpstreamURL:                   "http://amp-ordinary.example.invalid/fixture-base",
+		UpstreamAPIKeys:               []config.AmpUpstreamAPIKeyEntry{{APIKeys: []string{ampInboundFixture}, UpstreamAPIKey: "synthetic-service-key"}},
 		RestrictManagementToLocalhost: true,
 		ModelMappings: []config.AmpModelMapping{
 			{From: "client-project/original-chat", To: "client-project/configured-chat"},

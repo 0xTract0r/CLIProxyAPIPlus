@@ -1268,16 +1268,21 @@ type AmpModelMapping struct {
 }
 
 type AmpCode struct {
-	// UpstreamURL defines the upstream Amp control plane used for non-provider calls.
+	// UpstreamURL defines the Amp service for control-plane calls and eligible inference fallback.
 	UpstreamURL string `yaml:"upstream-url" json:"upstream-url"`
 
-	// UpstreamAPIKey optionally overrides the Authorization header when proxying Amp upstream calls.
+	// UpstreamAPIKey is the shared credential for legacy control-plane-only forwarding.
 	UpstreamAPIKey string `yaml:"upstream-api-key" json:"upstream-api-key"`
 
 	// UpstreamAPIKeys maps client API keys (from top-level api-keys) to upstream API keys.
 	// When a request is authenticated with one of the APIKeys, the corresponding UpstreamAPIKey
-	// is used for the upstream Amp request.
-	UpstreamAPIKeys []AmpUpstreamAPIKeyEntry `yaml:"upstream-api-keys,omitempty" json:"upstream-api-keys,omitempty"`
+	// is used for the upstream Amp request. YAML saves include an empty list so the
+	// comment-preserving merge can remove bindings when the last entry is revoked.
+	UpstreamAPIKeys []AmpUpstreamAPIKeyEntry `yaml:"upstream-api-keys" json:"upstream-api-keys,omitempty"`
+
+	// RequireUpstreamAPIKeyBinding keeps the control plane tenant-scoped with an empty list.
+	// Management saves retain this mode when the final binding is revoked.
+	RequireUpstreamAPIKeyBinding bool `yaml:"require-upstream-api-key-binding,omitempty" json:"require-upstream-api-key-binding,omitempty"`
 
 	// RestrictManagementToLocalhost restricts Amp management routes (/api/user, /api/threads, etc.)
 	// to only accept connections from localhost (127.0.0.1, ::1). When true, prevents drive-by
