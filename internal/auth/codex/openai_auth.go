@@ -167,15 +167,26 @@ func (o *CodexAuth) ExchangeCodeForTokensWithRedirect(ctx context.Context, code,
 
 	// Parse token response
 	var tokenResp struct {
-		AccessToken  string `json:"access_token"`
-		RefreshToken string `json:"refresh_token"`
-		IDToken      string `json:"id_token"`
-		TokenType    string `json:"token_type"`
-		ExpiresIn    int    `json:"expires_in"`
+		AccessToken  string          `json:"access_token"`
+		RefreshToken string          `json:"refresh_token"`
+		IDToken      string          `json:"id_token"`
+		TokenType    string          `json:"token_type"`
+		ExpiresIn    json.RawMessage `json:"expires_in"`
 	}
 
 	if err = json.Unmarshal(body, &tokenResp); err != nil {
 		return nil, fmt.Errorf("failed to parse token response: status=%d invalid JSON token payload", resp.StatusCode)
+	}
+
+	// An omitted expiry keeps the existing immediate-expiry behavior. An
+	// explicitly supplied expiry follows the same bounds as token refresh.
+	var expiresIn time.Duration
+	if len(tokenResp.ExpiresIn) != 0 {
+		var validExpiry bool
+		expiresIn, validExpiry = positiveOAuthExpiryDuration(ojson.ParseBytes(tokenResp.ExpiresIn))
+		if !validExpiry {
+			return nil, fmt.Errorf("failed to parse token response: status=%d invalid expires_in", resp.StatusCode)
+		}
 	}
 
 	// Extract account ID from ID token
@@ -201,7 +212,7 @@ func (o *CodexAuth) ExchangeCodeForTokensWithRedirect(ctx context.Context, code,
 		AccountID:    accountID,
 		Email:        email,
 		PlanType:     planType,
-		Expire:       time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second).Format(time.RFC3339),
+		Expire:       time.Now().Add(expiresIn).Format(time.RFC3339),
 	}
 
 	// Create auth bundle

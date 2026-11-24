@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestOrdinaryRefreshLegacyErrors(t *testing.T) {
@@ -122,4 +123,55 @@ func TestOrdinaryTokenResponseContentEncodings(t *testing.T) {
 			}
 		}
 	})
+}
+
+func TestOrdinaryInitialOAuthExchangeValidatesExpiry(t *testing.T) {
+	const secret = "fixture-token-never-in-diagnostic"
+	for _, tc := range []struct {
+		name, expiry string
+		valid        bool
+	}{
+		{"integer", `,"expires_in":3600`, true},
+		{"integral number", `,"expires_in":3600.0`, true},
+		{"scientific integer", `,"expires_in":3.6e3`, true},
+		{"fractional", `,"expires_in":3600.5`, false},
+		{"duration wraps despite valid int64", `,"expires_in":10000000000`, false},
+		{"provider omits optional expiry", "", true},
+		{"null", `,"expires_in":null`, false},
+		{"last duplicate wraps", `,"expires_in":3600,"expires_in":10000000000`, false},
+		{"zero", `,"expires_in":0`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			client := &http.Client{Transport: ordinaryOAuthRoundTripper(func(r *http.Request) (*http.Response, error) {
+				calls++
+				if r.URL.String() != TokenURL || r.Method != http.MethodPost {
+					t.Fatal("incorrect official token endpoint")
+				}
+				return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"access_token":"` + secret + `","refresh_token":"fixture-refresh"` + tc.expiry + `}`))}, nil
+			})}
+			started := time.Now().Truncate(time.Second)
+			got, err := NewCodexAuthWithHTTPClient(client).ExchangeCodeForTokens(t.Context(), "fixture-code", &PKCECodes{CodeVerifier: "fixture"})
+			if calls != 1 {
+				t.Fatalf("exchange calls=%d", calls)
+			}
+			if !tc.valid {
+				if err == nil || got != nil || strings.Contains(err.Error(), secret) {
+					t.Fatalf("invalid exchange returned credentials=%t error=%v", got != nil, err)
+				}
+				return
+			}
+			if err != nil || got == nil {
+				t.Fatalf("valid exchange: %v", err)
+			}
+			expires, parseErr := time.Parse(time.RFC3339, got.TokenData.Expire)
+			wantDuration := time.Hour
+			if tc.expiry == "" {
+				wantDuration = 0
+			}
+			if parseErr != nil || expires.Before(started.Add(wantDuration)) || expires.After(time.Now().Add(wantDuration)) {
+				t.Fatalf("unexpected expiry %q", got.TokenData.Expire)
+			}
+		})
+	}
 }
