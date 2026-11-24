@@ -147,7 +147,7 @@ func invokeAfterAuthMode(manager *Manager, provider, model, mode string, opts cl
 	}
 }
 
-func TestAfterAuthCredentialTerminateFailover(t *testing.T) {
+func TestAfterAuthCredentialTerminateRejectsWithoutReplay(t *testing.T) {
 	for _, homeMode := range []bool{false, true} {
 		for _, mode := range []string{"execute", "count", "stream"} {
 			t.Run(fmt.Sprintf("home=%t/%s", homeMode, mode), func(t *testing.T) {
@@ -196,21 +196,13 @@ func TestAfterAuthCredentialTerminateFailover(t *testing.T) {
 				}
 
 				payload, errInvoke := invokeAfterAuthMode(manager, provider, model, mode, opts)
-				if errInvoke != nil {
-					t.Fatalf("invokeAfterAuthMode() error = %v", errInvoke)
+				var refusal *cliproxyexecutor.RequestTerminatedError
+				if !errors.As(errInvoke, &refusal) || refusal.StatusCode() != http.StatusForbidden ||
+					string(refusal.ResponseBody()) != "cred-a refused" || refusal.ResponseHeaders().Get("X-Refused") != "cred-a" || len(payload) != 0 {
+					t.Fatalf("original refusal missing: error=%v payload=%q", errInvoke, payload)
 				}
-				if !reflect.DeepEqual(seenAuths, []string{"cred-a", "cred-b"}) {
-					t.Fatalf("interceptor saw %v, want [cred-a cred-b]", seenAuths)
-				}
-				if calls := executor.Calls(); !reflect.DeepEqual(calls, []string{"cred-b"}) {
-					t.Fatalf("executor calls = %v, want [cred-b]", calls)
-				}
-				wantPayload := "ok:cred-b"
-				if mode == "count" {
-					wantPayload = "count:cred-b"
-				}
-				if string(payload) != wantPayload {
-					t.Fatalf("payload = %q, want %q", string(payload), wantPayload)
+				if !reflect.DeepEqual(seenAuths, []string{"cred-a"}) || len(executor.Calls()) != 0 {
+					t.Fatalf("unexpected processing after refusal: selected=%v executed=%v", seenAuths, executor.Calls())
 				}
 				for _, res := range hook.Results() {
 					if res.AuthID == "cred-a" {
@@ -224,8 +216,8 @@ func TestAfterAuthCredentialTerminateFailover(t *testing.T) {
 					dispatcher.mu.Lock()
 					excluded := append([][]string(nil), dispatcher.excluded...)
 					dispatcher.mu.Unlock()
-					if len(excluded) != 2 || len(excluded[0]) != 0 || !reflect.DeepEqual(excluded[1], []string{"cred-a"}) {
-						t.Fatalf("Home excluded_auth_ids = %v, want [[] [cred-a]]", excluded)
+					if len(excluded) != 1 || len(excluded[0]) != 0 {
+						t.Fatalf("Home excluded_auth_ids = %v, want [[]]", excluded)
 					}
 				} else {
 					credA, ok := manager.GetByID("cred-a")

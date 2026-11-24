@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -1922,7 +1923,7 @@ func TestResponseInterceptRequest_SetsKindAcrossAuthManagerAndModelListPaths(t *
 	})
 }
 
-func TestHandlerAfterAuthCredentialTerminateFailover(t *testing.T) {
+func TestHandlerAfterAuthCredentialTerminateRejectsWithoutReplay(t *testing.T) {
 	model := "handler-after-auth-cred-terminate"
 	var executedAuths []string
 	executor := &interceptorCaptureExecutor{
@@ -1945,10 +1946,12 @@ func TestHandlerAfterAuthCredentialTerminateFailover(t *testing.T) {
 		}
 	}
 	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
-	var responseReqBody []byte
+	var intercepted []string
+	var responseCalls int
 	handler.SetPluginHost(&handlerInterceptorTestHost{
 		interceptRequestAfterAuth: func(_ context.Context, req pluginapi.RequestInterceptRequest) pluginapi.RequestInterceptResponse {
 			authID, _ := req.Metadata[coreexecutor.SelectedAuthMetadataKey].(string)
+			intercepted = append(intercepted, authID)
 			if authID == "handler-cred-a" {
 				return pluginapi.RequestInterceptResponse{
 					Headers:        http.Header{"X-Refused-Mutation": {"should-not-leak"}},
@@ -1962,23 +1965,21 @@ func TestHandlerAfterAuthCredentialTerminateFailover(t *testing.T) {
 			return pluginapi.RequestInterceptResponse{}
 		},
 		interceptResponse: func(_ context.Context, req pluginapi.ResponseInterceptRequest) pluginapi.ResponseInterceptResponse {
-			responseReqBody = cloneBytes(req.RequestBody)
+			responseCalls++
 			return pluginapi.ResponseInterceptResponse{}
 		},
 	})
 
 	body, _, errMsg := handler.ExecuteWithAuthManager(context.Background(), "openai", model, []byte(`{"model":"`+model+`"}`), "")
-	if errMsg != nil {
-		t.Fatalf("ExecuteWithAuthManager() errMsg = %#v", errMsg)
+	if errMsg == nil || errMsg.StatusCode != http.StatusForbidden || len(body) != 0 {
+		t.Fatalf("expected original 403 and no success body, got %#v, %q", errMsg, body)
 	}
-	if string(body) != "ok:handler-cred-b" {
-		t.Fatalf("body = %q, want ok:handler-cred-b", string(body))
+	var refusal *coreexecutor.RequestTerminatedError
+	if !errors.As(errMsg.Error, &refusal) || string(refusal.ResponseBody()) != `{"error":"cred-a refused"}` {
+		t.Fatalf("original refusal missing: %v", errMsg.Error)
 	}
-	if len(executedAuths) != 1 || executedAuths[0] != "handler-cred-b" {
-		t.Fatalf("executedAuths = %v, want [handler-cred-b]", executedAuths)
-	}
-	if strings.Contains(string(responseReqBody), "leaked") {
-		t.Fatalf("refused credential body leaked into response interceptor: %s", string(responseReqBody))
+	if len(intercepted) != 1 || intercepted[0] != "handler-cred-a" || len(executedAuths) != 0 || responseCalls != 0 {
+		t.Fatalf("unexpected processing after the local refusal: selected=%v executed=%v response intercepts=%d", intercepted, executedAuths, responseCalls)
 	}
 }
 

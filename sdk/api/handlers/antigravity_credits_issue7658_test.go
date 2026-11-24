@@ -267,27 +267,12 @@ func TestExecuteStreamWithAuthManager_IncompleteSSEBeforeValidationRequiredDoesN
 	}
 }
 
-func TestExecuteStreamWithAuthManager_IncompleteSSEBeforeValidationRequiredContinueRuleRotates(t *testing.T) {
+func TestExecuteStreamWithAuthManager_ProviderRefusalNeverReplays(t *testing.T) {
 	const model = "claude-sonnet-4-6-issue7658-handler-ssecont"
-	wantPayload := "data: {\"type\":\"response.completed\"}\n\n"
-	executor := &issue7658IncompleteSSEValidationExecutor{
-		secondAuthID: "ag-7658-ssec-2",
-		secondData:   []byte(wantPayload),
-	}
+	executor := &issue7658IncompleteSSEValidationExecutor{secondAuthID: "ag-7658-ssec-2"}
 	manager := coreauth.NewManager(nil, &coreauth.FillFirstSelector{}, nil)
-	manager.SetConfig(&internalconfig.Config{
-		QuotaExceeded: internalconfig.QuotaExceeded{AntigravityCredits: true},
-		OAuthRequestScopedErrors: map[string][]internalconfig.RequestScopedErrorRule{
-			"antigravity": {
-				{
-					Status: http.StatusForbidden,
-					Match:  []string{"VALIDATION_REQUIRED"},
-					Action: "continue",
-				},
-			},
-		},
-	})
-	manager.SetRetryConfig(0, 0, 1)
+	// Even when startup retries are configured, a provider refusal is terminal.
+	manager.SetRetryConfig(2, 0, 2)
 	manager.RegisterExecutor(executor)
 
 	for _, id := range []string{"ag-7658-ssec-1", "ag-7658-ssec-2"} {
@@ -325,11 +310,12 @@ func TestExecuteStreamWithAuthManager_IncompleteSSEBeforeValidationRequiredConti
 			gotErr = msg
 		}
 	}
-	if gotErr != nil {
-		t.Fatalf("unexpected err = %+v, want rotation to second auth on continue rule", gotErr)
+	if gotErr == nil || gotErr.StatusCode != http.StatusTooManyRequests || !strings.Contains(gotErr.Error.Error(), "quota exhausted") || len(gotData) != 0 {
+		t.Fatalf("expected original refusal and no payload: err=%+v data=%q", gotErr, gotData)
 	}
-	if string(gotData) != wantPayload {
-		t.Fatalf("data = %q, want %q", string(gotData), wantPayload)
+	normal, credits := executor.snapshot()
+	if len(normal) != 1 || normal[0] != "ag-7658-ssec-1" || len(credits) != 0 {
+		t.Fatalf("request replayed: normal=%v other=%v", normal, credits)
 	}
 }
 

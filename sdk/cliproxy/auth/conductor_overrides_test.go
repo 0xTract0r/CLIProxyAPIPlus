@@ -623,72 +623,22 @@ func newCredentialRetryLimitTestManager(t *testing.T, maxRetryCredentials int, a
 	return m, executor
 }
 
-func TestManager_MaxRetryCredentials_LimitsCrossCredentialRetries(t *testing.T) {
+func TestManager_MaxRetryCredentialsConfigRemainsBounded(t *testing.T) {
+	for _, tc := range []struct{ input, want int }{{1, 1}, {3, 3}, {0, internalconfig.DefaultMaxRetryCredentials}, {-1, internalconfig.DefaultMaxRetryCredentials}} {
+		manager := NewManager(nil, nil, nil)
+		manager.SetRetryConfig(0, 0, tc.input)
+		_, attempts, _ := manager.retrySettings()
+		if attempts != tc.want {
+			t.Errorf("configured limit %d results in %d, want %d", tc.input, attempts, tc.want)
+		}
+	}
+	manager, executor := newCredentialRetryLimitTestManager(t, 1, 3)
 	request := cliproxyexecutor.Request{Model: "test-model"}
-	testCases := []struct {
-		name   string
-		invoke func(*Manager) error
-	}{
-		{
-			name: "execute",
-			invoke: func(m *Manager) error {
-				_, errExecute := m.Execute(context.Background(), []string{"claude"}, request, cliproxyexecutor.Options{})
-				return errExecute
-			},
-		},
-		{
-			name: "execute_count",
-			invoke: func(m *Manager) error {
-				_, errExecute := m.ExecuteCount(context.Background(), []string{"claude"}, request, cliproxyexecutor.Options{})
-				return errExecute
-			},
-		},
-		{
-			name: "execute_stream",
-			invoke: func(m *Manager) error {
-				_, errExecute := m.ExecuteStream(context.Background(), []string{"claude"}, request, cliproxyexecutor.Options{})
-				return errExecute
-			},
-		},
+	_, err := manager.Execute(t.Context(), []string{"claude"}, request, cliproxyexecutor.Options{})
+	if err == nil || executor.Calls() != 1 {
+		t.Fatalf("explicit limit of one must make only one attempt: calls=%d err=%v", executor.Calls(), err)
 	}
 
-	// fork(harden-account-scheduling-limiter ERR-2): 3 credentials so the explicit cap,
-	// the unset/0 default cap, and the explicit unbounded escape hatch are distinguishable.
-	const authCount = 3
-
-	for _, tc := range testCases {
-		tc := tc
-		t.Run(tc.name, func(t *testing.T) {
-			limitedManager, limitedExecutor := newCredentialRetryLimitTestManager(t, 1, authCount)
-			if errInvoke := tc.invoke(limitedManager); errInvoke == nil {
-				t.Fatalf("expected error for limited retry execution")
-			}
-			if calls := limitedExecutor.Calls(); calls != 1 {
-				t.Fatalf("expected 1 call with max-retry-credentials=1, got %d", calls)
-			}
-
-			// max-retry-credentials=0 is indistinguishable from "left unset" in yaml and
-			// now defaults to DefaultMaxRetryCredentials (2), not the legacy unbounded
-			// try-all -- see auth.Manager.SetRetryConfig.
-			defaultManager, defaultExecutor := newCredentialRetryLimitTestManager(t, 0, authCount)
-			if errInvoke := tc.invoke(defaultManager); errInvoke == nil {
-				t.Fatalf("expected error for default-cap retry execution")
-			}
-			if calls := defaultExecutor.Calls(); calls != 2 {
-				t.Fatalf("expected 2 calls with max-retry-credentials unset/0 (defaults to DefaultMaxRetryCredentials=2), got %d", calls)
-			}
-
-			// A negative value is the explicit escape hatch that restores the legacy
-			// unbounded try-all failover (walks every available credential).
-			unlimitedManager, unlimitedExecutor := newCredentialRetryLimitTestManager(t, -1, authCount)
-			if errInvoke := tc.invoke(unlimitedManager); errInvoke == nil {
-				t.Fatalf("expected error for unlimited retry execution")
-			}
-			if calls := unlimitedExecutor.Calls(); calls != authCount {
-				t.Fatalf("expected %d calls with max-retry-credentials=-1 (explicit unbounded escape hatch), got %d", authCount, calls)
-			}
-		})
-	}
 }
 
 func TestManager_ModelSupportBadRequest_FallsBackAndSuspendsAuth(t *testing.T) {

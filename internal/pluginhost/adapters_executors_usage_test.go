@@ -1233,7 +1233,7 @@ func (e *endToEndSelectionTestExecutor) HttpRequest(ctx context.Context, auth *c
 	return nil, nil
 }
 
-func TestSchedulerPickAndUsageRecordShareSelectionIDEndToEnd(t *testing.T) {
+func TestSchedulerPickAndUsageRecordShareSelectionIDWithoutReplay(t *testing.T) {
 	provider := "selection-e2e-provider"
 	model := "selection-e2e-model"
 
@@ -1272,26 +1272,23 @@ func TestSchedulerPickAndUsageRecordShareSelectionIDEndToEnd(t *testing.T) {
 
 	manager := coreauth.NewManager(nil, &coreauth.FillFirstSelector{}, nil)
 	manager.SetRetryConfig(1, 0, 0)
-	coreauth.SetQuotaCooldownDisabled(true)
-	t.Cleanup(func() { coreauth.SetQuotaCooldownDisabled(false) })
 	manager.SetPluginScheduler(host)
 
 	if _, errReg := manager.Register(context.Background(), &coreauth.Auth{ID: "auth-e2e-1", Provider: provider}); errReg != nil {
 		t.Fatalf("Register(auth-e2e-1) error = %v", errReg)
 	}
 
-	attemptCount := 0
+	refusedCalls := 0
 	streamRelease := make(chan struct{})
 	manager.RegisterExecutor(&endToEndSelectionTestExecutor{
 		provider: provider,
 		execute: func(ctx context.Context, auth *coreauth.Auth, req coreexecutor.Request, opts coreexecutor.Options) (coreexecutor.Response, error) {
 			reporter := helps.NewUsageReporter(ctx, provider, req.Model, auth)
-			if opts.Metadata["mode"] == "retry-429-once" {
-				attemptCount++
-				if attemptCount == 1 {
-					reporter.PublishFailure(ctx, &coreauth.Error{Code: "rate_limited", Message: "429", HTTPStatus: http.StatusTooManyRequests, Retryable: true})
-					return coreexecutor.Response{}, &coreauth.Error{Code: "rate_limited", Message: "429", HTTPStatus: http.StatusTooManyRequests, Retryable: true}
-				}
+			if opts.Metadata["mode"] == "provider-refusal" {
+				refusedCalls++
+				refused := &coreauth.Error{Code: "rate_limited", Message: "429", HTTPStatus: http.StatusTooManyRequests, Retryable: true}
+				reporter.PublishFailure(ctx, refused)
+				return coreexecutor.Response{}, refused
 			}
 			reporter.Publish(ctx, coreusage.Detail{InputTokens: 10, OutputTokens: 5, TotalTokens: 15})
 			return coreexecutor.Response{Payload: []byte(`{"ok":true}`)}, nil
@@ -1310,33 +1307,7 @@ func TestSchedulerPickAndUsageRecordShareSelectionIDEndToEnd(t *testing.T) {
 		},
 	})
 
-	// 1. Single credential outer retry after 429: two Picks, two distinct SelectionIDs, each matching its UsageRecord.
-	traceCtx := logging.WithRequestID(context.Background(), "trace-429")
-	_, errExec := manager.Execute(traceCtx, []string{provider}, coreexecutor.Request{Model: model}, coreexecutor.Options{
-		Metadata: map[string]any{"mode": "retry-429-once"},
-	})
-	if errExec != nil {
-		t.Fatalf("Execute(retry-429-once) error = %v", errExec)
-	}
-	pick1 := <-pickSelectionIDs
-	pick2 := <-pickSelectionIDs
-	if pick1 == "" || pick2 == "" || pick1 == pick2 {
-		t.Fatalf("outer retry pick SelectionIDs = (%q, %q), want two distinct non-empty IDs", pick1, pick2)
-	}
-
-	rec1 := waitPluginUsageRecord(t, usageRecords)
-	rec2 := waitPluginUsageRecord(t, usageRecords)
-	if rec1.SelectionID != pick1 || !rec1.Failed {
-		t.Fatalf("first UsageRecord = (SelectionID=%q, Failed=%v), want (%q, true)", rec1.SelectionID, rec1.Failed, pick1)
-	}
-	if rec2.SelectionID != pick2 || rec2.Failed {
-		t.Fatalf("second UsageRecord = (SelectionID=%q, Failed=%v), want (%q, false)", rec2.SelectionID, rec2.Failed, pick2)
-	}
-	if rec1.RequestID == rec2.RequestID {
-		t.Fatalf("UsageRecord RequestIDs should remain distinct: %q", rec1.RequestID)
-	}
-
-	// 2. Concurrent requests and delayed asynchronous streaming usage keep their own SelectionIDs.
+	// Concurrent requests and delayed asynchronous streaming usage keep their own SelectionIDs.
 	sharedOpts := coreexecutor.Options{Stream: true, Metadata: map[string]any{"shared": "true"}}
 	streamRes, errStream := manager.ExecuteStream(context.Background(), []string{provider}, coreexecutor.Request{Model: model}, sharedOpts)
 	if errStream != nil {
@@ -1365,6 +1336,30 @@ func TestSchedulerPickAndUsageRecordShareSelectionIDEndToEnd(t *testing.T) {
 	if streamRec.SelectionID != streamPickID {
 		t.Fatalf("delayed stream UsageRecord.SelectionID = %q, want %q", streamRec.SelectionID, streamPickID)
 	}
+	// This is a separate client request after the successful stream and execute.
+	ctx := logging.WithRequestID(t.Context(), "trace-429")
+	_, err := manager.Execute(ctx, []string{provider}, coreexecutor.Request{Model: model}, coreexecutor.Options{
+		Metadata: map[string]any{"mode": "provider-refusal"},
+	})
+	var refused *coreauth.Error
+	if !errors.As(err, &refused) || refused.HTTPStatus != http.StatusTooManyRequests {
+		t.Fatalf("expected original 429: %v", err)
+	}
+	if refusedCalls != 1 {
+		t.Fatalf("expected one executor call for the refusal, got %d", refusedCalls)
+	}
+	refusalPick := <-pickSelectionIDs
+	rec := waitPluginUsageRecord(t, usageRecords)
+	if refusalPick == "" || refusalPick == concurrentPickID || refusalPick == streamPickID ||
+		rec.SelectionID != refusalPick || !rec.Failed {
+		t.Fatalf("refusal selection = %q, usage selection=%q failed=%v", refusalPick, rec.SelectionID, rec.Failed)
+	}
+	select {
+	case id := <-pickSelectionIDs:
+		t.Fatalf("unexpected replay selection: %q", id)
+	default:
+	}
+
 }
 
 func waitPluginUsageRecord(t *testing.T, ch <-chan pluginapi.UsageRecord) pluginapi.UsageRecord {
