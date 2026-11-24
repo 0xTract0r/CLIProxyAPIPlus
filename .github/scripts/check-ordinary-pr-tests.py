@@ -84,6 +84,7 @@ REQUIRED = {
         "TestExecuteStreamWithAuthManager_EmptyClosedStream",
     },
     "github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers/openai": {
+        "TestOrdinaryChatFirstFrameRetryAfterHTTP",
         "TestResponsesSSEBeforeFirstFramePreservesHTTPRefusal",
         "TestResponsesHandlerSendKeepAliveBeforeFT",
     },

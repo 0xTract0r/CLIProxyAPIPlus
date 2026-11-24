@@ -108,7 +108,9 @@ func TestOrdinaryHomeExecuteRefusalKeepsPublicIdentity(t *testing.T) {
 func TestOrdinaryHomeFirstStreamFrameRefusalIsTerminal(t *testing.T) {
 	refusal := &ordinaryHomeDenied{code: http.StatusTooManyRequests}
 	m, d, e := fixtureOrdinaryHomeErrorManager(t, nil, refusal)
+	started := time.Now()
 	stream, err := m.ExecuteStream(context.Background(), []string{"home-execution"}, ce.Request{Model: "test"}, ce.Options{Stream: true})
+	returned := time.Now()
 	if stream != nil {
 		t.Fatal("first-frame refusal exposed a stream")
 	}
@@ -116,10 +118,29 @@ func TestOrdinaryHomeFirstStreamFrameRefusalIsTerminal(t *testing.T) {
 	if !errors.As(err, &failure) || failure != refusal || statusCodeFromError(err) != http.StatusTooManyRequests || err.Error() != refusal.Error() {
 		t.Fatalf("first-frame error = %T %v, want the original provider 429", err, err)
 	}
-	var carrier interface{ RetryAfter() *time.Duration }
-	if !errors.As(err, &carrier) || carrier.RetryAfter() == nil || *carrier.RetryAfter() != 61*time.Second {
-		t.Fatal("public stream refusal lost the provider retry delay")
+	const providerDelay = 61 * time.Second
+	if original := failure.RetryAfter(); original == nil || *original != providerDelay {
+		t.Fatalf("original provider delay changed: %v", original)
 	}
+	var carrier interface{ RetryAfter() *time.Duration }
+	if !errors.As(err, &carrier) {
+		t.Fatal("public stream refusal lost the provider retry deadline")
+	}
+	sampledBefore := time.Now()
+	remaining := carrier.RetryAfter()
+	sampledAfter := time.Now()
+	if remaining == nil || *remaining <= 0 {
+		t.Fatalf("public stream refusal has no positive retry deadline: %T", carrier)
+	}
+	// RetryAfter reports the time remaining. The original deadline must
+	// still be at least a full provider delay from this request's start and
+	// no later than that delay measured from publication of the error.
+	if sampledAfter.Add(*remaining).Before(started.Add(providerDelay)) ||
+		sampledBefore.Add(*remaining).After(returned.Add(providerDelay)) {
+		t.Fatalf("public %T RetryAfter = %s, outside the deadline bounds for provider delay %s", carrier, *remaining, providerDelay)
+	}
+	t.Logf("public error=%T first RetryAfter=%T remaining=%s original=%s public header=%q",
+		err, carrier, *remaining, providerDelay, SafeResponseHeaders(err).Get("Retry-After"))
 	var bootstrap *streamBootstrapError
 	if errors.As(err, &bootstrap) || hasUpstreamExecutionAttempt(err) || isRequestStopError(err) {
 		t.Fatalf("public error retained an internal execution wrapper: %T %v", err, err)
