@@ -116,9 +116,6 @@ func mergeMissingModelSections(data, fallback *staticModelsJSON) *staticModelsJS
 	}
 
 	merged := *data
-	if merged.Copilot == nil {
-		merged.Copilot = cloneModelInfos(fallback.Copilot)
-	}
 	if merged.Claude == nil {
 		merged.Claude = cloneModelInfos(fallback.Claude)
 	}

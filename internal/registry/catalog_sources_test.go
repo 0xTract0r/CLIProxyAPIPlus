@@ -549,7 +549,7 @@ func TestCopilotCatalogOmissionAndEmptySection(t *testing.T) {
 		{"empty", `{"copilot":[]}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := publishCatalogBytes([]byte(`{"copilot":[{"id":"custom"}]}`)); err != nil {
+			if _, err := publishCatalogBytes([]byte(`{"copilot":[{"id":"custom"}],"claude":[{"id":"preserved"}]}`)); err != nil {
 				t.Fatal(err)
 			}
 			changed, err := publishCatalogBytes([]byte(tc.raw))
@@ -558,6 +558,9 @@ func TestCopilotCatalogOmissionAndEmptySection(t *testing.T) {
 			}
 			if got := len(GetStaticModelDefinitionsByChannel("copilot")); got != 0 {
 				t.Fatalf("got %d presets, want none", got)
+			}
+			if models := getModels().Claude; len(models) != 1 || models[0].ID != "preserved" {
+				t.Fatal("omitting an existing fork catalog section did not preserve its models")
 			}
 		})
 	}
