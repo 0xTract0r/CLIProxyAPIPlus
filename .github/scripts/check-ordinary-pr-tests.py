@@ -29,6 +29,10 @@ REQUIRED = {
         "TestServerCodexAPIKeyResponsesStreamingRequestLog",
         "TestRegisteredLegacyClaudeReauthRequiresOneTargetAndAdmin",
     },
+    "github.com/router-for-me/CLIProxyAPI/v8/internal/api/handlers/management": {
+        "TestOrdinaryLegacyClaudeReauthUsesSelectedFileAndAdmin",
+        "TestOrdinaryCodexV0SelectedReauth",
+    },
     "github.com/router-for-me/CLIProxyAPI/v8/internal/usage": {"TestKnownUsageKeyTiesFromDisk"},
 }
 
