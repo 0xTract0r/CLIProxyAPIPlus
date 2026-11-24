@@ -170,7 +170,7 @@ retain the corresponding business operation's fields.
 | `/server/server-id` | GET | Get the active deployment UUID. |
 | `/server/latest-version` | GET | Get latest release information. |
 | `/requests/api-call` | POST | Make an authenticated upstream call. |
-| `/routing/cooldown/reset` | POST | Clear credential cooldown. |
+| `/routing/cooldown/reset` | POST | Clear eligible local cooldown for the selected credential. Protected state or a changed selection returns `409`. |
 | `/routing/model-definitions/<channel>` | GET | Get model definitions. |
 | `/observability/logs` | GET, DELETE | Read or clear application logs. |
 | `/observability/logs/errors` | GET | List error-log files. |
@@ -196,7 +196,18 @@ retain the corresponding business operation's fields.
 | `/plugins/<id>` | DELETE | Delete a plugin. |
 | `/plugins/store` | GET | List the plugin store (supports optional `?refresh=true` to bypass cached release checks). |
 | `/plugins/store/<id>/install` | POST | Install or update a plugin. |
-| `/plugins/<id>/quota` | GET, POST, DELETE | Read, fetch, or reset plugin quota. |
+| `/plugins/<id>/quota` | GET, POST, DELETE | `GET` reads plugin quota metadata; `POST` fetches quota. `DELETE` does not call an external reset. It returns `409` for protected state or a changed selection, otherwise `501` for an eligible selected credential. |
+
+### Quota and local cooldown
+
+Quota reads and fetches report provider state. They do not reset it. The
+cooldown route accepts an `auth_index` and only clears eligible local cooldown
+state for that selection. Recorded provider limits and protected or ambiguous
+cooldown state remain intact on `409`. The legacy `POST /v0/management/quota/reset`
+also supports eligible local cleanup when no provider or plugin is specified.
+An explicit external reset through the legacy or plugin routes returns `409`
+for protected or changed selections, otherwise `501`, with no plugin reset or
+local fallback.
 
 ## OAuth
 
