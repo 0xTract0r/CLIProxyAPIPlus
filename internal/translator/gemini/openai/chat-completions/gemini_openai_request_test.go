@@ -179,13 +179,16 @@ func TestConvertOpenAIRequestToGeminiPreservesReasoningBeforeVisibleContentAndTo
 		"model": "gemini-3-flash",
 		"messages": [
 			{"role": "user", "content": "hi"},
-			{"role": "assistant", "content": "visible answer", "reasoning_content": "thinking only", "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}]},
+			{"role": "assistant", "content": "visible answer", "reasoning_content": "thinking only", "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\":\"fixture.txt\"}"}}]},
 			{"role": "tool", "tool_call_id": "call_1", "content": "{\"output\":\"ok\"}"},
 			{"role": "user", "content": "say ok"}
 		]
 	}`
 
-	result, _ := ConvertOpenAIRequestToGemini("gemini-3-flash", []byte(inputJSON), true)
+	result, err := ConvertOpenAIRequestToGemini("gemini-3-flash", []byte(inputJSON), true)
+	if err != nil {
+		t.Fatal(err)
+	}
 	contents := ojson.GetBytesNoCopy(result, "contents").Array()
 	if len(contents) != 4 {
 		t.Fatalf("contents length = %d, want 4. Output: %s", len(contents), result)
@@ -206,8 +209,11 @@ func TestConvertOpenAIRequestToGeminiPreservesReasoningBeforeVisibleContentAndTo
 	if got := parts[2].Get("functionCall.name").String(); got != "read_file" {
 		t.Fatalf("functionCall.name = %q, want read_file. Output: %s", got, result)
 	}
-	if got := parts[2].Get("thoughtSignature").String(); got != geminiFunctionThoughtSignature {
-		t.Fatalf("functionCall thoughtSignature = %q, want bypass sentinel. Output: %s", got, result)
+	if got := parts[2].Get("functionCall.args.path").String(); got != "fixture.txt" {
+		t.Fatalf("functionCall.args.path = %q, want fixture.txt. Output: %s", got, result)
+	}
+	if parts[2].Get("thoughtSignature").Exists() {
+		t.Fatalf("unsigned function call should omit thoughtSignature. Output: %s", result)
 	}
 	if got := contents[2].Get("parts.0.functionResponse.name").String(); got != "read_file" {
 		t.Fatalf("functionResponse.name = %q, want read_file. Output: %s", got, result)

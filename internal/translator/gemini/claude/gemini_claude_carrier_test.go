@@ -169,8 +169,8 @@ func TestGeminiClaudeUnsupportedPayloadDoesNotRetargetSignature(t *testing.T) {
 					content := geminiClaudeContentForParts(t, parts, mode)
 					output := replayGeminiClaudeContent(t, content)
 					for _, part := range ojson.GetBytes(output, "contents.0.parts").Array() {
-						if got := part.Get("thoughtSignature").String(); got != "" && got != sigcompat.GeminiSkipThoughtSignatureValidator {
-							t.Errorf("unsupported payload signature was attached to a different part: %s; content=%s", output, content)
+						if part.Get("thoughtSignature").Exists() {
+							t.Fatal("unsupported payload signature was attached to a different part or synthesized")
 						}
 					}
 				})

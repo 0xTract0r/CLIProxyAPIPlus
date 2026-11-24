@@ -179,38 +179,38 @@ func TestGeminiOpenAILateSignatureDoesNotCrossThoughtImage(t *testing.T) {
 	}
 }
 
-func TestGeminiOpenAINonStreamTrailingToolSignatureRoundTrip(t *testing.T) {
-	for _, tt := range []struct {
-		name    string
-		between string
-		want    string
+func TestOrdinaryGeminiOpenAIToolResponsePartAssociation(t *testing.T) {
+	const opaque = "upstream-supplied-opaque-fixture"
+	for _, tc := range []struct {
+		name        string
+		between     string
+		hasMetadata bool
 	}{
-		{"adjacent", "", capturedGeminiToolCallThoughtSignature},
-		{"empty text", `{"text":""},`, capturedGeminiToolCallThoughtSignature},
-		{"text boundary", `{"text":"answer"},`, ""},
-		{"image boundary", `{"inlineData":{"mimeType":"image/png","data":"eA=="}},`, ""},
-		{"thought image boundary", `{"thought":true,"inlineData":{"mimeType":"image/png","data":"eA=="}},`, ""},
+		{"adjacent", "", true},
+		{"empty text", `{"text":""},`, true},
+		{"text boundary", `{"text":"answer"},`, false},
+		{"image boundary", `{"inlineData":{"mimeType":"image/png","data":"eA=="}},`, false},
+		{"thought image boundary", `{"thought":true,"inlineData":{"mimeType":"image/png","data":"eA=="}},`, false},
 	} {
-		t.Run(tt.name, func(t *testing.T) {
-			upstream := []byte(`{"candidates":[{"content":{"parts":[{"functionCall":{"name":"lookup","args":{}}},` + tt.between + `{"thoughtSignature":"` + capturedGeminiToolCallThoughtSignature + `"}]},"finishReason":"STOP"}]}`)
+		t.Run(tc.name, func(t *testing.T) {
+			upstream := []byte(`{"candidates":[{"content":{"parts":[{"functionCall":{"name":"lookup","args":{"q":"Paris"}}},` +
+				tc.between + `{"thoughtSignature":"` + opaque + `"},{"functionCall":{"name":"weather","args":{"days":2}}}]},"finishReason":"STOP"}]}`)
 			response := ConvertGeminiResponseToOpenAINonStream(context.Background(), "gemini-4-carbon", nil, nil, upstream, nil)
-			call := ojson.GetBytes(response, "choices.0.message.tool_calls.0")
-			if got := call.Get("extra_content.google.thought_signature").String(); got != tt.want {
-				t.Fatalf("tail signature = %q, want %q; response=%s", got, tt.want, response)
+			message := ojson.GetBytes(response, "choices.0.message")
+			calls := message.Get("tool_calls").Array()
+			if len(calls) != 2 ||
+				calls[0].Get("function.name").String() != "lookup" ||
+				ojson.Parse(calls[0].Get("function.arguments").String()).Get("q").String() != "Paris" ||
+				calls[1].Get("function.name").String() != "weather" ||
+				ojson.Parse(calls[1].Get("function.arguments").String()).Get("days").Int() != 2 {
+				t.Fatal("response changed the tool calls, order, or arguments")
 			}
-			request := ojson.NewDocString(`{"messages":[{"role":"assistant","tool_calls":[]},{"role":"tool","tool_call_id":"","content":"ok"}]}`)
-			_ = request.SetRaw("messages.0.tool_calls.0", call.Raw)
-			_ = request.Set("messages.1.tool_call_id", call.Get("id").String())
-			output, errConvert := ConvertOpenAIRequestToGemini("gemini-4-carbon", request.Bytes(), false)
-			if errConvert != nil {
-				t.Fatal(errConvert)
+			if field := calls[0].Get("extra_content.google.thought_signature"); field.Exists() != tc.hasMetadata ||
+				(tc.hasMetadata && field.String() != opaque) || calls[1].Get("extra_content.google.thought_signature").Exists() {
+				t.Fatal("response associated tool metadata with the wrong part")
 			}
-			want := tt.want
-			if want == "" {
-				want = "skip_thought_signature_validator"
-			}
-			if got := ojson.GetBytes(output, "contents.0.parts.0.thoughtSignature").String(); got != want {
-				t.Fatalf("replayed tail signature = %q, want %q; output=%s", got, want, output)
+			if tc.name == "text boundary" && message.Get("content").String() != "answer" {
+				t.Fatal("response dropped visible text at the tool boundary")
 			}
 		})
 	}

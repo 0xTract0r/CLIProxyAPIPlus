@@ -13,8 +13,6 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-const geminiFunctionThoughtSignature = "skip_thought_signature_validator"
-
 // ConvertOpenAIRequestToGemini converts an OpenAI Chat Completions request (raw JSON)
 // into a complete Gemini request JSON. All JSON construction uses sjson and lookups use ojson.
 //
@@ -246,7 +244,9 @@ func convertOpenAIRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 						partDoc := ojson.NewDocString(`{"functionCall":{"name":""}}`)
 						_ = partDoc.Set("functionCall.name", functionName)
 						_ = partDoc.SetRaw("functionCall.args", tc.Get("function.arguments").String())
-						_ = partDoc.Set("thoughtSignature", openAIToolCallGeminiThoughtSignature(tc))
+						if thoughtSignature := openAIToolCallGeminiThoughtSignature(tc); thoughtSignature != "" {
+							_ = partDoc.Set("thoughtSignature", thoughtSignature)
+						}
 						partItems = append(partItems, partDoc.Bytes())
 						toolCalls = append(toolCalls, assistantToolCall{
 							id:   functionID,
@@ -571,7 +571,7 @@ func openAIToolCallGeminiThoughtSignature(toolCall ojson.Result) string {
 			return sigcompat.GeminiReplaySignatureOrBypass(signatureResult.String(), sigcompat.SignatureBlockKindGeminiFunctionCall)
 		}
 	}
-	return geminiFunctionThoughtSignature
+	return ""
 }
 
 func openAIInputAudioMimeType(audioFormat string) string {
