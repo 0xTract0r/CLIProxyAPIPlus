@@ -597,7 +597,7 @@ func (h *OpenAIAPIHandler) handleNonStreamingResponse(c *gin.Context, rawJSON []
 		return
 	}
 	handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
-	_, _ = c.Writer.Write(resp)
+	_, _ = c.Writer.Write(handlers.ApplyClientModelLabel(c, resp))
 	cliCancel()
 }
 
@@ -622,7 +622,7 @@ func (h *OpenAIAPIHandler) handleNonStreamingResponseViaResponses(c *gin.Context
 		cliCancel(fmt.Errorf("response conversion failed"))
 		return
 	}
-	_, _ = c.Writer.Write(converted)
+	_, _ = c.Writer.Write(handlers.ApplyClientModelLabel(c, converted))
 	cliCancel()
 }
 
@@ -750,7 +750,7 @@ func (h *OpenAIAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON []byt
 				h.LoggingAPIResponseError(c, termErr)
 			}
 			initialHasFinishReason := termErr != nil || chunkHasFinishReason(chunk)
-			_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", string(chunk))
+			_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", handlers.ApplyClientModelLabel(c, chunk))
 			flusher.Flush()
 			if termErr != nil {
 				cliCancel(termErr.Error)
@@ -1094,7 +1094,7 @@ func (h *OpenAIAPIHandler) handleStreamResult(c *gin.Context, flusher http.Flush
 			} else if !sawFinishReason && chunkHasFinishReason(chunk) {
 				sawFinishReason = true
 			}
-			_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", string(chunk))
+			_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", handlers.ApplyClientModelLabel(c, chunk))
 		},
 		ChunkError: func() *interfaces.ErrorMessage {
 			if terminalChunkErr != nil && !loggedTerminalErr {

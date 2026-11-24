@@ -60,6 +60,7 @@ func (s *Server) ampJSONInference(handler gin.HandlerFunc) gin.HandlerFunc {
 			}
 			setAmpRequestBody(c.Request, body)
 		}
+		handlers.SetClientResponseNames(c, model.Str, resolved)
 		handler(c)
 	}
 }

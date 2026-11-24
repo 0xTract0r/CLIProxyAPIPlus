@@ -340,13 +340,16 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 			// Write the first chunk
 			var streamState claudeSSEStreamState
 			streamState.trailingNewlines = 2
+			if handlers.ClientResponseNamesEnabled(c) {
+				streamState.declaredTools = newClaudeDeclaredToolNames(rawJSON)
+			}
 			streamState.ObserveChunk(chunk)
 			if streamState.policyRefusalErr != nil && !streamState.loggedTerminalError {
 				h.LoggingAPIResponseError(c, streamState.policyRefusalErr)
 				streamState.loggedTerminalError = true
 			}
-			if len(chunk) > 0 {
-				_, _ = c.Writer.Write(chunk)
+			if output := streamState.declaredTools.rewriteChunk(chunk); len(output) > 0 {
+				_, _ = c.Writer.Write(output)
 				flusher.Flush()
 			}
 
@@ -375,6 +378,7 @@ type claudeSSEStreamState struct {
 	currentEvent        string
 	eventData           [][]byte
 	lineBuf             bytes.Buffer
+	declaredTools       *claudeDeclaredToolNames
 }
 
 func (s *claudeSSEStreamState) ObserveChunk(chunk []byte) {
@@ -513,9 +517,12 @@ func (h *ClaudeCodeAPIHandler) forwardClaudeStreamWithState(c *gin.Context, flus
 				h.LoggingAPIResponseError(c, state.policyRefusalErr)
 				state.loggedTerminalError = true
 			}
-			_, _ = c.Writer.Write(chunk)
+			if output := state.declaredTools.rewriteChunk(chunk); len(output) > 0 {
+				_, _ = c.Writer.Write(output)
+			}
 		},
 		WriteTerminalError: func(errMsg *interfaces.ErrorMessage) {
+			state.declaredTools.flush(c.Writer)
 			state.FlushPendingLine()
 			if errMsg == nil {
 				return
@@ -544,6 +551,7 @@ func (h *ClaudeCodeAPIHandler) forwardClaudeStreamWithState(c *gin.Context, flus
 			}
 		},
 		WriteDone: func() {
+			state.declaredTools.flush(c.Writer)
 			state.FlushPendingLine()
 			if state.sawMessageStop || state.sawErrorEvent {
 				state.ensureSSEEventBoundary(c.Writer)
