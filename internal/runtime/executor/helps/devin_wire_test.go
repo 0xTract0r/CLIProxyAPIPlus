@@ -34,25 +34,6 @@ func TestConnectEnvelopeFraming(t *testing.T) {
 	}
 }
 
-func TestGenerateDevinDeviceFingerprint(t *testing.T) {
-	fp1 := GenerateDevinDeviceFingerprint("seed-1")
-	if len(fp1) != DevinFingerprintHexLen {
-		t.Fatalf("fp1 len = %d, want %d", len(fp1), DevinFingerprintHexLen)
-	}
-	// Check hex characters
-	for _, c := range fp1 {
-		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
-			t.Fatalf("invalid hex char in fingerprint: %c", c)
-		}
-	}
-
-	// Deterministic seed produces deterministic fingerprint
-	fp2 := GenerateDevinDeviceFingerprint("seed-1")
-	if fp1 != fp2 {
-		t.Fatalf("fingerprints for same seed do not match: %s != %s", fp1, fp2)
-	}
-}
-
 func TestBuildDevinGetChatMessageRequest(t *testing.T) {
 	prompts := []DevinPrompt{
 		{
@@ -575,27 +556,6 @@ func TestBuildDevinGetChatMessageRequest_Field15SequentialCounter(t *testing.T) 
 	}
 }
 
-func TestGenerateDevinDeviceFingerprint_RandomWhenEmptySeed(t *testing.T) {
-	fp1 := GenerateDevinDeviceFingerprint("")
-	fp2 := GenerateDevinDeviceFingerprint("")
-	if len(fp1) != DevinFingerprintHexLen {
-		t.Fatalf("fp1 len = %d, want %d", len(fp1), DevinFingerprintHexLen)
-	}
-	if len(fp2) != DevinFingerprintHexLen {
-		t.Fatalf("fp2 len = %d, want %d", len(fp2), DevinFingerprintHexLen)
-	}
-	if fp1 == fp2 {
-		t.Fatalf("fingerprints without explicit seed must be unique per call: %q == %q", fp1, fp2)
-	}
-
-	// With explicit seed, it must be deterministic
-	seeded1 := GenerateDevinDeviceFingerprint("my-stable-seed")
-	seeded2 := GenerateDevinDeviceFingerprint("my-stable-seed")
-	if seeded1 != seeded2 {
-		t.Fatalf("seeded fingerprints must be identical: %q != %q", seeded1, seeded2)
-	}
-}
-
 func extractField15Subfields(t *testing.T, reqBytes []byte) (string, map[int]uint64) {
 	t.Helper()
 	b := reqBytes
@@ -911,50 +871,6 @@ func TestBuildDevinGetChatMessageRequest_FiltersAutomationUpdateAndObfuscatesDes
 	}
 }
 
-func TestRegressionIssue5910_ClientMetadata(t *testing.T) {
-	b := BuildDevinClientMetadataBytes("test-session-token", "device-seed", "linux")
-	pos := 0
-	var ideName string
-	hasTag28 := false
-
-	for pos < len(b) {
-		num, typ, n := protowire.ConsumeTag(b[pos:])
-		if n <= 0 {
-			t.Fatalf("corrupt tag at %d", pos)
-		}
-		pos += n
-
-		if num == 1 && typ == protowire.BytesType {
-			val, bn := protowire.ConsumeBytes(b[pos:])
-			if bn <= 0 {
-				t.Fatalf("corrupt bytes at %d", pos)
-			}
-			pos += bn
-			ideName = string(val)
-		} else if num == 28 {
-			hasTag28 = true
-			nSkip := protowire.ConsumeFieldValue(num, typ, b[pos:])
-			if nSkip <= 0 {
-				t.Fatalf("corrupt field at %d", pos)
-			}
-			pos += nSkip
-		} else {
-			nSkip := protowire.ConsumeFieldValue(num, typ, b[pos:])
-			if nSkip <= 0 {
-				t.Fatalf("corrupt field at %d", pos)
-			}
-			pos += nSkip
-		}
-	}
-
-	if ideName != DevinDefaultClientName {
-		t.Errorf("BuildDevinClientMetadataBytes field 1 = %q, want %q", ideName, DevinDefaultClientName)
-	}
-	if hasTag28 {
-		t.Errorf("BuildDevinClientMetadataBytes should not emit field 28")
-	}
-}
-
 func TestRegressionIssue5910_UsageStatsCacheWriteTokens(t *testing.T) {
 	var f7Bytes []byte
 	// Field 2: input_tokens = 3
@@ -1067,5 +983,33 @@ func TestBuildDevinGetChatMessageRequest_ObfuscatesEmbeddedExecDescriptions(t *t
 		if !strings.Contains(body, "an session ID") || !strings.Contains(body, "to a existing unified") {
 			t.Fatalf("%s body should contain the obfuscated exec phrases: %s", label, body)
 		}
+	}
+}
+
+func TestOrdinaryDevinClientMetadataHasSelectedGrantWithoutDeviceIdentity(t *testing.T) {
+	const selected = "qa-selected-devin-grant"
+	body := BuildDevinClientMetadataBytes(selected, "", "")
+	found := false
+	for len(body) > 0 {
+		field, typ, n := protowire.ConsumeTag(body)
+		if n < 0 || typ != protowire.BytesType {
+			t.Fatal("invalid client metadata")
+		}
+		value, size := protowire.ConsumeBytes(body[n:])
+		if size < 0 {
+			t.Fatal("invalid field length")
+		}
+		switch field {
+		case 3:
+			found = string(value) == selected
+		case 4, 5:
+			// Language and actual runtime OS are ordinary metadata.
+		default:
+			t.Fatalf("unexpected client or device identity field %d", field)
+		}
+		body = body[n+size:]
+	}
+	if !found {
+		t.Fatal("selected grant missing")
 	}
 }

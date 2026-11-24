@@ -2,9 +2,6 @@ package devin
 
 import (
 	"context"
-	"crypto/rand"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -13,15 +10,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
 	"google.golang.org/protobuf/encoding/protowire"
 )
 
 const (
 	// DevinGetUserStatusPath is the Connect-RPC unary endpoint for seat management and quota.
 	DevinGetUserStatusPath = "/exa.seat_management_pb.SeatManagementService/GetUserStatus"
-
-	devinFingerprintHexLen = 732
 )
 
 // DevinUserStatus contains plan, quota, and account metadata returned by GetUserStatus.
@@ -41,63 +35,18 @@ type DevinUserStatus struct {
 	PlanEnd                     time.Time `json:"plan_end,omitempty"`
 }
 
-// GenerateDeviceFingerprint generates a 732-character hex device fingerprint.
-// When seed is empty, it generates a cryptographically random 732-character hex string per request.
-// When seed is provided, it derives a deterministic 732-character hex fingerprint.
-func GenerateDeviceFingerprint(seed string) string {
-	if seed == "" {
-		var b [devinFingerprintHexLen / 2]byte
-		if _, err := rand.Read(b[:]); err == nil {
-			return hex.EncodeToString(b[:])
-		}
-		seed = uuid.New().String()
-	}
-	var sb strings.Builder
-	counter := 0
-	for sb.Len() < devinFingerprintHexLen {
-		h := sha256.Sum256([]byte(fmt.Sprintf("%s-%d", seed, counter)))
-		sb.WriteString(hex.EncodeToString(h[:]))
-		counter++
-	}
-	return sb.String()[:devinFingerprintHexLen]
-}
-
-// BuildGetUserStatusRequest serializes a Connect-RPC GetUserStatus request protobuf.
-func BuildGetUserStatusRequest(sessionToken, deviceFingerprint string) []byte {
-	if deviceFingerprint == "" {
-		deviceFingerprint = GenerateDeviceFingerprint(sessionToken)
-	}
-
-	var f1Bytes []byte
-	f1Bytes = protowire.AppendTag(f1Bytes, 1, protowire.BytesType)
-	f1Bytes = protowire.AppendString(f1Bytes, "chisel")
-
-	f1Bytes = protowire.AppendTag(f1Bytes, 2, protowire.BytesType)
-	f1Bytes = protowire.AppendString(f1Bytes, "3000.10.21")
-
-	f1Bytes = protowire.AppendTag(f1Bytes, 3, protowire.BytesType)
-	f1Bytes = protowire.AppendString(f1Bytes, sessionToken)
-
-	f1Bytes = protowire.AppendTag(f1Bytes, 4, protowire.BytesType)
-	f1Bytes = protowire.AppendString(f1Bytes, "en")
-
-	f1Bytes = protowire.AppendTag(f1Bytes, 5, protowire.BytesType)
-	f1Bytes = protowire.AppendString(f1Bytes, runtime.GOOS)
-
-	f1Bytes = protowire.AppendTag(f1Bytes, 7, protowire.BytesType)
-	f1Bytes = protowire.AppendString(f1Bytes, "3000.10.21")
-
-	f1Bytes = protowire.AppendTag(f1Bytes, 12, protowire.BytesType)
-	f1Bytes = protowire.AppendString(f1Bytes, "chisel")
-
-	f1Bytes = protowire.AppendTag(f1Bytes, 31, protowire.BytesType)
-	f1Bytes = protowire.AppendString(f1Bytes, deviceFingerprint)
-
-	var reqBytes []byte
-	reqBytes = protowire.AppendTag(reqBytes, 1, protowire.BytesType)
-	reqBytes = protowire.AppendBytes(reqBytes, f1Bytes)
-
-	return reqBytes
+// BuildGetUserStatusRequest serializes a Connect-RPC GetUserStatus request
+// with the selected grant and ordinary runtime metadata alone.
+func BuildGetUserStatusRequest(sessionToken string) []byte {
+	var metadata []byte
+	metadata = protowire.AppendTag(metadata, 3, protowire.BytesType)
+	metadata = protowire.AppendString(metadata, sessionToken)
+	metadata = protowire.AppendTag(metadata, 4, protowire.BytesType)
+	metadata = protowire.AppendString(metadata, "en")
+	metadata = protowire.AppendTag(metadata, 5, protowire.BytesType)
+	metadata = protowire.AppendString(metadata, runtime.GOOS)
+	request := protowire.AppendTag(nil, 1, protowire.BytesType)
+	return protowire.AppendBytes(request, metadata)
 }
 
 // ParseGetUserStatusResponse decodes the binary protobuf returned by GetUserStatus.
@@ -332,7 +281,7 @@ func parseSecondsSubfield(data []byte) int64 {
 }
 
 // FetchUserStatus queries Connect-RPC endpoint GetUserStatus for quota, plan, and user details.
-func (s *DevinAuthService) FetchUserStatus(ctx context.Context, sessionToken, deviceSeed string) (*DevinUserStatus, error) {
+func (s *DevinAuthService) FetchUserStatus(ctx context.Context, sessionToken string) (*DevinUserStatus, error) {
 	if s == nil || s.client == nil {
 		return nil, errors.New("devin auth service: uninitialized client")
 	}
@@ -342,7 +291,7 @@ func (s *DevinAuthService) FetchUserStatus(ctx context.Context, sessionToken, de
 		return nil, errors.New("devin auth service: session token is required")
 	}
 
-	reqBody := BuildGetUserStatusRequest(sessionToken, GenerateDeviceFingerprint(deviceSeed))
+	reqBody := BuildGetUserStatusRequest(sessionToken)
 
 	endpoint := fmt.Sprintf("%s%s", strings.TrimRight(s.serverBaseURL, "/"), DevinGetUserStatusPath)
 	req, errReq := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(string(reqBody)))
@@ -364,14 +313,22 @@ func (s *DevinAuthService) FetchUserStatus(ctx context.Context, sessionToken, de
 		_ = resp.Body.Close()
 	}()
 
+	if resp.StatusCode != http.StatusOK {
+		return nil, devinUserStatusError{status: resp.StatusCode}
+	}
+
 	respBytes, errRead := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if errRead != nil {
 		return nil, errRead
 	}
 
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("devin seat management error (status %d): %s", resp.StatusCode, string(respBytes))
-	}
-
 	return ParseGetUserStatusResponse(respBytes)
+}
+
+type devinUserStatusError struct{ status int }
+
+func (e devinUserStatusError) StatusCode() int { return e.status }
+
+func (e devinUserStatusError) Error() string {
+	return fmt.Sprintf("Devin user status unavailable (HTTP %d)", e.status)
 }

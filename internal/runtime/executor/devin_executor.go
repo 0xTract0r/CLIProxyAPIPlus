@@ -98,7 +98,7 @@ func (e *DevinExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Aut
 	if req == nil {
 		return nil
 	}
-	apiKey, _, _ := devinAuthCredentials(auth)
+	apiKey, _ := devinAuthCredentials(auth)
 	if apiKey != "" {
 		// Codeium/Devin Connect-RPC upstream expects "Basic <token>-<token>" as its wire authentication header.
 		req.Header.Set("Authorization", "Basic "+apiKey+"-"+apiKey)
@@ -145,7 +145,7 @@ func (e *DevinExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 		return nil, errors.New("devin executor: auth is nil")
 	}
 
-	sessionToken, baseURL, deviceSeed := devinAuthCredentials(auth)
+	sessionToken, baseURL := devinAuthCredentials(auth)
 	if sessionToken == "" {
 		return auth, nil
 	}
@@ -156,7 +156,7 @@ func (e *DevinExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 		authService.SetServerBaseURL(baseURL)
 	}
 
-	status, err := authService.FetchUserStatus(ctx, sessionToken, deviceSeed)
+	status, err := authService.FetchUserStatus(ctx, sessionToken)
 	if err != nil {
 		log.Warnf("devin executor: failed to refresh user status for %s: %v", auth.ID, err)
 		return auth, err
@@ -442,7 +442,7 @@ func (e *DevinExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 }
 
 func (e *DevinExecutor) prepareDevinHTTPRequest(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*http.Request, string, []byte, error) {
-	apiKey, baseURL, deviceSeed := devinAuthCredentials(auth)
+	apiKey, baseURL := devinAuthCredentials(auth)
 	if apiKey == "" {
 		return nil, "", nil, fmt.Errorf("devin credentials missing: api_key or session_token required")
 	}
@@ -492,7 +492,7 @@ func (e *DevinExecutor) prepareDevinHTTPRequest(ctx context.Context, auth *clipr
 
 	protoBytes := helps.BuildDevinGetChatMessageRequest(
 		apiKey,
-		deviceSeed,
+		"",
 		chatModelUID,
 		systemPrompt,
 		prompts,
@@ -3136,9 +3136,9 @@ func newDevinStatusErrorForAuth(code int, headers http.Header, body []byte, auth
 	return devinQuotaScopedStatusError(err, auth, time.Now())
 }
 
-func devinAuthCredentials(auth *cliproxyauth.Auth) (apiKey string, baseURL string, deviceSeed string) {
+func devinAuthCredentials(auth *cliproxyauth.Auth) (apiKey string, baseURL string) {
 	if auth == nil {
-		return "", helps.DevinDefaultBaseURL, ""
+		return "", helps.DevinDefaultBaseURL
 	}
 	baseURL = helps.DevinDefaultBaseURL
 	if auth.Attributes != nil {
@@ -3154,9 +3154,6 @@ func devinAuthCredentials(auth *cliproxyauth.Auth) (apiKey string, baseURL strin
 		if v := strings.TrimSpace(auth.Attributes["base_url"]); v != "" {
 			baseURL = v
 		}
-		if v := strings.TrimSpace(auth.Attributes["device_seed"]); v != "" {
-			deviceSeed = v
-		}
 	}
 	if auth.Metadata != nil {
 		if v, ok := auth.Metadata["api_key"].(string); ok && strings.TrimSpace(v) != "" && apiKey == "" {
@@ -3167,9 +3164,6 @@ func devinAuthCredentials(auth *cliproxyauth.Auth) (apiKey string, baseURL strin
 		}
 		if v, ok := auth.Metadata["base_url"].(string); ok && strings.TrimSpace(v) != "" && baseURL == helps.DevinDefaultBaseURL {
 			baseURL = strings.TrimSpace(v)
-		}
-		if v, ok := auth.Metadata["device_seed"].(string); ok && strings.TrimSpace(v) != "" && deviceSeed == "" {
-			deviceSeed = strings.TrimSpace(v)
 		}
 	}
 	return
@@ -3182,7 +3176,7 @@ func devinAuthLogFields(auth *cliproxyauth.Auth) (authID, authLabel, authType, a
 	authID = auth.ID
 	authLabel = auth.Label
 	authType = "devin"
-	apiKey, _, _ := devinAuthCredentials(auth)
+	apiKey, _ := devinAuthCredentials(auth)
 	if apiKey != "" {
 		if len(apiKey) > 8 {
 			authValue = apiKey[:4] + "..." + apiKey[len(apiKey)-4:]

@@ -2,20 +2,19 @@ package devin
 
 import (
 	"context"
-	"crypto/tls"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
-	"os"
+	"strings"
 	"testing"
 	"time"
 
-	"github.com/MoeForge/moego/json"
 	"google.golang.org/protobuf/encoding/protowire"
 )
 
 func TestBuildGetUserStatusRequest(t *testing.T) {
-	reqBytes := BuildGetUserStatusRequest("test-token-123", "test-device-seed")
+	reqBytes := BuildGetUserStatusRequest("test-token-123")
 	if len(reqBytes) == 0 {
 		t.Fatal("expected non-empty request bytes")
 	}
@@ -26,8 +25,28 @@ func TestBuildGetUserStatusRequest(t *testing.T) {
 	}
 
 	f1Bytes, _ := protowire.ConsumeBytes(reqBytes[n:])
-	if len(f1Bytes) == 0 {
-		t.Fatal("expected non-empty ClientMetadata bytes")
+	found := false
+	for len(f1Bytes) != 0 {
+		field, typ, consumed := protowire.ConsumeTag(f1Bytes)
+		if consumed < 0 || typ != protowire.BytesType {
+			t.Fatal("invalid selected grant metadata")
+		}
+		fieldValue, size := protowire.ConsumeBytes(f1Bytes[consumed:])
+		if size < 0 {
+			t.Fatal("invalid metadata field length")
+		}
+		switch field {
+		case 3:
+			found = string(fieldValue) == "test-token-123"
+		case 4, 5:
+			// Ordinary language and runtime OS.
+		default:
+			t.Fatalf("unexpected client or device identity field %d", field)
+		}
+		f1Bytes = f1Bytes[consumed+size:]
+	}
+	if !found {
+		t.Fatal("selected grant missing")
 	}
 }
 
@@ -179,7 +198,7 @@ func TestFetchUserStatusLiveMock(t *testing.T) {
 	svc := NewDevinAuthService(server.Client())
 	svc.SetServerBaseURL(server.URL)
 
-	status, err := svc.FetchUserStatus(context.Background(), "mytoken", "device-seed")
+	status, err := svc.FetchUserStatus(context.Background(), "mytoken")
 	if err != nil {
 		t.Fatalf("FetchUserStatus failed: %v", err)
 	}
@@ -192,58 +211,72 @@ func TestFetchUserStatusLiveMock(t *testing.T) {
 	}
 }
 
-func TestLiveDevinUserStatus(t *testing.T) {
-	if os.Getenv("CPA_LIVE_TEST") != "true" {
-		t.Skip("skipping live test; set CPA_LIVE_TEST=true to run")
-	}
-	authPath := "../../../auths/devin-cli.json"
-	data, err := os.ReadFile(authPath)
-	if err != nil {
-		t.Skip("auths/devin-cli.json not found, skipping live probe")
-	}
+type ordinaryDevinStatusTransport func(*http.Request) (*http.Response, error)
 
-	var authJSON struct {
-		APIKey string `json:"api_key"`
-	}
-	if err := json.Unmarshal(data, &authJSON); err != nil || authJSON.APIKey == "" {
-		t.Skip("invalid auths/devin-cli.json, skipping")
-	}
+func (transport ordinaryDevinStatusTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	return transport(r)
+}
 
-	// Route through local mitmproxy / direct
-	proxyURL, _ := url.Parse("http://127.0.0.1:28082")
-	transport := &http.Transport{
-		Proxy: http.ProxyURL(proxyURL),
-		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: true,
-		},
+func TestOrdinaryDevinUserStatusRefusalPreservesSelectedGrant(t *testing.T) {
+	const grant = "selected-qa-status-token"
+	calls := 0
+	client := &http.Client{Transport: ordinaryDevinStatusTransport(func(r *http.Request) (*http.Response, error) {
+		calls++
+		if r.Header.Get("Authorization") != "Basic "+grant+"-"+grant || r.URL.Path != DevinGetUserStatusPath {
+			t.Fatal("status request changed selected authorization or destination")
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		expected := BuildGetUserStatusRequest(grant)
+		if string(body) != string(expected) {
+			t.Fatal("status request altered ordinary serialized contents")
+		}
+		return &http.Response{StatusCode: http.StatusUnauthorized, Header: make(http.Header),
+			Body: io.NopCloser(strings.NewReader("provider's private refusal detail"))}, nil
+	})}
+	service := NewDevinAuthService(client)
+	status, err := service.FetchUserStatus(t.Context(), grant)
+	var refusal interface{ StatusCode() int }
+	if status != nil || !errors.As(err, &refusal) || refusal.StatusCode() != http.StatusUnauthorized || calls != 1 {
+		t.Fatalf("expected one explicit refusal, calls=%d, err=%v", calls, err)
 	}
-	client := &http.Client{
-		Transport: transport,
-		Timeout:   15 * time.Second,
+	if strings.Contains(err.Error(), "private refusal detail") {
+		t.Fatal("raw provider refusal detail leaked")
 	}
+}
 
-	svc := NewDevinAuthService(client)
-	status, err := svc.FetchUserStatus(context.Background(), authJSON.APIKey, "")
-	if err != nil {
-		t.Skipf("Live FetchUserStatus skipped (network or proxy unreachable): %v", err)
-	}
-
-	t.Logf("Live Devin User Status:")
-	t.Logf("  Email: %s", status.Email)
-	t.Logf("  UserName: %s", status.UserName)
-	t.Logf("  UserID: %s", status.UserID)
-	t.Logf("  TeamID: %s", status.TeamID)
-	t.Logf("  OrgID: %s", status.OrgID)
-	t.Logf("  OrgName: %s", status.OrgName)
-	t.Logf("  Plan: %s", status.Plan)
-	t.Logf("  Daily Quota: %d%% (Resets at %v)", status.DailyQuotaRemainingPercent, status.DailyQuotaResetAt)
-	t.Logf("  Weekly Quota: %d%% (Resets at %v)", status.WeeklyQuotaRemainingPercent, status.WeeklyQuotaResetAt)
-	t.Logf("  Plan Period: %v -> %v", status.PlanStart, status.PlanEnd)
-
-	if status.Plan != "Pro" {
-		t.Errorf("expected plan Pro, got %s", status.Plan)
-	}
-	if status.Email == "" {
-		t.Error("expected non-empty email")
+func TestOrdinaryDevinOAuthRecordKeepsGrantedSessionWhenStatusUnavailable(t *testing.T) {
+	const grant = "qa-issued-devin-oauth-grant"
+	var profile, status int
+	fake := ordinaryDevinStatusTransport(func(req *http.Request) (*http.Response, error) {
+		reply := &http.Response{Header: make(http.Header)}
+		switch req.URL.Path {
+		case "/v3/self":
+			profile++
+			if req.Method != http.MethodGet || req.Header.Get("Authorization") != "Bearer "+grant {
+				t.Fatal("profile lookup changed its authorized context")
+			}
+			reply.StatusCode = http.StatusOK
+			reply.Body = io.NopCloser(strings.NewReader(`{"user_name":"fixture","user_id":"fixture-user","org_id":"fixture-org"}`))
+		case DevinGetUserStatusPath:
+			status++
+			data, err := io.ReadAll(req.Body)
+			if err != nil || req.Header.Get("Authorization") != "Basic "+grant+"-"+grant || string(data) != string(BuildGetUserStatusRequest(grant)) {
+				t.Fatal("status lookup changed its authorized context or added client/device metadata")
+			}
+			reply.StatusCode = http.StatusForbidden
+			reply.Body = io.NopCloser(strings.NewReader("fixture provider refusal"))
+		default:
+			t.Fatalf("unexpected service %s", req.URL.Path)
+		}
+		return reply, nil
+	})
+	svc := NewDevinAuthService(&http.Client{Transport: fake})
+	record, err := svc.CreateAuthRecord(t.Context(), grant)
+	if err != nil || record == nil || record.Attributes["session_token"] != grant ||
+		record.ID != "devin-fixture.json" || profile != 1 || status != 1 || len(record.Quota.Signals) != 0 {
+		t.Fatalf("failed status enrichment changed granted OAuth record or retried: profile=%d status=%d err=%v", profile, status, err)
 	}
 }

@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"compress/gzip"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
@@ -38,13 +37,6 @@ const (
 	DevinDefaultBaseURL = "https://server.codeium.com"
 	// DevinChatPath is the Connect-RPC endpoint for chat completions.
 	DevinChatPath = "/exa.api_server_pb.ApiServerService/GetChatMessage"
-
-	// DevinDefaultClientName is the client identifier declared in metadata.
-	DevinDefaultClientName = "chisel"
-	// DevinDefaultClientVersion is the client version declared in metadata.
-	DevinDefaultClientVersion = "3000.10.21"
-	// DevinFingerprintHexLen is the mandatory 732-hex-character length for metadata #31.
-	DevinFingerprintHexLen = 732
 
 	// DevinDefaultMaxTokens is the fallback max completion tokens.
 	DevinDefaultMaxTokens = 128000
@@ -127,28 +119,6 @@ type DevinFrameResult struct {
 	Usage                   *DevinUsage
 	ResponseDimensionGroups [][]byte
 	UnknownFieldNumbers     []int
-}
-
-// GenerateDevinDeviceFingerprint generates a 732-character hex device fingerprint.
-// When seed is empty, it generates a cryptographically random 732-character hex string per request (matching native devin-cli).
-// When seed is provided, it derives a deterministic 732-character hex fingerprint.
-func GenerateDevinDeviceFingerprint(seed string) string {
-	if seed == "" {
-		var b [DevinFingerprintHexLen / 2]byte
-		if _, err := rand.Read(b[:]); err == nil {
-			return hex.EncodeToString(b[:])
-		}
-		seed = uuid.New().String()
-	}
-	var sb strings.Builder
-	counter := 0
-	for sb.Len() < DevinFingerprintHexLen {
-		h := sha256.Sum256([]byte(fmt.Sprintf("%s-%d", seed, counter)))
-		sb.WriteString(hex.EncodeToString(h[:]))
-		counter++
-	}
-	// Truncate to exact 732 chars (11 full 64-char sha256 hex blocks + 28 chars of the 12th block) to match Devin CLI.
-	return sb.String()[:DevinFingerprintHexLen]
 }
 
 // GenerateDevinSentryTrace generates a Sentry distributed tracing header in the format:
@@ -251,44 +221,27 @@ func ReadConnectFrame(r io.Reader) (flag byte, payload []byte, err error) {
 	return flag, payload, nil
 }
 
-// BuildDevinClientMetadataBytes constructs the serialized bytes for Field 1 (ClientMetadata).
-func BuildDevinClientMetadataBytes(sessionToken, deviceSeed, osName string) []byte {
+// BuildDevinClientMetadataBytes contains the selected session grant and ordinary
+// runtime metadata. The legacy second parameter is ignored for existing callers.
+// Provider-issued client and device identity must never be synthesized.
+func BuildDevinClientMetadataBytes(sessionToken, _, osName string) []byte {
 	if osName == "" {
 		osName = runtime.GOOS
 	}
-	deviceFingerprint := GenerateDevinDeviceFingerprint(deviceSeed)
 
-	var f1Bytes []byte
-	f1Bytes = protowire.AppendTag(f1Bytes, 1, protowire.BytesType)
-	f1Bytes = protowire.AppendString(f1Bytes, DevinDefaultClientName)
-
-	f1Bytes = protowire.AppendTag(f1Bytes, 2, protowire.BytesType)
-	f1Bytes = protowire.AppendString(f1Bytes, DevinDefaultClientVersion)
-
-	f1Bytes = protowire.AppendTag(f1Bytes, 3, protowire.BytesType)
-	f1Bytes = protowire.AppendString(f1Bytes, sessionToken)
-
-	f1Bytes = protowire.AppendTag(f1Bytes, 4, protowire.BytesType)
-	f1Bytes = protowire.AppendString(f1Bytes, "en")
-
-	f1Bytes = protowire.AppendTag(f1Bytes, 5, protowire.BytesType)
-	f1Bytes = protowire.AppendString(f1Bytes, osName)
-
-	f1Bytes = protowire.AppendTag(f1Bytes, 7, protowire.BytesType)
-	f1Bytes = protowire.AppendString(f1Bytes, DevinDefaultClientVersion)
-
-	f1Bytes = protowire.AppendTag(f1Bytes, 12, protowire.BytesType)
-	f1Bytes = protowire.AppendString(f1Bytes, DevinDefaultClientName)
-
-	f1Bytes = protowire.AppendTag(f1Bytes, 31, protowire.BytesType)
-	f1Bytes = protowire.AppendString(f1Bytes, deviceFingerprint)
-	return f1Bytes
+	var metadata []byte
+	metadata = protowire.AppendTag(metadata, 3, protowire.BytesType)
+	metadata = protowire.AppendString(metadata, sessionToken)
+	metadata = protowire.AppendTag(metadata, 4, protowire.BytesType)
+	metadata = protowire.AppendString(metadata, "en")
+	metadata = protowire.AppendTag(metadata, 5, protowire.BytesType)
+	return protowire.AppendString(metadata, osName)
 }
 
 // BuildDevinGetChatMessageRequest encodes an entire GetChatMessageRequest protobuf payload.
 func BuildDevinGetChatMessageRequest(
 	sessionToken string,
-	deviceSeed string,
+	_ string,
 	chatModelUID string,
 	systemPrompt string,
 	prompts []DevinPrompt,
@@ -317,7 +270,7 @@ func BuildDevinGetChatMessageRequest(
 	reqBytes := make([]byte, 0, estimatedSize)
 
 	// 1. ClientMetadata (Field 1)
-	f1Bytes := BuildDevinClientMetadataBytes(sessionToken, deviceSeed, osName)
+	f1Bytes := BuildDevinClientMetadataBytes(sessionToken, "", osName)
 	reqBytes = protowire.AppendTag(reqBytes, 1, protowire.BytesType)
 	reqBytes = protowire.AppendBytes(reqBytes, f1Bytes)
 

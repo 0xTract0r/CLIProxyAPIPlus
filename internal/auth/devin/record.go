@@ -22,7 +22,7 @@ func (s *DevinAuthService) CreateAuthRecord(ctx context.Context, token string) (
 	if errSelf != nil {
 		log.Warn("failed to fetch devin user profile")
 	}
-	userStatus, errStatus := s.FetchUserStatus(ctx, sessionToken, "")
+	userStatus, errStatus := s.FetchUserStatus(ctx, sessionToken)
 	if errStatus != nil {
 		log.Warn("failed to fetch devin user status and quota")
 	}

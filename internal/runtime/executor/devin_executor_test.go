@@ -3,6 +3,7 @@ package executor
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -153,23 +154,19 @@ func TestDevinSWE17ModelUIDFromThinkingBudget(t *testing.T) {
 	}
 }
 
-func TestDevinAuthCredentials(t *testing.T) {
+func TestOrdinaryDevinAuthCredentials(t *testing.T) {
 	auth := &cliproxyauth.Auth{
 		Attributes: map[string]string{
 			"session_token": "token-xyz",
 			"base_url":      "https://custom.endpoint.com",
-			"device_seed":   "seed-456",
 		},
 	}
-	apiKey, baseURL, seed := devinAuthCredentials(auth)
+	apiKey, baseURL := devinAuthCredentials(auth)
 	if apiKey != "token-xyz" {
 		t.Errorf("apiKey = %q, want token-xyz", apiKey)
 	}
 	if baseURL != "https://custom.endpoint.com" {
 		t.Errorf("baseURL = %q, want https://custom.endpoint.com", baseURL)
-	}
-	if seed != "seed-456" {
-		t.Errorf("seed = %q, want seed-456", seed)
 	}
 }
 
@@ -5120,4 +5117,74 @@ func TestRegressionIssue6505_DevinClaudeStreamingNoFullInputEstimate(t *testing.
 	t.Run("partially cached prompt (input_tokens positive)", func(t *testing.T) {
 		runTest(t, 10, 0)
 	})
+}
+
+type ordinaryDevinBoundTransport func(*http.Request) (*http.Response, error)
+
+func (transport ordinaryDevinBoundTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	return transport(r)
+}
+
+func TestOrdinaryDevinRequestUsesSelectedGrantAndReturnsRefusal(t *testing.T) {
+	const selectedKey = "fixture-selected-grant"
+	calls := 0
+	ctx := context.WithValue(t.Context(), "cliproxy.roundtripper", ordinaryDevinBoundTransport(func(r *http.Request) (*http.Response, error) {
+		calls++
+		if r.URL.Hostname() != "selected.example.invalid" || r.Header.Get("Authorization") != "Basic "+selectedKey+"-"+selectedKey {
+			t.Fatal("wrong configured endpoint or selected authorization")
+		}
+		_, body, err := helps.ReadConnectFrame(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		field, wireType, n := protowire.ConsumeTag(body)
+		if n < 0 || field != 1 || wireType != protowire.BytesType {
+			t.Fatal("missing ordinary request metadata")
+		}
+		meta, size := protowire.ConsumeBytes(body[n:])
+		if size < 0 || !bytes.Contains(body[n+size:], []byte("fixture prompt")) {
+			t.Fatal("ordinary prompt missing")
+		}
+		found := false
+		for len(meta) != 0 {
+			field, typ, tag := protowire.ConsumeTag(meta)
+			if tag < 0 || typ != protowire.BytesType {
+				t.Fatal("invalid metadata")
+			}
+			value, fieldSize := protowire.ConsumeBytes(meta[tag:])
+			if fieldSize < 0 {
+				t.Fatal("invalid metadata length")
+			}
+			switch field {
+			case 3:
+				found = string(value) == selectedKey
+			case 4, 5:
+				// Ordinary runtime metadata.
+			default:
+				t.Fatalf("unexpected client or device identity field %d", field)
+			}
+			meta = meta[tag+fieldSize:]
+		}
+		if !found {
+			t.Fatal("selected grant missing from metadata")
+		}
+		return &http.Response{StatusCode: http.StatusForbidden, Header: make(http.Header),
+			Body: io.NopCloser(strings.NewReader("fixture provider refusal"))}, nil
+	}))
+	credential := &cliproxyauth.Auth{
+		ID: "selected.json", Provider: "devin",
+		Attributes: map[string]string{"session_token": selectedKey, "base_url": "https://selected.example.invalid"},
+		Metadata:   map[string]any{"api_key": "unselected-fallback", "device_seed": "legacy-value"},
+	}
+	request := cliproxyexecutor.Request{Model: "devin/swe-1.6",
+		Payload: []byte(`{"input":[{"type":"message","role":"user","content":"fixture prompt"}]}`)}
+	executor := NewDevinExecutor(&config.Config{})
+	_, err := executor.Execute(ctx, credential, request, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse})
+	var refusal interface{ StatusCode() int }
+	if !errors.As(err, &refusal) || refusal.StatusCode() != http.StatusForbidden || calls != 1 {
+		t.Fatalf("expected one explicit refusal, calls=%d, err=%v", calls, err)
+	}
+	if credential.Attributes["session_token"] != selectedKey || credential.Metadata["api_key"] != "unselected-fallback" {
+		t.Fatal("refusal mutated authorization")
+	}
 }
