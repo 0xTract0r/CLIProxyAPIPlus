@@ -9,6 +9,15 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      UPSTREAM_SYNC_PR: >-
+        ${{
+          contains(github.event.pull_request.labels.*.name, 'upstream-sync') ||
+          startsWith(github.head_ref, 'bot/upstream-sync') ||
+          startsWith(github.head_ref, 'codex/upstream-sync') ||
+          startsWith(github.head_ref, 'codex/sync-core') ||
+          startsWith(github.head_ref, 'codex/integrate-prod-')
+        }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -20,20 +29,29 @@ jobs:
           go-version-file: go.mod
           cache: true
       - name: Upstream sync test preflight
-        if: >-
-          contains(github.event.pull_request.labels.*.name, 'upstream-sync') ||
-          startsWith(github.head_ref, 'bot/upstream-sync') ||
-          startsWith(github.head_ref, 'codex/upstream-sync') ||
-          startsWith(github.head_ref, 'codex/sync-core') ||
-          startsWith(github.head_ref, 'codex/integrate-prod-')
+        if: env.UPSTREAM_SYNC_PR == 'true'
         run: GOTOOLCHAIN=local GOWORK=off GOPROXY=off go run .github/scripts/upstream-sync-test-preflight.go -pr-event "$GITHUB_EVENT_PATH"
+      - name: Prepare upstream sync test dependencies
+        if: env.UPSTREAM_SYNC_PR == 'true'
+        env:
+          GOTOOLCHAIN: local
+          GOWORK: 'off'
+        run: |
+          go version
+          go mod download
+          go list -deps -test ./... >/dev/null
       - name: Test
         shell: bash
         run: |
           set -euo pipefail
           results="$(mktemp)"
           trap 'rm -f "$results"' EXIT
-          GOTOOLCHAIN=auto go test -json -count=1 -timeout 600s ./... | tee "$results"
+          if [[ "$UPSTREAM_SYNC_PR" == 'true' ]]; then
+            bash .github/scripts/run-loopback-only.sh env GOTOOLCHAIN=local GOWORK=off GOPROXY=off \
+              go test -json -count=1 -timeout 600s ./... | tee "$results"
+          else
+            GOTOOLCHAIN=auto go test -json -count=1 -timeout 600s ./... | tee "$results"
+          fi
           python3 .github/scripts/check-ordinary-pr-tests.py "$results"
       - name: Ordinary fork feature survival audit
         run: |
