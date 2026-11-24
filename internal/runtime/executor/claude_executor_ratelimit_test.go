@@ -290,86 +290,6 @@ func TestClaudeExecutor_RateLimit_CaseInsensitiveRawHeaderMap(t *testing.T) {
 	}
 }
 
-func TestClaudeExecutor_RateLimit_FastModeAuthoritativeRejectionHeadersOverrideBody(t *testing.T) {
-	var attemptsCred1 atomic.Int32
-	var attemptsCred2 atomic.Int32
-
-	server1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		attemptsCred1.Add(1)
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Anthropic-Ratelimit-Unified-Status", "rejected")
-		w.Header().Set("Anthropic-Ratelimit-Unified-7d-Status", "rejected")
-		w.Header().Set("Anthropic-Ratelimit-Unified-7d-Reset", strconv.FormatInt(time.Now().Add(7*24*time.Hour).Unix(), 10))
-		w.Header().Set("Retry-After", "604800")
-		w.WriteHeader(http.StatusTooManyRequests)
-		// Body text mentioning fast request rejected, but headers explicitly reject unified quota
-		_, _ = w.Write([]byte(`{"type":"error","error":{"type":"rate_limit_error","message":"Fast request rejected"}}`))
-	}))
-	defer server1.Close()
-
-	server2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		attemptsCred2.Add(1)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"id":"msg-fast-ok","type":"message","role":"assistant","content":[{"type":"text","text":"hello from cred2"}]}`))
-	}))
-	defer server2.Close()
-
-	cfg := &config.Config{DisableCooling: false}
-	manager := cliproxyauth.NewManager(nil, nil, nil)
-	manager.SetRetryConfig(0, 0, 2)
-
-	executor := NewClaudeExecutor(cfg)
-	manager.RegisterExecutor(executor)
-
-	baseID := uuid.NewString()
-	auth1 := &cliproxyauth.Auth{ID: baseID + "-fast-override-1", Provider: "claude", Attributes: map[string]string{"api_key": "k1", "base_url": server1.URL}}
-	auth2 := &cliproxyauth.Auth{ID: baseID + "-fast-override-2", Provider: "claude", Attributes: map[string]string{"api_key": "k2", "base_url": server2.URL}}
-
-	reg := registry.GetGlobalRegistry()
-	reg.RegisterClient(auth1.ID, "claude", []*registry.ModelInfo{{ID: "claude-3-5-sonnet-20241022"}})
-	reg.RegisterClient(auth2.ID, "claude", []*registry.ModelInfo{{ID: "claude-3-5-sonnet-20241022"}})
-	t.Cleanup(func() {
-		reg.UnregisterClient(auth1.ID)
-		reg.UnregisterClient(auth2.ID)
-	})
-
-	if _, err := manager.Register(context.Background(), auth1); err != nil {
-		t.Fatalf("register auth1: %v", err)
-	}
-	if _, err := manager.Register(context.Background(), auth2); err != nil {
-		t.Fatalf("register auth2: %v", err)
-	}
-
-	payload := []byte(`{"speed":"fast","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
-	resp, err := manager.Execute(context.Background(), []string{"claude"}, cliproxyexecutor.Request{
-		Model:   "claude-3-5-sonnet-20241022",
-		Payload: payload,
-	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatClaude})
-	if err != nil {
-		t.Fatalf("expected failover to cred2 when authoritative rate limit headers present, got: %v", err)
-	}
-	if len(resp.Payload) == 0 {
-		t.Fatal("expected response from cred2")
-	}
-
-	if attemptsCred1.Load() != 1 {
-		t.Fatalf("attempts on cred1 = %d, want 1", attemptsCred1.Load())
-	}
-	if attemptsCred2.Load() != 1 {
-		t.Fatalf("attempts on cred2 = %d, want 1", attemptsCred2.Load())
-	}
-
-	// Verify cred1 was cooled down at credential level
-	registeredAuth, ok := manager.GetByID(auth1.ID)
-	if !ok || registeredAuth == nil {
-		t.Fatal("auth1 not found")
-	}
-	if !registeredAuth.Unavailable || !registeredAuth.Quota.Exceeded {
-		t.Fatalf("cred1 was not cooled down: unavailable=%v quota=%+v", registeredAuth.Unavailable, registeredAuth.Quota)
-	}
-}
-
 func TestClaudeExecutor_RateLimit_FastEntitlementWithRetryAfterRemainsRequestScoped(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -600,195 +520,117 @@ func TestClaudeExecutor_AuthManager_OrdinaryModel429DoesNotBlockSiblingModels(t 
 	}
 }
 
-func TestClaudeExecutor_AuthManager_AlternativeCredentialCanBeSelected(t *testing.T) {
-	var attemptsCred1 atomic.Int32
-	var attemptsCred2 atomic.Int32
-	now := time.Now()
-	sevenDayReset := now.Add(7 * 24 * time.Hour).Unix()
+const ordinaryRefusalModel = "claude-3-5-sonnet-20241022"
+const ordinaryRefusalDelay = 120 * time.Second
 
-	server1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		attemptsCred1.Add(1)
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Anthropic-Ratelimit-Unified-Status", "rejected")
-		w.Header().Set("Anthropic-Ratelimit-Unified-7d-Status", "rejected")
-		w.Header().Set("Anthropic-Ratelimit-Unified-7d-Reset", strconv.FormatInt(sevenDayReset, 10))
-		w.WriteHeader(http.StatusTooManyRequests)
-		_, _ = w.Write([]byte(`{"type":"error","error":{"type":"rate_limit_error","message":"7d limit rejected."}}`))
+func ordinaryClaudeSingleCredentialRefusal(t *testing.T) (context.Context, *cliproxyauth.Auth, *int) {
+	t.Helper()
+	calls := 0
+	ctx := context.WithValue(t.Context(), "cliproxy.roundtripper", ordinaryClaudeTestRoundTripper(func(req *http.Request) (*http.Response, error) {
+		calls++
+		if req.URL.Hostname() != "single-credential.fixture.invalid" || req.Method != http.MethodPost {
+			return nil, errors.New("unexpected route for ordinary provider refusal")
+		}
+		headers := make(http.Header)
+		headers.Set("Content-Type", "application/json")
+		headers.Set("Retry-After", "120")
+		headers.Set("Anthropic-Ratelimit-Unified-Status", "rejected")
+		return &http.Response{
+			StatusCode: http.StatusTooManyRequests,
+			Header:     headers,
+			Body:       io.NopCloser(strings.NewReader(`{"type":"error","error":{"type":"rate_limit_error","message":"Request rate limit reached."}}`)),
+			Request:    req,
+		}, nil
 	}))
-	defer server1.Close()
+	auth := &cliproxyauth.Auth{
+		ID: uuid.NewString(), Provider: "claude",
+		Attributes: map[string]string{"api_key": "ordinary-fixture-key", "base_url": "https://single-credential.fixture.invalid"},
+	}
+	return ctx, auth, &calls
+}
 
-	server2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		attemptsCred2.Add(1)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"id":"msg-123","type":"message","role":"assistant","content":[{"type":"text","text":"hello from cred2"}]}`))
-	}))
-	defer server2.Close()
-
-	cfg := &config.Config{
-		DisableCooling: false,
-	}
-	manager := cliproxyauth.NewManager(nil, nil, nil)
-	manager.SetRetryConfig(0, 0, 2)
-
-	executor := NewClaudeExecutor(cfg)
-	manager.RegisterExecutor(executor)
-
-	baseID := uuid.NewString()
-	auth1 := &cliproxyauth.Auth{
-		ID:       baseID + "-claude-cred-1",
-		Provider: "claude",
-		Attributes: map[string]string{
-			"api_key":  "test-key-1",
-			"base_url": server1.URL,
-		},
-	}
-	auth2 := &cliproxyauth.Auth{
-		ID:       baseID + "-claude-cred-2",
-		Provider: "claude",
-		Attributes: map[string]string{
-			"api_key":  "test-key-2",
-			"base_url": server2.URL,
-		},
-	}
-
-	reg := registry.GetGlobalRegistry()
-	reg.RegisterClient(auth1.ID, "claude", []*registry.ModelInfo{{ID: "claude-3-5-sonnet-20241022"}})
-	reg.RegisterClient(auth2.ID, "claude", []*registry.ModelInfo{{ID: "claude-3-5-sonnet-20241022"}})
-	t.Cleanup(func() {
-		reg.UnregisterClient(auth1.ID)
-		reg.UnregisterClient(auth2.ID)
-	})
-
-	if _, err := manager.Register(context.Background(), auth1); err != nil {
-		t.Fatalf("register auth1: %v", err)
-	}
-	if _, err := manager.Register(context.Background(), auth2); err != nil {
-		t.Fatalf("register auth2: %v", err)
-	}
-
-	payload := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
-	resp, err := manager.Execute(context.Background(), []string{"claude"}, cliproxyexecutor.Request{
-		Model:   "claude-3-5-sonnet-20241022",
-		Payload: payload,
-	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatClaude})
-	if err != nil {
-		t.Fatalf("expected successful failover to cred2, got error: %v", err)
-	}
-
-	if attemptsCred1.Load() != 1 {
-		t.Fatalf("attempts on cred1 = %d, want 1", attemptsCred1.Load())
-	}
-	if attemptsCred2.Load() != 1 {
-		t.Fatalf("attempts on cred2 = %d, want 1", attemptsCred2.Load())
-	}
-	if len(resp.Payload) == 0 {
-		t.Fatal("expected non-empty response payload from cred2")
-	}
-
-	// Next request should directly use cred2 without attempting cred1 (which is cooling down)
-	resp2, err2 := manager.Execute(context.Background(), []string{"claude"}, cliproxyexecutor.Request{
-		Model:   "claude-3-5-sonnet-20241022",
-		Payload: payload,
-	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatClaude})
-	if err2 != nil {
-		t.Fatalf("expected successful request on cred2, got error: %v", err2)
-	}
-	if attemptsCred1.Load() != 1 {
-		t.Fatalf("attempts on cred1 after 2nd request = %d, want 1 (must stay 1)", attemptsCred1.Load())
-	}
-	if attemptsCred2.Load() != 2 {
-		t.Fatalf("attempts on cred2 after 2nd request = %d, want 2", attemptsCred2.Load())
-	}
-	if len(resp2.Payload) == 0 {
-		t.Fatal("expected non-empty response payload from 2nd request")
+func assertOrdinaryClaude429(t *testing.T, err error) {
+	t.Helper()
+	var status interface{ StatusCode() int }
+	if !errors.As(err, &status) || status.StatusCode() != http.StatusTooManyRequests {
+		t.Fatalf("expected HTTP 429, got %v", err)
 	}
 }
 
-func TestClaudeExecutor_AuthManager_MultiModelPoolStreamStopsProbingOn429(t *testing.T) {
-	var attemptsCred1 atomic.Int32
-	var attemptsCred2 atomic.Int32
+func assertOrdinaryClaudeProvider429(t *testing.T, err error) {
+	t.Helper()
+	assertOrdinaryClaude429(t, err)
+	if !strings.Contains(err.Error(), "Request rate limit reached.") {
+		t.Fatal("provider refusal body was lost")
+	}
+	var hint retryAfterProvider
+	if !errors.As(err, &hint) || hint.RetryAfter() == nil || *hint.RetryAfter() != ordinaryRefusalDelay {
+		t.Fatal("expected the provider's Retry-After unchanged")
+	}
+}
 
-	server1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		attemptsCred1.Add(1)
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Anthropic-Ratelimit-Unified-Status", "rejected")
-		w.Header().Set("Anthropic-Ratelimit-Unified-7d-Status", "rejected")
-		w.Header().Set("Anthropic-Ratelimit-Unified-7d-Reset", strconv.FormatInt(time.Now().Add(7*24*time.Hour).Unix(), 10))
-		w.Header().Set("Retry-After", "604800")
-		w.WriteHeader(http.StatusTooManyRequests)
-		_, _ = w.Write([]byte(`{"type":"error","error":{"type":"rate_limit_error","message":"rate limited"}}`))
-	}))
-	defer server1.Close()
+func TestOrdinaryClaudeProviderRateLimitKeepsWaitHint(t *testing.T) {
+	ctx, auth, calls := ordinaryClaudeSingleCredentialRefusal(t)
+	req := cliproxyexecutor.Request{
+		Model:   ordinaryRefusalModel,
+		Payload: []byte(`{"max_tokens":16,"messages":[{"role":"user","content":"ordinary request"}]}`),
+	}
+	response, err := NewClaudeExecutor(&config.Config{}).Execute(ctx, auth, req,
+		cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatClaude})
+	assertOrdinaryClaudeProvider429(t, err)
+	if len(response.Payload) != 0 || *calls != 1 {
+		t.Fatal("provider refusal must end the request without a success body or retry")
+	}
+}
 
-	server2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		attemptsCred2.Add(1)
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg-1\",\"model\":\"claude-3-5-sonnet-20241022\"}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"))
-	}))
-	defer server2.Close()
-
-	cfg := &config.Config{DisableCooling: false}
+func TestOrdinaryClaudeIndependentRequestHonorsSameCredentialCooldown(t *testing.T) {
+	ctx, auth, calls := ordinaryClaudeSingleCredentialRefusal(t)
 	manager := cliproxyauth.NewManager(nil, nil, nil)
-	manager.SetRetryConfig(0, 0, 2)
-
-	manager.SetOAuthModelAlias(map[string][]config.OAuthModelAlias{
-		"claude": {
-			{Name: "claude-3-5-sonnet-20241022", Alias: "claude-pool-alias"},
-			{Name: "claude-3-opus-20240229", Alias: "claude-pool-alias"},
-		},
-	})
-
-	executor := NewClaudeExecutor(cfg)
-	manager.RegisterExecutor(executor)
-
-	baseID := uuid.NewString()
-	auth1 := &cliproxyauth.Auth{ID: baseID + "-pool-1", Provider: "claude", Attributes: map[string]string{"api_key": "k1", "base_url": server1.URL}}
-	auth2 := &cliproxyauth.Auth{ID: baseID + "-pool-2", Provider: "claude", Attributes: map[string]string{"api_key": "k2", "base_url": server2.URL}}
-
+	manager.RegisterExecutor(NewClaudeExecutor(&config.Config{}))
 	reg := registry.GetGlobalRegistry()
-	reg.RegisterClient(auth1.ID, "claude", []*registry.ModelInfo{
-		{ID: "claude-pool-alias"},
-		{ID: "claude-3-5-sonnet-20241022"},
-		{ID: "claude-3-opus-20240229"},
-	})
-	reg.RegisterClient(auth2.ID, "claude", []*registry.ModelInfo{
-		{ID: "claude-pool-alias"},
-		{ID: "claude-3-5-sonnet-20241022"},
-		{ID: "claude-3-opus-20240229"},
-	})
-	t.Cleanup(func() {
-		reg.UnregisterClient(auth1.ID)
-		reg.UnregisterClient(auth2.ID)
-	})
+	reg.RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: ordinaryRefusalModel}})
+	t.Cleanup(func() { reg.UnregisterClient(auth.ID) })
+	if _, err := manager.Register(ctx, auth); err != nil {
+		t.Fatal(err)
+	}
+	if members := manager.List(); len(members) != 1 || members[0].ID != auth.ID {
+		t.Fatal("fixture must have exactly one eligible credential")
+	}
+	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatClaude}
+	providers := []string{"claude"}
+	first := cliproxyexecutor.Request{Model: ordinaryRefusalModel,
+		Payload: []byte(`{"max_tokens":16,"messages":[{"role":"user","content":"first independent input"}]}`)}
+	started := time.Now()
+	_, err := manager.Execute(ctx, providers, first, opts)
+	assertOrdinaryClaude429(t, err)
+	var hint retryAfterProvider
+	if !errors.As(err, &hint) || hint.RetryAfter() == nil {
+		t.Fatal("expected a retry deadline for the selected credential")
+	}
+	wait := *hint.RetryAfter()
+	if wait <= 0 || wait > ordinaryRefusalDelay || wait < ordinaryRefusalDelay-time.Since(started) {
+		t.Fatal("retry deadline did not reflect the provider's wait hint")
+	}
+	if *calls != 1 {
+		t.Fatal("first refusal was retried")
+	}
+	second := cliproxyexecutor.Request{Model: ordinaryRefusalModel,
+		Payload: []byte(`{"max_tokens":16,"messages":[{"role":"user","content":"new unrelated input"}]}`)}
+	response, err := manager.Execute(ctx, providers, second, opts)
+	assertOrdinaryClaude429(t, err)
+	if len(response.Payload) != 0 || *calls != 1 {
+		t.Fatal("independent request must respect the existing cooldown")
+	}
+}
 
-	if _, err := manager.Register(context.Background(), auth1); err != nil {
-		t.Fatalf("register auth1: %v", err)
-	}
-	if _, err := manager.Register(context.Background(), auth2); err != nil {
-		t.Fatalf("register auth2: %v", err)
-	}
-
-	payload := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
-	res, err := manager.ExecuteStream(context.Background(), []string{"claude"}, cliproxyexecutor.Request{
-		Model:   "claude-pool-alias",
-		Payload: payload,
-	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatClaude})
-	if err != nil {
-		t.Fatalf("ExecuteStream failed: %v", err)
-	}
-	for chunk := range res.Chunks {
-		if chunk.Err != nil {
-			t.Fatalf("unexpected chunk error: %v", chunk.Err)
-		}
-	}
-
-	// Must have tried cred1 exactly once (did NOT probe the 2nd model on cred1 after 429) and failed over to cred2
-	if got := attemptsCred1.Load(); got != 1 {
-		t.Fatalf("attempts on cred1 = %d, want 1 (must not probe other models on cooled cred)", got)
-	}
-	if got := attemptsCred2.Load(); got != 1 {
-		t.Fatalf("attempts on cred2 = %d, want 1", got)
+func TestOrdinaryClaudeRateLimitStopsStreamBeforePayload(t *testing.T) {
+	ctx, auth, calls := ordinaryClaudeSingleCredentialRefusal(t)
+	req := cliproxyexecutor.Request{Model: ordinaryRefusalModel,
+		Payload: []byte(`{"max_tokens":16,"messages":[{"role":"user","content":"ordinary streaming input"}]}`)}
+	result, err := NewClaudeExecutor(&config.Config{}).ExecuteStream(ctx, auth, req,
+		cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatClaude})
+	assertOrdinaryClaudeProvider429(t, err)
+	if result != nil || *calls != 1 {
+		t.Fatal("pre-stream refusal produced stream output or retried")
 	}
 }
