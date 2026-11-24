@@ -206,6 +206,12 @@ func (r *UsageReporter) ObserveContentEvent(payload []byte) {
 			recognized = true
 			content = root.Get("delta").String() != ""
 			visible = content && (kind == "response.output_text.delta" || kind == "response.function_call_arguments.delta")
+		case "content_block_start":
+			recognized = true
+			block := root.Get("content_block")
+			visible = block.Get("text").String() != "" ||
+				(block.Get("type").String() == "tool_use" && len(block.Get("input").Map()) != 0)
+			content = visible || block.Get("thinking").String() != ""
 		case "content_block_delta":
 			recognized = true
 			visible = root.Get("delta.text").String() != "" || root.Get("delta.partial_json").String() != ""

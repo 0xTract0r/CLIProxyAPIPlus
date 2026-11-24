@@ -43,6 +43,9 @@ func (e *ClaudeExecutor) executeOrdinaryClaudeMessages(ctx context.Context, auth
 	}
 	reporter := helps.NewExecutorUsageReporter(ctx, e, baseModel, auth)
 	defer reporter.TrackFailure(ctx, &err)
+	if upstreamStream {
+		reporter.UseDecodedContentTelemetry()
+	}
 	if upstreamModel != baseModel {
 		reporter.SetUpstreamModel(upstreamModel)
 	}
@@ -56,7 +59,7 @@ func (e *ClaudeExecutor) executeOrdinaryClaudeMessages(ctx context.Context, auth
 	}
 	mediaType, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type"))
 	if upstreamStream && mediaType == "text/event-stream" {
-		payload, err := readOrdinaryClaudeResponse(resp, 32<<20)
+		payload, err := readOrdinaryClaudeResponse(resp, 32<<20, reporter.ContentEventObserver())
 		if err != nil {
 			return cliproxyexecutor.Response{}, err
 		}
@@ -68,7 +71,6 @@ func (e *ClaudeExecutor) executeOrdinaryClaudeMessages(ctx context.Context, auth
 			if data, ok := bytes.CutPrefix(line, []byte("data:")); ok {
 				data = bytes.TrimSpace(data)
 				usage.ObserveClaudeStream(line)
-				helps.ObserveClaudeTokenEvent(reporter, data)
 				reporter.ObserveResponseModel(line)
 				if message, refused := clienterror.ClaudePolicyRefusalMessage(data); refused {
 					refusal = message
@@ -134,7 +136,7 @@ func (e *ClaudeExecutor) executeOrdinaryClaudeMessages(ctx context.Context, auth
 }
 
 func readOrdinaryClaudeJSON(resp *http.Response, maxBytes int64) ([]byte, error) {
-	payload, err := readOrdinaryClaudeResponse(resp, maxBytes)
+	payload, err := readOrdinaryClaudeResponse(resp, maxBytes, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -144,14 +146,18 @@ func readOrdinaryClaudeJSON(resp *http.Response, maxBytes int64) ([]byte, error)
 	return payload, nil
 }
 
-func readOrdinaryClaudeResponse(resp *http.Response, maxBytes int64) ([]byte, error) {
+func readOrdinaryClaudeResponse(resp *http.Response, maxBytes int64, observer io.Writer) ([]byte, error) {
 	decoded, err := decodeResponseBody(resp.Body, claudeResponseContentEncoding(resp.Header))
 	if err != nil {
 		_ = resp.Body.Close()
 		return nil, ordinaryClaudeResponseReadError(err, "invalid Claude response encoding")
 	}
 	defer decoded.Close()
-	payload, err := io.ReadAll(io.LimitReader(decoded, maxBytes+1))
+	var reader io.Reader = io.LimitReader(decoded, maxBytes+1)
+	if observer != nil {
+		reader = io.TeeReader(reader, observer)
+	}
+	payload, err := io.ReadAll(reader)
 	if err != nil {
 		return nil, ordinaryClaudeResponseReadError(err, "could not read Claude response")
 	}

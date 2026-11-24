@@ -486,11 +486,13 @@ func (r *UsageReporter) ObserveResponse(resp *http.Response) {
 	}
 	r.StartResponseTTFT()
 	r.observeHeaders(resp)
+	mediaType, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+	decodedSSE := r.decodedContentTelemetry && mediaType == "text/event-stream"
 	resp.Body = &usageTTFTReadCloser{
 		ReadCloser: resp.Body,
 		observe:    r.bodyObserver(resp),
 		mark: func() {
-			if r.stream {
+			if r.stream || decodedSSE {
 				r.RecordFirstPacket()
 			} else {
 				r.MarkFirstResponseByte()
