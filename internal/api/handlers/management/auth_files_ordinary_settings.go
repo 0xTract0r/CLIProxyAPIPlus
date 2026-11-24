@@ -17,6 +17,7 @@ import (
 
 type ordinaryAccountSettingsView struct {
 	Note           string   `json:"note"`
+	RefreshEnabled bool     `json:"refresh_enabled"`
 	Disabled       bool     `json:"disabled"`
 	AuthIndex      string   `json:"auth_index"`
 	Revision       string   `json:"revision,omitempty"`
@@ -28,6 +29,7 @@ type ordinaryAccountSettingsRequest struct {
 	name, index, revision string
 	note                  *string
 	disabled              *bool
+	refreshEnabled        *bool
 }
 
 type ordinaryAccountSettingsTarget struct {
@@ -68,7 +70,12 @@ func (h *Handler) PatchOrdinaryAuthFileAccountSettings(c *gin.Context) {
 	}
 
 	expected := target.revision()
-	if header := strings.TrimSpace(c.GetHeader("If-Match")); (header != "" && header != `"`+expected+`"`) ||
+	header := strings.TrimSpace(c.GetHeader("If-Match"))
+	if req.refreshEnabled != nil && header == "" && req.revision == "" {
+		c.JSON(http.StatusPreconditionRequired, gin.H{"error": "read the credential settings before editing automatic refresh"})
+		return
+	}
+	if (header != "" && header != `"`+expected+`"`) ||
 		(req.revision != "" && req.revision != expected) {
 		c.JSON(http.StatusPreconditionFailed, gin.H{"error": "credential file changed, reload its settings"})
 		return
@@ -77,7 +84,7 @@ func (h *Handler) PatchOrdinaryAuthFileAccountSettings(c *gin.Context) {
 	ctx := c.Request.Context()
 	writeCtx := ctx
 	if target.file.Valid() {
-		writeCtx = sdkauth.WithAccountSettingsFilePatch(ctx, target.file, req.note != nil, req.disabled != nil)
+		writeCtx = sdkauth.WithAccountSettingsFilePatch(ctx, target.file, req.note != nil, req.disabled != nil, req.refreshEnabled != nil)
 	}
 	updated, committed, err := target.manager.ModifyPersisted(writeCtx, target.auth.ID, target.auth.RegistrationEpoch, func(current *coreauth.Auth) error {
 		h.mu.Lock()
@@ -103,6 +110,22 @@ func (h *Handler) PatchOrdinaryAuthFileAccountSettings(c *gin.Context) {
 		if req.note != nil {
 			current.Metadata["note"] = *req.note
 			syncAuthFileNoteAttribute(current)
+		}
+		if req.refreshEnabled != nil {
+			existing, _ := current.Metadata["account_settings"].(map[string]any)
+			settings := make(map[string]any, len(existing)+1)
+			for key, value := range existing {
+				settings[key] = value
+			}
+			if *req.refreshEnabled && !current.AutoQuarantined && !coreauth.IsReauthRequiredMetadata(current.Metadata) {
+				// Previous editors wrote the operator flag both here and at the file root.
+				for _, key := range []string{"refresh_disabled", "disable_refresh", "auto_refresh_disabled", "refresh_enabled"} {
+					delete(current.Metadata, key)
+					delete(current.Attributes, key)
+				}
+			}
+			settings["refresh_enabled"] = *req.refreshEnabled
+			current.Metadata["account_settings"] = settings
 		}
 		if req.disabled != nil {
 			current.Metadata["disabled"] = *req.disabled
@@ -196,12 +219,13 @@ func (target ordinaryAccountSettingsTarget) revision() string {
 		return target.file.Revision()
 	}
 	state, _ := json.Marshal(struct {
-		ID         string
-		Epoch      uint64
-		Generation uint64
-		Note       string
-		Disabled   bool
-	}{target.auth.ID, target.auth.RegistrationEpoch, target.auth.Generation, ordinaryAccountNote(target.auth), target.auth.Disabled})
+		ID             string
+		Epoch          uint64
+		Generation     uint64
+		Note           string
+		Disabled       bool
+		RefreshEnabled bool
+	}{target.auth.ID, target.auth.RegistrationEpoch, target.auth.Generation, ordinaryAccountNote(target.auth), target.auth.Disabled, ordinaryRefreshEnabled(target.auth)})
 	sum := sha256.Sum256(state)
 	return hex.EncodeToString(sum[:])
 }
@@ -214,9 +238,22 @@ func ordinaryAccountNote(auth *coreauth.Auth) string {
 	return strings.TrimSpace(raw)
 }
 
+func ordinaryRefreshEnabled(auth *coreauth.Auth) bool {
+	if settings, ok := auth.Metadata["account_settings"].(map[string]any); ok {
+		if enabled, ok := settings["refresh_enabled"].(bool); ok {
+			return enabled
+		}
+	}
+	return !auth.RefreshDisabled()
+}
+
 func writeOrdinaryAccountSettings(c *gin.Context, auth *coreauth.Auth, revision string, warnings []string) {
 	if revision != "" {
 		c.Header("ETag", `"`+revision+`"`)
+	}
+	refreshEnabled := ordinaryRefreshEnabled(auth)
+	if refreshEnabled && auth.RefreshDisabled() {
+		warnings = append(warnings, "automatic refresh is still blocked by credential state or legacy settings")
 	}
 	c.Header("Cache-Control", "no-store")
 
@@ -224,7 +261,7 @@ func writeOrdinaryAccountSettings(c *gin.Context, auth *coreauth.Auth, revision 
 		"name": authFileListName(auth),
 		"account_settings": ordinaryAccountSettingsView{
 			Note: ordinaryAccountNote(auth), Disabled: auth.Disabled, AuthIndex: lockedAuthIndex(auth), Revision: revision,
-			EditableFields: []string{"note", "disabled"}, Warnings: warnings,
+			RefreshEnabled: refreshEnabled, EditableFields: []string{"note", "disabled", "refresh_enabled"}, Warnings: warnings,
 		},
 	})
 }
@@ -287,6 +324,10 @@ func decodeOrdinaryAccountSettings(c *gin.Context) (ordinaryAccountSettingsReque
 			case "note":
 				req.note = &value
 			}
+		case "refresh_enabled":
+			if err := json.Unmarshal(raw, &req.refreshEnabled); err != nil || req.refreshEnabled == nil {
+				return req, http.StatusBadRequest, errors.New("refresh_enabled must be a boolean")
+			}
 		case "disabled":
 			if err := json.Unmarshal(raw, &req.disabled); err != nil || req.disabled == nil {
 				return req, http.StatusBadRequest, errors.New("disabled must be a boolean")
@@ -295,7 +336,7 @@ func decodeOrdinaryAccountSettings(c *gin.Context) (ordinaryAccountSettingsReque
 			return req, http.StatusBadRequest, errors.New("unsupported account settings field: " + key)
 		}
 	}
-	if req.note == nil && req.disabled == nil {
+	if req.note == nil && req.disabled == nil && req.refreshEnabled == nil {
 		return req, http.StatusBadRequest, errors.New("no editable account settings fields supplied")
 	}
 	return req, 0, nil

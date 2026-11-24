@@ -61,17 +61,23 @@ func TestOrdinaryAccountSettingsPreservesFileAndConflict(t *testing.T) {
 	}
 	got := ordinarySettingsRequest(server, http.MethodGet, query, nil, true, "")
 	etag := got.Header().Get("ETag")
-	if got.Code != 200 || etag == "" || !strings.Contains(got.Body.String(), `"editable_fields":["note","disabled"]`) ||
-		strings.Contains(got.Body.String(), "future") || strings.Contains(got.Body.String(), "refresh_enabled") {
+	if got.Code != 200 || etag == "" || !strings.Contains(got.Body.String(), `"editable_fields":["note","disabled","refresh_enabled"]`) ||
+		strings.Contains(got.Body.String(), "future") || !strings.Contains(got.Body.String(), `"refresh_enabled":false`) {
 		t.Fatalf("incompatible ordinary GET response code=%d body=%s", got.Code, got.Body)
 	}
 	patch := func(extra, expectedETag string) *httptest.ResponseRecorder {
 		body := []byte(`{"name":"` + ordinaryCredentialFile + `",` + extra + `}`)
 		return ordinarySettingsRequest(server, http.MethodPatch, ordinarySettingsRoute, body, true, expectedETag)
 	}
-	if invalid := patch(`"note":"should not publish","refresh_enabled":true`, etag); invalid.Code != 400 ||
-		!strings.Contains(invalid.Body.String(), "unsupported account settings field: refresh_enabled") {
+	if invalid := patch(`"note":"should not publish","fast":true`, etag); invalid.Code != 400 ||
+		!strings.Contains(invalid.Body.String(), "unsupported account settings field: fast") {
 		t.Fatal("unsupported field did not reject the entire draft")
+	}
+	if noRevision := patch(`"refresh_enabled":true`, ""); noRevision.Code != 428 {
+		t.Fatalf("refresh without revision returned %d", noRevision.Code)
+	}
+	if invalid := patch(`"refresh_enabled":null`, etag); invalid.Code != 400 {
+		t.Fatal("explicit nil refresh accepted")
 	}
 	if invalid := patch(`"disabled":null`, etag); invalid.Code != 400 {
 		t.Fatal("explicit nil bool accepted")
@@ -90,13 +96,14 @@ func TestOrdinaryAccountSettingsPreservesFileAndConflict(t *testing.T) {
 		t.Fatal("revision conflict changed disk")
 	}
 	etag = ordinarySettingsRequest(server, http.MethodGet, query, nil, true, "").Header().Get("ETag")
-	ok := patch(`"note":"submitted","disabled":true`, etag)
+	ok := patch(`"note":"submitted","disabled":true,"refresh_enabled":true`, etag)
 	if ok.Code != 200 || hooks != 1 || !strings.Contains(ok.Body.String(), `"note":"submitted"`) ||
 		ok.Header().Get("ETag") == etag {
 		t.Fatalf("normal legacy edit status=%d hooks=%d body=%s", ok.Code, hooks, ok.Body)
 	}
 	want := bytes.Replace(external, []byte(`"note" : "old"`), []byte(`"note" : "submitted"`), 1)
 	want = bytes.Replace(want, []byte(`"disabled":false`), []byte(`"disabled":true`), 1)
+	want = bytes.Replace(want, []byte(`"refresh_enabled": false`), []byte(`"refresh_enabled": true`), 1)
 	after, err := os.ReadFile(f.path)
 	if err != nil || !bytes.Equal(after, want) {
 		t.Fatal("old untouched JSON bytes were not preserved")
@@ -111,8 +118,101 @@ func TestOrdinaryAccountSettingsPreservesFileAndConflict(t *testing.T) {
 	}
 	read := ordinarySettingsRequest(f.newServer(reopened), http.MethodGet, query, nil, true, "")
 	if read.Code != 200 || !strings.Contains(read.Body.String(), `"disabled":true`) ||
-		!strings.Contains(read.Body.String(), `"note":"submitted"`) {
+		!strings.Contains(read.Body.String(), `"note":"submitted"`) || !strings.Contains(read.Body.String(), `"refresh_enabled":true`) {
 		t.Fatalf("cold settings mismatch: code=%d body=%s", read.Code, read.Body)
+	}
+
+	v8route := "/v8/management/credentials/account-settings"
+	fresh := f.newServer(reopened)
+	if denied := ordinarySettingsRequest(fresh, http.MethodGet, v8route+"?name="+ordinaryCredentialFile, nil, false, ""); denied.Code != 401 {
+		t.Fatalf("v8 unauthenticated status=%d", denied.Code)
+	}
+	v8etag := ordinarySettingsRequest(fresh, http.MethodGet, v8route+"?name="+ordinaryCredentialFile, nil, true, "").Header().Get("ETag")
+	body := []byte(`{"name":"` + ordinaryCredentialFile + `","refresh_enabled":false}`)
+	gotV8 := ordinarySettingsRequest(fresh, http.MethodPatch, v8route, body, true, v8etag)
+	if v8etag == "" || gotV8.Code != 200 {
+		t.Fatalf("v8 ordinary refresh patch status=%d: %s", gotV8.Code, gotV8.Body)
+	}
+	if stale := ordinarySettingsRequest(fresh, http.MethodPatch, v8route, body, true, v8etag); stale.Code != 412 {
+		t.Fatalf("v8 stale refresh status=%d", stale.Code)
+	}
+	finalManager := f.newManager()
+	if err := finalManager.Load(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	active := finalManager.List()
+	if len(active) != 1 || !active[0].RefreshDisabled() {
+		t.Fatal("cold credential did not disable token refresh")
+	}
+	finalBytes, err := os.ReadFile(f.path)
+	if err != nil || !bytes.Equal(finalBytes, bytes.Replace(want, []byte(`"refresh_enabled": true`), []byte(`"refresh_enabled": false`), 1)) {
+		t.Fatal("v8 refresh edit changed unrelated bytes")
+	}
+
+	finalServer := f.newServer(finalManager)
+	finalETag := ordinarySettingsRequest(finalServer, http.MethodGet, query, nil, true, "").Header().Get("ETag")
+	start := make(chan struct{})
+	results := make(chan int, 2)
+	for _, route := range []string{ordinarySettingsRoute, v8route} {
+		go func() {
+			<-start
+			payload := []byte(`{"name":"` + ordinaryCredentialFile + `","refresh_enabled":true,"note":"` + route + `"}`)
+			results <- ordinarySettingsRequest(finalServer, http.MethodPatch, route, payload, true, finalETag).Code
+		}()
+	}
+	close(start)
+	codes := []int{<-results, <-results}
+	if (codes[0] != 200 || codes[1] != 412) && (codes[0] != 412 || codes[1] != 200) {
+		t.Fatalf("concurrent v0/v8 writes got %v, want one commit and one stale revision", codes)
+	}
+}
+
+func TestOrdinaryAccountSettingsReenablesLegacyOperatorDisableButNotTerminal(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	for _, terminal := range []bool{false, true} {
+		name := "legacy operator preference"
+		if terminal {
+			name = "terminal refusal"
+		}
+		t.Run(name, func(t *testing.T) {
+			f := newOrdinaryCredentialFixture(t, ordinaryCredentialV0)
+			state := ""
+			if terminal {
+				state = `,"reauth_required":true,"refresh_status":"reauth_required"`
+			}
+			old := `{"type":"synthetic","refresh_enabled":false,"refresh_disabled":true,"account_settings":{"refresh_enabled":false,"number":9007199254740993}` + state + "}"
+			if err := os.WriteFile(f.path, []byte(old), 0600); err != nil {
+				t.Fatal(err)
+			}
+			manager := f.newManager()
+			if err := manager.Load(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			s := f.newServer(manager)
+			route := ordinarySettingsRoute + "?name=" + ordinaryCredentialFile
+			before := ordinarySettingsRequest(s, http.MethodGet, route, nil, true, "")
+			body := []byte(`{"name":"` + ordinaryCredentialFile + `","refresh_enabled":true}`)
+			updated := ordinarySettingsRequest(s, http.MethodPatch, ordinarySettingsRoute, body, true, before.Header().Get("ETag"))
+			if updated.Code != 200 || !strings.Contains(updated.Body.String(), `"refresh_enabled":true`) {
+				t.Fatalf("enable status=%d body=%s", updated.Code, updated.Body)
+			}
+			if strings.Contains(updated.Body.String(), "automatic refresh is still blocked") != terminal {
+				t.Fatalf("wrong terminal warning: %s", updated.Body)
+			}
+			reopened := f.newManager()
+			if err := reopened.Load(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			items := reopened.List()
+			if len(items) != 1 || items[0].RefreshDisabled() != terminal {
+				t.Fatal("unexpected cold refresh status")
+			}
+			persisted, err := os.ReadFile(f.path)
+			if err != nil || !bytes.Contains(persisted, []byte(`"number":9007199254740993`)) ||
+				bytes.Contains(persisted, []byte(`"refresh_disabled":true`)) != terminal {
+				t.Fatal("incorrect legacy operator or terminal metadata persistence")
+			}
+		})
 	}
 }
 

@@ -147,6 +147,7 @@ type accountSettingsPatchKey struct{}
 type accountSettingsPatch struct {
 	file                 AccountSettingsFile
 	note, disabled       bool
+	refreshEnabled       bool
 	fields               []string
 	selectedCodexLogin   bool
 	selectedCopilotLogin bool
@@ -154,8 +155,8 @@ type accountSettingsPatch struct {
 
 // WithAccountSettingsFilePatch lets a local store preserve unedited JSON bytes.
 // Other stores still use their normal ModifyPersisted transaction.
-func WithAccountSettingsFilePatch(ctx context.Context, file AccountSettingsFile, note, disabled bool) context.Context {
-	return context.WithValue(ctx, accountSettingsPatchKey{}, accountSettingsPatch{file: file, note: note, disabled: disabled})
+func WithAccountSettingsFilePatch(ctx context.Context, file AccountSettingsFile, note, disabled bool, refresh ...bool) context.Context {
+	return context.WithValue(ctx, accountSettingsPatchKey{}, accountSettingsPatch{file: file, note: note, disabled: disabled, refreshEnabled: len(refresh) > 0 && refresh[0]})
 }
 
 // WithCredentialFileFieldsPatch gives FileTokenStore the top-level fields
@@ -309,6 +310,31 @@ func (s *FileTokenStore) saveAccountSettingsPatch(path string, auth *coreauth.Au
 		}
 		if patch.disabled {
 			fields["disabled"], err = json.Marshal(auth.Disabled)
+			if err != nil {
+				return err
+			}
+		}
+		if patch.refreshEnabled {
+			settings, _ := auth.Metadata["account_settings"].(map[string]any)
+			enabled, ok := settings["refresh_enabled"].(bool)
+			if !ok {
+				return errors.New("invalid ordinary refresh setting")
+			}
+			var raw map[string]json.RawMessage
+			if err := json.Unmarshal(old, &raw); err != nil {
+				return err
+			}
+			object := raw["account_settings"]
+			if len(object) == 0 || bytes.Equal(object, []byte("null")) {
+				object = []byte("{}")
+			}
+			if enabled && !auth.AutoQuarantined && !coreauth.IsReauthRequiredMetadata(auth.Metadata) {
+				for _, key := range []string{"refresh_disabled", "disable_refresh", "auto_refresh_disabled", "refresh_enabled"} {
+					fields[key] = nil
+				}
+			}
+			value := json.RawMessage(strconv.FormatBool(enabled))
+			fields["account_settings"], err = patchCredentialFileJSON(object, map[string]json.RawMessage{"refresh_enabled": value})
 			if err != nil {
 				return err
 			}
