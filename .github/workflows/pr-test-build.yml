@@ -39,6 +39,48 @@ jobs:
           bash .github/scripts/run-loopback-only.sh env GOTOOLCHAIN=local GOWORK=off GOPROXY=off
           python3 .github/scripts/check-ordinary-pr-tests.py --run-selected
 
+  seaweedfs-storage:
+    name: S3-compatible credential storage
+    if: >-
+      ${{
+        contains(github.event.pull_request.labels.*.name, 'upstream-sync') ||
+        startsWith(github.head_ref, 'bot/upstream-sync') ||
+        startsWith(github.head_ref, 'codex/upstream-sync') ||
+        startsWith(github.head_ref, 'codex/sync-core') ||
+        startsWith(github.head_ref, 'codex/integrate-prod-')
+      }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Prepare test modules
+        env:
+          GOTOOLCHAIN: local
+          GOWORK: 'off'
+        run: go mod download
+      - name: Verify release asset and exercise isolated S3 storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          private="$(mktemp -d /tmp/cpa-s3.XXXXXX)"
+          trap 'rm -rf -- "$private"' EXIT
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+            --max-time 90 --max-filesize 49059307 \
+            https://github.com/seaweedfs/seaweedfs/releases/download/4.55/linux_amd64.tar.gz \
+            --output "$private/weed.tar.gz"
+          test "$(wc -c <"$private/weed.tar.gz")" -eq 49059307
+          printf '%s  %s\n' f156c609eeaf9e5fcfeea33fd70411222005f83760aa95893c9d58eff006b45c "$private/weed.tar.gz" | sha256sum -c -
+          tar -xzf "$private/weed.tar.gz" -C "$private" --no-same-owner --no-same-permissions weed
+          bash .github/scripts/run-loopback-only.sh bash .github/scripts/run-seaweedfs-integration.sh "$private/weed" "$private"
+
   build:
     runs-on: ubuntu-latest
     env:
