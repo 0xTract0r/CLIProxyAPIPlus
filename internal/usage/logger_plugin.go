@@ -903,13 +903,14 @@ func (s *RequestStatistics) mergeSnapshotLocked(snapshot StatisticsSnapshot, res
 	for apiName, apiSnapshot := range snapshot.APIs {
 		// A stored bucket can contain repeated rows. Legacy and hashed labels
 		// may mirror one another, so count occurrences within each source bucket.
-		var occurrences map[string]int
-		if restore {
-			occurrences = make(map[string]int)
-		}
 		apiName = s.normalizeUsageBucketLocked(strings.TrimSpace(apiName))
 		if apiName == "" {
 			continue
+		}
+		hash := usageKeyHash(apiName)
+		var occurrences map[string]int
+		if restore && hash != "" {
+			occurrences = make(map[string]int)
 		}
 		apiNames = append(apiNames, apiName)
 		for modelName, modelSnapshot := range apiSnapshot.Models {
@@ -933,19 +934,29 @@ func (s *RequestStatistics) mergeSnapshotLocked(snapshot StatisticsSnapshot, res
 					return MergeResult{}, err
 				}
 				key := dedupKey(apiName, modelName, detail)
-				if hash := usageKeyHash(apiName); hash != "" {
+				if hash != "" {
 					detail.APIKeyHash, detail.Source = hash, apiName
 				}
-				ordinal := 1
-				if restore {
-					occurrences[key]++
-					ordinal = occurrences[key]
+				if restore && occurrences == nil {
+					// Preserve one-for-one matching against persisted rows for
+					// ordinary groups, even if trim normalizes two source labels.
+					if seen[key] > 0 {
+						seen[key]--
+						result.Skipped++
+						continue
+					}
+				} else {
+					ordinal := 1
+					if occurrences != nil {
+						occurrences[key]++
+						ordinal = occurrences[key]
+					}
+					if seen[key] >= ordinal {
+						result.Skipped++
+						continue
+					}
+					seen[key] = ordinal
 				}
-				if seen[key] >= ordinal {
-					result.Skipped++
-					continue
-				}
-				seen[key] = ordinal
 				pricing := s.computeDetailPricing(modelName, detail.Tokens)
 				if !remaining.consume(detail.Tokens, pricing) {
 					return MergeResult{}, errUsageCapacity
