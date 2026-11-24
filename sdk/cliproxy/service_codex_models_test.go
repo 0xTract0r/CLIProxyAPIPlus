@@ -3,6 +3,7 @@ package cliproxy
 import (
 	"context"
 	"fmt"
+	"slices"
 	"testing"
 
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
@@ -103,8 +104,16 @@ func TestRegisterModelsForAuthCodexConfigurationUpdate(t *testing.T) {
 	}
 }
 
+func ordinaryCodexAPIKeyDefaultModels() []*ModelInfo {
+	models := internalregistry.GetCodexProModels()
+	// Spark requires a Pro OAuth grant. An API key alone has no OAuth tier.
+	return slices.DeleteFunc(models, func(model *ModelInfo) bool {
+		return model.ID == "gpt-5.3-codex-spark"
+	})
+}
+
 func TestRegisterModelsForAuthCodexAPIKeyModels(t *testing.T) {
-	defaultModels := internalregistry.GetCodexProModels()
+	defaultModels := ordinaryCodexAPIKeyDefaultModels()
 	if len(defaultModels) == 0 {
 		t.Fatal("expected Codex Pro default models")
 	}
@@ -189,7 +198,7 @@ func TestRegisterModelsForAuthCodexAPIKeyModels(t *testing.T) {
 }
 
 func TestRegisterModelsForAuthCodexAPIKeyDefaultRequiresConfigMatch(t *testing.T) {
-	defaultIDs := codexModelIDSet(internalregistry.GetCodexProModels())
+	defaultIDs := codexModelIDSet(ordinaryCodexAPIKeyDefaultModels())
 	tests := []struct {
 		name       string
 		config     config.Config
@@ -284,7 +293,7 @@ func TestRegisterModelsForAuthCodexAPIKeyDefaultRequiresConfigMatch(t *testing.T
 }
 
 func TestRegisterConfigAPIKeyAuthsCodexModelModes(t *testing.T) {
-	defaultIDs := codexModelIDSet(internalregistry.GetCodexProModels())
+	defaultIDs := codexModelIDSet(ordinaryCodexAPIKeyDefaultModels())
 	tests := []struct {
 		name       string
 		models     []internalconfig.CodexModel

@@ -32,6 +32,27 @@ func (s *Service) registerModelsForAuthWithCache(ctx context.Context, a *coreaut
 	return s.registerModelsForAuthWithConfigAndCache(ctx, s.currentConfig(), a, compatCache)
 }
 
+// usesBuiltinRetiredExecutor recognizes only the published local 501
+// connector. An SDK wrapper can implement a real replacement while exposing
+// its inner executor for session lifecycle, so an opaque wrapper is not proof.
+func (s *Service) usesBuiltinRetiredExecutor(provider string) bool {
+	if s.coreManager == nil {
+		return false
+	}
+	published, ok := s.coreManager.Executor(provider)
+	if !ok {
+		return false
+	}
+	switch e := published.(type) {
+	case *executor.GeminiCLIExecutor:
+		return e != nil
+	case *executor.GitHubCopilotExecutor:
+		return e != nil
+	default:
+		return false
+	}
+}
+
 func (s *Service) registerModelsForAuthWithConfigAndCache(ctx context.Context, cfg *config.Config, a *coreauth.Auth, compatCache *openAICompatibilityRegistrationCache) bool {
 	if a == nil || a.ID == "" {
 		return true
@@ -176,10 +197,13 @@ func (s *Service) registerModelsForAuthWithConfigAndCache(ctx context.Context, c
 		models = registry.GetKimiModels()
 		models = applyExcludedModels(models, excluded)
 	case "gemini-cli":
-		models = applyExcludedModels(registry.GetGeminiCLIModels(), excluded)
+		if !s.usesBuiltinRetiredExecutor(provider) {
+			models = applyExcludedModels(registry.GetGeminiCLIModels(), excluded)
+		}
 	case "github-copilot":
-		// The legacy authenticated remote discovery path is not used here.
-		models = applyExcludedModels(registry.GetGitHubCopilotModels(), excluded)
+		if !s.usesBuiltinRetiredExecutor(provider) {
+			models = applyExcludedModels(registry.GetGitHubCopilotModels(), excluded)
+		}
 	case "kilo":
 		models = applyExcludedModels(registry.GetKiloModels(), excluded)
 	case "gitlab":

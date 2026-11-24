@@ -5,6 +5,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
+
+	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers/openai"
 	"slices"
 	"strings"
 	"testing"
@@ -56,7 +60,7 @@ func TestCopilotPluginCatalogPublishesExecutableRoutes(t *testing.T) {
 				alias += tc.alphaSuffix
 			}
 			cfg := &config.Config{
-				OAuthExcludedModels: map[string][]string{copilot.Provider: {"copilot/hidden", "copilot/" + hidden, alpha, alias}},
+				OAuthExcludedModels: map[string][]string{copilot.Provider: {"copilot/hidden", "copilot/" + hidden}},
 				OAuthModelAlias: map[string][]config.OAuthModelAlias{copilot.Provider: {
 					{Name: "copilot/" + alpha, Alias: alias, ForceMapping: tc.forceMapping},
 					{Name: "copilot/" + hidden, Alias: "excluded-copilot-plugin-alias"},
@@ -108,6 +112,13 @@ func TestCopilotPluginCatalogPublishesExecutableRoutes(t *testing.T) {
 			}
 
 			base := handlers.NewBaseAPIHandlers(&cfg.SDKConfig, manager)
+			router := gin.New()
+			router.GET("/v1/models", openai.NewOpenAIAPIHandler(base).OpenAIModels)
+			list := httptest.NewRecorder()
+			router.ServeHTTP(list, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+			if list.Code != http.StatusOK || !strings.Contains(list.Body.String(), "team/"+alias) || strings.Contains(list.Body.String(), "team/copilot/"+hidden) {
+				t.Fatalf("public plugin catalog status=%d body=%s", list.Code, list.Body.String())
+			}
 			request := func(id, native, effort, responseModel string) {
 				t.Helper()
 				upstreamModel, upstreamEffort := "", ""

@@ -148,11 +148,6 @@ oauth:
   excluded-models:
     copilot:
       - "copilot/*-hidden"
-  request-scoped-errors:
-    copilot:
-      - status: 429
-        match: [copilot_test_request_limit]
-        action: stop
 `, forcePrefix, alias))
 	if err != nil {
 		t.Fatal(err)
@@ -234,7 +229,11 @@ oauth:
 			status = http.StatusTooManyRequests
 			response = `{"error":{"message":"copilot_test_request_limit"}}`
 		}
-		return &http.Response{StatusCode: status, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(response))}, nil
+		header := make(http.Header)
+		if returnLimit {
+			header.Set("Retry-After", "60")
+		}
+		return &http.Response{StatusCode: status, Header: header, Body: io.NopCloser(strings.NewReader(response))}, nil
 	}))
 	request := func(id string) int {
 		id += "(high)"
@@ -258,14 +257,14 @@ oauth:
 	}
 	returnLimit = true
 	if status := request(routedAlias); status != http.StatusTooManyRequests {
-		t.Fatalf("request-scoped failure returned %d, want 429", status)
+		t.Fatalf("service rejection returned %d, want 429", status)
 	}
 	returnLimit = false
-	if status := request(routedAlias); status != http.StatusOK {
-		t.Fatalf("request-scoped failure cooled down the model: next status = %d", status)
+	if status := request(routedAlias); status != http.StatusTooManyRequests {
+		t.Fatalf("same credential must respect active provider Retry-After, got %d", status)
 	}
-	if calls != len(publicIDs)+2 {
-		t.Fatalf("upstream calls = %d, want %d", calls, len(publicIDs)+2)
+	if calls != len(publicIDs)+1 {
+		t.Fatalf("upstream calls = %d, want %d (next request must be rejected locally)", calls, len(publicIDs)+1)
 	}
 }
 
