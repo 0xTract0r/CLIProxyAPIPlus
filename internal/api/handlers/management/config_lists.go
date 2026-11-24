@@ -2007,9 +2007,9 @@ func (h *Handler) PutMetaKeys(c *gin.Context) {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.cfg.MetaKey = filtered
-	h.cfg.SanitizeMetaKeys()
-	h.persistLocked(c)
+	draft := h.cfg.CloneForRuntime()
+	draft.MetaKey = filtered
+	h.persistMetaKeysLocked(c, draft)
 }
 
 func (h *Handler) PatchMetaKey(c *gin.Context) {
@@ -2057,7 +2057,8 @@ func (h *Handler) PatchMetaKey(c *gin.Context) {
 		return
 	}
 
-	entry := h.cfg.MetaKey[targetIndex]
+	draft := h.cfg.CloneForRuntime()
+	entry := draft.MetaKey[targetIndex]
 	if body.Value.APIKey != nil {
 		entry.APIKey = strings.TrimSpace(*body.Value.APIKey)
 	}
@@ -2104,34 +2105,33 @@ func (h *Handler) PatchMetaKey(c *gin.Context) {
 		entry.RequestScopedErrors = append([]config.RequestScopedErrorRule(nil), *body.Value.RequestScopedErrors...)
 	}
 	normalizeCodexKey(&entry)
-	h.cfg.MetaKey[targetIndex] = entry
-	h.cfg.SanitizeMetaKeys()
-	h.persistLocked(c)
+	draft.MetaKey[targetIndex] = entry
+	h.persistMetaKeysLocked(c, draft)
 }
 
 func (h *Handler) DeleteMetaKey(c *gin.Context) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	draft := h.cfg.CloneForRuntime()
 	if val := strings.TrimSpace(c.Query("api-key")); val != "" {
 		if baseRaw, okBase := c.GetQuery("base-url"); okBase {
 			base := strings.TrimSpace(baseRaw)
-			out := make([]config.MetaKey, 0, len(h.cfg.MetaKey))
-			for _, entry := range h.cfg.MetaKey {
+			out := make([]config.MetaKey, 0, len(draft.MetaKey))
+			for _, entry := range draft.MetaKey {
 				if strings.TrimSpace(entry.APIKey) == val && strings.TrimSpace(entry.BaseURL) == base {
 					continue
 				}
 				out = append(out, entry)
 			}
-			h.cfg.MetaKey = out
-			h.cfg.SanitizeMetaKeys()
-			h.persistLocked(c)
+			draft.MetaKey = out
+			h.persistMetaKeysLocked(c, draft)
 			return
 		}
 
 		matchIndex := -1
 		matchCount := 0
-		for i := range h.cfg.MetaKey {
-			if strings.TrimSpace(h.cfg.MetaKey[i].APIKey) == val {
+		for i := range draft.MetaKey {
+			if strings.TrimSpace(draft.MetaKey[i].APIKey) == val {
 				matchCount++
 				if matchIndex == -1 {
 					matchIndex = i
@@ -2143,23 +2143,27 @@ func (h *Handler) DeleteMetaKey(c *gin.Context) {
 			return
 		}
 		if matchIndex != -1 {
-			h.cfg.MetaKey = append(h.cfg.MetaKey[:matchIndex], h.cfg.MetaKey[matchIndex+1:]...)
+			draft.MetaKey = append(draft.MetaKey[:matchIndex], draft.MetaKey[matchIndex+1:]...)
 		}
-		h.cfg.SanitizeMetaKeys()
-		h.persistLocked(c)
+		h.persistMetaKeysLocked(c, draft)
 		return
 	}
 	if idxStr := c.Query("index"); idxStr != "" {
 		var idx int
 		_, errScan := fmt.Sscanf(idxStr, "%d", &idx)
-		if errScan == nil && idx >= 0 && idx < len(h.cfg.MetaKey) {
-			h.cfg.MetaKey = append(h.cfg.MetaKey[:idx], h.cfg.MetaKey[idx+1:]...)
-			h.cfg.SanitizeMetaKeys()
-			h.persistLocked(c)
+		if errScan == nil && idx >= 0 && idx < len(draft.MetaKey) {
+			draft.MetaKey = append(draft.MetaKey[:idx], draft.MetaKey[idx+1:]...)
+			h.persistMetaKeysLocked(c, draft)
 			return
 		}
 	}
 	c.JSON(400, gin.H{"error": "missing api-key or index"})
+}
+
+// persistMetaKeysLocked keeps the live list unchanged until the file is committed.
+func (h *Handler) persistMetaKeysLocked(c *gin.Context, draft *config.Config) {
+	draft.SanitizeMetaKeys()
+	persistProviderFieldLocked(h, c, draft, &h.cfg.MetaKey, draft.MetaKey)
 }
 
 func applyDisableCoolingPatch(c *gin.Context, raw json.RawMessage, target **bool) bool {
