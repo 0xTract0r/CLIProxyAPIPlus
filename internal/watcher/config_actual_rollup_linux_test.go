@@ -23,11 +23,10 @@ func TestRollupActualWatcherRepeatedSaves(t *testing.T) {
 	}
 
 	for _, mode := range []struct {
-		name, optIn string
-		bind        bool
-	}{{"directory-default", "0", false}, {"directory-opt-in", "1", false}, {"single-bind-opt-in", "1", true}} {
+		name                 string
+		bind, externalRename bool
+	}{{"directory-default", false, false}, {"directory-external-replace", false, true}, {"single-bind", true, false}} {
 		t.Run(mode.name, func(t *testing.T) {
-			t.Setenv("CPA_CONFIG_LINUX_ATOMIC_REPLACE", mode.optIn)
 			authDir := t.TempDir()
 			path := filepath.Join(t.TempDir(), "config.yaml")
 			if mode.bind {
@@ -74,7 +73,16 @@ func TestRollupActualWatcherRepeatedSaves(t *testing.T) {
 				save  func() error
 			}{
 				{11, "localhost", func() error {
-					return config.SaveConfigPreserveComments(path, updated)
+					if !mode.externalRename {
+						return config.SaveConfigPreserveComments(path, updated)
+					}
+					// Editors may replace the file even though the config API writes
+					// in place. Subsequent child and CAS saves must still reload.
+					tempPath := path + ".editor"
+					if err := os.WriteFile(tempPath, []byte(strings.Replace(initial, "request-retry: 7", "request-retry: 11", 1)), 0640); err != nil {
+						return err
+					}
+					return os.Rename(tempPath, path)
 				}},
 				{11, "fixture-child", func() error {
 					child := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestRollupActualWatcherRepeatedSaves$", "-test.timeout=10s")
@@ -99,7 +107,7 @@ func TestRollupActualWatcherRepeatedSaves(t *testing.T) {
 					t.Fatalf("edit %d: %v", i+1, err)
 				}
 				after, err := os.Stat(path)
-				if err != nil || os.SameFile(before, after) == (mode.optIn == "1" && !mode.bind) {
+				if err != nil || !os.SameFile(before, after) != (mode.externalRename && i == 0) {
 					t.Fatalf("edit %d unexpected inode identity, err=%v", i+1, err)
 				}
 				disk, err := config.ReadConfigFileSnapshot(path)
