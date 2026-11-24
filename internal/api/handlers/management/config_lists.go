@@ -877,9 +877,9 @@ func (h *Handler) PutOpenAICompat(c *gin.Context) {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.cfg.OpenAICompatibility = filtered
-	h.cfg.SanitizeOpenAICompatibility()
-	h.persistLocked(c)
+	draft := h.cfg.CloneForRuntime()
+	draft.OpenAICompatibility = filtered
+	h.persistOpenAICompatLocked(c, draft)
 }
 func (h *Handler) PatchOpenAICompat(c *gin.Context) {
 	type openAICompatPatch struct {
@@ -908,14 +908,15 @@ func (h *Handler) PatchOpenAICompat(c *gin.Context) {
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	draft := h.cfg.CloneForRuntime()
 	targetIndex := -1
-	if body.Index != nil && *body.Index >= 0 && *body.Index < len(h.cfg.OpenAICompatibility) {
+	if body.Index != nil && *body.Index >= 0 && *body.Index < len(draft.OpenAICompatibility) {
 		targetIndex = *body.Index
 	}
 	if targetIndex == -1 && body.Name != nil {
 		match := strings.TrimSpace(*body.Name)
-		for i := range h.cfg.OpenAICompatibility {
-			if h.cfg.OpenAICompatibility[i].Name == match {
+		for i := range draft.OpenAICompatibility {
+			if draft.OpenAICompatibility[i].Name == match {
 				targetIndex = i
 				break
 			}
@@ -926,7 +927,7 @@ func (h *Handler) PatchOpenAICompat(c *gin.Context) {
 		return
 	}
 
-	entry := h.cfg.OpenAICompatibility[targetIndex]
+	entry := draft.OpenAICompatibility[targetIndex]
 	if body.Value.Name != nil {
 		entry.Name = strings.TrimSpace(*body.Value.Name)
 	}
@@ -948,9 +949,8 @@ func (h *Handler) PatchOpenAICompat(c *gin.Context) {
 	if body.Value.BaseURL != nil {
 		trimmed := strings.TrimSpace(*body.Value.BaseURL)
 		if trimmed == "" {
-			h.cfg.OpenAICompatibility = append(h.cfg.OpenAICompatibility[:targetIndex], h.cfg.OpenAICompatibility[targetIndex+1:]...)
-			h.cfg.SanitizeOpenAICompatibility()
-			h.persistLocked(c)
+			draft.OpenAICompatibility = append(draft.OpenAICompatibility[:targetIndex], draft.OpenAICompatibility[targetIndex+1:]...)
+			h.persistOpenAICompatLocked(c, draft)
 			return
 		}
 		entry.BaseURL = trimmed
@@ -977,37 +977,44 @@ func (h *Handler) PatchOpenAICompat(c *gin.Context) {
 		entry.RequestScopedErrors = append([]config.RequestScopedErrorRule(nil), *body.Value.RequestScopedErrors...)
 	}
 	normalizeOpenAICompatibilityEntry(&entry)
-	h.cfg.OpenAICompatibility[targetIndex] = entry
-	h.cfg.SanitizeOpenAICompatibility()
-	h.persistLocked(c)
+	draft.OpenAICompatibility[targetIndex] = entry
+	h.persistOpenAICompatLocked(c, draft)
 }
 
 func (h *Handler) DeleteOpenAICompat(c *gin.Context) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	draft := h.cfg.CloneForRuntime()
 	if name := c.Query("name"); name != "" {
-		out := make([]config.OpenAICompatibility, 0, len(h.cfg.OpenAICompatibility))
-		for _, v := range h.cfg.OpenAICompatibility {
+		out := make([]config.OpenAICompatibility, 0, len(draft.OpenAICompatibility))
+		for _, v := range draft.OpenAICompatibility {
 			if v.Name != name {
 				out = append(out, v)
 			}
 		}
-		h.cfg.OpenAICompatibility = out
-		h.cfg.SanitizeOpenAICompatibility()
-		h.persistLocked(c)
+		draft.OpenAICompatibility = out
+		h.persistOpenAICompatLocked(c, draft)
 		return
 	}
 	if idxStr := c.Query("index"); idxStr != "" {
 		var idx int
 		_, err := fmt.Sscanf(idxStr, "%d", &idx)
-		if err == nil && idx >= 0 && idx < len(h.cfg.OpenAICompatibility) {
-			h.cfg.OpenAICompatibility = append(h.cfg.OpenAICompatibility[:idx], h.cfg.OpenAICompatibility[idx+1:]...)
-			h.cfg.SanitizeOpenAICompatibility()
-			h.persistLocked(c)
+		if err == nil && idx >= 0 && idx < len(draft.OpenAICompatibility) {
+			draft.OpenAICompatibility = append(draft.OpenAICompatibility[:idx], draft.OpenAICompatibility[idx+1:]...)
+			h.persistOpenAICompatLocked(c, draft)
 			return
 		}
 	}
 	c.JSON(400, gin.H{"error": "missing name or index"})
+}
+
+func (h *Handler) persistOpenAICompatLocked(c *gin.Context, draft *config.Config) {
+	draft.SanitizeOpenAICompatibility()
+	if err := commitConfigFieldLocked(h, c, draft, &h.cfg.OpenAICompatibility, draft.OpenAICompatibility); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to save config: %v", err)})
+		return
+	}
+	h.finishConfigSaveLocked(c)
 }
 
 // vertex-api-key: []VertexCompatKey

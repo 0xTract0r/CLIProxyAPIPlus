@@ -37,6 +37,9 @@ REQUIRED = {
           for status in (400, 401, 403, 429, 503)),
     },
     API: {
+        "TestOpenAICompatibilityRejectedSaveStaysUnpublished",
+        *(f"TestOpenAICompatibilityRejectedSaveStaysUnpublished/{operation}" for operation in
+          ("put", "patch_name_fallback", "patch_blank_base_url", "delete_name", "delete_index")),
         "TestLogSettingsCommitBeforeVisibility",
         *(f"TestLogSettingsCommitBeforeVisibility/{key}" for key in (
             "request-log", "logging-to-file", "logs-max-total-size-mb", "error-logs-max-files",
