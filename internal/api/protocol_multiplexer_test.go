@@ -12,6 +12,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/testutil/requestlogfixture"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -371,10 +372,10 @@ func TestServerRejectsIncompleteUnauthenticatedRequestBodiesPromptly(t *testing.
 				}
 				foundBodyInLog := false
 				for _, entry := range entries {
-					if !strings.HasSuffix(entry.Name(), ".log") {
+					if !strings.HasSuffix(entry.Name(), ".log.gz") {
 						continue
 					}
-					content, errReadFile := os.ReadFile(filepath.Join(logsDir, entry.Name()))
+					content, errReadFile := requestlogfixture.Read(filepath.Join(logsDir, entry.Name()))
 					if errReadFile != nil {
 						t.Fatalf("read log file: %v", errReadFile)
 					}

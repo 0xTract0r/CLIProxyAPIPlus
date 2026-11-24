@@ -26,6 +26,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/testutil/requestlogfixture"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
 )
 
@@ -322,7 +323,7 @@ func TestRequestLoggingMiddleware_StreamingResponsesUpstreamSections(t *testing.
 	}
 	var logPath string
 	for _, entry := range entries {
-		if strings.HasPrefix(entry.Name(), "v1-responses-") && strings.HasSuffix(entry.Name(), ".log") {
+		if strings.HasPrefix(entry.Name(), "v1-responses-") && strings.HasSuffix(entry.Name(), ".log.gz") {
 			logPath = logsDir + string(os.PathSeparator) + entry.Name()
 			break
 		}
@@ -330,7 +331,7 @@ func TestRequestLoggingMiddleware_StreamingResponsesUpstreamSections(t *testing.
 	if logPath == "" {
 		t.Fatal("streaming request log was not created")
 	}
-	content, errReadLog := os.ReadFile(logPath)
+	content, errReadLog := requestlogfixture.Read(logPath)
 	if errReadLog != nil {
 		t.Fatalf("read log file: %v", errReadLog)
 	}
@@ -546,7 +547,7 @@ func TestRequestLoggingMiddleware_ClientCancellationExclusion(t *testing.T) {
 		}
 		var errorLogCount int
 		for _, entry := range entries {
-			if strings.HasPrefix(entry.Name(), "error-") && strings.HasSuffix(entry.Name(), ".log") {
+			if strings.HasPrefix(entry.Name(), "error-") && strings.HasSuffix(entry.Name(), ".log.gz") {
 				errorLogCount++
 			}
 		}
@@ -592,14 +593,14 @@ func TestRequestLoggingMiddleware_ClientCancellationExclusion(t *testing.T) {
 			}
 			var errorLogPath string
 			for _, entry := range entries {
-				if strings.HasPrefix(entry.Name(), "error-") && strings.HasSuffix(entry.Name(), ".log") {
+				if strings.HasPrefix(entry.Name(), "error-") && strings.HasSuffix(entry.Name(), ".log.gz") {
 					errorLogPath = filepath.Join(logsDir, entry.Name())
 				}
 			}
 			if errorLogPath == "" {
 				t.Fatalf("requestLog=%v: expected error-*.log file, got entries=%v", requestLogEnabled, entries)
 			}
-			content, errReadFile := os.ReadFile(errorLogPath)
+			content, errReadFile := requestlogfixture.Read(errorLogPath)
 			if errReadFile != nil {
 				t.Fatalf("read error log: %v", errReadFile)
 			}
@@ -633,7 +634,7 @@ func TestRequestLoggingMiddleware_ClientCancellationExclusion(t *testing.T) {
 		}
 		var standardLogCount int
 		for _, entry := range entries {
-			if !strings.HasPrefix(entry.Name(), "error-") && strings.HasSuffix(entry.Name(), ".log") {
+			if !strings.HasPrefix(entry.Name(), "error-") && strings.HasSuffix(entry.Name(), ".log.gz") {
 				standardLogCount++
 			}
 		}
@@ -746,7 +747,7 @@ func TestRequestLoggingMiddleware_PreservesFullUUIDForLoggerAndTruncatesFilename
 	}
 	fileName := entries[0].Name()
 	expectedShortID := spy.lastLogRequestID[len(spy.lastLogRequestID)-8:]
-	expectedSuffix := "-" + expectedShortID + ".log"
+	expectedSuffix := "-" + expectedShortID + ".log.gz"
 	if !strings.HasSuffix(fileName, expectedSuffix) {
 		t.Fatalf("filename %q does not end with expected short suffix %q", fileName, expectedSuffix)
 	}
@@ -1224,14 +1225,14 @@ func TestRequestLoggingMiddlewareErrorLogKeepsUpstreamResponseWhenRequestLogDisa
 		}
 		var errorLogPaths []string
 		for _, entry := range entries {
-			if strings.HasPrefix(entry.Name(), "error-") && strings.HasSuffix(entry.Name(), ".log") {
+			if strings.HasPrefix(entry.Name(), "error-") && strings.HasSuffix(entry.Name(), ".log.gz") {
 				errorLogPaths = append(errorLogPaths, filepath.Join(logsDir, entry.Name()))
 			}
 		}
 		if len(errorLogPaths) != 1 {
 			t.Fatalf("error log count = %d, want 1 (entries=%v)", len(errorLogPaths), entries)
 		}
-		content, errReadFile := os.ReadFile(errorLogPaths[0])
+		content, errReadFile := requestlogfixture.Read(errorLogPaths[0])
 		if errReadFile != nil {
 			t.Fatalf("read error log: %v", errReadFile)
 		}
@@ -1487,14 +1488,14 @@ func TestRequestLoggingMiddlewareIsolatesDeferredResponseAcrossStreamCancelAndGi
 		}
 		var errorLogPaths []string
 		for _, entry := range entries {
-			if strings.HasPrefix(entry.Name(), "error-") && strings.HasSuffix(entry.Name(), ".log") {
+			if strings.HasPrefix(entry.Name(), "error-") && strings.HasSuffix(entry.Name(), ".log.gz") {
 				errorLogPaths = append(errorLogPaths, filepath.Join(logsDir, entry.Name()))
 			}
 		}
 		if len(errorLogPaths) != 1 {
 			t.Fatalf("error log count = %d, want 1 (entries=%v)", len(errorLogPaths), entries)
 		}
-		content, errReadFile := os.ReadFile(errorLogPaths[0])
+		content, errReadFile := requestlogfixture.Read(errorLogPaths[0])
 		if errReadFile != nil {
 			t.Fatalf("read error log: %v", errReadFile)
 		}

@@ -4,7 +4,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -13,6 +12,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/api/middleware"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/testutil/requestlogfixture"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executionregistry"
 )
 
@@ -40,11 +40,11 @@ func TestCodexSearchReadErrorDiagnosticInDownstreamLog(t *testing.T) {
 			if recorder.Code != http.StatusBadGateway || recorder.Body.String() != `{"error":"Failed to read Codex search response"}` {
 				t.Fatalf("client response changed: status=%d body=%s", recorder.Code, recorder.Body.String())
 			}
-			paths, errGlob := filepath.Glob(filepath.Join(logsDir, "*.log"))
+			paths, errGlob := filepath.Glob(filepath.Join(logsDir, "*.log.gz"))
 			if errGlob != nil || len(paths) != 1 {
 				t.Fatalf("logs = %v, error = %v", paths, errGlob)
 			}
-			data, errRead := os.ReadFile(paths[0])
+			data, errRead := requestlogfixture.Read(paths[0])
 			if errRead != nil {
 				t.Fatal(errRead)
 			}

@@ -562,7 +562,7 @@ func TestFileRequestLogger_UsesShortRequestIDForLocalAndFullForHome(t *testing.T
 		t.Fatalf("expected 1 log file, got %d", len(entries))
 	}
 	filename := entries[0].Name()
-	expectedSuffix := "-" + expectedShortID + ".log"
+	expectedSuffix := "-" + expectedShortID + ".log.gz"
 	if !strings.HasSuffix(filename, expectedSuffix) {
 		t.Fatalf("filename %q does not have expected suffix %q", filename, expectedSuffix)
 	}

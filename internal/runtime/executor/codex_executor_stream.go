@@ -90,10 +90,12 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 				break
 			}
 			if item.err != nil {
+				helps.RecordAPIResponseError(ctx, e.cfg, item.err)
 				fail(item.err)
 				return
 			}
 			line := item.line
+			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 			data, isData := bytes.CutPrefix(line, []byte("data:"))
 			done := false
 			if isData {

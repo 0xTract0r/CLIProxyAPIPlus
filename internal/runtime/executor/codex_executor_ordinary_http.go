@@ -349,11 +349,20 @@ func (e *CodexExecutor) sendOrdinaryCodex(ctx context.Context, auth *cliproxyaut
 	httpReq.Header.Set("Accept", "application/json")
 	if stream {
 		httpReq.Header.Set("Accept", "text/event-stream")
+		helps.RecordAPIRequest(ctx, e.cfg, helps.UpstreamRequestLog{
+			URL: httpReq.URL.String(), Method: httpReq.Method, Headers: codexStreamDiagnosticHeaders(httpReq.Header), Body: body, Provider: e.Identifier(),
+		})
 	}
 	client := reporter.TrackHTTPClient(e.ordinaryCodexHTTPClient(ctx, auth))
 	resp, err := client.Do(httpReq)
 	if err != nil {
+		if stream {
+			helps.RecordAPIResponseError(ctx, e.cfg, err)
+		}
 		return nil, nil, err
+	}
+	if stream {
+		helps.RecordAPIResponseMetadata(ctx, e.cfg, resp.StatusCode, resp.Header.Clone())
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		rawBody := resp.Body
@@ -364,6 +373,9 @@ func (e *CodexExecutor) sendOrdinaryCodex(ctx context.Context, auth *cliproxyaut
 		} else {
 			_ = rawBody.Close()
 		}
+		if stream {
+			helps.AppendAPIResponseChunk(ctx, e.cfg, raw)
+		}
 		e.observeOrdinaryPolicyRefusal(ctx, auth, req.Model, raw)
 		status := newCodexStatusErrWithHeadersAndCooling(resp.StatusCode, resp.Header, raw, e.modelLevelCooling())
 		if (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) && len(resp.Header.Values("Retry-After")) == 1 {
@@ -373,6 +385,9 @@ func (e *CodexExecutor) sendOrdinaryCodex(ctx context.Context, auth *cliproxyaut
 	}
 	decoded, err := helps.DecodeResponseBody(resp.Body, resp.Header)
 	if err != nil {
+		if stream {
+			helps.RecordAPIResponseError(ctx, e.cfg, err)
+		}
 		_ = resp.Body.Close()
 		return nil, nil, statusErr{code: http.StatusBadGateway, msg: "invalid Codex response encoding", cause: err}
 	}
@@ -381,6 +396,18 @@ func (e *CodexExecutor) sendOrdinaryCodex(ctx context.Context, auth *cliproxyaut
 	resp.Header.Del("Content-Length")
 	resp.ContentLength = -1
 	return resp, body, nil
+}
+
+// codexStreamDiagnosticHeaders copies only the headers needed to diagnose
+// wire format. Credential and account headers stay on the actual request.
+func codexStreamDiagnosticHeaders(source http.Header) http.Header {
+	diagnostic := make(http.Header, 3)
+	for _, name := range []string{"Accept", "Content-Type", "Content-Encoding"} {
+		if values := source.Values(name); len(values) > 0 {
+			diagnostic[name] = append([]string(nil), values...)
+		}
+	}
+	return diagnostic
 }
 
 func applyOrdinaryCodexRequestID(target, caller http.Header) {

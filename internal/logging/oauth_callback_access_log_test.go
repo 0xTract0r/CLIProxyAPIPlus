@@ -15,12 +15,14 @@ import (
 func TestOAuthCallbackAccessLogOmitsQuery(t *testing.T) {
 	var output bytes.Buffer
 	logger := log.StandardLogger()
-	oldOutput, oldLevel := logger.Out, logger.GetLevel()
+	oldOutput, oldLevel, oldFormatter := logger.Out, logger.GetLevel(), logger.Formatter
 	logger.SetOutput(&output)
 	logger.SetLevel(log.InfoLevel)
+	logger.SetFormatter(&log.TextFormatter{DisableColors: true})
 	t.Cleanup(func() {
 		logger.SetOutput(oldOutput)
 		logger.SetLevel(oldLevel)
+		logger.SetFormatter(oldFormatter)
 	})
 	router := gin.New()
 	router.Use(GinLogrusLogger())

@@ -36,6 +36,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor"
 	runtimehelps "github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/testutil/requestlogfixture"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v8/sdk/access"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executionregistry"
@@ -3246,7 +3247,7 @@ func TestServerResponsesStreamingRequestLogCapturesUpstreamSections(t *testing.T
 	}
 	var logPath string
 	for _, entry := range entries {
-		if strings.HasPrefix(entry.Name(), "v1-responses-") && strings.HasSuffix(entry.Name(), ".log") {
+		if strings.HasPrefix(entry.Name(), "v1-responses-") && strings.HasSuffix(entry.Name(), ".log.gz") {
 			logPath = filepath.Join(logsDir, entry.Name())
 			break
 		}
@@ -3254,7 +3255,7 @@ func TestServerResponsesStreamingRequestLogCapturesUpstreamSections(t *testing.T
 	if logPath == "" {
 		t.Fatal("streaming request log was not created in logs dir")
 	}
-	content, errReadLog := os.ReadFile(logPath)
+	content, errReadLog := requestlogfixture.Read(logPath)
 	if errReadLog != nil {
 		t.Fatalf("read log file: %v", errReadLog)
 	}
@@ -3328,6 +3329,7 @@ func TestServerCodexAPIKeyResponsesStreamingRequestLog(t *testing.T) {
 	credential := &auth.Auth{
 		ID:       "codex-api-key-test",
 		Provider: "codex",
+		ProxyURL: "direct",
 		Status:   auth.StatusActive,
 		Attributes: map[string]string{
 			auth.AttributeAPIKey: "test-codex-key",
@@ -3364,7 +3366,7 @@ func TestServerCodexAPIKeyResponsesStreamingRequestLog(t *testing.T) {
 	}
 	var logPath string
 	for _, entry := range entries {
-		if strings.HasPrefix(entry.Name(), "v1-responses-") && strings.HasSuffix(entry.Name(), ".log") {
+		if strings.HasPrefix(entry.Name(), "v1-responses-") && strings.HasSuffix(entry.Name(), ".log.gz") {
 			logPath = filepath.Join(logsDir, entry.Name())
 			break
 		}
@@ -3372,14 +3374,25 @@ func TestServerCodexAPIKeyResponsesStreamingRequestLog(t *testing.T) {
 	if logPath == "" {
 		t.Fatal("streaming request log was not created in logs dir")
 	}
-	content, errReadLog := os.ReadFile(logPath)
+	content, errReadLog := requestlogfixture.Read(logPath)
 	if errReadLog != nil {
 		t.Fatalf("read log file: %v", errReadLog)
 	}
 	logText := string(content)
+	for _, secret := range []string{"test-codex-key", "test-key"} {
+		if strings.Contains(logText, secret) {
+			t.Fatal("request log exposed a credential")
+		}
+	}
 	apiRequestIdx := strings.Index(logText, "=== API REQUEST 1 ===")
 	if apiRequestIdx == -1 {
 		t.Fatalf("streaming log missing API REQUEST 1:\n%s", logText)
+	}
+	if !strings.Contains(logText[apiRequestIdx:], "text/event-stream") {
+		t.Fatal("stream diagnostic log omitted Accept")
+	}
+	if strings.Contains(logText[apiRequestIdx:], "Authorization:") || strings.Contains(logText[apiRequestIdx:], "ChatGPT-Account-ID:") {
+		t.Fatal("upstream diagnostic section retained a credential header")
 	}
 	apiResponseIdx := strings.Index(logText, "=== API RESPONSE 1 ===")
 	if apiResponseIdx == -1 {
@@ -4087,7 +4100,7 @@ func testServerResponsesWebsocketReauthorizesEachTurn(t *testing.T, requestLog b
 			if strings.HasSuffix(entry.Name(), ".tmp") || strings.HasPrefix(entry.Name(), "request-log-parts-") {
 				t.Errorf("request log temporary entry remains after handler completion: %s", entry.Name())
 			}
-			if strings.HasSuffix(entry.Name(), ".log") {
+			if strings.HasSuffix(entry.Name(), ".log.gz") {
 				logCount++
 			}
 		}
