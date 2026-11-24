@@ -124,7 +124,7 @@ func refreshOrdinaryCodexGrant(ctx context.Context, auth *cliproxyauth.Auth, dis
 				return nil, ordinaryCodexGrantChanged()
 			}
 			fresh.Metadata = baseline
-			return fresh, nil
+			return finishOrdinaryCodexRefresh(fresh, nil), nil
 		}
 	}
 	if token == "" {
@@ -163,11 +163,25 @@ func refreshOrdinaryCodexGrant(ctx context.Context, auth *cliproxyauth.Auth, dis
 		}
 		fresh.Metadata = merged
 	}
+	return finishOrdinaryCodexRefresh(fresh, patch), nil
+}
+
+func finishOrdinaryCodexRefresh(fresh *cliproxyauth.Auth, patch *codexauth.CredentialRefreshPatch) *cliproxyauth.Auth {
 	fresh.CodexRefreshPatch = patch
+	plan := ordinaryCodexMetadataString(fresh.Metadata, "plan_type")
+	if plan != "" {
+		if fresh.Attributes == nil {
+			fresh.Attributes = make(map[string]string)
+		}
+		fresh.Attributes["plan_type"] = plan
+	}
 	if storage, ok := fresh.Storage.(*codexauth.CodexTokenStorage); ok && storage != nil {
 		copied := *storage
+		if plan != "" {
+			copied.PlanType = plan
+		}
 		copied.RefreshPatch = patch
 		fresh.Storage = &copied
 	}
-	return fresh, nil
+	return fresh
 }
