@@ -16,6 +16,12 @@ func TestUsageValidityRejectsMalformedCLISinkRecords(t *testing.T) {
 	if err := stats.SetPersistencePath(path); err != nil {
 		t.Fatal(err)
 	}
+	// Detach the background writer before TempDir removes its snapshot directory.
+	t.Cleanup(func() {
+		if err := stats.Close(); err != nil {
+			t.Errorf("closing CLI usage sink: %v", err)
+		}
+	})
 	publish := func(detail coreusage.Detail, at time.Time) {
 		sink.HandleUsage(t.Context(), coreusage.Record{
 			APIKey: "fixture", Model: "ordinary-usage-fixture", Detail: detail, RequestedAt: at,
