@@ -141,22 +141,22 @@ func TestIssue7017ExecuteSingleCredentialTerminalRetryAfter(t *testing.T) {
 	}
 }
 
-func TestIssue7017ExecuteStreamMultiCredentialFailsOver(t *testing.T) {
+func TestIssue7017ExecuteStreamReturnsSelectedCredentialRetryAfter(t *testing.T) {
 	hint := 256 * time.Second
 	manager, executor := issue7017Setup(t, 0, 0, issue7017HintError{msg: issue7017TurnBody(), hint: &hint}, "turn-a", "turn-b")
 
 	_, errStream := manager.ExecuteStream(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: "gpt-6.1-sol"}, cliproxyexecutor.Options{Stream: true})
-	if errStream == nil {
-		t.Fatal("expected terminal error after both credentials reject")
+	if statusCodeFromError(errStream) != http.StatusTooManyRequests {
+		t.Fatal("expected original terminal 429")
 	}
 	calls := executor.callIDs()
-	if len(calls) != 2 || calls[0] == calls[1] {
-		t.Fatalf("stream must fail over to the second credential, calls=%v", calls)
+	if len(calls) != 1 {
+		t.Fatalf("stream must execute only the selected credential, calls=%v", calls)
 	}
 	if got := SafeResponseHeaders(errStream).Get("Retry-After"); got != "256" {
 		t.Fatalf("stream terminal Retry-After = %q, want 256 (err=%v)", got, errStream)
 	}
-	for _, id := range []string{"turn-a", "turn-b"} {
+	for _, id := range calls {
 		got, _ := manager.GetByID(id)
 		state := got.ModelStates["gpt-6.1-sol"]
 		if state == nil || state.Quota.Exceeded || state.Quota.Reason == "quota" {
@@ -165,6 +165,14 @@ func TestIssue7017ExecuteStreamMultiCredentialFailsOver(t *testing.T) {
 		if sibling := got.ModelStates["gpt-6-astra"]; sibling != nil && (sibling.Unavailable || sibling.Quota.Exceeded) {
 			t.Fatalf("%s sibling model must stay available: %+v", id, sibling)
 		}
+	}
+	unselected := "turn-b"
+	if calls[0] == unselected {
+		unselected = "turn-a"
+	}
+	other, _ := manager.GetByID(unselected)
+	if state := other.ModelStates["gpt-6.1-sol"]; state != nil && (state.Unavailable || state.Quota.Exceeded) {
+		t.Fatalf("unselected credential changed: %+v", state)
 	}
 }
 

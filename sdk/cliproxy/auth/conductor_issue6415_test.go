@@ -11,71 +11,45 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 )
 
-// TestManager_Issue6415_RefreshPending_DoesNotSelectRejectedCredential reproduces
-// Issue #6415 symptom 1:
-// When a request fails with 401 and token expiry is unknown, concurrent requests
-// should not pick the credential while refresh is pending.
-func TestManager_Issue6415_RefreshPending_DoesNotSelectRejectedCredential(t *testing.T) {
-	m, executor, primary, backup, model := newUnauthorizedRefreshFixture(t, false)
+func TestManager_Issue6415_Original401DoesNotReplayAndBlocksRejectedGrant(t *testing.T) {
+	m, executor, primary, _, model := newUnauthorizedRefreshFixture(t, false)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	run := func() error {
+		opts := cliproxyexecutor.Options{Metadata: map[string]any{cliproxyexecutor.PinnedAuthMetadataKey: primary.ID}}
+		_, err := m.Execute(ctx, []string{"codex"}, cliproxyexecutor.Request{Model: model}, opts)
+		return err
+	}
+	if err := run(); statusCodeFromError(err) != http.StatusUnauthorized {
+		t.Fatalf("original provider 401 lost: %v", err)
+	}
+	current, ok := m.GetByID(primary.ID)
+	if !ok || current == nil {
+		t.Fatal("selected grant disappeared")
+	}
+	if blocked, _, _ := isAuthBlockedForModel(current, model, time.Now()); !blocked {
+		t.Fatal("rejected grant remains selectable")
+	}
 
-	refreshStarted := make(chan struct{})
-	releaseRefresh := make(chan struct{})
-
-	executor.mu.Lock()
-	executor.onRefresh = func() {
+	results := make(chan error, 2)
+	for range 2 {
+		go func() { results <- run() }()
+	}
+	for range 2 {
 		select {
-		case <-refreshStarted:
-		default:
-			close(refreshStarted)
-		}
-		<-releaseRefresh
-	}
-	executor.mu.Unlock()
-
-	req1Done := make(chan struct{})
-	var resp1 cliproxyexecutor.Response
-	var err1 error
-	go func() {
-		defer close(req1Done)
-		resp1, err1 = m.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
-	}()
-
-	// Wait for primary to hit 401 and enter Refresh (which is now blocked).
-	<-refreshStarted
-
-	// While refresh is pending on primary with a rejected token, primary must be blocked / not selectable.
-	currentPrimary, ok := m.GetByID(primary.ID)
-	if !ok || currentPrimary == nil {
-		t.Fatal("primary auth missing")
-	}
-	blocked, _, _ := isAuthBlockedForModel(currentPrimary, model, time.Now())
-	if !blocked {
-		t.Fatalf("primary must be blocked while refresh is pending for rejected token")
-	}
-
-	// Concurrent request while refresh is pending must pick backup and succeed without touching primary.
-	execCallsBefore := len(executor.ExecuteCalls())
-	resp2, err2 := m.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
-	if err2 != nil {
-		t.Fatalf("concurrent Execute error = %v, want success via backup", err2)
-	}
-	if got := string(resp2.Payload); got != backup.ID+":backup-access-token" {
-		t.Fatalf("concurrent Execute payload = %q, want backup response", got)
-	}
-	for _, call := range executor.ExecuteCalls()[execCallsBefore:] {
-		if call == primary.ID {
-			t.Fatalf("primary was executed during pending refresh!")
+		case err := <-results:
+			if err == nil {
+				t.Fatal("independent pinned request used a rejected grant")
+			}
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
 		}
 	}
-
-	// Release refresh and wait for first request to complete.
-	close(releaseRefresh)
-	<-req1Done
-	if err1 != nil {
-		t.Fatalf("first Execute error = %v, want success after refresh", err1)
+	if calls := executor.ExecuteCalls(); len(calls) != 1 || calls[0] != primary.ID {
+		t.Fatalf("provider calls = %v, want one selected call", calls)
 	}
-	if got := string(resp1.Payload); got != primary.ID+":fresh-access-token" {
-		t.Fatalf("first Execute payload = %q, want fresh primary response", got)
+	if n := executor.RefreshCalls(); n != 0 {
+		t.Fatalf("request started %d automatic refreshes, want 0", n)
 	}
 }
 

@@ -594,7 +594,7 @@ func TestResponsesWebsocketQueuedContinuationBeforeIdleEOFIs409(t *testing.T) {
 	}
 }
 
-func TestResponsesWebsocketEarly429RetriesAnotherCredentialWithoutClosingDownstream(t *testing.T) {
+func TestResponsesWebsocketEarly429StopsOnSelectedCredential(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	early429Frames := map[string]string{
@@ -607,7 +607,7 @@ func TestResponsesWebsocketEarly429RetriesAnotherCredentialWithoutClosingDownstr
 			t.Run(fmt.Sprintf("%s/buffering=%t", frameName, buffering), func(t *testing.T) {
 				var authAConns, authBConns atomic.Int32
 				var authACreates, authBCreates atomic.Int32
-				var authA429Next, authB429Next atomic.Bool
+				var authA429Next atomic.Bool
 				authA429Next.Store(true)
 
 				upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -617,6 +617,9 @@ func TestResponsesWebsocketEarly429RetriesAnotherCredentialWithoutClosingDownstr
 						authAConns.Add(1)
 					case "Bearer key-b":
 						authBConns.Add(1)
+						authBCreates.Add(1)
+						http.Error(w, "alternate must not be contacted", http.StatusForbidden)
+						return
 					default:
 						t.Errorf("unexpected Authorization header: %q", authHeader)
 						http.Error(w, "unauthorized", http.StatusUnauthorized)
@@ -660,20 +663,13 @@ func TestResponsesWebsocketEarly429RetriesAnotherCredentialWithoutClosingDownstr
 							_ = c.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf(`{"type":"response.completed","response":{"id":%q,"status":"completed","output":[{"id":"msg-a-%d","type":"message","role":"assistant","content":[{"type":"output_text","text":"from-a"}]}]}}`, respID, turn)))
 							continue
 						}
-						turn := authBCreates.Add(1)
-						if authB429Next.Load() {
-							_ = c.WriteMessage(websocket.TextMessage, []byte(early429Frame))
-							continue
-						}
-						respID := fmt.Sprintf("resp-b-%d", turn)
-						_ = c.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf(`{"type":"response.created","response":{"id":%q,"status":"in_progress","output":[]}}`, respID)))
-						_ = c.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf(`{"type":"response.completed","response":{"id":%q,"status":"completed","output":[{"id":"msg-b-%d","type":"message","role":"assistant","content":[{"type":"output_text","text":"from-b"}]}]}}`, respID, turn)))
+
 					}
 				}))
 				t.Cleanup(upstream.Close)
 
 				cfg := &config.Config{
-					DisableCooling:      true,
+					DisableCooling:      false,
 					RequestRetry:        0,
 					MaxRetryCredentials: 2,
 					Codex: config.CodexConfig{
@@ -700,6 +696,7 @@ func TestResponsesWebsocketEarly429RetriesAnotherCredentialWithoutClosingDownstr
 						ID:       spec.id,
 						Provider: "codex",
 						Status:   coreauth.StatusActive,
+						ProxyURL: "direct",
 						Attributes: map[string]string{
 							"api_key":    spec.key,
 							"base_url":   upstream.URL,
@@ -725,184 +722,37 @@ func TestResponsesWebsocketEarly429RetriesAnotherCredentialWithoutClosingDownstr
 				t.Cleanup(downstream.Close)
 				wsURL := "ws" + strings.TrimPrefix(downstream.URL, "http") + "/v1/responses"
 
-				// 1. Request 1 selects auth-a first, receives early 429, fails over to auth-b
-				// within the same downstream WebSocket request, and completes without closing downstream.
-				conn1, resp1, errDial1 := websocket.DefaultDialer.Dial(wsURL, nil)
-				if resp1 != nil && resp1.Body != nil {
-					defer func() {
-						if errClose := resp1.Body.Close(); errClose != nil {
-							t.Logf("close handshake response body: %v", errClose)
-						}
-					}()
+				conn, handshake, err := websocket.DefaultDialer.Dial(wsURL, nil)
+				if handshake != nil && handshake.Body != nil {
+					defer handshake.Body.Close()
 				}
-				if errDial1 != nil {
-					t.Fatalf("dial first downstream websocket: %v", errDial1)
+				if err != nil {
+					t.Fatal(err)
 				}
-				defer func() {
-					if errClose := conn1.Close(); errClose != nil {
-						t.Logf("close first downstream websocket: %v", errClose)
-					}
-				}()
-
-				req1 := fmt.Sprintf(`{"type":"response.create","model":%q,"input":[{"type":"message","id":"msg-1","role":"user","content":"hello"}]}`, modelName)
-				if errWrite := conn1.WriteMessage(websocket.TextMessage, []byte(req1)); errWrite != nil {
-					t.Fatalf("write request 1: %v", errWrite)
+				defer conn.Close()
+				request := fmt.Sprintf(`{"type":"response.create","model":%q,"input":[{"type":"message","role":"user","content":"ordinary request"}]}`, modelName)
+				if err := conn.WriteMessage(websocket.TextMessage, []byte(request)); err != nil {
+					t.Fatal(err)
 				}
-
-				var completed1 []byte
+				_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 				for {
-					_ = conn1.SetReadDeadline(time.Now().Add(5 * time.Second))
-					_, frame, errRead := conn1.ReadMessage()
-					if errRead != nil {
-						t.Fatalf("request 1 downstream websocket closed before completion: %v (authACreates=%d authBCreates=%d)", errRead, authACreates.Load(), authBCreates.Load())
+					_, frame, err := conn.ReadMessage()
+					if err != nil {
+						t.Fatal(err)
 					}
-					if gotID := ojson.GetBytesNoCopy(frame, "response.id").String(); gotID == "resp-a-buffered" {
-						t.Fatalf("buffered handshake from failed credential A leaked to downstream: %s", frame)
+					event := ojson.GetBytesNoCopy(frame, "type").String()
+					if event == "response.completed" {
+						t.Fatal("refused request reported completion")
 					}
-					if ojson.GetBytesNoCopy(frame, "type").String() == "response.completed" {
-						completed1 = frame
+					if event == "error" {
+						if status := ojson.GetBytesNoCopy(frame, "status").Int(); status != http.StatusTooManyRequests {
+							t.Fatalf("received status %d, want 429", status)
+						}
 						break
 					}
 				}
-				if got := ojson.GetBytesNoCopy(completed1, "response.id").String(); got != "resp-b-1" {
-					t.Fatalf("request 1 completed response.id = %q, want resp-b-1; frame=%s", got, completed1)
-				}
-				if authACreates.Load() != 1 || authBCreates.Load() != 1 {
-					t.Fatalf("after request 1: authACreates=%d authBCreates=%d, want 1 and 1", authACreates.Load(), authBCreates.Load())
-				}
-
-				followup1 := fmt.Sprintf(`{"type":"response.create","model":%q,"previous_response_id":"resp-b-1","input":[{"type":"message","id":"msg-1b","role":"user","content":"followup on b"}]}`, modelName)
-				if errWrite := conn1.WriteMessage(websocket.TextMessage, []byte(followup1)); errWrite != nil {
-					t.Fatalf("write followup on conn1: %v", errWrite)
-				}
-				var completed1b []byte
-				for {
-					_ = conn1.SetReadDeadline(time.Now().Add(5 * time.Second))
-					_, frame, errRead := conn1.ReadMessage()
-					if errRead != nil {
-						t.Fatalf("followup on conn1 closed before completion: %v", errRead)
-					}
-					if ojson.GetBytesNoCopy(frame, "type").String() == "response.completed" {
-						completed1b = frame
-						break
-					}
-				}
-				if got := ojson.GetBytesNoCopy(completed1b, "response.id").String(); got != "resp-b-2" {
-					t.Fatalf("followup on conn1 response.id = %q, want resp-b-2; frame=%s", got, completed1b)
-				}
-				if authBConns.Load() != 1 || authBCreates.Load() != 2 {
-					t.Fatalf("after followup on conn1: authBConns=%d authBCreates=%d, want 1 and 2", authBConns.Load(), authBCreates.Load())
-				}
-
-				// 2. A subsequent independent request can still select auth-a when cooling is disabled.
-				authA429Next.Store(false)
-				conn2, resp2, errDial2 := websocket.DefaultDialer.Dial(wsURL, nil)
-				if resp2 != nil && resp2.Body != nil {
-					defer func() {
-						if errClose := resp2.Body.Close(); errClose != nil {
-							t.Logf("close second handshake response body: %v", errClose)
-						}
-					}()
-				}
-				if errDial2 != nil {
-					t.Fatalf("dial second downstream websocket: %v", errDial2)
-				}
-				defer func() {
-					if errClose := conn2.Close(); errClose != nil {
-						t.Logf("close second downstream websocket: %v", errClose)
-					}
-				}()
-
-				req2 := fmt.Sprintf(`{"type":"response.create","model":%q,"input":[{"type":"message","id":"msg-2","role":"user","content":"independent"}]}`, modelName)
-				if errWrite := conn2.WriteMessage(websocket.TextMessage, []byte(req2)); errWrite != nil {
-					t.Fatalf("write request 2: %v", errWrite)
-				}
-				var completed2 []byte
-				for {
-					_ = conn2.SetReadDeadline(time.Now().Add(5 * time.Second))
-					_, frame, errRead := conn2.ReadMessage()
-					if errRead != nil {
-						t.Fatalf("request 2 downstream websocket closed before completion: %v", errRead)
-					}
-					if ojson.GetBytesNoCopy(frame, "type").String() == "response.completed" {
-						completed2 = frame
-						break
-					}
-				}
-				if got := ojson.GetBytesNoCopy(completed2, "response.id").String(); got != "resp-a-2" {
-					t.Fatalf("request 2 completed response.id = %q, want resp-a-2; frame=%s", got, completed2)
-				}
-				if authACreates.Load() != 2 || authBCreates.Load() != 2 {
-					t.Fatalf("after request 2: authACreates=%d authBCreates=%d, want 2 and 2", authACreates.Load(), authBCreates.Load())
-				}
-
-				// 3. A continuation with previous_response_id on the pinned connection refuses cross-credential replay.
-				authA429Next.Store(true)
-				req3 := fmt.Sprintf(`{"type":"response.create","model":%q,"previous_response_id":"resp-a-2","input":[{"type":"message","id":"msg-3","role":"user","content":"continuation"}]}`, modelName)
-				if errWrite := conn2.WriteMessage(websocket.TextMessage, []byte(req3)); errWrite != nil {
-					t.Fatalf("write request 3: %v", errWrite)
-				}
-				_ = conn2.SetReadDeadline(time.Now().Add(5 * time.Second))
-				_, _, errReadClose := conn2.ReadMessage()
-				var closeErr *websocket.CloseError
-				if !errors.As(errReadClose, &closeErr) || closeErr.Code != websocket.CloseServiceRestart || closeErr.Text != wsHTTPReplayRequiredCloseReason {
-					t.Fatalf("continuation failure close = %v, want %d %q", errReadClose, websocket.CloseServiceRestart, wsHTTPReplayRequiredCloseReason)
-				}
-				if authACreates.Load() != 3 || authBCreates.Load() != 2 {
-					t.Fatalf("after continuation failure: authACreates=%d authBCreates=%d, want 3 and 2 (must not replay previous_response_id on auth-b)", authACreates.Load(), authBCreates.Load())
-				}
-
-				// 4. When all eligible credentials return early 429, the downstream WebSocket receives a terminal 429 error frame before closing.
-				authA429Next.Store(true)
-				authB429Next.Store(true)
-				conn3, resp3, errDial3 := websocket.DefaultDialer.Dial(wsURL, nil)
-				if resp3 != nil && resp3.Body != nil {
-					defer func() {
-						if errClose := resp3.Body.Close(); errClose != nil {
-							t.Logf("close third handshake response body: %v", errClose)
-						}
-					}()
-				}
-				if errDial3 != nil {
-					t.Fatalf("dial third downstream websocket: %v", errDial3)
-				}
-				defer func() {
-					if errClose := conn3.Close(); errClose != nil {
-						t.Logf("close third downstream websocket: %v", errClose)
-					}
-				}()
-				req4 := fmt.Sprintf(`{"type":"response.create","model":%q,"input":[{"type":"message","id":"msg-4","role":"user","content":"exhausted"}]}`, modelName)
-				if errWrite := conn3.WriteMessage(websocket.TextMessage, []byte(req4)); errWrite != nil {
-					t.Fatalf("write request 4: %v", errWrite)
-				}
-				_ = conn3.SetReadDeadline(time.Now().Add(5 * time.Second))
-				msgType4, frame4, errRead4 := conn3.ReadMessage()
-				if errRead4 != nil {
-					t.Fatalf("expected terminal 429 error frame after exhausting credentials, got read error: %v", errRead4)
-				}
-				if msgType4 != websocket.TextMessage {
-					t.Fatalf("frame4 msgType = %d, want TextMessage (%d)", msgType4, websocket.TextMessage)
-				}
-				if got := ojson.GetBytesNoCopy(frame4, "type").String(); got != "error" {
-					t.Fatalf("frame4 type = %q, want error: %s", got, frame4)
-				}
-				if got := int(ojson.GetBytesNoCopy(frame4, "status").Int()); got != http.StatusTooManyRequests {
-					t.Fatalf("frame4 status = %d, want %d: %s", got, http.StatusTooManyRequests, frame4)
-				}
-				if got := ojson.GetBytesNoCopy(frame4, "error.type").String(); got != "usage_limit_reached" {
-					t.Fatalf("frame4 error.type = %q, want usage_limit_reached: %s", got, frame4)
-				}
-				if got := int(ojson.GetBytesNoCopy(frame4, "error.resets_in_seconds").Int()); got != 600 {
-					t.Fatalf("frame4 error.resets_in_seconds = %d, want 600: %s", got, frame4)
-				}
-				if got := ojson.GetBytesNoCopy(frame4, "headers.Retry-After").String(); got == "" {
-					t.Fatalf("frame4 headers.Retry-After is empty: %s", frame4)
-				}
-				if _, extraFrame, errAfter := conn3.ReadMessage(); errAfter == nil {
-					t.Fatalf("expected socket close after terminal 429 error frame, got frame: %s", extraFrame)
-				}
-				if authACreates.Load() != 4 || authBCreates.Load() != 3 {
-					t.Fatalf("after all credentials exhausted: authACreates=%d authBCreates=%d, want 4 and 3", authACreates.Load(), authBCreates.Load())
+				if authAConns.Load() != 1 || authACreates.Load() != 1 || authBConns.Load() != 0 || authBCreates.Load() != 0 {
+					t.Fatalf("connections/requests: selected %d/%d, alternate %d/%d", authAConns.Load(), authACreates.Load(), authBConns.Load(), authBCreates.Load())
 				}
 			})
 		}

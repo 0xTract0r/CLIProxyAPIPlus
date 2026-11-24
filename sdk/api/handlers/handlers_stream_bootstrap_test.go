@@ -678,14 +678,28 @@ func TestExecuteStreamWithAuthManager_EmptyClosedStream(t *testing.T) {
 		return &coreexecutor.StreamResult{Chunks: chunks}, nil
 	}}
 	handler, _ := registerBootstrapExecutor(t, executor)
-	dataChan, _, errChan := handler.ExecuteStreamWithAuthManager(context.Background(), "openai", "bootstrap-model", []byte(`{"model":"bootstrap-model"}`), "")
-	if _, ok := <-dataChan; ok {
-		t.Fatal("empty stream produced data")
-	}
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	dataChan, _, errChan := handler.ExecuteStreamWithAuthManager(ctx, "openai", "bootstrap-model", []byte(`{"model":"bootstrap-model"}`), "")
 	var streamErr *interfaces.ErrorMessage
-	for msg := range errChan {
-		if msg != nil {
+	for dataChan != nil || errChan != nil {
+		select {
+		case _, ok := <-dataChan:
+			if ok {
+				t.Fatal("empty stream produced data")
+			}
+			dataChan = nil
+		case msg, ok := <-errChan:
+			if !ok {
+				errChan = nil
+				continue
+			}
+			if msg == nil || streamErr != nil {
+				t.Fatal("empty stream must produce one terminal error")
+			}
 			streamErr = msg
+		case <-ctx.Done():
+			t.Fatal("empty stream did not terminate")
 		}
 	}
 	if streamErr == nil || streamErr.StatusCode != http.StatusInternalServerError {

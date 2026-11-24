@@ -3,6 +3,7 @@ package openai
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -66,135 +67,53 @@ func (e *sseContinuityCodexExecutor) HttpRequest(context.Context, *coreauth.Auth
 	return nil, nil
 }
 
-func TestResponsesSSEWaitOnlyKeepAliveDuringContinuityWait(t *testing.T) {
+func TestResponsesSSEBeforeFirstFramePreservesHTTPRefusal(t *testing.T) {
 	gin.SetMode(gin.TestMode)
+	for _, cooling := range []bool{false, true} {
+		name := "provider"
+		if cooling {
+			name = "local-cooldown"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			manager := coreauth.NewManager(nil, nil, nil)
+			exec := &ordinary429CodexExecutor{}
+			manager.RegisterExecutor(exec)
+			const model = "gpt-5-codex"
+			auth := &coreauth.Auth{ID: "ordinary-sse-refusal-" + name, Provider: "codex", Status: coreauth.StatusActive}
+			wantCalls := int32(1)
+			if cooling {
+				deadline := time.Now().Add(time.Minute)
+				auth.Quota = coreauth.QuotaState{Exceeded: true, Reason: "quota", NextRecoverAt: deadline}
+				auth.NextRetryAfter = deadline
+				wantCalls = 0
+			}
+			if _, err := manager.Register(ctx, auth); err != nil {
+				t.Fatal(err)
+			}
+			models := registry.GetGlobalRegistry()
+			models.RegisterClient(auth.ID, "codex", []*registry.ModelInfo{{ID: model}})
+			t.Cleanup(func() { models.UnregisterClient(auth.ID) })
 
-	t.Run("emits SSE keep-alive comment only while waiting", func(t *testing.T) {
-		tickCh := make(chan time.Time)
-		restore := handlers.SetContinuityKeepAliveTickerFactoryForTest(func(time.Duration) (<-chan time.Time, func()) {
-			return tickCh, func() {}
+			h := NewOpenAIResponsesAPIHandler(handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{
+				Streaming: sdkconfig.StreamingConfig{BootstrapRetries: 2},
+			}, manager))
+			router := gin.New()
+			router.POST("/v1/responses", h.Responses)
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-5-codex","stream":true,"input":"hello"}`))
+			router.ServeHTTP(rec, req.WithContext(ctx))
+			body := rec.Body.String()
+			if rec.Code != http.StatusTooManyRequests || !strings.HasPrefix(rec.Header().Get("Content-Type"), "application/json") ||
+				!json.Valid(rec.Body.Bytes()) || strings.Contains(body, ": keep-alive") {
+				t.Fatalf("pre-output error = %d %q %q, want HTTP 429 JSON without SSE", rec.Code, rec.Header().Get("Content-Type"), body)
+			}
+			if calls := exec.calls.Load(); calls != wantCalls {
+				t.Fatalf("provider calls = %d, want %d", calls, wantCalls)
+			}
 		})
-		defer restore()
-
-		manager := coreauth.NewManager(nil, nil, nil)
-		exec := &sseContinuityCodexExecutor{}
-		manager.RegisterExecutor(exec)
-		recoverAt := time.Now().Add(time.Minute)
-		auth := &coreauth.Auth{
-			ID:             "codex-sse-1",
-			Provider:       "codex",
-			Status:         coreauth.StatusActive,
-			Quota:          coreauth.QuotaState{Exceeded: true, Reason: "quota", NextRecoverAt: recoverAt},
-			NextRetryAfter: recoverAt,
-		}
-		if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
-			t.Fatalf("register: %v", errRegister)
-		}
-		registry.GetGlobalRegistry().RegisterClient(auth.ID, "codex", []*registry.ModelInfo{{ID: "gpt-5-codex"}})
-		t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(auth.ID) })
-
-		var mu sync.Mutex
-		polls := 0
-		waitStarted := make(chan struct{})
-		releaseReady := make(chan struct{})
-		manager.SetPluginScheduler(&sseContinuityScheduler{
-			continuityFn: func(_ context.Context, _ pluginapi.SchedulerContinuityRequest) (pluginapi.SchedulerContinuityResponse, bool, error) {
-				mu.Lock()
-				polls++
-				cur := polls
-				mu.Unlock()
-				if cur == 1 {
-					select {
-					case <-waitStarted:
-					default:
-						close(waitStarted)
-					}
-					return pluginapi.SchedulerContinuityResponse{
-						Decision:       pluginapi.SchedulerContinuityWait,
-						PollIntervalMs: 50,
-						WaitBudgetMs:   2000,
-					}, true, nil
-				}
-				<-releaseReady
-				// Clear cooldown so admission succeeds.
-				_, _ = manager.Update(context.Background(), &coreauth.Auth{
-					ID:       auth.ID,
-					Provider: "codex",
-					Status:   coreauth.StatusActive,
-				})
-				return pluginapi.SchedulerContinuityResponse{Decision: pluginapi.SchedulerContinuityReady}, true, nil
-			},
-		})
-
-		cfg := &sdkconfig.SDKConfig{Streaming: sdkconfig.StreamingConfig{KeepAliveSeconds: 0, SendKeepAliveBeforeFT: false}}
-		h := NewOpenAIResponsesAPIHandler(handlers.NewBaseAPIHandlers(cfg, manager))
-
-		recorder := httptest.NewRecorder()
-		c, _ := gin.CreateTestContext(recorder)
-		c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-5-codex","stream":true,"input":"hi"}`))
-
-		done := make(chan struct{})
-		go func() {
-			defer close(done)
-			h.Responses(c)
-		}()
-
-		<-waitStarted
-		tickCh <- time.Now()
-		close(releaseReady)
-
-		select {
-		case <-done:
-		case <-time.After(2 * time.Second):
-			t.Fatal("Responses handler did not finish")
-		}
-
-		body := recorder.Body.String()
-		if !strings.Contains(body, ": keep-alive\n\n") {
-			t.Fatalf("expected wait-only SSE keep-alive comment, got %q", body)
-		}
-		if !strings.Contains(body, "response.completed") {
-			t.Fatalf("expected response.completed after ready, got %q", body)
-		}
-	})
-
-	t.Run("disabled continuity emits zero SSE keep-alive comments and returns 429 JSON", func(t *testing.T) {
-		manager := coreauth.NewManager(nil, nil, nil)
-		manager.RegisterExecutor(&sseContinuityCodexExecutor{})
-		recoverAt := time.Now().Add(time.Minute)
-		auth := &coreauth.Auth{
-			ID:             "codex-sse-disabled",
-			Provider:       "codex",
-			Status:         coreauth.StatusActive,
-			Quota:          coreauth.QuotaState{Exceeded: true, Reason: "quota", NextRecoverAt: recoverAt},
-			NextRetryAfter: recoverAt,
-		}
-		if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
-			t.Fatalf("register: %v", errRegister)
-		}
-		registry.GetGlobalRegistry().RegisterClient(auth.ID, "codex", []*registry.ModelInfo{{ID: "gpt-5-codex"}})
-		t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(auth.ID) })
-
-		manager.SetPluginScheduler(&sseContinuityScheduler{
-			continuityFn: func(context.Context, pluginapi.SchedulerContinuityRequest) (pluginapi.SchedulerContinuityResponse, bool, error) {
-				return pluginapi.SchedulerContinuityResponse{Decision: pluginapi.SchedulerContinuityDisabled}, true, nil
-			},
-		})
-
-		cfg := &sdkconfig.SDKConfig{Streaming: sdkconfig.StreamingConfig{KeepAliveSeconds: 0, SendKeepAliveBeforeFT: false}}
-		h := NewOpenAIResponsesAPIHandler(handlers.NewBaseAPIHandlers(cfg, manager))
-		recorder := httptest.NewRecorder()
-		c, _ := gin.CreateTestContext(recorder)
-		c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-5-codex","stream":true,"input":"hi"}`))
-
-		h.Responses(c)
-		if recorder.Code != http.StatusTooManyRequests {
-			t.Fatalf("status = %d, want 429; body=%q", recorder.Code, recorder.Body.String())
-		}
-		if strings.Contains(recorder.Body.String(), ": keep-alive") {
-			t.Fatalf("unexpected SSE keep-alive comment when continuity disabled: %q", recorder.Body.String())
-		}
-	})
+	}
 }
 
 func TestResponsesWebsocketWaitOnlyPingDuringContinuityWait(t *testing.T) {

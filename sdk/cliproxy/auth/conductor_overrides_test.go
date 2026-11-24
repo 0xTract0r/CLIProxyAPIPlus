@@ -711,7 +711,7 @@ func TestManager_ModelSupportBadRequest_FallsBackAndSuspendsAuth(t *testing.T) {
 	}
 }
 
-func TestManagerExecute_AntigravityInvalidGrantFallsBackAndSuspendsAuth(t *testing.T) {
+func TestManagerExecute_AntigravityInvalidGrantRejectsOnlySelectedGrant(t *testing.T) {
 	m := NewManager(nil, nil, nil)
 	invalidGrantErr := &Error{
 		HTTPStatus: http.StatusBadRequest,
@@ -720,7 +720,7 @@ func TestManagerExecute_AntigravityInvalidGrantFallsBackAndSuspendsAuth(t *testi
 	executor := &authFallbackExecutor{
 		id: "antigravity",
 		executeErrors: map[string]error{
-			"aa-bad-auth": invalidGrantErr,
+			"aa-bad-auth": markUpstreamExecutionAttempt(invalidGrantErr),
 		},
 	}
 	m.RegisterExecutor(executor)
@@ -745,25 +745,16 @@ func TestManagerExecute_AntigravityInvalidGrantFallsBackAndSuspendsAuth(t *testi
 	}
 
 	request := cliproxyexecutor.Request{Model: model}
-	for i := 0; i < 2; i++ {
-		resp, errExecute := m.Execute(context.Background(), []string{"antigravity"}, request, cliproxyexecutor.Options{})
-		if errExecute != nil {
-			t.Fatalf("execute %d error = %v, want success", i, errExecute)
-		}
-		if string(resp.Payload) != goodAuth.ID {
-			t.Fatalf("execute %d payload = %q, want %q", i, string(resp.Payload), goodAuth.ID)
-		}
+	_, err := m.Execute(context.Background(), []string{"antigravity"}, request, cliproxyexecutor.Options{})
+	if statusCodeFromError(err) != http.StatusBadRequest || !errors.Is(err, invalidGrantErr) {
+		t.Fatalf("selected provider refusal changed: %v", err)
 	}
-
-	got := executor.ExecuteCalls()
-	want := []string{badAuth.ID, goodAuth.ID, goodAuth.ID}
-	if len(got) != len(want) {
-		t.Fatalf("execute calls = %v, want %v", got, want)
+	if calls := executor.ExecuteCalls(); !slices.Equal(calls, []string{badAuth.ID}) {
+		t.Fatalf("provider calls = %v, want only the rejected grant", calls)
 	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("execute call %d auth = %q, want %q", i, got[i], want[i])
-		}
+	good, ok := m.GetByID(goodAuth.ID)
+	if !ok || good.Unavailable || good.ModelStates[model] != nil {
+		t.Fatal("the rejected request changed the unrelated grant")
 	}
 
 	updatedBad, ok := m.GetByID(badAuth.ID)
@@ -785,7 +776,7 @@ func TestManagerExecute_AntigravityInvalidGrantFallsBackAndSuspendsAuth(t *testi
 	}
 }
 
-func TestManagerExecuteStream_AntigravityInvalidGrantFallsBackAndSuspendsAuth(t *testing.T) {
+func TestManagerExecuteStream_AntigravityInvalidGrantRejectsOnlySelectedGrant(t *testing.T) {
 	m := NewManager(nil, nil, nil)
 	invalidGrantErr := &Error{
 		HTTPStatus: http.StatusBadRequest,
@@ -794,7 +785,7 @@ func TestManagerExecuteStream_AntigravityInvalidGrantFallsBackAndSuspendsAuth(t 
 	executor := &authFallbackExecutor{
 		id: "antigravity",
 		streamFirstErrors: map[string]error{
-			"aa-bad-auth": invalidGrantErr,
+			"aa-bad-auth": markUpstreamExecutionAttempt(invalidGrantErr),
 		},
 	}
 	m.RegisterExecutor(executor)
@@ -819,32 +810,16 @@ func TestManagerExecuteStream_AntigravityInvalidGrantFallsBackAndSuspendsAuth(t 
 	}
 
 	request := cliproxyexecutor.Request{Model: model}
-	for i := 0; i < 2; i++ {
-		streamResult, errExecute := m.ExecuteStream(context.Background(), []string{"antigravity"}, request, cliproxyexecutor.Options{})
-		if errExecute != nil {
-			t.Fatalf("execute stream %d error = %v, want success", i, errExecute)
-		}
-		var payload []byte
-		for chunk := range streamResult.Chunks {
-			if chunk.Err != nil {
-				t.Fatalf("execute stream %d chunk error = %v, want success", i, chunk.Err)
-			}
-			payload = append(payload, chunk.Payload...)
-		}
-		if string(payload) != goodAuth.ID {
-			t.Fatalf("execute stream %d payload = %q, want %q", i, string(payload), goodAuth.ID)
-		}
+	_, err := m.ExecuteStream(context.Background(), []string{"antigravity"}, request, cliproxyexecutor.Options{})
+	if statusCodeFromError(err) != http.StatusBadRequest || !errors.Is(err, invalidGrantErr) {
+		t.Fatalf("selected provider refusal changed: %v", err)
 	}
-
-	got := executor.StreamCalls()
-	want := []string{badAuth.ID, goodAuth.ID, goodAuth.ID}
-	if len(got) != len(want) {
-		t.Fatalf("stream calls = %v, want %v", got, want)
+	if calls := executor.StreamCalls(); !slices.Equal(calls, []string{badAuth.ID}) {
+		t.Fatalf("provider calls = %v, want only the rejected grant", calls)
 	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("stream call %d auth = %q, want %q", i, got[i], want[i])
-		}
+	good, ok := m.GetByID(goodAuth.ID)
+	if !ok || good.Unavailable || good.ModelStates[model] != nil {
+		t.Fatal("the rejected request changed the unrelated grant")
 	}
 
 	updatedBad, ok := m.GetByID(badAuth.ID)
@@ -1433,7 +1408,7 @@ func TestManager_Execute_ClaudeLongContextExtraUsageDoesNotCooldownModel(t *test
 	}
 }
 
-func TestManager_Execute_DisableCooling_RetriesAfter429RetryAfter(t *testing.T) {
+func TestManager_Execute_DisableCooling_Preserves429RetryAfterWithoutReplay(t *testing.T) {
 	prev := quotaCooldownDisabled.Load()
 	quotaCooldownDisabled.Store(false)
 	t.Cleanup(func() { quotaCooldownDisabled.Store(prev) })
@@ -1447,7 +1422,7 @@ func TestManager_Execute_DisableCooling_RetriesAfter429RetryAfter(t *testing.T) 
 			"auth-429-retryafter-exec": &retryAfterStatusError{
 				status:     http.StatusTooManyRequests,
 				message:    "quota exhausted",
-				retryAfter: 5 * time.Millisecond,
+				retryAfter: 75 * time.Second,
 			},
 		},
 	}
@@ -1478,9 +1453,12 @@ func TestManager_Execute_DisableCooling_RetriesAfter429RetryAfter(t *testing.T) 
 		t.Fatalf("execute status = %d, want %d", statusCodeFromError(errExecute), http.StatusTooManyRequests)
 	}
 
+	if got := SafeResponseHeaders(errExecute).Get("Retry-After"); got != "75" {
+		t.Fatalf("Retry-After = %q, want 75", got)
+	}
 	calls := executor.ExecuteCalls()
-	if len(calls) != 4 {
-		t.Fatalf("execute calls = %d, want 4 (initial + 3 retries)", len(calls))
+	if !slices.Equal(calls, []string{auth.ID}) {
+		t.Fatalf("execute calls = %v, want one selected attempt", calls)
 	}
 }
 
@@ -1665,7 +1643,7 @@ func TestManager_RequestScopedErrorStopsCredentialFallbackWithoutSuspendingAuth(
 	}
 }
 
-func TestManager_DeepSeekInsufficientBalanceRotatesCredentialAndRebindsSession(t *testing.T) {
+func TestManager_DeepSeekInsufficientBalanceReturnsSelectedCredentialRefusal(t *testing.T) {
 	m := NewManager(nil, nil, nil)
 	m.SetRetryConfig(2, 30*time.Second, 0)
 	affinity := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
@@ -1681,10 +1659,10 @@ func TestManager_DeepSeekInsufficientBalanceRotatesCredentialAndRebindsSession(t
 	executor := &authFallbackExecutor{
 		id: provider,
 		executeErrors: map[string]error{
-			"aa-empty-balance": &Error{
+			"aa-empty-balance": markUpstreamExecutionAttempt(&Error{
 				HTTPStatus: http.StatusPaymentRequired,
 				Message:    `{"error":{"message":"Insufficient Balance","type":"unknown_error","param":null,"code":"invalid_request_error"}}`,
-			},
+			}),
 		},
 	}
 	m.RegisterExecutor(executor)
@@ -1712,34 +1690,24 @@ func TestManager_DeepSeekInsufficientBalanceRotatesCredentialAndRebindsSession(t
 		cliproxyexecutor.DerivedSessionIDMetadataKey: "deepseek-insufficient-balance",
 	}}
 	beforeExecute := time.Now()
-	resp, errExecute := m.Execute(
-		context.Background(),
-		[]string{provider},
-		cliproxyexecutor.Request{Model: model},
-		opts,
-	)
-	if errExecute != nil {
-		t.Fatalf("expected fallback to the next credential, got error: %v", errExecute)
+	_, errExecute := m.Execute(context.Background(), []string{provider}, cliproxyexecutor.Request{Model: model}, opts)
+	if statusCodeFromError(errExecute) != http.StatusPaymentRequired {
+		t.Fatalf("provider refusal = %v, want status %d", errExecute, http.StatusPaymentRequired)
 	}
-	if got := string(resp.Payload); got != availableAuth.ID {
-		t.Fatalf("served by %q, want %q", got, availableAuth.ID)
+	if calls := executor.ExecuteCalls(); !slices.Equal(calls, []string{depletedAuth.ID}) {
+		t.Fatalf("credential calls = %v, want selected credential only", calls)
 	}
 
-	resp, errExecute = m.Execute(
-		context.Background(),
-		[]string{provider},
-		cliproxyexecutor.Request{Model: model},
-		opts,
-	)
-	if errExecute != nil {
-		t.Fatalf("expected rebound session to use the next credential, got error: %v", errExecute)
+	// An independent request can explicitly select its own grant.
+	independent := cliproxyexecutor.Options{Metadata: map[string]any{
+		cliproxyexecutor.PinnedAuthMetadataKey: availableAuth.ID,
+	}}
+	resp, err := m.Execute(context.Background(), []string{provider}, cliproxyexecutor.Request{Model: model}, independent)
+	if err != nil || string(resp.Payload) != availableAuth.ID {
+		t.Fatalf("independent request result = %q, err = %v", resp.Payload, err)
 	}
-	if got := string(resp.Payload); got != availableAuth.ID {
-		t.Fatalf("rebound session served by %q, want %q", got, availableAuth.ID)
-	}
-	wantCalls := []string{depletedAuth.ID, availableAuth.ID, availableAuth.ID}
-	if calls := executor.ExecuteCalls(); !slices.Equal(calls, wantCalls) {
-		t.Fatalf("credential calls = %v, want %v", calls, wantCalls)
+	if calls := executor.ExecuteCalls(); !slices.Equal(calls, []string{depletedAuth.ID, availableAuth.ID}) {
+		t.Fatalf("credential calls = %v, want one call per request", calls)
 	}
 
 	updatedDepleted, ok := m.GetByID(depletedAuth.ID)
@@ -1758,7 +1726,7 @@ func TestManager_DeepSeekInsufficientBalanceRotatesCredentialAndRebindsSession(t
 	}
 }
 
-func TestManager_AnthropicCreditBalanceTooLowRotatesCredentialAndRebindsSession(t *testing.T) {
+func TestManager_AnthropicCreditBalanceTooLowReturnsSelectedCredentialRefusal(t *testing.T) {
 	m := NewManager(nil, nil, nil)
 	m.SetRetryConfig(2, 30*time.Second, 0)
 	affinity := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
@@ -1775,10 +1743,10 @@ func TestManager_AnthropicCreditBalanceTooLowRotatesCredentialAndRebindsSession(
 	executor := &authFallbackExecutor{
 		id: provider,
 		executeErrors: map[string]error{
-			"aa-empty-anthropic-key": &Error{
+			"aa-empty-anthropic-key": markUpstreamExecutionAttempt(&Error{
 				HTTPStatus: http.StatusBadRequest,
 				Message:    creditBalanceLowBody,
-			},
+			}),
 		},
 	}
 	m.RegisterExecutor(executor)
@@ -1806,34 +1774,24 @@ func TestManager_AnthropicCreditBalanceTooLowRotatesCredentialAndRebindsSession(
 		cliproxyexecutor.DerivedSessionIDMetadataKey: "anthropic-credit-balance-low",
 	}}
 	beforeExecute := time.Now()
-	resp, errExecute := m.Execute(
-		context.Background(),
-		[]string{provider},
-		cliproxyexecutor.Request{Model: model},
-		opts,
-	)
-	if errExecute != nil {
-		t.Fatalf("expected fallback to the next credential, got error: %v", errExecute)
+	_, errExecute := m.Execute(context.Background(), []string{provider}, cliproxyexecutor.Request{Model: model}, opts)
+	if statusCodeFromError(errExecute) != http.StatusBadRequest {
+		t.Fatalf("provider refusal = %v, want status %d", errExecute, http.StatusBadRequest)
 	}
-	if got := string(resp.Payload); got != availableAuth.ID {
-		t.Fatalf("served by %q, want %q", got, availableAuth.ID)
+	if calls := executor.ExecuteCalls(); !slices.Equal(calls, []string{depletedAuth.ID}) {
+		t.Fatalf("credential calls = %v, want selected credential only", calls)
 	}
 
-	resp, errExecute = m.Execute(
-		context.Background(),
-		[]string{provider},
-		cliproxyexecutor.Request{Model: model},
-		opts,
-	)
-	if errExecute != nil {
-		t.Fatalf("expected rebound session to use the next credential, got error: %v", errExecute)
+	// An independent request can explicitly select its own grant.
+	independent := cliproxyexecutor.Options{Metadata: map[string]any{
+		cliproxyexecutor.PinnedAuthMetadataKey: availableAuth.ID,
+	}}
+	resp, err := m.Execute(context.Background(), []string{provider}, cliproxyexecutor.Request{Model: model}, independent)
+	if err != nil || string(resp.Payload) != availableAuth.ID {
+		t.Fatalf("independent request result = %q, err = %v", resp.Payload, err)
 	}
-	if got := string(resp.Payload); got != availableAuth.ID {
-		t.Fatalf("rebound session served by %q, want %q", got, availableAuth.ID)
-	}
-	wantCalls := []string{depletedAuth.ID, availableAuth.ID, availableAuth.ID}
-	if calls := executor.ExecuteCalls(); !slices.Equal(calls, wantCalls) {
-		t.Fatalf("credential calls = %v, want %v", calls, wantCalls)
+	if calls := executor.ExecuteCalls(); !slices.Equal(calls, []string{depletedAuth.ID, availableAuth.ID}) {
+		t.Fatalf("credential calls = %v, want one call per request", calls)
 	}
 
 	updatedDepleted, ok := m.GetByID(depletedAuth.ID)
@@ -1864,7 +1822,7 @@ func TestManager_AnthropicCreditBalanceTooLowRotatesCredentialAndRebindsSession(
 	}
 }
 
-func TestManager_DeepSeekCredentialFailuresRotateCredential(t *testing.T) {
+func TestManager_DeepSeekCredentialRefusalsRemainOnSelectedCredential(t *testing.T) {
 	tests := []struct {
 		name      string
 		status    int
@@ -1919,19 +1877,16 @@ func TestManager_DeepSeekCredentialFailuresRotateCredential(t *testing.T) {
 				t.Fatalf("register available auth: %v", errRegister)
 			}
 
-			resp, errExecute := m.Execute(
+			_, errExecute := m.Execute(
 				context.Background(),
 				[]string{provider},
 				cliproxyexecutor.Request{Model: model},
 				cliproxyexecutor.Options{},
 			)
-			if errExecute != nil {
-				t.Fatalf("expected fallback to the next credential, got error: %v", errExecute)
+			if statusCodeFromError(errExecute) != tc.status {
+				t.Fatalf("refusal = %v, want status %d", errExecute, tc.status)
 			}
-			if got := string(resp.Payload); got != availableAuth.ID {
-				t.Fatalf("served by %q, want %q", got, availableAuth.ID)
-			}
-			wantCalls := []string{failedAuth.ID, availableAuth.ID}
+			wantCalls := []string{failedAuth.ID}
 			if calls := executor.ExecuteCalls(); !slices.Equal(calls, wantCalls) {
 				t.Fatalf("credential calls = %v, want %v", calls, wantCalls)
 			}
