@@ -50,8 +50,19 @@ func (h *Handler) withAuthUploadSelection(ctx context.Context) context.Context {
 
 // The directory publication gate only covers local installation and short
 // manager mutations. A remote request never blocks a config reload.
-func (s authUploadSelection) begin() (func(), bool) {
-	s.owner.authUploadScopeMu.RLock()
+func (s authUploadSelection) begin() (func(), bool) { return s.beginScope(false) }
+
+// tryBegin is reserved for installers already holding a store/file lock.
+func (s authUploadSelection) tryBegin() (func(), bool) { return s.beginScope(true) }
+
+func (s authUploadSelection) beginScope(nonblocking bool) (func(), bool) {
+	if nonblocking {
+		if !s.owner.authUploadScopeMu.TryRLock() {
+			return nil, false
+		}
+	} else {
+		s.owner.authUploadScopeMu.RLock()
+	}
 	if s.owner.fileOAuthGeneration != s.generation {
 		s.owner.authUploadScopeMu.RUnlock()
 		return nil, false
@@ -151,8 +162,23 @@ func (h *Handler) commitUploadedAuth(ctx context.Context, target *authUploadTarg
 		return errUnsupportedAuthUploadStore
 	}
 
+	// Backends call install under store.mu; lock=true takes a credential lock.
+	// A plain FileTokenStore installer with no file lock has neither lock and
+	// keeps the original blocking/same-generation reload behavior.
+	beginInstall := target.selection.begin
+	if backend != nil || lock {
+		beginInstall = target.selection.tryBegin
+	}
+	checkInstall := func() error {
+		release, eligible := beginInstall()
+		if !eligible {
+			return coreauth.ErrAuthPublicationOutOfScope
+		}
+		release()
+		return nil
+	}
 	commit := func(commitRemote func() error) error {
-		if err := target.selection.check(); err != nil {
+		if err := checkInstall(); err != nil {
 			return err
 		}
 		if err := target.validateDestination(); err != nil {
@@ -172,7 +198,7 @@ func (h *Handler) commitUploadedAuth(ctx context.Context, target *authUploadTarg
 		if err = errors.Join(err, errStat, tmp.Close()); err != nil {
 			return err
 		}
-		if err := target.selection.check(); err != nil {
+		if err := checkInstall(); err != nil {
 			return err
 		}
 		if commitRemote != nil {
@@ -180,7 +206,7 @@ func (h *Handler) commitUploadedAuth(ctx context.Context, target *authUploadTarg
 				return err
 			}
 		}
-		release, eligible := target.selection.begin()
+		release, eligible := beginInstall()
 		if !eligible {
 			return coreauth.ErrAuthPublicationOutOfScope
 		}

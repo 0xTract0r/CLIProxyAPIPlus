@@ -87,6 +87,10 @@ REQUIRED = {
         *(f"TestNamedRefreshFinalBoundaries/{version}_{case}" for version in ("v0", "v8")
           for case in ("removed", "removal_busy", "publication_scope", "payload_owner")),
         "TestNamedRefreshNoLockCycle",
+        "TestNamedRefreshUploadStoreOrder",
+        "TestUploadConfirmedBusyScopeKeepsPending",
+        "TestUploadUnlockedChecksWaitSameGeneration",
+        "TestUploadPlainUnlockedInstallerWaits",
         "TestBulkRefreshDoesNotDispatchAnObsoleteScope",
         "TestRequestRetrySaveFailurePreservesUnrelatedSave",
         "TestLocalAPIKeySaveFailureAndRetry",
