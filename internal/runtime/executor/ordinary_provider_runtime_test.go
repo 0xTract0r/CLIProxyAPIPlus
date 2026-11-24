@@ -78,6 +78,29 @@ func TestOrdinaryGitLabCodeSuggestionsRuntime(t *testing.T) {
 	}
 }
 
+func TestOrdinaryGitLabOtherFormatsTerminateBeforeSend(t *testing.T) {
+	t.Setenv("GITLAB_BASE_URL", "https://gitlab.example.invalid")
+	auth := &coreauth.Auth{ID: "synthetic-gitlab", Provider: "gitlab", Metadata: map[string]any{
+		"base_url": "https://gitlab.example.invalid", "access_token": "fixture",
+	}}
+	ctx := context.WithValue(t.Context(), "cliproxy.roundtripper", publicProviderFixtureTransport(func(*http.Request) (*http.Response, error) {
+		t.Fatal("unsupported GitLab operation attempted a request")
+		return nil, nil
+	}))
+	exec := NewGitLabExecutor(&config.Config{})
+	for _, model := range []string{"claude-sonnet-4-6", "gpt-5", "chat"} {
+		req := cliproxyexecutor.Request{Model: model,
+			Payload: []byte(`{"messages":[{"role":"user","content":"test"}]}`)}
+		_, err := exec.Execute(ctx, auth, req, cliproxyexecutor.Options{})
+		publicProviderTestStatus(t, err, http.StatusNotImplemented)
+	}
+	req := cliproxyexecutor.Request{Model: GitLabCodeSuggestionsModel}
+	_, err := exec.CountTokens(ctx, auth, req, cliproxyexecutor.Options{})
+	publicProviderTestStatus(t, err, http.StatusNotImplemented)
+	_, err = exec.ExecuteStream(ctx, auth, req, cliproxyexecutor.Options{})
+	publicProviderTestStatus(t, err, http.StatusNotImplemented)
+}
+
 func TestOrdinaryKiloGatewayRuntimeAndRefusal(t *testing.T) {
 	auth := &coreauth.Auth{ID: "synthetic-kilo", Provider: "kilo", Metadata: map[string]any{
 		"api_key": "fixture-kilo-key", "organization_id": "fixture-org",
