@@ -233,17 +233,17 @@ func (h *Handler) PutUsageStatisticsEnabled(c *gin.Context) {
 	saveBasicField(h, c, func(cfg *config.Config) *bool { return &cfg.UsageStatisticsEnabled }, v)
 }
 
-// UsageStatisticsEnabled
+// LoggingToFile
 func (h *Handler) GetLoggingToFile(c *gin.Context) {
-	c.JSON(200, gin.H{"logging-to-file": h.cfg.LoggingToFile})
+	readLogConfigField(h, c, "logging-to-file", func(cfg *config.Config) bool { return cfg.LoggingToFile })
 }
 func (h *Handler) PutLoggingToFile(c *gin.Context) {
-	h.updateBoolField(c, func(v bool) { h.cfg.LoggingToFile = v })
+	putLogBoolField(h, c, func(cfg *config.Config) *bool { return &cfg.LoggingToFile })
 }
 
 // LogsMaxTotalSizeMB
 func (h *Handler) GetLogsMaxTotalSizeMB(c *gin.Context) {
-	c.JSON(200, gin.H{"logs-max-total-size-mb": h.cfg.LogsMaxTotalSizeMB})
+	readLogConfigField(h, c, "logs-max-total-size-mb", func(cfg *config.Config) int { return cfg.LogsMaxTotalSizeMB })
 }
 func (h *Handler) PutLogsMaxTotalSizeMB(c *gin.Context) {
 	var body struct {
@@ -257,15 +257,12 @@ func (h *Handler) PutLogsMaxTotalSizeMB(c *gin.Context) {
 	if value < 0 {
 		value = 0
 	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	h.cfg.LogsMaxTotalSizeMB = value
-	h.persistLocked(c)
+	saveLogConfigField(h, c, func(cfg *config.Config) *int { return &cfg.LogsMaxTotalSizeMB }, value)
 }
 
 // ErrorLogsMaxFiles
 func (h *Handler) GetErrorLogsMaxFiles(c *gin.Context) {
-	c.JSON(200, gin.H{"error-logs-max-files": h.cfg.ErrorLogsMaxFiles})
+	readLogConfigField(h, c, "error-logs-max-files", func(cfg *config.Config) int { return cfg.ErrorLogsMaxFiles })
 }
 func (h *Handler) PutErrorLogsMaxFiles(c *gin.Context) {
 	var body struct {
@@ -279,16 +276,54 @@ func (h *Handler) PutErrorLogsMaxFiles(c *gin.Context) {
 	if value < 0 {
 		value = 10
 	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	h.cfg.ErrorLogsMaxFiles = value
-	h.persistLocked(c)
+	saveLogConfigField(h, c, func(cfg *config.Config) *int { return &cfg.ErrorLogsMaxFiles }, value)
 }
 
 // Request log
-func (h *Handler) GetRequestLog(c *gin.Context) { c.JSON(200, gin.H{"request-log": h.cfg.RequestLog}) }
+func (h *Handler) GetRequestLog(c *gin.Context) {
+	readLogConfigField(h, c, "request-log", func(cfg *config.Config) bool { return cfg.RequestLog })
+}
 func (h *Handler) PutRequestLog(c *gin.Context) {
-	h.updateBoolField(c, func(v bool) { h.cfg.RequestLog = v })
+	putLogBoolField(h, c, func(cfg *config.Config) *bool { return &cfg.RequestLog })
+}
+
+func readLogConfigField[T any](h *Handler, c *gin.Context, key string, field func(*config.Config) T) {
+	h.mu.Lock()
+	if h.cfg == nil {
+		h.mu.Unlock()
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "config unavailable"})
+		return
+	}
+	value := field(h.cfg)
+	h.mu.Unlock()
+	c.JSON(http.StatusOK, gin.H{key: value})
+}
+
+func putLogBoolField(h *Handler, c *gin.Context, field func(*config.Config) *bool) {
+	var body struct {
+		Value *bool `json:"value"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil || body.Value == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+		return
+	}
+	saveLogConfigField(h, c, field, *body.Value)
+}
+
+func saveLogConfigField[T any](h *Handler, c *gin.Context, field func(*config.Config) *T, value T) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.cfg == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "config unavailable"})
+		return
+	}
+	draft := h.cfg.CloneForRuntime()
+	*field(draft) = value
+	if err := commitConfigFieldLocked(h, c, draft, field(h.cfg), value); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to save config: %v", err)})
+		return
+	}
+	h.finishConfigSaveLocked(c)
 }
 
 // Websocket auth

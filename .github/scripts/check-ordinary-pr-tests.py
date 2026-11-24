@@ -20,6 +20,10 @@ REQUIRED = {
           for status in (400, 401, 403, 429, 503)),
     },
     API: {
+        "TestLogSettingsCommitBeforeVisibility",
+        *(f"TestLogSettingsCommitBeforeVisibility/{key}" for key in (
+            "request-log", "logging-to-file", "logs-max-total-size-mb", "error-logs-max-files",
+        )),
         "TestOrdinaryCredentialRoutesKeepForeignFilesOutsideMutation",
         "TestOrdinaryCredentialRoutesKeepForeignFilesOutsideMutation//v0/management/auth-files",
         "TestOrdinaryCredentialRoutesKeepForeignFilesOutsideMutation//v8/management/credentials",

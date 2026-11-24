@@ -360,7 +360,9 @@ func (h *Handler) SetLogDirectory(dir string) {
 			dir = abs
 		}
 	}
+	h.mu.Lock()
 	h.logDir = dir
+	h.mu.Unlock()
 }
 
 // SetPostAuthHook registers a hook to be called after auth record creation but before persistence.
@@ -552,20 +554,28 @@ func (h *Handler) persistLocked(c *gin.Context) bool {
 	return true
 }
 
-// persistProviderFieldLocked publishes only the selected field and save metadata.
-// Keep the config pointer stable for scalar readers. The caller holds h.mu.
+// persistProviderFieldLocked commits a provider edit and reports a public response.
 func persistProviderFieldLocked[T any](h *Handler, c *gin.Context, candidate *config.Config, live *T, staged T) {
-	sourceHash, err := config.SaveConfigPreserveCommentsWithSourceHash(h.configFilePath, candidate, c.GetBool(ConfigV8ContextKey))
-	if err != nil {
+	if err := commitConfigFieldLocked(h, c, candidate, live, staged); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save config"})
 		return
+	}
+	h.finishConfigSaveLocked(c)
+}
+
+// commitConfigFieldLocked publishes only the selected field and save metadata.
+// Keep the config pointer stable for scalar readers. The caller holds h.mu.
+func commitConfigFieldLocked[T any](h *Handler, c *gin.Context, candidate *config.Config, live *T, staged T) error {
+	sourceHash, err := config.SaveConfigPreserveCommentsWithSourceHash(h.configFilePath, candidate, c.GetBool(ConfigV8ContextKey))
+	if err != nil {
+		return err
 	}
 	*live = staged
 	h.cfg.SourceHash = sourceHash
 	if !maps.Equal(h.cfg.OAuthOnlyFields, candidate.OAuthOnlyFields) {
 		h.cfg.OAuthOnlyFields = candidate.OAuthOnlyFields
 	}
-	h.finishConfigSaveLocked(c)
+	return nil
 }
 
 func (h *Handler) finishConfigSaveLocked(c *gin.Context) {
