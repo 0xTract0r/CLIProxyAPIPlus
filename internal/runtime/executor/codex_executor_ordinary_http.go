@@ -362,7 +362,7 @@ func (e *CodexExecutor) sendOrdinaryCodex(ctx context.Context, auth *cliproxyaut
 		return nil, nil, err
 	}
 	if stream {
-		helps.RecordAPIResponseMetadata(ctx, e.cfg, resp.StatusCode, resp.Header.Clone())
+		helps.RecordAPIResponseMetadata(ctx, e.cfg, resp.StatusCode, codexStreamDiagnosticHeaders(resp.Header))
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		rawBody := resp.Body
@@ -399,7 +399,7 @@ func (e *CodexExecutor) sendOrdinaryCodex(ctx context.Context, auth *cliproxyaut
 }
 
 // codexStreamDiagnosticHeaders copies only the headers needed to diagnose
-// wire format. Credential and account headers stay on the actual request.
+// wire format. Credential and account headers stay on the actual HTTP exchange.
 func codexStreamDiagnosticHeaders(source http.Header) http.Header {
 	diagnostic := make(http.Header, 3)
 	for _, name := range []string{"Accept", "Content-Type", "Content-Encoding"} {

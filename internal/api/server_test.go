@@ -3298,6 +3298,9 @@ func TestServerCodexAPIKeyResponsesStreamingRequestLog(t *testing.T) {
 		default:
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Set-Cookie", "fixture-response-cookie")
+		w.Header().Set("ChatGPT-Account-ID", "fixture-response-account")
+		w.Header().Set("X-API-Key", "fixture-response-key")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("data: {\"type\":\"response.output_item.added\"}\n\n"))
 		if f, ok := w.(http.Flusher); ok {
@@ -3378,8 +3381,11 @@ func TestServerCodexAPIKeyResponsesStreamingRequestLog(t *testing.T) {
 	if errReadLog != nil {
 		t.Fatalf("read log file: %v", errReadLog)
 	}
+	if !strings.Contains(rr.Body.String(), "response.completed") {
+		t.Fatal("downstream response lost the SSE completion")
+	}
 	logText := string(content)
-	for _, secret := range []string{"test-codex-key", "test-key"} {
+	for _, secret := range []string{"test-codex-key", "test-key", "fixture-response-cookie", "fixture-response-account", "fixture-response-key"} {
 		if strings.Contains(logText, secret) {
 			t.Fatal("request log exposed a credential")
 		}
@@ -3412,6 +3418,9 @@ func TestServerCodexAPIKeyResponsesStreamingRequestLog(t *testing.T) {
 	}
 	if !strings.Contains(apiRequestSection, `"gpt-5-codex"`) {
 		t.Fatalf("API REQUEST section missing request body:\n%s", apiRequestSection)
+	}
+	if !strings.Contains(apiResponseSection, "Content-Type: text/event-stream") || !strings.Contains(apiResponseSection, "Status: 200") {
+		t.Fatal("upstream stream diagnostics lost the content type or status")
 	}
 	if !strings.Contains(apiResponseSection, "response.output_item.added") {
 		t.Fatalf("API RESPONSE section missing response chunk data:\n%s", apiResponseSection)
