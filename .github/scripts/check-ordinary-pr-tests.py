@@ -12,6 +12,10 @@ REFUSAL = "TestOrdinarySelectedCredentialRefusalIsTerminal"
 REQUIRED = {
     SDK: {
         "TestOrdinarySchedulerSelectionIDContract",
+        "TestOrdinarySchedulerRefusalContract",
+        "TestOrdinaryExplicitRetryAfterHTTP500KeepsSameCredential",
+        *(f"TestOrdinaryExplicitRetryAfterHTTP500KeepsSameCredential/{method}"
+          for method in ("execute", "count", "stream")),
         REFUSAL,
         "TestOrdinaryClaudeLongContextNeverRewritesRequestedModel",
         "TestOrdinaryClaudeAliasedOneMillionRequiresSubscription",
@@ -137,11 +141,16 @@ def check(stream):
             observed = actions[package, test]
             if observed != ["run", "pass"]:
                 failures.append(f"{package} {test}: expected run and pass, got {observed}")
+    if failures:
+        passed = sum(actions[package, test] == ["run", "pass"]
+                     for package, tests in REQUIRED.items() for test in tests)
+        failures.insert(0, f"Passed {passed}/{sum(map(len, REQUIRED.values()))} required ordinary test results.")
     return failures
 
 
 def run_selected():
     with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as results:
+        exits = []
         for package, names in REQUIRED.items():
             # Select top-level tests in their owning package. check() also
             # requires every declared subtest to report run and pass.
@@ -150,14 +159,15 @@ def run_selected():
             run = subprocess.run(
                 ["go", "test", "-mod=readonly", "-race", "-count=1", "-timeout=120s",
                  "-json", "-run", pattern, package],
-                stdout=results,
+                stdout=results, stderr=subprocess.DEVNULL,
             )
             if run.returncode:
-                print(f"Go tests failed in {package}", file=sys.stderr)
-                results.seek(0)
-                return check(results) or [f"{package} exited {run.returncode}"]
+                exits.append(f"Go package {package} exited {run.returncode}")
         results.seek(0)
-        return check(results)
+        failures = check(results)
+        if exits and not failures:
+            failures.append(f"Passed {sum(map(len, REQUIRED.values()))}/{sum(map(len, REQUIRED.values()))} required ordinary test results.")
+        return failures + exits
 
 
 if __name__ == "__main__":

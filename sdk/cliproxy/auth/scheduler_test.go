@@ -3075,223 +3075,8 @@ func TestOrdinarySchedulerSelectionIDContract(t *testing.T) {
 	})
 }
 
-func TestManagerPluginSchedulerRejectAfterFailedAttempt_Issue7434(t *testing.T) {
-	t.Run("transient_error_reruns_same_credential_in_next_retry_round", func(t *testing.T) {
-		prevQuota := quotaCooldownDisabled.Load()
-		prevTransient := transientErrorCooldownSeconds.Load()
-		quotaCooldownDisabled.Store(false)
-		SetTransientErrorCooldownSeconds(-1)
-		t.Cleanup(func() {
-			quotaCooldownDisabled.Store(prevQuota)
-			transientErrorCooldownSeconds.Store(prevTransient)
-		})
-
-		for _, mode := range []string{"execute", "count", "stream"} {
-			t.Run(mode, func(t *testing.T) {
-				manager := NewManager(nil, &FillFirstSelector{}, nil)
-				manager.SetRetryConfig(1, 0, 0)
-
-				authAID := "issue7434-transient-a-" + mode
-				authBID := "issue7434-transient-b-" + mode
-				modelID := "claude-sonnet-4-5"
-				reg := registry.GetGlobalRegistry()
-				reg.RegisterClient(authAID, "claude", []*registry.ModelInfo{{ID: modelID}})
-				reg.RegisterClient(authBID, "claude", []*registry.ModelInfo{{ID: modelID}})
-				t.Cleanup(func() {
-					reg.UnregisterClient(authAID)
-					reg.UnregisterClient(authBID)
-				})
-				if _, errRegister := manager.Register(context.Background(), &Auth{ID: authAID, Provider: "claude"}); errRegister != nil {
-					t.Fatalf("Register(%s) error = %v", authAID, errRegister)
-				}
-				if _, errRegister := manager.Register(context.Background(), &Auth{ID: authBID, Provider: "claude"}); errRegister != nil {
-					t.Fatalf("Register(%s) error = %v", authBID, errRegister)
-				}
-
-				var attemptedAuths []string
-				manager.executors["claude"] = &callbackSchedulerTestExecutor{
-					schedulerTestExecutor: schedulerTestExecutor{provider: "claude"},
-					execute: func(ctx context.Context, auth *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-						cliproxyexecutor.MarkUpstreamAttempt(ctx)
-						attemptedAuths = append(attemptedAuths, auth.ID)
-						if len(attemptedAuths) == 1 {
-							return cliproxyexecutor.Response{}, &Error{Code: "upstream_error", Message: "internal server error", HTTPStatus: http.StatusInternalServerError, Retryable: true}
-						}
-						return cliproxyexecutor.Response{Payload: []byte(`{"ok":true}`)}, nil
-					},
-					countTokens: func(ctx context.Context, auth *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-						cliproxyexecutor.MarkUpstreamAttempt(ctx)
-						attemptedAuths = append(attemptedAuths, auth.ID)
-						if len(attemptedAuths) == 1 {
-							return cliproxyexecutor.Response{}, &Error{Code: "upstream_error", Message: "internal server error", HTTPStatus: http.StatusInternalServerError, Retryable: true}
-						}
-						return cliproxyexecutor.Response{Payload: []byte(`{"input_tokens":12}`)}, nil
-					},
-					executeStream: func(ctx context.Context, auth *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
-						cliproxyexecutor.MarkUpstreamAttempt(ctx)
-						attemptedAuths = append(attemptedAuths, auth.ID)
-						if len(attemptedAuths) == 1 {
-							errCh := make(chan cliproxyexecutor.StreamChunk, 1)
-							errCh <- cliproxyexecutor.StreamChunk{Err: &Error{Code: "upstream_error", Message: "bootstrap stream 500", HTTPStatus: http.StatusInternalServerError, Retryable: true}}
-							close(errCh)
-							return &cliproxyexecutor.StreamResult{Chunks: errCh}, nil
-						}
-						ch := make(chan cliproxyexecutor.StreamChunk, 1)
-						ch <- cliproxyexecutor.StreamChunk{Payload: []byte("data: {\"type\":\"message_stop\"}\n\n")}
-						close(ch)
-						return &cliproxyexecutor.StreamResult{Chunks: ch}, nil
-					},
-				}
-
-				scheduler := &fakePluginScheduler{
-					pick: func(_ context.Context, req pluginapi.SchedulerPickRequest) (pluginapi.SchedulerPickResponse, bool, error) {
-						if prevSelected, _ := req.Options.Metadata[cliproxyexecutor.SelectedAuthMetadataKey].(string); prevSelected != "" {
-							return pluginapi.SchedulerPickResponse{
-								Handled:      true,
-								Reject:       true,
-								RejectReason: "session pinned to " + prevSelected,
-							}, true, nil
-						}
-						for _, c := range req.Candidates {
-							if c.ID == authAID {
-								return pluginapi.SchedulerPickResponse{Handled: true, AuthID: authAID}, true, nil
-							}
-						}
-						return pluginapi.SchedulerPickResponse{Handled: true, Reject: true, RejectReason: "pinned credential missing"}, true, nil
-					},
-				}
-				manager.SetPluginScheduler(scheduler)
-
-				switch mode {
-				case "execute":
-					resp, errExec := manager.Execute(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: modelID}, cliproxyexecutor.Options{})
-					if errExec != nil {
-						t.Fatalf("Execute() error = %v, want nil", errExec)
-					}
-					if string(resp.Payload) != `{"ok":true}` {
-						t.Fatalf("Execute() payload = %s, want {\"ok\":true}", string(resp.Payload))
-					}
-				case "count":
-					resp, errCount := manager.ExecuteCount(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: modelID}, cliproxyexecutor.Options{})
-					if errCount != nil {
-						t.Fatalf("ExecuteCount() error = %v, want nil", errCount)
-					}
-					if string(resp.Payload) != `{"input_tokens":12}` {
-						t.Fatalf("ExecuteCount() payload = %s, want {\"input_tokens\":12}", string(resp.Payload))
-					}
-				case "stream":
-					streamRes, errStream := manager.ExecuteStream(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: modelID}, cliproxyexecutor.Options{Stream: true})
-					if errStream != nil {
-						t.Fatalf("ExecuteStream() error = %v, want nil", errStream)
-					}
-					for range streamRes.Chunks {
-					}
-				}
-
-				if len(attemptedAuths) != 2 || attemptedAuths[0] != authAID || attemptedAuths[1] != authAID {
-					t.Fatalf("attemptedAuths = %v, want [%s %s]", attemptedAuths, authAID, authAID)
-				}
-				if len(scheduler.requests) != 3 {
-					t.Fatalf("len(scheduler.requests) = %d, want 3 (round0 pick, round0 rejected re-pick, round1 pick)", len(scheduler.requests))
-				}
-			})
-		}
-	})
-
-	t.Run("rate_limit_429_withholds_cooled_credential_in_next_round_so_plugin_switches", func(t *testing.T) {
-		prevQuota := quotaCooldownDisabled.Load()
-		quotaCooldownDisabled.Store(false)
-		t.Cleanup(func() {
-			quotaCooldownDisabled.Store(prevQuota)
-		})
-
-		for _, mode := range []string{"execute", "stream"} {
-			t.Run(mode, func(t *testing.T) {
-				manager := NewManager(nil, &FillFirstSelector{}, nil)
-				manager.SetRetryConfig(1, 0, 0)
-
-				authAID := "issue7434-429-a-" + mode
-				authBID := "issue7434-429-b-" + mode
-				modelID := "claude-sonnet-4-5"
-				reg := registry.GetGlobalRegistry()
-				reg.RegisterClient(authAID, "claude", []*registry.ModelInfo{{ID: modelID}})
-				reg.RegisterClient(authBID, "claude", []*registry.ModelInfo{{ID: modelID}})
-				t.Cleanup(func() {
-					reg.UnregisterClient(authAID)
-					reg.UnregisterClient(authBID)
-				})
-				if _, errRegister := manager.Register(context.Background(), &Auth{ID: authAID, Provider: "claude"}); errRegister != nil {
-					t.Fatalf("Register(%s) error = %v", authAID, errRegister)
-				}
-				if _, errRegister := manager.Register(context.Background(), &Auth{ID: authBID, Provider: "claude"}); errRegister != nil {
-					t.Fatalf("Register(%s) error = %v", authBID, errRegister)
-				}
-
-				var attemptedAuths []string
-				manager.executors["claude"] = &callbackSchedulerTestExecutor{
-					schedulerTestExecutor: schedulerTestExecutor{provider: "claude"},
-					execute: func(ctx context.Context, auth *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-						attemptedAuths = append(attemptedAuths, auth.ID)
-						if auth.ID == authAID {
-							return cliproxyexecutor.Response{}, &Error{Code: "rate_limited", Message: "rate limit exceeded", HTTPStatus: http.StatusTooManyRequests, Retryable: true}
-						}
-						return cliproxyexecutor.Response{Payload: []byte(`{"ok":true}`)}, nil
-					},
-					executeStream: func(ctx context.Context, auth *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
-						attemptedAuths = append(attemptedAuths, auth.ID)
-						if auth.ID == authAID {
-							return nil, &Error{Code: "rate_limited", Message: "rate limit exceeded", HTTPStatus: http.StatusTooManyRequests, Retryable: true}
-						}
-						ch := make(chan cliproxyexecutor.StreamChunk, 1)
-						ch <- cliproxyexecutor.StreamChunk{Payload: []byte("data: {\"type\":\"message_stop\"}\n\n")}
-						close(ch)
-						return &cliproxyexecutor.StreamResult{Chunks: ch}, nil
-					},
-				}
-
-				scheduler := &fakePluginScheduler{
-					pick: func(_ context.Context, req pluginapi.SchedulerPickRequest) (pluginapi.SchedulerPickResponse, bool, error) {
-						if prevSelected, _ := req.Options.Metadata[cliproxyexecutor.SelectedAuthMetadataKey].(string); prevSelected != "" {
-							return pluginapi.SchedulerPickResponse{
-								Handled:      true,
-								Reject:       true,
-								RejectReason: "do not switch mid-round",
-							}, true, nil
-						}
-						for _, c := range req.Candidates {
-							if c.ID == authAID {
-								return pluginapi.SchedulerPickResponse{Handled: true, AuthID: authAID}, true, nil
-							}
-						}
-						return pluginapi.SchedulerPickResponse{Handled: true, AuthID: req.Candidates[0].ID}, true, nil
-					},
-				}
-				manager.SetPluginScheduler(scheduler)
-
-				if mode == "execute" {
-					if _, errExec := manager.Execute(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: modelID}, cliproxyexecutor.Options{}); errExec != nil {
-						t.Fatalf("Execute() error = %v, want nil", errExec)
-					}
-				} else {
-					streamRes, errStream := manager.ExecuteStream(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: modelID}, cliproxyexecutor.Options{Stream: true})
-					if errStream != nil {
-						t.Fatalf("ExecuteStream() error = %v, want nil", errStream)
-					}
-					for range streamRes.Chunks {
-					}
-				}
-
-				if len(attemptedAuths) != 2 || attemptedAuths[0] != authAID || attemptedAuths[1] != authBID {
-					t.Fatalf("attemptedAuths = %v, want [%s %s]", attemptedAuths, authAID, authBID)
-				}
-				if len(scheduler.requests) != 3 {
-					t.Fatalf("len(scheduler.requests) = %d, want 3", len(scheduler.requests))
-				}
-			})
-		}
-	})
-
-	t.Run("preserves_upstream_429_when_retries_exhausted_or_sticky_plugin_rejects_next_round", func(t *testing.T) {
+func TestOrdinarySchedulerRefusalContract(t *testing.T) {
+	t.Run("preserves_upstream_429_without_another_pick", func(t *testing.T) {
 		prevQuota := quotaCooldownDisabled.Load()
 		quotaCooldownDisabled.Store(false)
 		t.Cleanup(func() {
@@ -3300,10 +3085,8 @@ func TestManagerPluginSchedulerRejectAfterFailedAttempt_Issue7434(t *testing.T) 
 
 		for _, retryRounds := range []int{0, 1} {
 			name := "request_retry_0"
-			wantPicks := 2
 			if retryRounds == 1 {
-				name = "request_retry_1_sticky_reject_in_round_1"
-				wantPicks = 3
+				name = "request_retry_1"
 			}
 			t.Run(name, func(t *testing.T) {
 				for _, mode := range []string{"execute", "count", "stream"} {
@@ -3312,35 +3095,33 @@ func TestManagerPluginSchedulerRejectAfterFailedAttempt_Issue7434(t *testing.T) 
 						manager.SetRetryConfig(retryRounds, 1, 0)
 
 						authAID := "issue7434-preserve-a-" + name + "-" + mode
-						authBID := "issue7434-preserve-b-" + name + "-" + mode
 						modelID := "claude-sonnet-4-5"
 						reg := registry.GetGlobalRegistry()
 						reg.RegisterClient(authAID, "claude", []*registry.ModelInfo{{ID: modelID}})
-						reg.RegisterClient(authBID, "claude", []*registry.ModelInfo{{ID: modelID}})
 						t.Cleanup(func() {
 							reg.UnregisterClient(authAID)
-							reg.UnregisterClient(authBID)
 						})
 						if _, errRegister := manager.Register(context.Background(), &Auth{ID: authAID, Provider: "claude"}); errRegister != nil {
 							t.Fatalf("Register(%s) error = %v", authAID, errRegister)
 						}
-						if _, errRegister := manager.Register(context.Background(), &Auth{ID: authBID, Provider: "claude"}); errRegister != nil {
-							t.Fatalf("Register(%s) error = %v", authBID, errRegister)
-						}
 
+						var attemptedAuths []string
 						manager.executors["claude"] = &callbackSchedulerTestExecutor{
 							schedulerTestExecutor: schedulerTestExecutor{provider: "claude"},
 							execute: func(ctx context.Context, auth *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
 								cliproxyexecutor.MarkUpstreamAttempt(ctx)
-								return cliproxyexecutor.Response{}, &Error{Code: "rate_limited", Message: "upstream 429", HTTPStatus: http.StatusTooManyRequests, Retryable: true}
+								attemptedAuths = append(attemptedAuths, auth.ID)
+								return cliproxyexecutor.Response{}, ordinaryRefusalFixture{status: http.StatusTooManyRequests, hint: 75 * time.Second}
 							},
 							countTokens: func(ctx context.Context, auth *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
 								cliproxyexecutor.MarkUpstreamAttempt(ctx)
-								return cliproxyexecutor.Response{}, &Error{Code: "rate_limited", Message: "upstream 429", HTTPStatus: http.StatusTooManyRequests, Retryable: true}
+								attemptedAuths = append(attemptedAuths, auth.ID)
+								return cliproxyexecutor.Response{}, ordinaryRefusalFixture{status: http.StatusTooManyRequests, hint: 75 * time.Second}
 							},
 							executeStream: func(ctx context.Context, auth *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
 								cliproxyexecutor.MarkUpstreamAttempt(ctx)
-								return nil, &Error{Code: "rate_limited", Message: "upstream 429", HTTPStatus: http.StatusTooManyRequests, Retryable: true}
+								attemptedAuths = append(attemptedAuths, auth.ID)
+								return nil, ordinaryRefusalFixture{status: http.StatusTooManyRequests, hint: 75 * time.Second}
 							},
 						}
 
@@ -3372,15 +3153,16 @@ func TestManagerPluginSchedulerRejectAfterFailedAttempt_Issue7434(t *testing.T) 
 						if gotErr == nil {
 							t.Fatal("error = nil, want upstream 429 error")
 						}
-						var authErr *Error
-						if !errors.As(gotErr, &authErr) {
-							t.Fatalf("error = %T (%v), want *auth.Error", gotErr, gotErr)
+						var refusal ordinaryRefusalFixture
+						if !errors.As(gotErr, &refusal) || statusCodeFromError(gotErr) != http.StatusTooManyRequests ||
+							SafeResponseHeaders(gotErr).Get("Retry-After") != "75" {
+							t.Fatalf("upstream 429 or Retry-After changed: %v", gotErr)
 						}
-						if authErr.Code != "rate_limited" || authErr.HTTPStatus != http.StatusTooManyRequests {
-							t.Fatalf("error = %s (status %d, msg %q), want rate_limited (status 429)", authErr.Code, authErr.HTTPStatus, authErr.Message)
+						if len(attemptedAuths) != 1 || attemptedAuths[0] != authAID {
+							t.Fatalf("upstream refusal must end on the selected authorization, attempts = %v", attemptedAuths)
 						}
-						if len(scheduler.requests) != wantPicks {
-							t.Fatalf("len(scheduler.requests) = %d, want %d", len(scheduler.requests), wantPicks)
+						if gotErr.Error() != refusal.Error() || len(scheduler.requests) != 1 {
+							t.Fatalf("upstream refusal changed or retried: error = %v, picks = %d", gotErr, len(scheduler.requests))
 						}
 					})
 				}
@@ -3465,7 +3247,119 @@ func TestManagerPluginSchedulerRejectAfterFailedAttempt_Issue7434(t *testing.T) 
 			})
 		}
 	})
+}
 
+func TestOrdinaryExplicitRetryAfterHTTP500KeepsSameCredential(t *testing.T) {
+	previousQuota := quotaCooldownDisabled.Load()
+	previousTransient := transientErrorCooldownSeconds.Load()
+	quotaCooldownDisabled.Store(false)
+	SetTransientErrorCooldownSeconds(-1)
+	t.Cleanup(func() {
+		quotaCooldownDisabled.Store(previousQuota)
+		transientErrorCooldownSeconds.Store(previousTransient)
+	})
+
+	const modelID = "claude-sonnet-4-5"
+	const streamFrame = "data: {\"type\":\"message_stop\"}\n\n"
+	for _, mode := range []string{"execute", "count", "stream"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx := t.Context()
+			authID := "ordinary-retry-500-" + mode
+			manager := NewManager(nil, &FillFirstSelector{}, nil)
+			manager.SetRetryConfig(1, 0, 0)
+			reg := registry.GetGlobalRegistry()
+			reg.RegisterClient(authID, "claude", []*registry.ModelInfo{{ID: modelID}})
+			t.Cleanup(func() { reg.UnregisterClient(authID) })
+			if _, err := manager.Register(ctx, &Auth{ID: authID, Provider: "claude"}); err != nil {
+				t.Fatal(err)
+			}
+
+			var attempts []string
+			firstAttempt := func(ctx context.Context, auth *Auth) bool {
+				cliproxyexecutor.MarkUpstreamAttempt(ctx)
+				attempts = append(attempts, auth.ID)
+				return len(attempts) == 1
+			}
+			temporaryFault := &Error{
+				Code: "upstream_error", Message: "internal server error", HTTPStatus: http.StatusInternalServerError, Retryable: true,
+			}
+			manager.RegisterExecutor(&callbackSchedulerTestExecutor{
+				schedulerTestExecutor: schedulerTestExecutor{provider: "claude"},
+				execute: func(ctx context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+					if firstAttempt(ctx, auth) {
+						return cliproxyexecutor.Response{}, temporaryFault
+					}
+					return cliproxyexecutor.Response{Payload: []byte(`{"ok":true}`)}, nil
+				},
+				countTokens: func(ctx context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+					if firstAttempt(ctx, auth) {
+						return cliproxyexecutor.Response{}, temporaryFault
+					}
+					return cliproxyexecutor.Response{Payload: []byte(`{"input_tokens":12}`)}, nil
+				},
+				executeStream: func(ctx context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+					chunks := make(chan cliproxyexecutor.StreamChunk, 1)
+					if firstAttempt(ctx, auth) {
+						chunks <- cliproxyexecutor.StreamChunk{Err: &Error{
+							Code: "upstream_error", Message: "bootstrap stream 500", HTTPStatus: http.StatusInternalServerError, Retryable: true,
+						}}
+					} else {
+						chunks <- cliproxyexecutor.StreamChunk{Payload: []byte(streamFrame)}
+					}
+					close(chunks)
+					return &cliproxyexecutor.StreamResult{Chunks: chunks}, nil
+				},
+			})
+			scheduler := &fakePluginScheduler{
+				handled: true,
+				pick: func(_ context.Context, request pluginapi.SchedulerPickRequest) (pluginapi.SchedulerPickResponse, bool, error) {
+					if len(request.Candidates) != 1 || request.Candidates[0].ID != authID {
+						t.Errorf("expected only the original credential in each eligible selection")
+						return pluginapi.SchedulerPickResponse{Handled: true, Reject: true}, true, nil
+					}
+					return pluginapi.SchedulerPickResponse{Handled: true, AuthID: authID}, true, nil
+				},
+			}
+			manager.SetPluginScheduler(scheduler)
+
+			providers := []string{"claude"}
+			request := cliproxyexecutor.Request{Model: modelID}
+			switch mode {
+			case "execute":
+				result, err := manager.Execute(ctx, providers, request, cliproxyexecutor.Options{})
+				if err != nil || string(result.Payload) != `{"ok":true}` {
+					t.Errorf("Execute() = %q, %v; want success after one retry", result.Payload, err)
+				}
+			case "count":
+				result, err := manager.ExecuteCount(ctx, providers, request, cliproxyexecutor.Options{})
+				if err != nil || string(result.Payload) != `{"input_tokens":12}` {
+					t.Errorf("ExecuteCount() = %q, %v; want 12 input tokens after one retry", result.Payload, err)
+				}
+			case "stream":
+				result, err := manager.ExecuteStream(ctx, providers, request, cliproxyexecutor.Options{Stream: true})
+				if err != nil || result == nil || result.Chunks == nil {
+					t.Errorf("ExecuteStream() error = %v; want successful bootstrap after one retry", err)
+					break
+				}
+				var frames int
+				for frame := range result.Chunks {
+					frames++
+					if frame.Err != nil || string(frame.Payload) != streamFrame {
+						t.Errorf("stream frame %d = %q, %v; want the completion frame", frames, frame.Payload, frame.Err)
+					}
+				}
+				if frames != 1 {
+					t.Errorf("stream frame count = %d; want 1", frames)
+				}
+			}
+			if len(attempts) != 2 || attempts[0] != authID || attempts[1] != authID {
+				t.Errorf("execution attempts = %v; want exactly two with the same credential", attempts)
+			}
+			if len(scheduler.requests) != 2 {
+				t.Errorf("plugin selections = %d; want one per round with a single credential", len(scheduler.requests))
+			}
+		})
+	}
 }
 
 type callbackSchedulerTestExecutor struct {
