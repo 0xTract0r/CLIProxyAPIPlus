@@ -1,7 +1,6 @@
 package executor
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -244,15 +243,18 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 			send(cliproxyexecutor.StreamChunk{Err: err})
 		}
 		var pendingFilter string
-		scanner := bufio.NewScanner(resp.Body)
-		scanner.Buffer(nil, 16<<20)
+		scanner := helps.NewCodexSSEScanner(ctx, resp.Body, 16<<20)
 		var state any
 		completed := false
+		var malformedFrame bool
 		for scanner.Scan() {
 			line := bytes.Clone(scanner.Bytes())
 			if data, ok := bytes.CutPrefix(line, []byte("data:")); ok {
 				data = bytes.TrimSpace(data)
 				if bytes.Equal(data, []byte("[DONE]")) {
+					if malformedFrame && !completed {
+						break
+					}
 					completed = true
 					if pendingFilter == "" {
 						chunks := sdktranslator.TranslateStream(ctx, sdktranslator.FromString("antigravity"), cliproxyexecutor.ResponseFormatOrSource(opts), req.Model, opts.OriginalRequest, body, data, &state)
@@ -269,8 +271,8 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 					break
 				}
 				if !ojson.ValidBytes(data) {
-					fail(statusErr{code: 502, msg: "invalid Antigravity SSE frame"})
-					return
+					malformedFrame = true
+					continue
 				}
 				if err := ordinaryAntigravityInBandError(data, resp.Header); err != nil {
 					fail(err)
@@ -309,6 +311,10 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 		}
 		if pendingFilter != "" {
 			fail(statusErr{code: http.StatusBadRequest, msg: pendingFilter, requestScoped: true})
+			return
+		}
+		if malformedFrame && !completed {
+			fail(statusErr{code: http.StatusBadGateway, msg: "invalid Antigravity SSE frame"})
 			return
 		}
 		if !completed {
