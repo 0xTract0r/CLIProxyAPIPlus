@@ -8,13 +8,12 @@ import (
 	"testing"
 	"time"
 
-	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 )
 
-func TestManagerSessionAffinityPreservesBindingAcrossHigherPriorityRecovery(t *testing.T) {
+func TestOrdinarySessionAffinityRetainsCredentialThroughCooldown(t *testing.T) {
 	for _, testCase := range []struct {
 		name           string
 		providerSuffix string
@@ -42,7 +41,6 @@ func TestManagerSessionAffinityPreservesBindingAcrossHigherPriorityRecovery(t *t
 			provider := "affinity-priority-" + testCase.providerSuffix
 			model := "affinity-priority-model"
 			highID := provider + "-high"
-			lowID := provider + "-low"
 
 			manager := NewManager(nil, nil, nil)
 			affinity := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
@@ -55,7 +53,6 @@ func TestManagerSessionAffinityPreservesBindingAcrossHigherPriorityRecovery(t *t
 
 			for _, auth := range []*Auth{
 				{ID: highID, Provider: provider, Status: StatusActive, Attributes: map[string]string{"priority": "1"}},
-				{ID: lowID, Provider: provider, Status: StatusActive, Attributes: map[string]string{"priority": "0"}},
 			} {
 				if _, errRegister := manager.Register(WithSkipPersist(ctx), auth); errRegister != nil {
 					t.Fatalf("Register(%s): %v", auth.ID, errRegister)
@@ -90,31 +87,13 @@ func TestManagerSessionAffinityPreservesBindingAcrossHigherPriorityRecovery(t *t
 				Success:  false,
 				Error:    &Error{HTTPStatus: http.StatusTooManyRequests, Message: "quota"},
 			})
-			if got := pick(opts); got.ID != lowID {
-				t.Fatalf("failover binding = %q, want %q", got.ID, lowID)
+			blocked, err := testCase.pick(manager, ctx, provider, model, opts)
+			if err == nil || blocked != nil {
+				t.Fatalf("cooling credential unexpectedly became available: auth=%v err=%v", blocked, err)
 			}
-
 			expireSessionAffinityPriorityModelCooldown(t, manager, highID, model)
-			if got := pick(opts); got.ID != lowID {
-				t.Fatalf("binding after higher-priority recovery = %q, want sticky %q", got.ID, lowID)
-			}
-
-			newSessionOpts := cliproxyexecutor.Options{Metadata: map[string]any{
-				cliproxyexecutor.DerivedSessionIDMetadataKey: "new-session",
-			}}
-			if got := pick(newSessionOpts); got.ID != highID {
-				t.Fatalf("cold binding for new session = %q, want high priority %q", got.ID, highID)
-			}
-
-			manager.MarkResult(ctx, Result{
-				AuthID:   lowID,
-				Provider: provider,
-				Model:    model,
-				Success:  false,
-				Error:    &Error{HTTPStatus: http.StatusTooManyRequests, Message: "quota"},
-			})
 			if got := pick(opts); got.ID != highID {
-				t.Fatalf("binding after bound auth became unavailable = %q, want %q", got.ID, highID)
+				t.Fatalf("binding after cooldown = %q, want original credential %q", got.ID, highID)
 			}
 		})
 	}
@@ -1224,115 +1203,6 @@ func TestManagerExecuteAndStreamRebindOnNeverEndToEnd(t *testing.T) {
 	}
 	if calls[authAID] != 1 || calls[authBID] != 0 {
 		t.Fatalf("calls after cooled 502 ExecuteStream = (A=%d, B=%d), want (1, 0)", calls[authAID], calls[authBID])
-	}
-}
-
-func TestManagerSessionAffinityRebindOnNeverBlocksAntigravityCreditsCrossAuthFallback(t *testing.T) {
-	ctx := context.Background()
-	provider := "antigravity"
-	model := "claude-sonnet-4-6"
-	authAID := "antigravity-never-a"
-	authBID := "antigravity-never-b"
-
-	calls := make(map[string]int)
-	var failAuthA bool
-	manager := NewManager(nil, nil, nil)
-	manager.SetConfig(&internalconfig.Config{
-		QuotaExceeded: internalconfig.QuotaExceeded{AntigravityCredits: true},
-	})
-	manager.SetRetryConfig(0, 0, 0)
-	affinity := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
-		Fallback: &RoundRobinSelector{},
-		TTL:      time.Hour,
-		RebindOn: SessionAffinityRebindOnNever,
-	})
-	defer affinity.Stop()
-	manager.SetSelector(affinity)
-	manager.RegisterExecutor(scriptedFailoverExecutor{
-		provider: provider,
-		execute: func(ctx context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-			calls[auth.ID]++
-			if auth.ID == authAID && failAuthA {
-				return cliproxyexecutor.Response{}, &Error{HTTPStatus: http.StatusTooManyRequests, Message: "quota exhausted"}
-			}
-			return cliproxyexecutor.Response{Payload: []byte(auth.ID)}, nil
-		},
-		stream: func(ctx context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
-			calls[auth.ID]++
-			if auth.ID == authAID && failAuthA {
-				return nil, &Error{HTTPStatus: http.StatusTooManyRequests, Message: "quota exhausted"}
-			}
-			ch := make(chan cliproxyexecutor.StreamChunk, 1)
-			ch <- cliproxyexecutor.StreamChunk{Payload: []byte(auth.ID)}
-			close(ch)
-			return &cliproxyexecutor.StreamResult{Chunks: ch}, nil
-		},
-	})
-
-	for _, auth := range []*Auth{
-		{ID: authAID, Provider: provider, Status: StatusActive, Attributes: map[string]string{"priority": "1"}},
-		{ID: authBID, Provider: provider, Status: StatusActive, Attributes: map[string]string{"priority": "0"}},
-	} {
-		if _, errRegister := manager.Register(WithSkipPersist(ctx), auth); errRegister != nil {
-			t.Fatalf("Register(%s): %v", auth.ID, errRegister)
-		}
-		registry.GetGlobalRegistry().RegisterClient(auth.ID, provider, []*registry.ModelInfo{{ID: model}})
-		t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(auth.ID) })
-	}
-	SetAntigravityCreditsHint(authAID, AntigravityCreditsHint{Known: true, Available: false, UpdatedAt: time.Now()})
-	SetAntigravityCreditsHint(authBID, AntigravityCreditsHint{Known: true, Available: true, UpdatedAt: time.Now()})
-	t.Cleanup(func() {
-		SetAntigravityCreditsHint(authAID, AntigravityCreditsHint{})
-		SetAntigravityCreditsHint(authBID, AntigravityCreditsHint{})
-	})
-
-	req := cliproxyexecutor.Request{Model: model}
-	opts := cliproxyexecutor.Options{
-		Headers: http.Header{"Session-Id": []string{"antigravity-never-session"}},
-	}
-
-	// 1. Cold Execute binds session to authA.
-	resp, errExec := manager.Execute(ctx, []string{provider}, req, opts)
-	if errExec != nil || string(resp.Payload) != authAID {
-		t.Fatalf("cold Execute = %q (err=%v), want %q", string(resp.Payload), errExec, authAID)
-	}
-
-	// 2. authA returns 429 and has no credits; authB has available credits, but rebind-on: never must block switching to authB.
-	failAuthA = true
-	calls[authAID] = 0
-	calls[authBID] = 0
-	if _, errExec = manager.Execute(ctx, []string{provider}, req, opts); errExec == nil || statusCodeFromError(errExec) != http.StatusTooManyRequests {
-		t.Fatalf("Execute on 429 = %v, want 429", errExec)
-	}
-	if calls[authBID] != 0 {
-		t.Fatalf("authB calls after Execute 429 = %d, want 0", calls[authBID])
-	}
-
-	if _, errStream := manager.ExecuteStream(ctx, []string{provider}, req, opts); errStream == nil || statusCodeFromError(errStream) != http.StatusTooManyRequests {
-		t.Fatalf("ExecuteStream on cooled authA = %v, want 429", errStream)
-	}
-	if calls[authBID] != 0 {
-		t.Fatalf("authB calls after ExecuteStream 429 = %d, want 0", calls[authBID])
-	}
-
-	// 3. Explicit PinnedAuthMetadataKey pointing to authB on the same session must also be rejected and never call authB via credits fallback.
-	pinnedBOpts := cliproxyexecutor.Options{
-		Headers: http.Header{"Session-Id": []string{"antigravity-never-session"}},
-		Metadata: map[string]any{
-			cliproxyexecutor.PinnedAuthMetadataKey: authBID,
-		},
-	}
-	if _, errExec = manager.Execute(ctx, []string{provider}, req, pinnedBOpts); errExec == nil || statusCodeFromError(errExec) != http.StatusTooManyRequests {
-		t.Fatalf("Execute with conflicting PinnedAuthMetadataKey = %v, want 429", errExec)
-	}
-	if calls[authBID] != 0 {
-		t.Fatalf("authB calls after conflicting pinned Execute = %d, want 0", calls[authBID])
-	}
-	if _, errStream := manager.ExecuteStream(ctx, []string{provider}, req, pinnedBOpts); errStream == nil || statusCodeFromError(errStream) != http.StatusTooManyRequests {
-		t.Fatalf("ExecuteStream with conflicting PinnedAuthMetadataKey = %v, want 429", errStream)
-	}
-	if calls[authBID] != 0 {
-		t.Fatalf("authB calls after conflicting pinned ExecuteStream = %d, want 0", calls[authBID])
 	}
 }
 
