@@ -13,6 +13,11 @@ REQUIRED = {
     SDK: {
         "TestOrdinarySchedulerSelectionIDContract",
         "TestOrdinarySchedulerRefusalContract",
+        "TestOrdinaryHomeSingleCredentialRetryConfiguration",
+        *(f"TestOrdinaryHomeSingleCredentialRetryConfiguration/{case}/wait={wait}"
+          for case in ("aggregate_overrides_credential_zero", "explicit_aggregate_zero_is_authoritative",
+                       "absent_aggregate_uses_credential_override", "absent_aggregate_and_override_use_global")
+          for wait in ("0s", "30ms")),
         "TestOrdinaryExplicitRetryAfterHTTP500KeepsSameCredential",
         *(f"TestOrdinaryExplicitRetryAfterHTTP500KeepsSameCredential/{method}"
           for method in ("execute", "count", "stream")),
