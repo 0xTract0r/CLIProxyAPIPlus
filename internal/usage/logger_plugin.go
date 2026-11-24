@@ -901,6 +901,12 @@ func (s *RequestStatistics) mergeSnapshotLocked(snapshot StatisticsSnapshot, res
 	}
 
 	for apiName, apiSnapshot := range snapshot.APIs {
+		// A stored bucket can contain repeated rows. Legacy and hashed labels
+		// may mirror one another, so count occurrences within each source bucket.
+		var occurrences map[string]int
+		if restore {
+			occurrences = make(map[string]int)
+		}
 		apiName = s.normalizeUsageBucketLocked(strings.TrimSpace(apiName))
 		if apiName == "" {
 			continue
@@ -930,16 +936,16 @@ func (s *RequestStatistics) mergeSnapshotLocked(snapshot StatisticsSnapshot, res
 				if hash := usageKeyHash(apiName); hash != "" {
 					detail.APIKeyHash, detail.Source = hash, apiName
 				}
-				if seen[key] > 0 {
-					if restore {
-						seen[key]--
-					}
+				ordinal := 1
+				if restore {
+					occurrences[key]++
+					ordinal = occurrences[key]
+				}
+				if seen[key] >= ordinal {
 					result.Skipped++
 					continue
 				}
-				if !restore {
-					seen[key] = 1
-				}
+				seen[key] = ordinal
 				pricing := s.computeDetailPricing(modelName, detail.Tokens)
 				if !remaining.consume(detail.Tokens, pricing) {
 					return MergeResult{}, errUsageCapacity
@@ -1001,12 +1007,18 @@ func (s *RequestStatistics) recordImported(modelName string, stats *apiStats, de
 func dedupKey(apiName, modelName string, detail RequestDetail) string {
 	timestamp := detail.Timestamp.UTC().Format(time.RFC3339Nano)
 	tokens := normaliseTokenStats(detail.Tokens)
-	return fmt.Sprintf(
+	source := detail.Source
+	knownKey := usageKeyHash(apiName) != ""
+	if knownKey {
+		// Imported and rekeyed rows both store the canonical bucket as Source.
+		source = apiName
+	}
+	fingerprint := fmt.Sprintf(
 		"%s|%s|%s|%s|%s|%t|%d|%d|%d|%d|%d|%d|%d|%d",
 		apiName,
 		modelName,
 		timestamp,
-		detail.Source,
+		source,
 		detail.AuthIndex,
 		detail.Failed,
 		tokens.InputTokens,
@@ -1018,6 +1030,10 @@ func dedupKey(apiName, modelName string, detail RequestDetail) string {
 		tokens.TotalTokens,
 		tokens.BillableTokens,
 	)
+	if id := strings.TrimSpace(detail.RequestID); knownKey && id != "" {
+		return fmt.Sprintf("%s|id:%q", fingerprint, id)
+	}
+	return fingerprint
 }
 
 func (s *RequestStatistics) recordPricing(pricing pricingTotals, dayKey string, hourKey int) {

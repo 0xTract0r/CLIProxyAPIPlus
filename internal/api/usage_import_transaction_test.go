@@ -53,7 +53,7 @@ func TestUsageImportWriteFailureLeavesCommittedHistory(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		s.UsageStatistics().Record(context.Background(), sdkusage.Record{Provider: "fixture", Model: "live", RequestedAt: time.Now(), Detail: sdkusage.Detail{InputTokens: 2, TotalTokens: 2}})
+		s.handlers.UsageObserver.HandleUsage(context.Background(), sdkusage.Record{Provider: "fixture", Model: "live", RequestedAt: time.Now(), Detail: sdkusage.Detail{InputTokens: 2, TotalTokens: 2}})
 	}()
 	call(s, "POST", "/import", body("must-not-persist"), 500)
 	<-done
