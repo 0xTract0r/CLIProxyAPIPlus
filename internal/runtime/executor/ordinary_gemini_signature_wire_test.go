@@ -77,3 +77,61 @@ func TestOrdinaryAIStudioSignatureTranslatedRequest(t *testing.T) {
 		t.Fatalf("issued signature did not survive ordinary translation: %v", err)
 	}
 }
+
+func TestOrdinaryGeminiRejectsForeignSignatureBeforeTransport(t *testing.T) {
+	if signature.DetectSignatureProvider(testClaudeCAISSample) != signature.SignatureProviderClaude {
+		t.Fatal("existing foreign-format fixture did not classify as Claude")
+	}
+	e := NewGeminiExecutor(&config.Config{})
+	for _, route := range []string{"execute", "stream", "count"} {
+		t.Run(route, func(t *testing.T) {
+			calls := 0
+			ctx := context.WithValue(t.Context(), "cliproxy.roundtripper", ordinaryGeminiSignatureTransport(func(*http.Request) (*http.Response, error) {
+				calls++
+				return nil, fmt.Errorf("invalid request must be rejected before transport")
+			}))
+			auth := &cliproxyauth.Auth{ID: "synthetic", Attributes: map[string]string{"api_key": "fake-api-key", "base_url": "https://provider.example.invalid"}}
+			opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatGemini}
+			req := cliproxyexecutor.Request{Model: "gemini-2.5-flash", Payload: []byte(fmt.Sprintf(`{"contents":[{"role":"user","parts":[{"text":"hello"}]},{"role":"model","parts":[{"functionCall":{"name":"weather","args":{}},"thoughtSignature":%q}]}]}`, testClaudeCAISSample))}
+			var err error
+			switch route {
+			case "execute":
+				_, err = e.Execute(ctx, auth, req, opts)
+			case "stream":
+				_, err = e.ExecuteStream(ctx, auth, req, opts)
+			case "count":
+				_, err = e.CountTokens(ctx, auth, req, opts)
+			}
+			status, ok := err.(interface{ StatusCode() int })
+			if !ok || status.StatusCode() != http.StatusBadRequest || calls != 0 {
+				t.Fatalf("expected local 400 with zero transport calls, got %v, calls=%d", err, calls)
+			}
+		})
+	}
+}
+
+func TestOrdinaryGeminiInteractionsRejectsForeignAndKeepsOpaque(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		wire   string
+		reject bool
+	}{
+		{"foreign", fmt.Sprintf("%q", testClaudeCAISSample), true},
+		{"wrong type", "7", true},
+		{"opaque", `"issued-native-test-value=="`, false},
+		{"unrecognized prefixed", `"claude#opaque-not-a-verified-envelope"`, false},
+		{"ordinary UUID", `"eb432ffe-3494-454c-93b8-69bfeeac7d49"`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := `{"input":[{"type":"thought","signature":` + tc.wire + `}]}`
+			doc := ojson.NewDocString(body)
+			err := signature.ValidateOutboundGeminiInteractionsSignatures(doc)
+			if (err != nil) != tc.reject {
+				t.Fatalf("unexpected outbound validation result: %v", err)
+			}
+			if doc.String() != body {
+				t.Fatal("outbound validation changed input bytes")
+			}
+		})
+	}
+}

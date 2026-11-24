@@ -41,7 +41,7 @@ func isAllowedOutboundGeminiSignature(value string) bool {
 }
 
 // ValidateOutboundGeminiSignatures checks the final GenerateContent request.
-// It treats signatures as opaque and leaves verification to the provider.
+// It rejects recognized foreign formats and leaves opaque values to Gemini.
 func ValidateOutboundGeminiSignatures(doc *ojson.Doc) error {
 	contents := doc.Get("contents")
 	for _, content := range contents.Array() {
@@ -79,7 +79,8 @@ func validateGeminiSignatureFields(part ojson.Result, names ...string) error {
 			if key.String() != name {
 				continue
 			}
-			valid = !found && value.Type == ojson.String && isAllowedOutboundGeminiSignature(value.String())
+			valid = !found && value.Type == ojson.String && isAllowedOutboundGeminiSignature(value.String()) &&
+				!isRecognizedForeignGeminiSignature(value.String())
 			found = true
 			return valid
 		}
@@ -89,6 +90,16 @@ func validateGeminiSignatureFields(part ojson.Result, names ...string) error {
 		return errInvalidGeminiThoughtSignature
 	}
 	return nil
+}
+
+// Reject only classifiers backed by recognized foreign wire structures.
+func isRecognizedForeignGeminiSignature(value string) bool {
+	switch DetectSignatureProvider(value) {
+	case SignatureProviderClaude, SignatureProviderGPT, SignatureProviderMeta:
+		return true
+	default:
+		return false
+	}
 }
 
 // SanitizeGeminiSystemInstruction removes empty part objects ({}) from
