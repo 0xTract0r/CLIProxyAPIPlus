@@ -186,6 +186,10 @@ access:
 # Routing strategy for selecting credentials when multiple match.
 routing:
   strategy: "round-robin" # round-robin (default), weighted-round-robin, fill-first
+  # Maximum simultaneous local requests per selected credential; 0 disables it.
+  # Additional requests wait FIFO (up to 64 pending and 30s), or return 503 when busy.
+  # Client cancellation stops waiting; the same credential remains selected.
+  max-concurrent-per-credential: 0
   # Existing files using the legacy adaptive strategy require an explicit operator review.
   # Startup rejects that strategy rather than applying a different selection policy.
   # weighted-round-robin uses each credential's integer weight (default 1, maximum 1,000,000).
@@ -212,10 +216,10 @@ routing:
   # LCP compaction matching requires at least 2 shared trailing turns; clients whose
   # compaction replaces all earlier turns with a summary should send X-Session-ID (or
   # another explicit session ID), or affinity starts a new binding at every compaction.
-  # Automatic failover is always enabled when bound auth becomes unavailable.
+  # In ordinary mode, an unavailable bound credential does not trigger failover.
   # An established binding outranks credential priority: once a session is bound, that
   # credential is kept even if a higher-priority credential recovers. Credential priority
-  # still decides cold bindings, requests without a session, and post-failover rebinding.
+  # still decides cold bindings and requests without a session.
   session-affinity: false # default: false
   # How long session-to-auth bindings are retained. Default: 1h
   session-affinity-ttl: "1h"
@@ -230,15 +234,9 @@ routing:
   # for maximum parallel concurrency.
   # Ignored when routing.session-affinity is false.
   session-affinity-subagents: true
-  # Controls which credential failures rebind an established session to the failover credential:
-  #   - "any" (default): any credential-attributed failure unbinds and rebinds on failover.
-  #   - "quota": transient errors (408, 5xx, empty stream, buffer limit) fail over for that
-  #     request only while keeping the session bound to its original credential; quota and auth
-  #     errors (429, 401/402/403, 404/model support, invalid_grant) rebind as normal.
-  #   - "never": never move or fail over an established session to another credential;
-  #     keep the binding and return the error (or retry the same credential) instead.
-  # Ignored when routing.session-affinity is false.
-  session-affinity-rebind-on: "any"
+  # Ordinary mode accepts "never" (or omission). It keeps the binding and
+  # returns provider errors without moving an established session.
+  session-affinity-rebind-on: "never"
 
   # When true, unprefixed model requests only use credentials without a prefix (except when prefix == model name).
   force-model-prefix: false

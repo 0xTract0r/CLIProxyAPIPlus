@@ -17,10 +17,27 @@ func discardStreamChunks(ch <-chan cliproxyexecutor.StreamChunk) {
 	if ch == nil {
 		return
 	}
-	go func() {
-		for range ch {
+	go drainStreamChunks(ch)
+}
+
+// Provider channels are expected to close when an attempt is cancelled.
+// Detach after a bounded grace period when a custom provider fails to close.
+func drainStreamChunks(ch <-chan cliproxyexecutor.StreamChunk) {
+	if ch == nil {
+		return
+	}
+	timer := time.NewTimer(time.Second)
+	defer timer.Stop()
+	for {
+		select {
+		case <-timer.C:
+			return
+		case _, open := <-ch:
+			if !open {
+				return
+			}
 		}
-	}()
+	}
 }
 
 type streamBootstrapError struct {

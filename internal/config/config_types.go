@@ -576,6 +576,9 @@ type QuotaExceeded struct {
 
 // RoutingConfig configures how credentials are selected for requests.
 type RoutingConfig struct {
+	// MaxConcurrentPerCredential bounds ordinary local execution per selected credential. Zero disables admission.
+	MaxConcurrentPerCredential int `yaml:"max-concurrent-per-credential,omitempty" json:"max-concurrent-per-credential,omitempty"`
+
 	// Deprecated: retained for configurations that enabled session affinity through the old name.
 	ClaudeCodeSessionAffinity bool `yaml:"claude-code-session-affinity,omitempty" json:"claude-code-session-affinity,omitempty"`
 

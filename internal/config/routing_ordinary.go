@@ -8,6 +8,9 @@ import (
 // ValidateOrdinaryRouting rejects routing policies that would move a session
 // to a different credential after an upstream failure.
 func (cfg *Config) ValidateOrdinaryRouting() error {
+	if cfg.Routing.MaxConcurrentPerCredential < 0 {
+		return fmt.Errorf("routing.max-concurrent-per-credential must not be negative")
+	}
 	if strings.EqualFold(strings.TrimSpace(cfg.Routing.Strategy), "adaptive") {
 		return fmt.Errorf("unsupported routing strategy %q", cfg.Routing.Strategy)
 	}

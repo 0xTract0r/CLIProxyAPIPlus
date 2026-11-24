@@ -222,7 +222,8 @@ type Manager struct {
 	authChangeWatchers map[string]map[chan struct{}]struct{}
 	scheduler          *authScheduler
 	// pluginScheduler runs outside m.mu before falling back to native selection.
-	pluginScheduler PluginScheduler
+	pluginScheduler             PluginScheduler
+	ordinaryCredentialAdmission ordinaryCredentialAdmission
 	// continuityClock overrides time.Now and timer waiting in unit tests.
 	continuityClock continuityClock
 	// homeRuntimeAuths retains legacy session auth lookups for non-execution callers.

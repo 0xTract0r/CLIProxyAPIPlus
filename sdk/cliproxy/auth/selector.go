@@ -1743,7 +1743,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	fallbackAuths := highestPriorityAuths(available)
 
 	modelKey := canonicalModelKey(model)
-	cacheKey := provider + "::" + primaryID + "::" + modelKey
+	cacheKey := ordinaryScopedAffinityKey(provider, primaryID, modelKey, opts.Metadata)
 	isFork := false
 	if opts.Metadata != nil {
 		if forkFlag, ok := opts.Metadata[cliproxyexecutor.IsForkMetadataKey].(bool); ok && forkFlag {
@@ -1753,7 +1753,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	isSubagent := !isFork && isSubagentSession(primaryID, fallbackID)
 	fallbackKey := ""
 	if fallbackID != "" && fallbackID != primaryID {
-		fallbackKey = provider + "::" + fallbackID + "::" + modelKey
+		fallbackKey = ordinaryScopedAffinityKey(provider, fallbackID, modelKey, opts.Metadata)
 	}
 	bind := func(authID string, recordSelection bool) {
 		keys := []string{cacheKey}
@@ -1773,7 +1773,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 				break
 			}
 		}
-		s.cache.setSessionAliases(authID, bindingProvider, primaryID, keys...)
+		s.cache.setSessionAliases(authID, bindingProvider, ordinaryAffinitySessionIndex(primaryID, opts.Metadata), keys...)
 	}
 
 	if cachedAuthID, ok := s.cache.GetAndRefresh(cacheKey); ok {
@@ -1823,7 +1823,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 				providers[candidateProvider] = struct{}{}
 			}
 		}
-		if parentAuthID := s.cache.latestSessionAuth(fallbackID, providers); parentAuthID != "" {
+		if parentAuthID := s.cache.latestSessionAuth(ordinaryAffinitySessionIndex(fallbackID, opts.Metadata), providers); parentAuthID != "" {
 			for _, auth := range available {
 				if auth.ID == parentAuthID {
 					bind(auth.ID, true)
@@ -2079,6 +2079,20 @@ func canonicalLCPProvider(provider string) string {
 	}
 }
 
+// The NUL separator cannot occur in an ordinary external session ID. The
+// existing unscoped keys remain valid for direct SDK callers without a scope.
+func ordinaryAffinitySessionIndex(id string, metadata map[string]any) string {
+	scope := sessionMetadataString(metadata, cliproxyexecutor.CallerScopeMetadataKey)
+	if scope == "" {
+		return id
+	}
+	return id + "\x00" + cliproxysession.CallerScope(scope)
+}
+
+func ordinaryScopedAffinityKey(provider, sessionID, model string, metadata map[string]any) string {
+	return provider + "::" + ordinaryAffinitySessionIndex(sessionID, metadata) + "::" + model
+}
+
 func lcpAffinityNamespace(provider, model string, metadata map[string]any) string {
 	provider = canonicalLCPProvider(provider)
 	model = canonicalModelKey(model)
@@ -2219,8 +2233,9 @@ func (s *SessionAffinitySelector) LookupAffinity(provider, model, sessionID stri
 	}
 	provider = strings.TrimSpace(provider)
 	model = strings.TrimSpace(model)
-	sessionID = strings.TrimSpace(sessionID)
-	if provider == "" || model == "" || sessionID == "" {
+	sessionID = cliproxysession.NormalizeExplicitID(sessionID)
+	if provider == "" || model == "" || sessionID == "" ||
+		strings.IndexByte(provider, 0) >= 0 || strings.IndexByte(model, 0) >= 0 {
 		return "", "unbound"
 	}
 
@@ -2400,11 +2415,11 @@ func (s *SessionAffinitySelector) OnResult(res Result) {
 		fallbackID = cliproxysession.BoundSessionIdentity(fallbackID)
 	}
 
-	cacheKey := ns + "::" + primaryID + "::" + nsModel
+	cacheKey := ordinaryScopedAffinityKey(ns, primaryID, nsModel, res.Options.Metadata)
 	isFork, _ := res.Options.Metadata[cliproxyexecutor.IsForkMetadataKey].(bool)
 	var fallbackKey string
 	if fallbackID != "" && fallbackID != primaryID && !isSubagentSession(primaryID, fallbackID) && !isFork {
-		fallbackKey = ns + "::" + fallbackID + "::" + nsModel
+		fallbackKey = ordinaryScopedAffinityKey(ns, fallbackID, nsModel, res.Options.Metadata)
 	}
 	if res.Success {
 		s.cache.Touch(cacheKey, res.AuthID)
@@ -2474,14 +2489,14 @@ func (s *SessionAffinitySelector) boundAuthForRequest(providers []string, model 
 
 	if primaryID != "" {
 		for _, candProvider := range candidateProviders {
-			if authID, ok := s.cache.Get(candProvider + "::" + primaryID + "::" + modelKey); ok && authID != "" {
+			if authID, ok := s.cache.Get(ordinaryScopedAffinityKey(candProvider, primaryID, modelKey, opts.Metadata)); ok && authID != "" {
 				return authID, true
 			}
 		}
 	}
 	if fallbackID != "" && fallbackID != primaryID && !isSubagent && !isFork {
 		for _, candProvider := range candidateProviders {
-			if authID, ok := s.cache.Get(candProvider + "::" + fallbackID + "::" + modelKey); ok && authID != "" {
+			if authID, ok := s.cache.Get(ordinaryScopedAffinityKey(candProvider, fallbackID, modelKey, opts.Metadata)); ok && authID != "" {
 				return authID, true
 			}
 		}

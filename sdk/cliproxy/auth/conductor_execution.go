@@ -1046,6 +1046,13 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		}
 		executor = executorForAuth(executor, auth)
 		var authErr error
+		releaseAdmission, errAdmission := m.admitOrdinaryCredential(execCtx, auth, routeModel, homeMode)
+		if errAdmission != nil {
+			return cliproxyexecutor.Response{}, errAdmission
+		}
+		if releaseAdmission != nil {
+			defer releaseAdmission()
+		}
 		didRefreshOnUnauthorized := false
 		for _, upstreamModel := range models {
 			execCtx = m.newUpstreamAttemptContext(execCtx)
@@ -1207,6 +1214,9 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			rewriteForceMappedResponse(&resp, attemptAliasResult)
 			return resp, nil
 		}
+		if releaseAdmission != nil {
+			releaseAdmission()
+		}
 		if authErr != nil {
 			if isCredentialTerminatedError(authErr) {
 				lastErr = authErr
@@ -1360,6 +1370,13 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		}
 		executor = executorForAuth(executor, auth)
 		var authErr error
+		releaseAdmission, errAdmission := m.admitOrdinaryCredential(execCtx, auth, routeModel, homeMode)
+		if errAdmission != nil {
+			return cliproxyexecutor.Response{}, errAdmission
+		}
+		if releaseAdmission != nil {
+			defer releaseAdmission()
+		}
 		didRefreshOnUnauthorized := false
 		for _, upstreamModel := range models {
 			execCtx = m.newUpstreamAttemptContext(execCtx)
@@ -1513,6 +1530,9 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			attemptAliasResult := resolveAttemptAliasResult(routing, auth, routeModel, upstreamModel, aliasResult)
 			rewriteForceMappedResponse(&resp, attemptAliasResult)
 			return resp, nil
+		}
+		if releaseAdmission != nil {
+			releaseAdmission()
 		}
 		if authErr != nil {
 			if isCredentialTerminatedError(authErr) {
@@ -1913,8 +1933,15 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			models = models[:1]
 			pooled = false
 		}
+		releaseAdmission, errAdmission := m.admitOrdinaryCredential(execCtx, auth, routeModel, homeMode)
+		if errAdmission != nil {
+			return nil, errAdmission
+		}
 		streamResult, errStream := m.executeStreamWithModelPool(execCtx, executor, auth, provider, execReq, execOpts, routeModel, streamExecutionModel, models, pooled, aliasResult, routing, !homeMode || selection != nil, selection != nil)
 		if errStream != nil {
+			if releaseAdmission != nil {
+				releaseAdmission()
+			}
 			syncPreferredUpstreamError(&upstreamErr, errStream)
 			if isTerminalRequestStopError(errStream) || isOrdinaryUpstreamRefusal(errStream) || (!IsRequestScopedContinueError(errStream) && (isRequestInvalidError(errStream) || cliproxyexecutor.IsUpstreamWebsocketTurnError(errStream))) {
 				// Only redispatch needs a release acknowledgement. Preserve the final
@@ -1960,7 +1987,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			}
 			return wrapHomeStream(ctx, streamResult, selection, releaseAttempt), nil
 		}
-		return streamResult, nil
+		return holdOrdinaryCredentialStream(ctx, streamResult, releaseAdmission), nil
 	}
 }
 

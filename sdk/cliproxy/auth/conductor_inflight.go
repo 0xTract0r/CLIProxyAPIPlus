@@ -196,8 +196,7 @@ func wrapInFlightStreamResult(result *cliproxyexecutor.StreamResult, scope *inFl
 		// The scope is released explicitly here before the drain can block;
 		// the deferred end above remains as the safety net for other exits.
 		scope.end()
-		for range result.Chunks {
-		}
+		drainStreamChunks(result.Chunks)
 		close(out)
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: result.Headers, Chunks: out}
