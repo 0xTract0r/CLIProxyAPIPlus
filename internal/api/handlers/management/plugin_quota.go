@@ -60,6 +60,10 @@ func (h *Handler) GetQuotaProviders(c *gin.Context) {
 
 // FetchCredentialQuota retrieves normalized quota for a credential via its quota provider or declarative probe.
 func (h *Handler) FetchCredentialQuota(c *gin.Context) {
+	h.fetchCredentialQuotaWithTransport(c, nil)
+}
+
+func (h *Handler) fetchCredentialQuotaWithTransport(c *gin.Context, transport http.RoundTripper) {
 	var body credentialQuotaRequest
 	if errBind := c.ShouldBindJSON(&body); errBind != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
@@ -118,7 +122,7 @@ func (h *Handler) FetchCredentialQuota(c *gin.Context) {
 	if auth.Metadata != nil {
 		if rawProbe, okProbe := auth.Metadata["quota_probe"]; okProbe && rawProbe != nil {
 			if probeMap, okMap := rawProbe.(map[string]any); okMap {
-				quotaResp, handledProbe, errProbe := h.executeQuotaProbe(c, auth, probeMap)
+				quotaResp, handledProbe, errProbe := h.executeQuotaProbeWithTransport(c, auth, probeMap, transport)
 				if handledProbe {
 					if errProbe != nil {
 						c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("quota probe failed: %v", errProbe)})
@@ -274,10 +278,6 @@ func (h *Handler) ResetPluginQuota(c *gin.Context) {
 	}
 
 	h.refuseExternalQuotaReset(c, auth)
-}
-
-func (h *Handler) executeQuotaProbe(c *gin.Context, auth *coreauth.Auth, probe map[string]any) (pluginapi.QuotaFetchResponse, bool, error) {
-	return h.executeQuotaProbeWithTransport(c, auth, probe, nil)
 }
 
 func (h *Handler) executeQuotaProbeWithTransport(c *gin.Context, auth *coreauth.Auth, probe map[string]any, transport http.RoundTripper) (pluginapi.QuotaFetchResponse, bool, error) {

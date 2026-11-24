@@ -323,7 +323,8 @@ func TestAuthFilesList_IncludesQuotaSupport(t *testing.T) {
 		Attributes: map[string]string{"runtime_only": "true"},
 		Metadata: map[string]any{
 			"quota_probe": map[string]any{
-				"url": "https://api.example.com/quota",
+				"url":    quotaProbeFixtureOrigin + "/hidden",
+				"header": map[string]any{"Authorization": "Bearer fixture-private-list"},
 			},
 		},
 	}
@@ -357,6 +358,9 @@ func TestAuthFilesList_IncludesQuotaSupport(t *testing.T) {
 		t.Fatalf("expected status 200, got %d", rec.Code)
 	}
 
+	if strings.Contains(rec.Body.String(), "fixture-private-list") || strings.Contains(rec.Body.String(), quotaProbeFixtureOrigin+"/hidden") {
+		t.Fatal("credential list exposed private quota probe configuration")
+	}
 	var resp struct {
 		Files []map[string]any `json:"files"`
 	}
@@ -384,8 +388,8 @@ func TestAuthFilesList_IncludesQuotaSupport(t *testing.T) {
 			if supports, ok := f["supports_quota"].(bool); !ok || !supports {
 				t.Fatalf("expected probe auth to have supports_quota: true, got %#v", f["supports_quota"])
 			}
-			if f["quota_probe"] == nil {
-				t.Fatal("expected quota_probe field to be present")
+			if _, exists := f["quota_probe"]; exists {
+				t.Fatal("v0 must not expose the quota probe")
 			}
 		case "normal-auth-list":
 			foundNormal = true
@@ -408,7 +412,7 @@ func TestAuthFilesListV8_QuotaPluginIDAndNoQuotaProbe(t *testing.T) {
 			ID:       "probe-auth",
 			FileName: "probe.json",
 			Provider: "custom",
-			Metadata: map[string]any{"quota_probe": map[string]any{"url": "https://api.example.com/quota"}},
+			Metadata: map[string]any{"quota_probe": map[string]any{"url": quotaProbeFixtureOrigin + "/hidden", "header": map[string]any{"Authorization": "Bearer fixture-private-list"}}},
 		},
 	}
 	for _, auth := range auths {
@@ -446,6 +450,9 @@ func TestAuthFilesListV8_QuotaPluginIDAndNoQuotaProbe(t *testing.T) {
 		if rec.Code != http.StatusOK {
 			t.Fatalf("expected status 200, got %d: %s", rec.Code, rec.Body.String())
 		}
+		if strings.Contains(rec.Body.String(), "fixture-private-list") || strings.Contains(rec.Body.String(), quotaProbeFixtureOrigin+"/hidden") {
+			t.Fatal("credential list exposed private quota probe configuration")
+		}
 		var resp struct {
 			Files []map[string]any `json:"files"`
 		}
@@ -482,8 +489,8 @@ func TestAuthFilesListV8_QuotaPluginIDAndNoQuotaProbe(t *testing.T) {
 	if supports, ok := v0Probe["supports_quota"].(bool); !ok || !supports {
 		t.Fatalf("v0 probe auth should keep supports_quota: true, got %#v", v0Probe["supports_quota"])
 	}
-	if v0Probe["quota_probe"] == nil {
-		t.Fatal("v0 probe auth should keep quota_probe")
+	if _, exists := v0Probe["quota_probe"]; exists {
+		t.Fatal("v0 must not expose the quota probe")
 	}
 }
 
@@ -538,8 +545,20 @@ func TestResetCredentialQuota_ExternalUnavailableKeepsLocalState(t *testing.T) {
 	}
 }
 
+const quotaProbeFixtureOrigin = "https://quota.example.invalid"
+
+func quotaProbeFixture(handler http.HandlerFunc) (apiCallFixtureRoundTripper, *int) {
+	calls := new(int)
+	return func(req *http.Request) (*http.Response, error) {
+		*calls++
+		rec := httptest.NewRecorder()
+		handler(rec, req)
+		return rec.Result(), nil
+	}, calls
+}
+
 func TestFetchCredentialQuota_DeclarativeProbe(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	transport, calls := quotaProbeFixture(func(w http.ResponseWriter, r *http.Request) {
 		if authHdr := r.Header.Get("Authorization"); authHdr != "Bearer secret-token" {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
@@ -550,25 +569,24 @@ func TestFetchCredentialQuota_DeclarativeProbe(t *testing.T) {
 			"subscription": {"plan": "ProbePro"},
 			"groups": [
 				{
-					"displayName": "API Limits",
+					"displayName": "API Limits secret-token",
 					"buckets": [
 						{"window": "monthly", "remainingFraction": 0.65, "resetTime": "2026-10-01T00:00:00Z"}
 					]
 				}
 			]
 		}`))
-	}))
-	defer upstream.Close()
+	})
 
 	manager := coreauth.NewManager(nil, nil, nil)
 	auth := &coreauth.Auth{
-		ID:       "probe-auth",
-		FileName: "probe.json",
-		Provider: "probe-provider",
+		ID:         "probe-auth",
+		FileName:   "probe.json",
+		Provider:   "openai-compatibility",
+		Attributes: map[string]string{"api_key": "secret-token", "base_url": quotaProbeFixtureOrigin},
 		Metadata: map[string]any{
-			"token": "secret-token",
 			"quota_probe": map[string]any{
-				"url":    upstream.URL + "/usage",
+				"url":    quotaProbeFixtureOrigin + "/usage",
 				"method": "GET",
 				"header": map[string]any{
 					"Authorization": "Bearer $TOKEN$",
@@ -586,10 +604,17 @@ func TestFetchCredentialQuota_DeclarativeProbe(t *testing.T) {
 	ctx, _ := gin.CreateTestContext(rec)
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v0/management/quota/fetch", strings.NewReader(`{"auth_index":"`+authIndex+`"}`))
 	ctx.Request.Header.Set("Content-Type", "application/json")
-	h.FetchCredentialQuota(ctx)
+	h.fetchCredentialQuotaWithTransport(ctx, transport)
+	if *calls != 1 {
+		t.Fatalf("quota fixture received %d requests, want 1", *calls)
+	}
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	if strings.Contains(rec.Body.String(), "secret-token") {
+		t.Fatal("response exposed echoed credential")
 	}
 
 	var quotaResp pluginapi.QuotaFetchResponse
@@ -605,18 +630,17 @@ func TestFetchCredentialQuota_DeclarativeProbe(t *testing.T) {
 }
 
 func TestFetchCredentialQuota_DeclarativeProbeSummaryOnly(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	transport, calls := quotaProbeFixture(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"summary":[{"key":"balance","label":"Balance","value":42,"unit":"credits"}]}`))
-	}))
-	defer upstream.Close()
+	})
 
 	manager := coreauth.NewManager(nil, nil, nil)
 	auth := &coreauth.Auth{
 		ID:       "probe-summary-auth",
 		FileName: "probe-summary.json",
 		Provider: "probe-summary",
-		Metadata: map[string]any{"quota_probe": map[string]any{"url": upstream.URL, "method": "GET"}},
+		Metadata: map[string]any{"quota_probe": map[string]any{"url": quotaProbeFixtureOrigin, "method": "GET"}},
 	}
 	authIndex := auth.EnsureIndex()
 	_, _ = manager.Register(context.Background(), auth)
@@ -627,7 +651,10 @@ func TestFetchCredentialQuota_DeclarativeProbeSummaryOnly(t *testing.T) {
 	ctx, _ := gin.CreateTestContext(rec)
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v0/management/quota/fetch", strings.NewReader(`{"auth_index":"`+authIndex+`"}`))
 	ctx.Request.Header.Set("Content-Type", "application/json")
-	h.FetchCredentialQuota(ctx)
+	h.fetchCredentialQuotaWithTransport(ctx, transport)
+	if *calls != 1 {
+		t.Fatalf("quota fixture received %d requests, want 1", *calls)
+	}
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d: %s", rec.Code, rec.Body.String())
@@ -649,20 +676,22 @@ func TestFilterUsableQuotaSummaryRequiresStringIdentifiers(t *testing.T) {
 }
 
 func TestExecuteQuotaProbeStripsSummaryKeyCaseInsensitively(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	transport, calls := quotaProbeFixture(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"subscription":{"plan":"ProbePro"},"Summary":"usage text"}`))
-	}))
-	defer upstream.Close()
+	})
 
 	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, nil)
 	rec := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(rec)
 	ctx.Request = httptest.NewRequest(http.MethodGet, "/probe", nil)
 
-	quotaResp, handled, errProbe := h.executeQuotaProbe(ctx, &coreauth.Auth{}, map[string]any{
-		"url": upstream.URL,
-	})
+	quotaResp, handled, errProbe := h.executeQuotaProbeWithTransport(ctx, &coreauth.Auth{}, map[string]any{
+		"url": quotaProbeFixtureOrigin,
+	}, transport)
+	if *calls != 1 {
+		t.Fatalf("quota fixture received %d requests, want 1", *calls)
+	}
 	if !handled || errProbe != nil {
 		t.Fatalf("executeQuotaProbe() handled=%v err=%v", handled, errProbe)
 	}
@@ -708,18 +737,17 @@ func TestFilterUsableQuotaSummaryOmitsNonStringOptionalMetadata(t *testing.T) {
 }
 
 func TestFetchCredentialQuota_DeclarativeProbeSummaryWithoutValueReturnsError(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	transport, calls := quotaProbeFixture(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"summary":[{"key":"balance","label":"Balance"}]}`))
-	}))
-	defer upstream.Close()
+	})
 
 	manager := coreauth.NewManager(nil, nil, nil)
 	auth := &coreauth.Auth{
 		ID:       "probe-summary-without-value-auth",
 		FileName: "probe-summary-without-value.json",
 		Provider: "probe-summary",
-		Metadata: map[string]any{"quota_probe": map[string]any{"url": upstream.URL, "method": "GET"}},
+		Metadata: map[string]any{"quota_probe": map[string]any{"url": quotaProbeFixtureOrigin, "method": "GET"}},
 	}
 	authIndex := auth.EnsureIndex()
 	_, _ = manager.Register(context.Background(), auth)
@@ -730,7 +758,10 @@ func TestFetchCredentialQuota_DeclarativeProbeSummaryWithoutValueReturnsError(t 
 	ctx, _ := gin.CreateTestContext(rec)
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v0/management/quota/fetch", strings.NewReader(`{"auth_index":"`+authIndex+`"}`))
 	ctx.Request.Header.Set("Content-Type", "application/json")
-	h.FetchCredentialQuota(ctx)
+	h.fetchCredentialQuotaWithTransport(ctx, transport)
+	if *calls != 1 {
+		t.Fatalf("quota fixture received %d requests, want 1", *calls)
+	}
 
 	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("expected status 502, got %d: %s", rec.Code, rec.Body.String())
@@ -738,18 +769,17 @@ func TestFetchCredentialQuota_DeclarativeProbeSummaryWithoutValueReturnsError(t 
 }
 
 func TestFetchCredentialQuota_DeclarativeProbeIgnoresMalformedOptionalSummary(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	transport, calls := quotaProbeFixture(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"subscription":{"plan":"ProbePro"},"summary":"usage text"}`))
-	}))
-	defer upstream.Close()
+	})
 
 	manager := coreauth.NewManager(nil, nil, nil)
 	auth := &coreauth.Auth{
 		ID:       "probe-malformed-summary-auth",
 		FileName: "probe-malformed-summary.json",
 		Provider: "probe-summary",
-		Metadata: map[string]any{"quota_probe": map[string]any{"url": upstream.URL, "method": "GET"}},
+		Metadata: map[string]any{"quota_probe": map[string]any{"url": quotaProbeFixtureOrigin, "method": "GET"}},
 	}
 	authIndex := auth.EnsureIndex()
 	_, _ = manager.Register(context.Background(), auth)
@@ -760,7 +790,10 @@ func TestFetchCredentialQuota_DeclarativeProbeIgnoresMalformedOptionalSummary(t 
 	ctx, _ := gin.CreateTestContext(rec)
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v0/management/quota/fetch", strings.NewReader(`{"auth_index":"`+authIndex+`"}`))
 	ctx.Request.Header.Set("Content-Type", "application/json")
-	h.FetchCredentialQuota(ctx)
+	h.fetchCredentialQuotaWithTransport(ctx, transport)
+	if *calls != 1 {
+		t.Fatalf("quota fixture received %d requests, want 1", *calls)
+	}
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d: %s", rec.Code, rec.Body.String())
@@ -776,7 +809,7 @@ func TestFetchCredentialQuota_DeclarativeProbeIgnoresMalformedOptionalSummary(t 
 
 func TestFetchCredentialQuota_DeclarativeProbeWithMapping(t *testing.T) {
 	futureServerTime := time.Now().Add(5 * time.Minute).UTC().Truncate(time.Second)
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	transport, calls := quotaProbeFixture(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Date", futureServerTime.Format(http.TimeFormat))
 		// Upstream returns raw non-normalized billing format
@@ -793,8 +826,7 @@ func TestFetchCredentialQuota_DeclarativeProbeWithMapping(t *testing.T) {
 				}
 			]
 		}`))
-	}))
-	defer upstream.Close()
+	})
 
 	manager := coreauth.NewManager(nil, nil, nil)
 	auth := &coreauth.Auth{
@@ -803,7 +835,7 @@ func TestFetchCredentialQuota_DeclarativeProbeWithMapping(t *testing.T) {
 		Provider: "probe-mapping",
 		Metadata: map[string]any{
 			"quota_probe": map[string]any{
-				"url":    upstream.URL + "/billing",
+				"url":    quotaProbeFixtureOrigin + "/billing",
 				"method": "GET",
 				"mapping": map[string]any{
 					"plan": "user.tier",
@@ -831,7 +863,10 @@ func TestFetchCredentialQuota_DeclarativeProbeWithMapping(t *testing.T) {
 	ctx, _ := gin.CreateTestContext(rec)
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v0/management/quota/fetch", strings.NewReader(`{"auth_index":"`+authIndex+`"}`))
 	ctx.Request.Header.Set("Content-Type", "application/json")
-	h.FetchCredentialQuota(ctx)
+	h.fetchCredentialQuotaWithTransport(ctx, transport)
+	if *calls != 1 {
+		t.Fatalf("quota fixture received %d requests, want 1", *calls)
+	}
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d: %s", rec.Code, rec.Body.String())
@@ -865,11 +900,10 @@ func TestFetchCredentialQuota_DeclarativeProbeWithMapping(t *testing.T) {
 }
 
 func TestFetchCredentialQuota_DeclarativeProbeInvalidReturnsError(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	transport, calls := quotaProbeFixture(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
 		_, _ = w.Write([]byte("random unmapped text"))
-	}))
-	defer upstream.Close()
+	})
 
 	manager := coreauth.NewManager(nil, nil, nil)
 	auth := &coreauth.Auth{
@@ -878,7 +912,7 @@ func TestFetchCredentialQuota_DeclarativeProbeInvalidReturnsError(t *testing.T) 
 		Provider: "probe-invalid",
 		Metadata: map[string]any{
 			"quota_probe": map[string]any{
-				"url":    upstream.URL + "/invalid",
+				"url":    quotaProbeFixtureOrigin + "/invalid",
 				"method": "GET",
 			},
 		},
@@ -893,7 +927,10 @@ func TestFetchCredentialQuota_DeclarativeProbeInvalidReturnsError(t *testing.T) 
 	ctx, _ := gin.CreateTestContext(rec)
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v0/management/quota/fetch", strings.NewReader(`{"auth_index":"`+authIndex+`"}`))
 	ctx.Request.Header.Set("Content-Type", "application/json")
-	h.FetchCredentialQuota(ctx)
+	h.fetchCredentialQuotaWithTransport(ctx, transport)
+	if *calls != 1 {
+		t.Fatalf("quota fixture received %d requests, want 1", *calls)
+	}
 
 	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("expected status 502 Bad Gateway for unmapped invalid probe response, got %d", rec.Code)
@@ -901,12 +938,11 @@ func TestFetchCredentialQuota_DeclarativeProbeInvalidReturnsError(t *testing.T) 
 }
 
 func TestFetchCredentialQuota_DeclarativeProbeMissingPathReturnsError(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	transport, calls := quotaProbeFixture(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		// Empty JSON object, missing all declared paths
 		_, _ = w.Write([]byte(`{}`))
-	}))
-	defer upstream.Close()
+	})
 
 	manager := coreauth.NewManager(nil, nil, nil)
 	auth := &coreauth.Auth{
@@ -915,7 +951,7 @@ func TestFetchCredentialQuota_DeclarativeProbeMissingPathReturnsError(t *testing
 		Provider: "probe-missing",
 		Metadata: map[string]any{
 			"quota_probe": map[string]any{
-				"url":    upstream.URL + "/empty",
+				"url":    quotaProbeFixtureOrigin + "/empty",
 				"method": "GET",
 				"mapping": map[string]any{
 					"plan": "missing.plan.path",
@@ -943,7 +979,10 @@ func TestFetchCredentialQuota_DeclarativeProbeMissingPathReturnsError(t *testing
 	ctx, _ := gin.CreateTestContext(rec)
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v0/management/quota/fetch", strings.NewReader(`{"auth_index":"`+authIndex+`"}`))
 	ctx.Request.Header.Set("Content-Type", "application/json")
-	h.FetchCredentialQuota(ctx)
+	h.fetchCredentialQuotaWithTransport(ctx, transport)
+	if *calls != 1 {
+		t.Fatalf("quota fixture received %d requests, want 1", *calls)
+	}
 
 	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("expected status 502 Bad Gateway when mapping paths are missing, got %d", rec.Code)
@@ -951,11 +990,10 @@ func TestFetchCredentialQuota_DeclarativeProbeMissingPathReturnsError(t *testing
 }
 
 func TestFetchCredentialQuota_DeclarativeProbeNonJSONWithMappingReturnsError(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	transport, calls := quotaProbeFixture(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html")
 		_, _ = w.Write([]byte(`<html>502 Gateway Timeout</html>`))
-	}))
-	defer upstream.Close()
+	})
 
 	manager := coreauth.NewManager(nil, nil, nil)
 	auth := &coreauth.Auth{
@@ -964,7 +1002,7 @@ func TestFetchCredentialQuota_DeclarativeProbeNonJSONWithMappingReturnsError(t *
 		Provider: "probe-nonjson",
 		Metadata: map[string]any{
 			"quota_probe": map[string]any{
-				"url":    upstream.URL + "/html",
+				"url":    quotaProbeFixtureOrigin + "/html",
 				"method": "GET",
 				"mapping": map[string]any{
 					"plan": "user.plan",
@@ -982,7 +1020,10 @@ func TestFetchCredentialQuota_DeclarativeProbeNonJSONWithMappingReturnsError(t *
 	ctx, _ := gin.CreateTestContext(rec)
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v0/management/quota/fetch", strings.NewReader(`{"auth_index":"`+authIndex+`"}`))
 	ctx.Request.Header.Set("Content-Type", "application/json")
-	h.FetchCredentialQuota(ctx)
+	h.fetchCredentialQuotaWithTransport(ctx, transport)
+	if *calls != 1 {
+		t.Fatalf("quota fixture received %d requests, want 1", *calls)
+	}
 
 	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("expected status 502 Bad Gateway for non-JSON upstream with mapping, got %d", rec.Code)
@@ -990,12 +1031,11 @@ func TestFetchCredentialQuota_DeclarativeProbeNonJSONWithMappingReturnsError(t *
 }
 
 func TestFetchCredentialQuota_MalformedNormalizedGroupsReturnsError(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	transport, calls := quotaProbeFixture(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		// Malformed normalized shape with empty group and no buckets or plan
 		_, _ = w.Write([]byte(`{"groups": [{}]}`))
-	}))
-	defer upstream.Close()
+	})
 
 	manager := coreauth.NewManager(nil, nil, nil)
 	auth := &coreauth.Auth{
@@ -1004,7 +1044,7 @@ func TestFetchCredentialQuota_MalformedNormalizedGroupsReturnsError(t *testing.T
 		Provider: "probe-malformed",
 		Metadata: map[string]any{
 			"quota_probe": map[string]any{
-				"url":    upstream.URL + "/malformed",
+				"url":    quotaProbeFixtureOrigin + "/malformed",
 				"method": "GET",
 			},
 		},
@@ -1019,7 +1059,10 @@ func TestFetchCredentialQuota_MalformedNormalizedGroupsReturnsError(t *testing.T
 	ctx, _ := gin.CreateTestContext(rec)
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v0/management/quota/fetch", strings.NewReader(`{"auth_index":"`+authIndex+`"}`))
 	ctx.Request.Header.Set("Content-Type", "application/json")
-	h.FetchCredentialQuota(ctx)
+	h.fetchCredentialQuotaWithTransport(ctx, transport)
+	if *calls != 1 {
+		t.Fatalf("quota fixture received %d requests, want 1", *calls)
+	}
 
 	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("expected status 502 Bad Gateway for malformed normalized groups, got %d", rec.Code)
@@ -1027,7 +1070,7 @@ func TestFetchCredentialQuota_MalformedNormalizedGroupsReturnsError(t *testing.T
 }
 
 func TestFetchCredentialQuota_NonNumericFractionReturnsError(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	transport, calls := quotaProbeFixture(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		// Non-numeric string value for fraction
 		_, _ = w.Write([]byte(`{
@@ -1036,8 +1079,7 @@ func TestFetchCredentialQuota_NonNumericFractionReturnsError(t *testing.T) {
 				"total": "unlimited"
 			}
 		}`))
-	}))
-	defer upstream.Close()
+	})
 
 	manager := coreauth.NewManager(nil, nil, nil)
 	auth := &coreauth.Auth{
@@ -1046,7 +1088,7 @@ func TestFetchCredentialQuota_NonNumericFractionReturnsError(t *testing.T) {
 		Provider: "probe-nonnumeric",
 		Metadata: map[string]any{
 			"quota_probe": map[string]any{
-				"url":    upstream.URL + "/usage",
+				"url":    quotaProbeFixtureOrigin + "/usage",
 				"method": "GET",
 				"mapping": map[string]any{
 					"groups": []any{
@@ -1073,7 +1115,10 @@ func TestFetchCredentialQuota_NonNumericFractionReturnsError(t *testing.T) {
 	ctx, _ := gin.CreateTestContext(rec)
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v0/management/quota/fetch", strings.NewReader(`{"auth_index":"`+authIndex+`"}`))
 	ctx.Request.Header.Set("Content-Type", "application/json")
-	h.FetchCredentialQuota(ctx)
+	h.fetchCredentialQuotaWithTransport(ctx, transport)
+	if *calls != 1 {
+		t.Fatalf("quota fixture received %d requests, want 1", *calls)
+	}
 
 	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("expected status 502 Bad Gateway for non-numeric fraction string, got %d", rec.Code)
@@ -1081,12 +1126,11 @@ func TestFetchCredentialQuota_NonNumericFractionReturnsError(t *testing.T) {
 }
 
 func TestFetchCredentialQuota_EmptyBucketsNormalizedReturnsError(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	transport, calls := quotaProbeFixture(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		// Malformed normalized shape with group containing an empty bucket object
 		_, _ = w.Write([]byte(`{"groups":[{"buckets":[{}]}]}`))
-	}))
-	defer upstream.Close()
+	})
 
 	manager := coreauth.NewManager(nil, nil, nil)
 	auth := &coreauth.Auth{
@@ -1095,7 +1139,7 @@ func TestFetchCredentialQuota_EmptyBucketsNormalizedReturnsError(t *testing.T) {
 		Provider: "probe-empty-bucket",
 		Metadata: map[string]any{
 			"quota_probe": map[string]any{
-				"url":    upstream.URL + "/empty-bucket",
+				"url":    quotaProbeFixtureOrigin + "/empty-bucket",
 				"method": "GET",
 			},
 		},
@@ -1110,7 +1154,10 @@ func TestFetchCredentialQuota_EmptyBucketsNormalizedReturnsError(t *testing.T) {
 	ctx, _ := gin.CreateTestContext(rec)
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v0/management/quota/fetch", strings.NewReader(`{"auth_index":"`+authIndex+`"}`))
 	ctx.Request.Header.Set("Content-Type", "application/json")
-	h.FetchCredentialQuota(ctx)
+	h.fetchCredentialQuotaWithTransport(ctx, transport)
+	if *calls != 1 {
+		t.Fatalf("quota fixture received %d requests, want 1", *calls)
+	}
 
 	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("expected status 502 Bad Gateway for empty bucket normalized groups, got %d", rec.Code)
@@ -1118,12 +1165,11 @@ func TestFetchCredentialQuota_EmptyBucketsNormalizedReturnsError(t *testing.T) {
 }
 
 func TestFetchCredentialQuota_LegitimateZeroQuotaAccepted(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	transport, calls := quotaProbeFixture(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		// Legitimate exhausted quota with remainingFraction: 0
 		_, _ = w.Write([]byte(`{"groups":[{"displayName":"Daily","buckets":[{"window":"daily","remainingFraction":0}]}]}`))
-	}))
-	defer upstream.Close()
+	})
 
 	manager := coreauth.NewManager(nil, nil, nil)
 	auth := &coreauth.Auth{
@@ -1132,7 +1178,7 @@ func TestFetchCredentialQuota_LegitimateZeroQuotaAccepted(t *testing.T) {
 		Provider: "probe-zero",
 		Metadata: map[string]any{
 			"quota_probe": map[string]any{
-				"url":    upstream.URL + "/zero-quota",
+				"url":    quotaProbeFixtureOrigin + "/zero-quota",
 				"method": "GET",
 			},
 		},
@@ -1147,7 +1193,10 @@ func TestFetchCredentialQuota_LegitimateZeroQuotaAccepted(t *testing.T) {
 	ctx, _ := gin.CreateTestContext(rec)
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v0/management/quota/fetch", strings.NewReader(`{"auth_index":"`+authIndex+`"}`))
 	ctx.Request.Header.Set("Content-Type", "application/json")
-	h.FetchCredentialQuota(ctx)
+	h.fetchCredentialQuotaWithTransport(ctx, transport)
+	if *calls != 1 {
+		t.Fatalf("quota fixture received %d requests, want 1", *calls)
+	}
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected status 200 for legitimate zero remaining fraction, got %d: %s", rec.Code, rec.Body.String())
@@ -1162,12 +1211,11 @@ func TestFetchCredentialQuota_LegitimateZeroQuotaAccepted(t *testing.T) {
 }
 
 func TestFetchCredentialQuota_WindowOnlyBucketReturnsError(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	transport, calls := quotaProbeFixture(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		// Bucket has window label but completely lacks remaining fraction or amount
 		_, _ = w.Write([]byte(`{"groups":[{"displayName":"Weekly","buckets":[{"window":"weekly"}]}]}`))
-	}))
-	defer upstream.Close()
+	})
 
 	manager := coreauth.NewManager(nil, nil, nil)
 	auth := &coreauth.Auth{
@@ -1176,7 +1224,7 @@ func TestFetchCredentialQuota_WindowOnlyBucketReturnsError(t *testing.T) {
 		Provider: "probe-window",
 		Metadata: map[string]any{
 			"quota_probe": map[string]any{
-				"url":    upstream.URL + "/window-only",
+				"url":    quotaProbeFixtureOrigin + "/window-only",
 				"method": "GET",
 			},
 		},
@@ -1191,7 +1239,10 @@ func TestFetchCredentialQuota_WindowOnlyBucketReturnsError(t *testing.T) {
 	ctx, _ := gin.CreateTestContext(rec)
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v0/management/quota/fetch", strings.NewReader(`{"auth_index":"`+authIndex+`"}`))
 	ctx.Request.Header.Set("Content-Type", "application/json")
-	h.FetchCredentialQuota(ctx)
+	h.fetchCredentialQuotaWithTransport(ctx, transport)
+	if *calls != 1 {
+		t.Fatalf("quota fixture received %d requests, want 1", *calls)
+	}
 
 	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("expected status 502 Bad Gateway for bucket without remaining fraction, got %d", rec.Code)
@@ -1199,15 +1250,14 @@ func TestFetchCredentialQuota_WindowOnlyBucketReturnsError(t *testing.T) {
 }
 
 func TestFetchCredentialQuota_MixedValidAndInvalidBuckets(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	transport, calls := quotaProbeFixture(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		// Mixed valid bucket and invalid bucket without remaining fraction
 		_, _ = w.Write([]byte(`{"groups":[{"displayName":"Limits","buckets":[
 			{"window":"daily","remainingFraction":0.8,"description":"valid"},
 			{"window":"weekly","description":"missing fraction"}
 		]}]}`))
-	}))
-	defer upstream.Close()
+	})
 
 	manager := coreauth.NewManager(nil, nil, nil)
 	auth := &coreauth.Auth{
@@ -1216,7 +1266,7 @@ func TestFetchCredentialQuota_MixedValidAndInvalidBuckets(t *testing.T) {
 		Provider: "probe-mixed",
 		Metadata: map[string]any{
 			"quota_probe": map[string]any{
-				"url":    upstream.URL + "/mixed",
+				"url":    quotaProbeFixtureOrigin + "/mixed",
 				"method": "GET",
 			},
 		},
@@ -1231,7 +1281,10 @@ func TestFetchCredentialQuota_MixedValidAndInvalidBuckets(t *testing.T) {
 	ctx, _ := gin.CreateTestContext(rec)
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v0/management/quota/fetch", strings.NewReader(`{"auth_index":"`+authIndex+`"}`))
 	ctx.Request.Header.Set("Content-Type", "application/json")
-	h.FetchCredentialQuota(ctx)
+	h.fetchCredentialQuotaWithTransport(ctx, transport)
+	if *calls != 1 {
+		t.Fatalf("quota fixture received %d requests, want 1", *calls)
+	}
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected status 200 for response with at least one valid bucket, got %d: %s", rec.Code, rec.Body.String())
@@ -1252,24 +1305,36 @@ func TestFetchCredentialQuota_MixedValidAndInvalidBuckets(t *testing.T) {
 	}
 }
 
+func TestExecuteQuotaProbeRejectsLocalDestinationBeforeTransport(t *testing.T) {
+	transport, calls := quotaProbeFixture(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, nil)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v0/management/quota/fetch", nil)
+	_, handled, err := h.executeQuotaProbeWithTransport(ctx, nil, map[string]any{
+		"url": "http://127.0.0.1/quota",
+	}, transport)
+	if !handled || err == nil || *calls != 0 {
+		t.Fatalf("local quota destination must be rejected before transport: handled=%v calls=%d err=%v", handled, *calls, err)
+	}
+}
+
 func TestFetchCredentialQuota_MissingTokenDoesNotHitUpstream(t *testing.T) {
-	var upstreamHit bool
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		upstreamHit = true
+	transport, calls := quotaProbeFixture(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"subscription":{"plan":"Fake"}}`))
-	}))
-	defer upstream.Close()
+	})
 
 	manager := coreauth.NewManager(nil, nil, nil)
 	// Auth with NO token/api_key
 	auth := &coreauth.Auth{
 		ID:       "probe-no-token-auth",
 		FileName: "probe-no-token.json",
-		Provider: "probe-no-token",
+		Provider: "openai",
 		Metadata: map[string]any{
 			"quota_probe": map[string]any{
-				"url":    upstream.URL + "/usage",
+				"url":    "https://api.openai.com/usage",
 				"method": "GET",
 				"header": map[string]any{
 					"Authorization": "Bearer $TOKEN$",
@@ -1287,13 +1352,16 @@ func TestFetchCredentialQuota_MissingTokenDoesNotHitUpstream(t *testing.T) {
 	ctx, _ := gin.CreateTestContext(rec)
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v0/management/quota/fetch", strings.NewReader(`{"auth_index":"`+authIndex+`"}`))
 	ctx.Request.Header.Set("Content-Type", "application/json")
-	h.FetchCredentialQuota(ctx)
+	h.fetchCredentialQuotaWithTransport(ctx, transport)
 
 	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("expected status 502 Bad Gateway when token is missing, got %d", rec.Code)
 	}
 	// Upstream must NEVER be contacted
-	if upstreamHit {
+	if !strings.Contains(rec.Body.String(), "stored access token is unavailable") {
+		t.Fatalf("expected missing token error, got %s", rec.Body.String())
+	}
+	if *calls != 0 {
 		t.Fatal("upstream server must NOT be contacted when template requires token but token is missing")
 	}
 }
