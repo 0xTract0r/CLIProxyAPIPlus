@@ -7,6 +7,38 @@ permissions:
   contents: read
 
 jobs:
+  ordinary-contracts:
+    name: Ordinary upstream-sync contracts
+    if: >-
+      ${{
+        contains(github.event.pull_request.labels.*.name, 'upstream-sync') ||
+        startsWith(github.head_ref, 'bot/upstream-sync') ||
+        startsWith(github.head_ref, 'codex/upstream-sync') ||
+        startsWith(github.head_ref, 'codex/sync-core') ||
+        startsWith(github.head_ref, 'codex/integrate-prod-')
+      }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Prepare test modules
+        env:
+          GOTOOLCHAIN: local
+          GOWORK: 'off'
+        run: go mod download
+      - name: Verify reviewed ordinary contracts on loopback
+        run: >-
+          bash .github/scripts/run-loopback-only.sh env GOTOOLCHAIN=local GOWORK=off GOPROXY=off
+          python3 .github/scripts/check-ordinary-pr-tests.py --run-selected
+
   build:
     runs-on: ubuntu-latest
     env:

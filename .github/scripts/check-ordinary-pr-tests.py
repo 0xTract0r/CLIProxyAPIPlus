@@ -1,6 +1,9 @@
 """Require execution and success of the named ordinary fork tests."""
 import json
+import re
+import subprocess
 import sys
+import tempfile
 from collections import defaultdict
 
 SDK = "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
@@ -21,7 +24,11 @@ REQUIRED = {
         "TestOrdinaryCredentialRoutesKeepForeignFilesOutsideMutation//v8/management/credentials",
         "TestOrdinaryAuthFileListScopeAndLifecycle",
         "TestIndependentOrdinaryCredentialFieldsPersistence",
+        "TestUsageImportWriteFailureLeavesCommittedHistory",
+        "TestUsageKnownKeyConfigurationCommit",
+        "TestServerCodexAPIKeyResponsesStreamingRequestLog",
     },
+    "github.com/router-for-me/CLIProxyAPI/v8/internal/usage": {"TestKnownUsageKeyTiesFromDisk"},
 }
 
 
@@ -47,9 +54,32 @@ def check(stream):
     return failures
 
 
+def run_selected():
+    with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as results:
+        for package, names in REQUIRED.items():
+            # Select top-level tests in their owning package. check() also
+            # requires every declared subtest to report run and pass.
+            parents = sorted(name for name in names if "/" not in name)
+            pattern = "^(" + "|".join(map(re.escape, parents)) + ")$"
+            run = subprocess.run(
+                ["go", "test", "-mod=readonly", "-race", "-count=1", "-timeout=120s",
+                 "-json", "-run", pattern, package],
+                stdout=results,
+            )
+            if run.returncode:
+                print(f"Go tests failed in {package}", file=sys.stderr)
+                results.seek(0)
+                return check(results) or [f"{package} exited {run.returncode}"]
+        results.seek(0)
+        return check(results)
+
+
 if __name__ == "__main__":
-    with open(sys.argv[1], encoding="utf-8") as results:
-        missing = check(results)
+    if sys.argv[1:] == ["--run-selected"]:
+        missing = run_selected()
+    else:
+        with open(sys.argv[1], encoding="utf-8") as results:
+            missing = check(results)
     if missing:
         print("\n".join(missing), file=sys.stderr)
         sys.exit(1)
