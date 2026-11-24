@@ -14,6 +14,7 @@ REQUIRED = {
         REFUSAL,
         "TestOrdinaryClaudeLongContextNeverRewritesRequestedModel",
         "TestOrdinaryClaudeAliasedOneMillionRequiresSubscription",
+        "TestManager_Issue6415_Original401DoesNotReplayAndBlocksRejectedGrant",
         *(f"{REFUSAL}/{method}/{status}"
           for method in ("execute", "count", "stream")
           for status in (400, 401, 403, 429, 503)),
@@ -32,9 +33,43 @@ REQUIRED = {
     "github.com/router-for-me/CLIProxyAPI/v8/internal/api/handlers/management": {
         "TestOrdinaryLegacyClaudeReauthUsesSelectedFileAndAdmin",
         "TestOrdinaryCodexV0SelectedReauth",
+        "TestClaudeOAuthV8CallbackPreservesURLSafeState",
+        "TestOrdinaryAccountSettingsPreservesOtherFields",
+        "TestGetUsageQueuePopsRequestedRecords",
+        "TestFetchCredentialQuota_DeclarativeProbeSummaryOnly",
+    },
+    "github.com/router-for-me/CLIProxyAPI/v8/internal/translator/antigravity/gemini": {
+        "TestOrdinaryGeminiAntigravityKeepsExplicitWireAndParallelOrder",
+    },
+    "github.com/router-for-me/CLIProxyAPI/v8/internal/translator/gemini/claude": {
+        "TestOrdinaryGeminiClaudeKeepsUnsignedThinkingAndTool",
+    },
+    "github.com/router-for-me/CLIProxyAPI/v8/internal/translator/gemini/openai/responses": {
+        "TestOrdinaryGeminiResponsesKeepsUnsignedCallAndResult",
+    },
+    "github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers": {
+        "TestExecuteStreamWithAuthManager_EmptyClosedStream",
+    },
+    "github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers/openai": {
+        "TestResponsesSSEBeforeFirstFramePreservesHTTPRefusal",
+        "TestResponsesHandlerSendKeepAliveBeforeFT",
+    },
+    "github.com/router-for-me/CLIProxyAPI/v8/internal/client/musecode": {
+        "TestRelayTransportDropsAndClientCancelDoNotCooldownCredential",
+    },
+    "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy": {
+        "TestOrdinaryRetiredFallbackNotInPublicCatalog",
+        "TestOrdinaryExternallyImplementedLegacyProviderKeepsExecutableCatalog",
     },
     "github.com/router-for-me/CLIProxyAPI/v8/internal/usage": {"TestKnownUsageKeyTiesFromDisk"},
 }
+
+# This watcher uses Linux filesystem notification semantics.
+if sys.platform.startswith("linux"):
+    watcher = "TestRollupActualWatcherRepeatedSaves"
+    REQUIRED["github.com/router-for-me/CLIProxyAPI/v8/internal/watcher"] = {
+        watcher, f"{watcher}/directory-default", f"{watcher}/directory-external-replace",
+    }
 
 
 def check(stream):
