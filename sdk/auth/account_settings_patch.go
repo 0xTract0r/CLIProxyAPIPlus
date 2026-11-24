@@ -451,13 +451,22 @@ func (s *FileTokenStore) saveAccountSettingsPatch(path string, auth *coreauth.Au
 			if len(object) == 0 || bytes.Equal(object, []byte("null")) {
 				object = []byte("{}")
 			}
-			if enabled && !auth.AutoQuarantined && !coreauth.IsReauthRequiredMetadata(auth.Metadata) {
-				for _, key := range []string{"refresh_disabled", "disable_refresh", "auto_refresh_disabled", "refresh_enabled"} {
+			settingsPatch := make(map[string]json.RawMessage)
+			if enabled {
+				prior, err := coreauth.DecodeCredentialMetadata(old)
+				if err != nil {
+					return err
+				}
+				if auth.RefreshPreferenceLocked() || (&coreauth.Auth{Metadata: prior}).RefreshPreferenceLocked() {
+					return coreauth.ErrRefreshPreferenceLocked
+				}
+				for _, key := range coreauth.LegacyRefreshPreferenceKeys() {
 					fields[key] = nil
+					settingsPatch[key] = nil
 				}
 			}
-			value := json.RawMessage(strconv.FormatBool(enabled))
-			fields["account_settings"], err = patchCredentialFileJSON(object, map[string]json.RawMessage{"refresh_enabled": value})
+			settingsPatch["refresh_enabled"] = json.RawMessage(strconv.FormatBool(enabled))
+			fields["account_settings"], err = patchCredentialFileJSON(object, settingsPatch)
 			if err != nil {
 				return err
 			}

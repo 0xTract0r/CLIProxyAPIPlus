@@ -81,6 +81,105 @@ func TestOrdinaryAccountSettingsPreservesOtherFields(t *testing.T) {
 	}
 }
 
+func TestOrdinaryAccountSettingsReenableLegacyRefreshPreference(t *testing.T) {
+	const rootAliases = `"refresh_disabled":true,"disable_refresh":"true","auto_refresh_disabled":1,"refresh_enabled":false,"auto_refresh":"false","auto_refresh_enabled":false`
+	const nestedAliases = `"refresh_disabled":true,"disable_refresh":true,"auto_refresh_disabled":true,"refresh_enabled":false,"auto_refresh":false,"auto_refresh_enabled":false`
+	for _, tt := range []struct {
+		name, extra   string
+		runtimeSignIn bool
+		wantStatus    coreauth.Status
+		wantBlocked   bool
+	}{
+		{name: "legacy preferences", wantStatus: coreauth.StatusActive},
+		{name: "operator disabled", extra: `,"disabled":true`, wantStatus: coreauth.StatusDisabled},
+		{name: "reauth required", extra: `,"reauth_required":true`, wantStatus: coreauth.StatusError, wantBlocked: true},
+		{name: "legacy reauth required", extra: `,"refresh_disabled_reason":"  Reauth_Required "`, wantStatus: coreauth.StatusError, wantBlocked: true},
+		{name: "automatic quarantine", extra: `,"auto_quarantined":true,"quarantine_reason":"terminal_auth_failure"`, wantStatus: coreauth.StatusQuarantined, wantBlocked: true},
+		{name: "runtime sign-in required", runtimeSignIn: true, wantStatus: coreauth.StatusActive, wantBlocked: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			const name = "ordinary-local.json"
+			const unrelated = `"legacy": {"count":9007199254740993,"disable_refresh":true}`
+			dir := t.TempDir()
+			path := filepath.Join(dir, name)
+			initial := `{"type":"codex","email":"fixture@example.invalid",` + rootAliases +
+				`,"account_settings":{` + nestedAliases + `,` + unrelated + `}` + tt.extra + `}`
+			if err := os.WriteFile(path, []byte(initial), 0600); err != nil {
+				t.Fatal(err)
+			}
+			store := sdkauth.NewFileTokenStore()
+			store.SetBaseDir(dir)
+			manager := coreauth.NewManager(store, nil, nil)
+			ctx := context.Background()
+			initialRecords, err := store.List(ctx)
+			if err != nil || len(initialRecords) != 1 {
+				t.Fatalf("load fixture: count=%d err=%v", len(initialRecords), err)
+			}
+			auth := initialRecords[0]
+			auth.RequiresSignIn = tt.runtimeSignIn
+			auth.Attributes["auto_refresh"] = "false"
+			auth.Attributes["auto_refresh_enabled"] = "false"
+			if _, err := manager.Register(coreauth.WithSkipPersist(ctx), auth); err != nil {
+				t.Fatal(err)
+			}
+			h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: dir}, manager)
+			h.tokenStore = store
+			router := gin.New()
+			const endpoint = "/auth-files/account-settings"
+			router.GET(endpoint, h.GetOrdinaryAuthFileAccountSettings)
+			router.PATCH(endpoint, h.PatchOrdinaryAuthFileAccountSettings)
+
+			get := httptest.NewRecorder()
+			router.ServeHTTP(get, httptest.NewRequest(http.MethodGet, endpoint+"?name="+name, nil))
+			etag := get.Header().Get("ETag")
+			if get.Code != http.StatusOK || etag == "" {
+				t.Fatalf("settings GET %d: %s", get.Code, get.Body.String())
+			}
+			request := httptest.NewRequest(http.MethodPatch, endpoint, strings.NewReader(`{"name":"`+name+`","refresh_enabled":true}`))
+			request.Header.Set("If-Match", etag)
+			result := httptest.NewRecorder()
+			router.ServeHTTP(result, request)
+			wantResponse := http.StatusOK
+			if tt.wantBlocked {
+				wantResponse = http.StatusConflict
+			}
+			if result.Code != wantResponse {
+				t.Errorf("settings PATCH %d, want %d: %s", result.Code, wantResponse, result.Body.String())
+			}
+
+			live, ok := manager.GetByID(name)
+			if !ok || live.RefreshDisabled() != tt.wantBlocked || live.RequiresSignIn != tt.runtimeSignIn {
+				t.Error("live refresh preference or sign-in lock differs from expected state")
+			}
+			cold := sdkauth.NewFileTokenStore()
+			cold.SetBaseDir(dir)
+			records, err := cold.List(ctx)
+			if err != nil || len(records) != 1 {
+				t.Fatalf("reload stored credential: count=%d err=%v", len(records), err)
+			}
+			saved := records[0]
+			if saved.RefreshDisabled() != tt.wantBlocked || saved.Status != tt.wantStatus ||
+				saved.Disabled != (tt.wantStatus == coreauth.StatusDisabled) ||
+				saved.AutoQuarantined != (tt.wantStatus == coreauth.StatusQuarantined) {
+				t.Fatalf("unexpected cold state: refresh disabled=%v status=%s disabled=%v quarantined=%v",
+					saved.RefreshDisabled(), saved.Status, saved.Disabled, saved.AutoQuarantined)
+			}
+			data, err := os.ReadFile(path)
+			if err != nil || !strings.Contains(string(data), unrelated) ||
+				(tt.wantBlocked && string(data) != initial) {
+				t.Fatalf("refresh preference edit changed unrelated or protected file contents: err=%v", err)
+			}
+			info, err := os.Stat(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if info.Mode().Perm() != 0600 {
+				t.Fatalf("file permissions changed to %v", info.Mode().Perm())
+			}
+		})
+	}
+}
+
 func TestOrdinaryReadOnlyQuotaSnapshotFieldsAndDirectoryIsolation(t *testing.T) {
 	makeHandler := func(name string, disabled bool, meta map[string]any) *Handler {
 		t.Helper()

@@ -112,20 +112,9 @@ func (h *Handler) PatchOrdinaryAuthFileAccountSettings(c *gin.Context) {
 			syncAuthFileNoteAttribute(current)
 		}
 		if req.refreshEnabled != nil {
-			existing, _ := current.Metadata["account_settings"].(map[string]any)
-			settings := make(map[string]any, len(existing)+1)
-			for key, value := range existing {
-				settings[key] = value
+			if err := current.SetAccountRefreshPreference(*req.refreshEnabled); err != nil {
+				return err
 			}
-			if *req.refreshEnabled && !current.AutoQuarantined && !coreauth.IsReauthRequiredMetadata(current.Metadata) {
-				// Previous editors wrote the operator flag both here and at the file root.
-				for _, key := range []string{"refresh_disabled", "disable_refresh", "auto_refresh_disabled", "refresh_enabled"} {
-					delete(current.Metadata, key)
-					delete(current.Attributes, key)
-				}
-			}
-			settings["refresh_enabled"] = *req.refreshEnabled
-			current.Metadata["account_settings"] = settings
 		}
 		if req.disabled != nil {
 			current.Metadata["disabled"] = *req.disabled
@@ -134,6 +123,10 @@ func (h *Handler) PatchOrdinaryAuthFileAccountSettings(c *gin.Context) {
 		return nil
 	})
 	if err != nil {
+		if errors.Is(err, coreauth.ErrRefreshPreferenceLocked) {
+			c.JSON(http.StatusConflict, gin.H{"error": coreauth.ErrRefreshPreferenceLocked.Error()})
+			return
+		}
 		if writeAuthFileStorageConflict(c, err) {
 			return
 		}

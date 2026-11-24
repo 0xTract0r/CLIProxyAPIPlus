@@ -5,7 +5,9 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"io"
+	"maps"
 	"net/http"
 	"net/url"
 	"os"
@@ -951,19 +953,74 @@ func (a *Auth) RefreshDisabled() bool {
 	if a == nil {
 		return false
 	}
-	if refreshDisabledFromMetadata(a.Metadata) {
-		return true
+	return refreshDisabledFromMetadata(a.Metadata) || refreshDisabledFromPreferences(a.Attributes)
+}
+
+var refreshPreferenceKeys = [...]struct {
+	name           string
+	disablingValue bool
+}{
+	{"refresh_disabled", true},
+	{"disable_refresh", true},
+	{"auto_refresh_disabled", true},
+	{"refresh_enabled", false},
+	{"auto_refresh", false},
+	{"auto_refresh_enabled", false},
+}
+
+// LegacyRefreshPreferenceKeys returns the preference fields read at the file
+// root and in account_settings. The nested refresh_enabled field is canonical.
+func LegacyRefreshPreferenceKeys() []string {
+	keys := make([]string, len(refreshPreferenceKeys))
+	for i, preference := range refreshPreferenceKeys {
+		keys[i] = preference.name
 	}
-	if len(a.Attributes) > 0 {
-		for _, key := range []string{"refresh_disabled", "disable_refresh", "auto_refresh_disabled"} {
-			if parsed, ok := parseBoolAny(a.Attributes[key]); ok && parsed {
-				return true
-			}
+	return keys
+}
+
+// RefreshPreferenceLocked reports whether a terminal credential state should
+// preserve the legacy preference fields during an ordinary settings edit.
+func (a *Auth) RefreshPreferenceLocked() bool {
+	storedQuarantine, _ := a.Metadata["auto_quarantined"].(bool)
+	return a.AutoQuarantined || storedQuarantine || a.RequiresSignIn || isReauthRequiredMetadata(a.Metadata)
+}
+
+// ErrRefreshPreferenceLocked means an explicit refresh enable would override
+// a credential that still requires sign-in or is automatically quarantined.
+var ErrRefreshPreferenceLocked = errors.New("automatic refresh is blocked by credential state")
+
+// SetAccountRefreshPreference records the user's preference for this credential.
+func (a *Auth) SetAccountRefreshPreference(enabled bool) error {
+	if enabled && a.RefreshPreferenceLocked() {
+		return ErrRefreshPreferenceLocked
+	}
+	if a.Metadata == nil {
+		a.Metadata = make(map[string]any)
+	}
+	existing, _ := metadataObject(a.Metadata["account_settings"])
+	settings := maps.Clone(existing)
+	if settings == nil {
+		settings = make(map[string]any, 1)
+	}
+	if enabled {
+		for _, key := range LegacyRefreshPreferenceKeys() {
+			delete(a.Metadata, key)
+			delete(a.Attributes, key)
+			delete(settings, key)
 		}
-		for _, key := range []string{"refresh_enabled", "auto_refresh", "auto_refresh_enabled"} {
-			if parsed, ok := parseBoolAny(a.Attributes[key]); ok && !parsed {
-				return true
-			}
+	}
+	settings["refresh_enabled"] = enabled
+	a.Metadata["account_settings"] = settings
+	return nil
+}
+
+func refreshDisabledFromPreferences[T any](values map[string]T) bool {
+	if len(values) == 0 {
+		return false
+	}
+	for _, preference := range refreshPreferenceKeys {
+		if parsed, ok := parseBoolAny(values[preference.name]); ok && parsed == preference.disablingValue {
+			return true
 		}
 	}
 	return false
@@ -1104,35 +1161,11 @@ func compactMetadataKey(key string) string {
 }
 
 func refreshDisabledFromMetadata(meta map[string]any) bool {
-	if len(meta) == 0 {
-		return false
-	}
-	if isReauthRequiredMetadata(meta) {
+	if isReauthRequiredMetadata(meta) || refreshDisabledFromPreferences(meta) {
 		return true
 	}
-	for _, key := range []string{"refresh_disabled", "disable_refresh", "auto_refresh_disabled"} {
-		if parsed, ok := parseBoolAny(meta[key]); ok && parsed {
-			return true
-		}
-	}
-	for _, key := range []string{"refresh_enabled", "auto_refresh", "auto_refresh_enabled"} {
-		if parsed, ok := parseBoolAny(meta[key]); ok && !parsed {
-			return true
-		}
-	}
-	if settings, ok := metadataObject(meta["account_settings"]); ok {
-		for _, key := range []string{"refresh_disabled", "disable_refresh", "auto_refresh_disabled"} {
-			if parsed, okParse := parseBoolAny(settings[key]); okParse && parsed {
-				return true
-			}
-		}
-		for _, key := range []string{"refresh_enabled", "auto_refresh", "auto_refresh_enabled"} {
-			if parsed, okParse := parseBoolAny(settings[key]); okParse && !parsed {
-				return true
-			}
-		}
-	}
-	return false
+	settings, ok := metadataObject(meta["account_settings"])
+	return ok && refreshDisabledFromPreferences(settings)
 }
 
 const refreshReauthRequiredMessage = "refresh token was already used; sign in again to reconnect this account"
