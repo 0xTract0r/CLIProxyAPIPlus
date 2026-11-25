@@ -25,8 +25,11 @@ func (h *Handler) GetInFlightRequests(c *gin.Context) {
 		return
 	}
 	resp := inFlightResponse{ByProvider: map[string]int64{}}
-	if h.authManager != nil {
-		snapshot := h.authManager.InFlightSnapshot()
+	h.mu.Lock()
+	manager := h.authManager
+	h.mu.Unlock()
+	if manager != nil {
+		snapshot := manager.InFlightSnapshot()
 		resp.InFlight = snapshot.InFlight
 		if !snapshot.OldestStartedAt.IsZero() {
 			oldest := snapshot.OldestStartedAt.UTC()

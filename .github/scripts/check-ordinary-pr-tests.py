@@ -109,6 +109,7 @@ REQUIRED = {
         *(f"TestVertexImportNumericRoundTripAndInvalidJSON/{version}/{result}"
           for version in ("v0", "v8") for result in ("valid", "trailing", "invalid")),
         "TestNamedRefreshNoLockCycle",
+        "TestGetInFlightRequestsDuringManagerReplacement",
         "TestNamedRefreshUploadStoreOrder",
         "TestUploadConfirmedBusyScopeKeepsPending",
         "TestUploadUnlockedChecksWaitSameGeneration",
