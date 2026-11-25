@@ -1,11 +1,17 @@
 package auth
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/claude"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
 // reauthRequiredMetadata mirrors exactly what markRefreshReauthRequiredWithReason
@@ -183,5 +189,80 @@ func TestFileTokenStore_Save_TransientStateDoesNotPersistAsReauth(t *testing.T) 
 	}
 	if got.Status == cliproxyauth.StatusError && got.Unavailable {
 		t.Fatalf("transient-cooldown-only auth restored as StatusError+Unavailable; only the terminal reauth lock should do that")
+	}
+}
+
+func TestSelectedClaudeFileOwnerWhitespace(t *testing.T) {
+	for _, fixture := range []struct {
+		name, old, account, organization string
+		rejectedAccounts                 []string
+	}{
+		{
+			name:         "padded UUIDs",
+			old:          `{"type":"claude","account_uuid":"  ab12cdef-1234-4abc-8def-abcdefabcdef  ","organization_uuid":"  ed34abcd-1234-4def-8abc-abcdefabcdef\t","access_token":"old","note":"keep"}`,
+			account:      " AB12CDEF-1234-4ABC-8DEF-ABCDEFABCDEF ",
+			organization: "ED34ABCD-1234-4DEF-8ABC-ABCDEFABCDEF",
+		},
+		{
+			name:             "opaque account and blank organization",
+			old:              `{"type":"claude","account_uuid":" Opaque-Owner\t","organization_uuid":" \t ","access_token":"old","note":"keep"}`,
+			account:          "Opaque-Owner",
+			organization:     "new-org",
+			rejectedAccounts: []string{" opaque-owner ", "   "},
+		},
+	} {
+		t.Run(fixture.name, func(t *testing.T) {
+			dir := t.TempDir()
+			name := "fixture.json"
+			path := filepath.Join(dir, name)
+			if err := os.WriteFile(path, []byte(fixture.old), 0600); err != nil {
+				t.Fatal(err)
+			}
+			store := NewFileTokenStore()
+			store.SetBaseDir(dir)
+			file, err := ReadAccountSettingsFile(dir, path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx := WithSelectedClaudeLoginFile(context.Background(), file, func() (func(), bool) {
+				return func() {}, true
+			})
+			save := func(account string) error {
+				_, err := store.Save(ctx, &cliproxyauth.Auth{
+					ID: name, FileName: name, Provider: "claude",
+					Storage: &claude.ClaudeTokenStorage{
+						AccountUUID: account, OrganizationUUID: fixture.organization,
+						AccessToken: "updated-access", RefreshToken: "updated-refresh",
+					},
+				})
+				return err
+			}
+			for _, account := range fixture.rejectedAccounts {
+				if err := save(account); !errors.Is(err, cliproxyauth.ErrFileRemovalBusy) {
+					t.Fatalf("unexpected result for an unmatched account: %v", err)
+				}
+				raw, err := os.ReadFile(path)
+				if err != nil || !bytes.Equal(raw, []byte(fixture.old)) {
+					t.Fatalf("rejected update changed the file: %v", err)
+				}
+			}
+			if !file.MatchesClaudeLoginOwner("", fixture.account, fixture.organization) {
+				t.Fatal("preflight rejected the equivalent saved account")
+			}
+			if err := save(fixture.account); err != nil {
+				t.Fatalf("CAS rejected the equivalent saved account: %v", err)
+			}
+			raw, err := os.ReadFile(path)
+			var persisted struct {
+				Access string `json:"access_token"`
+				Note   string `json:"note"`
+			}
+			if err != nil || json.Unmarshal(raw, &persisted) != nil || persisted.Access != "updated-access" || persisted.Note != "keep" {
+				t.Fatal("CAS did not write the new grant while preserving the note")
+			}
+		})
+	}
+	if matchesClaudeLoginOwner([]byte(`{"type":"claude","account_uuid":" "}`), "", " ", "") {
+		t.Fatal("a blank saved account cannot establish ownership")
 	}
 }

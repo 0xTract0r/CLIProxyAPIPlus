@@ -4,21 +4,22 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
 )
 
 func newProxyProbeHandler(t *testing.T) *Handler {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
-	manager := coreauth.NewManager(&memoryAuthStore{}, nil, nil)
+	manager := coreauth.NewManager(nil, nil, nil)
 	return NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
 }
 
@@ -189,5 +190,39 @@ func TestRunProxyConnectivityProbeRedactsCredentials(t *testing.T) {
 	}
 	if !strings.Contains(logged, "redacted") {
 		t.Fatalf("expected redacted proxy marker in logs, got: %s", logged)
+	}
+}
+
+type ordinaryProxyCheckTransport func(*http.Request) (*http.Response, error)
+
+func (f ordinaryProxyCheckTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestProxyConnectivityProbeBoundsDestinationsAndResponse(t *testing.T) {
+	for _, tc := range []struct {
+		reply string
+		valid bool
+	}{{"2001:db8::1", true}, {"not an address", false}} {
+		t.Run(tc.reply, func(t *testing.T) {
+			old := probeProxyExitIP
+			defer func() { probeProxyExitIP = old }()
+			var sends int
+			probeProxyExitIP = func(ctx context.Context, c *http.Client, raw string) proxyConnectivityProbeResult {
+				if c.CheckRedirect == nil || c.CheckRedirect(nil, nil) != http.ErrUseLastResponse {
+					t.Fatal("redirect escaped the fixed destination list")
+				}
+				c.Transport = ordinaryProxyCheckTransport(func(req *http.Request) (*http.Response, error) {
+					if sends >= len(proxyConnectivityProbeTargets) || req.URL.String() != proxyConnectivityProbeTargets[sends] || req.Header.Get("Authorization") != "" || req.Header.Get("Proxy-Authorization") != "" {
+						t.Fatal("unexpected target or account header")
+					}
+					sends++
+					return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(tc.reply)), Header: make(http.Header)}, nil
+				})
+				return dialProxyExitIP(ctx, c, raw)
+			}
+			got := probeProxyConnectivity(context.Background(), "http://proxy.invalid:8080")
+			if got.OK != tc.valid || tc.valid && (got.ExitIP != tc.reply || sends != 1) || !tc.valid && (got.ExitIP != "" || sends != len(proxyConnectivityProbeTargets)) {
+				t.Fatalf("result %#v (%d attempts)", got, sends)
+			}
+		})
 	}
 }

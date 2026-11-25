@@ -4,8 +4,8 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 )
 
 const claudeContext1MMetadataKey = "claude_context_1m"
@@ -74,7 +74,7 @@ func (m *Manager) authAllowsClaudeContextRequest(auth *Auth, model string, opts 
 	model = rewriteModelForAuth(model, auth)
 	if upstream := strings.TrimSpace(auth.Attributes[homeUpstreamModelAttributeKey]); upstream != "" {
 		model = upstream
-	} else if alias := resolveUpstreamModelFromAliases(OAuthModelAliasesFromAttributes(auth.Attributes), model); alias.UpstreamModel != "" {
+	} else if alias, ok := resolveUpstreamModelFromAliases(OAuthModelAliasesFromAttributes(auth.Attributes), model); ok && alias.UpstreamModel != "" {
 		model = alias.UpstreamModel
 	} else if table, ok := m.oauthModelAlias.Load().(*oauthModelAliasTable); ok && table != nil {
 		if alias, exists := table.reverse["claude"][strings.ToLower(canonicalModelKey(model))]; exists {
@@ -105,4 +105,14 @@ func (m *Manager) excludeClaudeContextAuths(model string, opts cliproxyexecutor.
 		out[id] = struct{}{}
 	}
 	return out
+}
+
+func authAllowsClaudeRouteModel(auth *Auth, model string) bool {
+	if registry.IsClaudeOpus1MAlias(canonicalModelKey(model)) {
+		return registry.ClaudePlanAllowsOpusLongContext(authClaudeSubscriptionPlanType(auth), auth.ClaudeUsageCreditsEnabled())
+	}
+	if !registry.IsClaudeOpusModelID(canonicalModelKey(model)) {
+		return true
+	}
+	return authAllowsClaudeOpusModel(auth)
 }

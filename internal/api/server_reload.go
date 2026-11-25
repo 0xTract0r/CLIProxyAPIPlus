@@ -6,22 +6,32 @@ import (
 	"reflect"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/access"
-	managementHandlers "github.com/router-for-me/CLIProxyAPI/v7/internal/api/handlers/management"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/cache"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/managementasset"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
-	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/access"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/cache"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/githubauth"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/managementasset"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/redisqueue"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor"
+	responsesclaude "github.com/router-for-me/CLIProxyAPI/v8/internal/translator/claude/openai/responses"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/usage"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers/openai"
+	sdkAuth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
 	"gopkg.in/yaml.v3"
 )
 
 func (s *Server) applyAccessConfig(oldCfg, newCfg *config.Config) bool {
-	if s == nil || s.accessManager == nil || newCfg == nil {
+	if s == nil || newCfg == nil {
+		return false
+	}
+	if s.tunnelHub != nil {
+		s.tunnelHub.UpdateAllowedAPIKeys(newCfg.APIKeys)
+	}
+	if s.accessManager == nil {
 		return false
 	}
 	if _, err := access.ApplyAccessProviders(s.accessManager, oldCfg, newCfg); err != nil {
@@ -52,10 +62,14 @@ func (s *Server) UpdateClientsContext(ctx context.Context, cfg *config.Config) b
 	if errContext := ctx.Err(); errContext != nil {
 		return false
 	}
+	cfg = cfg.CloneForRuntime()
 	// Reconstruct old config from YAML snapshot to avoid reference sharing issues
 	var oldCfg *config.Config
-	if len(s.oldConfigYaml) > 0 {
-		_ = yaml.Unmarshal(s.oldConfigYaml, &oldCfg)
+	s.cfgMu.RLock()
+	oldConfigYaml := append([]byte(nil), s.oldConfigYaml...)
+	s.cfgMu.RUnlock()
+	if len(oldConfigYaml) > 0 {
+		_ = yaml.Unmarshal(oldConfigYaml, &oldCfg)
 	}
 
 	// Update request logger enabled state if it has changed
@@ -71,18 +85,14 @@ func (s *Server) UpdateClientsContext(ctx context.Context, cfg *config.Config) b
 		}
 	}
 
-	// fork-only: reconfigure the Feishu error-log alert hook when its config changes.
-	if oldCfg == nil || !reflect.DeepEqual(oldCfg.ErrorLogAlert, cfg.ErrorLogAlert) {
-		logging.ConfigureErrorLogAlert(cfg.ErrorLogAlert)
-	}
-
 	if oldCfg == nil || oldCfg.Home.Enabled != cfg.Home.Enabled {
 		if setter, ok := s.requestLogger.(interface{ SetHomeEnabled(bool) }); ok {
 			setter.SetHomeEnabled(cfg.Home.Enabled)
 		}
 	}
 
-	if oldCfg == nil || oldCfg.LoggingToFile != cfg.LoggingToFile || oldCfg.LogsMaxTotalSizeMB != cfg.LogsMaxTotalSizeMB {
+	if oldCfg == nil || oldCfg.LoggingToFile != cfg.LoggingToFile || oldCfg.LogsMaxTotalSizeMB != cfg.LogsMaxTotalSizeMB ||
+		oldCfg.LogsCompressAfterDays != cfg.LogsCompressAfterDays || oldCfg.LogsDeleteAfterDays != cfg.LogsDeleteAfterDays {
 		if err := logging.ConfigureLogOutput(cfg); err != nil {
 			log.Errorf("failed to reconfigure log output: %v", err)
 		}
@@ -91,11 +101,7 @@ func (s *Server) UpdateClientsContext(ctx context.Context, cfg *config.Config) b
 		}
 	}
 
-	if oldCfg == nil || oldCfg.UsageStatisticsEnabled != cfg.UsageStatisticsEnabled {
-		redisqueue.SetUsageStatisticsEnabled(cfg.UsageStatisticsEnabled)
-	}
-
-	if oldCfg == nil || oldCfg.RedisUsageQueueRetentionSeconds != cfg.RedisUsageQueueRetentionSeconds {
+	if !s.isolatedUsage && (oldCfg == nil || oldCfg.RedisUsageQueueRetentionSeconds != cfg.RedisUsageQueueRetentionSeconds) {
 		redisqueue.SetRetentionSeconds(cfg.RedisUsageQueueRetentionSeconds)
 	}
 
@@ -117,6 +123,11 @@ func (s *Server) UpdateClientsContext(ctx context.Context, cfg *config.Config) b
 	}
 
 	applySignatureCacheConfig(oldCfg, cfg)
+	applyClaudeToolSearchConfig(cfg)
+
+	if oldCfg != nil && !reflect.DeepEqual(oldCfg.Antigravity.ConnectionPool, cfg.Antigravity.ConnectionPool) {
+		executor.ResetAntigravityTransports()
+	}
 
 	if s.handlers != nil && s.handlers.AuthManager != nil {
 		s.handlers.AuthManager.SetRetryConfig(cfg.RequestRetry, time.Duration(cfg.MaxRetryInterval)*time.Second, cfg.MaxRetryCredentials)
@@ -158,7 +169,9 @@ func (s *Server) UpdateClientsContext(ctx context.Context, cfg *config.Config) b
 			s.managementRoutesEnabled.Store(!newSecretEmpty)
 		}
 	}
-	redisqueue.SetEnabled(s.managementRoutesEnabled.Load() || (cfg != nil && cfg.Home.Enabled))
+	if !s.isolatedUsage {
+		redisqueue.SetEnabled(s.managementRoutesEnabled.Load() || cfg.Home.Enabled)
+	}
 
 	exampleAPIKeySafeModeRequired := s.exampleAPIKeySafeModeRequired(cfg)
 	if exampleAPIKeySafeModeRequired {
@@ -168,25 +181,58 @@ func (s *Server) UpdateClientsContext(ctx context.Context, cfg *config.Config) b
 	if accessConfigApplied || exampleAPIKeySafeModeRequired {
 		s.exampleAPIKeySafeModeActive.Store(exampleAPIKeySafeModeRequired)
 	}
+	if errContext := ctx.Err(); errContext != nil {
+		return false
+	}
+	s.cfgMu.Lock()
+	previousCfg := s.cfg
 	s.cfg = cfg
+	if !s.isolatedUsage {
+		usage.SetStatisticsEnabled(cfg.UsageStatisticsEnabled)
+		redisqueue.SetUsageStatisticsEnabled(cfg.UsageStatisticsEnabled)
+	}
+	var errAmp error
+	if previousCfg == nil || previousCfg.AmpCode.UpstreamURL != cfg.AmpCode.UpstreamURL ||
+		previousCfg.AmpCode.UpstreamAPIKey != cfg.AmpCode.UpstreamAPIKey ||
+		previousCfg.AmpCode.RequireUpstreamAPIKeyBinding != cfg.AmpCode.RequireUpstreamAPIKeyBinding ||
+		!reflect.DeepEqual(previousCfg.AmpCode.UpstreamAPIKeys, cfg.AmpCode.UpstreamAPIKeys) ||
+		!reflect.DeepEqual(previousCfg.APIKeys, cfg.APIKeys) ||
+		previousCfg.AmpCode.RestrictManagementToLocalhost != cfg.AmpCode.RestrictManagementToLocalhost {
+		errAmp = s.reloadAmpForwarding(cfg.AmpCode, cfg.APIKeys)
+	}
+	s.cfgMu.Unlock()
+	if errAmp != nil {
+		log.Warn("Amp upstream configuration rejected, keeping the previous forwarding target")
+	}
+	if oldCfg == nil || oldCfg.ErrorLogAlert != cfg.ErrorLogAlert {
+		logging.ConfigureErrorLogAlert(cfg.ErrorLogAlert)
+	}
 	if s.codexLiveHandler != nil {
 		if errUpdate := s.codexLiveHandler.UpdateConfig(cfg); errUpdate != nil {
 			log.WithError(errUpdate).Error("failed to update Codex Live media relay configuration")
 		}
 	}
+	if s.museCodeHandler != nil {
+		s.museCodeHandler.UpdateConfig(cfg)
+	}
 	s.wsAuthEnabled.Store(cfg.WebsocketAuth)
+	openai.SetResponsesWebsocketCompressionEnabled(cfg.Codex.WebsocketCompressionEnabled())
 	if oldCfg != nil && s.wsAuthChanged != nil && oldCfg.WebsocketAuth != cfg.WebsocketAuth {
 		s.wsAuthChanged(oldCfg.WebsocketAuth, cfg.WebsocketAuth)
 	}
+	githubauth.SetToken(cfg.GitHubToken)
 	managementasset.SetCurrentConfig(cfg)
 	if errContext := ctx.Err(); errContext != nil {
 		return false
 	}
 	// Save YAML snapshot for next comparison
-	s.oldConfigYaml, _ = yaml.Marshal(cfg)
+	marshaledCfg, _ := yaml.Marshal(cfg)
+	s.cfgMu.Lock()
+	s.oldConfigYaml = marshaledCfg
+	s.cfgMu.Unlock()
 
 	s.handlers.UpdateClients(effectiveSDKConfig(cfg))
-	s.handlers.SetPluginHost(s.pluginHost)
+	s.handlers.SetPluginHost(s.interceptorHost)
 	if s.pluginHost != nil {
 		s.pluginHost.SetModelExecutor(s.handlers)
 		s.pluginHost.SetAuthManager(s.handlers.AuthManager)
@@ -196,24 +242,8 @@ func (s *Server) UpdateClientsContext(ctx context.Context, cfg *config.Config) b
 		s.mgmt.SetConfig(cfg)
 		s.mgmt.SetAuthManager(s.handlers.AuthManager)
 		s.mgmt.SetPluginHost(s.pluginHost)
-		// fork-only: keep the quota snapshot auto-refresh loop aligned with the latest policy.
-		s.mgmt.StartQuotaSnapshotAutoRefresh(context.Background(), managementHandlers.QuotaSnapshotRefreshPolicyFromConfig(cfg))
-		// fork-only: re-evaluate the farm liveness probe arm state on reload.
-		s.mgmt.StartFarmLivenessProbe(context.Background(), managementHandlers.QuotaSnapshotRefreshPolicyFromConfig(cfg))
 	}
 	s.refreshPluginManagementRoutes()
-
-	// fork-only: notify the Amp routing module only when Amp config has changed.
-	if oldCfg == nil || !reflect.DeepEqual(oldCfg.AmpCode, cfg.AmpCode) {
-		if s.ampModule != nil {
-			log.Debugf("triggering amp module config update")
-			if err := s.ampModule.OnConfigUpdated(cfg); err != nil {
-				log.Errorf("failed to update Amp module config: %v", err)
-			}
-		} else {
-			log.Warnf("amp module is nil, skipping config update")
-		}
-	}
 
 	// Count client sources from configuration and auth store.
 	authEntries := 0
@@ -232,6 +262,7 @@ func (s *Server) UpdateClientsContext(ctx context.Context, cfg *config.Config) b
 	claudeAPIKeyCount := len(cfg.ClaudeKey)
 	codexAPIKeyCount := len(cfg.CodexKey)
 	xaiAPIKeyCount := len(cfg.XAIKey)
+	metaAPIKeyCount := len(cfg.MetaKey)
 	vertexAICompatCount := len(cfg.VertexCompatAPIKey)
 	openAICompatCount := 0
 	for i := range cfg.OpenAICompatibility {
@@ -242,8 +273,8 @@ func (s *Server) UpdateClientsContext(ctx context.Context, cfg *config.Config) b
 		openAICompatCount += len(entry.APIKeyEntries)
 	}
 
-	total := authEntries + geminiAPIKeyCount + interactionsAPIKeyCount + claudeAPIKeyCount + codexAPIKeyCount + xaiAPIKeyCount + vertexAICompatCount + openAICompatCount
-	fmt.Printf("server clients and configuration updated: %d clients (%d auth entries + %d Gemini API keys + %d Interactions API keys + %d Claude API keys + %d Codex keys + %d xAI keys + %d Vertex-compat + %d OpenAI-compat)\n",
+	total := authEntries + geminiAPIKeyCount + interactionsAPIKeyCount + claudeAPIKeyCount + codexAPIKeyCount + xaiAPIKeyCount + metaAPIKeyCount + vertexAICompatCount + openAICompatCount
+	fmt.Printf("server clients and configuration updated: %d clients (%d auth entries + %d Gemini API keys + %d Interactions API keys + %d Claude API keys + %d Codex keys + %d xAI keys + %d Meta API keys + %d Vertex-compat + %d OpenAI-compat)\n",
 		total,
 		authEntries,
 		geminiAPIKeyCount,
@@ -251,6 +282,7 @@ func (s *Server) UpdateClientsContext(ctx context.Context, cfg *config.Config) b
 		claudeAPIKeyCount,
 		codexAPIKeyCount,
 		xaiAPIKeyCount,
+		metaAPIKeyCount,
 		vertexAICompatCount,
 		openAICompatCount,
 	)
@@ -262,6 +294,13 @@ func (s *Server) SetWebsocketAuthChangeHandler(fn func(bool, bool)) {
 		return
 	}
 	s.wsAuthChanged = fn
+}
+
+// applyClaudeToolSearchConfig publishes upstream.claude.tool-search to the
+// Claude Responses translator, which the Claude executor and the Codex model
+// catalog also read so all three agree on it.
+func applyClaudeToolSearchConfig(cfg *config.Config) {
+	responsesclaude.SetClientToolSearchEnabled(cfg != nil && cfg.Claude.ToolSearch)
 }
 
 func configuredSignatureCacheEnabled(cfg *config.Config) bool {

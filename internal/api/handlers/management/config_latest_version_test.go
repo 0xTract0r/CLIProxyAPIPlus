@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 )
 
 type latestReleaseRoundTripFunc func(*http.Request) (*http.Response, error)
@@ -25,6 +26,8 @@ func TestGetLatestVersionUsesCanonicalUpstream(t *testing.T) {
 
 	cases := []struct {
 		name         string
+		panelRepo    string
+		route        string
 		upstreamCode int
 		body         string
 		requestError error
@@ -33,6 +36,8 @@ func TestGetLatestVersionUsesCanonicalUpstream(t *testing.T) {
 		wantError    string
 	}{
 		{name: "tag", upstreamCode: http.StatusOK, body: `{"tag_name":" v8.0.47 ","name":"ignored"}`, wantCode: http.StatusOK, wantVersion: "v8.0.47"},
+		{name: "custom panel repository does not change core release lookup", panelRepo: "https://example.invalid/custom/panel", route: "/v8/management/server/latest-version", upstreamCode: http.StatusOK, body: `{"tag_name":"fixture-v1"}`, wantCode: http.StatusOK, wantVersion: "fixture-v1"},
+		{name: "default panel repository does not change core release lookup", panelRepo: config.DefaultPanelGitHubRepository, upstreamCode: http.StatusOK, body: `{"tag_name":"fixture-v2"}`, wantCode: http.StatusOK, wantVersion: "fixture-v2"},
 		{name: "name fallback", upstreamCode: http.StatusOK, body: `{"tag_name":" ","name":" v8.0.48 "}`, wantCode: http.StatusOK, wantVersion: "v8.0.48"},
 		{name: "missing version", upstreamCode: http.StatusOK, body: `{}`, wantCode: http.StatusBadGateway, wantError: "invalid_response"},
 		{name: "invalid JSON", upstreamCode: http.StatusOK, body: `{`, wantCode: http.StatusBadGateway, wantError: "decode_failed"},
@@ -50,6 +55,9 @@ func TestGetLatestVersionUsesCanonicalUpstream(t *testing.T) {
 				if req.Method != http.MethodGet || req.Header.Get("Accept") != "application/vnd.github+json" || req.Header.Get("User-Agent") == "" {
 					t.Fatalf("unexpected release request method/headers: %s %v", req.Method, req.Header)
 				}
+				if req.Header.Get("Authorization") != "" {
+					t.Fatal("unexpected authorization with empty environment")
+				}
 				if tc.requestError != nil {
 					return nil, tc.requestError
 				}
@@ -61,9 +69,15 @@ func TestGetLatestVersionUsesCanonicalUpstream(t *testing.T) {
 			})
 
 			recorder := httptest.NewRecorder()
-			ctx, _ := gin.CreateTestContext(recorder)
-			ctx.Request = httptest.NewRequest(http.MethodGet, "/v0/management/latest-version", nil)
-			(&Handler{}).GetLatestVersion(ctx)
+			cfg := &config.Config{}
+			cfg.RemoteManagement.PanelGitHubRepository = tc.panelRepo
+			route := tc.route
+			if route == "" {
+				route = "/v0/management/latest-version"
+			}
+			engine := gin.New()
+			engine.GET(route, (&Handler{cfg: cfg}).GetLatestVersion)
+			engine.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, route, nil))
 			if !called {
 				t.Fatal("release lookup did not use the configured HTTP transport")
 			}

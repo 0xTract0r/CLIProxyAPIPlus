@@ -3,251 +3,166 @@ package executor
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"io"
+	"mime"
 	"net/http"
-	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
-	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
-	log "github.com/sirupsen/logrus"
-	"github.com/tidwall/sjson"
+	"github.com/MoeForge/moego/ojson"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 )
 
-func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
-	ctx = contextWithClaudeInboundHeaders(ctx, opts.Headers)
-	if opts.Alt == "responses/compact" {
-		return resp, statusErr{code: http.StatusNotImplemented, msg: "/responses/compact not supported"}
+func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	ctx = pinOrdinaryClaudeToolSearch(ctx, opts.SourceFormat)
+	if err := expandClaudeResponsesCompaction(&req, &opts); err != nil {
+		return cliproxyexecutor.Response{}, statusErr{code: http.StatusBadRequest, msg: err.Error(), requestScoped: true}
 	}
+	if claudeResponsesCompactionRequested(req, opts) {
+		return e.executeClaudeCompaction(ctx, auth, req, opts)
+	}
+	return e.executeOrdinaryClaudeMessages(ctx, auth, req, opts)
+}
+
+func (e *ClaudeExecutor) executeOrdinaryClaudeMessages(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ cliproxyexecutor.Response, err error) {
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 	upstreamModel := e.upstreamModel(baseModel)
-
-	apiKey, baseURL := claudeCreds(auth)
-	if baseURL == "" {
-		baseURL = "https://api.anthropic.com"
+	claude := sdktranslator.FormatClaude
+	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
+	upstreamStream := opts.SourceFormat != "" && responseFormat != claude && !claudeCompactionSummaryFromContext(ctx)
+	body, err := e.prepareOrdinaryClaudeMessages(ctx, auth, req, opts, upstreamStream, true, baseModel, upstreamModel)
+	if err != nil {
+		return cliproxyexecutor.Response{}, err
 	}
-
+	if claudeCompactionSummaryFromContext(ctx) {
+		body = finalizeClaudeCompactionSummaryBody(body)
+	}
 	reporter := helps.NewExecutorUsageReporter(ctx, e, baseModel, auth)
-	defer helps.TrackClaudeAttemptFailure(ctx, reporter, &err)
-	from := opts.SourceFormat
-	to := sdktranslator.FromString("claude")
-	// Use streaming translation to preserve function calling, except for claude.
-	stream := from != to
-	originalPayloadSource := req.Payload
-	if len(opts.OriginalRequest) > 0 {
-		originalPayloadSource = opts.OriginalRequest
+	defer reporter.TrackFailure(ctx, &err)
+	if upstreamStream {
+		reporter.UseDecodedContentTelemetry()
 	}
-	originalPayload := originalPayloadSource
-	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, stream)
-	body := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, stream)
-	body, _ = sjson.SetBytes(body, "model", upstreamModel)
-
-	body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
+	if upstreamModel != baseModel {
+		reporter.SetUpstreamModel(upstreamModel)
+	}
+	resp, err := e.sendOrdinaryClaudeRequest(ctx, auth, "/v1/messages", body, upstreamStream, opts.Headers, reporter)
 	if err != nil {
-		return resp, err
+		return cliproxyexecutor.Response{}, err
 	}
-	if rebuildMidSystemMessageEnabled(e.cfg, auth) {
-		body = rebuildMidSystemMessagesToTopLevel(body)
+	helps.RecordAPIResponseMetadata(ctx, e.cfg, resp.StatusCode, resp.Header.Clone())
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return cliproxyexecutor.Response{}, ordinaryClaudeHTTPError(resp)
 	}
-
-	// Apply cloaking (system prompt injection, fake user ID, sensitive word obfuscation)
-	// based on client type and configuration. billingVersion (the account
-	// high-water version V, floored up in the device profile) is resolved once and
-	// reused below for the real-path body cc_version alignment so both the outbound
-	// UA and the body draw the same V (no re-resolve).
-	billingVersion := resolveClaudeBillingVersion(ctx, e.cfg, auth, apiKey)
-	body = applyCloaking(ctx, e.cfg, auth, body, baseModel, apiKey, billingVersion)
-	body = ensureModelMaxTokens(body, baseModel)
-
-	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
-	requestPath := helps.PayloadRequestPath(opts)
-	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
-	body = ensureModelMaxTokens(body, baseModel)
-
-	// Disable thinking if tool_choice forces tool use (Anthropic API constraint)
-	body = disableThinkingIfToolChoiceForced(body)
-	body = normalizeClaudeTemperatureForThinking(body)
-	// Claude OAuth (and this executor's redact-thinking beta) returns signature-only
-	// thinking blocks unless display is set to "summarized".
-	body = ensureClaudeThinkingDisplay(body)
-
-	// Auto-inject cache_control if missing (optimization for ClawdBot/clients without caching support)
-	if countCacheControls(body) == 0 {
-		body = ensureCacheControl(body)
-	}
-
-	// Enforce Anthropic's cache_control block limit (max 4 breakpoints per request).
-	// Cloaking and ensureCacheControl may push the total over 4 when the client
-	// (e.g. Amp CLI) already sends multiple cache_control blocks.
-	body = enforceCacheControlLimit(body, 4)
-
-	// Normalize TTL values to prevent ordering violations under prompt-caching-scope-2026-01-05.
-	// A 1h-TTL block must not appear after a 5m-TTL block in evaluation order (tools→system→messages).
-	body = normalizeCacheControlTTL(body)
-
-	// Extract betas from body and convert to header
-	var extraBetas []string
-	extraBetas, body = extractAndRemoveBetas(body)
-	bodyForTranslation := body
-	bodyForUpstream := body
-	oauthToken := isClaudeOAuthToken(apiKey)
-	var oauthToolNamesReverseMap map[string]string
-	if oauthToken {
-		bodyForUpstream, oauthToolNamesReverseMap = prepareClaudeOAuthToolNamesForUpstream(bodyForUpstream, claudeToolPrefix, auth.ToolPrefixDisabled())
-	}
-	bodyForUpstream = sanitizeClaudeMessagesForClaudeUpstreamWithDebug(ctx, bodyForUpstream, baseModel)
-	// Fold a self-tagged "sdk-cli" cc_entrypoint in the body billing header into
-	// "cli" on the /v1/messages path, mirroring the outbound UA suffix fold. Real
-	// claude-cli clients skip cloak system-block regeneration (ShouldCloak=false
-	// in the default auto mode), so their inbound billing header would otherwise
-	// reach Anthropic verbatim, leaving the outbound UA suffix (cli) and the body
-	// cc_entrypoint (sdk-cli) divergent. Runs before signing so the recomputed cch
-	// covers the folded body; gated by the same switch (default on).
-	bodyForUpstream, entrypointFolded := normalizeClaudeBillingEntrypoint(e.cfg, bodyForUpstream)
-	// REAL serving path (ShouldCloak=false, genuine claude-cli) body cc_version
-	// floor: align the body billing-header cc_version <version> segment to the same
-	// account high-water V the outbound User-Agent is floored to, so a below-
-	// high-water client cannot emit UA=V + body cc_version=<lower> (a
-	// one-account-two-versions tell). The <build> segment is RECOMPUTED for V via
-	// the genuine claude-cli build-hash (first user message + V, real-machine
-	// validated). Runs on the final upstream body (after sanitize / entrypoint fold),
-	// mirroring normalizeClaudeBillingEntrypoint, so the single re-sign below covers
-	// the rewritten body exactly once. No-op on the cloaked path (cc_version is
-	// already V there) and when the switch is off (default) — real path then stays
-	// byte-identical to today.
-	bodyForUpstream, billingVersionAligned := alignRealPathBillingVersion(e.cfg, bodyForUpstream, billingVersion)
-	// Enable cch signing by default for OAuth tokens (not just experimental flag).
-	// Claude Code always computes cch; missing or invalid cch is a detectable
-	// fingerprint. Also re-sign when the entrypoint was folded or the real-path
-	// billing version was aligned so the cch stays consistent with the rewritten
-	// body even on non-OAuth paths. Exactly one re-sign covers all body mutations.
-	if oauthToken || experimentalCCHSigningEnabled(e.cfg, auth) || entrypointFolded || billingVersionAligned {
-		bodyForUpstream = signAnthropicMessagesBody(bodyForUpstream)
-	}
-	reporter.SetTranslatedReasoningEffort(bodyForUpstream, to.String())
-
-	url := fmt.Sprintf("%s/v1/messages?beta=true", baseURL)
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyForUpstream))
-	if err != nil {
-		return resp, err
-	}
-	applyClaudeHeaders(httpReq, auth, apiKey, false, extraBetas, e.cfg)
-	// claude 版本高水位持久化（真实 serving 路径）：applyClaudeHeaders 内部的
-	// resolveClaudeDeviceProfileForRequest -> ResolveClaudeDeviceProfile 已把本次真实
-	// 请求的合法高水位候选记入内存观测。这里把当前账号的观测高水位透出给 auth
-	// manager，由 RaiseClaudeDeviceHighWater 做"仅单调抬升才写盘"。PrepareRequest 只服务
-	// HttpRequest adapter 旁路，真实 /v1/messages 服务走 Execute/ExecuteStream/CountTokens，
-	// 因此写回必须挂在这些 serving 方法上，否则持久化永不触发（重启回落到 floor）。
-	e.persistClaudeDeviceHighWater(auth, apiKey)
-	var authID, authLabel, authType, authValue string
-	if auth != nil {
-		authID = auth.ID
-		authLabel = auth.Label
-		authType, authValue = auth.AccountInfo()
-	}
-	helps.RecordAPIRequest(ctx, e.cfg, helps.UpstreamRequestLog{
-		URL:       url,
-		Method:    http.MethodPost,
-		Headers:   httpReq.Header.Clone(),
-		Body:      bodyForUpstream,
-		Provider:  e.upstreamRequestLogProvider(),
-		AuthID:    authID,
-		AuthLabel: authLabel,
-		AuthType:  authType,
-		AuthValue: authValue,
-	})
-
-	ctx = helps.WithRuntimeTransportHostFromRequest(ctx, httpReq)
-	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
-	httpClient = reporter.TrackHTTPClient(httpClient)
-	httpResp, err := doClaudeHTTPWithTransportRetry(ctx, httpClient, httpReq)
-	if err != nil {
-		recordAPIResponseError(ctx, e.cfg, err)
-		if cliproxyexecutor.IsHTTPAttemptGateError(err) {
-			return resp, err
+	mediaType, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+	if upstreamStream && mediaType == "text/event-stream" {
+		payload, err := readOrdinaryClaudeResponse(resp, 32<<20, reporter.ContentEventObserver())
+		if err != nil {
+			return cliproxyexecutor.Response{}, err
 		}
-		return resp, claudeUpstreamTransportError(err)
-	}
-	attempt := helps.ClaimClaudeAttemptResponse(httpResp)
-	defer attempt.Abandon()
-	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
-	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		// Decompress error responses — pass the Content-Encoding value (may be empty)
-		// and let decodeResponseBody handle both header-declared and magic-byte-detected
-		// compression.  This keeps error-path behaviour consistent with the success path.
-		errBody, decErr := decodeResponseBody(httpResp.Body, httpResp.Header.Get("Content-Encoding"))
-		if decErr != nil {
-			helps.RecordAPIResponseError(ctx, e.cfg, decErr)
-			msg := fmt.Sprintf("failed to decode error response body: %v", decErr)
-			logWithRequestID(ctx).Warn(msg)
-			return resp, newClaudeStatusErr(httpResp.StatusCode, []byte(msg), httpResp.Header, time.Now())
-		}
-		errBody = attempt.ObserveDecoded(errBody)
-		b, readErr := io.ReadAll(errBody)
-		if readErr != nil {
-			helps.RecordAPIResponseError(ctx, e.cfg, readErr)
-			msg := fmt.Sprintf("failed to read error response body: %v", readErr)
-			helps.LogWithRequestID(ctx).Warn(msg)
-			b = []byte(msg)
-		}
-		appendAPIResponseChunk(ctx, e.cfg, b)
-		logWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, summarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
-		err = newClaudeStatusErr(httpResp.StatusCode, b, httpResp.Header, time.Now())
-		if errClose := errBody.Close(); errClose != nil {
-			log.Errorf("response body close error: %v", errClose)
-		}
-		return resp, err
-	}
-	decodedBody, err := decodeResponseBody(httpResp.Body, httpResp.Header.Get("Content-Encoding"))
-	if err != nil {
-		helps.RecordAPIResponseError(ctx, e.cfg, err)
-		if errClose := httpResp.Body.Close(); errClose != nil {
-			log.Errorf("response body close error: %v", errClose)
-		}
-		return resp, err
-	}
-	decodedBody = attempt.ObserveDecoded(decodedBody)
-	defer func() {
-		if errClose := decodedBody.Close(); errClose != nil {
-			log.Errorf("response body close error: %v", errClose)
-		}
-	}()
-	data, err := io.ReadAll(decodedBody)
-	if err != nil {
-		helps.RecordAPIResponseError(ctx, e.cfg, err)
-		return resp, err
-	}
-	helps.AppendAPIResponseChunk(ctx, e.cfg, data)
-	if stream {
-		if errValidate := validateClaudeStreamingResponse(data); errValidate != nil {
-			helps.RecordAPIResponseError(ctx, e.cfg, errValidate)
-			return resp, errValidate
-		}
-		lines := bytes.Split(data, []byte("\n"))
-		for _, line := range lines {
-			if detail, ok := helps.ParseClaudeStreamUsage(line); ok {
-				reporter.Publish(ctx, detail)
+		var usage helps.StreamUsageBuffer
+		var refusal string
+		var stream bytes.Buffer
+		stream.Grow(len(payload))
+		for line := range bytes.SplitSeq(payload, []byte("\n")) {
+			if data, ok := bytes.CutPrefix(line, []byte("data:")); ok {
+				data = bytes.TrimSpace(data)
+				usage.ObserveClaudeStream(line)
+				reporter.ObserveResponseModel(line)
+				if message, refused := clienterror.ClaudePolicyRefusalMessage(data); refused {
+					refusal = message
+				}
+				line = e.restoreResponseModel(line, req.Model)
 			}
+			stream.Write(line)
+			stream.WriteByte('\n')
 		}
-	} else {
-		reporter.Publish(ctx, helps.ParseClaudeUsage(data))
+		if err = validateClaudeStreamingResponse(payload); err != nil {
+			usage.PublishFailure(ctx, reporter, err)
+			return cliproxyexecutor.Response{}, err
+		}
+		if refusal != "" {
+			err := statusErr{code: http.StatusBadRequest, msg: refusal, requestScoped: true}
+			usage.PublishFailure(ctx, reporter, err)
+			return cliproxyexecutor.Response{}, err
+		}
+		var translated any
+		out := sdktranslator.TranslateNonStream(ctx, claude, responseFormat, req.Model, opts.OriginalRequest, body, stream.Bytes(), &translated)
+		if helps.ApplyPatchTranslationError(translated) != nil || len(out) == 0 {
+			return cliproxyexecutor.Response{}, statusErr{code: http.StatusBadGateway, msg: helps.ApplyPatchUpstreamErrorMessage}
+		}
+		if responseFormat == sdktranslator.FormatOpenAIResponse {
+			out = helps.EnsureResponsesUsageDetails(out)
+		}
+		usage.Publish(ctx, reporter)
+		headers := resp.Header.Clone()
+		headers.Set("Content-Type", "application/json")
+		headers.Del("Content-Length")
+		headers.Del("Content-Encoding")
+		return cliproxyexecutor.Response{Payload: out, Headers: headers}, nil
 	}
-	data = restoreClaudeOAuthToolNamesFromResponse(data, claudeToolPrefix, auth.ToolPrefixDisabled(), oauthToolNamesReverseMap)
-	data = e.restoreResponseModel(data, req.Model)
-	var param any
-	out := sdktranslator.TranslateNonStream(
-		ctx,
-		to,
-		from,
-		req.Model,
-		opts.OriginalRequest,
-		bodyForTranslation,
-		data,
-		&param,
-	)
-	resp = cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}
-	return resp, nil
+	payload, err := readOrdinaryClaudeJSON(resp, 32<<20)
+	if err != nil {
+		return cliproxyexecutor.Response{}, err
+	}
+	if !ojson.GetBytesNoCopy(payload, "content").IsArray() {
+		return cliproxyexecutor.Response{}, statusErr{code: http.StatusBadGateway, msg: "invalid Claude Messages response"}
+	}
+	usage := helps.ParseClaudeUsage(payload)
+	if message, refused := clienterror.ClaudePolicyRefusalMessage(payload); refused {
+		rejection := statusErr{code: http.StatusBadRequest, msg: message, requestScoped: true}
+		reporter.PublishFailureWithDetail(ctx, usage, rejection)
+		return cliproxyexecutor.Response{}, rejection
+	}
+	reporter.ObserveResponseModel(payload)
+	if !claudeCompactionSummaryFromContext(ctx) {
+		claude := sdktranslator.FromString("claude")
+		responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
+		payload = e.restoreResponseModel(payload, req.Model)
+		var translated any
+		payload = sdktranslator.TranslateNonStream(ctx, claude, responseFormat, req.Model, opts.OriginalRequest, body, payload, &translated)
+		if helps.ApplyPatchTranslationError(translated) != nil || len(payload) == 0 {
+			return cliproxyexecutor.Response{}, statusErr{code: http.StatusBadGateway, msg: helps.ApplyPatchUpstreamErrorMessage}
+		}
+		if responseFormat == sdktranslator.FormatOpenAIResponse {
+			payload = helps.EnsureResponsesUsageDetails(payload)
+		}
+	}
+	reporter.Publish(ctx, usage)
+	return cliproxyexecutor.Response{Payload: payload, Headers: resp.Header.Clone()}, nil
+}
+
+func readOrdinaryClaudeJSON(resp *http.Response, maxBytes int64) ([]byte, error) {
+	payload, err := readOrdinaryClaudeResponse(resp, maxBytes, nil)
+	if err != nil {
+		return nil, err
+	}
+	if !ojson.ValidBytes(payload) || !util.ParseGJSONBytesNoCopy(payload).IsObject() {
+		return nil, statusErr{code: http.StatusBadGateway, msg: "invalid Claude JSON response"}
+	}
+	return payload, nil
+}
+
+func readOrdinaryClaudeResponse(resp *http.Response, maxBytes int64, observer io.Writer) ([]byte, error) {
+	decoded, err := decodeResponseBody(resp.Body, claudeResponseContentEncoding(resp.Header))
+	if err != nil {
+		_ = resp.Body.Close()
+		return nil, ordinaryClaudeResponseReadError(err, "invalid Claude response encoding")
+	}
+	defer decoded.Close()
+	var reader io.Reader = io.LimitReader(decoded, maxBytes+1)
+	if observer != nil {
+		reader = io.TeeReader(reader, observer)
+	}
+	payload, err := io.ReadAll(reader)
+	if err != nil {
+		return nil, ordinaryClaudeResponseReadError(err, "could not read Claude response")
+	}
+	if int64(len(payload)) > maxBytes {
+		return nil, statusErr{code: http.StatusBadGateway, msg: "oversized Claude response"}
+	}
+	return payload, nil
 }

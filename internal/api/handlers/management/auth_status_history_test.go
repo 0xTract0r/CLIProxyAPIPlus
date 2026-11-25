@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 )
 
 func TestListAuthStatusHistoryFiltersNewestEntries(t *testing.T) {
@@ -17,7 +17,14 @@ func TestListAuthStatusHistoryFiltersNewestEntries(t *testing.T) {
 
 	authDir := t.TempDir()
 	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, nil)
+	source, err := h.openAuthStatusHistorySource()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
 	h.appendAuthStatusHistoryEvent(authStatusHistoryEvent{
+		source: source,
+
 		EventType:     "warning",
 		AuthName:      "alpha.json",
 		Provider:      "codex",
@@ -27,6 +34,8 @@ func TestListAuthStatusHistoryFiltersNewestEntries(t *testing.T) {
 		OccurredAt:    time.Date(2026, 4, 19, 0, 1, 0, 0, time.UTC),
 	})
 	h.appendAuthStatusHistoryEvent(authStatusHistoryEvent{
+		source: source,
+
 		EventType:  "cleared",
 		AuthName:   "alpha.json",
 		Provider:   "codex",
@@ -35,6 +44,8 @@ func TestListAuthStatusHistoryFiltersNewestEntries(t *testing.T) {
 		OccurredAt: time.Date(2026, 4, 19, 0, 2, 0, 0, time.UTC),
 	})
 	h.appendAuthStatusHistoryEvent(authStatusHistoryEvent{
+		source: source,
+
 		EventType:  "warning",
 		AuthName:   "beta.json",
 		Provider:   "claude",

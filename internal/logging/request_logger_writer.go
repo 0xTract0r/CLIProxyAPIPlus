@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/rand"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -14,11 +16,15 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
 	log "github.com/sirupsen/logrus"
 )
 
-var requestLogID atomic.Uint64
+var (
+	requestLogID                        atomic.Uint64
+	sanitizeFilenameInvalidCharsPattern = regexp.MustCompile(`[<>:"|?*\s]`)
+	sanitizeFilenameMultiHyphenPattern  = regexp.MustCompile(`-+`)
+)
 
 // LogRequest logs a complete non-streaming request/response cycle to a file.
 //
@@ -112,10 +118,9 @@ func (l *FileRequestLogger) logRequestWithSources(url, method string, requestHea
 
 	// Generate filename with request ID
 	filename := l.generateFilename(url, requestID)
-	if force && !l.enabled {
+	if (force && !l.enabled) || (statusCode >= http.StatusBadRequest && statusCode != 499) {
 		filename = l.generateErrorFilename(url, requestID)
 	}
-	filePath := filepath.Join(l.logsDir, filename)
 
 	requestBodyPath, errTemp := l.writeRequestBodyTempFile(body)
 	if errTemp != nil {
@@ -135,7 +140,11 @@ func (l *FileRequestLogger) logRequestWithSources(url, method string, requestHea
 		responseToWrite = response
 	}
 
-	writeErr := writeCompressedRequestLog(filePath, func(logFile io.Writer) error {
+	if requestTimestamp.IsZero() {
+		requestTimestamp = time.Now()
+	}
+	location := DisplayLocation()
+	writeErr := writeCompressedRequestLog(filepath.Join(l.logsDir, filename), func(logFile io.Writer) error {
 		return l.writeNonStreamingLog(
 			logFile,
 			url,
@@ -156,8 +165,8 @@ func (l *FileRequestLogger) logRequestWithSources(url, method string, requestHea
 			responseHeaders,
 			responseToWrite,
 			decompressErr,
-			requestTimestamp,
-			apiResponseTimestamp,
+			requestTimestamp.In(location),
+			apiResponseTimestamp.In(location),
 		)
 	})
 	if writeErr != nil {
@@ -176,16 +185,12 @@ func (l *FileRequestLogger) logRequestWithSources(url, method string, requestHea
 // writeCompressedRequestLog publishes a complete gzip log without first writing
 // an uncompressed final file. Readers never see an unfinished gzip stream.
 func writeCompressedRequestLog(plainPath string, write func(io.Writer) error) error {
-	file, errCreate := os.CreateTemp(filepath.Dir(plainPath), ".request-log-*.tmp")
+	tempPath := filepath.Join(filepath.Dir(plainPath), ".request-log-"+rand.Text()+".tmp")
+	file, errCreate := os.OpenFile(tempPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
 	if errCreate != nil {
 		return fmt.Errorf("create compressed request log: %w", errCreate)
 	}
-	tempPath := file.Name()
 	defer func() { _ = os.Remove(tempPath) }()
-	if errMode := file.Chmod(0o644); errMode != nil {
-		_ = file.Close()
-		return errMode
-	}
 	gz, errGzip := gzip.NewWriterLevel(file, gzip.BestSpeed)
 	if errGzip != nil {
 		_ = file.Close()
@@ -203,10 +208,36 @@ func writeCompressedRequestLog(plainPath string, write func(io.Writer) error) er
 	if errFileClose != nil {
 		return fmt.Errorf("close compressed request log: %w", errFileClose)
 	}
-	if errRename := os.Rename(tempPath, plainPath+".gz"); errRename != nil {
-		return fmt.Errorf("publish compressed request log: %w", errRename)
+	ext := filepath.Ext(plainPath)
+	base := strings.TrimSuffix(plainPath, ext)
+	prefix, id := base, ""
+	if i := strings.LastIndex(filepath.Base(base), "-"); i >= 0 {
+		pos := len(base) - len(filepath.Base(base)) + i
+		prefix, id = base[:pos], base[pos:]
 	}
-	return nil
+	for seq := 0; seq <= 1000; seq++ {
+		logicalPath := plainPath
+		if seq > 0 {
+			logicalPath = fmt.Sprintf("%s_%d%s%s", prefix, seq, id, ext)
+		}
+		// Plain and gzip versions of the same logical name are read as one log.
+		if _, err := os.Lstat(logicalPath); err == nil {
+			continue
+		} else if !os.IsNotExist(err) {
+			return fmt.Errorf("inspect request log name: %w", err)
+		}
+		target := logicalPath + ".gz"
+		if err := os.Link(tempPath, target); err != nil {
+			if os.IsExist(err) {
+				if info, statErr := os.Lstat(target); statErr == nil && info.Mode().IsRegular() {
+					continue
+				}
+			}
+			return fmt.Errorf("publish compressed request log: %w", err)
+		}
+		return nil
+	}
+	return fmt.Errorf("too many conflicting log files for %s", plainPath)
 }
 
 // LogStreamingRequest initiates logging for a streaming request.
@@ -241,7 +272,6 @@ func (l *FileRequestLogger) LogStreamingRequest(url, method string, headers map[
 
 	// Generate filename with request ID
 	filename := l.generateFilename(url, requestID)
-	filePath := filepath.Join(l.logsDir, filename)
 
 	requestHeaders := make(map[string][]string, len(headers))
 	for key, values := range headers {
@@ -264,7 +294,8 @@ func (l *FileRequestLogger) LogStreamingRequest(url, method string, headers map[
 
 	// Create streaming writer
 	writer := &FileStreamingLogWriter{
-		logFilePath:      filePath,
+		logsDir:          l.logsDir,
+		logFilename:      filename,
 		url:              url,
 		method:           method,
 		timestamp:        time.Now(),
@@ -333,13 +364,52 @@ func (l *FileRequestLogger) generateFilename(url string, requestID ...string) st
 	// Use request ID if provided, otherwise use sequential ID
 	var idPart string
 	if len(requestID) > 0 && requestID[0] != "" {
-		idPart = requestID[0]
+		idPart = l.sanitizeForFilename(ShortRequestID(requestID[0]))
 	} else {
 		id := requestLogID.Add(1)
 		idPart = fmt.Sprintf("%d", id)
 	}
 
-	return fmt.Sprintf("%s-%s-%s.log", sanitized, timestamp, idPart)
+	return filepath.Base(fmt.Sprintf("%s-%s-%s.log", sanitized, timestamp, idPart))
+}
+
+// createUniqueLogFile atomically opens a unique log file within dir. If a file with filename already exists,
+// it avoids overwriting by injecting an incrementing sequence number before the trailing request ID component.
+func createUniqueLogFile(dir, filename string) (*os.File, string, error) {
+	if filename == "" || strings.ContainsAny(filename, `/\`) || strings.Contains(filename, "..") || filename == "." || filepath.Base(filename) != filename {
+		return nil, "", fmt.Errorf("invalid log filename")
+	}
+	ext := filepath.Ext(filename)
+	base := strings.TrimSuffix(filename, ext)
+	idx := strings.LastIndex(base, "-")
+	prefix := base
+	idPart := ""
+	if idx > 0 {
+		prefix = base[:idx]
+		idPart = base[idx+1:]
+	}
+
+	target := filepath.Join(dir, filename)
+	logFile, errOpen := os.OpenFile(target, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
+	if errOpen == nil {
+		return logFile, target, nil
+	}
+	if !os.IsExist(errOpen) {
+		return nil, "", errOpen
+	}
+
+	for seq := 1; seq <= 1000; seq++ {
+		candidateName := fmt.Sprintf("%s_%d-%s%s", prefix, seq, idPart, ext)
+		candidatePath := filepath.Join(dir, candidateName)
+		logCandidate, errCandidate := os.OpenFile(candidatePath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
+		if errCandidate == nil {
+			return logCandidate, candidatePath, nil
+		}
+		if !os.IsExist(errCandidate) {
+			return nil, "", errCandidate
+		}
+	}
+	return nil, "", fmt.Errorf("too many conflicting log files for %s", filename)
 }
 
 // sanitizeForFilename replaces characters that are not safe for filenames.
@@ -351,21 +421,15 @@ func (l *FileRequestLogger) generateFilename(url string, requestID ...string) st
 //   - string: A sanitized filename
 func (l *FileRequestLogger) sanitizeForFilename(path string) string {
 	// Replace slashes with hyphens
-	sanitized := strings.ReplaceAll(path, "/", "-")
+	sanitized := strings.NewReplacer("/", "-", "\\", "-").Replace(path)
 
 	// Replace colons with hyphens
 	sanitized = strings.ReplaceAll(sanitized, ":", "-")
 
-	// Replace other problematic characters with hyphens
-	reg := regexp.MustCompile(`[<>:"|?*\s]`)
-	sanitized = reg.ReplaceAllString(sanitized, "-")
-
-	// Remove multiple consecutive hyphens
-	reg = regexp.MustCompile(`-+`)
-	sanitized = reg.ReplaceAllString(sanitized, "-")
-
-	// Remove leading/trailing hyphens
-	sanitized = strings.Trim(sanitized, "-")
+	sanitized = sanitizeFilenameInvalidCharsPattern.ReplaceAllString(sanitized, "-")
+	sanitized = strings.ReplaceAll(sanitized, "..", "-")
+	sanitized = sanitizeFilenameMultiHyphenPattern.ReplaceAllString(sanitized, "-")
+	sanitized = strings.Trim(sanitized, "-.")
 
 	// Handle empty result
 	if sanitized == "" {

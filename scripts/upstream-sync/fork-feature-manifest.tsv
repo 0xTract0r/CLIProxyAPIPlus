@@ -117,42 +117,14 @@ fork路由-管理端点	logs-compress-after-days	route	/logs-compress-after-days
 反关联-内建OAuth代理接线	kimi绑账号代理	pattern	NewKimiAuth\(h\.configForOAuthSetup\(setup\)	internal/api/handlers/management/auth_files_provider_oauth.go
 反关联-内建OAuth代理接线	proxy写落库record	pattern	applyOAuthAccountSetupToRecord\(record, setup\)	internal/api/handlers/management/auth_files_provider_oauth.go
 
-# === 卡片重新认证「按目标账号代理换 token + fail-closed + 官方 uTLS + 登录身份校验」接线调用点(12) ===
-# 回归背景(fix-oauth-egress-anticorr):同一次 c8132e1d 覆盖也丢了 claude 卡片重新认证的
-#   auth_name 接线(helper 留在 auth_files_anticorr.go 成了死代码,只 grep 符号定义仍"存活"),
-#   卡片重新认证因此回退全局代理/直连;codex 换 token 走 Go 默认 TLS(JA3 03117a8e)。
-#   这里同样钉【调用点】:handler 里的目标解析、重试/同账号兜底、record 继承、fail-closed
-#   检查,以及 oauthIdentityHTTPClient 里的 uTLS 构造。行为由 oauth_reauth_egress_test.go 守护。
-反关联-卡片重认证代理	claude解析目标账号	pattern	resolveOAuthReauthTarget\(c, "claude"\)	internal/api/handlers/management/auth_files_provider_oauth.go
-反关联-卡片重认证代理	codex解析目标账号	pattern	resolveOAuthReauthTarget\(c, "codex"\)	internal/api/handlers/management/auth_files_provider_oauth.go
-反关联-卡片重认证代理	无代理入口fail-closed	pattern	checkOAuthStartEgress\(setup\)	internal/api/handlers/management/auth_files_provider_oauth.go
-反关联-卡片重认证代理	claude换token重试	pattern	exchangeClaudeOAuthWithRetry\(exchangeCtx, anthropicAuth	internal/api/handlers/management/auth_files_provider_oauth.go
-反关联-卡片重认证代理	claude同账号代理兜底	pattern	newClaudeOAuthAccountProxyFallbackAuth\(targetAuth\)	internal/api/handlers/management/auth_files_provider_oauth.go
-反关联-卡片重认证代理	claude继承目标record	pattern	buildClaudeOAuthTokenRecord\(targetAuth, tokenStorage\)	internal/api/handlers/management/auth_files_provider_oauth.go
-反关联-卡片重认证代理	目标代理空/非法拒绝	pattern	oauthEgressProxyBlockReason\(authProxyURL\(target\)\)	internal/api/handlers/management/oauth_reauth_egress.go
-反关联-卡片重认证代理	换token官方uTLS分流	pattern	oauthAccountExchangeBaseClient\(auth, profileID, timeout\)	internal/api/handlers/management/oauth_account_setup.go
-反关联-卡片重认证代理	codex换token走codex-rs	pattern	NewOAuthRefreshUtlsHTTPClient\(proxyURL, profileID, timeout\)	internal/api/handlers/management/oauth_account_setup.go
-反关联-卡片重认证代理	claude校验登录账号=目标	pattern	verifyClaudeReauthIdentity\(targetAuth	internal/api/handlers/management/auth_files_provider_oauth.go
-反关联-卡片重认证代理	codex校验登录账号=目标	pattern	verifyCodexReauthIdentity\(targetAuth	internal/api/handlers/management/auth_files_provider_oauth.go
-反关联-卡片重认证代理	codex继承目标账号设置	pattern	inheritReauthAccountSettings\(record, targetAuth\)	internal/api/handlers/management/auth_files_provider_oauth.go
-
-# === 管理端 api-call「套账号托管身份头 + 账号代理 fail-closed」接线调用点(7) ===
-# 背景(fix-oauth-egress-anticorr 漏洞4 / 清单 A6):cpamp 额度查询经 POST /v0/management/api-call
-#   代发到 api.anthropic.com / chatgpt.com,原先原样转发前端 header(claude 出站是 claude-cli TLS
-#   配 Go 默认 UA;codex 是前端写死的 codex_cli_rs/0.76.0),且账号代理为空时直连。
-#   这里钉 APICall handler 里的 fail-closed 检查与托管身份头覆盖调用点,以及 claude/codex
-#   executor 复用 serving 头构造(PrepareRequest / applyCodexHeaders)的接线。
-#   行为由 api_call_managed_identity_test.go 守护。
-反关联-管理端api-call	账号代理空/非法fail-closed	pattern	h\.apiCallAccountProxyBlockReason\(auth\); reason != ""	internal/api/handlers/management/api_tools.go
-反关联-管理端api-call	取账号托管身份头	pattern	h\.apiCallManagedIdentityHeaders\(provider, parsedURL, auth\)	internal/api/handlers/management/api_tools.go
-反关联-管理端api-call	托管身份头覆盖前端同名头	pattern	applyAPICallManagedIdentity\(req\.Header, identity\)	internal/api/handlers/management/api_tools.go
-反关联-管理端api-call	账号代理不回退全局	pattern	return oauthEgressProxyBlockReason\(accountProxy\)	internal/api/handlers/management/api_call_managed_identity.go
-反关联-管理端api-call	claude托管头复用serving构造	pattern	e\.PrepareRequest\(probe, auth\)	internal/runtime/executor/claude_executor.go
-反关联-管理端api-call	codex托管头复用serving构造	pattern	applyCodexHeaders\(probe, auth, "", false, e\.cfg\)	internal/runtime/executor/codex_executor_request.go
-反关联-管理端api-call	codex auto委派托管头	pattern	e\.httpExec\.ManagedIdentityHeaders\(target, auth\)	internal/runtime/executor/codex_websockets_executor.go
-
 # === fork 自定义模块/反关联支撑文件存在性(19) ===
-fork文件-amp模块	internal/api/modules/amp/	file	-	internal/api/modules/amp
+Amp-active	model-alias-mapper	symbol	^func MatchModel\(	internal/api/modules/amp/model_mapping.go
+Amp-active	model-alias-wiring	pattern	amp\.MatchModel\(requested,	internal/api/server_amp_inference.go
+Amp-active	google-v1beta1-resource-route	route	providers\.Handle\(method, "/v1beta1/\*action", googleResource\)	internal/api/server_routes.go
+Amp-active	google-v1beta1-resource-regression	symbol	^func TestOrdinaryAmpGoogleResourceMethodsRequireBoundCaller\(	internal/api/server_amp_google_resources_test.go
+Amp-active	forward-route-regression	symbol	^func TestOrdinaryAmpRegisteredRoutesHaveHandlers\(	internal/api/server_amp_routes_contract_test.go
+Amp-active	bound-caller-cold-revocation	symbol	^func TestOrdinaryAmpBindingRevocationSurvivesManagementSaveAndRestart\(	internal/api/server_amp_tenant_test.go
+Amp-active	ordinary-response-names	symbol	^func TestOrdinaryAmpClientResponseNames\(	internal/api/server_amp_response_names_test.go
 fork文件-反关联支撑	provider_tls_probe.go(helps)	file	-	internal/runtime/executor/helps/provider_tls_probe.go
 fork文件-反关联支撑	tls_evidence_capture.go	file	-	internal/runtime/executor/helps/tls_evidence_capture.go
 fork文件-反关联支撑	codex_client_profile.go	file	-	internal/runtime/executor/helps/codex_client_profile.go
@@ -169,7 +141,7 @@ fork文件-反关联支撑	conductor_auto_quarantine.go	file	-	sdk/cliproxy/auth
 fork文件-反关联支撑	farm_pin.go	file	-	sdk/api/handlers/farm_pin.go
 fork文件-反关联支撑	provisioned_gate.go	file	-	sdk/cliproxy/auth/provisioned_gate.go
 fork文件-反关联支撑	farm_enrolled.go	file	-	sdk/cliproxy/auth/farm_enrolled.go
-fork文件-反关联支撑	tls_transport_probe/main.go	file	-	cmd/tls_transport_probe/main.go
+# The retired transport diagnostic is recorded in Git history; ordinary TLS verification has separate coverage.
 fork文件-反关联支撑	disable_image_generation_mode.go	file	-	internal/config/disable_image_generation_mode.go
 
 # === WS 出站接线【调用点】守护(2) ===

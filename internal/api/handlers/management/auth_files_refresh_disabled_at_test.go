@@ -4,20 +4,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
-// TestBuildAuthFileEntry_RefreshDisabledAt covers the R5-1a (telemetry-farm)
-// additive refresh_disabled_at field: buildAuthFileEntry must project the
-// automatic reauth/ban timestamp that markRefreshReauthRequiredWithReason
-// writes into Metadata["refresh_disabled_at"] so the farm-orchestrator
-// passthrough and the management UI can render *when* an account was banned
-// instead of a hardcoded "—". It must follow the same non-empty/non-zero gate
-// as quarantined_at: emitted only when the metadata key exists and the string
-// is non-empty and not a Go zero time, and absent for a healthy account, a
-// missing key, an empty / whitespace-only dirty value, or the RFC3339-encoded
-// Go zero time ("0001-01-01T00:00:00Z").
+// TestBuildAuthFileEntry_RefreshDisabledAt checks the passive status timestamp.
 func TestBuildAuthFileEntry_RefreshDisabledAt(t *testing.T) {
 	h := &Handler{cfg: &config.Config{}}
 
@@ -41,7 +32,7 @@ func TestBuildAuthFileEntry_RefreshDisabledAt(t *testing.T) {
 			t.Fatal("fixture setup: MarkRefreshReauthRequired did not write refresh_disabled_at")
 		}
 
-		entry := h.buildAuthFileEntry(auth)
+		entry := h.buildAuthFileEntry(auth, authFileQuotaContext{})
 		if entry == nil {
 			t.Fatal("buildAuthFileEntry() = nil, want an entry")
 		}
@@ -63,7 +54,7 @@ func TestBuildAuthFileEntry_RefreshDisabledAt(t *testing.T) {
 			Attributes: map[string]string{"runtime_only": "true"},
 			Metadata:   map[string]any{},
 		}
-		entry := h.buildAuthFileEntry(auth)
+		entry := h.buildAuthFileEntry(auth, authFileQuotaContext{})
 		if entry == nil {
 			t.Fatal("buildAuthFileEntry() = nil, want an entry")
 		}
@@ -80,7 +71,7 @@ func TestBuildAuthFileEntry_RefreshDisabledAt(t *testing.T) {
 			UpdatedAt:  time.Now(),
 			Attributes: map[string]string{"runtime_only": "true"},
 		}
-		entry := h.buildAuthFileEntry(auth)
+		entry := h.buildAuthFileEntry(auth, authFileQuotaContext{})
 		if entry == nil {
 			t.Fatal("buildAuthFileEntry() = nil, want an entry")
 		}
@@ -100,7 +91,7 @@ func TestBuildAuthFileEntry_RefreshDisabledAt(t *testing.T) {
 				"refresh_disabled_at": "   ",
 			},
 		}
-		entry := h.buildAuthFileEntry(auth)
+		entry := h.buildAuthFileEntry(auth, authFileQuotaContext{})
 		if entry == nil {
 			t.Fatal("buildAuthFileEntry() = nil, want an entry")
 		}
@@ -125,7 +116,7 @@ func TestBuildAuthFileEntry_RefreshDisabledAt(t *testing.T) {
 				"refresh_disabled_at": "0001-01-01T00:00:00Z",
 			},
 		}
-		entry := h.buildAuthFileEntry(auth)
+		entry := h.buildAuthFileEntry(auth, authFileQuotaContext{})
 		if entry == nil {
 			t.Fatal("buildAuthFileEntry() = nil, want an entry")
 		}

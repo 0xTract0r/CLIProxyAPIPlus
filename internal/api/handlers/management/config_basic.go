@@ -1,7 +1,7 @@
 package management
 
 import (
-	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -10,31 +10,41 @@ import (
 	"strings"
 	"time"
 
+	"github.com/MoeForge/moego/json"
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
-	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/proxyutil"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
+	sdkconfig "github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/proxyutil"
 	log "github.com/sirupsen/logrus"
 	"gopkg.in/yaml.v3"
 )
 
 const (
 	latestReleaseURL       = "https://api.github.com/repos/router-for-me/CLIProxyAPI/releases/latest"
-	latestReleaseUserAgent = "CLIProxyAPIPlus"
+	latestReleaseUserAgent = "CLIProxyAPI"
 )
 
 func (h *Handler) GetConfig(c *gin.Context) {
-	if h == nil || h.cfg == nil {
-		c.JSON(200, gin.H{})
+	snapshot := h.configSnapshot()
+	if snapshot == nil {
+		c.JSON(http.StatusOK, gin.H{})
 		return
 	}
-	c.JSON(200, new(*h.cfg))
+	c.JSON(http.StatusOK, snapshot)
 }
 
 type releaseInfo struct {
 	TagName string `json:"tag_name"`
 	Name    string `json:"name"`
+}
+
+func setLatestReleaseRequestHeaders(req *http.Request) {
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("User-Agent", latestReleaseUserAgent)
+	if token := util.ResolveGitHubToken(); token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
 }
 
 // GetLatestVersion returns the latest release version from GitHub without downloading assets.
@@ -54,8 +64,7 @@ func (h *Handler) GetLatestVersion(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "request_create_failed", "message": err.Error()})
 		return
 	}
-	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("User-Agent", latestReleaseUserAgent)
+	setLatestReleaseRequestHeaders(req)
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -93,20 +102,33 @@ func (h *Handler) GetLatestVersion(c *gin.Context) {
 }
 
 func WriteConfig(path string, data []byte) error {
-	data = config.NormalizeCommentIndentation(data)
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	doc, err := config.DecodeFirstConfigDocument(data)
 	if err != nil {
 		return err
 	}
-	if _, errWrite := f.Write(data); errWrite != nil {
-		_ = f.Close()
-		return errWrite
+	var commented []config.ArchivedV8Section
+	if config.IsV8ConfigLayout(doc.Content[0]) {
+		normalized, _, sections, errNorm := config.NormalizeConfigLayoutSilent(data, true)
+		if errNorm != nil {
+			return errNorm
+		}
+		if errValidate := config.ValidateConfigSave(data, normalized); errValidate != nil {
+			return errValidate
+		}
+		data, commented = normalized, sections
 	}
-	if errSync := f.Sync(); errSync != nil {
-		_ = f.Close()
-		return errSync
+	onDisk, err := config.ReadConfigFileSnapshot(path)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		err = config.CreateConfigFile(path, data)
+	case err == nil:
+		_, err = config.WriteConfigFileCAS(path, onDisk, data)
 	}
-	return f.Close()
+	if err != nil {
+		return err
+	}
+	config.WarnUnrecognizedV8Sections(commented)
+	return nil
 }
 
 func (h *Handler) PutConfigYAML(c *gin.Context) {
@@ -159,14 +181,14 @@ func (h *Handler) PutConfigYAML(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "reload_failed", "message": err.Error()})
 		return
 	}
-	h.cfg = newCfg
+	h.publishFileOAuthConfigLocked(newCfg)
 	c.JSON(http.StatusOK, gin.H{"ok": true, "changed": []string{"config"}})
 }
 
 // GetConfigYAML returns the raw config.yaml file bytes without re-encoding.
 // It preserves comments and original formatting/styles.
 func (h *Handler) GetConfigYAML(c *gin.Context) {
-	data, err := os.ReadFile(h.configFilePath)
+	data, err := config.ReadConfigFile(h.configFilePath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "not_found", "message": "config file not found"})
@@ -188,23 +210,40 @@ func (h *Handler) PutDebug(c *gin.Context) { h.updateBoolField(c, func(v bool) {
 
 // UsageStatisticsEnabled
 func (h *Handler) GetUsageStatisticsEnabled(c *gin.Context) {
-	c.JSON(200, gin.H{"usage-statistics-enabled": h.cfg.UsageStatisticsEnabled})
+	h.mu.Lock()
+	if h.cfg == nil {
+		h.mu.Unlock()
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "config unavailable"})
+		return
+	}
+	v := h.cfg.UsageStatisticsEnabled
+	h.mu.Unlock()
+	c.JSON(http.StatusOK, gin.H{"usage-statistics-enabled": v})
 }
 func (h *Handler) PutUsageStatisticsEnabled(c *gin.Context) {
-	h.updateBoolField(c, func(v bool) { h.cfg.UsageStatisticsEnabled = v })
+	var b struct {
+		Value *bool `json:"value"`
+	}
+	if err := c.ShouldBindJSON(&b); err != nil || b.Value == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+		return
+	}
+	v := *b.Value
+
+	saveBasicField(h, c, func(cfg *config.Config) *bool { return &cfg.UsageStatisticsEnabled }, v)
 }
 
-// UsageStatisticsEnabled
+// LoggingToFile
 func (h *Handler) GetLoggingToFile(c *gin.Context) {
-	c.JSON(200, gin.H{"logging-to-file": h.cfg.LoggingToFile})
+	readConfigField(h, c, "logging-to-file", func(cfg *config.Config) bool { return cfg.LoggingToFile })
 }
 func (h *Handler) PutLoggingToFile(c *gin.Context) {
-	h.updateBoolField(c, func(v bool) { h.cfg.LoggingToFile = v })
+	putLogBoolField(h, c, func(cfg *config.Config) *bool { return &cfg.LoggingToFile })
 }
 
 // LogsMaxTotalSizeMB
 func (h *Handler) GetLogsMaxTotalSizeMB(c *gin.Context) {
-	c.JSON(200, gin.H{"logs-max-total-size-mb": h.cfg.LogsMaxTotalSizeMB})
+	readConfigField(h, c, "logs-max-total-size-mb", func(cfg *config.Config) int { return cfg.LogsMaxTotalSizeMB })
 }
 func (h *Handler) PutLogsMaxTotalSizeMB(c *gin.Context) {
 	var body struct {
@@ -218,53 +257,12 @@ func (h *Handler) PutLogsMaxTotalSizeMB(c *gin.Context) {
 	if value < 0 {
 		value = 0
 	}
-	h.cfg.LogsMaxTotalSizeMB = value
-	h.persist(c)
-}
-
-// LogsCompressAfterDays
-func (h *Handler) GetLogsCompressAfterDays(c *gin.Context) {
-	c.JSON(200, gin.H{"logs-compress-after-days": h.cfg.LogsCompressAfterDays})
-}
-func (h *Handler) PutLogsCompressAfterDays(c *gin.Context) {
-	var body struct {
-		Value *int `json:"value"`
-	}
-	if errBindJSON := c.ShouldBindJSON(&body); errBindJSON != nil || body.Value == nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
-		return
-	}
-	value := *body.Value
-	if value < 0 {
-		value = config.DefaultLogsCompressAfterDays
-	}
-	h.cfg.LogsCompressAfterDays = value
-	h.persist(c)
-}
-
-// LogsDeleteAfterDays
-func (h *Handler) GetLogsDeleteAfterDays(c *gin.Context) {
-	c.JSON(200, gin.H{"logs-delete-after-days": h.cfg.LogsDeleteAfterDays})
-}
-func (h *Handler) PutLogsDeleteAfterDays(c *gin.Context) {
-	var body struct {
-		Value *int `json:"value"`
-	}
-	if errBindJSON := c.ShouldBindJSON(&body); errBindJSON != nil || body.Value == nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
-		return
-	}
-	value := *body.Value
-	if value < 0 {
-		value = config.DefaultLogsDeleteAfterDays
-	}
-	h.cfg.LogsDeleteAfterDays = value
-	h.persist(c)
+	saveConfigField(h, c, func(cfg *config.Config) *int { return &cfg.LogsMaxTotalSizeMB }, value)
 }
 
 // ErrorLogsMaxFiles
 func (h *Handler) GetErrorLogsMaxFiles(c *gin.Context) {
-	c.JSON(200, gin.H{"error-logs-max-files": h.cfg.ErrorLogsMaxFiles})
+	readConfigField(h, c, "error-logs-max-files", func(cfg *config.Config) int { return cfg.ErrorLogsMaxFiles })
 }
 func (h *Handler) PutErrorLogsMaxFiles(c *gin.Context) {
 	var body struct {
@@ -278,14 +276,54 @@ func (h *Handler) PutErrorLogsMaxFiles(c *gin.Context) {
 	if value < 0 {
 		value = 10
 	}
-	h.cfg.ErrorLogsMaxFiles = value
-	h.persist(c)
+	saveConfigField(h, c, func(cfg *config.Config) *int { return &cfg.ErrorLogsMaxFiles }, value)
 }
 
 // Request log
-func (h *Handler) GetRequestLog(c *gin.Context) { c.JSON(200, gin.H{"request-log": h.cfg.RequestLog}) }
+func (h *Handler) GetRequestLog(c *gin.Context) {
+	readConfigField(h, c, "request-log", func(cfg *config.Config) bool { return cfg.RequestLog })
+}
 func (h *Handler) PutRequestLog(c *gin.Context) {
-	h.updateBoolField(c, func(v bool) { h.cfg.RequestLog = v })
+	putLogBoolField(h, c, func(cfg *config.Config) *bool { return &cfg.RequestLog })
+}
+
+func readConfigField[T any](h *Handler, c *gin.Context, key string, field func(*config.Config) T) {
+	h.mu.Lock()
+	if h.cfg == nil {
+		h.mu.Unlock()
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "config unavailable"})
+		return
+	}
+	value := field(h.cfg)
+	h.mu.Unlock()
+	c.JSON(http.StatusOK, gin.H{key: value})
+}
+
+func putLogBoolField(h *Handler, c *gin.Context, field func(*config.Config) *bool) {
+	var body struct {
+		Value *bool `json:"value"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil || body.Value == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+		return
+	}
+	saveConfigField(h, c, field, *body.Value)
+}
+
+func saveConfigField[T any](h *Handler, c *gin.Context, field func(*config.Config) *T, value T) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.cfg == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "config unavailable"})
+		return
+	}
+	draft := h.cfg.CloneForRuntime()
+	*field(draft) = value
+	if err := commitConfigFieldLocked(h, c, draft, field(h.cfg), value); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to save config: %v", err)})
+		return
+	}
+	h.finishConfigSaveLocked(c)
 }
 
 // Websocket auth
@@ -298,10 +336,25 @@ func (h *Handler) PutWebsocketAuth(c *gin.Context) {
 
 // Request retry
 func (h *Handler) GetRequestRetry(c *gin.Context) {
-	c.JSON(200, gin.H{"request-retry": h.cfg.RequestRetry})
+	readConfigField(h, c, "request-retry", func(cfg *config.Config) int { return cfg.RequestRetry })
 }
 func (h *Handler) PutRequestRetry(c *gin.Context) {
-	h.updateIntField(c, func(v int) { h.cfg.RequestRetry = v })
+	var body struct {
+		Value *int `json:"value"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil || body.Value == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+		return
+	}
+	saveConfigField(h, c, func(cfg *config.Config) *int { return &cfg.RequestRetry }, *body.Value)
+}
+
+// Max retry credentials
+func (h *Handler) GetMaxRetryCredentials(c *gin.Context) {
+	c.JSON(200, gin.H{"max-retry-credentials": h.cfg.MaxRetryCredentials})
+}
+func (h *Handler) PutMaxRetryCredentials(c *gin.Context) {
+	h.updateIntField(c, func(v int) { h.cfg.MaxRetryCredentials = v })
 }
 
 // Max retry interval
@@ -320,39 +373,15 @@ func (h *Handler) PutForceModelPrefix(c *gin.Context) {
 	h.updateBoolField(c, func(v bool) { h.cfg.ForceModelPrefix = v })
 }
 
-// FarmAutoEnroll is the global switch that decides whether a brand-new account's
-// first completed authentication is auto-enrolled into the device telemetry farm
-// (see saveTokenRecord's previous == nil branch and config.FarmAutoEnrollEnabled).
-// The JSON contract is the positive {"value": bool} sense — value=true means
-// auto-enroll is on — matching the management UI toggle. The config stores it as
-// a *bool where unset defaults to true, so GET normalizes nil to true and PUT
-// always writes an explicit pointer.
-func (h *Handler) GetFarmAutoEnroll(c *gin.Context) {
-	c.JSON(200, gin.H{"value": config.FarmAutoEnrollEnabled(h.cfg)})
-}
-func (h *Handler) PutFarmAutoEnroll(c *gin.Context) {
-	h.updateBoolField(c, func(v bool) {
-		enabled := v
-		h.cfg.FarmAutoEnroll = &enabled
-	})
-}
-
 func normalizeRoutingStrategy(strategy string) (string, bool) {
 	normalized := strings.ToLower(strings.TrimSpace(strategy))
 	switch normalized {
 	case "", "round-robin", "roundrobin", "rr":
 		return "round-robin", true
+	case "weighted-round-robin", "weightedroundrobin", "wrr":
+		return "weighted-round-robin", true
 	case "fill-first", "fillfirst", "ff":
 		return "fill-first", true
-	case config.RoutingStrategyAdaptive:
-		// fork: accept the adaptive account-scheduling strategy so operators can
-		// hot-switch routing.strategy to "adaptive" via PUT
-		// /v0/management/routing/strategy instead of only via a config edit +
-		// container restart. The selector assembly layer already honors this
-		// exact value (sdk/cliproxy/service_config.go's
-		// internalconfig.RoutingStrategyAdaptive branch); match it precisely and
-		// do not invent aliases.
-		return config.RoutingStrategyAdaptive, true
 	default:
 		return "", false
 	}
@@ -360,9 +389,17 @@ func normalizeRoutingStrategy(strategy string) (string, bool) {
 
 // RoutingStrategy
 func (h *Handler) GetRoutingStrategy(c *gin.Context) {
-	strategy, ok := normalizeRoutingStrategy(h.cfg.Routing.Strategy)
+	h.mu.Lock()
+	if h.cfg == nil {
+		h.mu.Unlock()
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "config unavailable"})
+		return
+	}
+	current := h.cfg.Routing.Strategy
+	h.mu.Unlock()
+	strategy, ok := normalizeRoutingStrategy(current)
 	if !ok {
-		c.JSON(200, gin.H{"strategy": strings.TrimSpace(h.cfg.Routing.Strategy)})
+		c.JSON(200, gin.H{"strategy": strings.TrimSpace(current)})
 		return
 	}
 	c.JSON(200, gin.H{"strategy": strategy})
@@ -380,35 +417,104 @@ func (h *Handler) PutRoutingStrategy(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid strategy"})
 		return
 	}
-	h.cfg.Routing.Strategy = normalized
-	h.persist(c)
+	saveBasicField(h, c, func(cfg *config.Config) *string { return &cfg.Routing.Strategy }, normalized)
 }
 
 // Proxy URL
-func (h *Handler) GetProxyURL(c *gin.Context) { c.JSON(200, gin.H{"proxy-url": h.cfg.ProxyURL}) }
+func (h *Handler) GetProxyURL(c *gin.Context) {
+	h.mu.Lock()
+	if h.cfg == nil {
+		h.mu.Unlock()
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "config unavailable"})
+		return
+	}
+	v := h.cfg.ProxyURL
+	h.mu.Unlock()
+	c.JSON(http.StatusOK, gin.H{"proxy-url": v})
+}
 func (h *Handler) PutProxyURL(c *gin.Context) {
-	var body struct {
+	var b struct {
 		Value *string `json:"value"`
 	}
-	if err := c.ShouldBindJSON(&body); err != nil || body.Value == nil {
+	if err := c.ShouldBindJSON(&b); err != nil || b.Value == nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
 		return
 	}
-	proxyURL := strings.TrimSpace(*body.Value)
-	// Fail-closed: reject persisting a present-but-invalid global proxy_url. An
-	// invalid value would later force a direct egress that exposes the real server
-	// IP. Empty clears the global proxy; accounts still fall back to their own
-	// per-account egress guard. The explicit "direct"/"none" sentinels are accepted.
-	if proxyURL != "" {
-		if _, err := proxyutil.Parse(proxyURL); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("invalid proxy_url: %v", err)})
-			return
-		}
+	v := *b.Value
+	v = strings.TrimSpace(v)
+	setting, err := proxyutil.Parse(v)
+	if err != nil || (setting.Mode == proxyutil.ModeProxy && !proxyutil.ValidRequestProxy(v)) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid proxy URL"})
+		return
 	}
-	h.cfg.ProxyURL = proxyURL
-	h.persist(c)
+	saveBasicField(h, c, func(cfg *config.Config) *string { return &cfg.ProxyURL }, v)
 }
 func (h *Handler) DeleteProxyURL(c *gin.Context) {
-	h.cfg.ProxyURL = ""
-	h.persist(c)
+	saveBasicField(h, c, func(cfg *config.Config) *string { return &cfg.ProxyURL }, "")
+}
+
+// saveBasicField commits one scalar to disk before publishing the in-memory value.
+// Holding the handler lock across both steps also preserves concurrent sibling edits.
+func saveBasicField[T any](h *Handler, c *gin.Context, field func(*config.Config) *T, v T) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.cfg == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "config unavailable"})
+		return
+	}
+	draft := h.cfg.CloneForRuntime()
+	*field(draft) = v
+	persistProviderFieldLocked(h, c, draft, field(h.cfg), v)
+}
+
+func (h *Handler) GetLogsCompressAfterDays(c *gin.Context) {
+	h.mu.Lock()
+	if h.cfg == nil {
+		h.mu.Unlock()
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "config unavailable"})
+		return
+	}
+	v := h.cfg.LogsCompressAfterDays
+	h.mu.Unlock()
+	c.JSON(http.StatusOK, gin.H{"logs-compress-after-days": v})
+}
+func (h *Handler) PutLogsCompressAfterDays(c *gin.Context) {
+	var b struct {
+		Value *int `json:"value"`
+	}
+	if err := c.ShouldBindJSON(&b); err != nil || b.Value == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+		return
+	}
+	v := *b.Value
+	if v < 0 {
+		v = config.DefaultLogsCompressAfterDays
+	}
+	saveBasicField(h, c, func(cfg *config.Config) *int { return &cfg.LogsCompressAfterDays }, v)
+}
+
+func (h *Handler) GetLogsDeleteAfterDays(c *gin.Context) {
+	h.mu.Lock()
+	if h.cfg == nil {
+		h.mu.Unlock()
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "config unavailable"})
+		return
+	}
+	v := h.cfg.LogsDeleteAfterDays
+	h.mu.Unlock()
+	c.JSON(http.StatusOK, gin.H{"logs-delete-after-days": v})
+}
+func (h *Handler) PutLogsDeleteAfterDays(c *gin.Context) {
+	var b struct {
+		Value *int `json:"value"`
+	}
+	if err := c.ShouldBindJSON(&b); err != nil || b.Value == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+		return
+	}
+	v := *b.Value
+	if v < 0 {
+		v = config.DefaultLogsDeleteAfterDays
+	}
+	saveBasicField(h, c, func(cfg *config.Config) *int { return &cfg.LogsDeleteAfterDays }, v)
 }

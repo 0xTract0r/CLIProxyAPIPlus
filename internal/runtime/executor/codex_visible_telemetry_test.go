@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"net/http"
@@ -8,11 +9,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
-	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 )
 
 type captureCodexVisibleUsage struct {
@@ -31,13 +32,27 @@ func (p *captureCodexVisibleUsage) HandleUsage(_ context.Context, record usage.R
 }
 
 func TestCodexExecuteObservesVisibleSSEWhenContentTypeIsNotSSE(t *testing.T) {
-	model := "codex-visible-telemetry-non-sse-header"
+	for _, tc := range []struct {
+		name, contentType string
+		stream            bool
+	}{
+		{"wrong_header", "application/json", false},
+		{"actual_sse_header", "text/event-stream", false},
+		{"stream_wrong_header", "application/json", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) { assertOrdinaryCodexContentTelemetry(t, tc.name, tc.contentType, tc.stream) })
+	}
+}
+
+func assertOrdinaryCodexContentTelemetry(t *testing.T, name, contentType string, stream bool) {
+	t.Helper()
+	model := "codex-visible-telemetry-" + name
 	plugin := &captureCodexVisibleUsage{model: model, records: make(chan usage.Record, 2)}
 	usage.RegisterPlugin(plugin)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		// The production Codex HTTP path can return SSE framing under a generic body
 		// Content-Type. The executor knows the protocol and must still observe events.
-		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Type", contentType)
 		_, _ = io.WriteString(w, `data: {"type":"response.output_text.delta","delta":"a"}`+"\n\n")
 		w.(http.Flusher).Flush()
 		time.Sleep(20 * time.Millisecond)
@@ -57,15 +72,37 @@ func TestCodexExecuteObservesVisibleSSEWhenContentTypeIsNotSSE(t *testing.T) {
 			"api_key":  "test",
 		},
 	}
-	_, err := exec.Execute(context.Background(), auth, cliproxyexecutor.Request{
+	req := cliproxyexecutor.Request{
 		Model:   model,
 		Payload: []byte(`{"model":"` + model + `","input":"hello"}`),
-	}, cliproxyexecutor.Options{
+	}
+	opts := cliproxyexecutor.Options{
 		SourceFormat:   sdktranslator.FromString("codex"),
 		ResponseFormat: sdktranslator.FromString("codex"),
-	})
-	if err != nil {
-		t.Fatalf("Execute() error = %v", err)
+	}
+	if stream {
+		result, err := exec.ExecuteStream(t.Context(), auth, req, opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var raw []byte
+		for chunk := range result.Chunks {
+			if chunk.Err != nil {
+				t.Fatal(chunk.Err)
+			}
+			raw = append(raw, chunk.Payload...)
+		}
+		if !bytes.Contains(raw, []byte("resp_visible")) {
+			t.Fatal("stream lost the terminal response")
+		}
+	} else {
+		result, err := exec.Execute(t.Context(), auth, req, opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Contains(result.Payload, []byte("resp_visible")) {
+			t.Fatal("response lost the terminal payload")
+		}
 	}
 
 	select {
@@ -77,7 +114,7 @@ func TestCodexExecuteObservesVisibleSSEWhenContentTypeIsNotSSE(t *testing.T) {
 		if telemetry.FirstVisibleContentMS == nil || telemetry.LastVisibleContentMS == nil || *telemetry.LastVisibleContentMS-*telemetry.FirstVisibleContentMS < 10 {
 			t.Fatalf("visible span missing: %+v", telemetry)
 		}
-		if telemetry.ObservationKind != "protocol_content_events" || telemetry.StreamCompleted == nil || !*telemetry.StreamCompleted || telemetry.FastContext == nil {
+		if telemetry.ObservationKind != "protocol_content_events" || telemetry.StreamCompleted == nil || !*telemetry.StreamCompleted || telemetry.FastContext != nil {
 			t.Fatalf("terminal telemetry missing: %+v", telemetry)
 		}
 	case <-time.After(2 * time.Second):

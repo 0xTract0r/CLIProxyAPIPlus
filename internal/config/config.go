@@ -4,25 +4,23 @@
 // debug settings, proxy configuration, and API keys.
 package config
 
-// DefaultMaxRetryCredentials is the cross-credential failover cap applied by default for
-// a single failed request (harden-account-scheduling-limiter ERR-2). The legacy behavior
-// of 0 ("keep trying every available credential") lets one bad request walk the entire
-// fleet and can burn many accounts on a single upstream fault; this small bounded cap
-// contains that blast radius while still allowing a couple of genuine failovers.
-//
-// Wiring: because MaxRetryCredentials is a plain int, yaml cannot distinguish "left
-// unset" from an explicit 0, so both land in config as 0. Rather than changing the
-// upstream Config field to *int, this default is applied at the fork's runtime-wiring
-// edge -- auth.Manager.SetRetryConfig (sdk/cliproxy/auth/conductor_lifecycle.go) --
-// which maps a 0 it receives to this constant. A negative value (e.g. -1) is the
-// explicit escape hatch that restores the legacy unbounded try-all behavior; see the
-// SetRetryConfig doc comment and the matching fork notes in
-// internal/config/parse.go / internal/config/config_load.go (which must NOT clamp
-// negative values to 0, or the escape hatch never reaches SetRetryConfig).
+// ServerResponseCompression mirrors SDKConfig.ResponseCompression on the outer
+// Config so JSON and YAML round trips preserve server.response-compression.
+// The canonical storage remains SDKConfig.ResponseCompression; read the
+// effective value via EffectiveResponseCompression.
+type ServerResponseCompression = ResponseCompressionConfig
+
+// DefaultMaxRetryCredentials bounds the legacy zero-value retry setting.
 const DefaultMaxRetryCredentials = 2
 
 // Config represents the application's configuration, loaded from a YAML file.
 type Config struct {
+	// ServerResponseCompression is the JSON-visible mirror of the downstream
+	// response compression settings (YAML: server.response-compression).
+	ServerResponseCompression ResponseCompressionConfig `yaml:"-" json:"response-compression"`
+	// Models selects optional catalog sources independently for each catalog.
+	Models ModelCatalogs `yaml:"models" json:"models"`
+
 	SDKConfig `yaml:",inline"`
 	// Host is the network host/interface on which the API server will bind.
 	// Default is empty ("") to bind all interfaces (IPv4 + IPv6). Use "127.0.0.1" or "localhost" for local-only access.
@@ -30,11 +28,32 @@ type Config struct {
 	// Port is the network port on which the API server will listen.
 	Port int `yaml:"port" json:"-"`
 
+	// ServerID is the stable deployment UUID from server.server-id, or a
+	// process-local identity when the file cannot be written. It is not public JSON.
+	ServerID string `yaml:"-" json:"-"`
+
+	// GitHubToken is the global token for GitHub requests, taking precedence over GITHUB_TOKEN.
+	GitHubToken string `yaml:"github-token" json:"-"`
+
+	// TrustedProxies lists the IPs or CIDRs allowed to provide forwarded client IP headers.
+	// The server applies this list at startup; changing it requires a restart.
+	TrustedProxies []string `yaml:"trusted-proxies" json:"trusted-proxies"`
+
 	// TLS config controls HTTPS server settings.
 	TLS TLSConfig `yaml:"tls" json:"tls"`
 
+	// ShutdownTimeoutSeconds controls how long the API server waits for in-flight
+	// requests to finish during shutdown before forcibly closing connections.
+	// 0 (the default) keeps the legacy behavior of closing immediately without draining.
+	// Values are in seconds.
+	ShutdownTimeoutSeconds int `yaml:"shutdown-timeout" json:"shutdown-timeout"`
+
 	// Home config is runtime-only and is populated from -home-jwt.
 	Home HomeConfig `yaml:"-" json:"-"`
+
+	// SourceHash is runtime-only: the SHA-256 of the exact config file snapshot after startup
+	// rewrites, or empty when the config was not loaded from a file.
+	SourceHash string `yaml:"-" json:"-"`
 
 	// CredentialConcurrency contains Home-authoritative credential lifecycle settings.
 	CredentialConcurrency CredentialConcurrencyConfig `yaml:"credential-concurrency" json:"credential-concurrency"`
@@ -57,6 +76,12 @@ type Config struct {
 	// Pprof config controls the optional pprof HTTP debug server.
 	Pprof PprofConfig `yaml:"pprof" json:"pprof"`
 
+	// Discovery configures local network mDNS / DNS-SD service advertising.
+	Discovery DiscoveryConfig `yaml:"discovery" json:"discovery"`
+
+	// KVStore configures the local bbolt key-value store.
+	KVStore KVStoreConfig `yaml:"kv-store" json:"kv-store"`
+
 	// CommercialMode disables high-overhead request logging and HTTP middleware features to minimize per-request memory usage.
 	CommercialMode bool `yaml:"commercial-mode" json:"commercial-mode"`
 
@@ -67,27 +92,21 @@ type Config struct {
 	// When exceeded, the oldest log files are deleted until within the limit. Set to 0 to disable.
 	LogsMaxTotalSizeMB int `yaml:"logs-max-total-size-mb" json:"logs-max-total-size-mb"`
 
-	// LogsCompressAfterDays compresses log files older than this many days using gzip.
-	// Set to 0 to disable age-based compression.
+	// LogsCompressAfterDays compresses older log files. Zero disables compression.
 	LogsCompressAfterDays int `yaml:"logs-compress-after-days" json:"logs-compress-after-days"`
 
-	// LogsDeleteAfterDays deletes log files older than this many days.
-	// Applies to both plain `.log` files and compressed `.log.gz` files. Set to 0 to disable age-based deletion.
+	// LogsDeleteAfterDays deletes older log files. Zero disables age-based deletion.
 	LogsDeleteAfterDays int `yaml:"logs-delete-after-days" json:"logs-delete-after-days"`
 
-	// LoggingDisplayTimezoneOffsetHours 控制「人看的后端日志」时间显示时区偏移（小时）。
-	// 默认 8 表示 UTC+8（东八区），方便本地运维直接读懂日志时间。它只影响日志显示
-	// 与后台日志查询解析，不影响任何出站到上游的时间字段（Kiro 注入的
-	// `[Context: Current time is ...]` 等指纹时间保持原口径，绝不经过本设置）。
-	// 取值范围 [-12, 14]；超出范围会被钳回默认值 8。
+	// LoggingDisplayTimezoneOffsetHours sets the display timezone for local logs.
 	LoggingDisplayTimezoneOffsetHours int `yaml:"logging-display-timezone-offset-hours" json:"logging-display-timezone-offset-hours"`
+
+	// ErrorLogAlert stores the application error-log notification settings.
+	ErrorLogAlert ErrorLogAlertConfig `yaml:"error-log-alert" json:"error-log-alert"`
 
 	// ErrorLogsMaxFiles limits the number of error log files retained when request logging is disabled.
 	// When exceeded, the oldest error log files are deleted. Default is 10. Set to 0 to disable cleanup.
 	ErrorLogsMaxFiles int `yaml:"error-logs-max-files" json:"error-logs-max-files"`
-
-	// ErrorLogAlert controls external notifications for application error logs.
-	ErrorLogAlert ErrorLogAlertConfig `yaml:"error-log-alert" json:"error-log-alert"`
 
 	// UsageStatisticsEnabled toggles in-memory usage aggregation; when false, usage data is discarded.
 	UsageStatisticsEnabled bool `yaml:"usage-statistics-enabled" json:"usage-statistics-enabled"`
@@ -97,35 +116,37 @@ type Config struct {
 	// Default: 60. Max: 3600.
 	RedisUsageQueueRetentionSeconds int `yaml:"redis-usage-queue-retention-seconds" json:"redis-usage-queue-retention-seconds"`
 
-	// DisableCooling disables quota cooldown scheduling when true.
+	// DisableCooling disables auth/model cooldown scheduling when true unless a credential or provider overrides it.
 	DisableCooling bool `yaml:"disable-cooling" json:"disable-cooling"`
 
 	// SaveCooldownStatus persists runtime cooldown status next to auth files when true.
 	SaveCooldownStatus bool `yaml:"save-cooldown-status" json:"save-cooldown-status"`
 
-	// TransientErrorCooldownSeconds controls cooldowns for transient upstream errors.
+	// TransientErrorCooldownSeconds controls cooldowns for transient upstream errors (408/500/502/503/504/520-526).
 	// 0 keeps the legacy default cooldown. Negative values disable these cooldowns.
 	TransientErrorCooldownSeconds int `yaml:"transient-error-cooldown-seconds" json:"transient-error-cooldown-seconds"`
 
-	// QuotaSnapshotRefresh controls the background quota snapshot refresher.
+	// QuotaSnapshotRefresh stores the persisted quota snapshot refresh settings.
 	QuotaSnapshotRefresh QuotaSnapshotRefreshConfig `yaml:"quota-snapshot-refresh" json:"quota-snapshot-refresh"`
 
-	// AuthAutoRefreshWorkers overrides the size of the core auth auto-refresh worker pool.
+	// FarmAutoEnroll preserves the existing opt-out value in saved configuration.
+	FarmAutoEnroll *bool `yaml:"farm-auto-enroll,omitempty" json:"farm-auto-enroll,omitempty"`
+
+	// AuthAutoRefreshWorkers overrides the size of the core auth auto-refresh and manual refresh-all worker pool.
 	// When <= 0, the default worker count is used.
 	AuthAutoRefreshWorkers int `yaml:"auth-auto-refresh-workers" json:"auth-auto-refresh-workers"`
 
-	// RequestRetry defines the retry times when the request failed.
+	// RequestRetry defines the number of additional credential retry rounds after
+	// the first round has exhausted its eligible credentials.
 	RequestRetry int `yaml:"request-retry" json:"request-retry"`
-	// MaxRetryCredentials defines the maximum number of credentials to try for a failed request.
-	// 0 (including left unset -- an omitted int and an explicit 0 are indistinguishable in
-	// yaml) now defaults to DefaultMaxRetryCredentials (2) at the auth.Manager.SetRetryConfig
-	// runtime-wiring edge, bounding the account-burn blast radius of a single upstream fault.
-	// A negative value (e.g. -1) is the explicit escape hatch that restores the legacy
-	// unbounded "try every available credential" failover; it is preserved as-is through
-	// config load (parse.go / config_load.go do not clamp it to 0) and mapped to unbounded
-	// only at SetRetryConfig. A positive value is used as an explicit cap, as-is.
+	// MaxRetryCredentials defines the maximum number of different credentials to
+	// try in each credential retry round.
+	// Set to 0 or a negative value to keep trying all available credentials (legacy behavior).
 	MaxRetryCredentials int `yaml:"max-retry-credentials" json:"max-retry-credentials"`
-	// MaxRetryInterval defines the maximum wait time in seconds before retrying a cooled-down credential.
+	// MaxRetryInterval defines the maximum positive cooldown wait, in seconds,
+	// allowed before starting another credential retry round. A non-positive value
+	// forbids positive cooldown waits; it does not disable same-round credential
+	// failover or immediate additional rounds allowed by RequestRetry.
 	MaxRetryInterval int `yaml:"max-retry-interval" json:"max-retry-interval"`
 
 	// QuotaExceeded defines the behavior when a quota is exceeded.
@@ -133,12 +154,6 @@ type Config struct {
 
 	// Routing controls credential selection behavior.
 	Routing RoutingConfig `yaml:"routing" json:"routing"`
-
-	// AccountScheduling configures the adaptive account-scheduling subsystem
-	// (tier/quota-aware weighting, per-account rate limiting, new-account
-	// warm-up curve) consumed when Routing.Strategy is RoutingStrategyAdaptive.
-	// See account_scheduling.go.
-	AccountScheduling AccountSchedulingConfig `yaml:"account-scheduling" json:"account-scheduling"`
 
 	// WebsocketAuth enables or disables authentication for the WebSocket API.
 	WebsocketAuth bool `yaml:"ws-auth" json:"ws-auth"`
@@ -150,31 +165,21 @@ type Config struct {
 
 	AntigravitySignatureBypassStrict *bool `yaml:"antigravity-signature-bypass-strict,omitempty" json:"antigravity-signature-bypass-strict,omitempty"`
 
-	// FarmAutoEnroll is the global switch for auto-enrolling a brand-new account
-	// into the device telemetry farm on its first completed authentication (the
-	// management saveTokenRecord previous == nil branch). It is a *bool so the Go
-	// zero value cannot silently force it off: unset (nil) means enabled, which
-	// preserves the pre-toggle behavior where every newly authenticated account
-	// was auto-enrolled. Read it via config.FarmAutoEnrollEnabled (nil => true).
-	// Set farm-auto-enroll: false to make farm enrollment strictly manual
-	// opt-in through the account-level farm_enrolled toggle; existing accounts'
-	// enrollment is never changed by this switch (only first-auth enrollment is
-	// gated), and reauth of an existing account is unaffected either way.
-	FarmAutoEnroll *bool `yaml:"farm-auto-enroll,omitempty" json:"farm-auto-enroll,omitempty"`
+	// ProxyPoolPublisher identifies the runtime that published this snapshot, so a
+	// reload in one runtime never retires another runtime's snapshots.
+	ProxyPoolPublisher uint64 `yaml:"-" json:"-"`
+
+	// ProxyPoolGeneration fences obsolete runtime snapshots from the shared transport cache.
+	ProxyPoolGeneration uint64 `yaml:"-" json:"-"`
+
+	// Antigravity configures provider-wide Antigravity request behavior.
+	Antigravity AntigravityConfig `yaml:"antigravity" json:"antigravity"`
+
+	// Devin configures provider-wide Devin request behavior.
+	Devin DevinConfig `yaml:"devin" json:"devin"`
 
 	// GeminiKey defines Gemini API key configurations with optional routing overrides.
 	GeminiKey []GeminiKey `yaml:"gemini-api-key" json:"gemini-api-key"`
-
-	// KiroKey defines a list of Kiro (AWS CodeWhisperer) configurations.
-	KiroKey []KiroKey `yaml:"kiro" json:"kiro"`
-
-	// KiroFingerprint defines a global fingerprint configuration for all Kiro requests.
-	// When set, all Kiro requests will use this fixed fingerprint instead of random generation.
-	KiroFingerprint *KiroFingerprintConfig `yaml:"kiro-fingerprint,omitempty" json:"kiro-fingerprint,omitempty"`
-
-	// KiroPreferredEndpoint sets the global default preferred endpoint for all Kiro providers.
-	// Values: "ide" (default, CodeWhisperer) or "cli" (Amazon Q).
-	KiroPreferredEndpoint string `yaml:"kiro-preferred-endpoint" json:"kiro-preferred-endpoint"`
 
 	// InteractionsKey defines native Google Interactions API key configurations.
 	InteractionsKey []GeminiKey `yaml:"interactions-api-key" json:"interactions-api-key"`
@@ -185,6 +190,12 @@ type Config struct {
 	// XAIKey defines xAI API key configurations using the same structure as Codex API keys.
 	XAIKey []XAIKey `yaml:"xai-api-key" json:"xai-api-key"`
 
+	// MetaKey defines Meta API key configurations using the same structure as Codex API keys.
+	MetaKey []MetaKey `yaml:"meta-api-key" json:"meta-api-key"`
+
+	// XAI configures provider-wide xAI request behavior.
+	XAI XAIConfig `yaml:"xai" json:"xai"`
+
 	// Codex configures provider-wide Codex request behavior.
 	Codex CodexConfig `yaml:"codex" json:"codex"`
 
@@ -192,18 +203,15 @@ type Config struct {
 	// These are used only when the client does not send its own headers.
 	CodexHeaderDefaults CodexHeaderDefaults `yaml:"codex-header-defaults" json:"codex-header-defaults"`
 
+	// Claude configures provider-wide Claude request behavior.
+	Claude ClaudeConfig `yaml:"claude" json:"claude"`
+
 	// ClaudeKey defines a list of Claude API key configurations as specified in the YAML configuration file.
 	ClaudeKey []ClaudeKey `yaml:"claude-api-key" json:"claude-api-key"`
 
 	// ClaudeHeaderDefaults configures default header values for Claude API requests.
 	// These are used as fallbacks when the client does not send its own headers.
 	ClaudeHeaderDefaults ClaudeHeaderDefaults `yaml:"claude-header-defaults" json:"claude-header-defaults"`
-
-	// Claude configures Claude-specific request policy.
-	Claude ClaudeConfig `yaml:"claude" json:"claude"`
-
-	// ManagedHeaderProfile controls online refresh of version-sensitive managed header profiles.
-	ManagedHeaderProfile ManagedHeaderProfileConfig `yaml:"managed-header-profile" json:"managed-header-profile"`
 
 	// DisableClaudeCloakMode globally disables Claude request cloaking when true.
 	// Cloaking disguises requests as the official Claude Code CLI and replaces the
@@ -220,30 +228,35 @@ type Config struct {
 	// Used for services that use Vertex AI-style paths but with simple API key authentication.
 	VertexCompatAPIKey []VertexCompatKey `yaml:"vertex-api-key" json:"vertex-api-key"`
 
-	// AmpCode contains Amp CLI upstream configuration, management restrictions, and model mappings.
-	AmpCode AmpCode `yaml:"ampcode" json:"ampcode"`
-
 	// OAuthExcludedModels defines per-provider global model exclusions applied to OAuth/file-backed auth entries.
 	OAuthExcludedModels map[string][]string `yaml:"oauth-excluded-models,omitempty" json:"oauth-excluded-models,omitempty"`
 
+	// AmpCode stores settings for the existing Amp configuration block.
+	AmpCode AmpCode `yaml:"ampcode" json:"ampcode"`
+
+	// IncognitoBrowser stores the preference for opening OAuth URLs in a private browser window.
+	IncognitoBrowser bool `yaml:"incognito-browser" json:"incognito-browser"`
+
+	// CyberPolicyAlert stores the optional notification destination for policy events.
+	CyberPolicyAlert CyberPolicyAlertConfig `yaml:"cyber-policy-alert" json:"cyber-policy-alert"`
+
 	// OAuthModelAlias defines global model name aliases for OAuth/file-backed auth channels.
-	// These aliases affect both model listing and model routing for supported channels:
-	// vertex, aistudio, antigravity, claude, codex, kimi, xai.
+	// These aliases affect both model listing and model routing for supported channels,
+	// including vertex, aistudio, antigravity, claude, codex, kimi, xai, meta, and copilot.
 	//
 	// NOTE: This does not apply to existing per-credential model alias features under:
-	// gemini-api-key, interactions-api-key, codex-api-key, xai-api-key, claude-api-key, openai-compatibility, and vertex-api-key.
+	// gemini-api-key, interactions-api-key, codex-api-key, xai-api-key, meta-api-key, claude-api-key, openai-compatibility, and vertex-api-key.
 	OAuthModelAlias map[string][]OAuthModelAlias `yaml:"oauth-model-alias,omitempty" json:"oauth-model-alias,omitempty"`
+
+	// OAuthRequestScopedErrors defines per-provider request-scoped error rules applied to OAuth/file-backed auth entries.
+	// Supported channels include vertex, aistudio, antigravity, claude, codex, kimi, xai, meta, copilot, and OAuth plugin provider keys.
+	//
+	// NOTE: This applies only to OAuth credentials and does not affect per-credential request-scoped-errors under *-api-key.
+	OAuthRequestScopedErrors map[string][]RequestScopedErrorRule `yaml:"oauth-request-scoped-errors,omitempty" json:"oauth-request-scoped-errors,omitempty"`
+
+	// OAuthSettings defines per-channel model settings (such as max-context-length) applied to OAuth/file-backed auth entries.
+	OAuthSettings map[string][]OAuthModelSetting `yaml:"oauth-settings,omitempty" json:"oauth-settings,omitempty"`
 
 	// Payload defines default and override rules for provider payload parameters.
 	Payload PayloadConfig `yaml:"payload" json:"payload"`
-
-	// IncognitoBrowser enables opening OAuth URLs in incognito/private browsing mode.
-	// This is useful when you want to login with a different account without logging out
-	// from your current session. Default: false.
-	IncognitoBrowser bool `yaml:"incognito-browser" json:"incognito-browser"`
-
-	// CyberPolicyAlert configures the upstream cyber_policy flag alert side channel.
-	// When WebhookURL is empty (default), no outbound POST is fired; structured logs
-	// and per-account counters still update.
-	CyberPolicyAlert CyberPolicyAlertConfig `yaml:"cyber-policy-alert" json:"cyber-policy-alert"`
 }

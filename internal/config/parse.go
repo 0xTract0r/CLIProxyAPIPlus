@@ -12,8 +12,53 @@ import (
 // ParseConfigBytes parses a YAML configuration payload into Config and applies the same
 // in-memory normalizations as LoadConfigOptional, without persisting any changes to disk.
 func ParseConfigBytes(data []byte) (*Config, error) {
-	if len(data) == 0 {
-		return nil, fmt.Errorf("config payload is empty")
+	parsed, err := validateStartupConfig(data, false)
+	if err != nil {
+		return nil, err
+	}
+	if errHash := parsed.hashManagementSecret(); errHash != nil {
+		return nil, errHash
+	}
+	parsed.cfg.sanitizeStartupConfig()
+	return parsed.cfg, nil
+}
+
+// ParsePreparedConfigBytes loads the exact snapshot returned by upload preparation
+// and records its hash without reopening or rewriting the local mirror. A nil
+// snapshot is the optional standby result returned by upload preparation.
+func ParsePreparedConfigBytes(data []byte) (*Config, error) {
+	if data == nil {
+		return standbyConfig(), nil
+	}
+	cfg, errParse := ParseConfigBytes(data)
+	if errParse != nil {
+		return nil, errParse
+	}
+	cfg.SourceHash = ComputeSourceHash(data)
+	return cfg, nil
+}
+
+type startupConfig struct {
+	cfg  *Config
+	docs []*yaml.Node
+}
+
+func standbyConfig() *Config {
+	cfg := &Config{CredentialInFlight: DefaultCredentialInFlightConfig()}
+	cfg.NormalizePluginsConfig()
+	cfg.NormalizeClaudeConfig()
+	return cfg
+}
+
+// Decode errors and malformed YAML weights keep optional deployments in standby.
+// Runtime validation errors (including bcrypt's byte limit) still fail startup.
+func validateStartupConfig(data []byte, optional bool) (*startupConfig, error) {
+	docs, err := decodeConfigStream(data)
+	if err == nil && len(docs) == 0 {
+		err = fmt.Errorf("config payload is empty")
+	}
+	if err == nil {
+		err = validateCredentialWeightsNode(docs[0].Content[0])
 	}
 
 	var cfg Config
@@ -21,6 +66,8 @@ func ParseConfigBytes(data []byte) (*Config, error) {
 	cfg.Host = "" // Default empty: binds to all interfaces (IPv4 + IPv6)
 	cfg.LoggingToFile = false
 	cfg.LogsMaxTotalSizeMB = 0
+	cfg.LogsCompressAfterDays = DefaultLogsCompressAfterDays
+	cfg.LogsDeleteAfterDays = DefaultLogsDeleteAfterDays
 	cfg.LoggingDisplayTimezoneOffsetHours = DefaultLoggingDisplayTimezoneOffsetHours
 	cfg.ErrorLogsMaxFiles = 10
 	cfg.UsageStatisticsEnabled = false
@@ -32,34 +79,50 @@ func ParseConfigBytes(data []byte) (*Config, error) {
 	cfg.WebsocketAuth = true
 	cfg.Pprof.Enable = false
 	cfg.Pprof.Addr = DefaultPprofAddr
-	// fork(anticorr): restore the AmpCode localhost-restriction default that upstream's
-	// defaults-block rewrite silently dropped during the merge. Default false: API key
-	// auth is sufficient, so the Amp management surface is not locked to localhost.
-	cfg.AmpCode.RestrictManagementToLocalhost = false
+	cfg.Discovery.Enabled = false
+	cfg.Discovery.ServiceType = DefaultDiscoveryServiceType
+	cfg.Discovery.Subtypes = []string{"_chat-completions", "_responses", "_messages", "_generate-content", "_interactions"}
 	cfg.RemoteManagement.PanelGitHubRepository = DefaultPanelGitHubRepository
 	cfg.CredentialInFlight = DefaultCredentialInFlightConfig()
-	// fork(add-adaptive-account-scheduling): keep aligned with LoadConfigOptional.
-	cfg.AccountScheduling = DefaultAccountSchedulingConfig()
 
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
+	if err == nil {
+		err = docs[0].Decode(&cfg)
+	}
+	if err != nil {
+		if optional {
+			return &startupConfig{cfg: standbyConfig()}, nil
+		}
 		return nil, fmt.Errorf("parse config payload: %w", err)
+	}
+
+	if errValidate := validateTrustedProxies(cfg.TrustedProxies); errValidate != nil {
+		return nil, errValidate
 	}
 
 	cfg.CredentialConcurrency = cfg.CredentialConcurrency.WithDefaults()
 	if errValidate := cfg.CredentialInFlight.Validate(); errValidate != nil {
 		return nil, errValidate
 	}
-	if errValidate := cfg.AccountScheduling.Validate(); errValidate != nil {
+	// An old deployment may use adaptive routing. Falling back to round-robin
+	// would silently discard its scheduling constraints.
+	if strings.EqualFold(strings.TrimSpace(cfg.Routing.Strategy), "adaptive") {
+		return nil, fmt.Errorf("routing.strategy adaptive is unsupported by this build; the configuration was not applied")
+	}
+	if errValidate := cfg.ValidateCredentialWeights(); errValidate != nil {
 		return nil, errValidate
 	}
+	if errValidate := cfg.Codex.LiveMediaRelay.Validate(); errValidate != nil {
+		return nil, errValidate
+	}
+	if cfg.Discovery.ServiceType == "" {
+		cfg.Discovery.ServiceType = DefaultDiscoveryServiceType
+	}
+	if len(cfg.Discovery.Subtypes) == 0 {
+		cfg.Discovery.Subtypes = []string{"_chat-completions", "_responses", "_messages", "_generate-content", "_interactions"}
+	}
 
-	// Hash remote management key if plaintext is detected (nested), but do NOT persist.
-	if cfg.RemoteManagement.SecretKey != "" && !looksLikeBcrypt(cfg.RemoteManagement.SecretKey) {
-		hashed, errHash := bcrypt.GenerateFromPassword([]byte(cfg.RemoteManagement.SecretKey), bcrypt.DefaultCost)
-		if errHash != nil {
-			return nil, fmt.Errorf("hash remote management key: %w", errHash)
-		}
-		cfg.RemoteManagement.SecretKey = string(hashed)
+	if secret := cfg.RemoteManagement.SecretKey; len(secret) > 72 && !looksLikeBcrypt(secret) {
+		return nil, fmt.Errorf("hash remote management key: %w", bcrypt.ErrPasswordTooLong)
 	}
 
 	cfg.RemoteManagement.PanelGitHubRepository = strings.TrimSpace(cfg.RemoteManagement.PanelGitHubRepository)
@@ -72,17 +135,24 @@ func ParseConfigBytes(data []byte) (*Config, error) {
 		cfg.Pprof.Addr = DefaultPprofAddr
 	}
 
+	cfg.KVStore.Path = strings.TrimSpace(cfg.KVStore.Path)
+
 	if cfg.LogsMaxTotalSizeMB < 0 {
 		cfg.LogsMaxTotalSizeMB = 0
 	}
 
-	if cfg.ErrorLogsMaxFiles < 0 {
-		cfg.ErrorLogsMaxFiles = 10
+	if cfg.LogsCompressAfterDays < 0 {
+		cfg.LogsCompressAfterDays = DefaultLogsCompressAfterDays
 	}
-
-	// 显示时区偏移仅用于日志显示/解析；超出 [-12, 14] 钳回默认 UTC+8。
+	if cfg.LogsDeleteAfterDays < 0 {
+		cfg.LogsDeleteAfterDays = DefaultLogsDeleteAfterDays
+	}
 	if cfg.LoggingDisplayTimezoneOffsetHours < -12 || cfg.LoggingDisplayTimezoneOffsetHours > 14 {
 		cfg.LoggingDisplayTimezoneOffsetHours = DefaultLoggingDisplayTimezoneOffsetHours
+	}
+	cfg.ErrorLogAlert.FeishuWebhookURL = strings.TrimSpace(cfg.ErrorLogAlert.FeishuWebhookURL)
+	if cfg.ErrorLogsMaxFiles < 0 {
+		cfg.ErrorLogsMaxFiles = 10
 	}
 
 	if cfg.RedisUsageQueueRetentionSeconds <= 0 {
@@ -92,38 +162,52 @@ func ParseConfigBytes(data []byte) (*Config, error) {
 		cfg.RedisUsageQueueRetentionSeconds = 3600
 	}
 
-	// fork(harden-account-scheduling-limiter ERR-2): do NOT clamp a negative
-	// max-retry-credentials to 0 here. yaml cannot tell "omitted" from an
-	// explicit 0, so 0 now defaults to a bounded cap (DefaultMaxRetryCredentials)
-	// in auth.Manager.SetRetryConfig; a negative value is instead the explicit
-	// "-1 = unbounded try-all" escape hatch and must survive un-clamped to reach
-	// that call. Only SetRetryConfig maps 0/negative to their runtime meaning.
+	if cfg.MaxRetryCredentials < 0 {
+		cfg.MaxRetryCredentials = 0
+	}
 
 	cfg.NormalizePluginsConfig()
+	cfg.NormalizeClaudeConfig()
 	if errResolvePluginsDir := cfg.ResolvePluginsDir(); errResolvePluginsDir != nil && cfg.Plugins.Enabled {
 		return nil, errResolvePluginsDir
 	}
 
+	return &startupConfig{cfg: &cfg, docs: docs}, nil
+}
+
+func (cfg *Config) sanitizeStartupConfig() {
 	// Apply the same sanitization pipeline.
 	cfg.SanitizeGeminiKeys()
 	cfg.SanitizeInteractionsKeys()
 	cfg.SanitizeVertexCompatKeys()
 	cfg.SanitizeCodexKeys()
 	cfg.SanitizeXAIKeys()
+	cfg.SanitizeMetaKeys()
 	cfg.SanitizeCodexHeaderDefaults()
 	cfg.SanitizeClaudeHeaderDefaults()
-	// fork(anticorr): mirror LoadConfigOptional's Claude/managed-header/quota
-	// snapshot/Kiro sanitizers so the home remote-config overlay path applies the
-	// same normalization as the on-disk load path.
-	cfg.SanitizeClaudeConfig()
-	cfg.SanitizeManagedHeaderProfile()
-	cfg.SanitizeQuotaSnapshotRefresh()
 	cfg.SanitizeClaudeKeys()
-	cfg.SanitizeKiroKeys()
+	cfg.SanitizeAntigravity()
+	cfg.SanitizeDevin()
 	cfg.SanitizeOpenAICompatibility()
 	cfg.OAuthExcludedModels = NormalizeOAuthExcludedModels(cfg.OAuthExcludedModels)
 	cfg.SanitizeOAuthModelAlias()
+	cfg.SanitizeOAuthSettings()
+	cfg.SanitizeOAuthRequestScopedErrors()
+	cfg.SanitizeClaudeConfig()
+	cfg.SanitizeQuotaSnapshotRefresh()
 	cfg.SanitizePayloadRules()
 
-	return &cfg, nil
+}
+
+func (p *startupConfig) hashManagementSecret() error {
+	secret := p.cfg.RemoteManagement.SecretKey
+	if secret == "" || looksLikeBcrypt(secret) {
+		return nil
+	}
+	hashed, errHash := hashSecret(secret)
+	if errHash != nil {
+		return fmt.Errorf("hash remote management key: %w", errHash)
+	}
+	p.cfg.RemoteManagement.SecretKey = hashed
+	return nil
 }

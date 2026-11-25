@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	pkgurl "net/url"
 	"time"
 )
 
@@ -53,14 +54,22 @@ type KiloAuth struct {
 
 // NewKiloAuth creates a new instance of KiloAuth.
 func NewKiloAuth() *KiloAuth {
-	return &KiloAuth{
-		client: &http.Client{Timeout: 30 * time.Second},
-	}
+	return NewKiloAuthWithHTTPClient(&http.Client{Timeout: 30 * time.Second})
+}
+
+// NewKiloAuthWithHTTPClient lets management scope the HTTP transport.
+func NewKiloAuthWithHTTPClient(client *http.Client) *KiloAuth {
+	return &KiloAuth{client: client}
 }
 
 // InitiateDeviceFlow starts the device authentication flow.
 func (k *KiloAuth) InitiateDeviceFlow(ctx context.Context) (*DeviceAuthResponse, error) {
-	resp, err := k.client.Post(BaseURL+"/device-auth/codes", "application/json", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, BaseURL+"/device-auth/codes", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := k.client.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -87,14 +96,34 @@ func (k *KiloAuth) PollForToken(ctx context.Context, code string) (*DeviceStatus
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		case <-ticker.C:
-			resp, err := k.client.Get(BaseURL + "/device-auth/codes/" + code)
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, BaseURL+"/device-auth/codes/"+pkgurl.PathEscape(code), nil)
 			if err != nil {
 				return nil, err
 			}
-			defer resp.Body.Close()
-
+			resp, err := k.client.Do(req)
+			if err != nil {
+				return nil, err
+			}
+			switch resp.StatusCode {
+			case http.StatusAccepted:
+				resp.Body.Close()
+				continue
+			case http.StatusForbidden:
+				resp.Body.Close()
+				return nil, fmt.Errorf("device grant denied")
+			case http.StatusGone:
+				resp.Body.Close()
+				return nil, fmt.Errorf("device grant expired")
+			case http.StatusOK:
+				// Continue to the grant body.
+			default:
+				resp.Body.Close()
+				return nil, fmt.Errorf("device grant polling status %d", resp.StatusCode)
+			}
 			var data DeviceStatusResponse
-			if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+			err = json.NewDecoder(resp.Body).Decode(&data)
+			resp.Body.Close()
+			if err != nil {
 				return nil, err
 			}
 
@@ -141,7 +170,7 @@ func (k *KiloAuth) GetProfile(ctx context.Context, token string) (*Profile, erro
 func (k *KiloAuth) GetDefaults(ctx context.Context, token, orgID string) (*Defaults, error) {
 	url := BaseURL + "/defaults"
 	if orgID != "" {
-		url = BaseURL + "/organizations/" + orgID + "/defaults"
+		url = BaseURL + "/organizations/" + pkgurl.PathEscape(orgID) + "/defaults"
 	}
 
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)

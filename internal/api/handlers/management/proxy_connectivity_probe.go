@@ -6,11 +6,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/netip"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/proxyutil"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/proxyutil"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -99,7 +100,7 @@ func (h *Handler) RunProxyConnectivityProbe(c *gin.Context) {
 func probeProxyConnectivity(ctx context.Context, raw string) (result proxyConnectivityProbeResult) {
 	defer func() {
 		if r := recover(); r != nil {
-			log.Warnf("proxy connectivity probe panicked proxy=%s: %v", proxyutil.Redact(raw), r)
+			log.Warnf("proxy connectivity probe panicked proxy=%s", proxyutil.Redact(raw))
 			result = proxyConnectivityProbeResult{OK: false, Reason: proxyProbeReasonProbeFailed}
 		}
 	}()
@@ -126,11 +127,15 @@ func probeProxyConnectivity(ctx context.Context, raw string) (result proxyConnec
 
 	transport, mode, errBuild := proxyutil.BuildHTTPTransport(raw)
 	if errBuild != nil || mode != proxyutil.ModeProxy || transport == nil {
-		log.Warnf("proxy connectivity probe transport build failed proxy=%s: %v", proxyutil.Redact(raw), errBuild)
+		log.Warnf("proxy connectivity probe transport build failed proxy=%s", proxyutil.Redact(raw))
 		return proxyConnectivityProbeResult{OK: false, Reason: proxyProbeReasonInvalid}
 	}
 
-	client := &http.Client{Transport: transport}
+	defer transport.CloseIdleConnections()
+	client := &http.Client{
+		Transport:     transport,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
 	return probeProxyExitIP(ctx, client, raw)
 }
 
@@ -154,7 +159,7 @@ func dialProxyExitIP(ctx context.Context, client *http.Client, raw string) proxy
 		if timedOut {
 			sawTimeout = true
 		}
-		log.Debugf("proxy connectivity probe target failed proxy=%s: %v", proxyutil.Redact(raw), errAttempt)
+		log.Debugf("proxy connectivity probe target failed proxy=%s", proxyutil.Redact(raw))
 		if overallCtx.Err() != nil {
 			sawTimeout = true
 			break
@@ -201,8 +206,8 @@ func probeSingleProxyTarget(ctx context.Context, client *http.Client, target str
 		return "", errRead, isTimeoutErr(attemptCtx, errRead)
 	}
 	ip := strings.TrimSpace(string(body))
-	if ip == "" {
-		return "", errors.New("empty exit IP body"), false
+	if _, err := netip.ParseAddr(ip); err != nil {
+		return "", errors.New("invalid exit IP body"), false
 	}
 	return ip, nil, false
 }

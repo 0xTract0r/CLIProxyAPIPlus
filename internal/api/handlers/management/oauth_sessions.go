@@ -1,25 +1,28 @@
 package management
 
 import (
-	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/MoeForge/moego/json"
+	sdkAuth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/proxyutil"
+	log "github.com/sirupsen/logrus"
 )
 
 const (
-	oauthCallbackWaitTimeout = 15 * time.Minute
 	// oauthSessionTTL must cover device-code flows (xAI ~30m, Kimi ~15m).
-	oauthSessionTTL             = 30 * time.Minute
-	oauthCompletedSessionTTL    = time.Minute
-	maxOAuthStateLength         = 128
-	oauthSessionStatusComplete  = "ok"
-	oauthSessionStatusCancelled = "cancelled"
+	oauthSessionTTL          = 30 * time.Minute
+	oauthCompletedSessionTTL = time.Minute
+	oauthCancelledStatus     = "cancelled"
+	maxOAuthStateLength      = 128
 )
 
 const (
@@ -34,20 +37,57 @@ var (
 	errOAuthSessionExists     = errors.New("oauth session already exists")
 )
 
+// ErrSIWCCallbackRequiresV8 prevents legacy callback sinks from accepting SIWC codes.
+var ErrSIWCCallbackRequiresV8 = fmt.Errorf("%w: SIWC callbacks require /v8/management/oauth/callback", errOAuthSessionNotPending)
+
+type oauthRecoveryTarget struct {
+	AuthID                    string
+	FileName                  string
+	Path                      string
+	Provider                  string
+	Email                     string
+	AccountID                 string
+	OrganizationID            string
+	VerifyAfterLogin          bool
+	VerifyModel               string
+	SelectedFileRevision      string
+	SelectedFile              sdkAuth.AccountSettingsFile
+	SelectedRegistrationEpoch uint64
+	SelectedCredentialVersion uint64
+	SelectedDisabled          bool
+	SelectedGlobalRoute       string
+	SelectedRouteInherits     bool
+	ClaudePublication         *selectedClaudePublication
+}
+
 type oauthSession struct {
-	Provider    string
-	Status      string
-	Source      string
-	Metadata    map[string]any
-	Completed   bool
-	SavedPath   string
-	AuthName    string
-	Note        string
-	ProxyURL    string
-	CompletedAt time.Time
-	CreatedAt   time.Time
-	ExpiresAt   time.Time
-	cancel      context.CancelFunc
+	callbackDir        string
+	storageDir         string
+	callbackOwner      *Handler
+	callbackGeneration uint64
+	Provider           string
+	Status             string
+	Source             string
+	ProxyURL           string
+	Metadata           map[string]any
+	SIWC               *siwcBindSession
+	Target             *oauthRecoveryTarget
+	AuthID             string
+	SavedGrantHash     string
+	Saved              bool
+	Adopted            bool
+	BaselineExisted    bool
+	BaselineVersion    uint64
+	BaselineEpoch      uint64
+	AdoptedVersion     uint64
+	AdoptedEpoch       uint64
+	AdoptError         string
+	VerifyError        string
+	Committing         bool
+	SIWCCommitting     bool
+	Completed          bool
+	CreatedAt          time.Time
+	ExpiresAt          time.Time
 }
 
 type oauthSessionStore struct {
@@ -55,6 +95,7 @@ type oauthSessionStore struct {
 	ttl          time.Duration
 	completedTTL time.Duration
 	sessions     map[string]oauthSession
+	cancelled    map[string]oauthCancellation
 }
 
 func newOAuthSessionStore(ttl time.Duration) *oauthSessionStore {
@@ -69,20 +110,42 @@ func newOAuthSessionStore(ttl time.Duration) *oauthSessionStore {
 		ttl:          ttl,
 		completedTTL: completedTTL,
 		sessions:     make(map[string]oauthSession),
+		cancelled:    make(map[string]oauthCancellation),
 	}
 }
 
 func (s *oauthSessionStore) purgeExpiredLocked(now time.Time) {
 	for state, session := range s.sessions {
-		if !session.ExpiresAt.IsZero() && now.After(session.ExpiresAt) {
+		if (session.Completed || (!session.Committing && !session.SIWCCommitting)) && !session.ExpiresAt.IsZero() && now.After(session.ExpiresAt) {
+			if session.SIWC != nil {
+				session.SIWC.cancel()
+			}
 			delete(s.sessions, state)
+		}
+	}
+	for state, marker := range s.cancelled {
+		if !now.Before(marker.until) {
+			delete(s.cancelled, state)
 		}
 	}
 }
 
 func (s *oauthSessionStore) Register(state, provider string) {
+	s.RegisterWithProxy(state, provider, "")
+}
+
+func (s *oauthSessionStore) RegisterWithProxy(state, provider, proxyURL string) {
+	s.registerBuiltin(state, provider, proxyURL, "", nil, 0)
+}
+
+func (s *oauthSessionStore) registerBuiltin(state, provider, proxyURL, callbackDir string, owner *Handler, generation uint64) {
+	s.registerBuiltinWithStorage(state, provider, proxyURL, callbackDir, callbackDir, owner, generation)
+}
+
+func (s *oauthSessionStore) registerBuiltinWithStorage(state, provider, proxyURL, callbackDir, storageDir string, owner *Handler, generation uint64) {
 	state = strings.TrimSpace(state)
 	provider = strings.ToLower(strings.TrimSpace(provider))
+	proxyURL = strings.TrimSpace(proxyURL)
 	if state == "" || provider == "" {
 		return
 	}
@@ -92,18 +155,33 @@ func (s *oauthSessionStore) Register(state, provider string) {
 	defer s.mu.Unlock()
 
 	s.purgeExpiredLocked(now)
+	delete(s.cancelled, state)
 	s.sessions[state] = oauthSession{
-		Provider:  provider,
-		Status:    "",
-		Source:    oauthSessionSourceBuiltin,
-		CreatedAt: now,
-		ExpiresAt: now.Add(s.ttl),
+		callbackDir:        callbackDir,
+		storageDir:         storageDir,
+		callbackOwner:      owner,
+		callbackGeneration: generation,
+		Provider:           provider,
+		Status:             "",
+		Source:             oauthSessionSourceBuiltin,
+		ProxyURL:           proxyURL,
+		CreatedAt:          now,
+		ExpiresAt:          now.Add(s.ttl),
 	}
 }
 
 func (s *oauthSessionStore) RegisterPlugin(state, provider string, metadata map[string]any) error {
+	return s.RegisterPluginWithProxy(state, provider, metadata, "")
+}
+
+func (s *oauthSessionStore) RegisterPluginWithProxy(state, provider string, metadata map[string]any, proxyURL string) error {
+	return s.registerPlugin(state, provider, metadata, proxyURL, "", nil, 0)
+}
+
+func (s *oauthSessionStore) registerPlugin(state, provider string, metadata map[string]any, proxyURL, dir string, owner *Handler, generation uint64) error {
 	state = strings.TrimSpace(state)
 	provider = strings.ToLower(strings.TrimSpace(provider))
+	proxyURL = strings.TrimSpace(proxyURL)
 	if state == "" || provider == "" {
 		return fmt.Errorf("%w: empty state or provider", errInvalidOAuthState)
 	}
@@ -119,13 +197,18 @@ func (s *oauthSessionStore) RegisterPlugin(state, provider string, metadata map[
 	if _, ok := s.sessions[state]; ok {
 		return errOAuthSessionExists
 	}
+	delete(s.cancelled, state)
 	s.sessions[state] = oauthSession{
-		Provider:  provider,
-		Status:    "",
-		Source:    oauthSessionSourcePlugin,
-		Metadata:  cloneOAuthSessionMetadata(metadata),
-		CreatedAt: now,
-		ExpiresAt: now.Add(s.ttl),
+		callbackDir:        dir,
+		callbackOwner:      owner,
+		callbackGeneration: generation,
+		Provider:           provider,
+		Status:             "",
+		Source:             oauthSessionSourcePlugin,
+		ProxyURL:           proxyURL,
+		Metadata:           cloneOAuthSessionMetadata(metadata),
+		CreatedAt:          now,
+		ExpiresAt:          now.Add(s.ttl),
 	}
 	return nil
 }
@@ -146,19 +229,89 @@ func (s *oauthSessionStore) SetError(state, message string) {
 
 	s.purgeExpiredLocked(now)
 	session, ok := s.sessions[state]
-	if !ok || session.Completed {
+	if !ok || session.Completed || session.Committing {
 		return
 	}
-	if isOAuthSessionCancelledStatus(session.Status) || isOAuthSessionCompleteStatus(session.Status) {
-		return
-	}
-	session.Status = message
+	session.Status = redactSessionProxyInString(message, session.ProxyURL)
+	session.ProxyURL = ""
+	session.SIWCCommitting = false
 	session.ExpiresAt = now.Add(s.ttl)
 	s.sessions[state] = session
 }
 
-func (s *oauthSessionStore) Complete(state string) {
+func (s *oauthSessionStore) FailCommit(state, message string) {
 	state = strings.TrimSpace(state)
+	message = strings.TrimSpace(message)
+	if state == "" {
+		return
+	}
+	if message == "" {
+		message = "Authentication failed"
+	}
+	now := time.Now()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.purgeExpiredLocked(now)
+	session, ok := s.sessions[state]
+	if !ok || session.Completed {
+		return
+	}
+	session.Status = redactSessionProxyInString(message, session.ProxyURL)
+	session.ProxyURL = ""
+	session.Committing = false
+	session.SIWCCommitting = false
+	session.ExpiresAt = now.Add(s.ttl)
+	s.sessions[state] = session
+}
+
+func (s *oauthSessionStore) FailPendingPoll(state, message string) (errStatus string, completed bool, committing bool, ok bool) {
+	state = strings.TrimSpace(state)
+	message = strings.TrimSpace(message)
+	if state == "" {
+		return "", false, false, false
+	}
+	if message == "" {
+		message = "Authentication failed"
+	}
+	now := time.Now()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.purgeExpiredLocked(now)
+	session, exists := s.sessions[state]
+	if !exists {
+		return "", false, false, false
+	}
+	if session.Completed {
+		return "", true, false, true
+	}
+	if session.Committing || session.SIWCCommitting {
+		return "", false, true, true
+	}
+	if session.Status != "" {
+		return session.Status, false, false, true
+	}
+	session.Status = redactSessionProxyInString(message, session.ProxyURL)
+	session.ProxyURL = ""
+	session.ExpiresAt = now.Add(s.ttl)
+	s.sessions[state] = session
+	return session.Status, false, false, true
+}
+
+func (s *oauthSessionStore) Complete(state string) {
+	s.CompleteWithAuth(state, "")
+}
+
+func (s *oauthSessionStore) CompleteWithAuth(state, authID string) {
+	s.CompleteWithOutcome(state, authID, "", strings.TrimSpace(authID) != "", strings.TrimSpace(authID) != "", false, 0, 0, 0, 0, "", "")
+}
+
+func (s *oauthSessionStore) CompleteWithOutcome(state, authID, savedGrantHash string, saved, adopted, baselineExisted bool, baselineVersion, baselineEpoch, adoptedVersion, adoptedEpoch uint64, adoptErr, verifyErr string) {
+	state = strings.TrimSpace(state)
+	authID = strings.TrimSpace(authID)
 	if state == "" {
 		return
 	}
@@ -173,39 +326,70 @@ func (s *oauthSessionStore) Complete(state string) {
 		return
 	}
 	session.Status = ""
+	session.ProxyURL = ""
 	session.Metadata = nil
+	session.AuthID = authID
+	session.SavedGrantHash = strings.TrimSpace(savedGrantHash)
+	session.Saved = saved
+	session.Adopted = adopted
+	session.BaselineExisted = baselineExisted
+	session.BaselineVersion = baselineVersion
+	session.BaselineEpoch = baselineEpoch
+	session.AdoptedVersion = adoptedVersion
+	session.AdoptedEpoch = adoptedEpoch
+	session.AdoptError = strings.TrimSpace(adoptErr)
+	session.VerifyError = strings.TrimSpace(verifyErr)
+	session.Committing = false
+	session.SIWCCommitting = false
 	session.Completed = true
 	session.ExpiresAt = now.Add(s.completedTTL)
 	s.sessions[state] = session
 }
 
-func (s *oauthSessionStore) CompleteWithResult(state string, result oauthSessionResult) {
+func (s *oauthSessionStore) SetTarget(state string, target oauthRecoveryTarget) {
 	state = strings.TrimSpace(state)
 	if state == "" {
 		return
 	}
-	now := time.Now()
-
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	s.purgeExpiredLocked(now)
 	session, ok := s.sessions[state]
-	if !ok {
+	if !ok || session.Completed {
 		return
 	}
-	session.Status = oauthSessionStatusComplete
-	session.SavedPath = strings.TrimSpace(result.SavedPath)
-	session.AuthName = strings.TrimSpace(result.AuthName)
-	session.Note = strings.TrimSpace(result.Note)
-	session.ProxyURL = strings.TrimSpace(result.ProxyURL)
-	if provider := strings.ToLower(strings.TrimSpace(result.Provider)); provider != "" {
-		session.Provider = provider
-	}
-	session.CompletedAt = now
-	session.ExpiresAt = now.Add(s.ttl)
-	session.cancel = nil
+	copyTarget := target
+	session.Target = &copyTarget
 	s.sessions[state] = session
+}
+
+func (s *oauthSessionStore) MarkAdopted(state string, adoptedVersion, adoptedEpoch uint64) {
+	state = strings.TrimSpace(state)
+	if state == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	session, ok := s.sessions[state]
+	if !ok || !session.Completed {
+		return
+	}
+	session.Adopted = true
+	session.AdoptedVersion = adoptedVersion
+	session.AdoptedEpoch = adoptedEpoch
+	session.AdoptError = ""
+	s.sessions[state] = session
+}
+
+func (s *oauthSessionStore) GetTarget(state string) (oauthRecoveryTarget, bool) {
+	state = strings.TrimSpace(state)
+	if state == "" {
+		return oauthRecoveryTarget{}, false
+	}
+	session, ok := s.Get(state)
+	if !ok || session.Target == nil {
+		return oauthRecoveryTarget{}, false
+	}
+	return *session.Target, true
 }
 
 func (s *oauthSessionStore) CompleteProvider(provider string, source string) int {
@@ -222,54 +406,29 @@ func (s *oauthSessionStore) CompleteProvider(provider string, source string) int
 	s.purgeExpiredLocked(now)
 	removed := 0
 	for state, session := range s.sessions {
-		if session.Completed || !strings.EqualFold(session.Provider, provider) {
-			continue
+		if session.SIWC == nil && !session.Completed && !session.Committing && !session.SIWCCommitting && strings.EqualFold(session.Provider, provider) && (source == "" || session.Source == source) {
+			session.Status = ""
+			session.ProxyURL = ""
+			session.Metadata = nil
+			session.Committing = false
+			session.SIWCCommitting = false
+			session.Completed = true
+			session.ExpiresAt = now.Add(s.completedTTL)
+			s.sessions[state] = session
+			removed++
 		}
-		if source != "" && session.Source != source {
-			continue
-		}
-		// Preserve fork result-bearing sessions: a session already completed with a
-		// result (Status "ok") or cancelled must not be clobbered here.
-		if isOAuthSessionCancelledStatus(session.Status) || isOAuthSessionCompleteStatus(session.Status) {
-			continue
-		}
-		session.Status = ""
-		session.Metadata = nil
-		session.Completed = true
-		session.ExpiresAt = now.Add(s.completedTTL)
-		s.sessions[state] = session
-		removed++
 	}
 	return removed
 }
 
-func (s *oauthSessionStore) SetCancel(state string, cancel context.CancelFunc) bool {
-	state = strings.TrimSpace(state)
-	if state == "" || cancel == nil {
-		return false
-	}
-	now := time.Now()
-	cancelImmediately := false
-
-	s.mu.Lock()
-	s.purgeExpiredLocked(now)
-	session, ok := s.sessions[state]
-	if !ok || isOAuthSessionCancelledStatus(session.Status) {
-		cancelImmediately = true
-	} else {
-		session.cancel = cancel
-		s.sessions[state] = session
-	}
-	s.mu.Unlock()
-
-	if cancelImmediately {
-		cancel()
-		return false
-	}
-	return true
+func (s *oauthSessionStore) Get(state string) (oauthSession, bool) {
+	session, ok, _ := s.getWithCancelStatus(state)
+	return session, ok
 }
 
-func (s *oauthSessionStore) Get(state string) (oauthSession, bool) {
+// getWithCancelStatus is for poll readback only. A cancelled state has no
+// active session or stored credential metadata.
+func (s *oauthSessionStore) getWithCancelStatus(state string) (oauthSession, bool, bool) {
 	state = strings.TrimSpace(state)
 	now := time.Now()
 
@@ -279,7 +438,8 @@ func (s *oauthSessionStore) Get(state string) (oauthSession, bool) {
 	s.purgeExpiredLocked(now)
 	session, ok := s.sessions[state]
 	session.Metadata = cloneOAuthSessionMetadata(session.Metadata)
-	return session, ok
+	_, cancelled := s.cancelled[state]
+	return session, ok, cancelled
 }
 
 func (s *oauthSessionStore) IsPending(state, provider string) bool {
@@ -295,18 +455,8 @@ func (s *oauthSessionStore) IsPending(state, provider string) bool {
 	if !ok {
 		return false
 	}
-	if session.Completed {
+	if session.Completed || session.Status != "" {
 		return false
-	}
-	if session.Status != "" {
-		// Kiro device-code / auth_url flows store intermediate state in Status but
-		// remain pending; every other provider with a non-empty Status is terminal.
-		if !strings.EqualFold(session.Provider, "kiro") {
-			return false
-		}
-		if !strings.HasPrefix(session.Status, "device_code|") && !strings.HasPrefix(session.Status, "auth_url|") {
-			return false
-		}
 	}
 	if provider == "" {
 		return true
@@ -314,42 +464,65 @@ func (s *oauthSessionStore) IsPending(state, provider string) bool {
 	return strings.EqualFold(session.Provider, provider)
 }
 
-// Cancel marks a pending OAuth session cancelled so background waiters exit without saving
-// credentials. Returns true when a pending session was cancelled. Any registered cancel func
-// (from SetCancel) is invoked after unlock to interrupt an in-flight token exchange or metadata
-// fetch immediately.
-//
-// Fork behavior (restored after the v7.2.101 upstream merge): rather than deleting the session
-// (upstream), Cancel keeps it as a "cancelled" tombstone so GetAuthStatus can report an explicit
-// "cancelled" status to the management UI instead of "unknown or expired state". Background
-// waiters still exit because IsPending treats a non-empty terminal Status as not-pending. The
-// upstream guard is preserved so an already completed/errored/status-bearing session is left
-// untouched (a completed "ok" tombstone must not be clobbered into "cancelled").
-func (s *oauthSessionStore) Cancel(state string) bool {
+func (s *oauthSessionStore) claimCommit(state, provider string) bool {
 	state = strings.TrimSpace(state)
+	provider = strings.ToLower(strings.TrimSpace(provider))
 	if state == "" {
 		return false
 	}
 	now := time.Now()
-	var cancel context.CancelFunc
 
 	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	s.purgeExpiredLocked(now)
 	session, ok := s.sessions[state]
-	if !ok || session.Completed || session.Status != "" {
-		s.mu.Unlock()
+	if !ok || session.Completed || session.Status != "" || session.Committing || session.SIWCCommitting {
 		return false
 	}
-	cancel = session.cancel
-	session.cancel = nil
-	session.Status = oauthSessionStatusCancelled
-	session.ExpiresAt = now.Add(s.ttl)
-	s.sessions[state] = session
-	s.mu.Unlock()
-
-	if cancel != nil {
-		cancel()
+	if provider != "" && !strings.EqualFold(session.Provider, provider) {
+		return false
 	}
+	session.Committing = true
+	s.sessions[state] = session
+	return true
+}
+
+// Cancel removes a pending OAuth session so background waiters exit without saving credentials.
+// Returns true when a pending session was cancelled.
+func (s *oauthSessionStore) Cancel(state string) bool {
+	return s.cancel(state, nil)
+}
+
+func (s *oauthSessionStore) cancel(state string, scope *oauthFileScope) bool {
+	state = strings.TrimSpace(state)
+	if state == "" {
+		return false
+	}
+	// SIWC completion and cancellation share a per-session gate. A cancellation
+	// that wins this gate prevents persistence; after a committed bind it is a no-op.
+	if session, ok := s.Get(state); ok && session.SIWC != nil {
+		session.SIWC.mu.Lock()
+		defer session.SIWC.mu.Unlock()
+	}
+	now := time.Now()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.purgeExpiredLocked(now)
+	session, ok := s.sessions[state]
+	if !ok || !session.fileScope().allowed(scope) || session.Completed || session.Status != "" || session.Committing || session.SIWCCommitting {
+		return false
+	}
+	if session.SIWC != nil {
+		session.SIWC.cancel()
+		session.SIWC.pkce = nil
+	}
+	if session.Source == oauthSessionSourceBuiltin && session.SIWC == nil {
+		s.cancelled[state] = oauthCancellation{until: now.Add(s.completedTTL), scope: session.fileScope()}
+	}
+	delete(s.sessions, state)
 	return true
 }
 
@@ -368,19 +541,67 @@ var oauthSessions = newOAuthSessionStore(oauthSessionTTL)
 
 func RegisterOAuthSession(state, provider string) { oauthSessions.Register(state, provider) }
 
+func RegisterOAuthSessionWithProxy(state, provider, proxyURL string) {
+	oauthSessions.RegisterWithProxy(state, provider, proxyURL)
+}
+
 func RegisterPluginOAuthSession(state, provider string, metadata map[string]any) error {
 	return oauthSessions.RegisterPlugin(state, provider, metadata)
 }
 
+func RegisterPluginOAuthSessionWithProxy(state, provider string, metadata map[string]any, proxyURL string) error {
+	return oauthSessions.RegisterPluginWithProxy(state, provider, metadata, proxyURL)
+}
+
+func GetOAuthSessionProxyURL(state string) string {
+	session, ok := oauthSessions.Get(state)
+	if !ok || session.Completed || session.Status != "" {
+		return ""
+	}
+	return strings.TrimSpace(session.ProxyURL)
+}
+
+func redactSessionProxyInString(text, proxyURL string) string {
+	proxyURL = strings.TrimSpace(proxyURL)
+	if text == "" || proxyURL == "" {
+		return text
+	}
+	redacted := proxyutil.Redact(proxyURL)
+	if redacted != "" && redacted != proxyURL {
+		text = strings.ReplaceAll(text, proxyURL, redacted)
+	}
+	if parsed, errParse := url.Parse(proxyURL); errParse == nil && parsed != nil && parsed.User != nil {
+		if userInfo := parsed.User.String(); userInfo != "" {
+			text = strings.ReplaceAll(text, userInfo, "redacted")
+		}
+		if password, hasPass := parsed.User.Password(); hasPass && password != "" {
+			text = strings.ReplaceAll(text, password, "redacted")
+		}
+	}
+	return text
+}
+
 func SetOAuthSessionError(state, message string) { oauthSessions.SetError(state, message) }
+
+func FailOAuthSessionCommit(state, message string) { oauthSessions.FailCommit(state, message) }
 
 func CompleteOAuthSession(state string) { oauthSessions.Complete(state) }
 
-func CompleteOAuthSessionWithResult(state string, result oauthSessionResult) {
-	oauthSessions.CompleteWithResult(state, result)
+func CompleteOAuthSessionWithAuth(state, authID string) {
+	oauthSessions.CompleteWithAuth(state, authID)
 }
 
-func CancelOAuthSessionState(state string) bool { return oauthSessions.Cancel(state) }
+func CompleteOAuthSessionWithOutcome(state, authID, savedGrantHash string, saved, adopted, baselineExisted bool, baselineVersion, baselineEpoch, adoptedVersion, adoptedEpoch uint64, adoptErr, verifyErr string) {
+	oauthSessions.CompleteWithOutcome(state, authID, savedGrantHash, saved, adopted, baselineExisted, baselineVersion, baselineEpoch, adoptedVersion, adoptedEpoch, adoptErr, verifyErr)
+}
+
+func SetOAuthSessionTarget(state string, target oauthRecoveryTarget) {
+	oauthSessions.SetTarget(state, target)
+}
+
+func GetOAuthSessionTarget(state string) (oauthRecoveryTarget, bool) {
+	return oauthSessions.GetTarget(state)
+}
 
 func CompleteOAuthSessionsByProvider(provider string) int {
 	return oauthSessions.CompleteProvider(provider, oauthSessionSourceBuiltin)
@@ -388,10 +609,6 @@ func CompleteOAuthSessionsByProvider(provider string) int {
 
 func CompletePluginOAuthSessionsByProvider(provider string) int {
 	return oauthSessions.CompleteProvider(provider, oauthSessionSourcePlugin)
-}
-
-func SetOAuthSessionCancel(state string, cancel context.CancelFunc) bool {
-	return oauthSessions.SetCancel(state, cancel)
 }
 
 func GetOAuthSession(state string) (provider string, status string, ok bool) {
@@ -414,14 +631,6 @@ func IsOAuthSessionPending(state, provider string) bool {
 	return oauthSessions.IsPending(state, provider)
 }
 
-func isOAuthSessionCancelledStatus(status string) bool {
-	return strings.EqualFold(strings.TrimSpace(status), oauthSessionStatusCancelled)
-}
-
-func isOAuthSessionCompleteStatus(status string) bool {
-	return strings.EqualFold(strings.TrimSpace(status), oauthSessionStatusComplete)
-}
-
 // guardOAuthSessionPendingForSave returns errOAuthSessionNotPending when the session
 // is no longer pending (cancelled, completed, errored, or expired).
 // Call immediately before persisting credentials so a cancel that races with token
@@ -431,6 +640,40 @@ func guardOAuthSessionPendingForSave(state, provider string) error {
 		return nil
 	}
 	return errOAuthSessionNotPending
+}
+
+// claimOAuthSessionCommit atomically verifies that the session is still pending
+// and transitions it into the committing state so a concurrent CancelOAuthSession
+// cannot report true while credentials are being persisted.
+func claimOAuthSessionCommit(state, provider string) error {
+	if oauthSessions.claimCommit(state, provider) {
+		return nil
+	}
+	return errOAuthSessionNotPending
+}
+
+// claimBuiltinOAuthSession pins the configuration at the same point at which a
+// pending session begins committing. A stale worker cannot save under a new AuthDir.
+func (h *Handler) claimBuiltinOAuthSession(state, provider string) (*config.Config, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	session, ok := oauthSessions.Get(state)
+	scope := oauthFileScope{owner: h, generation: h.fileOAuthGeneration}
+	if !ok || !session.fileScope().allowed(&scope) {
+		return nil, errOAuthSessionNotPending
+	}
+	cfg := h.cfg.CloneForRuntime()
+	if session.storageDir != "" {
+		current, err := fileOAuthDirectory(fileOAuthConfigDir(cfg))
+		if err != nil || current != session.storageDir {
+			return nil, errOAuthSessionNotPending
+		}
+		cfg.AuthDir = session.storageDir
+	}
+	if err := claimOAuthSessionCommit(state, provider); err != nil {
+		return nil, err
+	}
+	return cfg, nil
 }
 
 // CancelOAuthSession cancels a pending OAuth session by state.
@@ -487,18 +730,14 @@ func NormalizeOAuthProvider(provider string) (string, error) {
 		return "anthropic", nil
 	case "codex", "openai":
 		return "codex", nil
-	case "gitlab":
-		return "gitlab", nil
-	case "gemini", "google":
-		return "gemini", nil
 	case "antigravity", "anti-gravity":
 		return "antigravity", nil
-	case "kiro":
-		return "kiro", nil
-	case "github":
-		return "github", nil
 	case "xai", "x-ai", "x.ai", "grok":
 		return "xai", nil
+	case "devin", "cognition":
+		return "devin", nil
+	case "meta", "muse":
+		return "meta", nil
 	default:
 		return "", errUnsupportedOAuthFlow
 	}
@@ -576,60 +815,81 @@ func writeOAuthCallbackFile(authDir, canonicalProvider, state, code, errorMessag
 	if err != nil {
 		return "", fmt.Errorf("marshal oauth callback payload: %w", err)
 	}
-	if err := writeOAuthCallbackFileAtomic(filePath, data); err != nil {
-		return "", fmt.Errorf("write oauth callback file: %w", err)
+	// Publish complete JSON atomically so background waiters cannot read a partial callback.
+	tmp, errCreate := os.CreateTemp(authDir, ".oauth-callback-*")
+	if errCreate != nil {
+		return "", fmt.Errorf("create oauth callback file: %w", errCreate)
+	}
+	tmpPath := tmp.Name()
+	defer func() {
+		if errRemove := os.Remove(tmpPath); errRemove != nil && !errors.Is(errRemove, os.ErrNotExist) {
+			log.Warn("failed to remove temporary OAuth callback file")
+		}
+	}()
+	_, errWrite := tmp.Write(data)
+	if errWrite == nil {
+		errWrite = tmp.Sync()
+	}
+	errClose := tmp.Close()
+	if errWrite != nil {
+		return "", fmt.Errorf("write oauth callback file: %w", errWrite)
+	}
+	if errClose != nil {
+		return "", fmt.Errorf("close oauth callback file: %w", errClose)
+	}
+	if errRename := os.Rename(tmpPath, filePath); errRename != nil {
+		return "", fmt.Errorf("publish oauth callback file: %w", errRename)
 	}
 	return filePath, nil
 }
 
-// writeOAuthCallbackFileAtomic writes data to a temp file in the same
-// directory and renames it over path, so a polling OAuth handler never reads a
-// partially written callback file. The temp name (<file>.tmp-<random>) never
-// matches the exact callback path the handlers poll, nor the *.json auth-file
-// watcher filter.
-func writeOAuthCallbackFileAtomic(path string, data []byte) (errWrite error) {
-	tmp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp-*")
-	if err != nil {
-		return err
-	}
-	tmpPath := tmp.Name()
-	defer func() {
-		if errWrite != nil {
-			_ = tmp.Close()
-			_ = os.Remove(tmpPath)
-		}
-	}()
-	if err = tmp.Chmod(0o600); err != nil {
-		return err
-	}
-	if _, err = tmp.Write(data); err != nil {
-		return err
-	}
-	if err = tmp.Sync(); err != nil {
-		return err
-	}
-	if err = tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmpPath, path)
-}
-
-// readOAuthCallbackFile returns the parsed callback payload and removes the
-// file. A missing file or a payload that is not (yet) valid JSON reports
-// ok=false and leaves the file in place, so the poller waits for the next tick
-// instead of consuming a partial write as an empty payload and failing the
-// session with a state mismatch.
+// readOAuthCallbackFile consumes a complete object only. Older writers may
+// publish the filename before the JSON write is finished.
 func readOAuthCallbackFile(path string) (map[string]string, bool) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, false
 	}
 	var payload map[string]string
-	if err = json.Unmarshal(data, &payload); err != nil {
+	if err := json.Unmarshal(data, &payload); err != nil || payload == nil {
 		return nil, false
 	}
-	_ = os.Remove(path)
+	if err := os.Remove(path); err != nil {
+		return nil, false
+	}
 	return payload, true
+}
+
+// RegisterFileOAuthSession binds a standard file callback to the accepted auth directory.
+func RegisterFileOAuthSession(state, provider, authDir string) error {
+	return registerFileOAuthSession(state, provider, authDir, "")
+}
+
+func registerFileOAuthSession(state, provider, authDir, proxyURL string) error {
+	if err := ValidateOAuthState(state); err != nil {
+		return err
+	}
+	canonicalProvider, err := NormalizeOAuthCallbackProvider(provider)
+	if err != nil {
+		return err
+	}
+	dir, err := fileOAuthDirectory(authDir)
+	if err != nil {
+		return err
+	}
+	oauthSessions.registerBuiltin(state, canonicalProvider, proxyURL, dir, nil, 0)
+	return nil
+}
+
+func fileOAuthDirectory(dir string) (string, error) {
+	if strings.TrimSpace(dir) == "" {
+		return "", errors.New("auth dir is empty")
+	}
+	absolute, err := filepath.Abs(dir)
+	if err != nil {
+		return "", err
+	}
+	return filepath.EvalSymlinks(absolute)
 }
 
 func WriteOAuthCallbackFileForPendingSession(authDir, provider, state, code, errorMessage string) (string, error) {
@@ -637,8 +897,133 @@ func WriteOAuthCallbackFileForPendingSession(authDir, provider, state, code, err
 	if err != nil {
 		return "", err
 	}
-	if !IsOAuthSessionPending(state, canonicalProvider) {
+	return oauthSessions.writePendingFileCallback(authDir, canonicalProvider, state, code, errorMessage, nil, 0)
+}
+
+type oauthFileScope struct {
+	owner      *Handler
+	generation uint64
+}
+
+type oauthCancellation struct {
+	until time.Time
+	scope oauthFileScope
+}
+
+func (s oauthSession) fileScope() oauthFileScope {
+	return oauthFileScope{owner: s.callbackOwner, generation: s.callbackGeneration}
+}
+
+func (s oauthFileScope) allowed(request *oauthFileScope) bool {
+	return s.owner == nil || request == nil || s == *request
+}
+
+func (h *Handler) oauthFileScope() oauthFileScope {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return oauthFileScope{owner: h, generation: h.fileOAuthGeneration}
+}
+
+func (s *oauthSessionStore) pollScoped(state string, scope oauthFileScope) (oauthSession, bool, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.purgeExpiredLocked(time.Now())
+	session, ok := s.sessions[state]
+	marker, cancelled := s.cancelled[state]
+	if !session.fileScope().allowed(&scope) {
+		return oauthSession{}, false, false
+	}
+	session.Metadata = cloneOAuthSessionMetadata(session.Metadata)
+	return session, ok, cancelled && marker.scope.allowed(&scope)
+}
+
+// publishFileOAuthConfigLocked requires h.mu and invalidates callbacks across directory changes.
+func (h *Handler) publishFileOAuthConfigLocked(next *config.Config) {
+	h.authUploadScopeMu.Lock()
+	defer h.authUploadScopeMu.Unlock()
+	if fileOAuthConfigDir(h.cfg) != fileOAuthConfigDir(next) {
+		h.fileOAuthGeneration++
+	}
+	h.cfg = next
+}
+
+func fileOAuthConfigDir(cfg *config.Config) string {
+	if cfg == nil {
+		return ""
+	}
+	return strings.TrimSpace(cfg.AuthDir)
+}
+
+// RegisterFileOAuthSession creates a callback scoped to this management handler and its current configuration.
+func (h *Handler) RegisterFileOAuthSession(state, provider, authDir string) error {
+	return h.registerFileOAuthSession(state, provider, authDir, "")
+}
+
+func (h *Handler) registerFileOAuthSession(state, provider, authDir, proxyURL string) error {
+	if err := ValidateOAuthState(state); err != nil {
+		return err
+	}
+	canonicalProvider, err := NormalizeOAuthCallbackProvider(provider)
+	if err != nil {
+		return err
+	}
+	dir, err := fileOAuthDirectory(authDir)
+	if err != nil {
+		return err
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if current, err := fileOAuthDirectory(fileOAuthConfigDir(h.cfg)); err != nil || current != dir {
+		return errOAuthSessionNotPending
+	}
+	oauthSessions.registerBuiltin(state, canonicalProvider, proxyURL, dir, h, h.fileOAuthGeneration)
+	return nil
+}
+
+func (h *Handler) registerPluginFileOAuthSession(state, provider string, metadata map[string]any, proxyURL string, scope oauthFileScope) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if scope.owner != h || scope.generation != h.fileOAuthGeneration {
+		return errOAuthSessionNotPending
+	}
+	dir, err := fileOAuthDirectory(fileOAuthConfigDir(h.cfg))
+	if err != nil {
+		return err
+	}
+	return oauthSessions.registerPlugin(state, provider, metadata, proxyURL, dir, h, h.fileOAuthGeneration)
+}
+
+// WriteFileOAuthCallback accepts callbacks only for this handler's active directory generation.
+func (h *Handler) WriteFileOAuthCallback(provider, state, code, errorMessage string) (string, error) {
+	if h == nil {
 		return "", errOAuthSessionNotPending
 	}
-	return writeOAuthCallbackFile(authDir, canonicalProvider, state, code, errorMessage)
+	canonicalProvider, err := normalizeOAuthCallbackProviderForPendingSession(provider, state)
+	if err != nil {
+		return "", err
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return oauthSessions.writePendingFileCallback(fileOAuthConfigDir(h.cfg), canonicalProvider, state, code, errorMessage, h, h.fileOAuthGeneration)
+}
+
+func (s *oauthSessionStore) writePendingFileCallback(authDir, provider, state, code, errorMessage string, owner *Handler, generation uint64) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.purgeExpiredLocked(time.Now())
+	session, ok := s.sessions[strings.TrimSpace(state)]
+	if !ok || session.Completed || session.Status != "" || !strings.EqualFold(session.Provider, provider) {
+		return "", errOAuthSessionNotPending
+	}
+	if session.SIWC != nil {
+		return "", ErrSIWCCallbackRequiresV8
+	}
+	if session.callbackDir == "" || session.callbackOwner != owner || session.callbackGeneration != generation {
+		return "", errOAuthSessionNotPending
+	}
+	current, err := fileOAuthDirectory(authDir)
+	if err != nil || current != session.callbackDir {
+		return "", errOAuthSessionNotPending
+	}
+	return writeOAuthCallbackFile(session.callbackDir, provider, state, code, errorMessage)
 }

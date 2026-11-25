@@ -12,10 +12,10 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
-	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 	"github.com/tidwall/gjson"
 )
 
@@ -81,7 +81,7 @@ func TestCodexConnectionPressureNeverReplaysStartedResponse(t *testing.T) {
 			auth := &cliproxyauth.Auth{ID: t.Name(), Provider: "codex", ProxyURL: "direct", Attributes: map[string]string{"api_key": "fixture", "base_url": server.URL, "fast_models": ""}, Metadata: map[string]any{"websockets": true}}
 			payload := []byte(`{"model":"gpt-6.1-sol","input":[{"role":"user","content":"synthetic test"}]}`)
 			opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("codex"), ResponseFormat: sdktranslator.FromString("codex"), OriginalRequest: payload}
-			_, _, err := runCodexFallbackRequest(ctx, exec, auth, cliproxyexecutor.Request{Model: "gpt-6.1-sol", Payload: payload}, opts, stream)
+			_, _, err := runOrdinaryCodexPressureRequest(ctx, exec, auth, cliproxyexecutor.Request{Model: "gpt-6.1-sol", Payload: payload}, opts, stream)
 			var status interface{ StatusCode() int }
 			if !errors.As(err, &status) || status.StatusCode() != http.StatusServiceUnavailable {
 				t.Fatalf("got %v, want connection pressure status 503", err)
@@ -91,4 +91,23 @@ func TestCodexConnectionPressureNeverReplaysStartedResponse(t *testing.T) {
 			}
 		})
 	}
+}
+
+func runOrdinaryCodexPressureRequest(ctx context.Context, exec *CodexAutoExecutor, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, stream bool) ([]byte, http.Header, error) {
+	if !stream {
+		response, err := exec.Execute(ctx, auth, req, opts)
+		return response.Payload, response.Headers, err
+	}
+	result, err := exec.ExecuteStream(ctx, auth, req, opts)
+	if err != nil {
+		return nil, nil, err
+	}
+	var payload []byte
+	for chunk := range result.Chunks {
+		payload = append(payload, chunk.Payload...)
+		if chunk.Err != nil {
+			err = chunk.Err
+		}
+	}
+	return payload, result.Headers, err
 }

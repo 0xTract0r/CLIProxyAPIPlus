@@ -5,23 +5,23 @@ import (
 	"testing"
 	"time"
 
-	_ "github.com/router-for-me/CLIProxyAPI/v7/internal/translator"
+	_ "github.com/router-for-me/CLIProxyAPI/v8/internal/translator"
 
 	// Import provider packages to trigger init() registration of ProviderAppliers
-	_ "github.com/router-for-me/CLIProxyAPI/v7/internal/thinking/provider/antigravity"
-	_ "github.com/router-for-me/CLIProxyAPI/v7/internal/thinking/provider/claude"
-	_ "github.com/router-for-me/CLIProxyAPI/v7/internal/thinking/provider/codex"
-	_ "github.com/router-for-me/CLIProxyAPI/v7/internal/thinking/provider/gemini"
-	_ "github.com/router-for-me/CLIProxyAPI/v7/internal/thinking/provider/interactions"
-	_ "github.com/router-for-me/CLIProxyAPI/v7/internal/thinking/provider/kimi"
-	_ "github.com/router-for-me/CLIProxyAPI/v7/internal/thinking/provider/openai"
-	_ "github.com/router-for-me/CLIProxyAPI/v7/internal/thinking/provider/xai"
+	_ "github.com/router-for-me/CLIProxyAPI/v8/internal/thinking/provider/antigravity"
+	_ "github.com/router-for-me/CLIProxyAPI/v8/internal/thinking/provider/claude"
+	_ "github.com/router-for-me/CLIProxyAPI/v8/internal/thinking/provider/codex"
+	_ "github.com/router-for-me/CLIProxyAPI/v8/internal/thinking/provider/gemini"
+	_ "github.com/router-for-me/CLIProxyAPI/v8/internal/thinking/provider/interactions"
+	_ "github.com/router-for-me/CLIProxyAPI/v8/internal/thinking/provider/kimi"
+	_ "github.com/router-for-me/CLIProxyAPI/v8/internal/thinking/provider/openai"
+	_ "github.com/router-for-me/CLIProxyAPI/v8/internal/thinking/provider/xai"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
-	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
+	"github.com/MoeForge/moego/ojson"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 )
 
 // thinkingTestCase represents a common test case structure for both suffix and body tests.
@@ -42,15 +42,25 @@ type thinkingTestCase struct {
 	expectErr       bool
 }
 
+func registerTestModelsForProviders(t *testing.T, prefix string) {
+	t.Helper()
+	reg := registry.GetGlobalRegistry()
+	models := getTestModels()
+	for _, provider := range []string{"gemini", "antigravity", "claude", "openai", "codex", "kimi", "xai", "interactions"} {
+		clientID := fmt.Sprintf("%s-%s", prefix, provider)
+		reg.RegisterClient(clientID, provider, models)
+		t.Cleanup(func() {
+			reg.UnregisterClient(clientID)
+		})
+	}
+}
+
 // TestThinkingE2EMatrix_Suffix tests the thinking configuration transformation using model name suffix.
 // Data flow: Input JSON → TranslateRequest → ApplyThinking → Validate Output
 // No helper functions are used; all test data is inline.
 func TestThinkingE2EMatrix_Suffix(t *testing.T) {
-	reg := registry.GetGlobalRegistry()
 	uid := fmt.Sprintf("thinking-e2e-suffix-%d", time.Now().UnixNano())
-
-	reg.RegisterClient(uid, "test", getTestModels())
-	defer reg.UnregisterClient(uid)
+	registerTestModelsForProviders(t, uid)
 
 	cases := []thinkingTestCase{
 		// level-model (Levels=minimal/low/medium/high, ZeroAllowed=false, DynamicAllowed=false)
@@ -241,7 +251,7 @@ func TestThinkingE2EMatrix_Suffix(t *testing.T) {
 			inputJSON:       `{"model":"level-subset-model(1)","messages":[{"role":"user","content":"hi"}]}`,
 			expectField:     "generationConfig.thinkingConfig.thinkingLevel",
 			expectValue:     "low",
-			includeThoughts: "true",
+			includeThoughts: "",
 			expectErr:       false,
 		},
 		// Case 17A: auto → medium → clamped to low when low/high are equally close
@@ -277,7 +287,7 @@ func TestThinkingE2EMatrix_Suffix(t *testing.T) {
 			inputJSON:       `{"model":"gemini-budget-model(medium)","messages":[{"role":"user","content":"hi"}]}`,
 			expectField:     "generationConfig.thinkingConfig.thinkingBudget",
 			expectValue:     "8192",
-			includeThoughts: "true",
+			includeThoughts: "",
 			expectErr:       false,
 		},
 		// Case 20: Effort xhigh → clamped to 20000 (max)
@@ -289,10 +299,10 @@ func TestThinkingE2EMatrix_Suffix(t *testing.T) {
 			inputJSON:       `{"model":"gemini-budget-model(xhigh)","messages":[{"role":"user","content":"hi"}]}`,
 			expectField:     "generationConfig.thinkingConfig.thinkingBudget",
 			expectValue:     "20000",
-			includeThoughts: "true",
+			includeThoughts: "",
 			expectErr:       false,
 		},
-		// Case 21: Effort none → clamped to 128 (min) → includeThoughts=false
+		// Case 21: Effort none → clamped to 128 (min)
 		{
 			name:            "21",
 			from:            "openai",
@@ -301,7 +311,7 @@ func TestThinkingE2EMatrix_Suffix(t *testing.T) {
 			inputJSON:       `{"model":"gemini-budget-model(none)","messages":[{"role":"user","content":"hi"}]}`,
 			expectField:     "generationConfig.thinkingConfig.thinkingBudget",
 			expectValue:     "128",
-			includeThoughts: "false",
+			includeThoughts: "",
 			expectErr:       false,
 		},
 		// Case 22: Effort auto → DynamicAllowed=true → -1
@@ -313,7 +323,7 @@ func TestThinkingE2EMatrix_Suffix(t *testing.T) {
 			inputJSON:       `{"model":"gemini-budget-model(auto)","messages":[{"role":"user","content":"hi"}]}`,
 			expectField:     "generationConfig.thinkingConfig.thinkingBudget",
 			expectValue:     "-1",
-			includeThoughts: "true",
+			includeThoughts: "",
 			expectErr:       false,
 		},
 		// Case 23: Claude source no suffix → passthrough
@@ -335,7 +345,7 @@ func TestThinkingE2EMatrix_Suffix(t *testing.T) {
 			inputJSON:       `{"model":"gemini-budget-model(8192)","messages":[{"role":"user","content":"hi"}]}`,
 			expectField:     "generationConfig.thinkingConfig.thinkingBudget",
 			expectValue:     "8192",
-			includeThoughts: "true",
+			includeThoughts: "",
 			expectErr:       false,
 		},
 		// Case 25: Budget 64000 → clamped to 20000 (max)
@@ -347,10 +357,10 @@ func TestThinkingE2EMatrix_Suffix(t *testing.T) {
 			inputJSON:       `{"model":"gemini-budget-model(64000)","messages":[{"role":"user","content":"hi"}]}`,
 			expectField:     "generationConfig.thinkingConfig.thinkingBudget",
 			expectValue:     "20000",
-			includeThoughts: "true",
+			includeThoughts: "",
 			expectErr:       false,
 		},
-		// Case 26: Budget 0 → clamped to 128 (min) → includeThoughts=false
+		// Case 26: Budget 0 → clamped to 128 (min)
 		{
 			name:            "26",
 			from:            "claude",
@@ -359,7 +369,7 @@ func TestThinkingE2EMatrix_Suffix(t *testing.T) {
 			inputJSON:       `{"model":"gemini-budget-model(0)","messages":[{"role":"user","content":"hi"}]}`,
 			expectField:     "generationConfig.thinkingConfig.thinkingBudget",
 			expectValue:     "128",
-			includeThoughts: "false",
+			includeThoughts: "",
 			expectErr:       false,
 		},
 		// Case 27: Budget -1 → DynamicAllowed=true → -1
@@ -371,7 +381,7 @@ func TestThinkingE2EMatrix_Suffix(t *testing.T) {
 			inputJSON:       `{"model":"gemini-budget-model(-1)","messages":[{"role":"user","content":"hi"}]}`,
 			expectField:     "generationConfig.thinkingConfig.thinkingBudget",
 			expectValue:     "-1",
-			includeThoughts: "true",
+			includeThoughts: "",
 			expectErr:       false,
 		},
 
@@ -396,7 +406,7 @@ func TestThinkingE2EMatrix_Suffix(t *testing.T) {
 			inputJSON:       `{"model":"gemini-mixed-model(high)","messages":[{"role":"user","content":"hi"}]}`,
 			expectField:     "generationConfig.thinkingConfig.thinkingLevel",
 			expectValue:     "high",
-			includeThoughts: "true",
+			includeThoughts: "",
 			expectErr:       false,
 		},
 		// Case 30: Effort xhigh → clamped to high
@@ -408,10 +418,10 @@ func TestThinkingE2EMatrix_Suffix(t *testing.T) {
 			inputJSON:       `{"model":"gemini-mixed-model(xhigh)","messages":[{"role":"user","content":"hi"}]}`,
 			expectField:     "generationConfig.thinkingConfig.thinkingLevel",
 			expectValue:     "high",
-			includeThoughts: "true",
+			includeThoughts: "",
 			expectErr:       false,
 		},
-		// Case 31: Effort none → clamped to low (min supported) → includeThoughts=false
+		// Case 31: Effort none → clamped to low (min supported)
 		{
 			name:            "31",
 			from:            "openai",
@@ -420,7 +430,7 @@ func TestThinkingE2EMatrix_Suffix(t *testing.T) {
 			inputJSON:       `{"model":"gemini-mixed-model(none)","messages":[{"role":"user","content":"hi"}]}`,
 			expectField:     "generationConfig.thinkingConfig.thinkingLevel",
 			expectValue:     "low",
-			includeThoughts: "false",
+			includeThoughts: "",
 			expectErr:       false,
 		},
 		// Case 32: Effort auto → DynamicAllowed=true → -1 (budget)
@@ -432,7 +442,7 @@ func TestThinkingE2EMatrix_Suffix(t *testing.T) {
 			inputJSON:       `{"model":"gemini-mixed-model(auto)","messages":[{"role":"user","content":"hi"}]}`,
 			expectField:     "generationConfig.thinkingConfig.thinkingBudget",
 			expectValue:     "-1",
-			includeThoughts: "true",
+			includeThoughts: "",
 			expectErr:       false,
 		},
 		// Case 33: Claude source no suffix → passthrough
@@ -454,7 +464,7 @@ func TestThinkingE2EMatrix_Suffix(t *testing.T) {
 			inputJSON:       `{"model":"gemini-mixed-model(8192)","messages":[{"role":"user","content":"hi"}]}`,
 			expectField:     "generationConfig.thinkingConfig.thinkingBudget",
 			expectValue:     "8192",
-			includeThoughts: "true",
+			includeThoughts: "",
 			expectErr:       false,
 		},
 		// Case 35: Budget 64000 → clamped to 32768 (max)
@@ -466,10 +476,10 @@ func TestThinkingE2EMatrix_Suffix(t *testing.T) {
 			inputJSON:       `{"model":"gemini-mixed-model(64000)","messages":[{"role":"user","content":"hi"}]}`,
 			expectField:     "generationConfig.thinkingConfig.thinkingBudget",
 			expectValue:     "32768",
-			includeThoughts: "true",
+			includeThoughts: "",
 			expectErr:       false,
 		},
-		// Case 36: Budget 0 → minimal → clamped to low (min level) → includeThoughts=false
+		// Case 36: Budget 0 → minimal → clamped to low (min level)
 		{
 			name:            "36",
 			from:            "claude",
@@ -478,7 +488,7 @@ func TestThinkingE2EMatrix_Suffix(t *testing.T) {
 			inputJSON:       `{"model":"gemini-mixed-model(0)","messages":[{"role":"user","content":"hi"}]}`,
 			expectField:     "generationConfig.thinkingConfig.thinkingLevel",
 			expectValue:     "low",
-			includeThoughts: "false",
+			includeThoughts: "",
 			expectErr:       false,
 		},
 		// Case 37: Budget -1 → DynamicAllowed=true → -1 (budget)
@@ -490,7 +500,7 @@ func TestThinkingE2EMatrix_Suffix(t *testing.T) {
 			inputJSON:       `{"model":"gemini-mixed-model(-1)","messages":[{"role":"user","content":"hi"}]}`,
 			expectField:     "generationConfig.thinkingConfig.thinkingBudget",
 			expectValue:     "-1",
-			includeThoughts: "true",
+			includeThoughts: "",
 			expectErr:       false,
 		},
 
@@ -626,7 +636,7 @@ func TestThinkingE2EMatrix_Suffix(t *testing.T) {
 			inputJSON:       `{"model":"antigravity-budget-model(medium)","contents":[{"role":"user","parts":[{"text":"hi"}]}]}`,
 			expectField:     "request.generationConfig.thinkingConfig.thinkingBudget",
 			expectValue:     "8192",
-			includeThoughts: "true",
+			includeThoughts: "",
 			expectErr:       false,
 		},
 		// Case 50: Effort xhigh → clamped to 20000 (max)
@@ -638,10 +648,10 @@ func TestThinkingE2EMatrix_Suffix(t *testing.T) {
 			inputJSON:       `{"model":"antigravity-budget-model(xhigh)","contents":[{"role":"user","parts":[{"text":"hi"}]}]}`,
 			expectField:     "request.generationConfig.thinkingConfig.thinkingBudget",
 			expectValue:     "20000",
-			includeThoughts: "true",
+			includeThoughts: "",
 			expectErr:       false,
 		},
-		// Case 51: Effort none → ZeroAllowed=true → 0 → includeThoughts=false
+		// Case 51: Effort none → ZeroAllowed=true → 0
 		{
 			name:            "51",
 			from:            "gemini",
@@ -650,7 +660,7 @@ func TestThinkingE2EMatrix_Suffix(t *testing.T) {
 			inputJSON:       `{"model":"antigravity-budget-model(none)","contents":[{"role":"user","parts":[{"text":"hi"}]}]}`,
 			expectField:     "request.generationConfig.thinkingConfig.thinkingBudget",
 			expectValue:     "0",
-			includeThoughts: "false",
+			includeThoughts: "",
 			expectErr:       false,
 		},
 		// Case 52: Effort auto → DynamicAllowed=true → -1
@@ -662,7 +672,7 @@ func TestThinkingE2EMatrix_Suffix(t *testing.T) {
 			inputJSON:       `{"model":"antigravity-budget-model(auto)","contents":[{"role":"user","parts":[{"text":"hi"}]}]}`,
 			expectField:     "request.generationConfig.thinkingConfig.thinkingBudget",
 			expectValue:     "-1",
-			includeThoughts: "true",
+			includeThoughts: "",
 			expectErr:       false,
 		},
 		// Case 53: Claude to Antigravity no suffix → passthrough
@@ -684,7 +694,7 @@ func TestThinkingE2EMatrix_Suffix(t *testing.T) {
 			inputJSON:       `{"model":"antigravity-budget-model(8192)","messages":[{"role":"user","content":"hi"}]}`,
 			expectField:     "request.generationConfig.thinkingConfig.thinkingBudget",
 			expectValue:     "8192",
-			includeThoughts: "true",
+			includeThoughts: "",
 			expectErr:       false,
 		},
 		// Case 55: Budget 64000 → clamped to 20000 (max)
@@ -696,10 +706,10 @@ func TestThinkingE2EMatrix_Suffix(t *testing.T) {
 			inputJSON:       `{"model":"antigravity-budget-model(64000)","messages":[{"role":"user","content":"hi"}]}`,
 			expectField:     "request.generationConfig.thinkingConfig.thinkingBudget",
 			expectValue:     "20000",
-			includeThoughts: "true",
+			includeThoughts: "",
 			expectErr:       false,
 		},
-		// Case 56: Budget 0 → ZeroAllowed=true → 0 → includeThoughts=false
+		// Case 56: Budget 0 → ZeroAllowed=true → 0
 		{
 			name:            "56",
 			from:            "claude",
@@ -708,7 +718,7 @@ func TestThinkingE2EMatrix_Suffix(t *testing.T) {
 			inputJSON:       `{"model":"antigravity-budget-model(0)","messages":[{"role":"user","content":"hi"}]}`,
 			expectField:     "request.generationConfig.thinkingConfig.thinkingBudget",
 			expectValue:     "0",
-			includeThoughts: "false",
+			includeThoughts: "",
 			expectErr:       false,
 		},
 		// Case 57: Budget -1 → DynamicAllowed=true → -1
@@ -720,7 +730,7 @@ func TestThinkingE2EMatrix_Suffix(t *testing.T) {
 			inputJSON:       `{"model":"antigravity-budget-model(-1)","messages":[{"role":"user","content":"hi"}]}`,
 			expectField:     "request.generationConfig.thinkingConfig.thinkingBudget",
 			expectValue:     "-1",
-			includeThoughts: "true",
+			includeThoughts: "",
 			expectErr:       false,
 		},
 
@@ -830,7 +840,7 @@ func TestThinkingE2EMatrix_Suffix(t *testing.T) {
 			expectValue: "medium",
 			expectErr:   false,
 		},
-		// Case 68: Budget 64000 → passthrough logic → xhigh
+		// Case 68: Budget 64000 → passthrough logic → max
 		{
 			name:        "68",
 			from:        "gemini",
@@ -838,7 +848,7 @@ func TestThinkingE2EMatrix_Suffix(t *testing.T) {
 			model:       "user-defined-model(64000)",
 			inputJSON:   `{"model":"user-defined-model(64000)","contents":[{"role":"user","parts":[{"text":"hi"}]}]}`,
 			expectField: "reasoning_effort",
-			expectValue: "xhigh",
+			expectValue: "max",
 			expectErr:   false,
 		},
 		// Case 69: Budget 0 → passthrough logic → none
@@ -885,7 +895,7 @@ func TestThinkingE2EMatrix_Suffix(t *testing.T) {
 			expectValue: "medium",
 			expectErr:   false,
 		},
-		// Case 73: Budget 64000 → passthrough logic → xhigh
+		// Case 73: Budget 64000 → passthrough logic → max
 		{
 			name:        "73",
 			from:        "claude",
@@ -893,7 +903,7 @@ func TestThinkingE2EMatrix_Suffix(t *testing.T) {
 			model:       "user-defined-model(64000)",
 			inputJSON:   `{"model":"user-defined-model(64000)","messages":[{"role":"user","content":"hi"}]}`,
 			expectField: "reasoning.effort",
-			expectValue: "xhigh",
+			expectValue: "max",
 			expectErr:   false,
 		},
 		// Case 74: Budget 0 → passthrough logic → none
@@ -927,7 +937,7 @@ func TestThinkingE2EMatrix_Suffix(t *testing.T) {
 			inputJSON:       `{"model":"user-defined-model(8192)","messages":[{"role":"user","content":"hi"}]}`,
 			expectField:     "generationConfig.thinkingConfig.thinkingBudget",
 			expectValue:     "8192",
-			includeThoughts: "true",
+			includeThoughts: "",
 			expectErr:       false,
 		},
 		// Case 77: OpenAI to Claude budget 8192 → passthrough → 8192
@@ -950,7 +960,7 @@ func TestThinkingE2EMatrix_Suffix(t *testing.T) {
 			inputJSON:       `{"model":"user-defined-model(8192)","input":[{"role":"user","content":"hi"}]}`,
 			expectField:     "generationConfig.thinkingConfig.thinkingBudget",
 			expectValue:     "8192",
-			includeThoughts: "true",
+			includeThoughts: "",
 			expectErr:       false,
 		},
 		// Case 79: OpenAI-Response to Claude budget 8192 → passthrough → 8192
@@ -1018,7 +1028,7 @@ func TestThinkingE2EMatrix_Suffix(t *testing.T) {
 			inputJSON:       `{"model":"gemini-budget-model(8192)","contents":[{"role":"user","parts":[{"text":"hi"}]}]}`,
 			expectField:     "generationConfig.thinkingConfig.thinkingBudget",
 			expectValue:     "8192",
-			includeThoughts: "true",
+			includeThoughts: "",
 			expectErr:       false,
 		},
 		// Case 85: Gemini to Gemini, budget 64000 → clamped to Max
@@ -1030,7 +1040,7 @@ func TestThinkingE2EMatrix_Suffix(t *testing.T) {
 			inputJSON:       `{"model":"gemini-budget-model(64000)","contents":[{"role":"user","parts":[{"text":"hi"}]}]}`,
 			expectField:     "generationConfig.thinkingConfig.thinkingBudget",
 			expectValue:     "20000",
-			includeThoughts: "true",
+			includeThoughts: "",
 			expectErr:       false,
 		},
 		// Case 86: Claude to Claude, budget 8192 → passthrough thinking.budget_tokens
@@ -1067,7 +1077,7 @@ func TestThinkingE2EMatrix_Suffix(t *testing.T) {
 			inputJSON:       `{"model":"gemini-budget-model(64000)","contents":[{"role":"user","parts":[{"text":"hi"}]}]}`,
 			expectField:     "request.generationConfig.thinkingConfig.thinkingBudget",
 			expectValue:     "20000",
-			includeThoughts: "true",
+			includeThoughts: "",
 			expectErr:       false,
 		},
 		// Case 89: Gemini to Antigravity, budget 8192 → passthrough (normal value)
@@ -1079,10 +1089,11 @@ func TestThinkingE2EMatrix_Suffix(t *testing.T) {
 			inputJSON:       `{"model":"gemini-budget-model(8192)","contents":[{"role":"user","parts":[{"text":"hi"}]}]}`,
 			expectField:     "request.generationConfig.thinkingConfig.thinkingBudget",
 			expectValue:     "8192",
-			includeThoughts: "true",
+			includeThoughts: "",
 			expectErr:       false,
 		},
 		// Case 95: Gemini-CLI to Antigravity, budget 8192 → passthrough (normal value)
+		// A budget alone does not request a reasoning summary; the explicit flag wins.
 		{
 			name:            "95",
 			from:            "gemini-cli",
@@ -1091,7 +1102,29 @@ func TestThinkingE2EMatrix_Suffix(t *testing.T) {
 			inputJSON:       `{"model":"gemini-budget-model(8192)","request":{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}}`,
 			expectField:     "request.generationConfig.thinkingConfig.thinkingBudget",
 			expectValue:     "8192",
+			includeThoughts: "",
+			expectErr:       false,
+		},
+		{
+			name:            "95_explicit_true",
+			from:            "gemini-cli",
+			to:              "antigravity",
+			model:           "gemini-budget-model(8192)",
+			inputJSON:       `{"model":"gemini-budget-model(8192)","request":{"generationConfig":{"thinkingConfig":{"includeThoughts":true}},"contents":[{"role":"user","parts":[{"text":"hi"}]}]}}`,
+			expectField:     "request.generationConfig.thinkingConfig.thinkingBudget",
+			expectValue:     "8192",
 			includeThoughts: "true",
+			expectErr:       false,
+		},
+		{
+			name:            "95_explicit_false",
+			from:            "gemini-cli",
+			to:              "antigravity",
+			model:           "gemini-budget-model(8192)",
+			inputJSON:       `{"model":"gemini-budget-model(8192)","request":{"generationConfig":{"thinkingConfig":{"includeThoughts":false}},"contents":[{"role":"user","parts":[{"text":"hi"}]}]}}`,
+			expectField:     "request.generationConfig.thinkingConfig.thinkingBudget",
+			expectValue:     "8192",
+			includeThoughts: "false",
 			expectErr:       false,
 		},
 
@@ -1210,6 +1243,116 @@ func TestThinkingE2EMatrix_Suffix(t *testing.T) {
 			expectValue: "low",
 			expectErr:   false,
 		},
+		// Global max effort and clamping after conversion.
+		// Case 90: Keep an explicitly supported max effort.
+		{
+			name:        "upstream_90",
+			from:        "openai-response",
+			to:          "codex",
+			model:       "level-max-model(max)",
+			inputJSON:   `{"model":"level-max-model(max)","input":[{"role":"user","content":"hi"}]}`,
+			expectField: "reasoning.effort",
+			expectValue: "max",
+		},
+		// Case 91: 32768 is the last budget in the xhigh band.
+		{
+			name:        "upstream_91",
+			from:        "gemini",
+			to:          "codex",
+			model:       "level-max-model(32768)",
+			inputJSON:   `{"model":"level-max-model(32768)","contents":[{"role":"user","parts":[{"text":"hi"}]}]}`,
+			expectField: "reasoning.effort",
+			expectValue: "xhigh",
+		},
+		// Case 92: 32769 is the first budget in the max band.
+		{
+			name:        "upstream_92",
+			from:        "gemini",
+			to:          "codex",
+			model:       "level-max-model(32769)",
+			inputJSON:   `{"model":"level-max-model(32769)","contents":[{"role":"user","parts":[{"text":"hi"}]}]}`,
+			expectField: "reasoning.effort",
+			expectValue: "max",
+		},
+		// Case 93: Budgets above 128000 still select max.
+		{
+			name:        "upstream_93",
+			from:        "gemini",
+			to:          "codex",
+			model:       "level-max-model(128001)",
+			inputJSON:   `{"model":"level-max-model(128001)","contents":[{"role":"user","parts":[{"text":"hi"}]}]}`,
+			expectField: "reasoning.effort",
+			expectValue: "max",
+		},
+		// Case 94: Clamp a derived level to the same-protocol model maximum.
+		{
+			name:        "upstream_94",
+			from:        "gemini",
+			to:          "gemini",
+			model:       "level-subset-model(64000)",
+			inputJSON:   `{"model":"level-subset-model(64000)","contents":[{"role":"user","parts":[{"text":"hi"}]}]}`,
+			expectField: "generationConfig.thinkingConfig.thinkingLevel",
+			expectValue: "high",
+		},
+		// Case 95: Clamp a derived budget to the same-protocol model maximum.
+		{
+			name:        "upstream_95",
+			from:        "gemini",
+			to:          "gemini",
+			model:       "gemini-budget-model(max)",
+			inputJSON:   `{"model":"gemini-budget-model(max)","contents":[{"role":"user","parts":[{"text":"hi"}]}]}`,
+			expectField: "generationConfig.thinkingConfig.thinkingBudget",
+			expectValue: "20000",
+		},
+		// Case 96: Convert max effort to its representative budget of 128000.
+		{
+			name:        "upstream_96",
+			from:        "claude",
+			to:          "claude",
+			model:       "claude-budget-model(max)",
+			inputJSON:   `{"model":"claude-budget-model(max)","messages":[{"role":"user","content":"hi"}]}`,
+			expectField: "thinking.budget_tokens",
+			expectValue: "128000",
+		},
+		// Case 97: Raise the budget for minimal effort to the Claude model minimum.
+		{
+			name:        "upstream_97",
+			from:        "claude",
+			to:          "claude",
+			model:       "claude-budget-model(minimal)",
+			inputJSON:   `{"model":"claude-budget-model(minimal)","messages":[{"role":"user","content":"hi"}]}`,
+			expectField: "thinking.budget_tokens",
+			expectValue: "1024",
+		},
+		// Case 98: Reject explicit max on a same-protocol model without that level.
+		{
+			name:      "upstream_98",
+			from:      "gemini",
+			to:        "gemini",
+			model:     "level-subset-model(max)",
+			inputJSON: `{"model":"level-subset-model(max)","contents":[{"role":"user","parts":[{"text":"hi"}]}]}`,
+			expectErr: true,
+		},
+		// Case 99: Clamp a derived level to the custom model levels.
+		{
+			name:        "upstream_99",
+			from:        "gemini",
+			to:          "openai",
+			model:       "user-defined-level-model(64000)",
+			inputJSON:   `{"model":"user-defined-level-model(64000)","contents":[{"role":"user","parts":[{"text":"hi"}]}]}`,
+			expectField: "reasoning_effort",
+			expectValue: "xhigh",
+		},
+		// Case 100: Clamp a derived budget to the custom model budget range.
+		{
+			name:        "upstream_100",
+			from:        "openai",
+			to:          "gemini",
+			model:       "user-defined-budget-model(max)",
+			inputJSON:   `{"model":"user-defined-budget-model(max)","messages":[{"role":"user","content":"hi"}]}`,
+			expectField: "generationConfig.thinkingConfig.thinkingBudget",
+			expectValue: "20000",
+		},
 	}
 
 	runThinkingTests(t, cases)
@@ -1218,11 +1361,8 @@ func TestThinkingE2EMatrix_Suffix(t *testing.T) {
 // TestThinkingE2EMatrix_Body tests the thinking configuration transformation using request body parameters.
 // Data flow: Input JSON with thinking params → TranslateRequest → ApplyThinking → Validate Output
 func TestThinkingE2EMatrix_Body(t *testing.T) {
-	reg := registry.GetGlobalRegistry()
 	uid := fmt.Sprintf("thinking-e2e-body-%d", time.Now().UnixNano())
-
-	reg.RegisterClient(uid, "test", getTestModels())
-	defer reg.UnregisterClient(uid)
+	registerTestModelsForProviders(t, uid)
 
 	cases := []thinkingTestCase{
 		// level-model (Levels=minimal/low/medium/high, ZeroAllowed=false, DynamicAllowed=false)
@@ -1413,7 +1553,7 @@ func TestThinkingE2EMatrix_Body(t *testing.T) {
 			inputJSON:       `{"model":"level-subset-model","messages":[{"role":"user","content":"hi"}],"thinking":{"type":"enabled","budget_tokens":1}}`,
 			expectField:     "generationConfig.thinkingConfig.thinkingLevel",
 			expectValue:     "low",
-			includeThoughts: "true",
+			includeThoughts: "",
 			expectErr:       false,
 		},
 
@@ -1496,7 +1636,7 @@ func TestThinkingE2EMatrix_Body(t *testing.T) {
 			inputJSON:       `{"model":"gemini-budget-model","messages":[{"role":"user","content":"hi"}],"thinking":{"type":"enabled","budget_tokens":8192}}`,
 			expectField:     "generationConfig.thinkingConfig.thinkingBudget",
 			expectValue:     "8192",
-			includeThoughts: "true",
+			includeThoughts: "",
 			expectErr:       false,
 		},
 		// Case 25: thinking.budget_tokens=64000 → clamped to 20000
@@ -1508,10 +1648,10 @@ func TestThinkingE2EMatrix_Body(t *testing.T) {
 			inputJSON:       `{"model":"gemini-budget-model","messages":[{"role":"user","content":"hi"}],"thinking":{"type":"enabled","budget_tokens":64000}}`,
 			expectField:     "generationConfig.thinkingConfig.thinkingBudget",
 			expectValue:     "20000",
-			includeThoughts: "true",
+			includeThoughts: "",
 			expectErr:       false,
 		},
-		// Case 26: thinking.budget_tokens=0 → clamped to 128 → includeThoughts=false
+		// Case 26: thinking.budget_tokens=0 → clamped to 128
 		{
 			name:            "26",
 			from:            "claude",
@@ -1520,7 +1660,7 @@ func TestThinkingE2EMatrix_Body(t *testing.T) {
 			inputJSON:       `{"model":"gemini-budget-model","messages":[{"role":"user","content":"hi"}],"thinking":{"type":"enabled","budget_tokens":0}}`,
 			expectField:     "generationConfig.thinkingConfig.thinkingBudget",
 			expectValue:     "128",
-			includeThoughts: "false",
+			includeThoughts: "",
 			expectErr:       false,
 		},
 		// Case 27: thinking.budget_tokens=-1 → -1 (DynamicAllowed=true)
@@ -1532,7 +1672,7 @@ func TestThinkingE2EMatrix_Body(t *testing.T) {
 			inputJSON:       `{"model":"gemini-budget-model","messages":[{"role":"user","content":"hi"}],"thinking":{"type":"enabled","budget_tokens":-1}}`,
 			expectField:     "generationConfig.thinkingConfig.thinkingBudget",
 			expectValue:     "-1",
-			includeThoughts: "true",
+			includeThoughts: "",
 			expectErr:       false,
 		},
 
@@ -1584,7 +1724,8 @@ func TestThinkingE2EMatrix_Body(t *testing.T) {
 			includeThoughts: "false",
 			expectErr:       false,
 		},
-		// Case 31A: reasoning_effort=none with zero allowed → delete thinkingConfig
+		// Case 31A: reasoning_effort=none with zero allowed removes the entire
+		// thinking config. includeThoughts alone would restore the model default.
 		{
 			name:        "31A",
 			from:        "openai",
@@ -1594,7 +1735,7 @@ func TestThinkingE2EMatrix_Body(t *testing.T) {
 			expectField: "",
 			expectErr:   false,
 		},
-		// Case 31B: reasoning_effort=none with zero allowed to Antigravity → delete thinkingConfig
+		// Case 31B: Antigravity keeps the same fully disabled representation.
 		{
 			name:        "31B",
 			from:        "openai",
@@ -1655,7 +1796,7 @@ func TestThinkingE2EMatrix_Body(t *testing.T) {
 			inputJSON:       `{"model":"gemini-mixed-model","messages":[{"role":"user","content":"hi"}],"thinking":{"type":"enabled","budget_tokens":8192}}`,
 			expectField:     "generationConfig.thinkingConfig.thinkingBudget",
 			expectValue:     "8192",
-			includeThoughts: "true",
+			includeThoughts: "",
 			expectErr:       false,
 		},
 		// Case 35: thinking.budget_tokens=64000 → clamped to 32768 (keeps budget)
@@ -1667,10 +1808,10 @@ func TestThinkingE2EMatrix_Body(t *testing.T) {
 			inputJSON:       `{"model":"gemini-mixed-model","messages":[{"role":"user","content":"hi"}],"thinking":{"type":"enabled","budget_tokens":64000}}`,
 			expectField:     "generationConfig.thinkingConfig.thinkingBudget",
 			expectValue:     "32768",
-			includeThoughts: "true",
+			includeThoughts: "",
 			expectErr:       false,
 		},
-		// Case 36: thinking.budget_tokens=0 → clamped to low → includeThoughts=false
+		// Case 36: thinking.budget_tokens=0 → clamped to low
 		{
 			name:            "36",
 			from:            "claude",
@@ -1679,7 +1820,7 @@ func TestThinkingE2EMatrix_Body(t *testing.T) {
 			inputJSON:       `{"model":"gemini-mixed-model","messages":[{"role":"user","content":"hi"}],"thinking":{"type":"enabled","budget_tokens":0}}`,
 			expectField:     "generationConfig.thinkingConfig.thinkingLevel",
 			expectValue:     "low",
-			includeThoughts: "false",
+			includeThoughts: "",
 			expectErr:       false,
 		},
 		// Case 37: thinking.budget_tokens=-1 → -1 (DynamicAllowed=true)
@@ -1691,7 +1832,7 @@ func TestThinkingE2EMatrix_Body(t *testing.T) {
 			inputJSON:       `{"model":"gemini-mixed-model","messages":[{"role":"user","content":"hi"}],"thinking":{"type":"enabled","budget_tokens":-1}}`,
 			expectField:     "generationConfig.thinkingConfig.thinkingBudget",
 			expectValue:     "-1",
-			includeThoughts: "true",
+			includeThoughts: "",
 			expectErr:       false,
 		},
 
@@ -1827,7 +1968,7 @@ func TestThinkingE2EMatrix_Body(t *testing.T) {
 			inputJSON:       `{"model":"antigravity-budget-model","contents":[{"role":"user","parts":[{"text":"hi"}]}],"generationConfig":{"thinkingConfig":{"thinkingLevel":"medium"}}}`,
 			expectField:     "request.generationConfig.thinkingConfig.thinkingBudget",
 			expectValue:     "8192",
-			includeThoughts: "true",
+			includeThoughts: "",
 			expectErr:       false,
 		},
 		// Case 50: thinkingLevel=xhigh → clamped to 20000
@@ -1839,7 +1980,7 @@ func TestThinkingE2EMatrix_Body(t *testing.T) {
 			inputJSON:       `{"model":"antigravity-budget-model","contents":[{"role":"user","parts":[{"text":"hi"}]}],"generationConfig":{"thinkingConfig":{"thinkingLevel":"xhigh"}}}`,
 			expectField:     "request.generationConfig.thinkingConfig.thinkingBudget",
 			expectValue:     "20000",
-			includeThoughts: "true",
+			includeThoughts: "",
 			expectErr:       false,
 		},
 		// Case 51: thinkingLevel=none → 0 (ZeroAllowed=true)
@@ -1851,7 +1992,7 @@ func TestThinkingE2EMatrix_Body(t *testing.T) {
 			inputJSON:       `{"model":"antigravity-budget-model","contents":[{"role":"user","parts":[{"text":"hi"}]}],"generationConfig":{"thinkingConfig":{"thinkingLevel":"none"}}}`,
 			expectField:     "request.generationConfig.thinkingConfig.thinkingBudget",
 			expectValue:     "0",
-			includeThoughts: "false",
+			includeThoughts: "",
 			expectErr:       false,
 		},
 		// Case 52: thinkingBudget=-1 → -1 (DynamicAllowed=true)
@@ -1863,7 +2004,7 @@ func TestThinkingE2EMatrix_Body(t *testing.T) {
 			inputJSON:       `{"model":"antigravity-budget-model","contents":[{"role":"user","parts":[{"text":"hi"}]}],"generationConfig":{"thinkingConfig":{"thinkingBudget":-1}}}`,
 			expectField:     "request.generationConfig.thinkingConfig.thinkingBudget",
 			expectValue:     "-1",
-			includeThoughts: "true",
+			includeThoughts: "",
 			expectErr:       false,
 		},
 		// Case 53: Claude no param → passthrough
@@ -1885,7 +2026,7 @@ func TestThinkingE2EMatrix_Body(t *testing.T) {
 			inputJSON:       `{"model":"antigravity-budget-model","messages":[{"role":"user","content":"hi"}],"thinking":{"type":"enabled","budget_tokens":8192}}`,
 			expectField:     "request.generationConfig.thinkingConfig.thinkingBudget",
 			expectValue:     "8192",
-			includeThoughts: "true",
+			includeThoughts: "",
 			expectErr:       false,
 		},
 		// Case 55: thinking.budget_tokens=64000 → clamped to 20000
@@ -1897,7 +2038,7 @@ func TestThinkingE2EMatrix_Body(t *testing.T) {
 			inputJSON:       `{"model":"antigravity-budget-model","messages":[{"role":"user","content":"hi"}],"thinking":{"type":"enabled","budget_tokens":64000}}`,
 			expectField:     "request.generationConfig.thinkingConfig.thinkingBudget",
 			expectValue:     "20000",
-			includeThoughts: "true",
+			includeThoughts: "",
 			expectErr:       false,
 		},
 		// Case 56: thinking.budget_tokens=0 → 0 (ZeroAllowed=true)
@@ -1909,7 +2050,7 @@ func TestThinkingE2EMatrix_Body(t *testing.T) {
 			inputJSON:       `{"model":"antigravity-budget-model","messages":[{"role":"user","content":"hi"}],"thinking":{"type":"enabled","budget_tokens":0}}`,
 			expectField:     "request.generationConfig.thinkingConfig.thinkingBudget",
 			expectValue:     "0",
-			includeThoughts: "false",
+			includeThoughts: "",
 			expectErr:       false,
 		},
 		// Case 57: thinking.budget_tokens=-1 → -1 (DynamicAllowed=true)
@@ -1921,7 +2062,7 @@ func TestThinkingE2EMatrix_Body(t *testing.T) {
 			inputJSON:       `{"model":"antigravity-budget-model","messages":[{"role":"user","content":"hi"}],"thinking":{"type":"enabled","budget_tokens":-1}}`,
 			expectField:     "request.generationConfig.thinkingConfig.thinkingBudget",
 			expectValue:     "-1",
-			includeThoughts: "true",
+			includeThoughts: "",
 			expectErr:       false,
 		},
 
@@ -2031,7 +2172,7 @@ func TestThinkingE2EMatrix_Body(t *testing.T) {
 			expectValue: "medium",
 			expectErr:   false,
 		},
-		// Case 68: thinkingBudget=64000 → xhigh (passthrough)
+		// Case 68: thinkingBudget=64000 → max (passthrough)
 		{
 			name:        "68",
 			from:        "gemini",
@@ -2039,7 +2180,7 @@ func TestThinkingE2EMatrix_Body(t *testing.T) {
 			model:       "user-defined-model",
 			inputJSON:   `{"model":"user-defined-model","contents":[{"role":"user","parts":[{"text":"hi"}]}],"generationConfig":{"thinkingConfig":{"thinkingBudget":64000}}}`,
 			expectField: "reasoning_effort",
-			expectValue: "xhigh",
+			expectValue: "max",
 			expectErr:   false,
 		},
 		// Case 69: thinkingBudget=0 → none
@@ -2086,7 +2227,7 @@ func TestThinkingE2EMatrix_Body(t *testing.T) {
 			expectValue: "medium",
 			expectErr:   false,
 		},
-		// Case 73: thinking.budget_tokens=64000 → xhigh (passthrough)
+		// Case 73: thinking.budget_tokens=64000 → max (passthrough)
 		{
 			name:        "73",
 			from:        "claude",
@@ -2094,7 +2235,7 @@ func TestThinkingE2EMatrix_Body(t *testing.T) {
 			model:       "user-defined-model",
 			inputJSON:   `{"model":"user-defined-model","messages":[{"role":"user","content":"hi"}],"thinking":{"type":"enabled","budget_tokens":64000}}`,
 			expectField: "reasoning.effort",
-			expectValue: "xhigh",
+			expectValue: "max",
 			expectErr:   false,
 		},
 		// Case 74: thinking.budget_tokens=0 → none
@@ -2151,7 +2292,7 @@ func TestThinkingE2EMatrix_Body(t *testing.T) {
 			inputJSON:       `{"model":"user-defined-model","input":[{"role":"user","content":"hi"}],"reasoning":{"effort":"medium"}}`,
 			expectField:     "generationConfig.thinkingConfig.thinkingBudget",
 			expectValue:     "8192",
-			includeThoughts: "true",
+			includeThoughts: "",
 			expectErr:       false,
 		},
 		// Case 79: OpenAI-Response reasoning.effort=medium to Claude → 8192
@@ -2219,7 +2360,7 @@ func TestThinkingE2EMatrix_Body(t *testing.T) {
 			inputJSON:       `{"model":"gemini-budget-model","contents":[{"role":"user","parts":[{"text":"hi"}]}],"generationConfig":{"thinkingConfig":{"thinkingBudget":8192}}}`,
 			expectField:     "generationConfig.thinkingConfig.thinkingBudget",
 			expectValue:     "8192",
-			includeThoughts: "true",
+			includeThoughts: "",
 			expectErr:       false,
 		},
 		// Case 85: Gemini to Gemini, thinkingBudget=64000 → exceeds Max error
@@ -2275,8 +2416,120 @@ func TestThinkingE2EMatrix_Body(t *testing.T) {
 			inputJSON:       `{"model":"gemini-budget-model","contents":[{"role":"user","parts":[{"text":"hi"}]}],"generationConfig":{"thinkingConfig":{"thinkingBudget":8192}}}`,
 			expectField:     "request.generationConfig.thinkingConfig.thinkingBudget",
 			expectValue:     "8192",
-			includeThoughts: "true",
+			includeThoughts: "",
 			expectErr:       false,
+		},
+
+		// Global max effort and clamping after conversion.
+		// Case 90: Keep an explicitly supported max effort.
+		{
+			name:        "90",
+			from:        "openai-response",
+			to:          "codex",
+			model:       "level-max-model",
+			inputJSON:   `{"model":"level-max-model","input":[{"role":"user","content":"hi"}],"reasoning":{"effort":"max"}}`,
+			expectField: "reasoning.effort",
+			expectValue: "max",
+		},
+		// Case 91: 32768 is the last budget in the xhigh band.
+		{
+			name:        "91",
+			from:        "gemini",
+			to:          "codex",
+			model:       "level-max-model",
+			inputJSON:   `{"model":"level-max-model","contents":[{"role":"user","parts":[{"text":"hi"}]}],"generationConfig":{"thinkingConfig":{"thinkingBudget":32768}}}`,
+			expectField: "reasoning.effort",
+			expectValue: "xhigh",
+		},
+		// Case 92: 32769 is the first budget in the max band.
+		{
+			name:        "92",
+			from:        "gemini",
+			to:          "codex",
+			model:       "level-max-model",
+			inputJSON:   `{"model":"level-max-model","contents":[{"role":"user","parts":[{"text":"hi"}]}],"generationConfig":{"thinkingConfig":{"thinkingBudget":32769}}}`,
+			expectField: "reasoning.effort",
+			expectValue: "max",
+		},
+		// Case 93: Budgets above 128000 still select max.
+		{
+			name:        "93",
+			from:        "gemini",
+			to:          "codex",
+			model:       "level-max-model",
+			inputJSON:   `{"model":"level-max-model","contents":[{"role":"user","parts":[{"text":"hi"}]}],"generationConfig":{"thinkingConfig":{"thinkingBudget":128001}}}`,
+			expectField: "reasoning.effort",
+			expectValue: "max",
+		},
+		// Case 94: Clamp a derived level to the same-protocol model maximum.
+		{
+			name:        "94",
+			from:        "gemini",
+			to:          "gemini",
+			model:       "level-subset-model",
+			inputJSON:   `{"model":"level-subset-model","contents":[{"role":"user","parts":[{"text":"hi"}]}],"generationConfig":{"thinkingConfig":{"thinkingBudget":64000}}}`,
+			expectField: "generationConfig.thinkingConfig.thinkingLevel",
+			expectValue: "high",
+		},
+		// Case 95: Clamp a derived budget to the same-protocol model maximum.
+		{
+			name:        "95",
+			from:        "gemini",
+			to:          "gemini",
+			model:       "gemini-budget-model",
+			inputJSON:   `{"model":"gemini-budget-model","contents":[{"role":"user","parts":[{"text":"hi"}]}],"generationConfig":{"thinkingConfig":{"thinkingLevel":"max"}}}`,
+			expectField: "generationConfig.thinkingConfig.thinkingBudget",
+			expectValue: "20000",
+		},
+		// Case 96: Convert max effort to its representative budget of 128000.
+		{
+			name:        "96",
+			from:        "claude",
+			to:          "claude",
+			model:       "claude-budget-model",
+			inputJSON:   `{"model":"claude-budget-model","messages":[{"role":"user","content":"hi"}],"thinking":{"type":"adaptive"},"output_config":{"effort":"max"}}`,
+			expectField: "thinking.budget_tokens",
+			expectValue: "128000",
+		},
+		// Case 97: Raise the budget for minimal effort to the Claude model minimum.
+		{
+			name:        "97",
+			from:        "claude",
+			to:          "claude",
+			model:       "claude-budget-model",
+			inputJSON:   `{"model":"claude-budget-model","messages":[{"role":"user","content":"hi"}],"thinking":{"type":"adaptive"},"output_config":{"effort":"minimal"}}`,
+			expectField: "thinking.budget_tokens",
+			expectValue: "1024",
+		},
+		// Case 98: Reject explicit max on a same-protocol model without that level.
+		{
+			name:      "98",
+			from:      "gemini",
+			to:        "gemini",
+			model:     "level-subset-model",
+			inputJSON: `{"model":"level-subset-model","contents":[{"role":"user","parts":[{"text":"hi"}]}],"generationConfig":{"thinkingConfig":{"thinkingLevel":"max"}}}`,
+			expectErr: true,
+		},
+		// Case 99: Clamp a derived level to the custom model levels.
+		{
+			name:        "99",
+			from:        "gemini",
+			to:          "openai",
+			model:       "user-defined-level-model",
+			inputJSON:   `{"model":"user-defined-level-model","contents":[{"role":"user","parts":[{"text":"hi"}]}],"generationConfig":{"thinkingConfig":{"thinkingBudget":64000}}}`,
+			expectField: "reasoning_effort",
+			expectValue: "xhigh",
+		},
+		// Case 100: Clamp a derived budget to the custom model budget range.
+		{
+			name:            "100",
+			from:            "openai",
+			to:              "gemini",
+			model:           "user-defined-budget-model",
+			inputJSON:       `{"model":"user-defined-budget-model","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"max"}`,
+			expectField:     "generationConfig.thinkingConfig.thinkingBudget",
+			expectValue:     "20000",
+			includeThoughts: "true",
 		},
 	}
 
@@ -2285,11 +2538,8 @@ func TestThinkingE2EMatrix_Body(t *testing.T) {
 
 // TestThinkingE2EProviderTargets covers provider-specific targets that are not part of the main matrix.
 func TestThinkingE2EProviderTargets(t *testing.T) {
-	reg := registry.GetGlobalRegistry()
 	uid := fmt.Sprintf("thinking-e2e-provider-targets-%d", time.Now().UnixNano())
-
-	reg.RegisterClient(uid, "test", getTestModels())
-	defer reg.UnregisterClient(uid)
+	registerTestModelsForProviders(t, uid)
 
 	cases := []thinkingTestCase{
 		// Kimi target: emit the native thinking object and accept reasoning_effort only as legacy input.
@@ -2483,6 +2733,18 @@ func TestThinkingE2EProviderTargets(t *testing.T) {
 			expectValue2: "medium",
 			expectAbsent: []string{"reasoning_effort"},
 		},
+		{
+			name:         "K17",
+			from:         "gemini",
+			to:           "kimi",
+			model:        "kimi-toggle-thinking-model",
+			inputJSON:    `{"model":"kimi-toggle-thinking-model","contents":[{"role":"user","parts":[{"text":"hi"}]}],"generationConfig":{"thinkingConfig":{"thinkingBudget":64000}}}`,
+			expectField:  "thinking.type",
+			expectValue:  "enabled",
+			expectField2: "thinking.effort",
+			expectValue2: "high",
+			expectAbsent: []string{"reasoning_effort"},
+		},
 
 		// xAI target: Grok uses Responses-compatible reasoning.effort with Grok-specific levels.
 		{
@@ -2575,8 +2837,17 @@ func TestThinkingE2EProviderTargets(t *testing.T) {
 			expectField: "reasoning.effort",
 			expectValue: "high",
 		},
+		{
+			name:        "X11",
+			from:        "gemini",
+			to:          "xai",
+			model:       "xai-level-model",
+			inputJSON:   `{"model":"xai-level-model","contents":[{"role":"user","parts":[{"text":"hi"}]}],"generationConfig":{"thinkingConfig":{"thinkingBudget":64000}}}`,
+			expectField: "reasoning.effort",
+			expectValue: "high",
+		},
 
-		// Interactions target: native API uses generation_config.thinking_level and thinking_summaries.
+		// Interactions target: native API uses generation_config.thinking_level and optional thinking_summaries.
 		{
 			name:         "I1",
 			from:         "interactions",
@@ -2589,15 +2860,66 @@ func TestThinkingE2EProviderTargets(t *testing.T) {
 			expectValue2: "auto",
 		},
 		{
-			name:         "I2",
+			name:        "I2",
+			from:        "interactions",
+			to:          "interactions",
+			model:       "level-model(8192)",
+			inputJSON:   `{"model":"level-model(8192)","input":"hi"}`,
+			expectField: "generation_config.thinking_level",
+			expectValue: "medium",
+		},
+		{
+			name:         "I3",
 			from:         "interactions",
 			to:           "interactions",
-			model:        "level-model(8192)",
-			inputJSON:    `{"model":"level-model(8192)","input":"hi"}`,
+			model:        "gemini-mixed-model",
+			inputJSON:    `{"model":"gemini-mixed-model","input":"hi","generation_config":{"thinking_budget":512}}`,
 			expectField:  "generation_config.thinking_level",
-			expectValue:  "medium",
-			expectField2: "generation_config.thinking_summaries",
-			expectValue2: "auto",
+			expectValue:  "low",
+			expectAbsent: []string{"generation_config.thinking_budget"},
+		},
+		// Responses client against a chat-shaped provider. Because thinking is read
+		// back off the translated body, this pair only works if the request translator
+		// rewrites reasoning.effort as reasoning_effort; nothing else covered it.
+		{
+			name:        "R1",
+			from:        "openai-response",
+			to:          "openai",
+			model:       "level-model",
+			inputJSON:   `{"model":"level-model","input":"hi","reasoning":{"effort":"high"}}`,
+			expectField: "reasoning_effort",
+			expectValue: "high",
+		},
+		{
+			name:        "R2",
+			from:        "openai-response",
+			to:          "openai",
+			model:       "level-model",
+			inputJSON:   `{"model":"level-model","input":"hi","reasoning":{"effort":"none"}}`,
+			expectField: "reasoning_effort",
+			expectValue: "minimal",
+		},
+		{
+			name:         "R3",
+			from:         "openai-response",
+			to:           "kimi",
+			model:        "kimi-toggle-thinking-model",
+			inputJSON:    `{"model":"kimi-toggle-thinking-model","input":"hi","reasoning":{"effort":"high"}}`,
+			expectField:  "thinking.type",
+			expectValue:  "enabled",
+			expectField2: "thinking.effort",
+			expectValue2: "high",
+			expectAbsent: []string{"reasoning_effort"},
+		},
+		{
+			name:            "R4",
+			from:            "openai-response",
+			to:              "antigravity",
+			model:           "antigravity-budget-model",
+			inputJSON:       `{"model":"antigravity-budget-model","input":"hi","reasoning":{"effort":"medium"}}`,
+			expectField:     "request.generationConfig.thinkingConfig.thinkingBudget",
+			expectValue:     "8192",
+			includeThoughts: "true",
 		},
 
 		// GitHub Copilot tests: gpt-5, gpt-5.1, gpt-5.2 (Levels=low/medium/high, some with none/xhigh)
@@ -2720,14 +3042,279 @@ func TestThinkingE2EProviderTargets(t *testing.T) {
 	runThinkingTests(t, cases)
 }
 
+func TestThinkingE2EDevinModelUID(t *testing.T) {
+	cases := []struct {
+		name    string
+		model   string
+		wantUID string
+	}{
+		{"D1", "MODEL_GPT_5_2(32768)", "MODEL_GPT_5_2_XHIGH"},
+		{"D2", "glm-5-2(32769)", "glm-5-2-max"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := helps.ResolveDevinChatModelUID(tc.model, "", 0); got != tc.wantUID {
+				t.Errorf("model %q resolved to %q, want %q", tc.model, got, tc.wantUID)
+			}
+		})
+	}
+}
+
+// TestThinkingE2EInteractionsMatrix covers the Interactions protocol in both
+// directions, which the suffix and body matrices above barely touch.
+//
+// Interactions expresses thinking through generation_config.thinking_level and the
+// independent auto/none generation_config.thinking_summaries control. Compatibility
+// thinking_budget and none/auto level inputs map onto a documented target level. The
+// IN cases drive Interactions
+// as the provider from every client protocol; the OUT cases drive an Interactions
+// client against every provider, so an explicit on/off request has to survive the
+// round trip in both roles.
+func TestThinkingE2EInteractionsMatrix(t *testing.T) {
+	uid := fmt.Sprintf("thinking-e2e-interactions-%d", time.Now().UnixNano())
+	registerTestModelsForProviders(t, uid)
+
+	cases := []thinkingTestCase{
+		// Interactions as provider: explicit on from every client protocol.
+		{
+			name:        "IN1",
+			from:        "claude",
+			to:          "interactions",
+			model:       "level-model",
+			inputJSON:   `{"model":"level-model","max_tokens":1024,"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"enabled","budget_tokens":10000}}`,
+			expectField: "generation_config.thinking_level",
+			expectValue: "high",
+		},
+		{
+			name:        "IN2",
+			from:        "openai",
+			to:          "interactions",
+			model:       "level-model",
+			inputJSON:   `{"model":"level-model","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"minimal"}`,
+			expectField: "generation_config.thinking_level",
+			expectValue: "minimal",
+		},
+		{
+			name:        "IN3",
+			from:        "openai-response",
+			to:          "interactions",
+			model:       "level-model",
+			inputJSON:   `{"model":"level-model","input":"hi","reasoning":{"effort":"low"}}`,
+			expectField: "generation_config.thinking_level",
+			expectValue: "low",
+		},
+		{
+			name:        "IN4",
+			from:        "gemini",
+			to:          "interactions",
+			model:       "level-model",
+			inputJSON:   `{"model":"level-model","contents":[{"role":"user","parts":[{"text":"hi"}]}],"generationConfig":{"thinkingConfig":{"includeThoughts":true,"thinkingBudget":20000}}}`,
+			expectField: "generation_config.thinking_level",
+			expectValue: "high",
+		},
+		// A level the model does not publish falls back to its highest level.
+		{
+			name:        "IN5",
+			from:        "openai",
+			to:          "interactions",
+			model:       "level-subset-model",
+			inputJSON:   `{"model":"level-subset-model","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"xhigh"}`,
+			expectField: "generation_config.thinking_level",
+			expectValue: "high",
+		},
+		// Interactions cannot fully disable this model, so thinking clamps to the
+		// lowest documented level. Summary visibility remains omitted unless the
+		// source independently requested it.
+		{
+			name:        "IN6",
+			from:        "claude",
+			to:          "interactions",
+			model:       "level-model",
+			inputJSON:   `{"model":"level-model","max_tokens":1024,"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"disabled"}}`,
+			expectField: "generation_config.thinking_level",
+			expectValue: "minimal",
+		},
+		{
+			name:        "IN7",
+			from:        "openai",
+			to:          "interactions",
+			model:       "level-model(none)",
+			inputJSON:   `{"model":"level-model(none)","messages":[{"role":"user","content":"hi"}]}`,
+			expectField: "generation_config.thinking_level",
+			expectValue: "minimal",
+		},
+		{
+			name:        "IN8",
+			from:        "interactions",
+			to:          "interactions",
+			model:       "level-model",
+			inputJSON:   `{"model":"level-model","generation_config":{"thinking_level":"none"},"input":"hi"}`,
+			expectField: "generation_config.thinking_level",
+			expectValue: "minimal",
+		},
+		// Interactions supports auto as its only enabled summary selector.
+		{
+			name:         "IN9",
+			from:         "interactions",
+			to:           "interactions",
+			model:        "level-model",
+			inputJSON:    `{"model":"level-model","generation_config":{"thinking_level":"low","thinking_summaries":"auto"},"input":"hi"}`,
+			expectField:  "generation_config.thinking_level",
+			expectValue:  "low",
+			expectField2: "generation_config.thinking_summaries",
+			expectValue2: "auto",
+		},
+		// A legacy thinking_budget maps onto the level enum.
+		{
+			name:        "IN10",
+			from:        "interactions",
+			to:          "interactions",
+			model:       "level-model",
+			inputJSON:   `{"model":"level-model","generation_config":{"thinking_budget":400},"input":"hi"}`,
+			expectField: "generation_config.thinking_level",
+			expectValue: "minimal",
+		},
+		// Auto on a model without dynamic thinking resolves to the mid-range level,
+		// the same normalization every other target gets.
+		{
+			name:        "IN11",
+			from:        "interactions",
+			to:          "interactions",
+			model:       "level-model",
+			inputJSON:   `{"model":"level-model","generation_config":{"thinking_budget":-1},"input":"hi"}`,
+			expectField: "generation_config.thinking_level",
+			expectValue: "medium",
+		},
+
+		// Interactions as client: explicit on has to reach every provider's own knob.
+		{
+			name:        "OUT1",
+			from:        "interactions",
+			to:          "claude",
+			model:       "claude-budget-model",
+			inputJSON:   `{"model":"claude-budget-model","generation_config":{"thinking_level":"medium"},"input":"hi"}`,
+			expectField: "thinking.budget_tokens",
+			expectValue: "8192",
+		},
+		{
+			name:        "OUT2",
+			from:        "interactions",
+			to:          "openai",
+			model:       "level-model",
+			inputJSON:   `{"model":"level-model","generation_config":{"thinking_level":"high"},"input":"hi"}`,
+			expectField: "reasoning_effort",
+			expectValue: "high",
+		},
+		{
+			name:        "OUT3",
+			from:        "interactions",
+			to:          "codex",
+			model:       "level-model",
+			inputJSON:   `{"model":"level-model","generation_config":{"thinking_level":"low"},"input":"hi"}`,
+			expectField: "reasoning.effort",
+			expectValue: "low",
+		},
+		{
+			name:        "OUT4",
+			from:        "interactions",
+			to:          "gemini",
+			model:       "gemini-budget-model",
+			inputJSON:   `{"model":"gemini-budget-model","generation_config":{"thinking_level":"medium"},"input":"hi"}`,
+			expectField: "generationConfig.thinkingConfig.thinkingBudget",
+			expectValue: "8192",
+		},
+		{
+			name:            "OUT5",
+			from:            "interactions",
+			to:              "antigravity",
+			model:           "antigravity-budget-model",
+			inputJSON:       `{"model":"antigravity-budget-model","generation_config":{"thinking_level":"medium"},"input":"hi"}`,
+			expectField:     "request.generationConfig.thinkingConfig.thinkingBudget",
+			expectValue:     "8192",
+			includeThoughts: "",
+		},
+		{
+			name:         "OUT6",
+			from:         "interactions",
+			to:           "kimi",
+			model:        "kimi-toggle-thinking-model",
+			inputJSON:    `{"model":"kimi-toggle-thinking-model","generation_config":{"thinking_level":"high"},"input":"hi"}`,
+			expectField:  "thinking.type",
+			expectValue:  "enabled",
+			expectField2: "thinking.effort",
+			expectValue2: "high",
+		},
+		{
+			name:        "OUT7",
+			from:        "interactions",
+			to:          "xai",
+			model:       "xai-level-model",
+			inputJSON:   `{"model":"xai-level-model","generation_config":{"thinking_level":"high"},"input":"hi"}`,
+			expectField: "reasoning.effort",
+			expectValue: "high",
+		},
+		// Interactions as client: explicit off has to reach every provider's own way
+		// of saying no thinking.
+		{
+			name:        "OUT8",
+			from:        "interactions",
+			to:          "claude",
+			model:       "claude-budget-model",
+			inputJSON:   `{"model":"claude-budget-model","generation_config":{"thinking_level":"none"},"input":"hi"}`,
+			expectField: "thinking.type",
+			expectValue: "disabled",
+		},
+		{
+			name:            "OUT9",
+			from:            "interactions",
+			to:              "antigravity",
+			model:           "antigravity-budget-model",
+			inputJSON:       `{"model":"antigravity-budget-model","generation_config":{"thinking_level":"none"},"input":"hi"}`,
+			expectField:     "request.generationConfig.thinkingConfig.thinkingBudget",
+			expectValue:     "0",
+			includeThoughts: "",
+		},
+		{
+			name:         "OUT10",
+			from:         "interactions",
+			to:           "kimi",
+			model:        "kimi-toggle-thinking-model",
+			inputJSON:    `{"model":"kimi-toggle-thinking-model","generation_config":{"thinking_level":"none"},"input":"hi"}`,
+			expectField:  "thinking.type",
+			expectValue:  "disabled",
+			expectAbsent: []string{"thinking.effort", "reasoning_effort"},
+		},
+		// A level+budget model that allows zero expresses off by dropping
+		// thinkingConfig entirely, so an Interactions client reaches the same shape a
+		// chat or Responses client does.
+		{
+			name:         "OUT11",
+			from:         "interactions",
+			to:           "gemini",
+			model:        "gemini-toggle-mixed-model",
+			inputJSON:    `{"model":"gemini-toggle-mixed-model","generation_config":{"thinking_level":"none"},"input":"hi"}`,
+			expectAbsent: []string{"generationConfig.thinkingConfig"},
+		},
+		// Auto reaches a dynamic-capable provider as dynamic thinking.
+		{
+			name:        "OUT12",
+			from:        "interactions",
+			to:          "gemini",
+			model:       "gemini-budget-model",
+			inputJSON:   `{"model":"gemini-budget-model","generation_config":{"thinking_level":"auto"},"input":"hi"}`,
+			expectField: "generationConfig.thinkingConfig.thinkingBudget",
+			expectValue: "-1",
+		},
+	}
+
+	runThinkingTests(t, cases)
+}
+
 // TestThinkingE2EClaudeAdaptive_Body covers Group 3 cases in docs/thinking-e2e-test-cases.md.
 // It focuses on Claude 4.6 adaptive thinking and effort/level cross-protocol semantics (body-only).
 func TestThinkingE2EClaudeAdaptive_Body(t *testing.T) {
-	reg := registry.GetGlobalRegistry()
 	uid := fmt.Sprintf("thinking-e2e-claude-adaptive-%d", time.Now().UnixNano())
-
-	reg.RegisterClient(uid, "test", getTestModels())
-	defer reg.UnregisterClient(uid)
+	registerTestModelsForProviders(t, uid)
 
 	cases := []thinkingTestCase{
 		// A subgroup: OpenAI -> Claude (reasoning_effort -> output_config.effort)
@@ -2920,7 +3507,7 @@ func TestThinkingE2EClaudeAdaptive_Body(t *testing.T) {
 			model:       "claude-opus-4-6-model",
 			inputJSON:   `{"model":"claude-opus-4-6-model","contents":[{"role":"user","parts":[{"text":"hi"}]}],"generationConfig":{"thinkingConfig":{"thinkingBudget":32768}}}`,
 			expectField: "output_config.effort",
-			expectValue: "max",
+			expectValue: "high",
 			expectErr:   false,
 		},
 		{
@@ -2952,6 +3539,30 @@ func TestThinkingE2EClaudeAdaptive_Body(t *testing.T) {
 			expectField: "output_config.effort",
 			expectValue: "high",
 			expectErr:   false,
+		},
+		{
+			name:         "B15",
+			from:         "gemini",
+			to:           "claude",
+			model:        "claude-opus-4-6-model",
+			inputJSON:    `{"model":"claude-opus-4-6-model","contents":[{"role":"user","parts":[{"text":"hi"}]}],"generationConfig":{"thinkingConfig":{"thinkingBudget":128000}}}`,
+			expectField:  "output_config.effort",
+			expectValue:  "max",
+			expectField2: "thinking.type",
+			expectValue2: "adaptive",
+			expectAbsent: []string{"thinking.budget_tokens"},
+		},
+		{
+			name:         "B16",
+			from:         "gemini",
+			to:           "claude",
+			model:        "claude-adaptive-xhigh-model",
+			inputJSON:    `{"model":"claude-adaptive-xhigh-model","contents":[{"role":"user","parts":[{"text":"hi"}]}],"generationConfig":{"thinkingConfig":{"thinkingBudget":64000}}}`,
+			expectField:  "output_config.effort",
+			expectValue:  "xhigh",
+			expectField2: "thinking.type",
+			expectValue2: "adaptive",
+			expectAbsent: []string{"thinking.budget_tokens"},
 		},
 
 		// C subgroup: Claude adaptive + effort cross-protocol conversion
@@ -3033,7 +3644,7 @@ func TestThinkingE2EClaudeAdaptive_Body(t *testing.T) {
 			inputJSON:       `{"model":"level-subset-model","messages":[{"role":"user","content":"hi"}],"thinking":{"type":"adaptive"},"output_config":{"effort":"high"}}`,
 			expectField:     "generationConfig.thinkingConfig.thinkingLevel",
 			expectValue:     "high",
-			includeThoughts: "true",
+			includeThoughts: "",
 			expectErr:       false,
 		},
 		{
@@ -3044,7 +3655,7 @@ func TestThinkingE2EClaudeAdaptive_Body(t *testing.T) {
 			inputJSON:       `{"model":"gemini-budget-model","messages":[{"role":"user","content":"hi"}],"thinking":{"type":"adaptive"},"output_config":{"effort":"low"}}`,
 			expectField:     "generationConfig.thinkingConfig.thinkingBudget",
 			expectValue:     "1024",
-			includeThoughts: "true",
+			includeThoughts: "",
 			expectErr:       false,
 		},
 		{
@@ -3055,7 +3666,7 @@ func TestThinkingE2EClaudeAdaptive_Body(t *testing.T) {
 			inputJSON:       `{"model":"gemini-budget-model","messages":[{"role":"user","content":"hi"}],"thinking":{"type":"adaptive"},"output_config":{"effort":"medium"}}`,
 			expectField:     "generationConfig.thinkingConfig.thinkingBudget",
 			expectValue:     "8192",
-			includeThoughts: "true",
+			includeThoughts: "",
 			expectErr:       false,
 		},
 		{
@@ -3066,7 +3677,7 @@ func TestThinkingE2EClaudeAdaptive_Body(t *testing.T) {
 			inputJSON:       `{"model":"gemini-budget-model","messages":[{"role":"user","content":"hi"}],"thinking":{"type":"adaptive"},"output_config":{"effort":"high"}}`,
 			expectField:     "generationConfig.thinkingConfig.thinkingBudget",
 			expectValue:     "20000",
-			includeThoughts: "true",
+			includeThoughts: "",
 			expectErr:       false,
 		},
 		{
@@ -3077,7 +3688,7 @@ func TestThinkingE2EClaudeAdaptive_Body(t *testing.T) {
 			inputJSON:       `{"model":"gemini-budget-model","messages":[{"role":"user","content":"hi"}],"thinking":{"type":"adaptive"}}`,
 			expectField:     "generationConfig.thinkingConfig.thinkingBudget",
 			expectValue:     "20000",
-			includeThoughts: "true",
+			includeThoughts: "",
 			expectErr:       false,
 		},
 		{
@@ -3088,7 +3699,7 @@ func TestThinkingE2EClaudeAdaptive_Body(t *testing.T) {
 			inputJSON:       `{"model":"gemini-mixed-model","messages":[{"role":"user","content":"hi"}],"thinking":{"type":"adaptive"},"output_config":{"effort":"high"}}`,
 			expectField:     "generationConfig.thinkingConfig.thinkingLevel",
 			expectValue:     "high",
-			includeThoughts: "true",
+			includeThoughts: "",
 			expectErr:       false,
 		},
 
@@ -3150,7 +3761,7 @@ func TestThinkingE2EClaudeAdaptive_Body(t *testing.T) {
 			inputJSON:       `{"model":"antigravity-budget-model","messages":[{"role":"user","content":"hi"}],"thinking":{"type":"adaptive"}}`,
 			expectField:     "request.generationConfig.thinkingConfig.thinkingBudget",
 			expectValue:     "20000",
-			includeThoughts: "true",
+			includeThoughts: "",
 			expectErr:       false,
 		},
 
@@ -3241,6 +3852,15 @@ func getTestModels() []*registry.ModelInfo {
 			Thinking:    &registry.ThinkingSupport{Levels: []string{"low", "high"}, ZeroAllowed: false, DynamicAllowed: false},
 		},
 		{
+			ID:          "level-max-model",
+			Object:      "model",
+			Created:     1700000000,
+			OwnedBy:     "test",
+			Type:        "openai",
+			DisplayName: "Max Effort Model",
+			Thinking:    &registry.ThinkingSupport{Levels: []string{"high", "xhigh", "max"}},
+		},
+		{
 			ID:          "gemini-budget-model",
 			Object:      "model",
 			Created:     1700000000,
@@ -3298,6 +3918,15 @@ func getTestModels() []*registry.ModelInfo {
 			ContextLength:       200000,
 			MaxCompletionTokens: 64000,
 			Thinking:            &registry.ThinkingSupport{Min: 1024, Max: 128000, ZeroAllowed: true, DynamicAllowed: false, Levels: []string{"low", "medium", "high"}},
+		},
+		{
+			ID:          "claude-adaptive-xhigh-model",
+			Object:      "model",
+			Created:     1700000000,
+			OwnedBy:     "test",
+			Type:        "claude",
+			DisplayName: "Claude Adaptive Xhigh Model",
+			Thinking:    &registry.ThinkingSupport{Levels: []string{"high", "xhigh"}},
 		},
 		{
 			ID:          "antigravity-budget-model",
@@ -3399,6 +4028,26 @@ func getTestModels() []*registry.ModelInfo {
 			DisplayName: "GPT-5.2 Codex",
 			Thinking:    &registry.ThinkingSupport{Levels: []string{"none", "low", "medium", "high", "xhigh"}, ZeroAllowed: true, DynamicAllowed: false},
 		},
+		{
+			ID:          "user-defined-level-model",
+			Object:      "model",
+			Created:     1700000000,
+			OwnedBy:     "test",
+			Type:        "openai",
+			DisplayName: "User Defined Level Model",
+			UserDefined: true,
+			Thinking:    &registry.ThinkingSupport{Levels: []string{"high", "xhigh"}},
+		},
+		{
+			ID:          "user-defined-budget-model",
+			Object:      "model",
+			Created:     1700000000,
+			OwnedBy:     "test",
+			Type:        "gemini",
+			DisplayName: "User Defined Budget Model",
+			UserDefined: true,
+			Thinking:    &registry.ThinkingSupport{Min: 128, Max: 20000},
+		},
 	}
 }
 
@@ -3437,7 +4086,12 @@ func runThinkingTests(t *testing.T, cases []thinkingTestCase) {
 				true,
 			)
 			if applyTo == "claude" {
-				body, _ = sjson.SetBytes(body, "max_tokens", 200000)
+				// Let the model's thinking range determine the budget in these tests.
+				doc := ojson.NewDoc(body)
+				if errSet := doc.Set("max_tokens", 200000); errSet != nil {
+					t.Fatalf("setting Claude max_tokens: %v", errSet)
+				}
+				body = doc.Bytes()
 			}
 
 			body, err := thinking.ApplyThinking(body, tc.model, tc.from, applyTo, applyTo)
@@ -3453,7 +4107,7 @@ func runThinkingTests(t *testing.T, cases []thinkingTestCase) {
 			}
 
 			for _, fieldPath := range tc.expectAbsent {
-				if gjson.GetBytes(body, fieldPath).Exists() {
+				if ojson.GetBytesNoCopy(body, fieldPath).Exists() {
 					t.Fatalf("expected field %s to be absent, body=%s", fieldPath, string(body))
 				}
 			}
@@ -3462,17 +4116,17 @@ func runThinkingTests(t *testing.T, cases []thinkingTestCase) {
 				var hasThinking bool
 				switch tc.to {
 				case "gemini":
-					hasThinking = gjson.GetBytes(body, "generationConfig.thinkingConfig").Exists()
+					hasThinking = ojson.GetBytesNoCopy(body, "generationConfig.thinkingConfig").Exists()
 				case "antigravity":
-					hasThinking = gjson.GetBytes(body, "request.generationConfig.thinkingConfig").Exists()
+					hasThinking = ojson.GetBytesNoCopy(body, "request.generationConfig.thinkingConfig").Exists()
 				case "claude":
-					hasThinking = gjson.GetBytes(body, "thinking").Exists()
+					hasThinking = ojson.GetBytesNoCopy(body, "thinking").Exists()
 				case "openai":
-					hasThinking = gjson.GetBytes(body, "reasoning_effort").Exists()
+					hasThinking = ojson.GetBytesNoCopy(body, "reasoning_effort").Exists()
 				case "codex":
-					hasThinking = gjson.GetBytes(body, "reasoning.effort").Exists() || gjson.GetBytes(body, "reasoning").Exists()
+					hasThinking = ojson.GetBytesNoCopy(body, "reasoning.effort").Exists() || ojson.GetBytesNoCopy(body, "reasoning").Exists()
 				case "kimi":
-					hasThinking = gjson.GetBytes(body, "thinking").Exists() || gjson.GetBytes(body, "reasoning_effort").Exists()
+					hasThinking = ojson.GetBytesNoCopy(body, "thinking").Exists() || ojson.GetBytesNoCopy(body, "reasoning_effort").Exists()
 				}
 				if hasThinking {
 					t.Fatalf("expected no thinking field but found one, body=%s", string(body))
@@ -3481,12 +4135,12 @@ func runThinkingTests(t *testing.T, cases []thinkingTestCase) {
 			}
 
 			assertField := func(fieldPath, expected string) {
-				val := gjson.GetBytes(body, fieldPath)
+				val := ojson.GetBytesNoCopy(body, fieldPath)
 				if !val.Exists() {
 					t.Fatalf("expected field %s not found, body=%s", fieldPath, string(body))
 				}
 				actualValue := val.String()
-				if val.Type == gjson.Number {
+				if val.Type == ojson.Number {
 					actualValue = fmt.Sprintf("%d", val.Int())
 				}
 				if actualValue != expected {
@@ -3498,22 +4152,39 @@ func runThinkingTests(t *testing.T, cases []thinkingTestCase) {
 			if tc.expectField2 != "" {
 				assertField(tc.expectField2, tc.expectValue2)
 			}
+
+			// Claude adaptive effort is only valid as a pair: native Claude Code
+			// 2.1.220 always sends thinking.type="adaptive" alongside
+			// output_config.effort. Emitting effort on its own would be a wire
+			// shape the real client never produces.
+			if tc.to == "claude" && ojson.GetBytesNoCopy(body, "output_config.effort").Exists() {
+				assertField("thinking.type", "adaptive")
+			}
 			if tc.expectField3 != "" {
 				assertField(tc.expectField3, tc.expectValue3)
 			}
 
-			if tc.includeThoughts != "" && (tc.to == "gemini" || tc.to == "antigravity") {
+			if tc.to == "gemini" || tc.to == "antigravity" {
 				path := "generationConfig.thinkingConfig.includeThoughts"
 				if tc.to == "antigravity" {
 					path = "request.generationConfig.thinkingConfig.includeThoughts"
 				}
-				itVal := gjson.GetBytes(body, path)
-				if !itVal.Exists() {
-					t.Fatalf("expected includeThoughts field not found, body=%s", string(body))
-				}
-				actual := fmt.Sprintf("%v", itVal.Bool())
-				if actual != tc.includeThoughts {
-					t.Fatalf("includeThoughts: expected %s, got %s, body=%s", tc.includeThoughts, actual, string(body))
+				// Each case declares its expected visibility independently from the
+				// extractor under test. Empty means the provider field must be absent.
+				wantIncludeThoughts := tc.includeThoughts
+				itVal := ojson.GetBytesNoCopy(body, path)
+				if wantIncludeThoughts == "" {
+					if itVal.Exists() {
+						t.Fatalf("includeThoughts should be absent without summary intent, body=%s", string(body))
+					}
+				} else {
+					if !itVal.Exists() {
+						t.Fatalf("expected includeThoughts field not found, body=%s", string(body))
+					}
+					actual := fmt.Sprintf("%v", itVal.Bool())
+					if actual != wantIncludeThoughts {
+						t.Fatalf("includeThoughts: expected %s, got %s, body=%s", wantIncludeThoughts, actual, string(body))
+					}
 				}
 			}
 		})

@@ -101,46 +101,6 @@ func TestParseAccountQuotaUtilization_ClaudeShape(t *testing.T) {
 	}
 }
 
-func TestAccountQuotaHeadroom_TakesTightestWindow(t *testing.T) {
-	a := &Auth{
-		Provider: "claude",
-		Metadata: map[string]any{
-			"quota_snapshot": map[string]any{
-				"usage": map[string]any{
-					// seven_day is the binding (tightest headroom) window at 77% used.
-					"five_hour": map[string]any{"utilization": 8.0, "resets_at": "2026-01-22T09:00:00Z"},
-					"seven_day": map[string]any{"utilization": 77.0, "resets_at": "2026-01-22T19:00:00Z"},
-				},
-			},
-		},
-	}
-
-	result, ok := AccountQuotaHeadroom(a)
-	if !ok {
-		t.Fatal("expected ok=true")
-	}
-	if result.Window != "seven_day" {
-		t.Fatalf("binding window = %q, want seven_day (the lower-headroom window)", result.Window)
-	}
-	wantHeadroom := 0.23
-	if got := result.Headroom; got < wantHeadroom-1e-9 || got > wantHeadroom+1e-9 {
-		t.Fatalf("Headroom = %v, want %v", got, wantHeadroom)
-	}
-	wantReset := time.Date(2026, 1, 22, 19, 0, 0, 0, time.UTC)
-	if !result.ResetsAt.Equal(wantReset) {
-		t.Fatalf("ResetsAt = %v, want %v", result.ResetsAt, wantReset)
-	}
-}
-
-func TestAccountQuotaHeadroom_UnknownWhenNoSnapshot(t *testing.T) {
-	if _, ok := AccountQuotaHeadroom(nil); ok {
-		t.Fatal("nil auth should be unknown")
-	}
-	if _, ok := AccountQuotaHeadroom(&Auth{Provider: "gemini"}); ok {
-		t.Fatal("auth with no quota_snapshot (e.g. a provider core does not poll quota for) should be unknown, not assumed-full-headroom")
-	}
-}
-
 func TestAccountQuotaWindow_HeadroomClamping(t *testing.T) {
 	over := AccountQuotaWindow{Name: "x", UtilizationPercent: 150}
 	if got := over.Headroom(); got != 0 {

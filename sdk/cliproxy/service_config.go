@@ -2,15 +2,48 @@ package cliproxy
 
 import (
 	"context"
+	"errors"
+	"io"
+	"os"
 	"strings"
 	"time"
 
-	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher/synthesizer"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/watcher/synthesizer"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
 	log "github.com/sirupsen/logrus"
 )
+
+func (s *Service) currentConfig() *config.Config {
+	if s == nil {
+		return nil
+	}
+	s.cfgMu.RLock()
+	cfg := s.cfg
+	s.cfgMu.RUnlock()
+	return cfg
+}
+
+func (s *Service) currentWatcher() *WatcherWrapper {
+	if s == nil {
+		return nil
+	}
+	s.cfgMu.RLock()
+	w := s.watcher
+	s.cfgMu.RUnlock()
+	return w
+}
+
+func (s *Service) setWatcher(w *WatcherWrapper) {
+	if s == nil {
+		return
+	}
+	s.cfgMu.Lock()
+	s.watcher = w
+	s.cfgMu.Unlock()
+}
 
 func (s *Service) applyConfigUpdate(newCfg *config.Config) {
 	s.applyConfigUpdateWithAuthSynthesis(context.Background(), newCfg, true)
@@ -26,155 +59,79 @@ type configCommit struct {
 }
 
 type routingRuntimeState struct {
-	strategy           string
-	sessionAffinity    bool
-	sessionAffinityTTL time.Duration
-
-	// accountScheduling is the AccountSchedulingConfig snapshot captured for
-	// this commit (openspec/changes/add-adaptive-account-scheduling). It only
-	// matters when strategy == internalconfig.RoutingStrategyAdaptive, and is
-	// deliberately EXCLUDED from selectorShapeEqual below: a change to it
-	// alone (e.g. a tier-weight or warm-up-curve tweak) must never trigger a
-	// selector rebuild -- newRoutingSelectorWithLiveScheduling's live
-	// accessor picks such a change up on the very next Pick instead. This
-	// field also means routingRuntimeState is no longer comparable with
-	// == / != as a whole (AccountSchedulingConfig embeds a slice,
-	// WarmupCurve) -- selectorShapeEqual is the only supported comparison.
-	accountScheduling internalconfig.AccountSchedulingConfig
-}
-
-// selectorShapeEqual reports whether a and b would produce the same *kind* of
-// Selector (same base strategy, same session-affinity wiring) -- i.e. whether
-// SetSelector actually needs to rebuild the selector. See the
-// accountScheduling field doc for why that field is intentionally excluded
-// from this comparison.
-func (a routingRuntimeState) selectorShapeEqual(b routingRuntimeState) bool {
-	return a.strategy == b.strategy &&
-		a.sessionAffinity == b.sessionAffinity &&
-		a.sessionAffinityTTL == b.sessionAffinityTTL
+	strategy                 string
+	sessionAffinity          bool
+	sessionAffinityTTL       time.Duration
+	sessionAffinitySubagents bool
+	sessionAffinityRebindOn  string
 }
 
 func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
 	state := routingRuntimeState{
-		strategy:           "round-robin",
-		sessionAffinityTTL: time.Hour,
-		accountScheduling:  internalconfig.DefaultAccountSchedulingConfig(),
+		strategy:                 "round-robin",
+		sessionAffinityTTL:       time.Hour,
+		sessionAffinitySubagents: true,
+		sessionAffinityRebindOn:  coreauth.SessionAffinityRebindOnNever,
 	}
 	if cfg == nil {
 		return state
 	}
 
 	switch strings.ToLower(strings.TrimSpace(cfg.Routing.Strategy)) {
+	case "weighted-round-robin", "weightedroundrobin", "wrr":
+		state.strategy = "weighted-round-robin"
 	case "fill-first", "fillfirst", "ff":
 		state.strategy = "fill-first"
-	case internalconfig.RoutingStrategyAdaptive:
-		// openspec/changes/add-adaptive-account-scheduling: opt into the
-		// tier/quota/warm-up-aware selector. newRoutingSelectorWithLiveScheduling
-		// below is what actually wires this to coreauth.NewAdaptiveSelector.
-		state.strategy = internalconfig.RoutingStrategyAdaptive
 	}
 	// fork: honor both the legacy ClaudeCodeSessionAffinity flag and the new
 	// universal SessionAffinity so existing configs keep session affinity on.
 	state.sessionAffinity = cfg.Routing.ClaudeCodeSessionAffinity || cfg.Routing.SessionAffinity
 	if ttl := strings.TrimSpace(cfg.Routing.SessionAffinityTTL); ttl != "" {
 		if parsed, errParse := time.ParseDuration(ttl); errParse == nil && parsed > 0 {
+			if parsed < time.Second {
+				parsed = time.Second
+			}
 			state.sessionAffinityTTL = parsed
 		}
 	}
-	// internal/config/account_scheduling.go's DefaultAccountSchedulingConfig
-	// is already merged into cfg.AccountScheduling by every config-load path
-	// (config_load.go / parse.go) before YAML unmarshal, so this is always a
-	// fully-defaulted snapshot, never a caller-constructed zero value.
-	state.accountScheduling = cfg.AccountScheduling
+	if state.sessionAffinity && cfg.Routing.SessionAffinitySubagents != nil {
+		state.sessionAffinitySubagents = *cfg.Routing.SessionAffinitySubagents
+	}
 	return state
 }
 
-// newRoutingSelector builds a Selector from state alone, scoring the
-// "adaptive" strategy against state.accountScheduling as a fixed snapshot
-// (no live re-read). This is what the pre-Service construction path
-// (builder.go, which has no *Service yet to read a live config from) calls;
-// the config-reload path (applyManagerConfig, below) calls
-// newRoutingSelectorWithLiveScheduling instead so an adaptive selector
-// re-reads AccountSchedulingConfig on every Pick without ever needing to be
-// rebuilt.
 func newRoutingSelector(state routingRuntimeState) coreauth.Selector {
-	return newRoutingSelectorWithLiveScheduling(state, nil)
+	return newRoutingSelectorWithExisting(state, nil)
 }
 
-// newRoutingSelectorWithLiveScheduling is newRoutingSelector plus an optional
-// live AccountSchedulingConfig accessor for the "adaptive" strategy
-// (openspec/changes/add-adaptive-account-scheduling, tasks.md 1.2/5.1). When
-// live is non-nil it is wired via coreauth.WithAdaptiveSchedulingProvider so a
-// config-file edit to warm-up-curve / tier-weight / mature-limit knobs takes
-// effect on the very next Pick without a selector rebuild -- rebuilding would
-// otherwise drop in-flight session-stickiness bindings and reset per-account
-// token buckets (coreauth.AdaptiveSelector self-hosts both). When live is
-// nil, the adaptive selector still scores against state.accountScheduling --
-// just as a fixed snapshot instead of a live read.
-//
-// Every other strategy value (including the pre-existing "round-robin" /
-// "fill-first" behavior) is completely unchanged by this function -- the
-// "adaptive" branch returns before reaching the pre-existing
-// session-affinity-wrapping code below it.
-func newRoutingSelectorWithLiveScheduling(state routingRuntimeState, live func() internalconfig.AccountSchedulingConfig) coreauth.Selector {
+func newRoutingSelectorWithExisting(state routingRuntimeState, existing coreauth.Selector) coreauth.Selector {
 	var selector coreauth.Selector
-	if state.strategy == "fill-first" {
+	switch state.strategy {
+	case "weighted-round-robin":
+		if existingWeighted := coreauth.UnwrapWeightedRoundRobinSelector(existing); existingWeighted != nil {
+			selector = existingWeighted
+		} else {
+			selector = &coreauth.WeightedRoundRobinSelector{}
+		}
+	case "fill-first":
 		selector = &coreauth.FillFirstSelector{}
-	} else {
+	default:
 		selector = &coreauth.RoundRobinSelector{}
 	}
-	if state.strategy == internalconfig.RoutingStrategyAdaptive {
-		var opts []coreauth.AdaptiveSelectorOption
-		if live != nil {
-			opts = append(opts, coreauth.WithAdaptiveSchedulingProvider(live))
-		}
-		// coreauth.AdaptiveSelector self-hosts session affinity with
-		// design.md D5 maturity grading via its own internal SessionCache --
-		// it must NOT additionally be wrapped in NewSessionAffinitySelectorWithConfig,
-		// which would short-circuit on a cache hit and never let the adaptive
-		// selector see/grade the binding (see adaptive_selector.go's type
-		// doc). So this branch returns directly, skipping the
-		// session-affinity wrap below entirely.
-		return coreauth.NewAdaptiveSelector(coreauth.AdaptiveSelectorConfig{
-			Fallback:        selector,
-			Scheduling:      state.accountScheduling,
-			SessionAffinity: state.sessionAffinity,
-			SessionTTL:      state.sessionAffinityTTL,
-		}, opts...)
-	}
 	if state.sessionAffinity {
+		subagents := state.sessionAffinitySubagents
 		selector = coreauth.NewSessionAffinitySelectorWithConfig(coreauth.SessionAffinityConfig{
-			Fallback: selector,
-			TTL:      state.sessionAffinityTTL,
+			Fallback:         selector,
+			TTL:              state.sessionAffinityTTL,
+			SubagentAffinity: &subagents,
+			RebindOn:         state.sessionAffinityRebindOn,
 		})
 	}
 	return selector
 }
 
-// liveAccountSchedulingConfig reads the current AccountSchedulingConfig off
-// the live *Service config (s.cfg, protected by s.cfgMu -- the same lock
-// commitConfigUpdate uses to swap s.cfg on every config commit/hot-reload).
-// Passed to the adaptive selector via coreauth.WithAdaptiveSchedulingProvider
-// (see newRoutingSelectorWithLiveScheduling) so a config-file edit to the
-// account-scheduling section is picked up on the very next Pick, even on a
-// reload that does not otherwise change routing.strategy / session-affinity
-// (and therefore does not trigger a selector rebuild -- see
-// routingRuntimeState.selectorShapeEqual).
-func (s *Service) liveAccountSchedulingConfig() internalconfig.AccountSchedulingConfig {
-	if s == nil {
-		return internalconfig.DefaultAccountSchedulingConfig()
-	}
-	s.cfgMu.RLock()
-	cfg := s.cfg
-	s.cfgMu.RUnlock()
-	if cfg == nil {
-		return internalconfig.DefaultAccountSchedulingConfig()
-	}
-	return cfg.AccountScheduling
-}
-
 func (s *Service) applyConfigUpdateWithAuthSynthesis(ctx context.Context, newCfg *config.Config, synthesizeConfigAuths bool) bool {
-	commit := s.commitConfigUpdate(newCfg)
+	commit := s.commitConfigUpdateContext(ctx, newCfg)
 	if commit.cfg == nil {
 		return false
 	}
@@ -182,28 +139,103 @@ func (s *Service) applyConfigUpdateWithAuthSynthesis(ctx context.Context, newCfg
 }
 
 // commitConfigUpdate applies only in-memory configuration state. Runtime work that
-// may block on plugins, models, storage, or networking is deliberately deferred.
+// may block on plugins, storage, or networking is deliberately deferred. Catalog
+// source generations change here so an older commit cannot restart stale readers.
 func (s *Service) commitConfigUpdate(newCfg *config.Config) configCommit {
+	return s.commitConfigUpdateContext(context.Background(), newCfg)
+}
+
+func (s *Service) commitConfigUpdateContext(ctx context.Context, newCfg *config.Config) configCommit {
 	if s == nil {
 		return configCommit{}
 	}
-
-	s.configUpdateMu.Lock()
-	defer s.configUpdateMu.Unlock()
-
-	if newCfg == nil {
-		s.cfgMu.RLock()
-		newCfg = s.cfg
-		s.cfgMu.RUnlock()
+	if ctx == nil {
+		ctx = context.Background()
 	}
+	s.configUpdateMu.Lock()
+	current := s.currentConfig()
 	if newCfg == nil {
+		newCfg = current
+	}
+	if newCfg == nil || ctx.Err() != nil {
+		s.configUpdateMu.Unlock()
+		return configCommit{}
+	}
+	if err := newCfg.ValidateOrdinaryRouting(); err != nil {
+		s.configUpdateMu.Unlock()
+		log.WithError(err).Warn("rejected routing configuration update")
+		return configCommit{}
+	}
+	nextDir := newCfg.AuthDir
+	if s.localStoreRoot == nil || current != nil && current.AuthDir == nextDir {
+		s.localStoreRequest++
+		defer s.configUpdateMu.Unlock()
+		return s.commitConfigUpdateLocked(newCfg, nil)
+	}
+	s.localStoreRequest++
+	request := s.localStoreRequest
+	s.configUpdateMu.Unlock()
+
+	dir, err := os.Open(nextDir)
+	if err != nil {
+		log.WithError(err).Warn("rejected credential directory change")
+		return configCommit{}
+	}
+	defer dir.Close()
+	if _, err := dir.Readdirnames(1); err != nil && !errors.Is(err, io.EOF) {
+		log.WithError(err).Warn("rejected unreadable credential directory")
+		return configCommit{}
+	}
+	opened, err := dir.Stat()
+	if err != nil {
+		return configCommit{}
+	}
+	nextStore := s.localStoreRoot.WithBaseDir(nextDir)
+	var commit configCommit
+	err = s.coreManager.WithLocalStoreRebind(ctx, nextStore, func(install func()) {
+		s.configUpdateMu.Lock()
+		defer s.configUpdateMu.Unlock()
+		if s.localStoreRequest != request || ctx.Err() != nil {
+			return
+		}
+		latest, err := os.Stat(nextDir)
+		if err != nil || !os.SameFile(opened, latest) {
+			log.Warn("rejected credential directory replaced during configuration update")
+			return
+		}
+		commit = s.commitConfigUpdateLocked(newCfg, install)
+	})
+	if err != nil {
+		log.WithError(err).Warn("could not rebind local credential store")
+	}
+	return commit
+}
+
+func (s *Service) commitConfigUpdateLocked(newCfg *config.Config, install func()) configCommit {
+	if errValidate := newCfg.ValidateCredentialWeights(); errValidate != nil {
+		log.WithError(errValidate).Warn("rejected config update with invalid credential weights")
 		return configCommit{}
 	}
 
+	if errValidate := newCfg.Models.Validate(); errValidate != nil {
+		log.WithError(errValidate).Warn("rejected invalid model catalog sources")
+		return configCommit{}
+	}
+	// Clone before assigning the generation: callers may still hold the input snapshot.
+	newCfg = newCfg.CloneForRuntime()
+	helps.AdvanceProxyPoolGeneration(s.proxyPoolPublisher, newCfg)
+	if install != nil {
+		install()
+	}
 	s.cfgMu.Lock()
+	if s.cfg == nil || s.cfg.AuthDir != newCfg.AuthDir {
+		s.authDirGeneration++
+	}
 	s.cfg = newCfg
 	s.cfgMu.Unlock()
+	s.cancelStaleAntigravityProbes("")
 	s.configSequence++
+	registry.UpdateModelCatalogSources(newCfg.Models, newCfg.Home.Enabled)
 	return configCommit{cfg: newCfg, sequence: s.configSequence}
 }
 
@@ -242,6 +274,10 @@ func (s *Service) applyConfigRuntime(ctx context.Context, commit configCommit, s
 	}
 	if !s.applyPprofConfigContext(ctx, cfg) {
 		return false
+	}
+	s.applyDiscoveryConfigContext(ctx, cfg)
+	if s.kvStoreManaged.Load() {
+		s.applyKVStoreConfig(cfg)
 	}
 	if errContext := ctx.Err(); errContext != nil {
 		return false
@@ -285,6 +321,9 @@ func (s *Service) applyConfigRuntime(ctx context.Context, commit configCommit, s
 		return false
 	}
 	s.syncPluginModelRuntime(registrationCtx)
+	if ctx.Err() == nil && s.hooks.OnConfigApplied != nil {
+		s.hooks.OnConfigApplied(s, cfg)
+	}
 	return ctx.Err() == nil
 }
 
@@ -299,8 +338,8 @@ func (s *Service) applyManagerConfig(ctx context.Context, commit configCommit) b
 		return false
 	}
 	routingState := normalizedRoutingRuntimeState(commit.cfg)
-	if s.appliedRoutingState == nil || !s.appliedRoutingState.selectorShapeEqual(routingState) {
-		s.coreManager.SetSelector(newRoutingSelectorWithLiveScheduling(routingState, s.liveAccountSchedulingConfig))
+	if s.appliedRoutingState == nil || *s.appliedRoutingState != routingState {
+		s.coreManager.SetSelector(newRoutingSelectorWithExisting(routingState, s.coreManager.Selector()))
 		s.appliedRoutingState = &routingState
 	}
 	s.applyRetryConfig(commit.cfg)
@@ -326,10 +365,11 @@ func (s *Service) updateServerClientsContext(ctx context.Context, cfg *config.Co
 }
 
 func (s *Service) reloadConfigFromWatcher() bool {
-	if s == nil || s.watcher == nil {
+	w := s.currentWatcher()
+	if w == nil {
 		return false
 	}
-	return s.watcher.ReloadConfigIfChanged()
+	return w.ReloadConfigIfChanged()
 }
 
 func (s *Service) registerConfigAPIKeyAuths(ctx context.Context, cfg *config.Config) {
@@ -385,8 +425,9 @@ func forceHomeRuntimeConfig(cfg *config.Config) {
 	cfg.UsageStatisticsEnabled = true
 	cfg.DisableCooling = true
 	cfg.SaveCooldownStatus = false
-	cfg.WebsocketAuth = false
+	cfg.WebsocketAuth = true
 	cfg.RemoteManagement.AllowRemote = false
 	cfg.RemoteManagement.DisableControlPanel = true
 	cfg.Plugins.StoreAuth = nil
+	cfg.KVStore.Disabled = true
 }

@@ -2,119 +2,83 @@ package executor
 
 import (
 	"context"
-	"errors"
-	"fmt"
+	"net/http"
 	"strings"
 	"time"
 
-	claudeauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/claude"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	log "github.com/sirupsen/logrus"
+	claudeauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/claude"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
-// errFarmUnprovisionedRefreshProxyMissing is returned by ClaudeExecutor.Refresh
-// when the farm supply-atomicity fail-closed gate matches an account
-// (FARM_REQUIRE_PROVISIONED armed + farm-enrolled + unprovisioned Claude) that
-// resolves to no proxy at all. Falling through to NewClaudeAuthWithProxyURL with
-// an empty proxy builds a direct OAuth transport (NewAnthropicHttpClient ->
-// proxyutil.NewDirectTransport) that would expose the real server IP to
-// api.anthropic.com under only the synthetic device_id. This sentinel is a new
-// executor-local error (not the helps package's egress guard) so the fail-closed
-// reason is specific to the farm supply-atomicity policy rather than the generic
-// serving egress guard, and callers can errors.Is it distinctly.
-var errFarmUnprovisionedRefreshProxyMissing = errors.New("farm account not provisioned and no proxy configured: refusing direct OAuth refresh to prevent IP exposure")
+func ordinaryClaudeRefreshToken(auth *cliproxyauth.Auth) string {
+	if auth == nil || strings.TrimSpace(auth.Attributes["api_key"]) != "" {
+		return ""
+	}
+	if token := claudeauth.ReadMetadataString(&auth.Metadata, "refresh_token"); strings.TrimSpace(token) != "" {
+		return strings.TrimSpace(token)
+	}
+	return strings.TrimSpace(claudeauth.ReadMetadataString(&auth.Metadata, "refreshToken"))
+}
+
+// ShouldPrepareRequestAuth only selects an expired ordinary OAuth credential
+// that actually has a rotation token. API keys and setup tokens are left as-is.
+func (e *ClaudeExecutor) ShouldPrepareRequestAuth(auth *cliproxyauth.Auth) bool {
+	if ordinaryClaudeRefreshToken(auth) == "" {
+		return false
+	}
+	expiry, known := auth.OuterExpirationTime()
+	return known && !expiry.After(time.Now())
+}
+
+func (e *ClaudeExecutor) PrepareRequestAuth(ctx context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {
+	if !e.ShouldPrepareRequestAuth(auth) {
+		return auth, nil
+	}
+	return e.Refresh(ctx, auth)
+}
 
 func (e *ClaudeExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {
-	log.Debugf("claude executor: refresh called")
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if auth == nil {
+		return nil, statusErr{code: http.StatusBadRequest, msg: "missing Claude credential", requestScoped: true}
+	}
+	if auth.Disabled || auth.Status == cliproxyauth.StatusDisabled || auth.AutoQuarantined || auth.RefreshDisabled() {
+		return auth, nil
+	}
 	if refreshed, handled, err := helps.RefreshAuthViaHome(ctx, e.cfg, auth); handled {
 		return refreshed, err
 	}
-	if auth == nil {
-		return nil, fmt.Errorf("claude executor: auth is nil")
-	}
-	// Honor operator-controlled refresh_disabled / refresh_enabled=false flags
-	// at the executor layer so unaware request paths cannot bypass the
-	// auto-refresh scheduler.
-	if auth.RefreshDisabled() {
-		log.Debugf("claude executor: refresh skipped because refresh_disabled=true")
+	token := ordinaryClaudeRefreshToken(auth)
+	if token == "" {
 		return auth, nil
 	}
-	var refreshToken string
-	if auth.Metadata != nil {
-		if v, ok := auth.Metadata["refresh_token"].(string); ok && v != "" {
-			refreshToken = v
-		}
-	}
-	if refreshToken == "" {
-		return auth, nil
-	}
-	// Farm supply-atomicity fail-closed gate (R5-3d): when the gate matches this
-	// account AND neither the account nor the global config carries a proxy, refuse
-	// to refresh instead of falling through to NewClaudeAuthWithProxyURL, whose
-	// empty-proxy path builds a direct transport that would expose the real server
-	// IP to the token endpoint. The auto-refresh scheduler (R5-3e) already unschedules
-	// these accounts; this is the defense-in-depth executor-layer guard for any
-	// other refresh caller. Strict no-op when FARM_REQUIRE_PROVISIONED is off / for
-	// non-enrolled or provisioned accounts (predicate returns false), so refresh
-	// behaviour stays byte-identical today. An account WITH a resolved proxy still
-	// refreshes normally (egress is not direct), so this never fail-closes a
-	// properly-proxied enrolled account.
-	if cliproxyauth.RequireProvisionedBlocked(auth) {
-		cfgProxyURL := ""
-		if e.cfg != nil {
-			cfgProxyURL = strings.TrimSpace(e.cfg.ProxyURL)
-		}
-		if strings.TrimSpace(auth.ProxyURL) == "" && cfgProxyURL == "" {
-			log.Warnf("claude executor: refusing OAuth refresh for farm-unprovisioned auth %q with no proxy (fail-closed)", auth.ID)
-			return nil, errFarmUnprovisionedRefreshProxyMissing
-		}
-	}
-	svc := claudeauth.NewClaudeAuthWithProxyURL(e.cfg, auth.ProxyURL)
-	// Raise the OAuth refresh User-Agent to this account's persisted
-	// device-profile high-water mark (when present) so background token
-	// refresh matches the same claude-cli identity this account's serving
-	// requests present, instead of the generic claudeOAuthUserAgent floor.
-	// The high-water suffix entrypoint is folded (sdk-cli -> cli, gated by
-	// config.NormalizeSdkCliEntrypointEnabled) so the token-endpoint UA suffix
-	// matches the serving outbound UA suffix aligned by
-	// helps.AlignClaudeDeviceProfileUserAgentSuffix.
-	if refreshUA := claudeRefreshHighWaterUserAgent(e.cfg, auth); refreshUA != "" {
-		svc = svc.WithUserAgent(refreshUA)
-	}
-	td, err := svc.RefreshTokensWithRetry(ctx, refreshToken, 3)
+
+	client := *helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 30*time.Second)
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	// Do not replay a refresh whose token may already have been rotated.
+	td, err := claudeauth.NewClaudeAuthWithHTTPClient(&client).RefreshTokens(ctx, token)
 	if err != nil {
 		return nil, err
 	}
-	if auth.Metadata == nil {
-		auth.Metadata = make(map[string]any)
+	if td == nil || strings.TrimSpace(td.AccessToken) == "" {
+		return nil, statusErr{code: http.StatusBadGateway, msg: "invalid Claude OAuth refresh response"}
 	}
-	auth.Metadata["access_token"] = td.AccessToken
-	if td.RefreshToken != "" {
-		auth.Metadata["refresh_token"] = td.RefreshToken
-	}
-	auth.Metadata["email"] = td.Email
-	auth.Metadata["expired"] = td.Expire
-	auth.Metadata["type"] = "claude"
-	now := time.Now().Format(time.RFC3339)
-	auth.Metadata["last_refresh"] = now
-	return auth, nil
-}
-
-// claudeRefreshHighWaterUserAgent returns the OAuth-refresh User-Agent for auth:
-// the account's persisted device-profile high-water User-Agent with its suffix
-// entrypoint folded (sdk-cli -> cli, gated by config.NormalizeSdkCliEntrypointEnabled)
-// so the token-endpoint refresh identity matches the serving outbound UA suffix.
-// It returns "" when auth has no usable high-water User-Agent, in which case the
-// caller leaves the constructor's claudeOAuthUserAgent floor untouched.
-func claudeRefreshHighWaterUserAgent(cfg *config.Config, auth *cliproxyauth.Auth) string {
-	if auth == nil {
-		return ""
-	}
-	hw, ok := cliproxyauth.ClaudeDeviceHighWaterFromMetadata(auth.Metadata)
-	if !ok || strings.TrimSpace(hw.UserAgent) == "" {
-		return ""
-	}
-	return helps.NormalizeClaudeUserAgentEntrypoint(cfg, hw.UserAgent)
+	refreshed := auth.Clone()
+	claudeauth.EnsureMetadataMap(&refreshed.Metadata)
+	claudeauth.StoreMetadataString(&refreshed.Metadata, "access_token", td.AccessToken)
+	claudeauth.StoreMetadataString(&refreshed.Metadata, "refresh_token", td.RefreshToken)
+	claudeauth.StoreMetadataString(&refreshed.Metadata, "expired", td.Expire)
+	claudeauth.StoreMetadataString(&refreshed.Metadata, "email", td.Email)
+	claudeauth.StoreMetadataString(&refreshed.Metadata, "account_uuid", td.AccountUUID)
+	claudeauth.StoreMetadataString(&refreshed.Metadata, "organization_uuid", td.OrganizationUUID)
+	claudeauth.StoreMetadataString(&refreshed.Metadata, "organization_name", td.OrganizationName)
+	claudeauth.StoreMetadataValue(&refreshed.Metadata, "type", "claude")
+	claudeauth.StoreMetadataValue(&refreshed.Metadata, "last_refresh", time.Now().UTC().Format(time.RFC3339))
+	return refreshed, nil
 }

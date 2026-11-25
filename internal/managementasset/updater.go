@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -17,10 +16,12 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/httpfetch"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
-	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
+	"github.com/MoeForge/moego/json"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/githubauth"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/httpfetch"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
+	sdkconfig "github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/sync/singleflight"
 )
@@ -473,16 +474,14 @@ func fetchLatestAsset(ctx context.Context, client *http.Client, releaseURL strin
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("User-Agent", httpUserAgent)
-	gitURL := strings.ToLower(strings.TrimSpace(os.Getenv("GITSTORE_GIT_URL")))
-	if tok := strings.TrimSpace(os.Getenv("GITSTORE_GIT_TOKEN")); tok != "" && strings.Contains(gitURL, "github.com") {
-		req.Header.Set("Authorization", "Bearer "+tok)
+	if token := githubauth.TokenForURL(releaseURL); token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
 	}
 
-	// fork(anticorr): keep the raw client.Do path here (instead of httpfetch.GetBytes)
-	// because the rate-limit-aware release cooldown needs the response headers
-	// (Retry-After / X-RateLimit-Reset), which httpfetch.GetBytes discards. The
-	// releaseRequestError carrying these fields is consumed by releaseCooldownFromError
-	// to back off the management-asset release check when GitHub rate-limits us.
+	// Read the release headers so a rejected check can honor GitHub's retry time.
+	if client == nil {
+		client = http.DefaultClient
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, "", fmt.Errorf("execute release request: %w", err)
@@ -491,7 +490,7 @@ func fetchLatestAsset(ctx context.Context, client *http.Client, releaseURL strin
 		_ = resp.Body.Close()
 	}()
 
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
 		now := time.Now()
 		return nil, "", &releaseRequestError{
@@ -502,8 +501,12 @@ func fetchLatestAsset(ctx context.Context, client *http.Client, releaseURL strin
 		}
 	}
 
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, "", fmt.Errorf("read release response: %w", err)
+	}
 	var release releaseResponse
-	if err = json.NewDecoder(resp.Body).Decode(&release); err != nil {
+	if err = json.Unmarshal(data, &release); err != nil {
 		return nil, "", fmt.Errorf("decode release response: %w", err)
 	}
 

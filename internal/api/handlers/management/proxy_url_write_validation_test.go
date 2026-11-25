@@ -10,8 +10,9 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	sdkAuth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
 // TestPatchAuthFileFields_RejectsInvalidProxyURL verifies a PATCH that sets an
@@ -151,5 +152,91 @@ func TestPutProxyURL_RejectsInvalidValue(t *testing.T) {
 	}
 	if cfg.ProxyURL != "http://good.proxy:8080" {
 		t.Fatalf("cfg.ProxyURL = %q, want unchanged %q", cfg.ProxyURL, "http://good.proxy:8080")
+	}
+}
+
+func TestCredentialProxyValidationBeforeWriteRegisterAndHook(t *testing.T) {
+	dir := t.TempDir()
+	name := "ordinary-credential.json"
+	path := filepath.Join(dir, name)
+	const initial = `{"type":"codex","proxy_url":"http://existing.example.invalid:8080","legacy":9007199254740993}`
+	if err := os.WriteFile(path, []byte(initial), 0600); err != nil {
+		t.Fatal(err)
+	}
+	store := sdkAuth.NewFileTokenStore()
+	store.SetBaseDir(dir)
+	manager := coreauth.NewManager(store, nil, nil)
+	if _, err := manager.Register(coreauth.WithSkipPersist(context.Background()), &coreauth.Auth{
+		ID: name, FileName: name, Provider: "codex", ProxyURL: "http://existing.example.invalid:8080",
+		Attributes: map[string]string{"path": path},
+		Metadata:   map[string]any{"type": "codex", "proxy_url": "http://existing.example.invalid:8080"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	handler := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: dir}, manager)
+	handler.tokenStore = store
+	hookCalls := 0
+	handler.postAuthPersistHook = func(context.Context, *coreauth.Auth) error {
+		hookCalls++
+		return nil
+	}
+	router := gin.New()
+	router.PATCH("/fields", handler.PatchAuthFileFields)
+	router.POST("/v0/auth-files", handler.UploadAuthFile)
+	router.POST("/v8/credentials", handler.UploadAuthFileV8)
+	send := func(method, endpoint, body string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(method, endpoint, strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		return rec
+	}
+
+	for _, part := range []string{
+		`"proxy_url":"http://bad.example.invalid:90000"`,
+		`"proxy-url":false`,
+		`"proxy_url.host":"bad.example.invalid"`,
+	} {
+		resp := send(http.MethodPatch, "/fields", `{"name":"`+name+`","note":"must not publish",`+part+"}")
+		if resp.Code != http.StatusBadRequest {
+			t.Fatalf("PATCH rejected invalid proxy with %d: %s", resp.Code, resp.Body.String())
+		}
+	}
+	for _, route := range []string{"/v0/auth-files", "/v8/credentials"} {
+		for _, fixture := range []string{name, "must-not-register.json"} {
+			resp := send(http.MethodPost, route+"?name="+fixture, `{"type":"codex","proxy-url":"ftp://invalid.example.invalid"}`)
+			if resp.Code != http.StatusBadRequest {
+				t.Fatalf("%s invalid upload got %d: %s", route, resp.Code, resp.Body.String())
+			}
+		}
+	}
+	if hookCalls != 0 {
+		t.Fatalf("rejected request triggered %d persist hooks", hookCalls)
+	}
+	if _, ok := manager.GetByID("must-not-register.json"); ok {
+		t.Fatal("invalid upload registered a credential")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "must-not-register.json")); !os.IsNotExist(err) {
+		t.Fatalf("invalid upload produced a path: %v", err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil || string(got) != initial {
+		t.Fatalf("invalid request altered existing credential bytes: %v", err)
+	}
+	before, ok := manager.GetByID(name)
+	if !ok || before.ProxyURL != "http://existing.example.invalid:8080" || before.Metadata["note"] != nil {
+		t.Fatal("invalid request altered live credentials")
+	}
+
+	for _, value := range []string{`"direct"`, `""`, "null"} {
+		resp := send(http.MethodPatch, "/fields", `{"name":"`+name+`","proxy_url":`+value+"}")
+		if resp.Code != http.StatusOK {
+			t.Fatalf("valid clear/direct %s got %d: %s", value, resp.Code, resp.Body.String())
+		}
+	}
+	after, ok := manager.GetByID(name)
+	if !ok || after.ProxyURL != "" {
+		t.Fatal("null did not clear live proxy setting")
 	}
 }

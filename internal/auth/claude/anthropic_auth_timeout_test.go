@@ -5,11 +5,9 @@ import (
 	"errors"
 	"net"
 	"net/http"
-	"sync"
+	"strings"
 	"testing"
 	"time"
-
-	"golang.org/x/net/http2"
 )
 
 type contextBlockingRoundTripper struct{}
@@ -44,27 +42,83 @@ func TestNewAnthropicHttpClientHasBoundedTimeout(t *testing.T) {
 	}
 }
 
-type cancelledDialer struct{}
-
-func (cancelledDialer) Dial(network, addr string) (net.Conn, error) {
-	return nil, errors.New("dial should not be called after context cancellation")
+func TestClaudeOAuthConstructorsShareBoundedDefault(t *testing.T) {
+	for _, client := range []*http.Client{NewAnthropicHttpClient(nil), NewClaudeAuth(nil).httpClient, NewClaudeAuthWithHTTPClient(nil).httpClient, NewClaudeAuthWithProxyURL(nil, "direct").httpClient} {
+		if client.Timeout != 60*time.Second {
+			t.Fatalf("default HTTP request timeout = %s, want 60s", client.Timeout)
+		}
+	}
+	injected := &http.Client{Timeout: time.Second, Transport: contextBlockingRoundTripper{}}
+	if auth := NewClaudeAuthWithHTTPClient(injected); auth.httpClient != injected {
+		t.Fatal("caller-provided HTTP client was replaced")
+	}
 }
 
-func TestUTLSRoundTripperDoesNotDialAfterContextCancelled(t *testing.T) {
-	transport := &utlsRoundTripper{
-		connections: make(map[string]*http2.ClientConn),
-		pending:     make(map[string]*sync.Cond),
-		dialer:      cancelledDialer{},
+func TestClaudeOAuthClientTimeoutAndProfileCancellation(t *testing.T) {
+	client := NewAnthropicHttpClient(nil)
+	client.Timeout = 10 * time.Millisecond
+	client.Transport = contextBlockingRoundTripper{}
+	auth := NewClaudeAuthWithHTTPClient(client)
+	if _, err := auth.FetchOAuthProfile(context.Background(), "fixture-token"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("profile total deadline error = %v", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, TokenURL, nil)
-	if err != nil {
-		t.Fatalf("new request: %v", err)
+	if _, err := auth.FetchOAuthRoles(ctx, "fixture-token"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("roles canceled error = %v", err)
 	}
+}
 
-	_, err = transport.RoundTrip(req)
+func TestClaudeOAuthStandardTransportRespectsCanceledRequest(t *testing.T) {
+	client := NewClaudeAuthWithProxyURL(nil, "direct").httpClient
+	transport := client.Transport.(*http.Transport)
+	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		return nil, errors.New("unexpected dial")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://fixture.invalid", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.Do(req)
 	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("RoundTrip error = %v, want context canceled", err)
+		t.Fatalf("standard transport cancellation error = %v", err)
+	}
+}
+
+func TestClaudeOAuthTransportBoundsWithZeroGlobalDefaults(t *testing.T) {
+	original := http.DefaultTransport
+	zeroDefaults := &http.Transport{}
+	http.DefaultTransport = zeroDefaults
+	defer func() { http.DefaultTransport = original }()
+	for _, raw := range []string{"", "direct", "http://proxy.fixture.invalid:8080", "https://proxy.fixture.invalid", "socks5://proxy.fixture.invalid:1080"} {
+		tr, ok := NewClaudeAuthWithProxyURL(nil, raw).httpClient.Transport.(*http.Transport)
+		if !ok || tr.TLSHandshakeTimeout != 10*time.Second || tr.IdleConnTimeout != 90*time.Second {
+			t.Fatalf("mode %q did not provide bounded TLS and idle timeouts", raw)
+		}
+	}
+	if zeroDefaults.TLSHandshakeTimeout != 0 || zeroDefaults.IdleConnTimeout != 0 {
+		t.Fatal("constructor mutated the global transport")
+	}
+}
+
+func TestClaudeOAuthStandardTLSHandshakeTimeout(t *testing.T) {
+	client := NewClaudeAuthWithProxyURL(nil, "direct").httpClient
+	client.Timeout = time.Second
+	transport := client.Transport.(*http.Transport)
+	transport.TLSHandshakeTimeout = 10 * time.Millisecond
+	transport.DialContext = func(context.Context, string, string) (net.Conn, error) {
+		local, peer := net.Pipe()
+		t.Cleanup(func() { _ = peer.Close() })
+		return local, nil
+	}
+	resp, err := client.Get("https://fixture.invalid")
+	if resp != nil {
+		_ = resp.Body.Close()
+		t.Fatal("stalled in-memory TLS handshake unexpectedly succeeded")
+	}
+	if err == nil || !strings.Contains(err.Error(), "TLS handshake timeout") {
+		t.Fatalf("expected Go TLS handshake timeout, got %v", err)
 	}
 }

@@ -7,18 +7,182 @@ permissions:
   contents: read
 
 jobs:
+  ordinary-contracts:
+    name: Ordinary upstream-sync contracts
+    if: >-
+      ${{
+        contains(github.event.pull_request.labels.*.name, 'upstream-sync') ||
+        startsWith(github.head_ref, 'bot/upstream-sync') ||
+        startsWith(github.head_ref, 'codex/upstream-sync') ||
+        startsWith(github.head_ref, 'codex/sync-core') ||
+        startsWith(github.head_ref, 'codex/integrate-prod-')
+      }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Prepare test modules
+        id: ordinary_modules
+        env:
+          GOTOOLCHAIN: local
+          GOWORK: 'off'
+        run: go mod download
+      - name: Build Core PR head for Linux amd64 on loopback
+        id: ordinary_build
+        shell: bash
+        env:
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          commit="$(git rev-parse HEAD)"
+          test "$commit" = "$PR_HEAD_SHA"
+          git diff --quiet HEAD --
+          tree="$(git rev-parse 'HEAD^{tree}')"
+          printf 'Core source commit=%s tree=%s\n' "$commit" "$tree"
+
+          binary="$(mktemp "$RUNNER_TEMP/cliproxy-candidate.XXXXXX")"
+          trap 'rm -f -- "$binary"' EXIT
+          version="candidate-${commit:0:12}"
+          build_date="$(git show -s --format=%cI HEAD)"
+          bash .github/scripts/run-loopback-only.sh env \
+            CGO_ENABLED=1 GOOS=linux GOARCH=amd64 GOTOOLCHAIN=local GOWORK=off GOPROXY=off \
+            go build -mod=readonly -buildvcs=false \
+            -ldflags="-s -w -X 'main.Version=${version}-plus' -X 'main.Commit=${commit}' -X 'main.BuildDate=${build_date}'" \
+            -o "$binary" ./cmd/server
+
+          description="$(LC_ALL=C file -b -- "$binary")"
+          printf 'Core executable type: %s\n' "$description"
+          if [[ "$description" != "ELF 64-bit LSB "* || "$description" != *"executable, x86-64"* ]]; then
+            exit 1
+          fi
+          printf 'Core executable SHA-256: '
+          sha256sum <"$binary"
+
+      - name: Verify reviewed ordinary contracts on loopback
+        id: ordinary_results
+        run: >-
+          bash .github/scripts/run-loopback-only.sh env GOTOOLCHAIN=local GOWORK=off GOPROXY=off
+          python3 .github/scripts/check-ordinary-pr-tests.py --run-selected
+
+      - name: Run complete ordinary support package tests
+        if: >-
+          ${{ !cancelled() && steps.ordinary_modules.outcome == 'success' &&
+              steps.ordinary_build.outcome == 'success' &&
+              (steps.ordinary_results.outcome == 'success' || steps.ordinary_results.outcome == 'failure') }}
+        run: >-
+          bash .github/scripts/run-loopback-only.sh env GOTOOLCHAIN=local GOWORK=off GOPROXY=off
+          go test -mod=readonly -race -count=1 -timeout=120s -v
+          ./internal/usage ./sdk/cliproxy/usage ./internal/kvstore
+          ./internal/clienterror ./internal/modelconfig ./internal/credentialweight
+          ./sdk/access ./sdk/pluginabi ./sdk/cliproxy/executionregistry ./internal/client/codex/tool-schema
+
+  seaweedfs-storage:
+    name: S3-compatible credential storage
+    if: >-
+      ${{
+        contains(github.event.pull_request.labels.*.name, 'upstream-sync') ||
+        startsWith(github.head_ref, 'bot/upstream-sync') ||
+        startsWith(github.head_ref, 'codex/upstream-sync') ||
+        startsWith(github.head_ref, 'codex/sync-core') ||
+        startsWith(github.head_ref, 'codex/integrate-prod-')
+      }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Prepare test modules
+        env:
+          GOTOOLCHAIN: local
+          GOWORK: 'off'
+        run: go mod download
+      - name: Verify release asset and exercise isolated S3 storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          private="$(mktemp -d /tmp/cpa-s3.XXXXXX)"
+          trap 'rm -rf -- "$private"' EXIT
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+            --max-time 90 --max-filesize 49059307 \
+            https://github.com/seaweedfs/seaweedfs/releases/download/4.55/linux_amd64.tar.gz \
+            --output "$private/weed.tar.gz"
+          test "$(wc -c <"$private/weed.tar.gz")" -eq 49059307
+          printf '%s  %s\n' f156c609eeaf9e5fcfeea33fd70411222005f83760aa95893c9d58eff006b45c "$private/weed.tar.gz" | sha256sum -c -
+          tar -xzf "$private/weed.tar.gz" -C "$private" --no-same-owner --no-same-permissions weed
+          bash .github/scripts/run-loopback-only.sh bash .github/scripts/run-seaweedfs-integration.sh "$private/weed" "$private"
+
   build:
     runs-on: ubuntu-latest
+    env:
+      UPSTREAM_SYNC_PR: >-
+        ${{
+          contains(github.event.pull_request.labels.*.name, 'upstream-sync') ||
+          startsWith(github.head_ref, 'bot/upstream-sync') ||
+          startsWith(github.head_ref, 'codex/upstream-sync') ||
+          startsWith(github.head_ref, 'codex/sync-core') ||
+          startsWith(github.head_ref, 'codex/integrate-prod-')
+        }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
           cache: true
+      - name: Upstream sync test preflight
+        if: env.UPSTREAM_SYNC_PR == 'true'
+        env:
+          GOTOOLCHAIN: local
+          GOWORK: 'off'
+          GOPROXY: 'off'
+        run: |
+          go test -mod=readonly -count=1 ./.github/scripts
+          go run .github/scripts/upstream-sync-test-preflight.go -pr-event "$GITHUB_EVENT_PATH"
+      - name: Prepare upstream sync test dependencies
+        if: env.UPSTREAM_SYNC_PR == 'true'
+        env:
+          GOTOOLCHAIN: local
+          GOWORK: 'off'
+        run: |
+          go version
+          go mod download
+          go list -deps -test ./... >/dev/null
       - name: Test
-        run: GOTOOLCHAIN=auto go test -timeout 600s ./...
+        shell: bash
+        run: |
+          set -euo pipefail
+          results="$(mktemp)"
+          trap 'rm -f "$results"' EXIT
+          if [[ "$UPSTREAM_SYNC_PR" == 'true' ]]; then
+            bash .github/scripts/run-loopback-only.sh env GOTOOLCHAIN=local GOWORK=off GOPROXY=off \
+              go test -json -count=1 -timeout 600s ./... | tee "$results"
+          else
+            GOTOOLCHAIN=auto go test -json -count=1 -timeout 600s ./... | tee "$results"
+          fi
+          python3 .github/scripts/check-ordinary-pr-tests.py "$results"
+      - name: Ordinary fork feature survival audit
+        run: |
+          bash scripts/upstream-sync/check-fork-features-alive.sh . \
+            --manifest scripts/upstream-sync/ordinary-fork-feature-manifest.tsv
       # IMPORTANT: keep "Refresh models catalog" AFTER "Test". This step rewrites the
       # committed model catalog on disk; registry tests assert the committed catalog
       # state, so running it before "Test" mutates the catalog and turns those
@@ -29,5 +193,11 @@ jobs:
         run: |
           go build -o test-output ./cmd/server
           rm -f test-output
-      - name: fork feature survival audit
-        run: bash scripts/upstream-sync/check-fork-features-alive.sh
+      - name: Cross-build for Solaris
+        env:
+          GOOS: solaris
+          GOARCH: amd64
+          CGO_ENABLED: 0
+        run: |
+          go build -o test-output-solaris ./cmd/server
+          rm -f test-output-solaris

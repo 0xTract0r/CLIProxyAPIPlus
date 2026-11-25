@@ -18,8 +18,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 )
@@ -131,23 +131,23 @@ func dispatchCyberPolicyWebhook(url string, payload cyberPolicyAlertPayload) {
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
-		log.WithError(err).Warn("codex executor: cyber_policy webhook request build failed")
+		log.Warn("codex executor: cyber_policy webhook request build failed")
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
-	client := &http.Client{Timeout: cyberPolicyWebhookTimeout}
+	client := &http.Client{Timeout: cyberPolicyWebhookTimeout, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	resp, err := client.Do(req)
 	if err != nil {
-		log.WithError(err).WithField("webhook_url", url).Warn("codex executor: cyber_policy webhook dispatch failed")
+		log.Warn("codex executor: cyber_policy webhook dispatch failed")
 		return
 	}
 	defer func() {
 		_ = resp.Body.Close()
 	}()
-	if resp.StatusCode >= 400 {
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		log.WithFields(log.Fields{
-			"webhook_url": url,
-			"status":      resp.StatusCode,
+
+			"status": resp.StatusCode,
 		}).Warn("codex executor: cyber_policy webhook returned non-2xx status")
 	}
 }
@@ -167,5 +167,14 @@ func cyberPolicyHitFromData(data []byte, eventType string) bool {
 
 // cyberPolicyCodeMatches reports whether the JSON field at path equals "cyber_policy".
 func cyberPolicyCodeMatches(data []byte, path string) bool {
-	return gjson.GetBytes(data, path).String() == "cyber_policy"
+	code := gjson.GetBytes(data, path).String()
+	return code == "cyber_policy" || code == "cyber_policy_violation"
+}
+
+// observeOrdinaryPolicyRefusal records an explicit provider event. The original
+// error is still returned to the caller with its status and retry information.
+func (e *CodexExecutor) observeOrdinaryPolicyRefusal(ctx context.Context, auth *cliproxyauth.Auth, model string, data []byte) {
+	if cyberPolicyCodeMatches(data, "error.code") || cyberPolicyCodeMatches(data, "response.error.code") || cyberPolicyCodeMatches(data, "code") {
+		e.recordCyberPolicy(ctx, auth, model)
+	}
 }

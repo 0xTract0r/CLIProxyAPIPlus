@@ -1,11 +1,11 @@
 package signature
 
 import (
-	"encoding/base64"
+	"github.com/MoeForge/moego/base64"
 	"strings"
 	"testing"
 
-	"github.com/tidwall/gjson"
+	"github.com/MoeForge/moego/ojson"
 	"google.golang.org/protobuf/encoding/protowire"
 )
 
@@ -28,6 +28,143 @@ func testClaudeThinkingSignature() string {
 	payload = protowire.AppendTag(payload, 3, protowire.VarintType)
 	payload = protowire.AppendVarint(payload, 1)
 	return base64.StdEncoding.EncodeToString(payload)
+}
+
+// TestBase64AlphabetSet_MatchesEncoderAlphabets pins the charset lookup tables
+// against the encoders they stand in for. A wrong table would silently accept
+// bytes that are not valid base64, or reject a legal payload character.
+func TestBase64AlphabetSet_MatchesEncoderAlphabets(t *testing.T) {
+	cases := []struct {
+		name     string
+		set      [256]bool
+		alphabet string
+	}{
+		{"grok unpadded std", grokEncryptedContentCharSet, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"},
+		{"gpt base64url", gptReasoningSignatureCharSet, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_="},
+		{"meta base64url unpadded", metaReasoningSignatureCharSet, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"},
+	}
+	for _, tc := range cases {
+		allowed := map[byte]bool{}
+		for i := 0; i < len(tc.alphabet); i++ {
+			allowed[tc.alphabet[i]] = true
+		}
+		for c := 0; c < 256; c++ {
+			want := allowed[byte(c)]
+			if got := tc.set[c]; got != want {
+				t.Errorf("%s: byte 0x%02x (%q) accepted=%v, want %v", tc.name, c, string(rune(c)), got, want)
+			}
+		}
+	}
+}
+
+// replaySafeEnvelopeFixtures returns one fixture per self-describing provider
+// envelope that carries replayable state. Every entry must survive the structural
+// pre-filter, because losing one would silently reclassify that provider.
+func replaySafeEnvelopeFixtures(t *testing.T) map[string]struct {
+	sig  string
+	want SignatureProvider
+} {
+	return map[string]struct {
+		sig  string
+		want SignatureProvider
+	}{
+		"claude single-layer E":   {testClaudeThinkingSignature(), SignatureProviderClaude},
+		"claude double-layer R":   {testUnpaddedAntigravityClaudeThinkingSignature(), SignatureProviderClaude},
+		"claude CAIS":             {testClaudeCAISSignature("claude-fable-5"), SignatureProviderClaude},
+		"antigravity CAQS":        {antigravityCAQSFixture(t), SignatureProviderClaude},
+		"gemini protobuf field2":  {testGeminiThoughtSignatureEnvelope(), SignatureProviderGemini},
+		"gemini vertex bare tink": {testGeminiBareTinkSignature(405), SignatureProviderGemini},
+		"gpt fernet":              {testGPTReasoningSignature(), SignatureProviderGPT},
+		"meta muse":               {testMetaReasoningSignature(1024), SignatureProviderMeta},
+	}
+}
+
+// TestSelfDescribingSignatureFirstChars_CoversEveryKnownEnvelope guards the
+// structural pre-filter. DetectSignatureProviderForBlock skips every provider
+// validator when maybeSelfDescribingSignatureEnvelope returns false, so an
+// envelope missing from selfDescribingSignatureFirstChars would silently fall
+// through to the residual class. Adding a provider envelope without registering
+// its base64 first character fails here.
+func TestSelfDescribingSignatureFirstChars_CoversEveryKnownEnvelope(t *testing.T) {
+	for name, fixture := range replaySafeEnvelopeFixtures(t) {
+		if !maybeSelfDescribingSignatureEnvelope(fixture.sig) {
+			t.Errorf("%s: first char %q is not in selfDescribingSignatureFirstChars %q; register it or detection will skip this envelope",
+				name, string(fixture.sig[0]), selfDescribingSignatureFirstChars)
+		}
+	}
+
+	// The pre-filter must not be so wide that it stops filtering. Opaque xAI
+	// ciphertext is the shape it exists to reject.
+	for _, sig := range []string{
+		"K1ZAIbzDbO",
+		"jQDLUr+fD8RFP8nbkkfI",
+		"qcgG7jzxH3D6mlVLBBaKXaG3",
+	} {
+		if maybeSelfDescribingSignatureEnvelope(sig) {
+			t.Errorf("opaque ciphertext %q must not look like a self-describing envelope", sig)
+		}
+	}
+}
+
+// TestGeminiASCIIUUIDIsGateIndependent documents why ascii_uuid is excluded from
+// selfDescribingSignatureFirstChars. Its first byte is the first hex character of
+// the UUID, so the base64 first character spreads over several values, and none of
+// them need to be registered: the envelope is never replay-safe, so it resolves to
+// SignatureProviderUnknown either way and Gemini model parts recover it through the
+// bypass sentinel keyed on block kind.
+func TestGeminiASCIIUUIDClassificationIsGateIndependent(t *testing.T) {
+	// First hex digit chosen to land on distinct base64 first characters.
+	for _, uuid := range []string{
+		"09743975-4bb0-4936-9e28-d5b0d21bdc48",
+		"49743975-4bb0-4936-9e28-d5b0d21bdc48",
+		"89743975-4bb0-4936-9e28-d5b0d21bdc48",
+		"a9743975-4bb0-4936-9e28-d5b0d21bdc48",
+		"e9743975-4bb0-4936-9e28-d5b0d21bdc48",
+	} {
+		sig := testGeminiThoughtSignature([]byte(uuid))
+		if got := DetectSignatureProvider(sig); got != SignatureProviderUnknown {
+			t.Errorf("uuid %q: DetectSignatureProvider = %q, want %q regardless of the pre-filter",
+				uuid[:8], got, SignatureProviderUnknown)
+		}
+	}
+}
+
+// TestDetectSignatureProviderForBlock_ClassifiesEveryKnownEnvelope pins the
+// classification of each envelope so a reordering of the validator chain cannot
+// silently reassign one provider's signatures to another.
+func TestDetectSignatureProviderForBlock_ClassifiesEveryKnownEnvelope(t *testing.T) {
+	for name, fixture := range replaySafeEnvelopeFixtures(t) {
+		if got := DetectSignatureProvider(fixture.sig); got != fixture.want {
+			t.Errorf("%s: DetectSignatureProvider = %q, want %q", name, got, fixture.want)
+		}
+	}
+}
+
+// TestGeminiEnvelopeNeverClaimsClaudeSignatures pins the invariant that keeps
+// Claude and Gemini separable independently of probe order in
+// DetectSignatureProviderForBlock. Gemini validates wire shape only and has no
+// literal marker, so it is the weakest judge; Claude envelopes survive it solely
+// because they carry extra top-level fields beyond the container and therefore
+// fail Gemini's single-record shape. Loosening the Gemini envelope check would
+// make probe order start mattering, and fails here first.
+func TestGeminiEnvelopeNeverClaimsClaudeSignatures(t *testing.T) {
+	for name, sig := range map[string]string{
+		"single-layer E":        testClaudeThinkingSignature(),
+		"single-layer E opaque": testClaudeThinkingSignatureWithOpaqueLen(64),
+		"double-layer R":        testUnpaddedAntigravityClaudeThinkingSignature(),
+		"CAIS synthetic":        testClaudeCAISSignature("claude-opus-5"),
+		"CAIS observed":         observedFable5Sample,
+	} {
+		if isRecognizedGeminiProviderSignature(sig, SignatureBlockKindUnknown) {
+			t.Errorf("claude %s is claimed by the Gemini envelope check; probe order in DetectSignatureProviderForBlock is now load-bearing", name)
+		}
+		if got := DetectSignatureProvider(sig); got != SignatureProviderClaude {
+			t.Errorf("claude %s: DetectSignatureProvider = %q, want %q", name, got, SignatureProviderClaude)
+		}
+		if _, ok := CompatibleSignatureForProvider(SignatureProviderGemini, sig); ok {
+			t.Errorf("claude %s must not be replayable as a Gemini signature", name)
+		}
+	}
 }
 
 func TestDetectSignatureProvider_UsesProviderPrefix(t *testing.T) {
@@ -104,7 +241,7 @@ func TestDetectSignatureProvider_DoesNotClassifyArbitraryBase64AsGemini(t *testi
 	}
 }
 
-func TestGeminiASCIIUUIDSignatureUsesBypass(t *testing.T) {
+func TestGeminiASCIIUUIDSignatureClassificationRejectsCompatibility(t *testing.T) {
 	plainUUID := "e24830a7-5cd6-42fe-998b-ee539e72b9c3"
 	sig := testGeminiThoughtSignature([]byte(plainUUID))
 
@@ -129,17 +266,6 @@ func TestGeminiASCIIUUIDSignatureUsesBypass(t *testing.T) {
 	}
 	if normalized, ok := CompatibleSignatureForProviderBlock(SignatureProviderGemini, sig, SignatureBlockKindGeminiFunctionCall); ok || normalized != "" {
 		t.Fatalf("UUID tool-call signature normalized=%q ok=%v, want empty and false", normalized, ok)
-	}
-	decision := DecideSignatureCompatibility(SignatureProviderGemini, sig, SignatureBlockKindGeminiFunctionCall)
-	if decision.Action != SignatureActionReplaceWithGeminiBypass {
-		t.Fatalf("function-call UUID action = %q, want %q", decision.Action, SignatureActionReplaceWithGeminiBypass)
-	}
-	if decision.ReplacementSignature != GeminiSkipThoughtSignatureValidator {
-		t.Fatalf("function-call UUID replacement = %q, want %q", decision.ReplacementSignature, GeminiSkipThoughtSignatureValidator)
-	}
-	decision = DecideSignatureCompatibility(SignatureProviderGemini, sig, SignatureBlockKindGeminiModelPart)
-	if decision.Action != SignatureActionReplaceWithGeminiBypass {
-		t.Fatalf("model-part UUID action = %q, want %q", decision.Action, SignatureActionReplaceWithGeminiBypass)
 	}
 }
 
@@ -189,16 +315,6 @@ func TestSplitSignatureProviderPrefix_UsesStrictProviderAliases(t *testing.T) {
 	}
 }
 
-func TestDecideSignatureCompatibility_GeminiFunctionCallUsesBypass(t *testing.T) {
-	decision := DecideSignatureCompatibility(SignatureProviderGemini, "claude#"+testClaudeThinkingSignature(), SignatureBlockKindGeminiFunctionCall)
-	if decision.Action != SignatureActionReplaceWithGeminiBypass {
-		t.Fatalf("Action = %q, want %q", decision.Action, SignatureActionReplaceWithGeminiBypass)
-	}
-	if decision.ReplacementSignature != GeminiSkipThoughtSignatureValidator {
-		t.Fatalf("ReplacementSignature = %q, want %q", decision.ReplacementSignature, GeminiSkipThoughtSignatureValidator)
-	}
-}
-
 func TestSanitizeClaudeMessagesSignaturesForModel_NormalizesSameProviderClaude(t *testing.T) {
 	nativeSig := testClaudeThinkingSignature()
 	sig := "claude#" + nativeSig
@@ -212,7 +328,7 @@ func TestSanitizeClaudeMessagesSignaturesForModel_NormalizesSameProviderClaude(t
 	if report.Preserved != 1 || report.DroppedBlocks != 0 {
 		t.Fatalf("unexpected report: %+v", report)
 	}
-	if got := gjson.GetBytes(output, "messages.0.content.0.signature").String(); got != expectedSig {
+	if got := ojson.GetBytes(output, "messages.0.content.0.signature").String(); got != expectedSig {
 		t.Fatalf("signature = %q, want normalized %q", got, expectedSig)
 	}
 }
@@ -225,7 +341,7 @@ func TestSanitizeClaudeMessagesSignaturesForModel_DropsClaudeThinkingForGemini(t
 	if report.DroppedBlocks != 1 {
 		t.Fatalf("DroppedBlocks = %d, want 1; report=%+v", report.DroppedBlocks, report)
 	}
-	content := gjson.GetBytes(output, "messages.0.content").Array()
+	content := ojson.GetBytes(output, "messages.0.content").Array()
 	if len(content) != 1 {
 		t.Fatalf("content length = %d, want 1: %s", len(content), output)
 	}
@@ -243,7 +359,7 @@ func TestSanitizeClaudeMessagesSignaturesForModel_PreservesGeminiThinkingForGemi
 	if report.Preserved != 1 || report.DroppedBlocks != 0 {
 		t.Fatalf("unexpected report: %+v", report)
 	}
-	if got := gjson.GetBytes(output, "messages.0.content.0.signature").String(); got != nativeSig {
+	if got := ojson.GetBytes(output, "messages.0.content.0.signature").String(); got != nativeSig {
 		t.Fatalf("signature = %q, want normalized %q", got, nativeSig)
 	}
 }
@@ -256,7 +372,7 @@ func TestSanitizeClaudeMessagesSignaturesForModel_PreservesGPTForGPT(t *testing.
 	if report.Preserved != 1 || report.DroppedBlocks != 0 {
 		t.Fatalf("unexpected report: %+v", report)
 	}
-	if got := gjson.GetBytes(output, "messages.0.content.0.signature").String(); got != sig {
+	if got := ojson.GetBytes(output, "messages.0.content.0.signature").String(); got != sig {
 		t.Fatalf("signature = %q, want preserved %q", got, sig)
 	}
 }
@@ -269,7 +385,7 @@ func TestSanitizeClaudeMessagesSignaturesForModel_DropsEmptyAssistantMessage(t *
 	if report.DroppedBlocks != 1 {
 		t.Fatalf("DroppedBlocks = %d, want 1", report.DroppedBlocks)
 	}
-	messages := gjson.GetBytes(output, "messages").Array()
+	messages := ojson.GetBytes(output, "messages").Array()
 	if len(messages) != 1 {
 		t.Fatalf("messages length = %d, want 1: %s", len(messages), output)
 	}
@@ -285,7 +401,7 @@ func TestSanitizeClaudeMessagesForClaudeUpstream_DropsInvalidThinkingAndCleansTo
 	if report.DroppedBlocks != 1 {
 		t.Fatalf("DroppedBlocks = %d, want 1; report=%+v", report.DroppedBlocks, report)
 	}
-	parts := gjson.GetBytes(output, "messages.0.content").Array()
+	parts := ojson.GetBytes(output, "messages.0.content").Array()
 	if len(parts) != 2 {
 		t.Fatalf("content length = %d, want 2: %s", len(parts), output)
 	}
@@ -321,7 +437,7 @@ func TestSanitizeClaudeMessagesForClaudeUpstream_NormalizesValidThinkingAndDrops
 	if report.Preserved != 1 || report.DroppedBlocks != 1 {
 		t.Fatalf("unexpected report: %+v", report)
 	}
-	messages := gjson.GetBytes(output, "messages").Array()
+	messages := ojson.GetBytes(output, "messages").Array()
 	if len(messages) != 2 {
 		t.Fatalf("messages length = %d, want 2: %s", len(messages), output)
 	}

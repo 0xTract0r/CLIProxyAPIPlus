@@ -8,21 +8,30 @@ import (
 	"testing"
 	"time"
 
-	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	homekv "github.com/router-for-me/CLIProxyAPI/v7/internal/home"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	homekv "github.com/router-for-me/CLIProxyAPI/v8/internal/home"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	log "github.com/sirupsen/logrus"
 )
 
 type antigravityCreditsFallbackExecutor struct {
-	streamCreditsRequested []bool
+	executeCreditsRequested []bool
+	streamCreditsRequested  []bool
 }
 
 func (e *antigravityCreditsFallbackExecutor) Identifier() string { return "antigravity" }
 
-func (e *antigravityCreditsFallbackExecutor) Execute(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-	return cliproxyexecutor.Response{}, &Error{HTTPStatus: http.StatusNotImplemented, Message: "Execute not implemented"}
+func (e *antigravityCreditsFallbackExecutor) Execute(ctx context.Context, _ *Auth, req cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	creditsRequested := AntigravityCreditsRequested(ctx)
+	e.executeCreditsRequested = append(e.executeCreditsRequested, creditsRequested)
+	if !creditsRequested {
+		return cliproxyexecutor.Response{}, &Error{HTTPStatus: http.StatusTooManyRequests, Message: "quota exhausted"}
+	}
+	return cliproxyexecutor.Response{
+		Payload: []byte("credits fallback"),
+		Headers: http.Header{"X-Credits": {req.Model}},
+	}, nil
 }
 
 func (e *antigravityCreditsFallbackExecutor) ExecuteStream(ctx context.Context, _ *Auth, req cliproxyexecutor.Request, _ cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
@@ -88,43 +97,30 @@ func (h *captureLogHook) Fire(entry *log.Entry) error {
 	return nil
 }
 
-func TestManagerExecuteStream_AntigravityCreditsFallbackAfterBootstrap429(t *testing.T) {
+func TestManagerExecuteStream_AntigravityPreservesBootstrapRefusal(t *testing.T) {
 	const model = "claude-opus-4-6-thinking"
 	executor := &antigravityCreditsFallbackExecutor{}
 	manager := NewManager(nil, nil, nil)
-	manager.SetConfig(&internalconfig.Config{
-		QuotaExceeded: internalconfig.QuotaExceeded{AntigravityCredits: true},
-	})
 	manager.RegisterExecutor(executor)
-	registry.GetGlobalRegistry().RegisterClient("ag-credits", "antigravity", []*registry.ModelInfo{{ID: model}})
-	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient("ag-credits") })
-	if _, errRegister := manager.Register(context.Background(), &Auth{ProxyURL: "http://test-proxy:8080", ID: "ag-credits", Provider: "antigravity"}); errRegister != nil {
-		t.Fatalf("register auth: %v", errRegister)
+	registry.GetGlobalRegistry().RegisterClient("ag-ordinary-refusal", "antigravity", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient("ag-ordinary-refusal") })
+	if _, err := manager.Register(context.Background(), &Auth{ID: "ag-ordinary-refusal", Provider: "antigravity"}); err != nil {
+		t.Fatal(err)
 	}
-
-	streamResult, errExecute := manager.ExecuteStream(context.Background(), []string{"antigravity"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
-	if errExecute != nil {
-		t.Fatalf("execute stream: %v", errExecute)
-	}
-
-	var payload []byte
-	for chunk := range streamResult.Chunks {
-		if chunk.Err != nil {
-			t.Fatalf("unexpected stream error: %v", chunk.Err)
+	stream, err := manager.ExecuteStream(context.Background(), []string{"antigravity"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if err == nil {
+		for chunk := range stream.Chunks {
+			if len(chunk.Payload) != 0 || err != nil || chunk.Err == nil {
+				t.Fatalf("unexpected chunk: %+v", chunk)
+			}
+			err = chunk.Err
 		}
-		payload = append(payload, chunk.Payload...)
 	}
-	if string(payload) != "credits fallback" {
-		t.Fatalf("payload = %q, want %q", string(payload), "credits fallback")
+	if statusCodeFromError(err) != http.StatusTooManyRequests || !strings.Contains(err.Error(), "quota exhausted") {
+		t.Fatalf("want original 429, got %v", err)
 	}
-	if got := streamResult.Headers.Get("X-Credits"); got != model {
-		t.Fatalf("X-Credits header = %q, want routed model", got)
-	}
-	if len(executor.streamCreditsRequested) != 2 {
-		t.Fatalf("stream calls = %d, want 2", len(executor.streamCreditsRequested))
-	}
-	if executor.streamCreditsRequested[0] || !executor.streamCreditsRequested[1] {
-		t.Fatalf("credits flags = %v, want [false true]", executor.streamCreditsRequested)
+	if calls := executor.streamCreditsRequested; len(calls) != 1 || calls[0] {
+		t.Fatalf("want one standard call, got %v", calls)
 	}
 }
 
@@ -264,5 +260,86 @@ func TestIsAuthBlockedForModel_KeepsGeminiBlockedWithoutCreditsBypass(t *testing
 	blocked, reason, _ := isAuthBlockedForModel(auth, "gemini-3-flash", time.Now())
 	if !blocked || reason != blockReasonCooldown {
 		t.Fatalf("expected gemini model to remain blocked, got blocked=%v reason=%v", blocked, reason)
+	}
+}
+
+func TestManagerExecuteAndStream_ExpiredNegativeCreditsHintRespectsModelCooldown(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		name := "execute"
+		if stream {
+			name = "execute_stream"
+		}
+		t.Run(name, func(t *testing.T) {
+			authID := "ag-expired-negative-hint-" + name
+			const model = "claude-sonnet-4-6"
+			executor := &antigravityCreditsFallbackExecutor{}
+			manager := NewManager(nil, nil, nil)
+			manager.SetConfig(&internalconfig.Config{
+				QuotaExceeded: internalconfig.QuotaExceeded{AntigravityCredits: true},
+			})
+			manager.RegisterExecutor(executor)
+			registry.GetGlobalRegistry().RegisterClient(authID, "antigravity", []*registry.ModelInfo{{ID: model}})
+			t.Cleanup(func() {
+				registry.GetGlobalRegistry().UnregisterClient(authID)
+				SetAntigravityCreditsHint(authID, AntigravityCreditsHint{})
+			})
+
+			cooldownUntil := time.Now().Add(30 * time.Minute)
+			if _, errRegister := manager.Register(context.Background(), &Auth{
+				ID:       authID,
+				Provider: "antigravity",
+				ModelStates: map[string]*ModelState{
+					model: {
+						Unavailable:    true,
+						NextRetryAfter: cooldownUntil,
+						Quota: QuotaState{
+							Exceeded:      true,
+							NextRecoverAt: cooldownUntil,
+						},
+					},
+				},
+			}); errRegister != nil {
+				t.Fatalf("register auth: %v", errRegister)
+			}
+
+			// Fresh negative hint must still suppress credits fallback while model is in cooldown.
+			SetAntigravityCreditsHint(authID, AntigravityCreditsHint{
+				Known:     true,
+				Available: false,
+				UpdatedAt: time.Now(),
+			})
+			if stream {
+				if _, errStream := manager.ExecuteStream(context.Background(), []string{"antigravity"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{}); errStream == nil {
+					t.Fatal("ExecuteStream() succeeded with fresh negative credits hint, want cooldown error")
+				}
+			} else {
+				if _, errExec := manager.Execute(context.Background(), []string{"antigravity"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{}); errExec == nil {
+					t.Fatal("Execute() succeeded with fresh negative credits hint, want cooldown error")
+				}
+			}
+			if len(executor.executeCreditsRequested) != 0 || len(executor.streamCreditsRequested) != 0 {
+				t.Fatalf("executor calls during fresh negative hint = (%d, %d), want (0, 0)", len(executor.executeCreditsRequested), len(executor.streamCreditsRequested))
+			}
+
+			// An expired hint leaves the existing cooldown in force.
+			SetAntigravityCreditsHint(authID, AntigravityCreditsHint{
+				Known:     true,
+				Available: false,
+				UpdatedAt: time.Now().Add(-AntigravityCreditsHintRefreshInterval - time.Second),
+			})
+			var err error
+			req := cliproxyexecutor.Request{Model: model}
+			if stream {
+				_, err = manager.ExecuteStream(context.Background(), []string{"antigravity"}, req, cliproxyexecutor.Options{})
+			} else {
+				_, err = manager.Execute(context.Background(), []string{"antigravity"}, req, cliproxyexecutor.Options{})
+			}
+			if statusCodeFromError(err) != http.StatusTooManyRequests || SafeResponseHeaders(err).Get("Retry-After") == "" {
+				t.Fatalf("want original cooldown and deadline, got %v", err)
+			}
+			if len(executor.executeCreditsRequested) != 0 || len(executor.streamCreditsRequested) != 0 {
+				t.Fatalf("cooldown dispatched: execute=%v stream=%v", executor.executeCreditsRequested, executor.streamCreditsRequested)
+			}
+		})
 	}
 }

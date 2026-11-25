@@ -5,8 +5,8 @@ import (
 	"net/http"
 	"strings"
 
-	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
-	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
+	sdkaccess "github.com/router-for-me/CLIProxyAPI/v8/sdk/access"
+	sdkconfig "github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
 )
 
 // Register ensures the config-access provider is available to the access manager.
@@ -59,36 +59,13 @@ func (p *provider) Authenticate(_ context.Context, r *http.Request) (*sdkaccess.
 	if len(p.keys) == 0 {
 		return nil, sdkaccess.NewNotHandledError()
 	}
-	authHeader := r.Header.Get("Authorization")
-	authHeaderGoogle := r.Header.Get("X-Goog-Api-Key")
-	authHeaderAnthropic := r.Header.Get("X-Api-Key")
-	queryKey := ""
-	queryAuthToken := ""
-	if r.URL != nil {
-		queryKey = r.URL.Query().Get("key")
-		queryAuthToken = r.URL.Query().Get("auth_token")
-	}
-	if authHeader == "" && authHeaderGoogle == "" && authHeaderAnthropic == "" && queryKey == "" && queryAuthToken == "" {
-		return nil, sdkaccess.NewNoCredentialsError()
-	}
-
-	apiKey := extractBearerToken(authHeader)
-
-	candidates := []struct {
-		value  string
-		source string
-	}{
-		{apiKey, "authorization"},
-		{authHeaderGoogle, "x-goog-api-key"},
-		{authHeaderAnthropic, "x-api-key"},
-		{queryKey, "query-key"},
-		{queryAuthToken, "query-auth-token"},
-	}
-
+	candidates := requestAPIKeys(r)
+	hadCredentials := false
 	for _, candidate := range candidates {
 		if candidate.value == "" {
 			continue
 		}
+		hadCredentials = true
 		if _, ok := p.keys[candidate.value]; ok {
 			return &sdkaccess.Result{
 				Provider:  p.Identifier(),
@@ -99,8 +76,44 @@ func (p *provider) Authenticate(_ context.Context, r *http.Request) (*sdkaccess.
 			}, nil
 		}
 	}
-
+	if !hadCredentials && r.Header.Get("Authorization") == "" {
+		return nil, sdkaccess.NewNoCredentialsError()
+	}
 	return nil, sdkaccess.NewInvalidCredentialError()
+}
+
+// RequestPresentsInlineKey is a possession check, to be used after authentication.
+func RequestPresentsInlineKey(r *http.Request, key string) bool {
+	if key == "" {
+		return false
+	}
+	for _, candidate := range requestAPIKeys(r) {
+		if candidate.value == key {
+			return true
+		}
+	}
+	return false
+}
+
+func requestAPIKeys(r *http.Request) []struct{ value, source string } {
+	authHeader := r.Header.Get("Authorization")
+	authHeaderGoogle := r.Header.Get("X-Goog-Api-Key")
+	authHeaderAnthropic := r.Header.Get("X-Api-Key")
+	queryKey := ""
+	queryAuthToken := ""
+	if r.URL != nil {
+		queryKey = r.URL.Query().Get("key")
+		queryAuthToken = r.URL.Query().Get("auth_token")
+	}
+	apiKey := extractBearerToken(authHeader)
+
+	return []struct{ value, source string }{
+		{apiKey, "authorization"},
+		{authHeaderGoogle, "x-goog-api-key"},
+		{authHeaderAnthropic, "x-api-key"},
+		{queryKey, "query-key"},
+		{queryAuthToken, "query-auth-token"},
+	}
 }
 
 func extractBearerToken(header string) string {

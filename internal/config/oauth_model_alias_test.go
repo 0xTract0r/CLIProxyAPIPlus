@@ -55,55 +55,25 @@ func TestSanitizeOAuthModelAlias_AllowsMultipleAliasesForSameName(t *testing.T) 
 	}
 }
 
-func TestSanitizeOAuthModelAlias_InjectsDefaultKiroAliases(t *testing.T) {
-	// When no kiro aliases are configured, defaults should be injected
-	cfg := &Config{
-		OAuthModelAlias: map[string][]OAuthModelAlias{
-			"codex": {
-				{Name: "gpt-5", Alias: "g5"},
-			},
-		},
-	}
-
+func TestSanitizeOAuthModelAlias_PreservesOnlyExplicitKiroAliases(t *testing.T) {
+	cfg := &Config{OAuthModelAlias: map[string][]OAuthModelAlias{
+		"codex": {{Name: "gpt-5", Alias: "g5"}},
+	}}
 	cfg.SanitizeOAuthModelAlias()
-
-	kiroAliases := cfg.OAuthModelAlias["kiro"]
-	if len(kiroAliases) == 0 {
-		t.Fatal("expected default kiro aliases to be injected")
+	if _, ok := cfg.OAuthModelAlias["kiro"]; ok {
+		t.Fatal("Kiro aliases must remain absent when unconfigured")
 	}
-
-	// Check that standard Claude model names are present
-	aliasSet := make(map[string]bool)
-	for _, a := range kiroAliases {
-		aliasSet[a.Alias] = true
+	cfg.OAuthModelAlias[" KiRo "] = []OAuthModelAlias{{
+		Name: " fixture-upstream ", Alias: " fixture-alias ", Fork: true,
+	}}
+	cfg.SanitizeOAuthModelAlias()
+	if aliases := cfg.OAuthModelAlias["kiro"]; len(aliases) != 1 ||
+		aliases[0].Name != "fixture-upstream" || aliases[0].Alias != "fixture-alias" || !aliases[0].Fork {
+		t.Fatalf("explicit legacy Kiro alias did not survive: %#v", aliases)
 	}
-	expectedAliases := []string{
-		"claude-sonnet-4-5-20250929",
-		"claude-sonnet-4-5",
-		"claude-sonnet-4-20250514",
-		"claude-sonnet-4",
-		"claude-opus-4-6",
-		"claude-opus-4-5-20251101",
-		"claude-opus-4-5",
-		"claude-haiku-4-5-20251001",
-		"claude-haiku-4-5",
-	}
-	for _, expected := range expectedAliases {
-		if !aliasSet[expected] {
-			t.Fatalf("expected default kiro alias %q to be present", expected)
-		}
-	}
-
-	// All should have fork=true
-	for _, a := range kiroAliases {
-		if !a.Fork {
-			t.Fatalf("expected all default kiro aliases to have fork=true, got fork=false for %q", a.Alias)
-		}
-	}
-
-	// Codex aliases should still be preserved
-	if len(cfg.OAuthModelAlias["codex"]) != 1 {
-		t.Fatal("expected codex aliases to be preserved")
+	if aliases := cfg.OAuthModelAlias["codex"]; len(aliases) != 1 ||
+		aliases[0].Name != "gpt-5" || aliases[0].Alias != "g5" {
+		t.Fatalf("existing Codex alias did not survive: %#v", aliases)
 	}
 }
 
@@ -279,14 +249,113 @@ func TestSanitizeOAuthModelAlias_DoesNotReinjectAfterExplicitDeletionEmpty(t *te
 	}
 }
 
-func TestSanitizeOAuthModelAlias_InjectsDefaultKiroWhenEmpty(t *testing.T) {
-	// When OAuthModelAlias is nil, kiro defaults should still be injected
-	cfg := &Config{}
+func TestSanitizeOAuthModelAlias_NoDefaultKiroAndPreservesExplicitEmpty(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		input      map[string][]OAuthModelAlias
+		wantMarker bool
+	}{
+		{name: "unset"},
+		{name: "nil marker", input: map[string][]OAuthModelAlias{" KiRo ": nil}, wantMarker: true},
+		{name: "empty marker", input: map[string][]OAuthModelAlias{" KIRO ": {}}, wantMarker: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &Config{OAuthModelAlias: tt.input}
+			for i := 0; i < 2; i++ {
+				cfg.SanitizeOAuthModelAlias()
+				aliases, ok := cfg.OAuthModelAlias["kiro"]
+				if ok != tt.wantMarker || aliases != nil {
+					t.Fatalf("Kiro marker present=%t aliases=%#v, want marker present=%t and nil aliases", ok, aliases, tt.wantMarker)
+				}
+			}
+		})
+	}
+}
+
+func TestParseConfigOAuthMetaChannel(t *testing.T) {
+	const yamlConfig = `
+oauth-model-alias:
+  meta:
+    - name: "muse-spark-1.3"
+      alias: "muse-latest"
+      fork: true
+      force-mapping: true
+oauth-excluded-models:
+  meta:
+    - "muse-spark-1.1"
+oauth-request-scoped-errors:
+  meta:
+    - status: 400
+      match:
+        - "context_length_exceeded"
+      action: "stop"
+`
+
+	cfg, err := ParseConfigBytes([]byte(yamlConfig))
+	if err != nil {
+		t.Fatalf("ParseConfigBytes failed: %v", err)
+	}
+
+	aliases, ok := cfg.OAuthModelAlias["meta"]
+	if !ok || len(aliases) != 1 {
+		t.Fatalf("oauth-model-alias[meta] missing or len != 1: %#v", aliases)
+	}
+	if aliases[0].Name != "muse-spark-1.3" || aliases[0].Alias != "muse-latest" || !aliases[0].Fork || !aliases[0].ForceMapping {
+		t.Fatalf("unexpected meta alias: %+v", aliases[0])
+	}
+
+	excluded, ok := cfg.OAuthExcludedModels["meta"]
+	if !ok || len(excluded) != 1 || excluded[0] != "muse-spark-1.1" {
+		t.Fatalf("oauth-excluded-models[meta] = %#v, want [muse-spark-1.1]", excluded)
+	}
+
+	rules, ok := cfg.OAuthRequestScopedErrors["meta"]
+	if !ok || len(rules) != 1 {
+		t.Fatalf("oauth-request-scoped-errors[meta] missing or len != 1: %#v", rules)
+	}
+	if rules[0].Status != 400 || rules[0].Action != "stop" || len(rules[0].Match) != 1 || rules[0].Match[0] != "context_length_exceeded" {
+		t.Fatalf("unexpected meta request-scoped error rule: %+v", rules[0])
+	}
+}
+
+func TestSanitizeOAuthModelAlias_PreservesCaseOnlyAlias(t *testing.T) {
+	cfg := &Config{
+		OAuthModelAlias: map[string][]OAuthModelAlias{
+			"opencode-go": {
+				{Name: "minimax-m3.1-flash", Alias: "MiniMax-M3.1-Flash"},
+				{Name: "same-exact", Alias: "same-exact"},
+			},
+		},
+	}
 
 	cfg.SanitizeOAuthModelAlias()
 
-	kiroAliases := cfg.OAuthModelAlias["kiro"]
-	if len(kiroAliases) == 0 {
-		t.Fatal("expected default kiro aliases to be injected when OAuthModelAlias is nil")
+	aliases := cfg.OAuthModelAlias["opencode-go"]
+	if len(aliases) != 1 {
+		t.Fatalf("expected 1 case-only alias, got %d (%#v)", len(aliases), aliases)
+	}
+	if aliases[0].Name != "minimax-m3.1-flash" || aliases[0].Alias != "MiniMax-M3.1-Flash" {
+		t.Fatalf("unexpected sanitized alias: %+v", aliases[0])
+	}
+}
+
+func TestSanitizeOAuthModelAlias_PreservesOfficialOptionalFlagAsCopy(t *testing.T) {
+	openAPI := false
+	cfg := &Config{OAuthModelAlias: map[string][]OAuthModelAlias{
+		" Vertex ": {{Name: "Fixture", Alias: "fixture", OpenAPI: &openAPI}},
+		" KiRo ":   nil,
+	}}
+	cfg.SanitizeOAuthModelAlias()
+	cfg.SanitizeOAuthModelAlias()
+	aliases := cfg.OAuthModelAlias["vertex"]
+	if len(aliases) != 1 || aliases[0].Alias != "fixture" || aliases[0].OpenAPI == nil {
+		t.Fatalf("normalized Vertex alias = %#v", aliases)
+	}
+	openAPI = true
+	if *aliases[0].OpenAPI {
+		t.Fatal("normalizer retained the caller's OpenAPI pointer")
+	}
+	if tombstone, ok := cfg.OAuthModelAlias["kiro"]; !ok || tombstone != nil {
+		t.Fatalf("the normalized Kiro deletion marker was lost: %#v", tombstone)
 	}
 }

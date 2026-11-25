@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	homekv "github.com/router-for-me/CLIProxyAPI/v7/internal/home"
+	homekv "github.com/router-for-me/CLIProxyAPI/v8/internal/home"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -210,21 +210,33 @@ func TestClearSignatureCacheHomeDoesNotPrefixDelete(t *testing.T) {
 	}
 }
 
-func TestGetCachedSignatureRequiredGeminiEmptyThinkingSentinel(t *testing.T) {
-	client := newFakeSignatureKVClient()
-	client.getErr = errors.New("get should not be called")
-	useFakeSignatureKVClient(t, client, true, nil)
+func TestOrdinaryGeminiSignatureCacheAbsence(t *testing.T) {
+	const model = "gemini-3-pro-preview"
+	t.Run("empty_input_skips_KV", func(t *testing.T) {
+		client := newFakeSignatureKVClient()
+		client.getErr = errors.New("unexpected KVGet")
+		useFakeSignatureKVClient(t, client, true, nil)
 
-	got, errGet := GetCachedSignatureRequired(context.Background(), "gemini-3-pro-preview", "")
-	if errGet != nil {
-		t.Fatalf("GetCachedSignatureRequired() error = %v", errGet)
-	}
-	if got != "skip_thought_signature_validator" {
-		t.Fatalf("GetCachedSignatureRequired() = %q, want Gemini sentinel", got)
-	}
-	if client.getCount != 0 {
-		t.Fatalf("KVGet count = %d, want 0", client.getCount)
-	}
+		got, err := GetCachedSignatureRequired(context.Background(), model, "")
+		if err != nil || got != "" {
+			t.Fatal("empty input must return absence without a storage error")
+		}
+		if client.getCount+client.setCount+client.delCount+client.expireCount != 0 {
+			t.Fatal("empty input touched KV")
+		}
+	})
+	t.Run("missing_KV_value_stays_absent", func(t *testing.T) {
+		client := newFakeSignatureKVClient()
+		useFakeSignatureKVClient(t, client, true, nil)
+
+		got, err := GetCachedSignatureRequired(context.Background(), model, "ordinary fixture text")
+		if err != nil || got != "" {
+			t.Fatal("a missing cache value must stay absent")
+		}
+		if client.getCount != 1 || client.expireCount != 0 {
+			t.Fatal("cache miss should read once without extending TTL")
+		}
+	})
 }
 
 func TestCacheSignature_DifferentModelGroups(t *testing.T) {

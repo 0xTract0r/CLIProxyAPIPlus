@@ -2,49 +2,13 @@ package auth
 
 import (
 	"encoding/json"
-	"math"
-	"net/http"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 )
 
-// This file implements openspec/changes/add-adaptive-account-scheduling
-// tasks.md Phase 0 task 0.3: parse the already-persisted, already-polled
-// Auth.Metadata["quota_snapshot"]["usage"] payload (refreshed on a ~45min
-// cycle by internal/api/handlers/management/quota_snapshots.go) into
-// structured per-window utilization, and expose a single "current quota
-// headroom" query function for the Phase 1 weight function (design.md D1:
-// weight = tier capacity x (1 - utilization%) x freshness).
-//
-// Scope boundary (see design.md D1 / tasks.md 0.3 vs 1.1): this file only
-// reads the most recent snapshot already sitting in metadata. It
-// deliberately does NOT do the token-delta estimation between two snapshots
-// that design.md D1 describes ("两次快照之间用逐请求 token 数增量估算") --
-// that refinement belongs to Phase 1 (tasks.md 1.1), which can layer a
-// token-based adjustment on top of the structured windows this file exposes.
-//
-// Confirmed schema (design.md §1.1, docs/repo-memory-ledger.md §7.1, and
-// live-verified via sdk/cliproxy/service_fork_anticorr.go's existing
-// claudeUsageCreditsEnabled which already reads quota_snapshot.usage.extra_usage):
-// Claude's quota_snapshot.usage (the raw https://api.anthropic.com/api/oauth/usage
-// response body) is a flat object whose usage-window entries look like
-// {"five_hour":{"utilization":8.0,"resets_at":"2026-01-22T09:00:00Z"},
-//
-//	"seven_day":{...},"seven_day_sonnet":{...},"extra_usage":{"is_enabled":false}}.
-//
-// utilization is a 0-100 percentage, not a 0-1 fraction. This file detects
-// window objects generically (any object under "usage" carrying a numeric
-// "utilization" field) rather than hardcoding the window name set, so it
-// keeps working if Anthropic adds e.g. "seven_day_opus" without a code
-// change, and it naturally skips non-window sibling objects like
-// "extra_usage" (no "utilization" key) without special-casing them by name.
-//
-// Codex /backend-api/wham/usage nests its shared plan windows under
-// rate_limit.primary_window / secondary_window, with used_percent (0-100)
-// and reset_at (Unix seconds). Separate code-review and additional model
-// limits do not describe the shared serving pool and are not parsed here.
+// These helpers consume stored quota observations. They have no execution or
+// credential selection side effects.
 const (
 	accountQuotaSnapshotMetadataKey = "quota_snapshot"
 	accountQuotaUsageKey            = "usage"
@@ -123,130 +87,8 @@ func ParseAccountQuotaUtilization(auth *Auth) (AccountQuotaUtilization, bool) {
 	}
 
 	windows := parseAccountQuotaWindows(usage)
-	if result.Provider == "codex" {
-		windows = parseCodexQuotaWindows(usage)
-	}
 	result.Windows = windows
 	return result, len(windows) > 0
-}
-
-func parseCodexQuotaWindows(usage map[string]any) map[string]AccountQuotaWindow {
-	windows := make(map[string]AccountQuotaWindow)
-	limits, _ := metadataObject(usage["rate_limit"])
-	for _, key := range []string{"primary_window", "secondary_window"} {
-		window, ok := metadataObject(limits[key])
-		if !ok {
-			continue
-		}
-		used, ok := accountQuotaNumericValue(window["used_percent"])
-		if !ok || math.IsNaN(used) || math.IsInf(used, 0) {
-			continue
-		}
-		reset, _ := parseTimeValue(window["reset_at"])
-		name := "codex_" + strings.TrimSuffix(key, "_window")
-		windows[name] = AccountQuotaWindow{
-			Name: name, UtilizationPercent: clampUtilizationPercent(used), ResetsAt: reset,
-		}
-	}
-	return windows
-}
-
-// codexQuotaSnapshotCooldown skips an exhausted shared plan before any model
-// or session selection. It never disables the credential or its refresh loop.
-// Expired/unknown resets cannot pin an account indefinitely; normal serving
-// feedback still handles those cases. Multiple exhausted windows must all reset.
-// An explicit upstream allow (allowed=true and limit_reached=false, both present
-// as booleans) wins over used_percent; missing or non-boolean signals fall back
-// to the used_percent rule.
-func codexQuotaSnapshotCooldown(auth *Auth, now time.Time) (time.Time, bool) {
-	if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
-		return time.Time{}, false
-	}
-	snapshot, _ := metadataObject(auth.Metadata[accountQuotaSnapshotMetadataKey])
-	usage, _ := metadataObject(snapshot[accountQuotaUsageKey])
-	limits, _ := metadataObject(usage["rate_limit"])
-	allowed, hasAllowed := limits["allowed"].(bool)
-	reached, hasReached := limits["limit_reached"].(bool)
-	// Upstream explicitly still serves this plan (e.g. used_percent=100 with
-	// allowed=true and no credits). A real 429 is still handled by the passive
-	// serving cooldown path, so do not pre-emptively skip the account here.
-	if hasAllowed && allowed && hasReached && !reached {
-		return time.Time{}, false
-	}
-	// Preserve Codex's existing credit overflow semantics, but never override
-	// an explicit upstream refusal with a possibly stale credit balance.
-	if !(hasAllowed && !allowed) && !reached {
-		credits, _ := metadataObject(usage["credits"])
-		hasCredits, _ := credits["has_credits"].(bool)
-		unlimited, _ := credits["unlimited"].(bool)
-		balance, _ := accountQuotaNumericValue(credits["balance"])
-		if hasCredits && (unlimited || (balance > 0 && !math.IsInf(balance, 0))) {
-			return time.Time{}, false
-		}
-	}
-	var reset time.Time
-	for _, window := range parseCodexQuotaWindows(usage) {
-		if window.UtilizationPercent >= 100 && window.ResetsAt.After(now) && window.ResetsAt.After(reset) {
-			reset = window.ResetsAt
-		}
-	}
-	return reset, !reset.IsZero()
-}
-
-// claudeQuotaSnapshotCooldown applies shared limits to every model and named
-// family limits only to that family. Unknown future windows must not become
-// account-wide exclusions. Enabled extra usage preserves overflow unless its
-// reported budget is exhausted; this never enables billing upstream.
-func claudeQuotaSnapshotCooldown(auth *Auth, model string, now time.Time) (time.Time, bool) {
-	if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), "claude") {
-		return time.Time{}, false
-	}
-	if claudeSnapshotCreditsUsable(auth) {
-		return time.Time{}, false
-	}
-	quota, ok := ParseAccountQuotaUtilization(auth)
-	if !ok {
-		return time.Time{}, false
-	}
-	model = strings.ToLower(canonicalModelKey(model))
-	var reset time.Time
-	for name, window := range quota.Windows {
-		applies := false
-		switch name {
-		case "five_hour", "seven_day", "seven_day_oauth_apps":
-			applies = true
-		case "seven_day_opus", "seven_day_sonnet", "seven_day_haiku":
-			applies = strings.Contains(model, strings.TrimPrefix(name, "seven_day_"))
-		}
-		if applies && window.UtilizationPercent >= 100 && window.ResetsAt.After(now) && window.ResetsAt.After(reset) {
-			reset = window.ResetsAt
-		}
-	}
-	return reset, !reset.IsZero()
-}
-
-func claudeSnapshotCreditsUsable(auth *Auth) bool {
-	if !auth.ClaudeUsageCreditsEnabled() {
-		return false
-	}
-	snapshot, _ := metadataObject(auth.Metadata[accountQuotaSnapshotMetadataKey])
-	usage, _ := metadataObject(snapshot[accountQuotaUsageKey])
-	extra, ok := metadataObject(usage["extra_usage"])
-	if !ok {
-		extra, _ = metadataObject(usage["extraUsage"])
-	}
-	if used, ok := accountQuotaNumericValue(extra["utilization"]); ok && used >= 100 {
-		return false
-	}
-	if limit, ok := accountQuotaNumericValue(extra["monthly_limit"]); ok && !math.IsNaN(limit) && !math.IsInf(limit, 0) {
-		if limit <= 0 {
-			return false
-		}
-		if used, ok := accountQuotaNumericValue(extra["used_credits"]); ok && used >= limit {
-			return false
-		}
-	}
-	return true
 }
 
 // parseAccountQuotaWindows scans every top-level entry of a quota_snapshot
@@ -261,7 +103,7 @@ func parseAccountQuotaWindows(usage map[string]any) map[string]AccountQuotaWindo
 			continue
 		}
 		utilization, ok := accountQuotaNumericValue(obj[accountQuotaUtilizationKey])
-		if !ok || math.IsNaN(utilization) || math.IsInf(utilization, 0) {
+		if !ok {
 			// Not a usage-window object (e.g. "extra_usage": {"is_enabled": false}).
 			continue
 		}
@@ -313,31 +155,6 @@ type AccountQuotaHeadroomResult struct {
 // should bake in silently by picking a single numeric fallback -- Phase 1
 // has the tier/provider context (design.md O5/O6 and tasks.md 1.1) needed to
 // pick correctly per-provider, this function does not.
-// AccountQuotaHeadroom is the SELECTION-facing headroom read: it prefers the
-// per-account real-time rate signal harvested from each serving response's
-// upstream rate-limit headers (harden P1b, IngestServingRateHeaders below --
-// fresher than the ~poll-cadence quota snapshot) and falls back to the persisted
-// quota snapshot when no usable real-time window exists yet. The two share the
-// AccountQuotaHeadroomResult shape, so account_weight.go's AccountQuotaWeightFactor
-// and the management surfacing endpoint transparently pick up the freshest signal
-// without any change on their side. The OBS burn/pacing derivations deliberately
-// call accountQuotaHeadroomSnapshot instead (see UpdateAccountBurnObservability /
-// AccountPacingObservabilityFor) so their EWMA stays anchored to the fixed refresh
-// cadence rather than jittering with every serving response.
-func AccountQuotaHeadroom(auth *Auth) (AccountQuotaHeadroomResult, bool) {
-	if auth != nil {
-		if rt, ok := accountRealtimeHeadroom(auth.ID, time.Now()); ok {
-			return rt, true
-		}
-	}
-	return accountQuotaHeadroomSnapshot(auth)
-}
-
-// accountQuotaHeadroomSnapshot is the snapshot-only headroom read (the original
-// AccountQuotaHeadroom body): the tightest window across the persisted
-// quota_snapshot.usage payload, with no real-time overlay. It is the read the OBS
-// burn/pacing math anchors to so those derivations stay deterministic against the
-// refresh cadence.
 func accountQuotaHeadroomSnapshot(auth *Auth) (AccountQuotaHeadroomResult, bool) {
 	utilization, ok := ParseAccountQuotaUtilization(auth)
 	if !ok {
@@ -561,80 +378,6 @@ func UpdateAccountBurnObservability(prevAuth, updatedAuth *Auth, now time.Time) 
 	clearAccountSchedulingValue(updatedAuth.Metadata, accountSchedulingBurnProjectedExhaustKey)
 }
 
-// AccountPacingObservability is the read-side observability view derived from the
-// persisted burn state plus the live binding-window headroom/reset. BurnRatePerHour
-// and ProjectedExhaustionAt are pure observability (never fed back into any limit).
-// PacingFactorDryRun, despite its name, is NO LONGER dry-run: as of batch-2 it IS
-// multiplied into the rpm ceiling of WARMING accounts by AdaptiveSelector.rateLimitParams
-// (via pacingRPMMultiplier) in adaptive_selector.go. Mature accounts are unaffected --
-// the selector short-circuits on status.Mature before the factor is ever read, so
-// mature rpm stays byte-identical to before.
-type AccountPacingObservability struct {
-	BurnRatePerHour       float64
-	HasBurnRate           bool
-	ProjectedExhaustionAt time.Time
-	HasProjection         bool
-	// PacingFactorDryRun is p = clamp(k*fair/burn, p_floor, 1), fair =
-	// remainingHeadroomPoints / hoursUntilReset.
-	//
-	// NOTE: the "DryRun" in this field name is historical and now MISLEADING. Since
-	// batch-2 this factor is actually applied to warming-account rpm (see
-	// adaptive_selector.go rateLimitParams / pacingRPMMultiplier); it is NOT dry-run.
-	// Mature accounts remain exempt. The name is retained deliberately because it is
-	// also surfaced on the management API wire as the JSON key "pacing_factor_dryrun"
-	// (internal/api/handlers/management/auth_files_adaptive_scheduling.go); renaming
-	// only the Go symbol would leave that misleading label on the observable wire
-	// anyway, and renaming the wire key would break the frontend, so the name is kept
-	// and flagged here rather than churned.
-	PacingFactorDryRun float64
-	HasPacingFactor    bool
-}
-
-// AccountPacingObservabilityFor computes the pacing observability for an
-// auth at time now. burn rate + projection are passed through from the persisted
-// state; the pacing factor is derived fresh from the binding window's live
-// headroom and resets_at. Any of the three is reported as unknown (Has*=false)
-// rather than a fabricated number:
-//   - no burn history (fewer than two same-window samples) -> pacing unknown;
-//   - binding window missing resets_at, or already at/past reset -> pacing unknown
-//     ("resets_at 缺失窗口跳过").
-//
-// It is a pure read: it reads only persisted state and never mutates auth or gates.
-func AccountPacingObservabilityFor(auth *Auth, now time.Time) AccountPacingObservability {
-	var out AccountPacingObservability
-	st := ReadAccountBurnState(auth)
-	out.BurnRatePerHour = st.BurnRatePerHour
-	out.HasBurnRate = st.HasBurnRate
-	out.ProjectedExhaustionAt = st.ProjectedExhaustionAt
-	out.HasProjection = st.HasProjection
-
-	if !st.HasBurnRate {
-		return out
-	}
-	// Snapshot-only: the pacing factor is derived from the same fixed-cadence
-	// binding-window headroom/reset the burn EWMA above was built from, not the
-	// per-response real-time overlay.
-	headroom, ok := accountQuotaHeadroomSnapshot(auth)
-	if !ok || headroom.ResetsAt.IsZero() {
-		return out
-	}
-	hoursUntilReset := headroom.ResetsAt.Sub(now).Hours()
-	if hoursUntilReset <= 0 {
-		return out
-	}
-	fair := (headroom.Headroom * 100) / hoursUntilReset
-	var p float64
-	if st.BurnRatePerHour <= burnRateEpsilon {
-		// Burn has decayed to ~0: not pacing down.
-		p = 1
-	} else {
-		p = PacingFactorK * fair / st.BurnRatePerHour
-	}
-	out.PacingFactorDryRun = clampPacingFactor(p)
-	out.HasPacingFactor = true
-	return out
-}
-
 func clampUtilizationPercent(v float64) float64 {
 	if v < 0 {
 		return 0
@@ -645,389 +388,6 @@ func clampUtilizationPercent(v float64) float64 {
 	return v
 }
 
-func clampPacingFactor(p float64) float64 {
-	if p < PacingFactorFloor {
-		return PacingFactorFloor
-	}
-	if p > 1 {
-		return 1
-	}
-	return p
-}
-
-// -----------------------------------------------------------------------------
-// P1b: upstream real-time rate-limit headers (harden-account-scheduling-limiter).
-//
-// Every Claude serving response carries anthropic-ratelimit-unified-<window>-
-// {utilization,status,reset} headers, and every Codex response carries the
-// X-Codex-{Primary,Secondary}-Used-Percent / -Reset-* headers. Those report each
-// account's per-window utilization LIVE, ahead of the background quota-snapshot
-// poll. We harvest them per account into an in-memory overlay so:
-//
-//   - selection prefers the freshest headroom (AccountQuotaHeadroom above reads
-//     this overlay first, snapshot second); and
-//   - a plan-quota 429 can cool precisely by the exhausted window's own reset
-//     instead of a fixed escalating ladder (accountRealtimeRejectedReset, wired
-//     into MarkResult's 429 handling).
-//
-// In-memory only, exactly like the concurrency gate (design §6.2 rationale): the
-// overlay is lost on restart -- safe, because the next serving response and the
-// snapshot poll both re-establish it -- and it is NEVER persisted. Each window
-// carries an ObservedAt so a stale reading (older than realtimeRateTTL) is
-// ignored and the code falls back to the snapshot.
-// -----------------------------------------------------------------------------
-
-// realtimeRateTTL bounds how long a harvested real-time window is trusted. Past
-// it the account is assumed idle (the snapshot poll, which keeps updating, is
-// fresher) and the overlay window is ignored. A package var so a future
-// config-wiring slice can tune it without an API change.
-var realtimeRateTTL = 15 * time.Minute
-
-// RealtimeRateWindow is one account's most recently observed per-window rate
-// state harvested from a serving response's upstream rate-limit headers.
-type RealtimeRateWindow struct {
-	// Name is the window token verbatim from the header (e.g. "5h", "7d",
-	// "7d_oi" for Claude; "codex_primary" / "codex_secondary" for Codex).
-	Name string
-	// UtilizationPercent is the upstream-reported utilization normalised to a
-	// 0-100 percentage, clamped defensively. Claude reports a 0-1 fraction
-	// (scaled x100 in parseClaudeRealtimeWindows); Codex already reports 0-100.
-	UtilizationPercent float64
-	// Status is the upstream status token lowercased (e.g. "allowed",
-	// "rejected"), empty when the response carried none.
-	Status string
-	// ResetAt is when this window resets, zero when unparseable/absent.
-	ResetAt time.Time
-	// ObservedAt is when this reading was harvested (staleness anchor).
-	ObservedAt time.Time
-}
-
-// Headroom returns 1 - UtilizationPercent/100, clamped to [0,1].
-func (w RealtimeRateWindow) Headroom() float64 {
-	h := 1 - w.UtilizationPercent/100
-	if h < 0 {
-		return 0
-	}
-	if h > 1 {
-		return 1
-	}
-	return h
-}
-
-// accountRealtimeRate is one account's live window overlay, guarded for
-// concurrent serving-response writes and selection reads.
-type accountRealtimeRate struct {
-	mu      sync.RWMutex
-	windows map[string]RealtimeRateWindow
-}
-
-// realtimeRateStore maps authID -> *accountRealtimeRate. sync.Map keeps the
-// per-account overlays independent (design D2: one account never blocks another).
-var realtimeRateStore sync.Map
-
-func realtimeRateFor(authID string) *accountRealtimeRate {
-	if v, ok := realtimeRateStore.Load(authID); ok {
-		return v.(*accountRealtimeRate)
-	}
-	created := &accountRealtimeRate{windows: make(map[string]RealtimeRateWindow)}
-	actual, _ := realtimeRateStore.LoadOrStore(authID, created)
-	return actual.(*accountRealtimeRate)
-}
-
-// IngestServingRateHeaders harvests the upstream real-time rate-limit headers off
-// one completed serving response into the per-account overlay. Provider-scoped:
-// Claude parses anthropic-ratelimit-unified-*, Codex parses X-Codex-*; any other
-// provider is a no-op (its quota snapshot, if any, still governs). Wired from the
-// single usage sink (internal/usage) which sees every request -- stream and
-// non-stream -- with the auth id, provider, and response headers already in hand.
-func IngestServingRateHeaders(provider, authID string, headers http.Header, now time.Time) {
-	authID = strings.TrimSpace(authID)
-	if authID == "" || len(headers) == 0 {
-		return
-	}
-	if now.IsZero() {
-		now = time.Now()
-	}
-	var parsed map[string]*realtimeWindowParse
-	switch strings.ToLower(strings.TrimSpace(provider)) {
-	case "claude":
-		parsed = parseClaudeRealtimeWindows(headers, now)
-	case "codex":
-		parsed = parseCodexRealtimeWindows(headers, now)
-	default:
-		return
-	}
-	if len(parsed) == 0 {
-		return
-	}
-	store := realtimeRateFor(authID)
-	store.mu.Lock()
-	for name, win := range parsed {
-		if win == nil || (!win.hasUtil && win.Status == "" && win.ResetAt.IsZero()) {
-			continue
-		}
-		// Merge onto any prior reading so a response that carried only some of a
-		// window's fields (e.g. status without a fresh reset) does not wipe the
-		// others.
-		prev := store.windows[name]
-		prev.Name = name
-		if win.hasUtil {
-			prev.UtilizationPercent = clampUtilizationPercent(win.UtilizationPercent)
-		}
-		if win.Status != "" {
-			prev.Status = win.Status
-		}
-		if !win.ResetAt.IsZero() {
-			prev.ResetAt = win.ResetAt
-		}
-		prev.ObservedAt = now
-		store.windows[name] = prev
-	}
-	store.mu.Unlock()
-}
-
-// realtimeWindowParse is the intermediate per-window accumulator during header
-// parsing; hasUtil distinguishes "utilization 0" from "no utilization field".
-type realtimeWindowParse struct {
-	Name               string
-	UtilizationPercent float64
-	Status             string
-	ResetAt            time.Time
-	hasUtil            bool
-}
-
-// parseClaudeRealtimeWindows extracts every anthropic-ratelimit-unified-<window>-
-// {utilization,status,reset} triple. Header keys are matched case-insensitively
-// (ranging the map directly rather than trusting a guessed canonical form), and
-// the window token is whatever sits between the fixed prefix and the trailing
-// field name -- so a newly added window (e.g. an extra 7d variant) is captured
-// without a code change, mirroring the snapshot parser's generic stance.
-func parseClaudeRealtimeWindows(headers http.Header, now time.Time) map[string]*realtimeWindowParse {
-	const prefix = "anthropic-ratelimit-unified-"
-	acc := make(map[string]*realtimeWindowParse)
-	for key, vals := range headers {
-		if len(vals) == 0 {
-			continue
-		}
-		lk := strings.ToLower(key)
-		if !strings.HasPrefix(lk, prefix) {
-			continue
-		}
-		rest := lk[len(prefix):]
-		sep := strings.LastIndex(rest, "-")
-		if sep <= 0 {
-			// A bare unified-level header (e.g. "-status") with no window token.
-			continue
-		}
-		window := rest[:sep]
-		field := rest[sep+1:]
-		entry := acc[window]
-		if entry == nil {
-			entry = &realtimeWindowParse{Name: window}
-			acc[window] = entry
-		}
-		raw := strings.TrimSpace(vals[0])
-		switch field {
-		case "utilization":
-			// Unit: the upstream anthropic-ratelimit-unified-<window>-utilization
-			// value is a 0-1 FRACTION, not a 0-100 percentage. Scale by 100 here so
-			// UtilizationPercent matches the snapshot's percent scale and
-			// Headroom()'s 1-v/100; IngestServingRateHeaders still clamps via
-			// clampUtilizationPercent on store. Production evidence: one account
-			// returned 0.62-0.66 while its quota snapshot read five_hour=62% at the
-			// same moment; another returned 0.02. Storing the raw value read 0.66
-			// as 0.66%, so a busy account looked ~99% free and adaptive weighting
-			// favoured exactly the accounts already carrying traffic.
-			if f, err := strconv.ParseFloat(raw, 64); err == nil {
-				entry.UtilizationPercent = f * 100
-				entry.hasUtil = true
-			}
-		case "status":
-			entry.Status = strings.ToLower(raw)
-		case "reset":
-			if ts, ok := parseRealtimeResetValue(raw, now); ok {
-				entry.ResetAt = ts
-			}
-		}
-	}
-	return acc
-}
-
-// parseCodexRealtimeWindows maps the X-Codex-{Primary,Secondary}-Used-Percent and
-// reset headers onto the same overlay so Codex selection benefits from the live
-// signal symmetrically (harden P1b). It reuses the header names the existing
-// codex proactive-cooldown path already relies on (see conductor_fork_ext.go).
-//
-// Credits exception: when the response also reports usable account credits
-// (codexCreditsUsable) an exhausted window is marked "allowed" instead of
-// "rejected", because the upstream keeps serving the account from its credit
-// balance. Utilization stays the real upstream value (100) so observability is
-// unchanged; only the rejection status is withheld. Without credits the behavior
-// is unchanged. Note Codex currently scores 0 adaptive weight regardless
-// (AccountTierBaseWeight, design §8.2) and is served by the round-robin fallback,
-// so this overlay does not gate Codex selection today.
-func parseCodexRealtimeWindows(headers http.Header, now time.Time) map[string]*realtimeWindowParse {
-	acc := make(map[string]*realtimeWindowParse)
-	creditsUsable := codexCreditsUsable(headers)
-	for _, bucket := range []struct {
-		name   string
-		prefix string
-	}{
-		{"codex_primary", "X-Codex-Primary"},
-		{"codex_secondary", "X-Codex-Secondary"},
-	} {
-		usedRaw := strings.TrimSpace(headers.Get(bucket.prefix + "-Used-Percent"))
-		if usedRaw == "" {
-			continue
-		}
-		used, err := strconv.ParseFloat(usedRaw, 64)
-		if err != nil {
-			continue
-		}
-		entry := &realtimeWindowParse{Name: bucket.name, UtilizationPercent: used, hasUtil: true}
-		if used >= 100 {
-			if creditsUsable {
-				// Explicit "allowed" (not empty) so the overlay merge overwrites a
-				// "rejected" left by an earlier credit-less reading of this window.
-				entry.Status = "allowed"
-			} else {
-				entry.Status = "rejected"
-			}
-		}
-		entry.ResetAt = quotaHeaderResetTime(headers, bucket.prefix, now)
-		acc[bucket.name] = entry
-	}
-	return acc
-}
-
-// parseRealtimeResetValue parses a rate-limit reset header value, accepting an
-// absolute unix-seconds timestamp, an RFC3339 timestamp, or a relative
-// "seconds-until-reset" integer. Returns a future instant only.
-func parseRealtimeResetValue(raw string, now time.Time) (time.Time, bool) {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return time.Time{}, false
-	}
-	if unix, err := strconv.ParseInt(raw, 10, 64); err == nil {
-		// Heuristic: a value far larger than a plausible relative-seconds window
-		// is an absolute epoch timestamp; a small one is seconds-until-reset.
-		if unix > 1_000_000 {
-			ts := time.Unix(unix, 0)
-			if ts.After(now) {
-				return ts, true
-			}
-			return time.Time{}, false
-		}
-		if unix > 0 {
-			return now.Add(time.Duration(unix) * time.Second), true
-		}
-		return time.Time{}, false
-	}
-	if ts, err := time.Parse(time.RFC3339, raw); err == nil {
-		if ts.After(now) {
-			return ts, true
-		}
-	}
-	return time.Time{}, false
-}
-
-// accountRealtimeHeadroom returns the tightest (lowest-headroom) NON-STALE
-// real-time window for authID, or ok=false when no fresh overlay exists (so the
-// caller falls back to the snapshot). A window whose ResetAt has already passed is
-// skipped: its utilization has reset upstream, so it must not keep constraining
-// selection.
-func accountRealtimeHeadroom(authID string, now time.Time) (AccountQuotaHeadroomResult, bool) {
-	v, ok := realtimeRateStore.Load(authID)
-	if !ok {
-		return AccountQuotaHeadroomResult{}, false
-	}
-	store := v.(*accountRealtimeRate)
-	store.mu.RLock()
-	defer store.mu.RUnlock()
-
-	tightest := AccountQuotaHeadroomResult{Headroom: 1}
-	found := false
-	for _, win := range store.windows {
-		if win.ObservedAt.IsZero() || now.Sub(win.ObservedAt) > realtimeRateTTL {
-			continue
-		}
-		if !win.ResetAt.IsZero() && !win.ResetAt.After(now) {
-			continue
-		}
-		headroom := win.Headroom()
-		if !found || headroom < tightest.Headroom {
-			tightest = AccountQuotaHeadroomResult{
-				Headroom: headroom,
-				Window:   win.Name,
-				ResetsAt: win.ResetAt,
-			}
-			found = true
-		}
-	}
-	if !found {
-		return AccountQuotaHeadroomResult{}, false
-	}
-	return tightest, true
-}
-
-// accountRealtimeRejectedReset returns the reset instant to cool an account down
-// to on a plan-quota 429 (harden P1b): the reset of the exhausted window (one
-// whose upstream status is "rejected", else the tightest-headroom non-stale
-// window with a known future reset), clamped to at most one hour out so a
-// mis-reported multi-day reset can never wedge an account for days. ok=false when
-// there is no usable real-time reset, letting the caller fall back to the
-// escalating ladder.
-func accountRealtimeRejectedReset(authID string, now time.Time) (time.Time, bool) {
-	v, ok := realtimeRateStore.Load(authID)
-	if !ok {
-		return time.Time{}, false
-	}
-	store := v.(*accountRealtimeRate)
-	store.mu.RLock()
-	defer store.mu.RUnlock()
-
-	var chosen time.Time
-	chosenHeadroom := 2.0 // higher than any real headroom (<=1)
-	rejectedFound := false
-	found := false
-	for _, win := range store.windows {
-		if win.ObservedAt.IsZero() || now.Sub(win.ObservedAt) > realtimeRateTTL {
-			continue
-		}
-		if win.ResetAt.IsZero() || !win.ResetAt.After(now) {
-			continue
-		}
-		isRejected := win.Status == "rejected"
-		// Prefer an explicitly rejected window; among equal rejection state pick
-		// the tightest headroom (the window actually gating the account).
-		if isRejected && !rejectedFound {
-			chosen = win.ResetAt
-			chosenHeadroom = win.Headroom()
-			rejectedFound = true
-			found = true
-			continue
-		}
-		if isRejected == rejectedFound {
-			if h := win.Headroom(); !found || h < chosenHeadroom {
-				chosen = win.ResetAt
-				chosenHeadroom = h
-				found = true
-			}
-		}
-	}
-	if !found {
-		return time.Time{}, false
-	}
-	if chosen.Sub(now) > time.Hour {
-		chosen = now.Add(time.Hour)
-	}
-	return chosen, true
-}
-
-// accountQuotaNumericValue parses a JSON-decoded value (float64, json.Number,
-// int-family, or numeric string) as a float64. It intentionally does not
-// accept bool -- a stray "utilization": true would otherwise silently parse
-// as 1.0/100 rather than being rejected as "not a window".
 func accountQuotaNumericValue(raw any) (float64, bool) {
 	switch v := raw.(type) {
 	case float64:
@@ -1058,5 +418,27 @@ func accountQuotaNumericValue(raw any) (float64, bool) {
 		return f, true
 	default:
 		return 0, false
+	}
+}
+
+func parseFirstProductionAtValue(raw any) (time.Time, bool) {
+	switch v := raw.(type) {
+	case time.Time:
+		if v.IsZero() {
+			return time.Time{}, false
+		}
+		return v, true
+	case string:
+		trimmed := strings.TrimSpace(v)
+		if trimmed == "" {
+			return time.Time{}, false
+		}
+		parsed, err := time.Parse(time.RFC3339, trimmed)
+		if err != nil {
+			return time.Time{}, false
+		}
+		return parsed, true
+	default:
+		return time.Time{}, false
 	}
 }

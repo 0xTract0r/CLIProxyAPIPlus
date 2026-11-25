@@ -3,12 +3,13 @@
 package vertex
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/misc"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -34,6 +35,14 @@ type VertexCredentialStorage struct {
 	// Prefix optionally namespaces models for this credential (e.g., "teamA").
 	// This results in model names like "teamA/gemini-2.0-flash".
 	Prefix string `json:"prefix,omitempty"`
+
+	// Metadata holds arbitrary key-value pairs injected via hooks.
+	Metadata map[string]any `json:"-"`
+}
+
+// SetMetadata allows external callers to inject metadata into the storage before saving.
+func (s *VertexCredentialStorage) SetMetadata(meta map[string]any) {
+	s.Metadata = meta
 }
 
 // SaveTokenToFile writes the credential payload to the given file path in JSON format.
@@ -52,6 +61,24 @@ func (s *VertexCredentialStorage) SaveTokenToFile(authFilePath string) error {
 	if err := os.MkdirAll(filepath.Dir(authFilePath), 0o700); err != nil {
 		return fmt.Errorf("vertex credential: create directory failed: %w", err)
 	}
+
+	// Preserve JSON tags and decimal spelling before the map fast path merges
+	// hook metadata. The generic struct merge round-trip uses float64.
+	raw, err := json.Marshal(s)
+	if err != nil {
+		return fmt.Errorf("vertex credential: marshal failed: %w", err)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	var source map[string]any
+	if err := decoder.Decode(&source); err != nil {
+		return fmt.Errorf("vertex credential: decode failed: %w", err)
+	}
+	data, errMerge := misc.MergeMetadata(source, s.Metadata)
+	if errMerge != nil {
+		return fmt.Errorf("vertex credential: merge metadata failed: %w", errMerge)
+	}
+
 	f, err := os.Create(authFilePath)
 	if err != nil {
 		return fmt.Errorf("vertex credential: create file failed: %w", err)
@@ -63,7 +90,7 @@ func (s *VertexCredentialStorage) SaveTokenToFile(authFilePath string) error {
 	}()
 	enc := json.NewEncoder(f)
 	enc.SetIndent("", "  ")
-	if err = enc.Encode(s); err != nil {
+	if err = enc.Encode(data); err != nil {
 		return fmt.Errorf("vertex credential: encode failed: %w", err)
 	}
 	return nil

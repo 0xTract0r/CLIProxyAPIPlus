@@ -3,205 +3,174 @@ package executor
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
-	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
-	"github.com/tidwall/gjson"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
+	log "github.com/sirupsen/logrus"
 )
 
+type ordinaryStageLogCapture struct {
+	mu       sync.Mutex
+	messages []string
+}
+
+func (*ordinaryStageLogCapture) Levels() []log.Level { return []log.Level{log.InfoLevel} }
+func (c *ordinaryStageLogCapture) Fire(entry *log.Entry) error {
+	if strings.HasPrefix(entry.Message, "codex stream stages ") {
+		c.mu.Lock()
+		c.messages = append(c.messages, entry.Message)
+		c.mu.Unlock()
+	}
+	return nil
+}
+
 func TestCodexStreamStagesRealWebsocket(t *testing.T) {
-	for _, session := range []bool{false, true} {
-		for _, mode := range []string{"completed", "read_error", "cancel", "cancel_before_consume"} {
-			t.Run(fmt.Sprintf("session=%t/%s", session, mode), func(t *testing.T) {
-				mainReceived := make(chan struct{})
-				allowFirst := make(chan struct{})
-				burstSent := make(chan struct{})
-				allowControls := make(chan struct{})
-				var controlsOnce sync.Once
-				releaseControls := func() { controlsOnce.Do(func() { close(allowControls) }) }
-				defer releaseControls()
-				releaseServer := make(chan struct{})
-				var firstOnce, serverOnce sync.Once
-				releaseFirst := func() { firstOnce.Do(func() { close(allowFirst) }) }
-				release := func() { serverOnce.Do(func() { close(releaseServer) }) }
-				defer releaseFirst()
-				defer release()
-				upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
-				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-					if !websocket.IsWebSocketUpgrade(r) {
-						http.Error(w, "unexpected HTTP", 500)
+	logger := log.StandardLogger()
+	capture := &ordinaryStageLogCapture{}
+	old := logger.ReplaceHooks(make(log.LevelHooks))
+	logger.AddHook(capture)
+	t.Cleanup(func() { logger.ReplaceHooks(old) })
+
+	for _, tc := range []struct {
+		name, outcome string
+		frames        uint64
+		visible       bool
+		turns         int
+	}{
+		{"completed", "completed", 3, true, 2},
+		{"read_error", "read_error", 1, false, 1},
+		{"terminal_failure", "terminal_failure", 1, false, 1},
+		{"cancel", "context_done", 1, false, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var handshakes, requests atomic.Int32
+			received := make(chan struct{}, tc.turns)
+			sendFirst := make(chan struct{}, tc.turns)
+			stop := make(chan struct{})
+			upgrader := websocket.Upgrader{}
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				handshakes.Add(1)
+				conn, err := upgrader.Upgrade(w, r, nil)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				defer conn.Close()
+				for range tc.turns {
+					if _, _, err := conn.ReadMessage(); err != nil {
+						t.Error(err)
 						return
 					}
-					conn, err := upgrader.Upgrade(w, r, nil)
-					if err != nil {
+					requests.Add(1)
+					received <- struct{}{}
+					select {
+					case <-stop:
+						return
+					case <-sendFirst:
+					}
+					if tc.name == "terminal_failure" {
+						_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"error","status":400,"error":{"code":"invalid_request","message":"sensitive-fixture-error"}}`))
 						return
 					}
-					defer func() { _ = conn.Close() }()
-					if _, _, err = conn.ReadMessage(); err != nil {
+					_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.created","response":{"id":"fixture","status":"in_progress"}}`))
+					switch tc.name {
+					case "read_error":
+						_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.ClosePolicyViolation, "sensitive-fixture-error"), time.Now().Add(time.Second))
 						return
-					}
-					_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp_warm","status":"completed","output":[]}}`))
-					_, body, err := conn.ReadMessage()
-					if err != nil {
+					case "cancel":
+						<-stop
 						return
+					default:
+						_ = conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(time.Second))
+						_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.output_text.delta","delta":"sensitive-fixture-text"}`))
+						_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"fixture","status":"completed","output":[]}}`))
 					}
-					if gjson.GetBytes(body, "service_tier").String() != "priority" {
-						t.Error("priority changed")
-					}
-					close(mainReceived)
-					<-allowFirst
-					_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.created","response":{"id":"resp_main","status":"in_progress","output":[]}}`))
-					<-allowControls
-					_ = conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(time.Second))
-					_ = conn.WriteControl(websocket.PongMessage, nil, time.Now().Add(time.Second))
-					for i := 0; i < 64; i++ {
-						_ = conn.WriteJSON(map[string]any{"type": "response.reasoning_summary_text.delta", "delta": fmt.Sprintf("synthetic-%d", i)})
-					}
-					if mode == "completed" {
-						_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.output_text.delta","delta":"visible"}`))
-						_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp_main","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"visible"}]}],"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}`))
-					}
-					close(burstSent)
-					if mode == "read_error" {
-						_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.ClosePolicyViolation, "synthetic"), time.Now().Add(time.Second))
-						return
-					}
-					<-releaseServer
-				}))
-				defer server.Close()
-				cfg := &config.Config{SDKConfig: config.SDKConfig{RequestLog: true, DisableImageGeneration: config.DisableImageGenerationAll}}
-				exec := NewCodexAutoExecutor(cfg)
-				exec.wsExec.store = &codexWebsocketSessionStore{sessions: make(map[string]*codexWebsocketSession)}
-				ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
-				ginCtx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
-				source, err := logging.NewFileBodySourceInDir(t.TempDir(), "dense")
+				}
+			}))
+			defer server.Close()
+			defer close(stop)
+			executor := NewCodexWebsocketsExecutor(&config.Config{})
+			executor.store = &codexWebsocketSessionStore{sessions: make(map[string]*codexWebsocketSession)}
+			defer executor.CloseExecutionSession(t.Name())
+			auth := &cliproxyauth.Auth{ID: "fixture-grant", Provider: "codex", ProxyURL: "direct",
+				Attributes: map[string]string{"api_key": "sensitive-fixture-secret", "base_url": server.URL}}
+			req := cliproxyexecutor.Request{Model: "fixture-model", Payload: []byte(`{"model":"fixture-model","input":"synthetic"}`)}
+			opts := cliproxyexecutor.Options{
+				SourceFormat: sdktranslator.FormatCodex,
+				Metadata:     map[string]any{cliproxyexecutor.ExecutionSessionMetadataKey: t.Name()},
+			}
+			for range tc.turns {
+				ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+				defer cancel()
+				ctx = fixtureCodexTenantContext(cliproxyexecutor.WithDownstreamWebsocket(ctx))
+				ctx, stages := helps.BeginCodexStreamStages(ctx, nil)
+				result, err := executor.ExecuteStream(ctx, auth, req, opts)
 				if err != nil {
 					t.Fatal(err)
 				}
-				defer func() { _ = source.Cleanup() }()
-				ginCtx.Set(logging.APIWebsocketTimelineSourceContextKey, source)
-				ctx, cancel := context.WithTimeout(context.WithValue(context.Background(), "gin", ginCtx), 3*time.Second)
-				defer cancel()
-				ctx, stages := helps.BeginCodexStreamStages(ctx, ginCtx)
-				payload := []byte(`{"model":"gpt-5-codex","input":"synthetic input"}`)
-				if session {
-					payload = []byte(`{"model":"gpt-5-codex","prompt_cache_key":"stage-cache","input":"synthetic input"}`)
-				}
-				req := cliproxyexecutor.Request{Model: "gpt-5-codex", Payload: payload}
-				opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("codex"), ResponseFormat: sdktranslator.FromString("codex")}
-				auth := &cliproxyauth.Auth{ID: t.Name(), Provider: "codex", ProxyURL: "direct", Attributes: map[string]string{"api_key": "test", "base_url": server.URL, "fast_models": "*"}}
-				defer exec.CloseExecutionSession(codexFastSessionFallbackID(opts, req))
-				type result struct {
-					stream *cliproxyexecutor.StreamResult
-					err    error
-				}
-				ready := make(chan result, 1)
-				go func() { stream, err := exec.ExecuteStream(ctx, auth, req, opts); ready <- result{stream, err} }()
 				select {
-				case <-mainReceived:
 				case <-ctx.Done():
-					t.Fatal("main not sent")
+					t.Fatal(ctx.Err())
+				case <-received:
 				}
 				select {
-				case <-ready:
-					t.Fatal("peek returned before a real upstream frame")
+				case <-result.Chunks:
+					t.Fatal("stream emitted before the upstream response")
 				default:
 				}
-				releaseFirst()
-				var stream *cliproxyexecutor.StreamResult
-				select {
-				case r := <-ready:
-					if r.err != nil {
-						t.Fatal(r.err)
-					}
-					stream = r.stream
-				case <-ctx.Done():
-					t.Fatal("first frame not delivered")
-				}
-				releaseControls()
-				select {
-				case <-burstSent:
-				case <-ctx.Done():
-					t.Fatal("dense upstream burst stalled")
-				}
-				var output strings.Builder
-				var streamErr error
-				if mode == "cancel" {
-					// A received chunk proves synchronous timeline logging finished before send.
-					select {
-					case chunk, ok := <-stream.Chunks:
-						if !ok || chunk.Err != nil || len(chunk.Payload) == 0 {
-							t.Fatal("cancel fixture did not receive a logged payload chunk")
+				sendFirst <- struct{}{}
+				var publishedError bool
+				for chunk := range result.Chunks {
+					if tc.name == "cancel" {
+						if chunk.Err != nil && !errors.Is(chunk.Err, context.Canceled) {
+							t.Fatalf("cancellation changed the ordinary error: %v", chunk.Err)
 						}
-						output.Write(chunk.Payload)
-					case <-ctx.Done():
-						t.Fatal("cancel fixture did not reach consumer acknowledgement")
-					}
-					cancel()
-				} else if mode == "cancel_before_consume" {
-					// Server send completion does not imply executor consumption/logging.
-					cancel()
-				}
-				for chunk := range stream.Chunks {
-					output.Write(chunk.Payload)
-					if chunk.Err != nil {
-						streamErr = chunk.Err
+						cancel()
+					} else {
+						publishedError = publishedError || chunk.Err != nil
 					}
 				}
 				stages.HandlerDone()
-				release()
 				v := stages.Snapshot()
-				if !v.Active || v.MainAttempts != 1 || v.WireRead.Count == 0 || v.ConsumerWait.Count == 0 || v.Send.Count == 0 || v.TimelineStorage != "file" {
-					t.Fatalf("missing actual stage counters: %+v", v)
+				if !v.Active || v.MainAttempts != 1 || v.Frames != tc.frames ||
+					v.WireRead.Count < tc.frames || v.ConsumerWait.Count < tc.frames ||
+					v.Send.Count == 0 || v.TimelineStorage != "disabled" {
+					t.Fatalf("ordinary stream counters: %+v", v)
 				}
-				if mode == "cancel_before_consume" {
-					if v.Outcome != "context_done" || v.Timeline.Count > v.Frames {
-						t.Fatalf("pre-consumption cancellation counters inconsistent: %+v", v)
-					}
-				} else if v.Timeline.Count == 0 {
-					t.Fatalf("acknowledged stream omitted timeline logging: %+v", v)
+				if v.FirstVisibleObserved != tc.visible || (tc.visible && v.FirstVisible <= 0) || v.Outcome != tc.outcome {
+					t.Fatalf("wrong content or terminal diagnostic: %+v", v)
 				}
-				if mode == "completed" {
-					if v.Liveness.PingReceived != 1 || v.Liveness.PongReceived != 1 {
-						t.Fatalf("actual control frames not scoped to main request: %+v", v.Liveness)
-					}
-					if streamErr != nil || !strings.Contains(output.String(), "visible") || v.Frames != 67 || v.Timeline.Count != 67 {
-						t.Fatalf("dense stream changed: err=%v frames=%d timeline=%d", streamErr, v.Frames, v.Timeline.Count)
-					}
-				} else if mode == "read_error" {
-					if streamErr == nil || v.Outcome != "read_error" {
-						t.Fatalf("read error omitted: %v %+v", streamErr, v)
-					}
-				} else if streamErr != nil && !errors.Is(streamErr, context.Canceled) {
-					t.Fatal(streamErr)
+				if tc.name == "completed" && v.Liveness.PingReceived != 1 {
+					t.Fatalf("ping not attributed to main turn: %+v", v.Liveness)
 				}
-				if (mode == "cancel" || mode == "cancel_before_consume") && v.Outcome != "context_done" {
-					t.Fatalf("cancelled stream completed normally: %+v", v)
+				if (tc.name == "read_error" || tc.name == "terminal_failure") != publishedError {
+					t.Fatalf("unexpected stream error delivery: %t", publishedError)
 				}
-				bytes, err := source.Bytes()
-				if err != nil {
-					t.Fatal(err)
-				}
-				if mode == "completed" && strings.Count(string(bytes), "Event: api.websocket.response") != 68 {
-					t.Fatal("dense frame log bytes lost")
-				}
-				if len(source.Paths()) != 1 {
-					t.Fatal("dense logging created one file per frame")
-				}
-			})
+			}
+			if handshakes.Load() != 1 || int(requests.Load()) != tc.turns {
+				t.Fatalf("unexpected upstream handshake/request count: %d/%d", handshakes.Load(), requests.Load())
+			}
+		})
+	}
+	capture.mu.Lock()
+	defer capture.mu.Unlock()
+	if len(capture.messages) != 5 {
+		t.Fatalf("diagnostic summaries = %d, want 5", len(capture.messages))
+	}
+	for _, summary := range capture.messages {
+		if strings.Contains(summary, "sensitive-fixture") || !strings.Contains(summary, "first_visible_observed=") {
+			t.Fatalf("summary omitted stage metadata or included private content")
 		}
 	}
 }

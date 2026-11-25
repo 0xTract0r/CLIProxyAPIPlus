@@ -3,21 +3,20 @@ package executor
 import (
 	"compress/gzip"
 	"context"
-	"fmt"
+	"errors"
 	"io"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/gorilla/websocket"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
-	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 )
 
 type captureStreamTelemetryUsage struct {
@@ -50,50 +49,67 @@ func TestClaudeTelemetryTerminalBoundaryAndDecodedContent(t *testing.T) {
 			var releaseOnce sync.Once
 			unblock := func() { releaseOnce.Do(func() { close(release) }) }
 			defer unblock()
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				w.Header().Set("Content-Type", "text/event-stream")
-				if tc.outcome == "read_error" {
-					w.Header().Set("Content-Length", "999999")
+			reader, writerPipe := io.Pipe()
+			defer reader.Close()
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			rt := ordinaryClaudeTestRoundTripper(func(r *http.Request) (*http.Response, error) {
+				headers := http.Header{"Content-Type": {"text/event-stream"}}
+				if tc.gzip {
+					headers.Set("Content-Encoding", "gzip")
 				}
-				var writer io.Writer = w
+				return &http.Response{StatusCode: 200, Header: headers, Body: reader, Request: r}, nil
+			})
+			go func() {
+				defer writerPipe.Close()
+				go func() { <-ctx.Done(); _ = writerPipe.CloseWithError(ctx.Err()) }()
+				var writer io.Writer = writerPipe
 				var compressed *gzip.Writer
 				if tc.gzip {
-					w.Header().Set("Content-Encoding", "gzip")
-					compressed = gzip.NewWriter(w)
+					compressed = gzip.NewWriter(writerPipe)
 					writer = compressed
 					defer compressed.Close()
 				}
+
 				_, _ = io.WriteString(writer, "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"a\"}}\n\n"+
 					"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"b\"}}\n\n"+
 					"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":4,\"output_tokens\":6}}\n\n")
 				if compressed != nil {
 					_ = compressed.Flush()
 				}
-				w.(http.Flusher).Flush()
 				select {
 				case <-release:
-				case <-r.Context().Done():
+				case <-ctx.Done():
 					return
+				}
+				if tc.outcome == "read_error" {
+					_ = writerPipe.CloseWithError(io.ErrUnexpectedEOF)
 				}
 				if tc.outcome == "stop" {
 					_, _ = io.WriteString(writer, "data: {\"type\":\"message_stop\"}\n\n")
 				}
-			}))
-			defer server.Close()
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
+			}()
+			streamCtx := context.WithValue(ctx, "cliproxy.roundtripper", rt)
 			executor := NewClaudeExecutor(&config.Config{})
-			auth := &cliproxyauth.Auth{ProxyURL: "direct", Attributes: map[string]string{"api_key": "telemetry-test-key", "base_url": server.URL}}
-			result, err := executor.ExecuteStream(ctx, auth, cliproxyexecutor.Request{Model: model, Payload: []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")})
+			auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "telemetry-test-key", "base_url": "https://fixture.invalid"}}
+			result, err := executor.ExecuteStream(streamCtx, auth, cliproxyexecutor.Request{Model: model, Payload: []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")})
 			if err != nil {
 				t.Fatal(err)
 			}
 			seenUsage := make(chan struct{})
 			drained := make(chan struct{})
 			var seenOnce sync.Once
+			var streamErr error
+			var visible int
 			go func() {
 				defer close(drained)
 				for chunk := range result.Chunks {
+					if chunk.Err != nil {
+						streamErr = chunk.Err
+					}
+					if strings.Contains(string(chunk.Payload), "text_delta") {
+						visible++
+					}
 					if strings.Contains(string(chunk.Payload), "message_delta") {
 						seenOnce.Do(func() { close(seenUsage) })
 					}
@@ -122,6 +138,9 @@ func TestClaudeTelemetryTerminalBoundaryAndDecodedContent(t *testing.T) {
 				unblock()
 				t.Fatal("stream did not end")
 			}
+			if visible != 2 || (streamErr == nil) != (tc.outcome == "stop") || (tc.outcome == "cancel" && !errors.Is(streamErr, context.Canceled)) {
+				t.Fatalf("content frames=%d, terminal error=%v", visible, streamErr)
+			}
 			var record usage.Record
 			select {
 			case record = <-plugin.records:
@@ -129,10 +148,10 @@ func TestClaudeTelemetryTerminalBoundaryAndDecodedContent(t *testing.T) {
 				t.Fatal("missing terminal usage")
 			}
 			telemetry := record.Telemetry
-			if record.Detail.OutputTokens != 6 || record.Detail.InputTokens != 4 {
-				t.Fatalf("lost tokens: %+v", record.Detail)
+			if record.TTFT <= 0 || record.Detail.OutputTokens != 6 || record.Detail.InputTokens != 4 {
+				t.Fatalf("TTFT=%s, input=%d, output=%d", record.TTFT, record.Detail.InputTokens, record.Detail.OutputTokens)
 			}
-			if telemetry == nil || telemetry.ContentChunks == nil || *telemetry.ContentChunks != 2 {
+			if telemetry == nil || telemetry.ContentChunks == nil || *telemetry.ContentChunks != 2 || telemetry.FirstVisibleContentMS == nil || telemetry.VisibleContentEvents == nil || *telemetry.VisibleContentEvents != 2 {
 				t.Fatalf("decoded content counted incorrectly: %+v", telemetry)
 			}
 			wantSuccess := tc.outcome == "stop"
@@ -144,7 +163,7 @@ func TestClaudeTelemetryTerminalBoundaryAndDecodedContent(t *testing.T) {
 			}
 			select {
 			case extra := <-plugin.records:
-				t.Fatal(fmt.Sprintf("double accounting: %+v", extra))
+				t.Fatalf("double accounting: %+v", extra)
 			case <-time.After(30 * time.Millisecond):
 			}
 		})
@@ -156,7 +175,7 @@ func TestCodexWebsocketTelemetryResponseDone(t *testing.T) {
 	plugin := &captureStreamTelemetryUsage{model: model, records: make(chan usage.Record, 2)}
 	usage.RegisterPlugin(plugin)
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newCodexPipeServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			return
@@ -166,25 +185,36 @@ func TestCodexWebsocketTelemetryResponseDone(t *testing.T) {
 			return
 		}
 		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.output_text.delta","delta":"x"}`))
-		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.done","response":{"id":"telemetry-test","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}}`))
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.done","response":{"id":"telemetry-test","status":"completed","service_tier":"default","output":[],"usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}}`))
 	}))
 	defer server.Close()
-	exec := NewCodexWebsocketsExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{Provider: "codex", ProxyURL: "direct", Attributes: map[string]string{"api_key": "test-key", "base_url": server.URL, "plan_type": "pro"}}
-	result, err := exec.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{Model: model, Payload: []byte(`{"input":[{"role":"user","content":"hi"}]}`)}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("codex")})
+	exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
+	exec.directDialContext = server.dial
+	auth := &cliproxyauth.Auth{Provider: "codex", ProxyURL: "direct", Attributes: map[string]string{"api_key": "test-key", "base_url": server.URL}}
+	ctx := cliproxyexecutor.WithDownstreamWebsocket(t.Context())
+	result, err := exec.ExecuteStream(ctx, auth, cliproxyexecutor.Request{Model: model, Payload: []byte(`{"service_tier":"priority","input":[{"role":"user","content":"hi"}]}`)}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("codex")})
 	if err != nil {
 		t.Fatal(err)
 	}
+	var visible, finished bool
 	for chunk := range result.Chunks {
 		if chunk.Err != nil {
 			t.Fatal(chunk.Err)
 		}
+		visible = visible || strings.Contains(string(chunk.Payload), "response.output_text.delta")
+		finished = finished || strings.Contains(string(chunk.Payload), "response.done")
+	}
+	if !visible || !finished {
+		t.Fatalf("visible=%t terminal=%t", visible, finished)
 	}
 	select {
 	case record := <-plugin.records:
+		if record.EffectiveServiceTier != "priority" || record.ResponseServiceTier != "default" {
+			t.Fatalf("service tiers = %q / %q, want priority / default", record.EffectiveServiceTier, record.ResponseServiceTier)
+		}
 		v := record.Telemetry
-		if v == nil || v.StreamCompleted == nil || !*v.StreamCompleted || v.Transport != "websocket" || record.Detail.OutputTokens != 2 {
-			t.Fatalf("wrong WS terminal usage: %+v", record)
+		if v == nil || v.StreamCompleted == nil || !*v.StreamCompleted || v.Transport != "websocket" || record.TTFT <= 0 || v.FirstVisibleContentMS == nil || v.VisibleContentEvents == nil || *v.VisibleContentEvents != 1 || record.Detail.OutputTokens != 2 {
+			t.Fatalf("wrong WS terminal usage: telemetry=%+v output=%d ttft=%s", v, record.Detail.OutputTokens, record.TTFT)
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("missing WS usage")

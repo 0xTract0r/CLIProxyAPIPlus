@@ -4,51 +4,42 @@
 package claude
 
 import (
-	"bytes"
-	"compress/gzip"
-	"compress/zlib"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/andybalholm/brotli"
-	"github.com/klauspost/compress/zstd"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
+	"github.com/MoeForge/moego/json"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/sync/singleflight"
 )
 
 // OAuth configuration constants for Claude/Anthropic
 const (
-	AuthURL     = "https://claude.ai/oauth/authorize"
-	TokenURL    = "https://api.anthropic.com/v1/oauth/token"
-	ClientID    = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-	RedirectURI = "http://localhost:54545/callback"
+	AuthURL = "https://claude.ai/oauth/authorize"
+	// TokenURL is the authorization-code exchange endpoint. Claude Code 2.1.220
+	// posts the code exchange to platform.claude.com, not api.anthropic.com.
+	TokenURL         = "https://platform.claude.com/v1/oauth/token"
+	RefreshTokenURL  = "https://platform.claude.com/v1/oauth/token"
+	ProfileURL       = "https://api.anthropic.com/api/oauth/profile"
+	RolesURL         = "https://api.anthropic.com/api/oauth/claude_cli/roles"
+	ClientID         = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+	RedirectURI      = "http://localhost:54545/callback"
+	ClaudeOAuthScope = "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
+
+	// Native Claude Code includes the Console scope when authorizing a new login.
+	// Keep the established token refresh scope unchanged.
+	claudeOAuthAuthorizeScope = "org:create_api_key " + ClaudeOAuthScope
 
 	claudeRefreshMinBackoff = 5 * time.Second
 	claudeRefreshMaxBackoff = 5 * time.Minute
-
-	// claudeOAuthUserAgent mirrors the baseline User-Agent serving sends for Claude
-	// (defaultClaudeFingerprintUserAgent in internal/runtime/executor/helps). OAuth
-	// token exchange/refresh has no inbound client context, so it uses this baseline
-	// default to stay consistent with the serving identity. Kept as a local copy
-	// because that constant is unexported and importing the executor package here
-	// would create an import cycle. This value MUST stay in lockstep with the
-	// device-profile floor; TestClaudeOAuthUserAgentMatchesDeviceProfileFloor guards
-	// the two against drift.
-	claudeOAuthUserAgent = "claude-cli/2.1.211 (external, cli)"
+	claudeRefreshTimeout    = 30 * time.Second
 )
-
-const maxOAuthErrorBodyBytes = 512
 
 var (
 	claudeRefreshGroup singleflight.Group
@@ -130,7 +121,11 @@ func isClaudeRefreshRetryable(err error) bool {
 	if errors.As(err, &httpErr) {
 		return httpErr.Retryable()
 	}
-	return true
+	// A transport or response-decoding error is ambiguous: Anthropic may have
+	// consumed the single-use refresh token even though the response was lost.
+	// Retrying the same token can turn a transient network fault into
+	// invalid_grant. Only explicit retryable HTTP responses are safe to replay.
+	return false
 }
 
 // tokenResponse represents the response structure from Anthropic's OAuth token endpoint.
@@ -150,23 +145,44 @@ type tokenResponse struct {
 	} `json:"account"`
 }
 
+// authorizationCodeExchangeRequest is the authorization-code exchange body.
+type authorizationCodeExchangeRequest struct {
+	GrantType    string `json:"grant_type"`
+	Code         string `json:"code"`
+	RedirectURI  string `json:"redirect_uri"`
+	ClientID     string `json:"client_id"`
+	CodeVerifier string `json:"code_verifier"`
+	State        string `json:"state"`
+}
+
+// OAuthProfile is the account identity returned by Anthropic's OAuth profile endpoint.
+type OAuthProfile struct {
+	Account struct {
+		UUID  string `json:"uuid"`
+		Email string `json:"email"`
+	} `json:"account"`
+	Organization struct {
+		UUID string `json:"uuid"`
+		Name string `json:"name"`
+	} `json:"organization"`
+}
+
 // ClaudeAuth handles Anthropic OAuth2 authentication flow.
 // It provides methods for generating authorization URLs, exchanging codes for tokens,
 // and refreshing expired tokens using PKCE for enhanced security.
 type ClaudeAuth struct {
-	httpClient *http.Client
-	// userAgent is set on OAuth token exchange/refresh requests. All
-	// constructors default it to claudeOAuthUserAgent so egress never falls
-	// back to the Go net/http default ("Go-http-client/1.1"); callers that
-	// know a per-account device-profile high-water User-Agent should raise it
-	// via WithUserAgent so refresh matches that account's serving identity.
-	userAgent string
+	httpClient     *http.Client
+	authorizeScope string
+}
+
+func resolveClaudeAuthorizeScope(cfg *config.Config) string {
+	if cfg != nil && !cfg.Claude.OAuthIncludeCreateAPIKeyEnabled() {
+		return ClaudeOAuthScope
+	}
+	return claudeOAuthAuthorizeScope
 }
 
 // NewClaudeAuth creates a new Anthropic authentication service.
-// It initializes the OAuth HTTP client with a bounded standard transport. OAuth
-// token exchange is a control-plane flow and should favor reliability and proxy
-// correctness over browser-like ClientHello impersonation.
 //
 // Parameters:
 //   - cfg: The application configuration containing proxy settings
@@ -180,56 +196,97 @@ func NewClaudeAuth(cfg *config.Config) *ClaudeAuth {
 // NewClaudeAuthWithProxyURL creates a new Anthropic authentication service with a proxy override.
 // proxyURL takes precedence over cfg.ProxyURL when non-empty.
 func NewClaudeAuthWithProxyURL(cfg *config.Config, proxyURL string) *ClaudeAuth {
-	effectiveProxyURL := strings.TrimSpace(proxyURL)
-	var sdkCfg *config.SDKConfig
-	if cfg != nil {
-		sdkCfgCopy := cfg.SDKConfig
-		if effectiveProxyURL == "" {
-			effectiveProxyURL = strings.TrimSpace(cfg.ProxyURL)
-		}
-		sdkCfgCopy.ProxyURL = effectiveProxyURL
-		sdkCfg = &sdkCfgCopy
-	} else if effectiveProxyURL != "" {
-		sdkCfgCopy := config.SDKConfig{ProxyURL: effectiveProxyURL}
-		sdkCfg = &sdkCfgCopy
+	proxyURL = strings.TrimSpace(proxyURL)
+	if proxyURL == "" && cfg != nil {
+		proxyURL = strings.TrimSpace(cfg.ProxyURL)
 	}
-
-	// Anti-correlation (leak 03117a8e): OAuth token exchange/refresh must present
-	// the SAME replicated claude-cli (Node/OpenSSL) ClientHello that serving uses
-	// for api.anthropic.com, not a Go-default TLS fingerprint. NewAnthropicHttpClient
-	// (Go-default transport) is kept only for the management/defensive path; the
-	// bare refresh client here uses the serving uTLS profile (claude_cli_clienthello_v1),
-	// strict no-downgrade, HTTP/1.1 only, with the same per-account proxy.
-	proxyForUtls := ""
-	if sdkCfg != nil {
-		proxyForUtls = strings.TrimSpace(sdkCfg.ProxyURL)
-	}
-	return &ClaudeAuth{
-		httpClient: helps.NewOAuthRefreshUtlsHTTPClient(proxyForUtls, helps.ClaudeCLIClientHelloProfileID, anthropicHTTPClientTimeout),
-		userAgent:  claudeOAuthUserAgent,
-	}
+	return &ClaudeAuth{httpClient: newClaudeOAuthHTTPClient(proxyURL), authorizeScope: resolveClaudeAuthorizeScope(cfg)}
 }
 
 func NewClaudeAuthWithHTTPClient(client *http.Client) *ClaudeAuth {
 	if client == nil {
-		client = NewAnthropicHttpClient(nil)
+		return NewClaudeAuth(nil)
 	}
-	return &ClaudeAuth{httpClient: client, userAgent: claudeOAuthUserAgent}
+	return &ClaudeAuth{httpClient: client}
 }
 
-// WithUserAgent overrides the User-Agent sent on OAuth token exchange/refresh
-// requests. Callers pass the account's persisted device-profile high-water
-// User-Agent (see sdk/cliproxy/auth.ClaudeDeviceHighWaterFromMetadata) so a
-// per-account refresh matches that account's serving identity instead of the
-// generic baseline. An empty/whitespace-only userAgent leaves the existing
-// value (the claudeOAuthUserAgent floor) untouched, so callers can call this
-// unconditionally without risking a downgrade to an empty User-Agent.
-func (o *ClaudeAuth) WithUserAgent(userAgent string) *ClaudeAuth {
-	if strings.TrimSpace(userAgent) == "" {
-		return o
+func setClaudeOAuthJSONHeaders(req *http.Request) {
+	req.Header.Set("Accept", "application/json")
+	if req.Method == http.MethodPost {
+		req.Header.Set("Content-Type", "application/json")
 	}
-	o.userAgent = userAgent
-	return o
+}
+
+func (o *ClaudeAuth) fetchOAuthControlPlaneJSON(ctx context.Context, endpoint, accessToken, label string) ([]byte, error) {
+	if o == nil || o.httpClient == nil {
+		return nil, fmt.Errorf("fetch Claude OAuth %s: HTTP client is nil", label)
+	}
+	accessToken = strings.TrimSpace(accessToken)
+	if accessToken == "" {
+		return nil, fmt.Errorf("fetch Claude OAuth %s: access token is empty", label)
+	}
+	req, errRequest := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if errRequest != nil {
+		return nil, fmt.Errorf("create Claude OAuth %s request: %w", label, errRequest)
+	}
+	setClaudeOAuthJSONHeaders(req)
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("Cache-Control", "no-cache")
+
+	resp, errDo := o.httpClient.Do(req)
+	if errDo != nil {
+		switch {
+		case errors.Is(errDo, context.Canceled):
+			return nil, context.Canceled
+		case errors.Is(errDo, context.DeadlineExceeded):
+			return nil, context.DeadlineExceeded
+		case errors.Is(errDo, errInvalidClaudeOAuthProxy):
+			return nil, errInvalidClaudeOAuthProxy
+		default:
+			return nil, fmt.Errorf("Claude OAuth %s request failed", label)
+		}
+	}
+	defer func() {
+		if errClose := resp.Body.Close(); errClose != nil {
+			log.Errorf("failed to close Claude OAuth %s response body: %v", label, errClose)
+		}
+	}()
+	body, errRead := readClaudeOAuthResponseBody(resp)
+	if errRead != nil {
+		return nil, fmt.Errorf("read Claude OAuth %s response: %w", label, errRead)
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return nil, fmt.Errorf("fetch Claude OAuth %s failed with status %d", label, resp.StatusCode)
+	}
+	return body, nil
+}
+
+// FetchOAuthProfile retrieves the account identity associated with an OAuth access token.
+func (o *ClaudeAuth) FetchOAuthProfile(ctx context.Context, accessToken string) (*OAuthProfile, error) {
+	body, errFetch := o.fetchOAuthControlPlaneJSON(ctx, ProfileURL, accessToken, "profile")
+	if errFetch != nil {
+		return nil, errFetch
+	}
+	var profile OAuthProfile
+	if errUnmarshal := json.Unmarshal(body, &profile); errUnmarshal != nil {
+		return nil, errors.New("failed to parse Claude OAuth profile response")
+	}
+	if strings.TrimSpace(profile.Account.UUID) == "" {
+		return nil, fmt.Errorf("fetch Claude OAuth profile: response account UUID is empty")
+	}
+	return &profile, nil
+}
+
+// FetchOAuthRoles retrieves the current OAuth account roles on explicit request.
+func (o *ClaudeAuth) FetchOAuthRoles(ctx context.Context, accessToken string) (json.RawMessage, error) {
+	body, err := o.fetchOAuthControlPlaneJSON(ctx, RolesURL, accessToken, "roles")
+	if err != nil {
+		return nil, err
+	}
+	if !json.Valid(body) {
+		return nil, errors.New("failed to parse Claude OAuth roles response")
+	}
+	return json.RawMessage(body), nil
 }
 
 // GenerateAuthURL creates the OAuth authorization URL with PKCE.
@@ -249,12 +306,17 @@ func (o *ClaudeAuth) GenerateAuthURL(state string, pkceCodes *PKCECodes) (string
 		return "", "", fmt.Errorf("PKCE codes are required")
 	}
 
+	scope := claudeOAuthAuthorizeScope
+	if o != nil && o.authorizeScope != "" {
+		scope = o.authorizeScope
+	}
+
 	params := url.Values{
 		"code":                  {"true"},
 		"client_id":             {ClientID},
 		"response_type":         {"code"},
 		"redirect_uri":          {RedirectURI},
-		"scope":                 {"user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"},
+		"scope":                 {scope},
 		"code_challenge":        {pkceCodes.CodeChallenge},
 		"code_challenge_method": {"S256"},
 		"state":                 {state},
@@ -301,19 +363,20 @@ func (o *ClaudeAuth) ExchangeCodeForTokens(ctx context.Context, code, state stri
 	}
 	newCode, newState := o.parseCodeAndState(code)
 
-	// Prepare token exchange request
-	reqBody := map[string]interface{}{
-		"code":          newCode,
-		"state":         state,
-		"grant_type":    "authorization_code",
-		"client_id":     ClientID,
-		"redirect_uri":  RedirectURI,
-		"code_verifier": pkceCodes.CodeVerifier,
+	if strings.TrimSpace(newCode) == "" || strings.TrimSpace(state) == "" || strings.TrimSpace(pkceCodes.CodeVerifier) == "" {
+		return nil, errors.New("authorization code, expected state and PKCE verifier are required")
+	}
+	if newState != "" && newState != state {
+		return nil, errors.New("Claude OAuth state mismatch")
 	}
 
-	// Include state if present
-	if newState != "" {
-		reqBody["state"] = newState
+	reqBody := authorizationCodeExchangeRequest{
+		GrantType:    "authorization_code",
+		Code:         newCode,
+		RedirectURI:  RedirectURI,
+		ClientID:     ClientID,
+		CodeVerifier: pkceCodes.CodeVerifier,
+		State:        state,
 	}
 
 	jsonBody, err := json.Marshal(reqBody)
@@ -321,17 +384,11 @@ func (o *ClaudeAuth) ExchangeCodeForTokens(ctx context.Context, code, state stri
 		return nil, fmt.Errorf("failed to marshal request body: %w", err)
 	}
 
-	// log.Debugf("Token exchange request: %s", string(jsonBody))
-
 	req, err := http.NewRequestWithContext(ctx, "POST", TokenURL, strings.NewReader(string(jsonBody)))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create token request: %w", err)
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-	if o.userAgent != "" {
-		req.Header.Set("User-Agent", o.userAgent)
-	}
+	setClaudeOAuthJSONHeaders(req)
 
 	resp, err := o.httpClient.Do(req)
 	if err != nil {
@@ -343,144 +400,41 @@ func (o *ClaudeAuth) ExchangeCodeForTokens(ctx context.Context, code, state stri
 		}
 	}()
 
-	body, err := readOAuthTokenResponseBody(resp)
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("token exchange failed with status %d", resp.StatusCode)
+	}
+
+	body, err := readClaudeOAuthResponseBody(resp)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read token response: %w", err)
 	}
-	// log.Debugf("Token response: %s", string(body))
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("token exchange failed with status %d: %s", resp.StatusCode, summarizeOAuthErrorBody(body))
-	}
-	// log.Debugf("Token response: %s", string(body))
 
 	var tokenResp tokenResponse
 	if err = json.Unmarshal(body, &tokenResp); err != nil {
-		return nil, fmt.Errorf("failed to parse token response: %w; %s", err, summarizeOAuthHTTPResponse(resp, body))
+		return nil, errors.New("failed to parse Claude OAuth token response")
+	}
+	if strings.TrimSpace(tokenResp.AccessToken) == "" {
+		return nil, errors.New("Claude OAuth token response is missing an access token")
 	}
 
-	// Create token data
+	// Create token data.
 	tokenData := ClaudeTokenData{
-		AccessToken:  tokenResp.AccessToken,
-		RefreshToken: tokenResp.RefreshToken,
-		Email:        tokenResp.Account.EmailAddress,
-		Expire:       time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second).Format(time.RFC3339),
+		AccessToken:      tokenResp.AccessToken,
+		RefreshToken:     tokenResp.RefreshToken,
+		Email:            tokenResp.Account.EmailAddress,
+		AccountUUID:      tokenResp.Account.UUID,
+		OrganizationUUID: tokenResp.Organization.UUID,
+		OrganizationName: tokenResp.Organization.Name,
+		Expire:           time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second).Format(time.RFC3339),
 	}
 
-	// Create auth bundle
+	// Create auth bundle.
 	bundle := &ClaudeAuthBundle{
 		TokenData:   tokenData,
 		LastRefresh: time.Now().Format(time.RFC3339),
 	}
 
 	return bundle, nil
-}
-
-func summarizeOAuthErrorBody(body []byte) string {
-	summary := strings.TrimSpace(string(body))
-	if summary == "" {
-		return "<empty response body>"
-	}
-	summary = strings.ReplaceAll(summary, "\r", " ")
-	summary = strings.ReplaceAll(summary, "\n", " ")
-	if len(summary) > maxOAuthErrorBodyBytes {
-		return summary[:maxOAuthErrorBodyBytes] + "..."
-	}
-	return summary
-}
-
-func summarizeOAuthHTTPResponse(resp *http.Response, body []byte) string {
-	status := 0
-	contentType := ""
-	contentEncoding := ""
-	if resp != nil {
-		status = resp.StatusCode
-		contentType = strings.TrimSpace(resp.Header.Get("Content-Type"))
-		contentEncoding = strings.TrimSpace(resp.Header.Get("Content-Encoding"))
-	}
-	if contentType == "" {
-		contentType = "<empty>"
-	}
-	if contentEncoding == "" {
-		contentEncoding = "<empty>"
-	}
-	preview := summarizeOAuthErrorBody(body)
-	if preview != "<empty response body>" {
-		preview = strconv.QuoteToASCII(preview)
-	}
-	return fmt.Sprintf("status=%d content_type=%s content_encoding=%s body_preview=%s", status, contentType, contentEncoding, preview)
-}
-
-func readOAuthTokenResponseBody(resp *http.Response) ([]byte, error) {
-	if resp == nil || resp.Body == nil {
-		return nil, fmt.Errorf("empty token response body")
-	}
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-	encodings := oauthTokenContentEncodings(resp.Header.Get("Content-Encoding"))
-	if len(encodings) == 0 {
-		return body, nil
-	}
-	decoded := body
-	for i := len(encodings) - 1; i >= 0; i-- {
-		decoded, err = decodeOAuthTokenResponseBody(decoded, encodings[i])
-		if err != nil {
-			return nil, err
-		}
-	}
-	return decoded, nil
-}
-
-func oauthTokenContentEncodings(value string) []string {
-	if strings.TrimSpace(value) == "" {
-		return nil
-	}
-	parts := strings.Split(value, ",")
-	encodings := make([]string, 0, len(parts))
-	for _, part := range parts {
-		encoding := strings.ToLower(strings.TrimSpace(part))
-		if encoding == "" || encoding == "identity" {
-			continue
-		}
-		encodings = append(encodings, encoding)
-	}
-	return encodings
-}
-
-func decodeOAuthTokenResponseBody(body []byte, encoding string) ([]byte, error) {
-	switch strings.ToLower(strings.TrimSpace(encoding)) {
-	case "gzip", "x-gzip":
-		reader, err := gzip.NewReader(bytes.NewReader(body))
-		if err != nil {
-			return nil, fmt.Errorf("decode gzip token response: %w", err)
-		}
-		defer func() {
-			_ = reader.Close()
-		}()
-		return io.ReadAll(reader)
-	case "br":
-		return io.ReadAll(brotli.NewReader(bytes.NewReader(body)))
-	case "zstd":
-		reader, err := zstd.NewReader(bytes.NewReader(body))
-		if err != nil {
-			return nil, fmt.Errorf("decode zstd token response: %w", err)
-		}
-		defer reader.Close()
-		return io.ReadAll(reader)
-	case "deflate":
-		reader, err := zlib.NewReader(bytes.NewReader(body))
-		if err != nil {
-			return nil, fmt.Errorf("decode deflate token response: %w", err)
-		}
-		defer func() {
-			_ = reader.Close()
-		}()
-		return io.ReadAll(reader)
-	default:
-		return nil, fmt.Errorf("unsupported token response content-encoding %q", encoding)
-	}
 }
 
 // RefreshTokens refreshes the access token using the refresh token.
@@ -498,6 +452,9 @@ func (o *ClaudeAuth) RefreshTokens(ctx context.Context, refreshToken string) (*C
 	if refreshToken == "" {
 		return nil, fmt.Errorf("refresh token is required")
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if blockedUntil := claudeRefreshBlockedUntil(refreshToken); blockedUntil.After(time.Now()) {
 		return nil, &refreshHTTPError{
 			status:    http.StatusTooManyRequests,
@@ -507,7 +464,13 @@ func (o *ClaudeAuth) RefreshTokens(ctx context.Context, refreshToken string) (*C
 	}
 
 	result, err, _ := claudeRefreshGroup.Do(refreshToken, func() (interface{}, error) {
-		return o.refreshTokensSingleFlight(context.WithoutCancel(ctx), refreshToken)
+		refreshCtx, cancelRefresh := context.WithTimeout(context.WithoutCancel(ctx), claudeRefreshTimeout)
+		defer cancelRefresh()
+		if errReadiness := claudeRefreshReadiness(refreshCtx); errReadiness != nil {
+			return nil, errReadiness
+		}
+
+		return o.refreshTokensSingleFlight(refreshCtx, refreshToken)
 	})
 	if err != nil {
 		return nil, err
@@ -532,6 +495,7 @@ func (o *ClaudeAuth) refreshTokensSingleFlight(ctx context.Context, refreshToken
 		"client_id":     ClientID,
 		"grant_type":    "refresh_token",
 		"refresh_token": refreshToken,
+		"scope":         ClaudeOAuthScope,
 	}
 
 	jsonBody, err := json.Marshal(reqBody)
@@ -539,16 +503,11 @@ func (o *ClaudeAuth) refreshTokensSingleFlight(ctx context.Context, refreshToken
 		return nil, fmt.Errorf("failed to marshal request body: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", TokenURL, strings.NewReader(string(jsonBody)))
+	req, err := http.NewRequestWithContext(ctx, "POST", RefreshTokenURL, strings.NewReader(string(jsonBody)))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create refresh request: %w", err)
 	}
-
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-	if o.userAgent != "" {
-		req.Header.Set("User-Agent", o.userAgent)
-	}
+	setClaudeOAuthJSONHeaders(req)
 
 	resp, err := o.httpClient.Do(req)
 	if err != nil {
@@ -558,15 +517,8 @@ func (o *ClaudeAuth) refreshTokensSingleFlight(ctx context.Context, refreshToken
 		_ = resp.Body.Close()
 	}()
 
-	body, err := readOAuthTokenResponseBody(resp)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read refresh response: %w", err)
-	}
-
 	if resp.StatusCode != http.StatusOK {
-		// MERGE-REVIEW: adopt upstream refreshHTTPError + 429 retry-after backoff while
-		// keeping fork's bounded summarizeOAuthErrorBody to avoid logging huge OAuth bodies.
-		message := summarizeOAuthErrorBody(body)
+		message := http.StatusText(resp.StatusCode)
 		if resp.StatusCode == http.StatusTooManyRequests {
 			retryAfter := parseClaudeRetryAfter(resp)
 			setClaudeRefreshBlockedUntil(refreshToken, time.Now().Add(retryAfter))
@@ -579,22 +531,33 @@ func (o *ClaudeAuth) refreshTokensSingleFlight(ctx context.Context, refreshToken
 		}
 	}
 
-	// log.Debugf("Token response: %s", string(body))
+	body, err := readClaudeOAuthResponseBody(resp)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read refresh response: %w", err)
+	}
 
 	var tokenResp tokenResponse
 	if err = json.Unmarshal(body, &tokenResp); err != nil {
-		return nil, fmt.Errorf("failed to parse token response: %w; %s", err, summarizeOAuthHTTPResponse(resp, body))
+		return nil, errors.New("failed to parse Claude OAuth token response")
+	}
+	if strings.TrimSpace(tokenResp.AccessToken) == "" {
+		return nil, errors.New("Claude OAuth token response is missing an access token")
 	}
 
-	// Create token data
 	clearClaudeRefreshBlockedUntil(refreshToken)
-
-	return &ClaudeTokenData{
+	if strings.TrimSpace(tokenResp.RefreshToken) == "" {
+		tokenResp.RefreshToken = refreshToken
+	}
+	tokenData := &ClaudeTokenData{
 		AccessToken:  tokenResp.AccessToken,
 		RefreshToken: tokenResp.RefreshToken,
-		Email:        tokenResp.Account.EmailAddress,
 		Expire:       time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second).Format(time.RFC3339),
-	}, nil
+	}
+	tokenData.Email = tokenResp.Account.EmailAddress
+	tokenData.AccountUUID = tokenResp.Account.UUID
+	tokenData.OrganizationUUID = tokenResp.Organization.UUID
+	tokenData.OrganizationName = tokenResp.Organization.Name
+	return tokenData, nil
 }
 
 // CreateTokenStorage creates a new ClaudeTokenStorage from auth bundle and user info.
@@ -608,11 +571,14 @@ func (o *ClaudeAuth) refreshTokensSingleFlight(ctx context.Context, refreshToken
 //   - *ClaudeTokenStorage: A new token storage instance
 func (o *ClaudeAuth) CreateTokenStorage(bundle *ClaudeAuthBundle) *ClaudeTokenStorage {
 	storage := &ClaudeTokenStorage{
-		AccessToken:  bundle.TokenData.AccessToken,
-		RefreshToken: bundle.TokenData.RefreshToken,
-		LastRefresh:  bundle.LastRefresh,
-		Email:        bundle.TokenData.Email,
-		Expire:       bundle.TokenData.Expire,
+		AccessToken:      bundle.TokenData.AccessToken,
+		RefreshToken:     bundle.TokenData.RefreshToken,
+		LastRefresh:      bundle.LastRefresh,
+		Email:            bundle.TokenData.Email,
+		AccountUUID:      bundle.TokenData.AccountUUID,
+		OrganizationUUID: bundle.TokenData.OrganizationUUID,
+		OrganizationName: bundle.TokenData.OrganizationName,
+		Expire:           bundle.TokenData.Expire,
 	}
 
 	return storage
@@ -631,6 +597,9 @@ func (o *ClaudeAuth) CreateTokenStorage(bundle *ClaudeAuthBundle) *ClaudeTokenSt
 //   - *ClaudeTokenData: The refreshed token data
 //   - error: An error if all retry attempts fail
 func (o *ClaudeAuth) RefreshTokensWithRetry(ctx context.Context, refreshToken string, maxRetries int) (*ClaudeTokenData, error) {
+	if maxRetries <= 0 {
+		maxRetries = 1
+	}
 	var lastErr error
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
@@ -646,6 +615,9 @@ func (o *ClaudeAuth) RefreshTokensWithRetry(ctx context.Context, refreshToken st
 		tokenData, err := o.RefreshTokens(ctx, refreshToken)
 		if err == nil {
 			return tokenData, nil
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, ErrClaudeRefreshDeferred) {
+			return nil, err
 		}
 
 		lastErr = err
@@ -669,6 +641,17 @@ func (o *ClaudeAuth) UpdateTokenStorage(storage *ClaudeTokenStorage, tokenData *
 	storage.AccessToken = tokenData.AccessToken
 	storage.RefreshToken = tokenData.RefreshToken
 	storage.LastRefresh = time.Now().Format(time.RFC3339)
-	storage.Email = tokenData.Email
+	if strings.TrimSpace(tokenData.Email) != "" {
+		storage.Email = tokenData.Email
+	}
+	if strings.TrimSpace(tokenData.AccountUUID) != "" {
+		storage.AccountUUID = tokenData.AccountUUID
+	}
+	if strings.TrimSpace(tokenData.OrganizationUUID) != "" {
+		storage.OrganizationUUID = tokenData.OrganizationUUID
+	}
+	if strings.TrimSpace(tokenData.OrganizationName) != "" {
+		storage.OrganizationName = tokenData.OrganizationName
+	}
 	storage.Expire = tokenData.Expire
 }

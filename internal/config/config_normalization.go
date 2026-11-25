@@ -2,10 +2,14 @@ package config
 
 import (
 	"fmt"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
-	sdkpluginstore "github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginstore"
+	"github.com/MoeForge/moego/regexp"
+	sdkpluginstore "github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginstore"
+	log "github.com/sirupsen/logrus"
 )
 
 // NormalizePluginsConfig applies default plugin configuration values.
@@ -34,6 +38,17 @@ func (cfg *Config) NormalizePluginsConfig() {
 	}
 }
 
+// NormalizeClaudeConfig applies default Claude provider configuration values.
+func (cfg *Config) NormalizeClaudeConfig() {
+	if cfg == nil {
+		return
+	}
+	if cfg.Claude.SessionDatePinDays == nil {
+		days := DefaultClaudeSessionDatePinDays
+		cfg.Claude.SessionDatePinDays = &days
+	}
+}
+
 // SanitizeCodexHeaderDefaults trims surrounding whitespace from the
 // configured Codex header fallback values.
 func (cfg *Config) SanitizeCodexHeaderDefaults() {
@@ -42,102 +57,183 @@ func (cfg *Config) SanitizeCodexHeaderDefaults() {
 	}
 	cfg.CodexHeaderDefaults.UserAgent = strings.TrimSpace(cfg.CodexHeaderDefaults.UserAgent)
 	cfg.CodexHeaderDefaults.BetaFeatures = strings.TrimSpace(cfg.CodexHeaderDefaults.BetaFeatures)
+	cfg.Codex.SignInWithChatGPTIdentifier = strings.TrimSpace(cfg.Codex.SignInWithChatGPTIdentifier)
 }
 
 // SanitizeClaudeHeaderDefaults trims surrounding whitespace from the
-// configured Claude fingerprint baseline values.
+// configured Claude fingerprint baseline values, normalizes the native
+// entrypoint and beta override lists, and resets an unknown client-request-id
+// mode to the default.
 func (cfg *Config) SanitizeClaudeHeaderDefaults() {
 	if cfg == nil {
 		return
 	}
+	cfg.ClaudeHeaderDefaults.NativeEntrypoints = normalizeClaudeEntrypointNames(cfg.ClaudeHeaderDefaults.NativeEntrypoints)
+	cfg.ClaudeHeaderDefaults.AnthropicBetaStrip = normalizeClaudeBetaNames(cfg.ClaudeHeaderDefaults.AnthropicBetaStrip)
+	cfg.ClaudeHeaderDefaults.AnthropicBetaAppend = normalizeClaudeBetaNames(cfg.ClaudeHeaderDefaults.AnthropicBetaAppend)
+	mode := strings.ToLower(strings.TrimSpace(cfg.ClaudeHeaderDefaults.ClientRequestID))
+	switch mode {
+	case "", ClaudeClientRequestIDOn, ClaudeClientRequestIDOff, ClaudeClientRequestIDPassthrough:
+	default:
+		log.Warnf("unrecognized claude header-defaults client-request-id %q (supported: on, off, passthrough); falling back to on", cfg.ClaudeHeaderDefaults.ClientRequestID)
+		mode = ""
+	}
+	cfg.ClaudeHeaderDefaults.ClientRequestID = mode
 	cfg.ClaudeHeaderDefaults.UserAgent = strings.TrimSpace(cfg.ClaudeHeaderDefaults.UserAgent)
 	cfg.ClaudeHeaderDefaults.PackageVersion = strings.TrimSpace(cfg.ClaudeHeaderDefaults.PackageVersion)
 	cfg.ClaudeHeaderDefaults.RuntimeVersion = strings.TrimSpace(cfg.ClaudeHeaderDefaults.RuntimeVersion)
 	cfg.ClaudeHeaderDefaults.OS = strings.TrimSpace(cfg.ClaudeHeaderDefaults.OS)
 	cfg.ClaudeHeaderDefaults.Arch = strings.TrimSpace(cfg.ClaudeHeaderDefaults.Arch)
 	cfg.ClaudeHeaderDefaults.Timeout = strings.TrimSpace(cfg.ClaudeHeaderDefaults.Timeout)
-	cfg.ClaudeHeaderDefaults.FarmOS = strings.TrimSpace(cfg.ClaudeHeaderDefaults.FarmOS)
-	cfg.ClaudeHeaderDefaults.FarmArch = strings.TrimSpace(cfg.ClaudeHeaderDefaults.FarmArch)
+	cfg.ClaudeHeaderDefaults.Timezone = strings.TrimSpace(cfg.ClaudeHeaderDefaults.Timezone)
 }
 
-// SanitizeOAuthModelAlias normalizes and deduplicates global OAuth model name aliases.
+// normalizeClaudeEntrypointNames trims and lowercases entrypoint names,
+// dropping empty and duplicate entries while keeping the configured order.
+func normalizeClaudeEntrypointNames(names []string) []string {
+	if len(names) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(names))
+	seen := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		name = strings.ToLower(strings.TrimSpace(name))
+		if name == "" {
+			continue
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		out = append(out, name)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// normalizeClaudeBetaNames trims beta names and drops empty and duplicate
+// entries while keeping the configured order.
+func normalizeClaudeBetaNames(names []string) []string {
+	if len(names) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(names))
+	seen := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		out = append(out, name)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// SanitizeOAuthSettings normalizes and deduplicates global OAuth model settings.
 // It trims whitespace, normalizes channel keys to lower-case, drops empty entries,
-// allows multiple aliases per upstream name, and ensures aliases are unique within each channel.
-func (cfg *Config) SanitizeOAuthModelAlias() {
-	if cfg == nil {
+// and ensures entries are unique within each channel.
+func (cfg *Config) SanitizeOAuthSettings() {
+	if cfg == nil || len(cfg.OAuthSettings) == 0 {
 		return
 	}
-
-	// fork(anticorr): default alias injection was dropped when config sanitization
-	// was split out of config.go during the upstream merge. Restore it here so a
-	// stock config still exposes the fork's Kiro / GitHub Copilot / Claude 1M
-	// aliases. Injection is per-channel and only fires when the channel is entirely
-	// absent, so a user-configured channel — or an explicit empty/nil channel used
-	// as a "deleted" marker (#222) — is never re-populated.
-	if cfg.OAuthModelAlias == nil {
-		cfg.OAuthModelAlias = make(map[string][]OAuthModelAlias)
-	}
-
-	hasChannel := func(channel string) bool {
-		for key := range cfg.OAuthModelAlias {
-			if strings.EqualFold(strings.TrimSpace(key), channel) {
-				return true
-			}
-		}
-		return false
-	}
-
-	if !hasChannel("kiro") {
-		cfg.OAuthModelAlias["kiro"] = defaultKiroAliases()
-	}
-	if !hasChannel("github-copilot") {
-		cfg.OAuthModelAlias["github-copilot"] = defaultGitHubCopilotAliases()
-	}
-	if !hasChannel("claude") {
-		cfg.OAuthModelAlias["claude"] = defaultClaudeAliases()
-	}
-
-	out := make(map[string][]OAuthModelAlias, len(cfg.OAuthModelAlias))
-	for rawChannel, aliases := range cfg.OAuthModelAlias {
+	out := make(map[string][]OAuthModelSetting, len(cfg.OAuthSettings))
+	for rawChannel, settings := range cfg.OAuthSettings {
 		channel := strings.ToLower(strings.TrimSpace(rawChannel))
-		if channel == "" {
+		if channel == "" || len(settings) == 0 {
 			continue
 		}
-		// fork(anticorr): preserve explicit empty/nil channels as disabled markers
-		// so defaults are not re-injected on later sanitization passes (#222).
-		if len(aliases) == 0 {
-			out[channel] = nil
-			continue
-		}
-		seenAlias := make(map[string]struct{}, len(aliases))
-		clean := make([]OAuthModelAlias, 0, len(aliases))
-		for _, entry := range aliases {
+		seen := make(map[string]struct{}, len(settings))
+		reversed := make([]OAuthModelSetting, 0, len(settings))
+		for i := len(settings) - 1; i >= 0; i-- {
+			entry := settings[i]
 			name := strings.TrimSpace(entry.Name)
+			if name == "" {
+				continue
+			}
 			alias := strings.TrimSpace(entry.Alias)
-			if name == "" || alias == "" {
+			key := strings.ToLower(name) + "->" + strings.ToLower(alias)
+			if _, ok := seen[key]; ok {
 				continue
 			}
-			if strings.EqualFold(name, alias) {
+			seen[key] = struct{}{}
+			var openAPI *bool
+			if entry.OpenAPI != nil {
+				value := *entry.OpenAPI
+				openAPI = &value
+			}
+			reversed = append(reversed, OAuthModelSetting{
+				OpenAPI:          openAPI,
+				Name:             name,
+				Alias:            alias,
+				MaxContextLength: entry.MaxContextLength,
+			})
+		}
+		if len(reversed) > 0 {
+			clean := make([]OAuthModelSetting, len(reversed))
+			for i := range reversed {
+				clean[len(reversed)-1-i] = reversed[i]
+			}
+			out[channel] = clean
+		}
+	}
+	cfg.OAuthSettings = out
+}
+
+// SanitizeOAuthRequestScopedErrors normalizes and validates global OAuth request-scoped error rules.
+// It trims whitespace, normalizes channel keys to lower-case, validates status/action, and drops invalid rules.
+func (cfg *Config) SanitizeOAuthRequestScopedErrors() {
+	if cfg == nil || len(cfg.OAuthRequestScopedErrors) == 0 {
+		return
+	}
+	out := make(map[string][]RequestScopedErrorRule, len(cfg.OAuthRequestScopedErrors))
+	for rawChannel, rules := range cfg.OAuthRequestScopedErrors {
+		channel := strings.ToLower(strings.TrimSpace(rawChannel))
+		if channel == "" || len(rules) == 0 {
+			continue
+		}
+		clean := make([]RequestScopedErrorRule, 0, len(rules))
+		for _, r := range rules {
+			action := strings.ToLower(strings.TrimSpace(r.Action))
+			match := make([]string, 0, len(r.Match))
+			for _, m := range r.Match {
+				if tm := strings.TrimSpace(m); tm != "" {
+					match = append(match, tm)
+				}
+			}
+			matchRegexr := make([]string, 0, len(r.MatchRegexr))
+			for _, re := range r.MatchRegexr {
+				if tre := strings.TrimSpace(re); tre != "" {
+					matchRegexr = append(matchRegexr, tre)
+				}
+			}
+			if r.Status <= 0 || (len(match) == 0 && len(matchRegexr) == 0) || action == "" {
 				continue
 			}
-			aliasKey := strings.ToLower(alias)
-			if _, ok := seenAlias[aliasKey]; ok {
-				continue
-			}
-			seenAlias[aliasKey] = struct{}{}
-			clean = append(clean, OAuthModelAlias{
-				Name:         name,
-				Alias:        alias,
-				Fork:         entry.Fork,
-				DisplayName:  strings.TrimSpace(entry.DisplayName),
-				ForceMapping: entry.ForceMapping,
+			clean = append(clean, RequestScopedErrorRule{
+				Status:      r.Status,
+				Match:       match,
+				MatchRegexr: matchRegexr,
+				Action:      action,
 			})
 		}
 		if len(clean) > 0 {
 			out[channel] = clean
 		}
 	}
-	cfg.OAuthModelAlias = out
+	if len(out) == 0 {
+		cfg.OAuthRequestScopedErrors = nil
+		return
+	}
+	cfg.OAuthRequestScopedErrors = out
 }
 
 // SanitizeOpenAICompatibility removes OpenAI-compatibility provider entries that are
@@ -179,6 +275,42 @@ func (cfg *Config) SanitizeXAIKeys() {
 		return
 	}
 	cfg.XAIKey = sanitizeCodexKeyEntries(cfg.XAIKey)
+	for i := range cfg.XAIKey {
+		cfg.XAIKey[i].AlphaSearch = false
+	}
+}
+
+// SanitizeMetaKeys normalizes Meta API key entries, defaulting BaseURL to https://api.meta.ai/v1 if empty.
+func (cfg *Config) SanitizeMetaKeys() {
+	if cfg == nil {
+		return
+	}
+	cfg.MetaKey = sanitizeMetaKeyEntries(cfg.MetaKey)
+}
+
+func sanitizeMetaKeyEntries(entries []MetaKey) []MetaKey {
+	if len(entries) == 0 {
+		return entries
+	}
+	out := make([]MetaKey, 0, len(entries))
+	for i := range entries {
+		e := entries[i]
+		e.APIKey = strings.TrimSpace(e.APIKey)
+		// meta-api-key requires a valid API key. DCA tokens require OAuth storage (auths/*.json).
+		if e.APIKey == "" || strings.HasPrefix(e.APIKey, "dca:") {
+			continue
+		}
+		e.Prefix = normalizeModelPrefix(e.Prefix)
+		e.BaseURL = strings.TrimSpace(e.BaseURL)
+		if e.BaseURL == "" {
+			e.BaseURL = "https://api.meta.ai/v1"
+		}
+		e.Headers = NormalizeHeaders(e.Headers)
+		e.ExcludedModels = NormalizeExcludedModels(e.ExcludedModels)
+		e.AlphaSearch = false
+		out = append(out, e)
+	}
+	return out
 }
 
 func sanitizeCodexKeyEntries(entries []CodexKey) []CodexKey {
@@ -200,6 +332,108 @@ func sanitizeCodexKeyEntries(entries []CodexKey) []CodexKey {
 	return out
 }
 
+// NormalizeSensitiveWordsReplace trims replacement target keys, drops blank keys,
+// and preserves replacement values (including empty strings for phrase deletion).
+func NormalizeSensitiveWordsReplace(in map[string]string) map[string]string {
+	if len(in) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(in))
+	for k := range in {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make(map[string]string, len(in))
+	for _, rawKey := range keys {
+		trimmedKey := strings.TrimSpace(rawKey)
+		if trimmedKey == "" {
+			continue
+		}
+		if _, exists := out[trimmedKey]; exists && rawKey != trimmedKey {
+			continue
+		}
+		out[trimmedKey] = in[rawKey]
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// NormalizeSensitivePatternsReplace validates Go RE2 regex rules, logs and drops
+// invalid or blank patterns, and preserves replacement values (including empty strings).
+func NormalizeSensitivePatternsReplace(in []SensitivePatternRule) []SensitivePatternRule {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]SensitivePatternRule, 0, len(in))
+	for i, rule := range in {
+		if strings.TrimSpace(rule.Pattern) == "" {
+			continue
+		}
+		if _, errCompile := regexp.Compile(rule.Pattern); errCompile != nil {
+			log.WithFields(log.Fields{
+				"rule_index": i + 1,
+				"pattern":    rule.Pattern,
+				"error":      errCompile,
+			}).Warn("sensitive-patterns-replace rule dropped: invalid regex")
+			continue
+		}
+		out = append(out, SensitivePatternRule{
+			Pattern:     rule.Pattern,
+			Replacement: rule.Replacement,
+		})
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// SanitizeAntigravity normalizes Antigravity sensitive-word settings.
+func (cfg *Config) SanitizeAntigravity() {
+	if cfg == nil {
+		return
+	}
+	cfg.Antigravity.SensitiveWordsReplace = NormalizeSensitiveWordsReplace(cfg.Antigravity.SensitiveWordsReplace)
+	cfg.Antigravity.SensitivePatternsReplace = NormalizeSensitivePatternsReplace(cfg.Antigravity.SensitivePatternsReplace)
+}
+
+// SanitizeDevin normalizes Devin sensitive-word settings.
+func (cfg *Config) SanitizeDevin() {
+	if cfg == nil {
+		return
+	}
+	cfg.Devin.SensitiveWordsReplace = NormalizeSensitiveWordsReplace(cfg.Devin.SensitiveWordsReplace)
+	cfg.Devin.SensitivePatternsReplace = NormalizeSensitivePatternsReplace(cfg.Devin.SensitivePatternsReplace)
+}
+
+// NormalizeCloakConfig trims strings and removes blank sensitive words.
+func NormalizeCloakConfig(cloak *CloakConfig) *CloakConfig {
+	if cloak == nil {
+		return nil
+	}
+	cloak.Mode = strings.TrimSpace(cloak.Mode)
+	if len(cloak.SensitiveWords) > 0 {
+		normalizedWords := make([]string, 0, len(cloak.SensitiveWords))
+		for _, w := range cloak.SensitiveWords {
+			if trimmed := strings.TrimSpace(w); trimmed != "" {
+				normalizedWords = append(normalizedWords, trimmed)
+			}
+		}
+		if len(normalizedWords) > 0 {
+			cloak.SensitiveWords = normalizedWords
+		} else {
+			cloak.SensitiveWords = nil
+		}
+	} else {
+		cloak.SensitiveWords = nil
+	}
+	cloak.SensitiveWordsReplace = NormalizeSensitiveWordsReplace(cloak.SensitiveWordsReplace)
+	cloak.SensitivePatternsReplace = NormalizeSensitivePatternsReplace(cloak.SensitivePatternsReplace)
+	return cloak
+}
+
 // SanitizeClaudeKeys normalizes headers for Claude credentials.
 func (cfg *Config) SanitizeClaudeKeys() {
 	if cfg == nil || len(cfg.ClaudeKey) == 0 {
@@ -210,6 +444,15 @@ func (cfg *Config) SanitizeClaudeKeys() {
 		entry.Prefix = normalizeModelPrefix(entry.Prefix)
 		entry.Headers = NormalizeHeaders(entry.Headers)
 		entry.ExcludedModels = NormalizeExcludedModels(entry.ExcludedModels)
+		entry.Cloak = NormalizeCloakConfig(entry.Cloak)
+		// Only a recognized value is rewritten. An unrecognized one is preserved as
+		// written so sanitizing a config file never destroys operator input; the
+		// request path falls back to the default profile and reports it once.
+		if normalized, ok := NormalizeClaudeFingerprintProfile(entry.FingerprintProfile); ok {
+			entry.FingerprintProfile = normalized
+		} else {
+			entry.FingerprintProfile = strings.TrimSpace(entry.FingerprintProfile)
+		}
 	}
 }
 
@@ -219,15 +462,15 @@ func sanitizeGeminiKeyEntries(entries []GeminiKey) []GeminiKey {
 	for i := range entries {
 		entry := entries[i]
 		entry.APIKey = strings.TrimSpace(entry.APIKey)
-		if entry.APIKey == "" {
+		entry.BaseURL = strings.TrimSpace(entry.BaseURL)
+		if entry.APIKey == "" && entry.BaseURL == "" {
 			continue
 		}
 		entry.Prefix = normalizeModelPrefix(entry.Prefix)
-		entry.BaseURL = strings.TrimSpace(entry.BaseURL)
 		entry.ProxyURL = strings.TrimSpace(entry.ProxyURL)
 		entry.Headers = NormalizeHeaders(entry.Headers)
 		entry.ExcludedModels = NormalizeExcludedModels(entry.ExcludedModels)
-		uniqueKey := entry.APIKey + "|" + entry.BaseURL
+		uniqueKey := formatGeminiKeyDedupID(entry)
 		if _, exists := seen[uniqueKey]; exists {
 			continue
 		}
@@ -237,8 +480,64 @@ func sanitizeGeminiKeyEntries(entries []GeminiKey) []GeminiKey {
 	return out
 }
 
+func formatGeminiKeyDedupID(entry GeminiKey) string {
+	var b strings.Builder
+	b.WriteString(entry.APIKey)
+	b.WriteByte(0)
+	b.WriteString(entry.BaseURL)
+	b.WriteByte(0)
+	b.WriteString(entry.ProxyURL)
+	b.WriteByte(0)
+	b.WriteString(entry.Prefix)
+	b.WriteByte(0)
+	b.WriteString(FormatSortedHeaders(entry.Headers))
+	b.WriteByte(0)
+	b.WriteString(FormatConnectionPoolDedupID(entry.ConnectionPool))
+	return b.String()
+}
+
+// FormatConnectionPoolDedupID serializes a per-credential connection-pool override
+// deterministically for credential deduplication and auth-index mapping.
+func FormatConnectionPoolDedupID(pool *ProxyConnectionPoolConfig) string {
+	if pool == nil {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("pool:")
+	if pool.Enabled != nil {
+		b.WriteString(strconv.FormatBool(*pool.Enabled))
+	}
+	b.WriteByte(0)
+	b.WriteString(strings.TrimSpace(pool.IdleConnTimeout))
+	b.WriteByte(0)
+	if pool.MaxIdleConnsPerHost != nil {
+		b.WriteString(strconv.Itoa(*pool.MaxIdleConnsPerHost))
+	}
+	return b.String()
+}
+
+// FormatSortedHeaders serializes headers deterministically with null byte separators.
+func FormatSortedHeaders(headers map[string]string) string {
+	if len(headers) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(headers))
+	for k := range headers {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	for _, k := range keys {
+		b.WriteString(k)
+		b.WriteByte(0)
+		b.WriteString(headers[k])
+		b.WriteByte(0)
+	}
+	return b.String()
+}
+
 // SanitizeGeminiKeys deduplicates and normalizes Gemini credentials.
-// It uses API key + base URL as the uniqueness key.
+// It uses API key, base URL, proxy URL, prefix, and custom headers as the uniqueness key.
 func (cfg *Config) SanitizeGeminiKeys() {
 	if cfg == nil {
 		return
@@ -247,7 +546,7 @@ func (cfg *Config) SanitizeGeminiKeys() {
 }
 
 // SanitizeInteractionsKeys deduplicates and normalizes native Interactions credentials.
-// It uses API key + base URL as the uniqueness key.
+// It uses API key, base URL, proxy URL, prefix, and custom headers as the uniqueness key.
 func (cfg *Config) SanitizeInteractionsKeys() {
 	if cfg == nil {
 		return
@@ -312,15 +611,6 @@ func NormalizeExcludedModels(models []string) []string {
 	return out
 }
 
-// NormalizeCodexFastModels trims, lowercases, and deduplicates the Codex fast/priority
-// model allowlist. It preserves the order of first occurrences and drops empty entries.
-// Reused by both the auth synthesizer (to write the fast_models attribute) and the
-// runtime gate (to compare a request's model against the allowlist) so both sides agree
-// on normalization.
-func NormalizeCodexFastModels(models []string) []string {
-	return NormalizeExcludedModels(models)
-}
-
 // NormalizeOAuthExcludedModels cleans provider -> excluded models mappings by normalizing provider keys
 // and applying model exclusion normalization to each entry.
 func NormalizeOAuthExcludedModels(entries map[string][]string) map[string][]string {
@@ -345,6 +635,84 @@ func NormalizeOAuthExcludedModels(entries map[string][]string) map[string][]stri
 	return out
 }
 
+// SanitizeOAuthModelAlias normalizes and deduplicates global OAuth model name aliases.
+// It trims whitespace, normalizes channel keys to lower-case, drops empty entries,
+// allows multiple aliases per upstream name, and ensures aliases are unique within each channel.
+func (cfg *Config) SanitizeOAuthModelAlias() {
+	if cfg == nil {
+		return
+	}
+
+	// Inject defaults only for absent channels. Explicit empty and nil
+	// entries are deletion markers and survive subsequent sanitization.
+	if cfg.OAuthModelAlias == nil {
+		cfg.OAuthModelAlias = make(map[string][]OAuthModelAlias)
+	}
+
+	hasChannel := func(channel string) bool {
+		for key := range cfg.OAuthModelAlias {
+			if strings.EqualFold(strings.TrimSpace(key), channel) {
+				return true
+			}
+		}
+		return false
+	}
+
+	if !hasChannel("github-copilot") {
+		cfg.OAuthModelAlias["github-copilot"] = defaultGitHubCopilotAliases()
+	}
+	if !hasChannel("claude") {
+		cfg.OAuthModelAlias["claude"] = defaultClaudeAliases()
+	}
+
+	out := make(map[string][]OAuthModelAlias, len(cfg.OAuthModelAlias))
+	for rawChannel, aliases := range cfg.OAuthModelAlias {
+		channel := strings.ToLower(strings.TrimSpace(rawChannel))
+		if channel == "" {
+			continue
+		}
+		// Preserve deletion markers across normalization passes.
+		if len(aliases) == 0 {
+			out[channel] = nil
+			continue
+		}
+		seenAlias := make(map[string]struct{}, len(aliases))
+		clean := make([]OAuthModelAlias, 0, len(aliases))
+		for _, entry := range aliases {
+			name := strings.TrimSpace(entry.Name)
+			alias := strings.TrimSpace(entry.Alias)
+			if name == "" || alias == "" {
+				continue
+			}
+			if name == alias {
+				continue
+			}
+			aliasKey := strings.ToLower(alias)
+			if _, ok := seenAlias[aliasKey]; ok {
+				continue
+			}
+			seenAlias[aliasKey] = struct{}{}
+			var openAPI *bool
+			if entry.OpenAPI != nil {
+				value := *entry.OpenAPI
+				openAPI = &value
+			}
+			clean = append(clean, OAuthModelAlias{
+				OpenAPI:      openAPI,
+				Name:         name,
+				Alias:        alias,
+				Fork:         entry.Fork,
+				DisplayName:  strings.TrimSpace(entry.DisplayName),
+				ForceMapping: entry.ForceMapping,
+			})
+		}
+		if len(clean) > 0 {
+			out[channel] = clean
+		}
+	}
+	cfg.OAuthModelAlias = out
+}
+
 // NormalizeClaudeSonnetLongContextPolicy returns a supported policy value.
 func NormalizeClaudeSonnetLongContextPolicy(policy string) string {
 	switch strings.ToLower(strings.TrimSpace(policy)) {
@@ -357,79 +725,6 @@ func NormalizeClaudeSonnetLongContextPolicy(policy string) string {
 	default:
 		return ClaudeSonnetLongContextPolicyFailWithHint
 	}
-}
-
-// NormalizeSdkCliEntrypointEnabled reports whether the sdk-cli→cli
-// cc_entrypoint normalization (see ClaudeConfig.NormalizeSdkCliEntrypoint) is
-// active. It defaults to true (enabled) when the pointer is unset, so a stock
-// config normalizes Agent SDK / `claude -p` traffic without an explicit
-// opt-in. Set claude.normalize-sdk-cli-entrypoint: false to opt out and
-// restore the previous "mirror inbound entrypoint verbatim" behavior.
-func NormalizeSdkCliEntrypointEnabled(cfg *Config) bool {
-	if cfg == nil || cfg.Claude.NormalizeSdkCliEntrypoint == nil {
-		return true
-	}
-	return *cfg.Claude.NormalizeSdkCliEntrypoint
-}
-
-// AlignRealPathBillingVersionEnabled reports whether the REAL serving path
-// (genuine claude-cli, helps.ShouldCloak == false) rewrites the body billing
-// header cc_version <version> segment to the account high-water version V (see
-// ClaudeConfig.AlignRealPathBillingVersion). Unlike NormalizeSdkCliEntrypoint,
-// this defaults to false (disabled) when the pointer is unset, so the real
-// serving path stays byte-for-byte unchanged until an operator explicitly opts
-// in after real-machine validation. Set claude.align-real-path-billing-version:
-// true to enable.
-func AlignRealPathBillingVersionEnabled(cfg *Config) bool {
-	return cfg != nil &&
-		cfg.Claude.AlignRealPathBillingVersion != nil &&
-		*cfg.Claude.AlignRealPathBillingVersion
-}
-
-// FarmAutoEnrollEnabled reports whether a brand-new account's first completed
-// authentication is auto-enrolled into the device telemetry farm (management
-// saveTokenRecord's previous == nil branch; see Config.FarmAutoEnroll). It
-// defaults to true (enabled) when the pointer is unset, preserving the
-// pre-toggle behavior where every newly authenticated account was auto-enrolled
-// and avoiding the Go bool zero-value trap that would otherwise make a stock
-// config silently stop enrolling. Set farm-auto-enroll: false to make farm
-// enrollment strictly manual opt-in via the account-level farm_enrolled toggle.
-func FarmAutoEnrollEnabled(cfg *Config) bool {
-	return cfg == nil ||
-		cfg.FarmAutoEnroll == nil ||
-		*cfg.FarmAutoEnroll
-}
-
-// ManagedHeaderOnlineUpdateEnabled reports whether core may consult public
-// online registries to refresh provider-managed version markers.
-func ManagedHeaderOnlineUpdateEnabled(cfg *Config) bool {
-	return cfg != nil &&
-		cfg.ManagedHeaderProfile.OnlineUpdate != nil &&
-		*cfg.ManagedHeaderProfile.OnlineUpdate
-}
-
-// ManagedHeaderProfileFetchTimeout returns the clamped online-refresh fetch
-// timeout in seconds (default 2, clamped to [1, 10]).
-func ManagedHeaderProfileFetchTimeout(cfg *Config) int {
-	if cfg == nil || cfg.ManagedHeaderProfile.FetchTimeoutSeconds <= 0 {
-		return 2
-	}
-	if cfg.ManagedHeaderProfile.FetchTimeoutSeconds > 10 {
-		return 10
-	}
-	return cfg.ManagedHeaderProfile.FetchTimeoutSeconds
-}
-
-// ManagedHeaderProfileCacheTTL returns the clamped online-refresh cache TTL in
-// seconds (default 6h, floored at 60s).
-func ManagedHeaderProfileCacheTTL(cfg *Config) int {
-	if cfg == nil || cfg.ManagedHeaderProfile.CacheTTLSeconds <= 0 {
-		return 6 * 60 * 60
-	}
-	if cfg.ManagedHeaderProfile.CacheTTLSeconds < 60 {
-		return 60
-	}
-	return cfg.ManagedHeaderProfile.CacheTTLSeconds
 }
 
 // QuotaSnapshotRefreshEnabled reports whether the background quota snapshot
@@ -535,4 +830,8 @@ func formatQuotaSnapshotDuration(duration time.Duration) string {
 	default:
 		return duration.String()
 	}
+}
+
+func NormalizeCodexFastModels(models []string) []string {
+	return NormalizeExcludedModels(models)
 }

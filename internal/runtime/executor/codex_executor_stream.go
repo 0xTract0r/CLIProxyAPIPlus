@@ -1,232 +1,233 @@
 package executor
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"io"
-	"net/http"
-	"strings"
+	"sync"
+	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
-	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
-	log "github.com/sirupsen/logrus"
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 )
 
 func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
 	if opts.Alt == "responses/compact" {
-		return nil, statusErr{code: http.StatusBadRequest, msg: "streaming not supported for /responses/compact"}
+		return nil, statusErr{code: 400, msg: "streaming is unavailable for compact requests", requestScoped: true}
+	}
+	model := thinking.ParseSuffix(req.Model).ModelName
+	compat, err := e.expandCodexResponsesCompaction(auth, &req, &opts, model)
+	if err != nil {
+		return nil, statusErr{code: 400, msg: err.Error(), requestScoped: true}
 	}
 	if isCodexOpenAIImageRequest(opts) {
 		return e.executeOpenAIImageStream(ctx, auth, req, opts)
 	}
-	baseModel := thinking.ParseSuffix(req.Model).ModelName
-
-	apiKey, baseURL := codexCreds(auth)
-	if baseURL == "" {
-		baseURL = "https://chatgpt.com/backend-api/codex"
-	}
-
-	reporter := helps.NewExecutorUsageReporter(ctx, e, baseModel, auth)
-	defer reporter.TrackFailure(ctx, &err)
-
-	from := opts.SourceFormat
-	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
-	to := sdktranslator.FromString("codex")
-	originalPayloadSource := req.Payload
-	if len(opts.OriginalRequest) > 0 {
-		originalPayloadSource = opts.OriginalRequest
-	}
-	originalPayload := originalPayloadSource
-	originalTranslated, body := translateCodexRequestPair(from, to, baseModel, originalPayload, req.Payload, true)
-
-	body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
-	if err != nil {
+	if err = rejectSyntheticCompactionPreviousResponseID(ctx, req.Payload); err != nil {
 		return nil, err
 	}
-
-	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
-	requestPath := helps.PayloadRequestPath(opts)
-	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
-	body, _ = sjson.DeleteBytes(body, "previous_response_id")
-	body, _ = sjson.DeleteBytes(body, "generate")
-	body, _ = sjson.DeleteBytes(body, "prompt_cache_retention")
-	body, _ = sjson.DeleteBytes(body, "safety_identifier")
-	body, _ = sjson.DeleteBytes(body, "stream_options")
-	body = helps.SetStringIfDifferent(body, "model", baseModel)
-	body = normalizeCodexInstructions(body)
-	// fork: 图像策略统一走 applyImageGenerationPolicy（DisableImageGenerationOff 注入、
-	// 其余档位含 nil cfg 剥离 image_generation）。opts.Headers 透传用于 responses-lite 判定。
-	body = applyImageGenerationPolicy(e.cfg, body, baseModel, auth, opts.Headers)
-	body = sanitizeOpenAIResponsesReasoningEncryptedContent(ctx, "codex executor", body)
-	body = normalizeCodexParallelToolCalls(body, opts.Headers)
-	body, optimizeMultiAgentV2 := helps.OptimizeCodexMultiAgentV2Request(ctx, opts.Headers, body, e.cfg)
-	body, replayScope, errReplay := applyCodexReasoningReplayCacheRequired(ctx, from, req, opts, body)
-	if errReplay != nil {
-		return nil, errReplay
+	if e.shouldCompactCompatResponsesTrigger(compat, req, opts) {
+		return e.executeCodexResponsesCompactionStream(ctx, auth, req, opts)
 	}
-	body = applyCodexServiceTierPolicy(body, codexFastEnabled(auth, baseModel))
-	reporter.SetTranslatedReasoningEffort(body, to.String())
-
-	url := strings.TrimSuffix(baseURL, "/") + "/responses"
-	var identityState codexIdentityConfuseState
-	httpReq, upstreamBody, identityState, err := e.cacheHelper(ctx, from, url, auth, req, originalPayloadSource, body, opts.Headers)
-	if err != nil {
-		return nil, err
-	}
-	applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg)
-	applyModelHeaderOverrides(httpReq.Header, baseModel)
-	// fork(anticorr): codex 版本高水位持久化（真实 serving 出站点：ExecuteStream 主对话流）。
-	e.persistCodexDeviceHighWater(httpReq.Context(), auth)
-	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
-	var authID, authLabel, authType, authValue string
-	if auth != nil {
-		authID = auth.ID
-		authLabel = auth.Label
-		authType, authValue = auth.AccountInfo()
-	}
-	helps.RecordAPIRequest(ctx, e.cfg, helps.UpstreamRequestLog{
-		URL:       url,
-		Method:    http.MethodPost,
-		Headers:   httpReq.Header.Clone(),
-		Body:      upstreamBody,
-		Provider:  e.Identifier(),
-		AuthID:    authID,
-		AuthLabel: authLabel,
-		AuthType:  authType,
-		AuthValue: authValue,
-	})
-
-	httpClient := helps.NewUtlsHTTPClient(ctx, e.cfg, auth, 0)
-	reporter.SetCodexFastContext(originalPayloadSource, upstreamBody, codexFastEnabled(auth, baseModel))
+	reporter := helps.NewExecutorUsageReporter(ctx, e, model, auth)
 	reporter.UseDecodedContentTelemetry()
-	httpClient = reporter.TrackHTTPClient(httpClient)
-	httpResp, err := httpClient.Do(httpReq)
+	defer reporter.TrackFailure(ctx, &err)
+	resp, body, err := e.sendOrdinaryCodex(ctx, auth, req, opts, "/responses", true, compat, reporter)
 	if err != nil {
-		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return nil, err
 	}
-	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
-	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		data, readErr := io.ReadAll(httpResp.Body)
-		if errClose := httpResp.Body.Close(); errClose != nil {
-			log.Errorf("codex executor: close response body error: %v", errClose)
+	scanCtx, cancelScanner := context.WithCancel(ctx)
+	resp.Body = &ordinaryCodexOnceCloser{ReadCloser: resp.Body}
+	scanned := startOrdinaryCodexScanner(scanCtx, resp.Body)
+	var prefetched [][]byte
+	if e.cfg != nil && e.cfg.Codex.StreamBootstrapBuffering {
+		prefetched, err = bufferOrdinaryCodexBootstrap(ctx, scanned, e.cfg.Codex.StreamBootstrapTimeoutDuration(), e.modelLevelCooling(), func(raw []byte) { e.observeOrdinaryPolicyRefusal(ctx, auth, req.Model, raw) })
+		if err != nil {
+			cancelScanner()
+			_ = resp.Body.Close()
+			return nil, err
 		}
-		if readErr != nil {
-			helps.RecordAPIResponseError(ctx, e.cfg, readErr)
-			return nil, readErr
-		}
-		data = applyCodexIdentityConfuseResponsePayload(data, identityState)
-		if errClearReplay := clearCodexReasoningReplayOnInvalidSignature(ctx, replayScope, httpResp.StatusCode, data); errClearReplay != nil {
-			return nil, errClearReplay
-		}
-		helps.AppendAPIResponseChunk(ctx, e.cfg, data)
-		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
-		err = newCodexStatusErr(httpResp.StatusCode, data, httpResp.Header)
-		return nil, err
 	}
 	out := make(chan cliproxyexecutor.StreamChunk)
 	go func() {
 		defer close(out)
-		defer func() {
-			if errClose := httpResp.Body.Close(); errClose != nil {
-				log.Errorf("codex executor: close response body error: %v", errClose)
+		defer resp.Body.Close()
+		defer cancelScanner()
+		send := func(chunk cliproxyexecutor.StreamChunk) bool {
+			select {
+			case <-ctx.Done():
+				return false
+			case out <- chunk:
+				return true
 			}
-		}()
-		scanner := bufio.NewScanner(io.TeeReader(httpResp.Body, reporter.ContentEventObserver()))
-		scanner.Buffer(nil, 52_428_800) // 50MB
-		claudeInputTokens := helps.NewClaudeInputTokenState(from, to, responseFormat, originalPayload)
+		}
+		fail := func(err error) { reporter.PublishFailure(ctx, err); send(cliproxyexecutor.StreamChunk{Err: err}) }
+		next := func() (ordinaryCodexScannedLine, bool) {
+			if len(prefetched) > 0 {
+				v := prefetched[0]
+				prefetched[0] = nil
+				prefetched = prefetched[1:]
+				return ordinaryCodexScannedLine{line: v}, true
+			}
+			select {
+			case <-ctx.Done():
+				return ordinaryCodexScannedLine{}, false
+			case v, ok := <-scanned:
+				return v, ok
+			}
+		}
+		items := make(map[int64][]byte)
+		var fallback [][]byte
 		var param any
-		outputItemsByIndex := make(map[int64][]byte)
-		var outputItemsFallback [][]byte
-		// cyberPolicyRecorded 保证同一 ExecuteStream 调用内只对 cyber_policy 计数一次
-		// （response 端常见会先发 type=error，紧接着 type=response.failed）。
-		var cyberPolicyRecorded bool
-		for scanner.Scan() {
-			line := applyCodexIdentityConfuseResponsePayload(scanner.Bytes(), identityState)
+		sawOutput := false
+		target := cliproxyexecutor.ResponseFormatOrSource(opts)
+		for {
+			item, ok := next()
+			if !ok {
+				break
+			}
+			if item.err != nil {
+				helps.RecordAPIResponseError(ctx, e.cfg, item.err)
+				fail(item.err)
+				return
+			}
+			line := item.line
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
-			translatedLine := bytes.Clone(line)
-			terminalSuccess := false
-
-			if bytes.HasPrefix(line, dataTag) {
-				data := bytes.TrimSpace(line[5:])
-				data = helps.RestoreCodexMultiAgentV2Response(data, optimizeMultiAgentV2)
-				translatedLine = append([]byte("data: "), data...)
-				eventType := gjson.GetBytes(data, "type").String()
-				// fork: cyber_policy 侧信道告警。先于 terminal err 检测，确保即使该事件随后
-				// 被当作 terminal error 提前 return，也能记录 cyber_policy 计数（authManager 写回
-				// CyberPolicyFlagCount / LastCyberPolicyAt）。
-				if (eventType == "error" || eventType == "response.failed") &&
-					!cyberPolicyRecorded && cyberPolicyHitFromData(data, eventType) {
-					cyberPolicyRecorded = true
-					e.recordCyberPolicy(ctx, auth, req.Model)
+			data, isData := bytes.CutPrefix(line, []byte("data:"))
+			done := false
+			if isData {
+				data = bytes.TrimSpace(data)
+				reporter.ObserveContentEvent(data)
+				if terminal, _, failed := codexTerminalFailureErrWithCooling(data, e.modelLevelCooling()); failed {
+					e.observeOrdinaryPolicyRefusal(ctx, auth, req.Model, data)
+					fail(terminal)
+					return
 				}
-				if streamErr, terminalBody, ok := codexTerminalFailureErr(data); ok {
-					if errClearReplay := clearCodexReasoningReplayOnInvalidSignature(ctx, replayScope, streamErr.StatusCode(), terminalBody); errClearReplay != nil {
-						helps.RecordAPIResponseError(ctx, e.cfg, errClearReplay)
-						reporter.PublishFailure(ctx, errClearReplay)
-						select {
-						case out <- cliproxyexecutor.StreamChunk{Err: errClearReplay}:
-						case <-ctx.Done():
-						}
+				reporter.ObserveResponseModel(data)
+				event := helps.CodexResponseEventType(data)
+				observeCodexTokenEvent(reporter, data)
+				sawOutput = sawOutput || helps.HasMeaningfulCodexOutputDelta(data)
+				if event == "response.output_item.done" {
+					collectCodexOutputItemDone(data, items, &fallback)
+				}
+				done = event == "response.completed" || event == "response.done" || event == "response.incomplete"
+				if done {
+					if helps.IsCodexTerminalEmptyIncomplete(data, len(items)+len(fallback), sawOutput) {
+						fail(newCodexEmptyIncompleteStreamError())
 						return
 					}
-					helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
-					reporter.PublishFailure(ctx, streamErr)
-					select {
-					case out <- cliproxyexecutor.StreamChunk{Err: streamErr}:
-					case <-ctx.Done():
+					data = patchCodexCompletedOutput(data, items, fallback)
+					line = append([]byte("data: "), data...)
+					if usage, ok := helps.ParseCodexUsageWithOutputItems(data, items, fallback); ok {
+						reporter.Publish(ctx, usage)
+					} else {
+						reporter.EnsurePublished(ctx)
 					}
-					return
-				}
-				switch eventType {
-				case "response.output_item.done":
-					collectCodexOutputItemDone(data, outputItemsByIndex, &outputItemsFallback)
-				case "response.completed", "response.incomplete":
-					terminalSuccess = true
-					if detail, ok := helps.ParseCodexUsage(data); ok {
-						reporter.Publish(ctx, detail)
-					}
-					publishCodexImageToolUsage(ctx, reporter, body, data)
-					data = patchCodexCompletedOutput(data, outputItemsByIndex, outputItemsFallback)
-					if eventType == "response.completed" {
-						cacheCodexReasoningReplayFromCompleted(replayScope, data)
-					}
-					translatedLine = append([]byte("data: "), data...)
+					publishCodexImageToolUsageWithOutputItems(ctx, reporter, body, data, items, fallback)
 				}
 			}
+			for _, chunk := range sdktranslator.TranslateStream(ctx, sdktranslator.FromString("codex"), target, req.Model, opts.OriginalRequest, body, line, &param) {
+				if len(chunk) != 0 && !send(cliproxyexecutor.StreamChunk{Payload: chunk}) {
+					return
+				}
+			}
+			if done {
+				return
+			}
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		fail(newCodexIncompleteStreamError())
+	}()
+	return &cliproxyexecutor.StreamResult{Headers: resp.Header.Clone(), Chunks: out}, nil
+}
 
-			translatedLine = applyCodexIdentityExposeResponsePayload(translatedLine, identityState)
-			chunks := helps.TranslateStreamWithClaudeInputTokens(ctx, to, responseFormat, req.Model, originalPayload, body, translatedLine, &param, claudeInputTokens)
-			for i := range chunks {
-				select {
-				case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
-				case <-ctx.Done():
-					return
-				}
-			}
-			if terminalSuccess {
+type ordinaryCodexScannedLine struct {
+	line []byte
+	err  error
+}
+
+func startOrdinaryCodexScanner(ctx context.Context, body io.ReadCloser) <-chan ordinaryCodexScannedLine {
+	output := make(chan ordinaryCodexScannedLine)
+	go func() {
+		defer close(output)
+		stop := context.AfterFunc(ctx, func() { _ = body.Close() })
+		defer stop()
+		scan := helps.NewCodexSSEScanner(ctx, body, 16<<20)
+		for scan.Scan() {
+			select {
+			case <-ctx.Done():
 				return
+			case output <- ordinaryCodexScannedLine{line: bytes.Clone(scan.Bytes())}:
 			}
 		}
-		if errScan := scanner.Err(); errScan != nil {
-			if ctx.Err() != nil {
-				return
+		if err := scan.Err(); err != nil {
+			select {
+			case <-ctx.Done():
+			case output <- ordinaryCodexScannedLine{err: err}:
 			}
-			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
-		}
-		streamErr := newCodexIncompleteStreamError()
-		helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
-		reporter.PublishFailure(ctx, streamErr)
-		select {
-		case out <- cliproxyexecutor.StreamChunk{Err: streamErr}:
-		case <-ctx.Done():
 		}
 	}()
-	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
+	return output
+}
+
+func bufferOrdinaryCodexBootstrap(ctx context.Context, in <-chan ordinaryCodexScannedLine, budget time.Duration, modelLevelCooling bool, observeFailure func([]byte)) ([][]byte, error) {
+	var lines [][]byte
+	var timer *time.Timer
+	var deadline <-chan time.Time
+	if budget > 0 {
+		timer = time.NewTimer(budget)
+		defer timer.Stop()
+		deadline = timer.C
+	}
+	bytesRead := 0
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-deadline:
+			return lines, nil
+		case batch, ok := <-in:
+			if !ok {
+				return nil, newCodexIncompleteStreamError()
+			}
+			if batch.err != nil {
+				return nil, batch.err
+			}
+			if data, ok := bytes.CutPrefix(batch.line, []byte("data:")); ok {
+				data = bytes.TrimSpace(data)
+				if terminal, _, failed := codexTerminalFailureErrWithCooling(data, modelLevelCooling); failed {
+					if observeFailure != nil {
+						observeFailure(data)
+					}
+					return nil, terminal
+				}
+				kind := helps.CodexResponseEventType(data)
+				if kind == "response.completed" || kind == "response.done" || kind == "response.incomplete" ||
+					(kind != "" && !isCodexBootstrapBufferableEvent(kind, data)) {
+					return append(lines, batch.line), nil
+				}
+			}
+			lines = append(lines, batch.line)
+			bytesRead += len(batch.line)
+			if len(lines) >= codexBootstrapMaxBufferedFrames || bytesRead >= codexBootstrapMaxBufferedBytes {
+				return lines, nil
+			}
+		}
+	}
+}
+
+type ordinaryCodexOnceCloser struct {
+	io.ReadCloser
+	once sync.Once
+	err  error
+}
+
+func (c *ordinaryCodexOnceCloser) Close() error {
+	c.once.Do(func() { c.err = c.ReadCloser.Close() })
+	return c.err
 }

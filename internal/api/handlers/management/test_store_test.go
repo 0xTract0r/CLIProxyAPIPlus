@@ -4,7 +4,7 @@ import (
 	"context"
 	"sync"
 
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
 type memoryAuthStore struct {
@@ -47,3 +47,8 @@ func (s *memoryAuthStore) Delete(_ context.Context, id string) error {
 }
 
 func (s *memoryAuthStore) SetBaseDir(string) {}
+
+// The test store has no independent durable backing to update on upload.
+func (*memoryAuthStore) PersistAuthUpload(_ context.Context, _ string, _ []byte, install func(func() error) error) error {
+	return install(func() error { return nil })
+}

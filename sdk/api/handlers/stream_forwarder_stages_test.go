@@ -10,8 +10,8 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 )
 
 type stageBarrierFlusher struct {
@@ -94,6 +94,8 @@ func TestForwardStreamStagesWriteFlushAndCancel(t *testing.T) {
 				if recorder.Body.String() != "terminal" || v.Write.Count != 1 || v.Flush.Count != 1 {
 					t.Fatal("terminal write/flush changed")
 				}
+			} else if !v.Liveness.DownstreamCanceled || v.Write.Count != 0 || v.Flush.Count != 0 {
+				t.Fatalf("downstream cancellation stages: %+v", v)
 			}
 		})
 	}
@@ -116,4 +118,63 @@ func TestForwardStreamClosedErrorsSleepsUntilData(t *testing.T) {
 		close(data)
 		<-done
 	})
+}
+
+func TestForwardStreamFinalizesOnceAndCountsFailedFlush(t *testing.T) {
+	terminalErr := errors.New("upstream failed")
+	flushErr := errors.New("downstream closed")
+	for _, test := range []struct {
+		name                 string
+		terminalChunk        bool
+		closeErr             error
+		flushErr             error
+		wantCancel           error
+		wantBody             string
+		wantTerminalAttempts uint64
+	}{
+		{name: "clean close", wantBody: "done"},
+		{name: "terminal chunk", terminalChunk: true, wantBody: "chunk"},
+		{name: "close validation failure", closeErr: terminalErr, wantCancel: terminalErr, wantBody: "error", wantTerminalAttempts: 1},
+		{name: "failed terminal flush", closeErr: terminalErr, flushErr: flushErr, wantCancel: flushErr, wantBody: "error", wantTerminalAttempts: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest("POST", "/stream", nil)
+			ctx, stages := helps.BeginCodexStreamStages(c.Request.Context(), c)
+			helps.StartCodexMainStream(ctx, time.Now(), nil)
+			data := make(chan []byte, 1)
+			if test.terminalChunk {
+				data <- []byte("chunk")
+			}
+			close(data)
+			zero := time.Duration(0)
+			var seen []error
+			var flushes int
+			(&BaseAPIHandler{}).ForwardStream(c, recorder, func(err error) { seen = append(seen, err) }, data, nil, StreamForwardOptions{
+				KeepAliveInterval: &zero,
+				WriteChunk:        func(chunk []byte) { _, _ = c.Writer.Write(chunk) },
+				ChunkDone:         func() bool { return test.terminalChunk },
+				CloseError: func() *interfaces.ErrorMessage {
+					if test.closeErr == nil {
+						return nil
+					}
+					return &interfaces.ErrorMessage{Error: test.closeErr}
+				},
+				WriteTerminalError: func(*interfaces.ErrorMessage) { _, _ = c.Writer.WriteString("error") },
+				WriteDone:          func() { _, _ = c.Writer.WriteString("done") },
+				Flush:              func() error { flushes++; return test.flushErr },
+			})
+			snapshot := stages.Snapshot()
+			if len(seen) != 1 || !errors.Is(seen[0], test.wantCancel) {
+				t.Fatalf("unexpected final outcome: %v", seen)
+			}
+			if recorder.Body.String() != test.wantBody || flushes != 1 || snapshot.Write.Count != 1 || snapshot.Flush.Count != 1 {
+				t.Fatalf("body %q, flushes %d, stages %+v", recorder.Body.String(), flushes, snapshot)
+			}
+			if snapshot.Liveness.TerminalErrorAttempts != test.wantTerminalAttempts || snapshot.Liveness.DownstreamCanceled != (test.flushErr != nil) {
+				t.Fatalf("liveness %+v", snapshot.Liveness)
+			}
+		})
+	}
 }

@@ -1,41 +1,47 @@
 package auth
 
-import "context"
+import (
+	"context"
+	"errors"
+)
 
-type skipPersistContextKey struct{}
-type deferAPIKeyModelAliasRebuildContextKey struct{}
-type refreshResultWriteContextKey struct{}
+// ErrCredentialFileRemoved identifies a file that disappeared before an explicit edit.
+var ErrCredentialFileRemoved = errors.New("credential file no longer exists")
 
-// WithRefreshResultWrite marks an Update whose token-owned fields come straight
-// from a successful upstream refresh. Such a write carries the newest token the
-// provider issued (a rotation has already invalidated the previous refresh
-// token upstream), so the stale write-back guard must not roll it back based on
-// local timestamps, which become untrustworthy after a host clock jump.
-// Concurrent same-token refreshes are coalesced by the provider singleflight and
-// a refresh with an already rotated token fails upstream, so neither reaches
-// this write. Only the refresh success paths may set this marker.
-func WithRefreshResultWrite(ctx context.Context) context.Context {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	return context.WithValue(ctx, refreshResultWriteContextKey{}, true)
-}
+type checkedStoreWriteKey struct{}
 
-// withoutRefreshResultWrite clears the refresh-result marker so it only applies
-// to the Update that carries the refresh result, never to nested writes made by
-// lifecycle hooks (e.g. plugin model registration calling Update again).
-func withoutRefreshResultWrite(ctx context.Context) context.Context {
-	if !isRefreshResultWrite(ctx) {
-		return ctx
-	}
-	return context.WithValue(ctx, refreshResultWriteContextKey{}, false)
-}
-
-func isRefreshResultWrite(ctx context.Context) bool {
+// IsExplicitCredentialEdit lets file stores distinguish editing an existing
+// credential from registration, including during a delayed watcher event.
+func IsExplicitCredentialEdit(ctx context.Context) bool {
 	if ctx == nil {
 		return false
 	}
-	enabled, ok := ctx.Value(refreshResultWriteContextKey{}).(bool)
+	checked, _ := ctx.Value(checkedStoreWriteKey{}).(bool)
+	return checked
+}
+
+type skipPersistContextKey struct{}
+type deferAPIKeyModelAliasRebuildContextKey struct{}
+type authCreationIntentContextKey struct{}
+
+// WithAuthCreationIntent returns a derived context that allows a token store to
+// create a missing disabled credential. It is intended only for the immediate
+// persistence performed by login and credential migration flows.
+func WithAuthCreationIntent(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, authCreationIntentContextKey{}, true)
+}
+
+// HasAuthCreationIntent reports whether the current save is part of a login or
+// credential migration flow that may intentionally create a disabled record.
+func HasAuthCreationIntent(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	v := ctx.Value(authCreationIntentContextKey{})
+	enabled, ok := v.(bool)
 	return ok && enabled
 }
 
@@ -47,6 +53,18 @@ func WithSkipPersist(ctx context.Context) context.Context {
 		ctx = context.Background()
 	}
 	return context.WithValue(ctx, skipPersistContextKey{}, true)
+}
+
+// WithoutSkipPersist returns a derived context that re-enables persistence even
+// when the parent context was marked with WithSkipPersist.
+func WithoutSkipPersist(ctx context.Context) context.Context {
+	if ctx == nil {
+		return context.Background()
+	}
+	if !shouldSkipPersist(ctx) {
+		return ctx
+	}
+	return context.WithValue(ctx, skipPersistContextKey{}, false)
 }
 
 func shouldSkipPersist(ctx context.Context) bool {

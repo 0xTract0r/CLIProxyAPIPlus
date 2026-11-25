@@ -10,7 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	homekv "github.com/router-for-me/CLIProxyAPI/v7/internal/home"
+	homekv "github.com/router-for-me/CLIProxyAPI/v8/internal/home"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -111,6 +111,9 @@ func purgeExpiredCaches() {
 	purgeExpiredCodexReasoningReplayCache(now)
 	purgeExpiredXAIReasoningReplayCache(now)
 	purgeExpiredAntigravityReasoningReplayCache(now)
+	purgeExpiredKimiThinkingReplayCache(now)
+	purgeExpiredClaudeThinkingReplayCache(now)
+	purgeExpiredClaudeWebSearchResultCache(now)
 }
 
 // CacheSignature stores a thinking signature for a given model group and text.
@@ -169,9 +172,6 @@ func GetCachedSignatureRequired(ctx context.Context, modelName, text string) (st
 	groupKey := GetModelGroup(modelName)
 
 	if text == "" {
-		if groupKey == "gemini" {
-			return "skip_thought_signature_validator", nil
-		}
 		return "", nil
 	}
 
@@ -185,9 +185,6 @@ func GetCachedSignatureRequired(ctx context.Context, modelName, text string) (st
 			return "", errGet
 		}
 		if !found {
-			if groupKey == "gemini" {
-				return "skip_thought_signature_validator", nil
-			}
 			return "", nil
 		}
 		if _, errExpire := client.KVExpire(ctx, key, SignatureCacheTTL); errExpire != nil {
@@ -198,9 +195,6 @@ func GetCachedSignatureRequired(ctx context.Context, modelName, text string) (st
 
 	val, ok := signatureCache.Load(groupKey)
 	if !ok {
-		if groupKey == "gemini" {
-			return "skip_thought_signature_validator", nil
-		}
 		return "", nil
 	}
 	sc := val.(*groupCache)
@@ -213,17 +207,11 @@ func GetCachedSignatureRequired(ctx context.Context, modelName, text string) (st
 	entry, exists := sc.entries[textHash]
 	if !exists {
 		sc.mu.Unlock()
-		if groupKey == "gemini" {
-			return "skip_thought_signature_validator", nil
-		}
 		return "", nil
 	}
 	if now.Sub(entry.Timestamp) > SignatureCacheTTL {
 		delete(sc.entries, textHash)
 		sc.mu.Unlock()
-		if groupKey == "gemini" {
-			return "skip_thought_signature_validator", nil
-		}
 		return "", nil
 	}
 

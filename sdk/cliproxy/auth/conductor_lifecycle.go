@@ -2,25 +2,19 @@ package auth
 
 import (
 	"context"
+	"fmt"
+	"math"
+	"reflect"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
-	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/copilot"
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	log "github.com/sirupsen/logrus"
 )
 
-// SetRetryConfig updates retry attempts, credential retry limit and cooldown wait interval.
-//
-// fork(harden-account-scheduling-limiter ERR-2): maxRetryCredentials default wiring.
-// yaml cannot distinguish an omitted max-retry-credentials from an explicit 0, so both
-// land here as 0 and now default to internalconfig.DefaultMaxRetryCredentials (2) --
-// bounding the cross-credential failover blast radius of one failed request instead of
-// the legacy "walk every available credential" behavior. A negative value (e.g. -1) is
-// the explicit escape hatch for that legacy unbounded behavior: it is stored as 0, which
-// conductor_execution.go's `maxRetryCredentials > 0` cap check already treats as
-// unbounded. A positive value is used as-is. Negative values must reach this call
-// un-clamped -- see the matching fork notes in internal/config/parse.go and
-// internal/config/config_load.go.
+// SetRetryConfig updates additional credential retry rounds, the per-round credential limit, and the cooldown wait interval.
 func (m *Manager) SetRetryConfig(retry int, maxRetryInterval time.Duration, maxRetryCredentials int) {
 	if m == nil {
 		return
@@ -28,11 +22,8 @@ func (m *Manager) SetRetryConfig(retry int, maxRetryInterval time.Duration, maxR
 	if retry < 0 {
 		retry = 0
 	}
-	switch {
-	case maxRetryCredentials == 0:
+	if maxRetryCredentials <= 0 {
 		maxRetryCredentials = internalconfig.DefaultMaxRetryCredentials
-	case maxRetryCredentials < 0:
-		maxRetryCredentials = 0
 	}
 	if maxRetryInterval < 0 {
 		maxRetryInterval = 0
@@ -42,28 +33,127 @@ func (m *Manager) SetRetryConfig(retry int, maxRetryInterval time.Duration, maxR
 	m.maxRetryInterval.Store(maxRetryInterval.Nanoseconds())
 }
 
+// unwrapProviderExecutor follows ExecutorUnwrapper chains to the innermost
+// executor. A nil result or a cycle returns the last non-nil executor.
+// A visited bound prevents unbounded traversal on malformed chains.
+func unwrapProviderExecutor(executor ProviderExecutor) ProviderExecutor {
+	visited := make(map[ProviderExecutor]struct{})
+	for executor != nil {
+		// Only comparable values can be hashed; non-comparable innermost
+		// executors are returned directly to avoid a panic.
+		if !reflect.ValueOf(executor).Comparable() {
+			return executor
+		}
+		if _, seen := visited[executor]; seen {
+			return executor
+		}
+		visited[executor] = struct{}{}
+		unwrapper, ok := executor.(ExecutorUnwrapper)
+		if !ok || unwrapper == nil {
+			return executor
+		}
+		inner := unwrapper.Unwrap()
+		if inner == nil || sameExecutor(inner, executor) {
+			return executor
+		}
+		executor = inner
+	}
+	return nil
+}
+
+// sameExecutor reports whether two executors are the same published or owned
+// instance without panicking on non-comparable values.
+func sameExecutor(a, b ProviderExecutor) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	if !reflect.ValueOf(a).Comparable() || !reflect.ValueOf(b).Comparable() {
+		return false
+	}
+	return a == b
+}
+
+// ExecutorRevision returns the monotonic revision for a provider's executor
+// registration. Each RegisterExecutor and UnregisterExecutor advances it.
+func (m *Manager) ExecutorRevision(provider string) uint64 {
+	if m == nil {
+		return 0
+	}
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	if provider == "" {
+		return 0
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.executorRevisions[provider]
+}
+
 // RegisterExecutor registers a provider executor with the manager.
 func (m *Manager) RegisterExecutor(executor ProviderExecutor) {
+	m.RegisterExecutorWithRevision(executor)
+}
+
+// RegisterExecutorWithRevision registers a provider executor and returns the
+// provider's executor revision captured under the same lock as publication,
+// so callers can correlate the revision with this exact registration.
+func (m *Manager) RegisterExecutorWithRevision(executor ProviderExecutor) uint64 {
 	if executor == nil {
-		return
+		return 0
 	}
 	provider := strings.TrimSpace(executor.Identifier())
 	if provider == "" {
-		return
+		return 0
 	}
 
 	var replaced ProviderExecutor
+	var toReschedule []string
+	var revision uint64
 	m.mu.Lock()
 	replaced = m.executors[provider]
 	m.executors[provider] = executor
+	if m.executorRevisions == nil {
+		m.executorRevisions = make(map[string]uint64)
+	}
+	m.executorRevisions[provider]++
+	revision = m.executorRevisions[provider]
+	for id, auth := range m.auths {
+		if auth != nil && strings.EqualFold(executorKeyFromAuth(auth), provider) {
+			toReschedule = append(toReschedule, id)
+		}
+	}
 	m.mu.Unlock()
 
-	if replaced == nil || replaced == executor {
-		return
+	for _, id := range toReschedule {
+		m.queueRefreshReschedule(id)
+	}
+
+	if replaced == nil || sameExecutor(replaced, executor) {
+		return revision
+	}
+	replacedOwned := unwrapProviderExecutor(replaced)
+	executorOwned := unwrapProviderExecutor(executor)
+	// Rewrapping the identical owned executor must not close its sessions.
+	if replacedOwned != nil && sameExecutor(replacedOwned, executorOwned) {
+		return revision
+	}
+	if replacedOwned != nil && executorOwned != nil && !sameExecutor(replacedOwned, executorOwned) {
+		if sharer, ok := replacedOwned.(ExecutionSessionSharer); ok && sharer != nil && sharer.SharesExecutionSessionsWith(executorOwned) {
+			return revision
+		}
+	}
+	if sharer, ok := replaced.(ExecutionSessionSharer); ok && sharer != nil && sharer.SharesExecutionSessionsWith(executor) {
+		return revision
 	}
 	if closer, ok := replaced.(ExecutionSessionCloser); ok && closer != nil {
 		closer.CloseExecutionSession(CloseAllExecutionSessionsID)
+		return revision
 	}
+	if replacedOwned != nil && !sameExecutor(replacedOwned, replaced) {
+		if closer, ok := replacedOwned.(ExecutionSessionCloser); ok && closer != nil {
+			closer.CloseExecutionSession(CloseAllExecutionSessionsID)
+		}
+	}
+	return revision
 }
 
 // UnregisterExecutor removes the executor associated with the provider key.
@@ -74,6 +164,10 @@ func (m *Manager) UnregisterExecutor(provider string) {
 	}
 	m.mu.Lock()
 	delete(m.executors, provider)
+	if m.executorRevisions == nil {
+		m.executorRevisions = make(map[string]uint64)
+	}
+	m.executorRevisions[provider]++
 	m.mu.Unlock()
 }
 
@@ -82,139 +176,798 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	if auth == nil {
 		return nil, nil
 	}
-	// Fork: hydrate runtime-only fields (per-account proxy_url, managed/custom
-	// headers) from metadata before the scheduler and executors observe the auth.
-	hydrateRuntimeFields(auth)
+	NormalizeCredentialMetadata(auth.Metadata)
+	if errWeight := ValidateAuthWeight(auth); errWeight != nil {
+		return nil, fmt.Errorf("register auth: %w", errWeight)
+	}
 	if auth.ID == "" {
 		auth.ID = uuid.NewString()
 	}
+	finishSource, errSource := m.beginFileRegistration(auth)
+	if errSource != nil {
+		return nil, errSource
+	}
+	defer finishSource()
+	releaseMutation, errMutation := m.lockAuthMutationContext(ctx, auth.ID)
+	if errMutation != nil {
+		return nil, errMutation
+	}
+	defer releaseMutation()
+	if auth.HasFileSnapshot() && !auth.fileSnapshotMatchesContext(ctx) {
+		return nil, ErrStaleRegistrationSnapshot
+	}
 	now := time.Now()
-	clearedCooldown := false
-	if m.cooldownDisabledForAuth(auth) || auth.Disabled || auth.Status == StatusDisabled {
-		clearedCooldown = clearCooldownStateForAuth(auth, now)
+	if auth.Generation == 0 {
+		auth.Generation = 1
+	}
+	if auth.CreatedAt.IsZero() {
+		auth.CreatedAt = now
+	}
+	if auth.AdoptedAt.IsZero() {
+		auth.AdoptedAt = now
+	}
+	if auth.AdoptedGrantHash == "" {
+		auth.AdoptedGrantHash = AuthGrantFingerprint(auth)
+	}
+	auth.UpdatedAt = now
+	cooldownStateChanged := normalizeModelStates(auth)
+	seedInitialForceCooldownDeadlines(auth)
+	if auth.Disabled || auth.Status == StatusDisabled {
+		cooldownStateChanged = clearCooldownStateForAuth(auth, now) || cooldownStateChanged
+	} else if m.cooldownDisabledForAuth(auth) {
+		cooldownStateChanged = clearDisabledCooldownStateForAuth(auth, now) || cooldownStateChanged
 	}
 	auth.EnsureIndex()
-	authClone := auth.Clone()
-	m.pacingMu.Lock()
 	m.mu.Lock()
-	preserveAccountLimitPolicy(authClone, m.auths[auth.ID])
-	auth = authClone.Clone()
+	if m.authEpochs == nil {
+		m.authEpochs = make(map[string]uint64)
+	}
+	if existing, exists := m.auths[auth.ID]; exists && existing != nil && existing.RegistrationEpoch > m.authEpochs[auth.ID] {
+		m.authEpochs[auth.ID] = existing.RegistrationEpoch
+	}
+	if auth.RegistrationEpoch > m.authEpochs[auth.ID] {
+		m.authEpochs[auth.ID] = auth.RegistrationEpoch
+	}
+	m.authEpochs[auth.ID]++
+	if auth.RegistrationEpoch != 0 {
+		auth.CopilotCatalog = nil
+	}
+	auth.RegistrationEpoch = m.authEpochs[auth.ID]
+	if existing, exists := m.auths[auth.ID]; exists && existing != nil {
+		auth.CredentialVersion = max(auth.CredentialVersion, existing.CredentialVersion) + 1
+	} else if auth.CredentialVersion == 0 {
+		auth.CredentialVersion = 1
+	}
+	auth.Generation = 1
+	aliasTableBeforeSave := m.oauthModelAlias.Load()
+	// Serialize this credential, but release the manager lock during store I/O.
+	// Persist failures stay non-fatal, but must not be silent: a restart would
+	// lose the credential that only exists in memory.
+	if errPersist := m.persistLocked(ctx, auth); errPersist != nil {
+		log.WithFields(log.Fields{"auth_id": auth.ID, "credential": auth.ID, "provider": auth.Provider}).Warnf("failed to persist registered auth %s (%s): %v", auth.Provider, auth.ID, errPersist)
+	}
+	if m.authEpochs[auth.ID] != auth.RegistrationEpoch {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("auth %s changed registration during persistence", auth.ID)
+	}
+	if m.oauthModelAlias.Load() != aliasTableBeforeSave {
+		cooldownStateChanged = m.migrateAuthAliasModelStatesLocked(auth, nil, now, false) || cooldownStateChanged
+		if len(auth.ModelStates) > 0 {
+			updateAggregatedAvailability(auth, now)
+		}
+	}
+	releasePublication, eligible := authPublicationFence(ctx).Begin()
+	if !eligible {
+		m.mu.Unlock()
+		return nil, ErrAuthPublicationOutOfScope
+	}
+	auth.ClearFileSnapshot()
+	authClone := auth.Clone()
 	m.auths[auth.ID] = authClone
+	releasePublication()
+	m.notifyAuthChangeLocked(auth.ID)
+	// Snapshot before unlocking: MarkResult mutates the published auth in place.
+	var schedulerSnapshot *Auth
+	if m.scheduler != nil {
+		schedulerSnapshot = authClone.Clone()
+	}
 	m.mu.Unlock()
-	m.refreshWarmupPacingLocked()
-	m.pacingMu.Unlock()
+	releaseMutation()
+	finishSource()
 	if !shouldDeferAPIKeyModelAliasRebuild(ctx) {
 		m.rebuildAPIKeyModelAliasFromRuntimeConfig()
 	}
 	if m.scheduler != nil {
-		m.scheduler.upsertAuth(authClone)
+		m.scheduler.upsertAuth(schedulerSnapshot)
 	}
+	m.structuralEpoch.Add(1)
 	m.queueRefreshReschedule(auth.ID)
-	_ = m.persist(ctx, auth)
 	m.hook.OnAuthRegistered(ctx, auth.Clone())
-	if clearedCooldown {
-		m.persistCooldownStates(ctx)
+	if cooldownStateChanged {
+		m.persistCooldownStates(context.Background())
 	}
 	return auth.Clone(), nil
 }
 
+type updateAuthMode int
+
+const (
+	updateModeReplace updateAuthMode = iota
+	updateModeRefresh
+	updateModePrepare
+)
+
+// UpdatePreparedAuth atomically merges request preparation results into the latest runtime auth
+// under the manager lock, preserving concurrent modifications without modifying refresh lifecycle fields.
+func (m *Manager) UpdatePreparedAuth(ctx context.Context, base, updated *Auth) (*Auth, error) {
+	return m.updateInternal(ctx, base, updated, updateModePrepare)
+}
+
+func (m *Manager) updatePreparedAuthStrict(ctx context.Context, base, updated *Auth) (*Auth, bool, bool, error) {
+	return m.updateInternalWithStatus(ctx, base, updated, updateModePrepare, true)
+}
+
+// UpdateRefreshedAuth atomically merges refresh results into the latest runtime auth
+// under the manager lock, preserving concurrent modifications (proxy_url, notes, weights, etc.).
+func (m *Manager) UpdateRefreshedAuth(ctx context.Context, base, updated *Auth) (*Auth, error) {
+	return m.updateInternal(ctx, base, updated, updateModeRefresh)
+}
+
+func (m *Manager) updateRefreshedAuthWithStatus(ctx context.Context, base, updated *Auth) (*Auth, bool, bool, error) {
+	return m.updateInternalWithStatus(ctx, base, updated, updateModeRefresh, false)
+}
+
 // Update replaces an existing auth entry and notifies hooks.
 func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
-	if auth == nil || auth.ID == "" {
-		return nil, nil
+	return m.updateInternal(ctx, nil, auth, updateModeReplace)
+}
+
+type storeWriteError struct{ cause error }
+
+func (e *storeWriteError) Error() string { return "credential changes could not be saved" }
+func (e *storeWriteError) Unwrap() error { return e.cause }
+
+// ModifyPersisted applies an explicit edit. If the configured store rejects the
+// write, it returns that error and leaves the previous registration published.
+// Runtime-only entries retain their existing storage policy.
+func (m *Manager) ModifyPersisted(ctx context.Context, id string, expectedEpoch uint64, edit func(*Auth) error) (*Auth, bool, error) {
+	return m.modify(ctx, id, expectedEpoch, edit, true)
+}
+
+// Modify loads the latest auth for id while holding the per-auth mutation gate,
+// applies edit to a clone of that auth, and commits the result through the
+// standard persistence and publication path. It returns (nil, false, nil) if
+// the auth is not present when the gate is acquired.
+func (m *Manager) Modify(ctx context.Context, id string, expectedEpoch uint64, edit func(*Auth) error) (*Auth, bool, error) {
+	return m.modify(ctx, id, expectedEpoch, edit, false)
+}
+
+func (m *Manager) modify(ctx context.Context, id string, expectedEpoch uint64, edit func(*Auth) error, checkWrite bool) (*Auth, bool, error) {
+	id = strings.TrimSpace(id)
+	if m == nil || id == "" || edit == nil {
+		return nil, false, nil
 	}
-	// Fork: hydrate runtime-only fields (per-account proxy_url, managed/custom
-	// headers) from metadata before merging into the live entry.
-	hydrateRuntimeFields(auth)
-	m.pacingMu.Lock()
+	releaseMutation, errMutation := m.lockAuthMutationContext(ctx, id)
+	if errMutation != nil {
+		return nil, false, errMutation
+	}
+	defer releaseMutation()
+
+	m.mu.RLock()
+	existing, ok := m.auths[id]
+	var current *Auth
+	var currentEpoch uint64
+	if ok && existing != nil {
+		current = existing.Clone()
+		currentEpoch = existing.RegistrationEpoch
+		if m.authEpochs != nil && m.authEpochs[id] > currentEpoch {
+			currentEpoch = m.authEpochs[id]
+		}
+	}
+	m.mu.RUnlock()
+	if current == nil {
+		return nil, false, nil
+	}
+	if expectedEpoch != 0 && expectedEpoch > currentEpoch && checkWrite {
+		return nil, false, fmt.Errorf("registration epoch %d is newer than current epoch %d", expectedEpoch, currentEpoch)
+	}
+	if expectedEpoch != 0 && expectedEpoch < currentEpoch {
+		return nil, false, fmt.Errorf("update auth %s: stale registration epoch %d < %d", id, expectedEpoch, currentEpoch)
+	}
+	if errEdit := edit(current); errEdit != nil {
+		return nil, false, errEdit
+	}
+	if expectedEpoch != 0 {
+		current.RegistrationEpoch = expectedEpoch
+	}
+	writeCtx := ctx
+	if checkWrite {
+		writeCtx = context.WithValue(WithoutSkipPersist(ctx), checkedStoreWriteKey{}, true)
+	}
+	committedAuth, didCommit, persistCooldown, errUpdate := m.updateInternalLocked(writeCtx, nil, current, updateModeReplace)
+	releaseMutation()
+	if errUpdate == nil && didCommit && committedAuth != nil {
+		m.finishAuthUpdate(ctx, committedAuth, persistCooldown)
+	}
+	return committedAuth, errUpdate == nil && didCommit && committedAuth != nil, errUpdate
+}
+
+func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode updateAuthMode) (*Auth, error) {
+	committedAuth, _, _, err := m.updateInternalWithStatus(ctx, base, auth, mode, false)
+	return committedAuth, err
+}
+
+func (m *Manager) updateInternalWithStatus(ctx context.Context, base, auth *Auth, mode updateAuthMode, strictPrepareVersion bool) (*Auth, bool, bool, error) {
+	if auth == nil || auth.ID == "" {
+		return nil, false, false, nil
+	}
+	releaseMutation, errMutation := m.lockAuthMutationContext(ctx, auth.ID)
+	if errMutation != nil {
+		return nil, false, false, errMutation
+	}
+	committedAuth, didCommit, baseSuperseded, persistCooldown, err := m.updateInternalLockedWithOptions(ctx, base, auth, mode, strictPrepareVersion)
+	releaseMutation()
+	if err == nil && didCommit && committedAuth != nil {
+		m.finishAuthUpdate(ctx, committedAuth, persistCooldown)
+	}
+	return committedAuth, didCommit, baseSuperseded, err
+}
+
+// finishAuthUpdate runs post-commit side effects after the per-auth mutation
+// gate has been released, preserving the original update ordering in which
+// hooks and scheduler updates could re-enter manager operations.
+func (m *Manager) finishAuthUpdate(ctx context.Context, committed *Auth, persistCooldown bool) {
+	if committed == nil {
+		return
+	}
+	if !shouldDeferAPIKeyModelAliasRebuild(ctx) {
+		m.rebuildAPIKeyModelAliasFromRuntimeConfig()
+	}
+	if m.scheduler != nil {
+		m.scheduler.upsertAuth(committed.Clone())
+	}
+	m.structuralEpoch.Add(1)
+	m.queueRefreshReschedule(committed.ID)
+	m.hook.OnAuthUpdated(ctx, committed.Clone())
+	if persistCooldown {
+		m.persistCooldownStates(context.Background())
+	}
+}
+
+// updateInternalLocked assumes the caller already holds the per-auth
+// mutation lock. It only commits manager state; callers run
+// finishAuthUpdate after releasing the gate. persistCooldownStates is also
+// deferred by callers because it may re-enter manager operations.
+// updateInternalLocked commits an update while the caller holds the gate.
+// The second return value reports whether this call actually committed new
+// state (versus returning the current snapshot for a discarded stale
+// update); only real commits may run post-commit side effects.
+func (m *Manager) updateInternalLocked(ctx context.Context, base, auth *Auth, mode updateAuthMode) (committedAuth *Auth, committed bool, persistCooldown bool, err error) {
+	committedAuth, committed, _, persistCooldown, err = m.updateInternalLockedWithOptions(ctx, base, auth, mode, false)
+	return committedAuth, committed, persistCooldown, err
+}
+
+func (m *Manager) updateInternalLockedWithOptions(ctx context.Context, base, auth *Auth, mode updateAuthMode, strictPrepareVersion bool) (committedAuth *Auth, committed bool, baseSuperseded bool, persistCooldown bool, err error) {
+	if auth == nil || auth.ID == "" {
+		return nil, false, false, false, nil
+	}
+	NormalizeCredentialMetadata(auth.Metadata)
+	if errWeight := ValidateAuthWeight(auth); errWeight != nil {
+		return nil, false, false, false, fmt.Errorf("update auth: %w", errWeight)
+	}
+	isFileSnapshot := mode == updateModeReplace && auth.HasFileSnapshot()
+	if isFileSnapshot {
+		m.mu.RLock()
+		existing, ok := m.auths[auth.ID]
+		m.mu.RUnlock()
+		if !ok || existing == nil {
+			return nil, false, false, false, nil
+		}
+		// Validate file snapshot freshness under the per-auth mutation gate
+		// without holding m.mu across filesystem I/O.
+		if !auth.fileSnapshotMatchesContext(ctx) {
+			m.mu.RLock()
+			current := m.auths[auth.ID].Clone()
+			m.mu.RUnlock()
+			return current, false, false, false, nil
+		}
+	}
 	m.mu.Lock()
 	existing, ok := m.auths[auth.ID]
 	if !ok || existing == nil {
 		m.mu.Unlock()
-		m.pacingMu.Unlock()
-		return nil, nil
+		return nil, false, false, false, nil
+	}
+	if m.authEpochs == nil {
+		m.authEpochs = make(map[string]uint64)
+	}
+	if existing.RegistrationEpoch > m.authEpochs[auth.ID] {
+		m.authEpochs[auth.ID] = existing.RegistrationEpoch
+	}
+	if (mode == updateModeRefresh || mode == updateModePrepare) && base != nil && existing.RegistrationEpoch != base.RegistrationEpoch {
+		m.mu.Unlock()
+		return nil, false, true, false, fmt.Errorf("update auth %s: stale registration epoch %d != %d", auth.ID, base.RegistrationEpoch, existing.RegistrationEpoch)
+	}
+	baseSuperseded = base != nil && (existing.CredentialVersion != base.CredentialVersion || CredentialsChanged(base, existing))
+	// Do not let an in-flight refresh overwrite credentials committed after its snapshot.
+	if mode == updateModeRefresh && baseSuperseded {
+		if auth.CodexRefreshPatch == nil || !auth.CodexRefreshPatch.CanApplyTo(existing.Metadata) {
+			current := existing.Clone()
+			m.mu.Unlock()
+			// Discarded stale refresh: committed=false so callers do not
+			// run finishAuthUpdate for a state this call did not change.
+			return current, false, true, false, nil
+		}
+	}
+	if mode == updateModePrepare && strictPrepareVersion && baseSuperseded {
+		current := existing.Clone()
+		m.mu.Unlock()
+		return current, false, true, false, nil
+	}
+	if mode == updateModeRefresh {
+		merged := MergeRefreshedAuth(base, existing, auth)
+		if merged != nil {
+			if merged.Disabled || merged.Status == StatusDisabled {
+				merged.RefreshFailures = auth.RefreshFailures
+			}
+			auth = merged
+			NormalizeCredentialMetadata(auth.Metadata)
+		}
+	} else if mode == updateModePrepare {
+		merged := MergePreparedAuth(base, existing, auth)
+		if merged != nil {
+			auth = merged
+			NormalizeCredentialMetadata(auth.Metadata)
+		}
+	}
+	if auth.RegistrationEpoch != 0 && auth.RegistrationEpoch < m.authEpochs[auth.ID] {
+		m.mu.Unlock()
+		return nil, false, true, false, fmt.Errorf("update auth %s: stale registration epoch %d < %d", auth.ID, auth.RegistrationEpoch, m.authEpochs[auth.ID])
+	}
+	if mode == updateModeReplace {
+		if paths := changedFilePaths(existing, auth); len(paths) > 0 {
+			finishSource, errSource := m.reserveFilePathsLocked(paths)
+			if errSource != nil {
+				m.mu.Unlock()
+				return nil, false, false, false, errSource
+			}
+			defer finishSource()
+		}
+	}
+	if auth.RegistrationEpoch >= m.authEpochs[auth.ID] {
+		m.authEpochs[auth.ID] = auth.RegistrationEpoch
+	} else if auth.RegistrationEpoch == 0 {
+		auth.RegistrationEpoch = m.authEpochs[auth.ID]
 	}
 	if !auth.indexAssigned && auth.Index == "" {
 		auth.Index = existing.Index
 		auth.indexAssigned = existing.indexAssigned
 	}
+	if isFileSnapshot && auth.CreatedAt.IsZero() {
+		auth.CreatedAt = existing.CreatedAt
+	}
 	auth.Success = existing.Success
 	auth.Failed = existing.Failed
 	auth.recentRequests = existing.recentRequests
-	preserveAccountLimitPolicy(auth, existing)
-	if !existing.Disabled && existing.Status != StatusDisabled && !auth.Disabled && auth.Status != StatusDisabled {
-		if len(auth.ModelStates) == 0 && len(existing.ModelStates) > 0 {
-			auth.ModelStates = existing.ModelStates
+	if existing.CopilotCatalog != nil || auth.CopilotCatalog != nil {
+		// An unversioned file reload or stale clone cannot replace newer discovery.
+		// A different account or upstream must discover its own permissions.
+		switch {
+		case existing.Provider != auth.Provider || auth.Disabled || auth.Status == StatusDisabled ||
+			authMetadataString(existing, "base_url") != authMetadataString(auth, "base_url") ||
+			authMetadataString(existing, "account_id") != authMetadataString(auth, "account_id") ||
+			authRefreshToken(existing) != authRefreshToken(auth):
+			auth.CopilotCatalog = copilot.UnavailableCatalog
+		case auth.CopilotCatalog == nil || auth.Generation < existing.Generation || isFileSnapshot:
+			auth.CopilotCatalog = existing.CopilotCatalog
 		}
 	}
-	// Guard against a stale write-back rolling token state backwards: if a
-	// refresh advanced the stored tokens after the caller cloned this auth,
-	// keep the newer token-owned fields while still applying the caller's
-	// non-token metadata changes. Writes carrying a successful upstream refresh
-	// result skip this guard: the rotated token is authoritative, and local
-	// timestamps on the stored record may be future-dated after a clock jump.
-	if !isRefreshResultWrite(ctx) && preserveNewerTokenOwnedFields(auth, existing) {
-		logEntryWithRequestID(ctx).WithField("auth_id", auth.ID).Warn("auth update carried stale token-owned fields; preserved newer stored token state")
+	if auth.Generation <= existing.Generation {
+		auth.Generation = existing.Generation + 1
+	} else {
+		auth.Generation++
 	}
-	// Guard against a stale write-back silently rolling back the automatic
-	// terminal-auth quarantine lock: a caller that cloned this auth before a
-	// concurrent MarkResult quarantined it would otherwise wholesale-overwrite
-	// the live entry with its unaware zero-value quarantine fields.
-	if preserveQuarantineFieldsOnStaleWriteback(auth, existing) {
-		logEntryWithRequestID(ctx).WithField("auth_id", auth.ID).Warn("auth update carried stale auto-quarantine fields; preserved live quarantine state")
+	existingVersion := existing.CredentialVersion
+	if existingVersion == 0 {
+		existingVersion = 1
 	}
+	credChanged := CredentialsChanged(existing, auth)
+	if credChanged {
+		auth.CredentialVersion = max(auth.CredentialVersion, existingVersion) + 1
+	} else {
+		auth.CredentialVersion = existingVersion
+	}
+	cooldownStateChanged := false
 	now := time.Now()
-	clearedCooldown := false
-	if m.cooldownDisabledForAuth(auth) || auth.Disabled || auth.Status == StatusDisabled {
-		clearedCooldown = clearCooldownStateForAuth(auth, now)
+	if !existing.Disabled && existing.Status != StatusDisabled && !auth.Disabled && auth.Status != StatusDisabled {
+		if isFileSnapshot {
+			auth.ModelStates = existing.ModelStates
+			auth.LastRefreshedAt = existing.LastRefreshedAt
+			if !credChanged {
+				auth.NextRefreshAfter = existing.NextRefreshAfter
+				auth.RefreshFailures = existing.RefreshFailures
+			}
+		} else if len(auth.ModelStates) == 0 && len(existing.ModelStates) > 0 {
+			auth.ModelStates = existing.ModelStates
+		}
+		if isFileSnapshot || (credChanged && mode == updateModeReplace && existing.Quota.Exceeded && existing.Quota.NextRecoverAt.After(now) && !auth.Quota.NextRecoverAt.After(now)) {
+			if (auth.Status == "" || auth.Status == StatusActive) && existing.Status != "" {
+				auth.Status = existing.Status
+			}
+			if auth.StatusMessage == "" {
+				auth.StatusMessage = existing.StatusMessage
+			}
+			auth.Unavailable = existing.Unavailable
+			auth.NextRetryAfter = existing.NextRetryAfter
+			if auth.LastError == nil && existing.LastError != nil {
+				auth.LastError = cloneError(existing.LastError)
+			}
+			observation := mergeQuotaObservation(auth.Quota, existing.Quota)
+			auth.Quota = existing.Quota.Clone()
+			auth.Quota.ObservedAt = observation.ObservedAt
+			auth.Quota.Signals = observation.Signals
+			auth.cooldownRecordedSeq = existing.cooldownRecordedSeq
+			auth.forceCooldownUntil = existing.forceCooldownUntil
+			auth.quotaForceCooldownUntil = existing.quotaForceCooldownUntil
+			auth.credQuotaForceUntil = existing.credQuotaForceUntil
+			auth.credentialRetryAfter = existing.credentialRetryAfter
+			auth.nonAuthCredentialRetryAfter = existing.nonAuthCredentialRetryAfter
+			auth.nonAuthCredentialLastError = cloneError(existing.nonAuthCredentialLastError)
+			auth.nonQuotaCooldownUntil = existing.nonQuotaCooldownUntil
+			auth.forceCooldownSeeded = existing.forceCooldownSeeded
+		}
+		clearedAuthGrantRetry := false
+		if credChanged || mode == updateModeRefresh {
+			applyPreservedRejectedTokens(existing, auth, mode == updateModeRefresh)
+			applyPreservedRenewalState(existing, auth, mode, now)
+			if auth.RejectedAccessToken == "" || authAccessToken(auth) != auth.RejectedAccessToken {
+				auth.RefreshFailures = 0
+				if credChanged && mode != updateModeRefresh && auth.NextRefreshAfter.Equal(existing.NextRefreshAfter) {
+					if authHasUnchangedRejectedRefreshToken(auth) {
+						if exp, ok := auth.AccessTokenExpirationTime(); ok && !exp.IsZero() && exp.After(now) {
+							auth.NextRefreshAfter = exp
+						} else {
+							auth.NextRefreshAfter = time.Time{}
+						}
+					} else {
+						auth.NextRefreshAfter = time.Time{}
+					}
+				}
+				canServeWithAccessToken := !auth.RequiresSignIn || auth.HasValidAccessToken(now)
+				if canServeWithAccessToken {
+					preserveNonAuth := mode == updateModeRefresh ||
+						(credChanged && authRefreshToken(existing) != "" && authRefreshToken(existing) == authRefreshToken(auth))
+					if reconcileAuthGrantCooldownAfterRefresh(auth, existing, preserveNonAuth, now) {
+						clearedAuthGrantRetry = true
+						cooldownStateChanged = true
+					} else if !auth.Quota.NextRecoverAt.After(now) && auth.Unavailable && !auth.NextRetryAfter.After(now) && !auth.credentialRetryAfter.After(now) && !effectiveAuthForceUntil(auth).After(now) {
+						auth.Unavailable = false
+						auth.NextRetryAfter = time.Time{}
+						auth.cooldownRecordedSeq = 0
+						auth.forceCooldownUntil = time.Time{}
+						auth.quotaForceCooldownUntil = time.Time{}
+						auth.credentialRetryAfter = time.Time{}
+						auth.nonAuthCredentialRetryAfter = time.Time{}
+						auth.nonAuthCredentialLastError = nil
+						auth.nonQuotaCooldownUntil = time.Time{}
+						auth.LastError = nil
+						auth.StatusMessage = ""
+						auth.Status = StatusActive
+						cooldownStateChanged = true
+					}
+				}
+				if canServeWithAccessToken {
+					resumed := clearUnauthorizedModelStates(auth, now)
+					if len(resumed) > 0 {
+						cooldownStateChanged = true
+					}
+				} else if auth.RequiresSignIn && !auth.HasValidAccessToken(now) {
+					auth.Unavailable = true
+					auth.Status = StatusError
+					if auth.StatusMessage == "" {
+						if existing.StatusMessage != "" {
+							auth.StatusMessage = existing.StatusMessage
+						} else {
+							auth.StatusMessage = "unauthorized (refresh token invalid)"
+						}
+					}
+					if auth.LastError == nil {
+						if existing.LastError != nil {
+							auth.LastError = cloneError(existing.LastError)
+						} else if auth.RefreshError != nil {
+							auth.LastError = refreshAccessError(auth, auth.RefreshError.Message, false, hasUnauthorizedAuthFailure(existing))
+							if auth.LastError.Code == "refresh_outcome_unknown" {
+								auth.StatusMessage = auth.LastError.Message
+							}
+						}
+					}
+				}
+			}
+		} else {
+			applyPreservedRejectedTokens(existing, auth, false)
+			applyPreservedRenewalState(existing, auth, mode, now)
+		}
+		// A refresh that confirms quota restoration (issue #6690) releases the
+		// credential-wide cooldown early; otherwise the active credential
+		// quota below is preserved exactly as before.
+		devinQuotaRestored := mode == updateModeRefresh && applyDevinQuotaRestoration(auth, existing, now)
+		if devinQuotaRestored {
+			cooldownStateChanged = true
+		} else if existing.Quota.Exceeded && existing.Quota.Reason == "credential_quota" && existing.Quota.NextRecoverAt.After(now) {
+			auth.Unavailable = existing.Unavailable
+			if clearedAuthGrantRetry {
+				auth.NextRetryAfter = existing.Quota.NextRecoverAt
+				if existing.forceCooldownUntil.After(auth.NextRetryAfter) {
+					auth.NextRetryAfter = existing.forceCooldownUntil
+				}
+				if auth.credentialRetryAfter.After(auth.NextRetryAfter) {
+					auth.NextRetryAfter = auth.credentialRetryAfter
+				}
+			} else {
+				auth.NextRetryAfter = existing.NextRetryAfter
+				if auth.credentialRetryAfter.After(auth.NextRetryAfter) {
+					auth.NextRetryAfter = auth.credentialRetryAfter
+				}
+			}
+			// Preserve cooldown fields; keep the newest observation snapshot.
+			observation := mergeQuotaObservation(auth.Quota, existing.Quota)
+			auth.Quota = existing.Quota
+			auth.Quota.ObservedAt = observation.ObservedAt
+			auth.Quota.Signals = observation.Signals
+			auth.cooldownRecordedSeq = existing.cooldownRecordedSeq
+			auth.forceCooldownUntil = existing.forceCooldownUntil
+			auth.quotaForceCooldownUntil = existing.quotaForceCooldownUntil
+			auth.credQuotaForceUntil = existing.credQuotaForceUntil
+			if !clearedAuthGrantRetry {
+				auth.credentialRetryAfter = existing.credentialRetryAfter
+				auth.nonAuthCredentialRetryAfter = existing.nonAuthCredentialRetryAfter
+				auth.nonAuthCredentialLastError = cloneError(existing.nonAuthCredentialLastError)
+				auth.nonQuotaCooldownUntil = existing.nonQuotaCooldownUntil
+			}
+			auth.forceCooldownSeeded = existing.forceCooldownSeeded
+			if auth.Status == StatusActive {
+				auth.Status = existing.Status
+			}
+		} else if !credChanged && mode == updateModeReplace && existing.forceCooldownUntil.After(now) && !auth.NextRetryAfter.After(now) {
+			auth.Unavailable = existing.Unavailable
+			auth.NextRetryAfter = existing.NextRetryAfter
+			auth.cooldownRecordedSeq = existing.cooldownRecordedSeq
+			auth.forceCooldownUntil = existing.forceCooldownUntil
+			auth.quotaForceCooldownUntil = existing.quotaForceCooldownUntil
+			auth.credQuotaForceUntil = existing.credQuotaForceUntil
+			auth.credentialRetryAfter = existing.credentialRetryAfter
+			auth.nonAuthCredentialRetryAfter = existing.nonAuthCredentialRetryAfter
+			auth.nonAuthCredentialLastError = cloneError(existing.nonAuthCredentialLastError)
+			auth.nonQuotaCooldownUntil = existing.nonQuotaCooldownUntil
+			auth.forceCooldownSeeded = existing.forceCooldownSeeded
+			if auth.LastError == nil && existing.LastError != nil {
+				auth.LastError = cloneError(existing.LastError)
+			}
+			if auth.StatusMessage == "" {
+				auth.StatusMessage = existing.StatusMessage
+			}
+			if auth.Status == StatusActive {
+				auth.Status = existing.Status
+			}
+		}
+	} else {
+		applyPreservedRejectedTokens(existing, auth, mode == updateModeRefresh)
+		applyPreservedRenewalState(existing, auth, mode, now)
+		// Refresh updates must retain their outcome rather than the pending job marker.
+		if mode != updateModeRefresh {
+			if !credChanged {
+				auth.LastRefreshedAt = existing.LastRefreshedAt
+				auth.NextRefreshAfter = existing.NextRefreshAfter
+				auth.RefreshFailures = existing.RefreshFailures
+			} else if authHasUnchangedRejectedRefreshToken(auth) {
+				if exp, ok := auth.AccessTokenExpirationTime(); ok && !exp.IsZero() && exp.After(now) {
+					auth.NextRefreshAfter = exp
+				} else {
+					auth.NextRefreshAfter = time.Time{}
+				}
+			}
+		}
+	}
+	auth.UpdatedAt = now
+	cooldownStateChanged = m.migrateAuthAliasModelStatesLocked(auth, nil, now, false) || cooldownStateChanged
+	seedInitialForceCooldownDeadlines(auth)
+	if auth.Disabled || auth.Status == StatusDisabled {
+		cooldownStateChanged = clearCooldownStateForAuth(auth, now) || cooldownStateChanged
+	} else if m.cooldownDisabledForAuth(auth) {
+		cooldownStateChanged = clearDisabledCooldownStateForAuth(auth, now) || cooldownStateChanged
+	}
+	if existing.Metadata != nil {
+		if persistedHints, hasHints := existing.Metadata["antigravity_capability_hints"]; hasHints {
+			if auth.Metadata == nil {
+				auth.Metadata = make(map[string]any)
+			}
+			auth.Metadata["antigravity_capability_hints"] = persistedHints
+		}
 	}
 	auth.EnsureIndex()
+	// Save before publication, including the transactional Meta mint path.
+	// Runtime-only changes made during I/O are merged below, never overwritten.
+	existingBeforeSave := existing.Clone()
+	refreshPatchBeforeSave := auth.CodexRefreshPatch
+	persistMetaMint := (mode == updateModePrepare || mode == updateModeRefresh) && strings.EqualFold(strings.TrimSpace(auth.Provider), "meta")
+	if errPersist := m.persistLocked(ctx, auth); errPersist != nil {
+		if commit, ok := ctx.Value(observedRefreshCommitKey{}).(*observedRefreshCommit); ok {
+			if observedRefreshStoreConflict(errPersist) {
+				m.mu.Unlock()
+				return nil, false, baseSuperseded, false, ErrSelectedRefreshChanged
+			}
+			// The provider may already have rotated the grant. Preserve that
+			// result for this same registration, but never report durable success.
+			commit.persistErr = errPersist
+		} else if IsExplicitCredentialEdit(ctx) {
+			m.mu.Unlock()
+			return nil, false, baseSuperseded, false, &storeWriteError{cause: errPersist}
+		}
+		// A minted Meta key must reach the store before requests can use it.
+		if persistMetaMint {
+			m.mu.Unlock()
+			return nil, false, baseSuperseded, false, fmt.Errorf("persist meta auth: %w", errPersist)
+		}
+		// Ordinary persistence failures remain non-fatal, but never silent.
+		log.WithFields(log.Fields{"auth_id": auth.ID, "credential": auth.ID, "provider": auth.Provider}).Warnf("failed to persist updated auth %s (%s): %v", auth.Provider, auth.ID, errPersist)
+	}
+	if m.authEpochs[auth.ID] != auth.RegistrationEpoch {
+		m.mu.Unlock()
+		return nil, false, true, false, fmt.Errorf("auth %s changed registration during persistence", auth.ID)
+	}
+	mergeAuthSaveDelta(auth, existingBeforeSave, existing, false)
+	if m.migrateAuthAliasModelStatesLocked(auth, nil, now, false) {
+		cooldownStateChanged = true
+		updateAggregatedAvailability(auth, now)
+	}
+	if (auth.RejectedAccessToken == "" && existing.RejectedAccessToken != "") || (auth.RejectedSIWCAccessToken == "" && existing.RejectedSIWCAccessToken != "") {
+		probe := auth.Clone()
+		probe.CodexRefreshPatch = refreshPatchBeforeSave
+		applyPreservedRejectedTokens(existing, probe, mode == updateModeRefresh)
+		auth.RejectedAccessToken = probe.RejectedAccessToken
+		auth.RejectedSIWCAccessToken = probe.RejectedSIWCAccessToken
+	}
+	if existing.RequiresSignIn != existingBeforeSave.RequiresSignIn ||
+		!equalErrorPtr(existing.RefreshError, existingBeforeSave.RefreshError) ||
+		existing.RejectedRefreshToken != existingBeforeSave.RejectedRefreshToken ||
+		existing.RejectedSIWCRefreshToken != existingBeforeSave.RejectedSIWCRefreshToken ||
+		existing.RenewalWarnedRefreshToken != existingBeforeSave.RenewalWarnedRefreshToken ||
+		!existing.RenewalEventAt.Equal(existingBeforeSave.RenewalEventAt) ||
+		existing.InferenceVerified != existingBeforeSave.InferenceVerified ||
+		!existing.LastInferenceVerifiedAt.Equal(existingBeforeSave.LastInferenceVerifiedAt) ||
+		existing.RenewalVerified != existingBeforeSave.RenewalVerified ||
+		!existing.LastRenewalVerifiedAt.Equal(existingBeforeSave.LastRenewalVerifiedAt) {
+		probe := auth.Clone()
+		probe.CodexRefreshPatch = refreshPatchBeforeSave
+		applyPreservedRenewalState(existing, probe, mode, now)
+		auth.RequiresSignIn = probe.RequiresSignIn
+		auth.RefreshError = probe.RefreshError
+		auth.RejectedRefreshToken = probe.RejectedRefreshToken
+		auth.RejectedSIWCRefreshToken = probe.RejectedSIWCRefreshToken
+		auth.RenewalWarnedRefreshToken = probe.RenewalWarnedRefreshToken
+		auth.RenewalEventAt = probe.RenewalEventAt
+		auth.AdoptedAt = probe.AdoptedAt
+		auth.AdoptedGrantHash = probe.AdoptedGrantHash
+		auth.InferenceVerified = probe.InferenceVerified
+		auth.LastInferenceVerifiedAt = probe.LastInferenceVerifiedAt
+		auth.RenewalVerified = probe.RenewalVerified
+		auth.LastRenewalVerifiedAt = probe.LastRenewalVerifiedAt
+		if authHasUnchangedRejectedRefreshToken(auth) && !existingBeforeSave.RequiresSignIn {
+			if exp, okExp := auth.AccessTokenExpirationTime(); okExp && !exp.IsZero() && exp.After(now) {
+				if auth.NextRefreshAfter.IsZero() || auth.NextRefreshAfter.Before(exp) {
+					auth.NextRefreshAfter = exp
+				}
+			}
+		}
+	}
+	if existing.Generation >= auth.Generation {
+		auth.Generation = existing.Generation + 1
+	}
+	releasePublication, eligible := authPublicationFence(ctx).Begin()
+	if !eligible {
+		m.mu.Unlock()
+		return nil, false, false, false, ErrAuthPublicationOutOfScope
+	}
+	auth.ClearFileSnapshot()
 	authClone := auth.Clone()
 	m.auths[auth.ID] = authClone
-	m.mu.Unlock()
-	m.refreshWarmupPacingLocked()
-	m.pacingMu.Unlock()
-	if !shouldDeferAPIKeyModelAliasRebuild(ctx) {
-		m.rebuildAPIKeyModelAliasFromRuntimeConfig()
-	}
+	releasePublication()
+	m.notifyAuthChangeLocked(auth.ID)
+	// Snapshot before unlocking: MarkResult mutates the published auth in place.
+	var schedulerSnapshot *Auth
 	if m.scheduler != nil {
-		m.scheduler.upsertAuth(authClone)
+		schedulerSnapshot = authClone.Clone()
 	}
-	m.queueRefreshReschedule(auth.ID)
-	_ = m.persist(ctx, auth)
-	// The refresh-result marker only covers this write; nested hook writes must
-	// keep the stale write-back guard.
-	m.hook.OnAuthUpdated(withoutRefreshResultWrite(ctx), auth.Clone())
-	if clearedCooldown {
-		m.persistCooldownStates(ctx)
+	shouldForgetWeighted := authClone.Disabled ||
+		authClone.Status == StatusDisabled ||
+		(authWeight(existingBeforeSave) > 0 && authWeight(authClone) <= 0) ||
+		executorKeyFromAuth(existingBeforeSave) != executorKeyFromAuth(authClone)
+	forgetEpoch := authClone.RegistrationEpoch
+	forgetGen := authClone.Generation
+	m.mu.Unlock()
+	_ = schedulerSnapshot
+	if shouldForgetWeighted {
+		m.forgetWeightedAuthUpTo(authClone.ID, forgetEpoch, forgetGen)
 	}
-	return auth.Clone(), nil
+	return auth.Clone(), true, baseSuperseded, cooldownStateChanged, nil
+}
+
+func equalErrorPtr(a, b *Error) bool {
+	if a == nil && b == nil {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+	return a.Code == b.Code && a.Message == b.Message && a.Retryable == b.Retryable && a.HTTPStatus == b.HTTPStatus
 }
 
 // Remove deletes an auth from runtime state without persisting.
 // Disk and token-store deletion must be handled by the caller.
 func (m *Manager) Remove(ctx context.Context, id string) {
-	defer notifyPacingAdmission()
+	m.RemoveIf(ctx, id, nil)
+}
+
+// RemoveIf deletes an auth from runtime state while holding the per-auth
+// mutation gate when predicate is nil or returns true for the current auth.
+func (m *Manager) RemoveIf(ctx context.Context, id string, predicate func(*Auth) bool) bool {
 	if m == nil {
-		return
+		return false
 	}
 	id = strings.TrimSpace(id)
 	if id == "" {
-		return
+		return false
 	}
-	_ = ctx
+	releaseMutation := m.lockAuthMutation(id)
+	defer releaseMutation()
 
-	m.pacingMu.Lock()
+	if predicate != nil {
+		m.mu.RLock()
+		snapshot := m.auths[id]
+		if snapshot != nil {
+			snapshot = snapshot.Clone()
+		}
+		m.mu.RUnlock()
+		if !predicate(snapshot) {
+			return false
+		}
+	}
+
+	persist := m.persistenceLock(id)
+	// Legacy callers can reach removal after committing storage, even if the request was canceled.
+	if err := persist.lock(context.Background()); err != nil {
+		return false
+	}
 	m.mu.Lock()
+	releasePublication, eligible := authPublicationFence(ctx).Begin()
+	if !eligible {
+		m.mu.Unlock()
+		persist.unlock()
+		return false
+	}
+	epoch, after := m.retireAuthLocked(ctx, id)
+	releasePublication()
+	persist.markRetired(epoch)
+	m.mu.Unlock()
+	persist.unlock()
+	releaseMutation()
+	if after == nil {
+		return false
+	}
+	after()
+	return true
+}
+
+// retireAuthLocked requires the credential mutation gate and m.mu. Side effects
+// may re-enter the manager and are called after releasing mutation gates.
+func (m *Manager) retireAuthLocked(ctx context.Context, id string) (uint64, func()) {
 	existing := m.auths[id]
 	if existing == nil {
-		m.mu.Unlock()
-		m.pacingMu.Unlock()
-		return
+		return m.authEpochs[id], nil
 	}
 	provider := strings.TrimSpace(existing.Provider)
 	delete(m.auths, id)
-	m.persistedPolicies.Delete(id)
+	m.notifyAuthChangeLocked(id)
 	if m.modelPoolOffsets != nil {
 		delete(m.modelPoolOffsets, id)
 	}
@@ -227,39 +980,89 @@ func (m *Manager) Remove(ctx context.Context, id string) {
 			delete(m.homeRuntimeAuths, sessionID)
 		}
 	}
-	m.mu.Unlock()
-	m.pacingMu.Unlock()
-
-	if !shouldDeferAPIKeyModelAliasRebuild(ctx) {
-		m.rebuildAPIKeyModelAliasFromRuntimeConfig()
+	if m.authEpochs == nil {
+		m.authEpochs = make(map[string]uint64)
 	}
-	if m.scheduler != nil {
-		m.scheduler.removeAuth(id)
+	if existing.RegistrationEpoch > m.authEpochs[id] {
+		m.authEpochs[id] = existing.RegistrationEpoch
 	}
-	m.queueRefreshUnschedule(id)
-	m.invalidateSessionAffinity(id)
+	m.authEpochs[id]++
+	tombstoneEpoch := m.authEpochs[id]
+	return tombstoneEpoch, func() {
+		m.forgetWeightedAuthUpTo(id, tombstoneEpoch, ^uint64(0))
+		if !shouldDeferAPIKeyModelAliasRebuild(ctx) {
+			m.rebuildAPIKeyModelAliasFromRuntimeConfig()
+		}
+		if m.scheduler != nil {
+			m.scheduler.RecordRemovalTombstone(id, tombstoneEpoch)
+		}
+		m.structuralEpoch.Add(1)
+		m.queueRefreshUnschedule(id)
+		m.invalidateSessionAffinity(id)
 
-	if provider != "" {
-		if exec, ok := m.Executor(provider); ok && exec != nil {
-			if closer, okCloser := exec.(ExecutionSessionCloser); okCloser {
-				closer.CloseExecutionSession(CloseAllExecutionSessionsID)
+		if provider != "" {
+			if exec, ok := m.Executor(provider); ok && exec != nil {
+				if authCloser, okAuthCloser := exec.(AuthExecutionSessionCloser); okAuthCloser && authCloser != nil {
+					authCloser.CloseAuthExecutionSessions(id)
+				} else if closer, okCloser := exec.(ExecutionSessionCloser); okCloser {
+					closer.CloseExecutionSession(CloseAllExecutionSessionsID)
+				}
 			}
 		}
+		m.persistCooldownStates(context.Background())
 	}
-	m.persistCooldownStates(ctx)
 }
 
 func (m *Manager) invalidateSessionAffinity(authID string) {
 	if m == nil || authID == "" {
 		return
 	}
-	if invalidator, ok := m.selector.(interface{ InvalidateAuth(string) }); ok && invalidator != nil {
+	sel := m.Selector()
+	if invalidator, ok := sel.(interface{ InvalidateAuth(string) }); ok && invalidator != nil {
 		invalidator.InvalidateAuth(authID)
 	}
 }
 
+func (m *Manager) forgetWeightedAuthUpTo(authID string, maxEpoch, maxGen uint64) {
+	if m == nil || authID == "" {
+		return
+	}
+	sel := m.Selector()
+	if epochForgetter, ok := sel.(interface {
+		ForgetAuthUpTo(string, uint64, uint64)
+	}); ok && epochForgetter != nil {
+		epochForgetter.ForgetAuthUpTo(authID, maxEpoch, maxGen)
+		return
+	}
+	if forgetter, ok := sel.(interface{ ForgetAuth(string) }); ok && forgetter != nil {
+		forgetter.ForgetAuth(authID)
+	}
+}
+
+// WithLocalStoreRebind excludes Load and persistence during an internal
+// binding change. The callback may install the new store once it accepts the
+// configuration generation, and must not reenter Manager mutation methods.
+func (m *Manager) WithLocalStoreRebind(ctx context.Context, next Store, accept func(install func())) error {
+	if err := m.authLoadGate.Acquire(ctx, math.MaxInt64); err != nil {
+		return err
+	}
+	defer m.authLoadGate.Release(math.MaxInt64)
+	accept(func() { m.SetStore(next) })
+	return nil
+}
+
 // Load resets manager state from the backing store.
 func (m *Manager) Load(ctx context.Context) error {
+	// Exclude complete Save/publication transactions, including new registrations
+	// not yet present in auths. Never wait for this barrier while holding m.mu.
+	lockCtx := ctx
+	if lockCtx == nil {
+		lockCtx = context.Background()
+	}
+	if errAcquire := m.authLoadGate.Acquire(lockCtx, math.MaxInt64); errAcquire != nil {
+		return errAcquire
+	}
+	defer m.authLoadGate.Release(math.MaxInt64)
 	m.mu.RLock()
 	store := m.store
 	m.mu.RUnlock()
@@ -270,34 +1073,128 @@ func (m *Manager) Load(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	m.pacingMu.Lock()
 	m.mu.Lock()
+	now := time.Now()
+	previousAuths := m.auths
 	m.auths = make(map[string]*Auth, len(items))
+	if m.authEpochs == nil {
+		m.authEpochs = make(map[string]uint64, len(items))
+	}
 	for _, auth := range items {
 		if auth == nil || auth.ID == "" {
 			continue
 		}
+		NormalizeCredentialMetadata(auth.Metadata)
+		if errWeight := ValidateAuthWeight(auth); errWeight != nil {
+			continue
+		}
 		auth.EnsureIndex()
+		_ = m.migrateAuthAliasModelStatesLocked(auth, nil, now, false)
+		seedInitialForceCooldownDeadlines(auth)
+		if len(auth.ModelStates) > 0 {
+			updateAggregatedAvailability(auth, now)
+		}
+		auth.CopilotCatalog = nil
+		m.authEpochs[auth.ID] = max(m.authEpochs[auth.ID], auth.RegistrationEpoch) + 1
+		auth.RegistrationEpoch = m.authEpochs[auth.ID]
+		auth.Generation = 1
+		if prev, exists := previousAuths[auth.ID]; exists && prev != nil {
+			auth.CredentialVersion = max(auth.CredentialVersion, prev.CredentialVersion)
+			if CredentialsChanged(prev, auth) {
+				auth.CredentialVersion++
+			}
+		}
+		if auth.CredentialVersion == 0 {
+			auth.CredentialVersion = 1
+		}
 		m.auths[auth.ID] = auth.Clone()
 	}
+
+	type removalTombstone struct {
+		id    string
+		epoch uint64
+	}
+	var removedTombstones []removalTombstone
+	for prevID := range previousAuths {
+		if _, exists := m.auths[prevID]; !exists {
+			m.authEpochs[prevID]++
+			removedTombstones = append(removedTombstones, removalTombstone{
+				id:    prevID,
+				epoch: m.authEpochs[prevID],
+			})
+		}
+	}
+
 	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
 	if cfg == nil {
 		cfg = &internalconfig.Config{}
 	}
 	m.rebuildAPIKeyModelAliasLocked(cfg)
+	for id := range m.authChangeWatchers {
+		m.notifyAuthChangeLocked(id)
+	}
 	m.mu.Unlock()
-	m.refreshWarmupPacingLocked()
-	m.pacingMu.Unlock()
+
+	if m.scheduler != nil {
+		for _, rt := range removedTombstones {
+			m.scheduler.RecordRemovalTombstone(rt.id, rt.epoch)
+		}
+	}
+	for _, rt := range removedTombstones {
+		m.forgetWeightedAuthUpTo(rt.id, rt.epoch, ^uint64(0))
+	}
+	m.structuralEpoch.Add(1)
 	m.syncScheduler()
 	return nil
 }
 
-func (m *Manager) persist(ctx context.Context, auth *Auth) error {
-	if m.store == nil || auth == nil {
+type authPersistLock struct {
+	gate           chan struct{}
+	lastEpoch      uint64
+	lastGeneration uint64
+}
+
+func (m *Manager) persistenceLock(id string) *authPersistLock {
+	if lock, ok := m.persistLocks.Load(id); ok {
+		return lock.(*authPersistLock)
+	}
+	lock, _ := m.persistLocks.LoadOrStore(id, &authPersistLock{gate: make(chan struct{}, 1)})
+	return lock.(*authPersistLock)
+}
+
+func (l *authPersistLock) lock(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case l.gate <- struct{}{}:
+		if err := ctx.Err(); err != nil {
+			l.unlock()
+			return err
+		}
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (l *authPersistLock) unlock() { <-l.gate }
+
+func (l *authPersistLock) markRetired(epoch uint64) {
+	if epoch > 0 && epoch >= l.lastEpoch {
+		l.lastEpoch, l.lastGeneration = epoch, math.MaxUint64
+	}
+}
+
+func (m *Manager) persist(ctx context.Context, auth *Auth) (persistErr error) {
+	m.mu.RLock()
+	store := m.store
+	m.mu.RUnlock()
+	if store == nil || auth == nil {
 		return nil
 	}
-	if shouldSkipPersist(ctx) {
-		return nil
+	if errWeight := ValidateAuthWeight(auth); errWeight != nil {
+		return fmt.Errorf("persist auth: %w", errWeight)
 	}
 	if IsConfigAPIKeyAuth(auth) {
 		return nil
@@ -314,34 +1211,48 @@ func (m *Manager) persist(ctx context.Context, auth *Auth) error {
 	if auth.Metadata == nil {
 		return nil
 	}
-	// Every writer shares the same storage boundary. A delayed token/header
-	// refresh must not overwrite a newer, successfully persisted operator patch.
-	m.policyPersistenceMu.Lock()
-	defer m.policyPersistenceMu.Unlock()
-	toSave := auth
-	if ctx == nil {
-		ctx = context.Background()
+
+	pLock := m.persistenceLock(auth.ID)
+	if err := pLock.lock(ctx); err != nil {
+		return err
 	}
-	explicit, _ := ctx.Value(accountPolicyWriteKey{}).(bool)
-	if !explicit {
-		if current, ok := m.persistedPolicies.Load(auth.ID); ok {
-			policy := current.(*Auth)
-			_, fixed := accountSchedulingRawValue(policy.Metadata, "limit_overrides")
-			_, temporary := accountSchedulingRawValue(policy.Metadata, "temporary_limits")
-			_, profile := accountSchedulingRawValue(policy.Metadata, "speed_profile")
-			_, mode := accountSchedulingRawValue(policy.Metadata, "warmup_mode")
-			_, period := accountSchedulingRawValue(policy.Metadata, "warmup_period_days")
-			if fixed || temporary || profile || mode || period {
-				toSave = auth.Clone()
-				preserveAccountLimitPolicy(toSave, policy)
-			}
+	defer pLock.unlock()
+	if auth.RegistrationEpoch < pLock.lastEpoch || (auth.RegistrationEpoch == pLock.lastEpoch && auth.Generation < pLock.lastGeneration) {
+		if IsExplicitCredentialEdit(ctx) {
+			return fmt.Errorf("credential write was superseded")
 		}
+		return nil
 	}
-	_, err := m.store.Save(ctx, toSave)
-	if err == nil {
-		policy := &Auth{Metadata: map[string]any{}}
-		preserveAccountLimitPolicy(policy, toSave)
-		m.persistedPolicies.Store(auth.ID, policy)
+	if IsExplicitCredentialEdit(ctx) {
+		// A failed management edit must not supersede the last durable version.
+		epoch, generation := pLock.lastEpoch, pLock.lastGeneration
+		defer func() {
+			if persistErr != nil {
+				pLock.lastEpoch, pLock.lastGeneration = epoch, generation
+			}
+		}()
 	}
+	pLock.lastEpoch = auth.RegistrationEpoch
+	pLock.lastGeneration = auth.Generation
+
+	if shouldSkipPersist(ctx) {
+		return nil
+	}
+	releaseFg, errWait := m.beginForegroundStoreSave(ctx)
+	if errWait != nil {
+		return errWait
+	}
+	defer releaseFg()
+	// persistLocked has released m.mu, and persistence/foreground gates have
+	// already been acquired. Release this lease before returning to its m.mu
+	// reacquisition; no manager lock is held while waiting for scope ownership.
+	if commit, ok := ctx.Value(observedRefreshCommitKey{}).(*observedRefreshCommit); ok {
+		release, eligible := commit.begin()
+		if !eligible {
+			return ErrSelectedRefreshChanged
+		}
+		defer release()
+	}
+	_, err := store.Save(ctx, auth)
 	return err
 }

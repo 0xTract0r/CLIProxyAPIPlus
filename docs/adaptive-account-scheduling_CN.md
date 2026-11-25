@@ -225,30 +225,12 @@ weight = tier 基础容量权重 x (1 - 额度利用率) x 新鲜度系数
 
 结构化的按额度窗口利用率。
 
-Claude 的 `five_hour`、`seven_day`、`seven_day_oauth_apps` 约束所有模型；
-`seven_day_opus`、`seven_day_sonnet`、`seven_day_haiku` 只约束名称包含对应家族的请求，
-未知未来窗口不扩大为全账号限制。适用窗口已用100%且尚未重置时，在轮询或会话亲和前
-暂时排除账号，所有已耗尽的适用窗口重置后恢复。已开启额外用量且其已报告利用率/月预算
-尚未耗尽时保留超额通道；调度不会开启额外付费，也不会停止凭证刷新。缺失/过期重置时间
-仍交给原有请求失败冷却处理。
-
-Codex 从 `quota_snapshot.usage.rate_limit` 读取共享套餐额度：
-`primary_window` / `secondary_window` 映射为 `codex_primary` / `codex_secondary`，
-读取 `used_percent` 和 Unix 时间 `reset_at`。代码审查与附加模型额度不用于阻断共享账号池。
-所有调度策略及会话绑定都会跳过任一共享窗口已用 100% 且尚未重置的账号；所有耗尽窗口
-重置或新快照恢复余量后自动恢复选号，账号保持启用，凭证继续正常刷新。有可用付费
-credits 时允许超额使用，但不覆盖上游明确的 `allowed=false` / `limit_reached=true`。
-快照显式放行（`allowed=true` 且 `limit_reached=false`，两者均为布尔）时以上游为准，
-不预先跳过；任一字段缺失或非布尔时仍按 100% 规则。被动冷却（真实 429 / 成功响应头
-used≥100）不受影响。
-缺失重置时间或旧时间已过期不会造成永久锁定，实际请求失败仍沿用原有冷却。无需新增配置。
-
 账号完全没有可用的 `quota_snapshot.usage` 快照时（从未探测过 / 探测失败 / 该 provider 不
 轮询额度）整体为 `null`，绝不能读成"0% 已用"。
 
 | 字段 | 类型 | 含义 |
 | --- | --- | --- |
-| `windows` | object | Claude 使用上游窗口名（如 `five_hour` / `seven_day` / `seven_day_sonnet`）；Codex 使用 `codex_primary` / `codex_secondary`。 |
+| `windows` | object | key 是上游原始窗口名（如 `five_hour` / `seven_day` / `seven_day_sonnet`）。 |
 | `windows.<w>.utilization_percent` | number, 0-100 | 上游原样的利用率百分比，已裁剪到 `[0,100]`。 |
 | `windows.<w>.headroom` | number, 0-1 | `1 - utilization_percent/100`，已裁剪到 `[0,1]`。 |
 | `windows.<w>.resets_at` | string, RFC3339 UTC，可选 | 该窗口的重置时间；上游没给出可解析时间戳时字段不出现。 |

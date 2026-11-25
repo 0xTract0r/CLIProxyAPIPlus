@@ -19,20 +19,22 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	managementHandlers "github.com/router-for-me/CLIProxyAPI/v7/internal/api/handlers/management"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/api/middleware"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/api/modules"
-	ampmodule "github.com/router-for-me/CLIProxyAPI/v7/internal/api/modules/amp"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/kiro"
-	codexlive "github.com/router-for-me/CLIProxyAPI/v7/internal/client/codex/live"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/managementasset"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
-	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	managementHandlers "github.com/router-for-me/CLIProxyAPI/v8/internal/api/handlers/management"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/api/middleware"
+	codexlive "github.com/router-for-me/CLIProxyAPI/v8/internal/client/codex/live"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/client/musecode"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/githubauth"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/managementasset"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginhost"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/redisqueue"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/usage"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/wstunnel"
+	sdkaccess "github.com/router-for-me/CLIProxyAPI/v8/sdk/access"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers/openai"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/net/http2"
 	"gopkg.in/yaml.v3"
@@ -48,6 +50,7 @@ type Server struct {
 	server *http.Server
 
 	// muxBaseListener is the shared TCP listener used to serve both HTTP and Redis protocol traffic.
+	listenerMu      sync.Mutex
 	muxBaseListener net.Listener
 
 	// muxHTTPListener receives HTTP connections selected by the multiplexer.
@@ -56,9 +59,12 @@ type Server struct {
 	// handlers contains the API handlers for processing requests.
 	handlers         *handlers.BaseAPIHandler
 	codexLiveHandler *codexlive.Handler
+	museCodeHandler  *musecode.Handler
+	tunnelHub        *wstunnel.Hub
 
 	// cfg holds the current server configuration.
-	cfg *config.Config
+	cfgMu sync.RWMutex
+	cfg   *config.Config
 
 	// oldConfigYaml stores a YAML snapshot of the previous configuration for change detection.
 	// This prevents issues when the config object is modified in place by Management API.
@@ -84,13 +90,23 @@ type Server struct {
 	wsAuthEnabled atomic.Bool
 
 	// management handler
-	mgmt *managementHandlers.Handler
+	mgmt       *managementHandlers.Handler
+	ampForward atomic.Pointer[ampForwardState]
 
-	// ampModule is the Amp routing module for model mapping hot-reload.
-	ampModule *ampmodule.AmpModule
+	isolatedUsage   bool
+	usageRequestsMu sync.Mutex
+	usageRequests   int
+	usageStopping   bool
 
 	// pluginHost owns dynamic plugin Management API route dispatch.
 	pluginHost *pluginhost.Host
+
+	// interceptorHost is the resolved PluginInterceptorHost installed on request
+	// handlers. When a caller provides their own host via
+	// WithPluginInterceptorHost, interceptor calls and capability detection
+	// delegate to that host while plugin model routing, lifecycle callbacks, and
+	// websocket observers stay delegated to pluginHost.
+	interceptorHost handlers.PluginInterceptorHost
 
 	// managementRoutesRegistered tracks whether the management routes have been attached to the engine.
 	managementRoutesRegistered atomic.Bool
@@ -123,6 +139,9 @@ type Server struct {
 // Returns:
 //   - *Server: A new server instance
 func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdkaccess.Manager, configFilePath string, opts ...ServerOption) *Server {
+	if cfg != nil {
+		cfg = cfg.CloneForRuntime()
+	}
 	optionState := &serverOptionConfig{
 		requestLoggerFactory: defaultRequestLoggerFactory,
 	}
@@ -136,36 +155,16 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 
 	// Create gin engine
 	engine := gin.New()
+	if errSetTrustedProxies := engine.SetTrustedProxies(cfg.TrustedProxies); errSetTrustedProxies != nil {
+		log.WithError(errSetTrustedProxies).Error("invalid trusted-proxies configuration; forwarded client IP headers will be ignored")
+		if errDisableTrustedProxies := engine.SetTrustedProxies(nil); errDisableTrustedProxies != nil {
+			log.WithError(errDisableTrustedProxies).Error("failed to disable trusted proxy handling")
+		}
+	}
 	if optionState.engineConfigurator != nil {
 		optionState.engineConfigurator(engine)
 	}
 
-	// Add middleware
-	engine.Use(logging.GinLogrusLogger())
-	engine.Use(logging.GinLogrusRecovery())
-	engine.Use(logging.CPATraceIDMiddleware())
-	engine.Use(buildInfoHeadersMiddleware())
-	for _, mw := range optionState.extraMiddleware {
-		engine.Use(mw)
-	}
-
-	// Add request logging middleware (positioned after recovery, before auth)
-	// Resolve logs directory relative to the configuration file directory.
-	var requestLogger logging.RequestLogger
-	var toggle func(bool)
-	if !cfg.CommercialMode {
-		if optionState.requestLoggerFactory != nil {
-			requestLogger = optionState.requestLoggerFactory(cfg, configFilePath)
-		}
-		if requestLogger != nil {
-			engine.Use(middleware.RequestLoggingMiddleware(requestLogger))
-			if setter, ok := requestLogger.(interface{ SetEnabled(bool) }); ok {
-				toggle = setter.SetEnabled
-			}
-		}
-	}
-
-	engine.Use(corsMiddleware())
 	wd, err := os.Getwd()
 	if err != nil {
 		wd = configFilePath
@@ -177,23 +176,81 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 
 	// Create server instance
 	s := &Server{
-		engine:              engine,
-		handlers:            handlers.NewBaseAPIHandlers(effectiveSDKConfig(cfg), authManager),
-		cfg:                 cfg,
-		accessManager:       accessManager,
-		requestLogger:       requestLogger,
-		loggerToggle:        toggle,
-		configFilePath:      configFilePath,
-		currentPath:         wd,
-		envManagementSecret: envManagementSecret,
-		wsRoutes:            make(map[string]struct{}),
-		pluginHost:          optionState.pluginHost,
-
+		engine:                       engine,
+		handlers:                     handlers.NewBaseAPIHandlers(effectiveSDKConfig(cfg), authManager),
+		tunnelHub:                    wstunnel.NewHub(wstunnel.Options{}),
+		cfg:                          cfg,
+		accessManager:                accessManager,
+		configFilePath:               configFilePath,
+		currentPath:                  wd,
+		envManagementSecret:          envManagementSecret,
+		wsRoutes:                     make(map[string]struct{}),
+		pluginHost:                   optionState.pluginHost,
 		exampleAPIKeySafeModeEnabled: optionState.exampleAPIKeySafeMode,
 	}
+
+	// Resolve the interceptor host once so startup and reload share the same
+	// wiring. A caller-provided host keeps interceptor dispatch and capability
+	// detection on the embedder implementation while model routing, lifecycle
+	// callbacks, and websocket observers remain delegated to the internal
+	// plugin host. Typed-nil values are normalized first so they cannot defeat
+	// SetPluginHost's own nil-interface normalization.
+
+	if custom := normalizeInterceptorHost(optionState.pluginInterceptorHost); custom != nil {
+		s.interceptorHost = &delegatedInterceptorHost{
+			primary:    custom,
+			pluginHost: optionState.pluginHost,
+		}
+	} else {
+		s.interceptorHost = optionState.pluginHost
+	}
+
+	// Add middleware
+	engine.Use(logging.GinLogrusLogger())
+	engine.Use(logging.CPATraceIDMiddleware())
+	engine.Use(buildInfoHeadersMiddleware())
+	engine.Use(s.maxRequestBodyBytesMiddleware())
+
+	// Add request logging middleware before recovery and extra middleware so that
+	// any panic response written by GinLogrusRecovery or custom extraMiddleware is
+	// captured before request logging finalizes.
+	var requestLogger logging.RequestLogger
+	var toggle func(bool)
+	if !cfg.CommercialMode {
+		if optionState.requestLoggerFactory != nil {
+			requestLogger = optionState.requestLoggerFactory(cfg, configFilePath)
+		}
+		if requestLogger != nil {
+			requestLog := middleware.RequestLoggingMiddleware(requestLogger)
+			engine.Use(func(c *gin.Context) {
+				// Amp control-plane requests may contain credentials. Keep access
+				// logging while excluding their raw request and response bodies.
+				if ampForwardPath(c.FullPath()) {
+					c.Next()
+					return
+				}
+				requestLog(c)
+			})
+			if setter, ok := requestLogger.(interface{ SetEnabled(bool) }); ok {
+				toggle = setter.SetEnabled
+			}
+		}
+	}
+	s.requestLogger = requestLogger
+	s.loggerToggle = toggle
+
+	engine.Use(logging.GinLogrusRecovery())
+	for _, mw := range optionState.extraMiddleware {
+		engine.Use(mw)
+	}
+
+	engine.Use(ampForwardPreflight)
+	engine.Use(corsMiddleware())
+	engine.Use(s.responseCompressionMiddleware())
+	openai.SetResponsesWebsocketCompressionEnabled(cfg.Codex.WebsocketCompressionEnabled())
 	s.wsAuthEnabled.Store(cfg.WebsocketAuth)
 	s.exampleAPIKeySafeModeActive.Store(s.exampleAPIKeySafeModeRequired(cfg))
-	s.handlers.SetPluginHost(optionState.pluginHost)
+	s.handlers.SetPluginHost(s.interceptorHost)
 	if optionState.pluginHost != nil {
 		optionState.pluginHost.SetModelExecutor(s.handlers)
 		optionState.pluginHost.SetAuthManager(authManager)
@@ -204,25 +261,25 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	if authManager != nil {
 		authManager.SetRetryConfig(cfg.RequestRetry, time.Duration(cfg.MaxRetryInterval)*time.Second, cfg.MaxRetryCredentials)
 	}
+	githubauth.SetToken(cfg.GitHubToken)
 	managementasset.SetCurrentConfig(cfg)
 	auth.SetQuotaCooldownDisabled(cfg.DisableCooling)
 	auth.SetTransientErrorCooldownSeconds(cfg.TransientErrorCooldownSeconds)
 	applySignatureCacheConfig(nil, cfg)
+	applyClaudeToolSearchConfig(cfg)
 	// Initialize management handler
 	s.mgmt = managementHandlers.NewHandler(cfg, configFilePath, authManager)
+
+	s.isolatedUsage = optionState.isolatedUsage
+	if s.isolatedUsage {
+		s.mgmt.UseIsolatedUsageStatistics(cfg, configFilePath)
+		s.handlers.UsageObserver = s.mgmt.UsageStatistics()
+	}
 	s.mgmt.SetPluginHost(optionState.pluginHost)
 	s.mgmt.SetConfigReloadHook(optionState.configReloadHook)
 	if optionState.localPassword != "" {
 		s.mgmt.SetLocalPassword(optionState.localPassword)
 	}
-	// Resolve the reader-side log directory the same way the writer does
-	// (defaultRequestLoggerFactory / NewFileRequestLogger): when the resolved
-	// directory is relative, anchor it to the config file's directory rather
-	// than the process working directory. Without this, the reader falls back
-	// to <cwd>/logs while the writer writes to <configDir>/logs, so lookups
-	// such as GET /request-log-by-id/{id} always 404 when cwd != configDir.
-	// When WRITABLE_PATH is set, ResolveLogDirectory returns an absolute path
-	// and this join is skipped, preserving already-correct deployments.
 	logDir := logging.ResolveLogDirectory(cfg)
 	if !filepath.IsAbs(logDir) {
 		logDir = filepath.Join(filepath.Dir(configFilePath), logDir)
@@ -234,13 +291,6 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	if optionState.postAuthPersistHook != nil {
 		s.mgmt.SetPostAuthPersistHook(optionState.postAuthPersistHook)
 	}
-	// Start the quota snapshot auto-refresh loop (fork-only) so cached quota
-	// snapshots stay warm for the management UI.
-	s.mgmt.StartQuotaSnapshotAutoRefresh(context.Background(), managementHandlers.QuotaSnapshotRefreshPolicyFromConfig(cfg))
-	// Start the serving-independent farm account liveness probe (fork-only,
-	// default off via FARM_LIVENESS_PROBE_ENABLED) so an idle farm account revoked
-	// upstream is detected even with no serving traffic.
-	s.mgmt.StartFarmLivenessProbe(context.Background(), managementHandlers.QuotaSnapshotRefreshPolicyFromConfig(cfg))
 	s.localPassword = optionState.localPassword
 
 	// Home heartbeat gate: when home is enabled, block all endpoints with 503 until the
@@ -250,18 +300,10 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 
 	// Setup routes
 	s.setupRoutes()
-
-	// Register the Amp routing module (fork-only) using the V2 module Context.
-	s.ampModule = ampmodule.NewLegacy(accessManager, AuthMiddleware(accessManager))
-	ampCtx := modules.Context{
-		Engine:         engine,
-		BaseHandler:    s.handlers,
-		Config:         cfg,
-		AuthMiddleware: AuthMiddleware(accessManager),
+	if errAmp := s.reloadAmpForwarding(cfg.AmpCode, cfg.APIKeys); errAmp != nil {
+		log.Warn("Amp forwarding disabled: invalid upstream configuration")
 	}
-	if err := modules.RegisterModule(ampCtx, s.ampModule); err != nil {
-		log.Errorf("Failed to register Amp module: %v", err)
-	}
+	s.registerAmpForwardRoutes()
 
 	// Apply additional router configurators from options
 	if optionState.routerConfigurator != nil {
@@ -272,29 +314,50 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	// or when a local management password is provided (e.g. TUI mode).
 	hasManagementSecret := cfg.RemoteManagement.SecretKey != "" || envManagementSecret || s.localPassword != ""
 	s.managementRoutesEnabled.Store(hasManagementSecret)
-	redisqueue.SetEnabled(hasManagementSecret || (cfg != nil && cfg.Home.Enabled))
+	if !s.isolatedUsage {
+		usage.SetStatisticsEnabled(cfg.UsageStatisticsEnabled)
+		redisqueue.SetUsageStatisticsEnabled(cfg.UsageStatisticsEnabled)
+		redisqueue.SetEnabled(hasManagementSecret || cfg.Home.Enabled)
+	}
 	if hasManagementSecret {
 		s.registerManagementRoutes()
 	}
 	s.refreshPluginManagementRoutes()
 	engine.NoRoute(s.pluginManagementNoRoute)
 
-	// CLIProxyAPIPlus extension: register Kiro OAuth web routes at /v0/oauth/kiro/*.
-	kiroOAuthHandler := kiro.NewOAuthWebHandler(cfg)
-	kiroOAuthHandler.RegisterRoutes(engine)
-	log.Info("Kiro OAuth Web routes registered at /v0/oauth/kiro/*")
-
 	if optionState.keepAliveEnabled {
 		s.enableKeepAlive(optionState.keepAliveTimeout, optionState.keepAliveOnTimeout)
 	}
 
 	// Create HTTP server
+	var handler http.Handler = wrapUnconsumedRequestBodyHandler(engine)
+	if s.isolatedUsage {
+		handler = s.trackUsageRequests(handler)
+	}
 	s.server = &http.Server{
-		Addr:    fmt.Sprintf("%s:%d", cfg.Host, cfg.Port),
-		Handler: engine,
+		Addr:              fmt.Sprintf("%s:%d", cfg.Host, cfg.Port),
+		Handler:           handler,
+		ReadHeaderTimeout: muxSniffDeadline,
 	}
 
 	return s
+}
+
+func (s *Server) getConfig() *config.Config {
+	if s == nil {
+		return nil
+	}
+	s.cfgMu.RLock()
+	defer s.cfgMu.RUnlock()
+	return s.cfg
+}
+
+// Handler returns the HTTP handler used by the server.
+func (s *Server) Handler() http.Handler {
+	if s == nil || s.server == nil {
+		return nil
+	}
+	return s.server.Handler
 }
 
 // Start begins listening for and serving HTTP or HTTPS requests.
@@ -313,10 +376,11 @@ func (s *Server) Start() error {
 		return fmt.Errorf("failed to start HTTP server: %v", errListen)
 	}
 
-	useTLS := s.cfg != nil && s.cfg.TLS.Enable
+	cfg := s.getConfig()
+	useTLS := cfg != nil && cfg.TLS.Enable
 	if useTLS {
-		certPath := strings.TrimSpace(s.cfg.TLS.Cert)
-		keyPath := strings.TrimSpace(s.cfg.TLS.Key)
+		certPath := strings.TrimSpace(cfg.TLS.Cert)
+		keyPath := strings.TrimSpace(cfg.TLS.Key)
 		if certPath == "" || keyPath == "" {
 			if errClose := listener.Close(); errClose != nil {
 				log.Errorf("failed to close listener after TLS validation failure: %v", errClose)
@@ -346,8 +410,10 @@ func (s *Server) Start() error {
 	}
 
 	httpListener := newMuxListener(listener.Addr(), 1024)
+	s.listenerMu.Lock()
 	s.muxBaseListener = listener
 	s.muxHTTPListener = httpListener
+	s.listenerMu.Unlock()
 
 	httpErrCh := make(chan error, 1)
 	acceptErrCh := make(chan error, 1)
@@ -361,13 +427,19 @@ func (s *Server) Start() error {
 
 	select {
 	case errServe := <-httpErrCh:
-		if s.muxBaseListener != nil {
-			if errClose := s.muxBaseListener.Close(); errClose != nil && !errors.Is(errClose, net.ErrClosed) {
+		s.listenerMu.Lock()
+		muxBase := s.muxBaseListener
+		muxHTTP := s.muxHTTPListener
+		s.muxBaseListener = nil
+		s.muxHTTPListener = nil
+		s.listenerMu.Unlock()
+		if muxBase != nil {
+			if errClose := muxBase.Close(); errClose != nil && !errors.Is(errClose, net.ErrClosed) {
 				log.Debugf("failed to close shared listener after HTTP serve exit: %v", errClose)
 			}
 		}
-		if s.muxHTTPListener != nil {
-			_ = s.muxHTTPListener.Close()
+		if muxHTTP != nil {
+			_ = muxHTTP.Close()
 		}
 		errAccept := <-acceptErrCh
 		errServe = normalizeHTTPServeError(errServe)
@@ -380,11 +452,17 @@ func (s *Server) Start() error {
 		}
 		return nil
 	case errAccept := <-acceptErrCh:
-		if s.muxHTTPListener != nil {
-			_ = s.muxHTTPListener.Close()
+		s.listenerMu.Lock()
+		muxHTTP := s.muxHTTPListener
+		muxBase := s.muxBaseListener
+		s.muxHTTPListener = nil
+		s.muxBaseListener = nil
+		s.listenerMu.Unlock()
+		if muxHTTP != nil {
+			_ = muxHTTP.Close()
 		}
-		if s.muxBaseListener != nil {
-			if errClose := s.muxBaseListener.Close(); errClose != nil && !errors.Is(errClose, net.ErrClosed) {
+		if muxBase != nil {
+			if errClose := muxBase.Close(); errClose != nil && !errors.Is(errClose, net.ErrClosed) {
 				log.Debugf("failed to close shared listener after accept loop exit: %v", errClose)
 			}
 		}
@@ -401,11 +479,14 @@ func (s *Server) Start() error {
 	}
 }
 
-// Stop gracefully shuts down the API server without interrupting any
-// active connections.
+// Stop closes listeners and shuts down the API server.
+// When server.shutdown-timeout is a positive number of seconds, Stop first lets
+// in-flight requests finish within that budget (http.Server.Shutdown), then
+// forcibly closes whatever remains. The default 0 closes immediately, preserving
+// the behavior introduced to prevent hanging on active requests (#6094).
 //
 // Parameters:
-//   - ctx: The context for graceful shutdown
+//   - ctx: Context bounding the whole stop operation.
 //
 // Returns:
 //   - error: An error if the server fails to stop
@@ -419,24 +500,123 @@ func (s *Server) Stop(ctx context.Context) error {
 		}
 	}
 
-	if s.muxHTTPListener != nil {
-		_ = s.muxHTTPListener.Close()
+	s.listenerMu.Lock()
+	muxHTTP := s.muxHTTPListener
+	s.muxHTTPListener = nil
+	muxBase := s.muxBaseListener
+	s.muxBaseListener = nil
+	s.listenerMu.Unlock()
+
+	if muxHTTP != nil {
+		_ = muxHTTP.Close()
 	}
-	if s.muxBaseListener != nil {
-		if errClose := s.muxBaseListener.Close(); errClose != nil && !errors.Is(errClose, net.ErrClosed) {
-			log.Debugf("failed to close shared listener: %v", errClose)
+	if muxBase != nil {
+		if errCloseBase := muxBase.Close(); errCloseBase != nil && !errors.Is(errCloseBase, net.ErrClosed) {
+			log.Debugf("failed to close shared listener: %v", errCloseBase)
 		}
 	}
 
-	// Shutdown the HTTP server.
-	errShutdown := s.server.Shutdown(ctx)
+	// Close the HTTP server. With a positive server.shutdown-timeout, drain
+	// in-flight requests for up to that many seconds first; otherwise close
+	// immediately without graceful draining.
+	var errCloseServer error
+	if s.server != nil {
+		drainTimeout := 0
+		if cfg := s.getConfig(); cfg != nil {
+			drainTimeout = cfg.ShutdownTimeoutSeconds
+		}
+		if drainTimeout > 0 {
+			// Bound the drain by the configured timeout even when the caller's
+			// context is more generous: shutdown must never hang longer than the
+			// operator chose. A tighter caller deadline still wins via parent ctx.
+			drainCtx, cancel := context.WithTimeout(ctx, time.Duration(drainTimeout)*time.Second)
+			defer cancel()
+			log.Debugf("draining HTTP connections for up to %ds", drainTimeout)
+			errShutdown := s.server.Shutdown(drainCtx)
+			if errShutdown != nil && !errors.Is(errShutdown, context.DeadlineExceeded) && !errors.Is(errShutdown, context.Canceled) {
+				errCloseServer = errShutdown
+			}
+		}
+		// Always force-close afterwards: this terminates anything that outlived
+		// the drain budget and is a no-op when Shutdown already returned cleanly.
+		// Hijacked connections (WebSocket sessions) are not tracked by the HTTP
+		// server; they are released by their own managers below.
+		if errClose := s.server.Close(); errClose != nil && !errors.Is(errClose, http.ErrServerClosed) && !errors.Is(errClose, net.ErrClosed) && errCloseServer == nil {
+			errCloseServer = errClose
+		}
+	}
 	if s.codexLiveHandler != nil {
 		s.codexLiveHandler.Close()
 	}
-	if errShutdown != nil {
-		return fmt.Errorf("failed to shutdown HTTP server: %v", errShutdown)
+	if s.tunnelHub != nil {
+		s.tunnelHub.Close()
+	}
+	var errUsage error
+	if s.isolatedUsage {
+		errUsage = s.stopUsageRequests()
+	}
+	if errCloseServer != nil {
+		return errors.Join(fmt.Errorf("failed to shutdown HTTP server: %w", errCloseServer), errUsage)
+	}
+	if errUsage != nil {
+		return errUsage
 	}
 
 	log.Debug("API server stopped")
+	return nil
+}
+
+// UsageStatistics returns the management history store selected for this server.
+func (s *Server) UsageStatistics() *usage.RequestStatistics {
+	if s == nil {
+		return nil
+	}
+	return s.mgmt.UsageStatistics()
+}
+
+func (s *Server) trackUsageRequests(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.usageRequestsMu.Lock()
+		if s.usageStopping {
+			s.usageRequestsMu.Unlock()
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		s.usageRequests++
+		s.usageRequestsMu.Unlock()
+		defer func() {
+			s.usageRequestsMu.Lock()
+			s.usageRequests--
+			flush := s.usageStopping && s.usageRequests == 0
+			s.usageRequestsMu.Unlock()
+			if flush {
+				if err := s.flushUsage(); err != nil {
+					log.WithError(err).Warn("usage: deferred shutdown save failed")
+				}
+			}
+		}()
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (s *Server) stopUsageRequests() error {
+	s.usageRequestsMu.Lock()
+	if s.usageStopping {
+		s.usageRequestsMu.Unlock()
+		return nil
+	}
+	s.usageStopping = true
+	pending := s.usageRequests
+	s.usageRequestsMu.Unlock()
+	if pending != 0 {
+		return nil // Immediate close: the last request to unwind owns the final save.
+	}
+	return s.flushUsage()
+}
+
+func (s *Server) flushUsage() error {
+	if err := s.UsageStatistics().Close(); err != nil {
+		return fmt.Errorf("persist usage history at shutdown: %w", err)
+	}
 	return nil
 }

@@ -87,7 +87,7 @@ func readOAuthReauthHistoryEventsFromFile(path, authName string, limit int) ([]o
 		limit = defaultOAuthReauthHistoryLimit
 	}
 
-	f, err := os.Open(path)
+	f, err := openAuditHistory(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return []oauthReauthHistoryEvent{}, nil
@@ -115,6 +115,12 @@ func readOAuthReauthHistoryEventsFromFile(path, authName string, limit int) ([]o
 		if !event.OccurredAt.IsZero() {
 			event.OccurredAt = event.OccurredAt.UTC()
 		}
+		event.Error = redactAuditHistoryText(event.Error)
+		for _, summary := range []*oauthReauthFileSummary{event.Before, event.After} {
+			if summary != nil {
+				summary.Label = redactAuditHistoryText(summary.Label)
+			}
+		}
 		events = append(events, event)
 	}
 	if err := scanner.Err(); err != nil {
@@ -131,7 +137,8 @@ func readOAuthReauthHistoryEventsFromFile(path, authName string, limit int) ([]o
 }
 
 func (h *Handler) ListOAuthReauthHistory(c *gin.Context) {
-	if h == nil || h.cfg == nil {
+	cfg := h.configSnapshot()
+	if cfg == nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "handler not initialized"})
 		return
 	}
@@ -148,9 +155,9 @@ func (h *Handler) ListOAuthReauthHistory(c *gin.Context) {
 		return
 	}
 
-	events, err := readOAuthReauthHistoryEventsFromFile(oauthReauthHistoryPath(h.cfg.AuthDir), authName, limit)
+	events, err := readOAuthReauthHistoryEventsFromFile(oauthReauthHistoryPath(cfg.AuthDir), authName, limit)
 	if err != nil {
-		log.WithError(err).Warn("management: read oauth reauth history failed")
+		log.Warn("management: read oauth reauth history failed")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read oauth reauth history"})
 		return
 	}

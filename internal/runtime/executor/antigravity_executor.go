@@ -1,132 +1,122 @@
-// Package executor provides runtime execution capabilities for various AI service providers.
-// This file implements the Antigravity executor that proxies requests to the antigravity
-// upstream using OAuth credentials.
 package executor
 
 import (
-	"context"
-	"crypto/tls"
-	"encoding/json"
+	"bytes"
 	"fmt"
-	"net/http"
+	"net/url"
 	"strings"
-	"sync"
-	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/cache"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
-	internalsignature "github.com/router-for-me/CLIProxyAPI/v7/internal/signature"
-	antigravityclaude "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/antigravity/claude"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
-	log "github.com/sirupsen/logrus"
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
+	"github.com/MoeForge/moego/json"
+	"github.com/MoeForge/moego/ojson"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 )
 
 const (
-	antigravityBaseURLDaily                = "https://daily-cloudcode-pa.googleapis.com"
-	antigravitySandboxBaseURLDaily         = "https://daily-cloudcode-pa.sandbox.googleapis.com"
-	antigravityBaseURLProd                 = "https://cloudcode-pa.googleapis.com"
-	antigravityCountTokensPath             = "/v1internal:countTokens"
-	antigravityStreamPath                  = "/v1internal:streamGenerateContent"
-	antigravityGeneratePath                = "/v1internal:generateContent"
-	antigravityClientID                    = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com"
-	antigravityClientSecret                = "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"
-	antigravityAuthType                    = "antigravity"
-	refreshSkew                            = 3000 * time.Second
-	antigravityCreditsHintRefreshInterval  = 10 * time.Minute
-	antigravityCreditsHintRefreshTimeout   = 5 * time.Second
-	antigravityShortQuotaCooldownThreshold = 5 * time.Minute
-	antigravityInstantRetryThreshold       = 3 * time.Second
-	// systemInstruction              = "You are Antigravity, a powerful agentic AI coding assistant designed by the Google Deepmind team working on Advanced Agentic Coding.You are pair programming with a USER to solve their coding task. The task may require creating a new codebase, modifying or debugging an existing codebase, or simply answering a question.**Absolute paths only****Proactiveness**"
+	antigravityCountTokensPath = "/v1internal:countTokens"
+	antigravityStreamPath      = "/v1internal:streamGenerateContent"
+	antigravityGeneratePath    = "/v1internal:generateContent"
+	antigravityAuthType        = "antigravity"
 )
 
-// AntigravityExecutor proxies requests to the antigravity upstream.
-type AntigravityExecutor struct {
-	cfg *config.Config
-}
+type AntigravityExecutor struct{ cfg *config.Config }
 
-// NewAntigravityExecutor creates a new Antigravity executor instance.
-//
-// Parameters:
-//   - cfg: The application configuration
-//
-// Returns:
-//   - *AntigravityExecutor: A new Antigravity executor instance
 func NewAntigravityExecutor(cfg *config.Config) *AntigravityExecutor {
 	return &AntigravityExecutor{cfg: cfg}
 }
-
-// antigravityTransport is a singleton HTTP/1.1 transport shared by all Antigravity requests.
-// It is initialized once via antigravityTransportOnce to avoid leaking a new connection pool
-// (and the goroutines managing it) on every request.
-var (
-	antigravityTransport     *http.Transport
-	antigravityTransportOnce sync.Once
-)
-
-func cloneTransportWithHTTP11(base *http.Transport) *http.Transport {
-	if base == nil {
-		return nil
+func (*AntigravityExecutor) Identifier() string         { return antigravityAuthType }
+func (e *AntigravityExecutor) SupportsApplyPatch() bool { return e != nil }
+func ResetAntigravityTransports()                       { helps.ResetProxyTransports() }
+func ensureAntigravityGeminiLeadingUserContent(modelName string, payload []byte) []byte {
+	if strings.Contains(strings.ToLower(modelName), "claude") {
+		return payload
 	}
-
-	clone := base.Clone()
-	clone.ForceAttemptHTTP2 = false
-	// Wipe TLSNextProto to prevent implicit HTTP/2 upgrade.
-	clone.TLSNextProto = make(map[string]func(authority string, c *tls.Conn) http.RoundTripper)
-	if clone.TLSClientConfig == nil {
-		clone.TLSClientConfig = &tls.Config{}
-	} else {
-		clone.TLSClientConfig = clone.TLSClientConfig.Clone()
-	}
-	// Actively advertise only HTTP/1.1 in the ALPN handshake.
-	clone.TLSClientConfig.NextProtos = []string{"http/1.1"}
-	return clone
+	return helps.EnsureGeminiLeadingUserContent(payload, "request.contents")
 }
 
-// initAntigravityTransport creates the shared HTTP/1.1 transport exactly once.
-func initAntigravityTransport() {
-	base, ok := http.DefaultTransport.(*http.Transport)
-	if !ok {
-		base = &http.Transport{}
+func ensureAntigravityGeminiLeadingUserContentDoc(modelName string, doc *ojson.Doc) bool {
+	if doc == nil || strings.Contains(strings.ToLower(modelName), "claude") {
+		return false
 	}
-	antigravityTransport = cloneTransportWithHTTP11(base)
+	return helps.EnsureGeminiLeadingUserContentDoc(doc, "request.contents")
 }
 
-// newAntigravityHTTPClient creates an HTTP client specifically for Antigravity,
-// enforcing HTTP/1.1 by disabling HTTP/2 to perfectly mimic Node.js https defaults.
-// The underlying Transport is a singleton to avoid leaking connection pools.
-func newAntigravityHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, timeout time.Duration) *http.Client {
-	antigravityTransportOnce.Do(initAntigravityTransport)
-
-	client := helps.NewProxyAwareHTTPClient(ctx, cfg, auth, timeout)
-	// If no transport is set, use the shared HTTP/1.1 transport.
-	if client.Transport == nil {
-		client.Transport = antigravityTransport
-		return client
+// ensureAntigravityGeminiTrailingUserContent appends a synthetic empty user turn
+// if the final turn is a model turn. Claude targets are left unchanged because
+// the adapter rejects empty text parts.
+func ensureAntigravityGeminiTrailingUserContent(modelName string, payload []byte) []byte {
+	if strings.Contains(strings.ToLower(modelName), "claude") {
+		return payload
 	}
-
-	// Preserve proxy settings from proxy-aware transports while forcing HTTP/1.1.
-	if transport, ok := client.Transport.(*http.Transport); ok {
-		client.Transport = cloneTransportWithHTTP11(transport)
-	}
-	return client
+	return helps.EnsureGeminiTrailingUserContent(payload, "request.contents")
 }
 
-func sanitizeAntigravityGeminiRequestSignatures(modelName string, rawJSON []byte) []byte {
-	if !antigravityUsesReasoningReplayCache(modelName) {
-		return rawJSON
+func ensureAntigravityGeminiTrailingUserContentDoc(modelName string, doc *ojson.Doc) bool {
+	if doc == nil || strings.Contains(strings.ToLower(modelName), "claude") {
+		return false
 	}
-	rawJSON = internalsignature.SanitizeGeminiRequestThoughtSignatures(rawJSON, "request.contents")
-	return normalizeAntigravityGeminiFunctionResponseRoles(rawJSON)
+	return helps.EnsureGeminiTrailingUserContentDoc(doc, "request.contents")
 }
 
+// ensureAntigravityGeminiBoundaryUserContent normalizes both leading and trailing
+// turns for Gemini targets. A trailing reasoning-only model turn is dropped first
+// so the request does not rely only on a synthetic empty user turn (#6530).
+// Claude targets are left unchanged.
+func ensureAntigravityGeminiBoundaryUserContent(modelName string, payload []byte) []byte {
+	if strings.Contains(strings.ToLower(modelName), "claude") {
+		return payload
+	}
+	payload = helps.DropGeminiTrailingThoughtOnlyContent(payload, "request.contents")
+	return helps.EnsureGeminiBoundaryUserContent(payload, "request.contents")
+}
+
+func ensureAntigravityGeminiBoundaryUserContentDoc(modelName string, doc *ojson.Doc) bool {
+	if doc == nil || strings.Contains(strings.ToLower(modelName), "claude") {
+		return false
+	}
+	changed := helps.DropGeminiTrailingThoughtOnlyContentDoc(doc, "request.contents")
+	if helps.EnsureGeminiBoundaryUserContentDoc(doc, "request.contents") {
+		changed = true
+	}
+	return changed
+}
+
+type antigravityContentEdit struct {
+	index       int64
+	path        string
+	start       int
+	end         int
+	replacement []byte
+}
+
+func normalizeAntigravityGeminiFunctionResponseRolesDoc(doc *ojson.Doc) bool {
+	if doc == nil {
+		return false
+	}
+	contents := doc.Get("request.contents")
+	if !contents.IsArray() {
+		return false
+	}
+	wrapped := []byte(`{"request":{"contents":` + contents.Raw + `}}`)
+	normalized := normalizeAntigravityGeminiFunctionResponseRoles(wrapped)
+	if bytes.Equal(normalized, wrapped) {
+		return false
+	}
+	updatedContents := util.GetGJSONBytesNoCopy(normalized, "request.contents")
+	if !updatedContents.IsArray() || updatedContents.Raw == contents.Raw {
+		return false
+	}
+	return doc.SetRawBytes("request.contents", []byte(updatedContents.Raw)) == nil
+}
+
+// normalizeAntigravityGeminiFunctionResponseRoles edits each response turn in
+// isolation, then splices all changed turns into the request with one body copy.
+// Applying SJSON once per field made large histories scale with history size
+// multiplied by the number of tool turns.
 func normalizeAntigravityGeminiFunctionResponseRoles(rawJSON []byte) []byte {
 	rawJSON = repairAntigravityGeminiFunctionResponseNames(rawJSON)
-	contents := gjson.GetBytes(rawJSON, "request.contents")
+	contents := util.GetGJSONBytesNoCopy(rawJSON, "request.contents")
 	if !contents.IsArray() {
 		return rawJSON
 	}
@@ -134,18 +124,23 @@ func normalizeAntigravityGeminiFunctionResponseRoles(rawJSON []byte) []byte {
 		id   string
 		name string
 	}
-	out := rawJSON
+
+	edits := make([]antigravityContentEdit, 0)
 	var pending []functionRef
-	for contentIndex, content := range contents.Array() {
+	validOffsets := true
+	contents.ForEach(func(contentIndex, content ojson.Result) bool {
 		parts := content.Get("parts")
-		if !parts.IsArray() || len(parts.Array()) == 0 {
+		if !parts.IsArray() {
 			pending = nil
-			continue
+			return true
 		}
+
 		var calls, responses []functionRef
-		var responseParts []json.RawMessage
+		var responseParts, otherParts []json.RawMessage
+		partCount := 0
 		hasOtherPart := false
-		parts.ForEach(func(_, part gjson.Result) bool {
+		parts.ForEach(func(_, part ojson.Result) bool {
+			partCount++
 			switch {
 			case part.Get("functionCall").Exists():
 				calls = append(calls, functionRef{id: part.Get("functionCall.id").String(), name: part.Get("functionCall.name").String()})
@@ -154,75 +149,160 @@ func normalizeAntigravityGeminiFunctionResponseRoles(rawJSON []byte) []byte {
 				responseParts = append(responseParts, json.RawMessage(part.Raw))
 			default:
 				hasOtherPart = true
+				otherParts = append(otherParts, json.RawMessage(part.Raw))
 			}
 			return true
 		})
+		if partCount == 0 {
+			pending = nil
+			return true
+		}
 		if len(calls) > 0 && len(responses) == 0 {
 			pending = calls
-			continue
+			return true
 		}
 		if len(responses) == 0 {
 			if hasOtherPart {
 				pending = nil
 			}
-			continue
+			return true
 		}
-		if hasOtherPart || len(calls) > 0 {
+		if len(calls) > 0 {
 			pending = nil
-			continue
+			return true
 		}
 
-		if len(pending) == len(responses) {
-			ordered := make([]json.RawMessage, 0, len(responseParts))
+		var contentDoc *ojson.Doc
+		contentChanged := false
+		if len(pending) > 0 && len(responses) > 0 {
+			ordered := make([]json.RawMessage, 0, partCount)
 			used := make([]bool, len(responses))
 			for _, call := range pending {
-				matched := -1
 				for responseIndex, response := range responses {
 					if used[responseIndex] {
 						continue
 					}
 					if (call.id != "" && response.id == call.id) || (call.id == "" && call.name != "" && response.name == call.name) {
-						matched = responseIndex
+						used[responseIndex] = true
+						ordered = append(ordered, responseParts[responseIndex])
 						break
 					}
 				}
-				if matched < 0 {
-					ordered = nil
-					break
+			}
+			for responseIndex := range responses {
+				if !used[responseIndex] {
+					ordered = append(ordered, responseParts[responseIndex])
 				}
-				used[matched] = true
-				ordered = append(ordered, responseParts[matched])
 			}
 			if len(ordered) == len(responseParts) {
-				if encoded, errMarshal := json.Marshal(ordered); errMarshal == nil {
-					if updated, errSet := sjson.SetRawBytes(out, fmt.Sprintf("request.contents.%d.parts", contentIndex), encoded); errSet == nil {
-						out = updated
+				ordered = append(ordered, otherParts...)
+				encoded, errMarshal := json.Marshal(ordered)
+				if errMarshal == nil && !bytes.Equal(encoded, []byte(parts.Raw)) {
+					contentDoc = ojson.NewDoc([]byte(content.Raw))
+					if errSet := contentDoc.SetRawBytes("parts", encoded); errSet == nil {
+						contentChanged = true
 					}
 				}
 			}
 		}
 		pending = nil
-		if content.Get("role").String() != "model" {
-			if updated, errSet := sjson.SetBytes(out, fmt.Sprintf("request.contents.%d.role", contentIndex), "model"); errSet == nil {
-				out = updated
+		if !hasOtherPart && content.Get("role").String() != "model" {
+			if contentDoc == nil {
+				contentDoc = ojson.NewDoc([]byte(content.Raw))
+			}
+			if errSet := contentDoc.Set("role", "model"); errSet == nil {
+				contentChanged = true
 			}
 		}
-	}
-	return out
+		if !contentChanged || contentDoc == nil {
+			return true
+		}
+		contentJSON := contentDoc.Bytes()
+
+		start := content.Index
+		end := start + len(content.Raw)
+		if start < 0 || end < start || end > len(rawJSON) || !bytes.Equal(rawJSON[start:end], []byte(content.Raw)) {
+			validOffsets = false
+		}
+		edits = append(edits, antigravityContentEdit{
+			index:       contentIndex.Int(),
+			start:       start,
+			end:         end,
+			replacement: contentJSON,
+		})
+		return true
+	})
+	return applyAntigravityIndexedEdits(rawJSON, edits, validOffsets)
 }
 
+// applyAntigravityIndexedEdits splices collected JSON fragments into the original
+// request with one body copy. Applying SJSON once per field made large histories
+// scale with history size multiplied by the number of edits.
+func applyAntigravityIndexedEdits(rawJSON []byte, edits []antigravityContentEdit, validOffsets bool) []byte {
+	if len(edits) == 0 {
+		return rawJSON
+	}
+	if !validOffsets || !ojson.ValidBytes(rawJSON) {
+		return applyAntigravityContentEditsWithSJSON(rawJSON, edits)
+	}
+
+	finalSize := len(rawJSON)
+	cursor := 0
+	for _, edit := range edits {
+		if edit.start < cursor {
+			return applyAntigravityContentEditsWithSJSON(rawJSON, edits)
+		}
+		finalSize += len(edit.replacement) - (edit.end - edit.start)
+		if finalSize < 0 {
+			return applyAntigravityContentEditsWithSJSON(rawJSON, edits)
+		}
+		cursor = edit.end
+	}
+	out := make([]byte, 0, finalSize)
+	cursor = 0
+	for _, edit := range edits {
+		out = append(out, rawJSON[cursor:edit.start]...)
+		out = append(out, edit.replacement...)
+		cursor = edit.end
+	}
+	return append(out, rawJSON[cursor:]...)
+}
+
+// applyAntigravityContentEditsWithSJSON preserves the legacy path semantics if
+// a GJSON result cannot be proven to point into the original request bytes.
+func applyAntigravityContentEditsWithSJSON(rawJSON []byte, edits []antigravityContentEdit) []byte {
+	doc := ojson.NewDoc(rawJSON)
+	changed := false
+	for _, edit := range edits {
+		path := edit.path
+		if path == "" {
+			path = fmt.Sprintf("request.contents.%d", edit.index)
+		}
+		if errSet := doc.SetRawBytes(path, edit.replacement); errSet == nil {
+			changed = true
+		}
+	}
+	if !changed {
+		return rawJSON
+	}
+	return doc.Bytes()
+}
+
+// repairAntigravityGeminiFunctionResponseNames copies missing or placeholder
+// functionResponse names from the matching functionCall. Edits are applied to
+// each part in isolation, then spliced into the request with one body copy.
 func repairAntigravityGeminiFunctionResponseNames(rawJSON []byte) []byte {
-	contents := gjson.GetBytes(rawJSON, "request.contents")
+	contents := util.GetGJSONBytesNoCopy(rawJSON, "request.contents")
 	if !contents.IsArray() {
 		return rawJSON
 	}
 	callIDToName := make(map[string]string)
-	contents.ForEach(func(_, content gjson.Result) bool {
+	contents.ForEach(func(_, content ojson.Result) bool {
 		parts := content.Get("parts")
 		if !parts.IsArray() {
 			return true
 		}
-		parts.ForEach(func(_, part gjson.Result) bool {
+		parts.ForEach(func(_, part ojson.Result) bool {
 			fc := part.Get("functionCall")
 			if fc.Exists() {
 				id := strings.TrimSpace(fc.Get("id").String())
@@ -239,200 +319,72 @@ func repairAntigravityGeminiFunctionResponseNames(rawJSON []byte) []byte {
 		return rawJSON
 	}
 
-	out := rawJSON
-	contents.ForEach(func(contentIdx, content gjson.Result) bool {
+	edits := make([]antigravityContentEdit, 0)
+	validOffsets := true
+	contents.ForEach(func(contentIdx, content ojson.Result) bool {
 		parts := content.Get("parts")
 		if !parts.IsArray() {
 			return true
 		}
-		parts.ForEach(func(partIdx, part gjson.Result) bool {
+		parts.ForEach(func(partIdx, part ojson.Result) bool {
 			fr := part.Get("functionResponse")
-			if fr.Exists() {
-				id := strings.TrimSpace(fr.Get("id").String())
-				name := strings.TrimSpace(fr.Get("name").String())
-				if id != "" && (name == "" || name == "unknown") {
-					if realName, ok := callIDToName[id]; ok {
-						path := fmt.Sprintf("request.contents.%d.parts.%d.functionResponse.name", contentIdx.Int(), partIdx.Int())
-						if updated, errSet := sjson.SetBytes(out, path, realName); errSet == nil {
-							out = updated
-						}
-					}
-				}
+			if !fr.Exists() {
+				return true
 			}
+			id := strings.TrimSpace(fr.Get("id").String())
+			name := strings.TrimSpace(fr.Get("name").String())
+			if id == "" || (name != "" && name != "unknown") {
+				return true
+			}
+			realName, ok := callIDToName[id]
+			if !ok {
+				return true
+			}
+			updatedPart, errSet := ojson.SetBytes([]byte(part.Raw), "functionResponse.name", realName)
+			if errSet != nil {
+				return true
+			}
+			start := part.Index
+			end := start + len(part.Raw)
+			if start < 0 || end < start || end > len(rawJSON) || !bytes.Equal(rawJSON[start:end], []byte(part.Raw)) {
+				validOffsets = false
+			}
+			edits = append(edits, antigravityContentEdit{
+				index:       contentIdx.Int(),
+				path:        fmt.Sprintf("request.contents.%d.parts.%d", contentIdx.Int(), partIdx.Int()),
+				start:       start,
+				end:         end,
+				replacement: updatedPart,
+			})
 			return true
 		})
 		return true
 	})
-	return out
+	return applyAntigravityIndexedEdits(rawJSON, edits, validOffsets)
 }
 
-func validateAntigravityRequestSignatures(ctx context.Context, modelName string, from sdktranslator.Format, rawJSON []byte) ([]byte, error) {
-	if from.String() != "claude" {
-		return rawJSON, nil
-	}
-	before := countClaudeThinkingBlocks(rawJSON)
-	if antigravityUsesReasoningReplayCache(modelName) {
-		rawJSON = antigravityclaude.StripInvalidGeminiSignatureThinkingBlocks(rawJSON)
-		logAntigravitySignatureStrip(before, countClaudeThinkingBlocks(rawJSON), "provider_cleanup", "empty_or_non_gemini_signature")
-		return rawJSON, nil
-	}
-	// Claude models accept only Claude-format thinking signatures.
-	rawJSON = antigravityclaude.StripEmptySignatureThinkingBlocks(rawJSON)
-	logAntigravitySignatureStrip(before, countClaudeThinkingBlocks(rawJSON), "prefix_cleanup", "empty_or_non_claude_signature")
-	if cache.SignatureCacheEnabled() {
-		return rawJSON, nil
-	}
-	if !cache.SignatureBypassStrictMode() {
-		// Non-strict bypass: let the translator handle invalid signatures
-		// by dropping unsigned thinking blocks silently (no 400).
-		return rawJSON, nil
-	}
-	// Fork increment: in strict bypass mode, reject requests carrying invalid
-	// Claude/Antigravity thinking-block signatures with a 400 instead of silently
-	// stripping them, so callers learn their signatures are wrong.
-	if err := antigravityclaude.ValidateClaudeBypassSignatures(rawJSON); err != nil {
-		return rawJSON, statusErr{code: http.StatusBadRequest, msg: err.Error()}
-	}
-	return rawJSON, nil
-}
-
-func hasAntigravityClaudeTypedWebSearchTool(payload []byte) bool {
-	tools := gjson.GetBytes(payload, "tools")
-	if !tools.IsArray() {
+func antigravitySameRedirectOrigin(a, b *url.URL) bool {
+	if a == nil || b == nil || a.Hostname() == "" || b.Hostname() == "" {
 		return false
 	}
-	for _, tool := range tools.Array() {
-		switch tool.Get("type").String() {
-		case "web_search_20250305", "web_search_20260209":
-			return true
-		}
-	}
-	return false
+	return strings.EqualFold(a.Scheme, b.Scheme) &&
+		strings.EqualFold(a.Hostname(), b.Hostname()) &&
+		antigravityRedirectOriginPort(a) == antigravityRedirectOriginPort(b)
 }
 
-func hasAntigravityGoogleSearchTool(payload []byte) bool {
-	tools := gjson.GetBytes(payload, "request.tools")
-	if !tools.IsArray() {
-		return false
+func antigravityRedirectOriginPort(u *url.URL) string {
+	if u == nil {
+		return ""
 	}
-	for _, tool := range tools.Array() {
-		if tool.Get("googleSearch").Exists() {
-			return true
-		}
+	if port := u.Port(); port != "" {
+		return port
 	}
-	return false
-}
-
-func shouldResolveAntigravityWebSearchGroundingURLs(from sdktranslator.Format, originalRequestRawJSON, requestRawJSON []byte) bool {
-	return from.String() == "claude" &&
-		hasAntigravityClaudeTypedWebSearchTool(originalRequestRawJSON) &&
-		hasAntigravityGoogleSearchTool(requestRawJSON)
-}
-
-func (e *AntigravityExecutor) resolveWebSearchGroundingURLs(ctx context.Context, auth *cliproxyauth.Auth, from sdktranslator.Format, originalRequestRawJSON, requestRawJSON, responseRawJSON []byte) []byte {
-	if !shouldResolveAntigravityWebSearchGroundingURLs(from, originalRequestRawJSON, requestRawJSON) {
-		return responseRawJSON
+	switch strings.ToLower(u.Scheme) {
+	case "http":
+		return "80"
+	case "https":
+		return "443"
+	default:
+		return ""
 	}
-	return helps.ResolveAntigravityGroundingURLs(ctx, e.cfg, auth, responseRawJSON)
-}
-
-func countClaudeThinkingBlocks(rawJSON []byte) int {
-	messages := gjson.GetBytes(rawJSON, "messages")
-	if !messages.IsArray() {
-		return 0
-	}
-
-	count := 0
-	messages.ForEach(func(_, message gjson.Result) bool {
-		content := message.Get("content")
-		if !content.IsArray() {
-			return true
-		}
-		content.ForEach(func(_, part gjson.Result) bool {
-			if part.Get("type").String() == "thinking" {
-				count++
-			}
-			return true
-		})
-		return true
-	})
-	return count
-}
-
-func logAntigravitySignatureStrip(before, after int, stage, reason string) {
-	removed := before - after
-	if removed <= 0 {
-		return
-	}
-	log.WithFields(log.Fields{
-		"component":       "signature_sanitizer",
-		"executor":        "antigravity",
-		"target_provider": "claude",
-		"action":          "drop_thinking_blocks",
-		"stage":           stage,
-		"reason":          reason,
-		"count":           removed,
-	}).Debug("antigravity executor: dropped Claude thinking blocks with invalid signatures")
-}
-
-// Identifier returns the executor identifier.
-func (e *AntigravityExecutor) Identifier() string { return antigravityAuthType }
-
-// PrepareRequest injects Antigravity credentials into the outgoing HTTP request.
-func (e *AntigravityExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Auth) error {
-	if req == nil {
-		return nil
-	}
-	token, _, errToken := e.ensureAccessToken(req.Context(), auth)
-	if errToken != nil {
-		return errToken
-	}
-	if strings.TrimSpace(token) == "" {
-		return statusErr{code: http.StatusUnauthorized, msg: "missing access token"}
-	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	var attrs map[string]string
-	if auth != nil {
-		attrs = auth.Attributes
-	}
-	util.ApplyCustomHeadersFromAttrs(req, attrs)
-	return nil
-}
-
-// HttpRequest injects Antigravity credentials into the request and executes it.
-// It uses a whitelist approach: all incoming headers are stripped and only
-// the minimum set required by the Antigravity protocol is explicitly set.
-func (e *AntigravityExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth, req *http.Request) (*http.Response, error) {
-	if req == nil {
-		return nil, fmt.Errorf("antigravity executor: request is nil")
-	}
-	if ctx == nil {
-		ctx = req.Context()
-	}
-	httpReq := req.WithContext(ctx)
-
-	// --- Whitelist: save only the headers we need from the original request ---
-	contentType := httpReq.Header.Get("Content-Type")
-
-	// Wipe ALL incoming headers
-	for k := range httpReq.Header {
-		delete(httpReq.Header, k)
-	}
-
-	// --- Set only the headers Antigravity actually sends ---
-	if contentType != "" {
-		httpReq.Header.Set("Content-Type", contentType)
-	}
-	// Content-Length is managed automatically by Go's http.Client from the Body
-	httpReq.Header.Set("User-Agent", resolveUserAgent(auth))
-	httpReq.Close = true // sends Connection: close
-
-	// Inject Authorization: Bearer <token>
-	if err := e.PrepareRequest(httpReq, auth); err != nil {
-		return nil, err
-	}
-
-	ctx = helps.WithRuntimeTransportHostFromRequest(ctx, httpReq)
-	httpClient := newAntigravityHTTPClient(ctx, e.cfg, auth, 0)
-	return httpClient.Do(httpReq)
 }

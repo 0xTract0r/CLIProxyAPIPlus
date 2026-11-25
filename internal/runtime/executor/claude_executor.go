@@ -3,160 +3,132 @@ package executor
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"net/http"
-	"net/url"
 	"strings"
-	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
-	sigcompat "github.com/router-for-me/CLIProxyAPI/v7/internal/signature"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	"github.com/MoeForge/moego/ojson"
+	claudeauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/claude"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	responsesclaude "github.com/router-for-me/CLIProxyAPI/v8/internal/translator/claude/openai/responses"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 	log "github.com/sirupsen/logrus"
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
 )
 
-// ClaudeExecutor is a stateless executor for Anthropic Claude over the messages API.
-// If api_key is unavailable on auth, it falls back to legacy via ClientAdapter.
 type ClaudeExecutor struct {
 	cfg                     *config.Config
 	requestLogProvider      string
 	upstreamModelNormalizer func(string) string
-	// authManager wires the auth manager so the per-account claude client
-	// device-profile high-water can be persisted into the auth record
-	// (auth.Metadata[claude_device_high_water]). Without a manager the high-water
-	// write-back degrades to a no-op.
-	authManager *cliproxyauth.Manager
+	// Kept for the old detached tool-state helper while its retirement is reviewed.
 }
 
-// claudeToolPrefix is empty to match real Claude Code behavior (no tool name prefix).
-// Previously "proxy_" was used but this is a detectable fingerprint difference.
-const claudeToolPrefix = ""
-
-func shouldSanitizeClaudeMessagesForUpstream(baseModel string) bool {
-	return sigcompat.SignatureProviderFromModelName(baseModel) == sigcompat.SignatureProviderClaude
-}
-
-func sanitizeClaudeMessagesForClaudeUpstreamWithDebug(ctx context.Context, body []byte, baseModel string) []byte {
-	sanitized := body
-	if shouldSanitizeClaudeMessagesForUpstream(baseModel) {
-		var report sigcompat.SignatureSanitizeReport
-		sanitized, report = sigcompat.SanitizeClaudeMessagesForClaudeUpstream(body, baseModel)
-		logClaudeSignatureSanitizeReport(ctx, baseModel, report)
-	}
-	return sanitizeClaudeWebSearchDomains(sanitized)
-}
-
-// sanitizeClaudeWebSearchDomains removes empty allowed_domains/blocked_domains
-// arrays from built-in web_search tools. Some clients (e.g. litellm) emit an
-// empty array instead of omitting the field, and Anthropic rejects it with
-// "Empty list of domains is ambiguous. Provide at least one domain or null.".
-// Deleting the key is equivalent to leaving it unset.
-func sanitizeClaudeWebSearchDomains(body []byte) []byte {
-	tools := gjson.GetBytes(body, "tools")
-	if !tools.Exists() || !tools.IsArray() {
-		return body
-	}
-	tools.ForEach(func(index, tool gjson.Result) bool {
-		if !strings.HasPrefix(tool.Get("type").String(), "web_search_") {
-			return true
-		}
-		for _, field := range []string{"allowed_domains", "blocked_domains"} {
-			value := tool.Get(field)
-			if value.Exists() && value.IsArray() && len(value.Array()) == 0 {
-				path := fmt.Sprintf("tools.%d.%s", index.Int(), field)
-				if updated, errDelete := sjson.DeleteBytes(body, path); errDelete == nil {
-					body = updated
-				}
-			}
-		}
-		return true
-	})
-	return body
-}
-
-func logClaudeSignatureSanitizeReport(ctx context.Context, baseModel string, report sigcompat.SignatureSanitizeReport) {
-	if report.DroppedBlocks == 0 && report.DroppedSignatures == 0 && report.ReplacedSignatures == 0 {
-		return
-	}
-
-	fields := log.Fields{
-		"component":           "signature_sanitizer",
-		"executor":            "claude",
-		"action":              "sanitize_claude_messages",
-		"target_provider":     string(report.TargetProvider),
-		"target_model":        baseModel,
-		"preserved":           report.Preserved,
-		"dropped_blocks":      report.DroppedBlocks,
-		"dropped_signatures":  report.DroppedSignatures,
-		"replaced_signatures": report.ReplacedSignatures,
-	}
-	if len(report.Decisions) > 0 {
-		decision := report.Decisions[0]
-		fields["first_block_kind"] = string(decision.BlockKind)
-		fields["first_detected_provider"] = string(decision.DetectedProvider)
-		fields["first_reason"] = decision.Reason
-	}
-
-	helps.LogWithRequestID(ctx).WithFields(fields).Debug("claude executor: sanitized signature history before upstream")
-}
-
-// oauthToolRenameMap maps OpenCode-style (lowercase) tool names to Claude Code-style
-// (TitleCase) names. Anthropic uses tool name fingerprinting to detect third-party
-// clients on OAuth traffic. Renaming to official names avoids extra-usage billing.
-// All tools are mapped to TitleCase equivalents to match Claude Code naming patterns.
-var oauthToolRenameMap = map[string]string{
-	"bash":         "Bash",
-	"read":         "Read",
-	"write":        "Write",
-	"edit":         "Edit",
-	"glob":         "Glob",
-	"grep":         "Grep",
-	"task":         "Task",
-	"webfetch":     "WebFetch",
-	"todowrite":    "TodoWrite",
-	"question":     "Question",
-	"skill":        "Skill",
-	"ls":           "LS",
-	"todoread":     "TodoRead",
-	"notebookedit": "NotebookEdit",
-}
-
-// The reverse map is now computed per-request in remapOAuthToolNames so that
-// only names the client actually caused us to rewrite are restored on the
-// response. A global reverse map — as used previously — corrupted responses
-// for clients that sent mixed casing (e.g. Amp CLI sends `Bash` TitleCase
-// alongside `glob` lowercase; the request flagged renames via `glob→Glob`,
-// then the global reverse map incorrectly rewrote every `Bash` in the
-// response to `bash`, causing Amp to reject the tool_use as unknown).
-
-// oauthToolsToRemove lists tool names that must be stripped from OAuth requests
-// even after remapping. Currently empty — all tools are mapped instead of removed.
-var oauthToolsToRemove = map[string]bool{}
-
-// Anthropic-compatible upstreams may reject or even crash when Claude models
-// omit max_tokens. Prefer registered model metadata before using a fallback.
 const defaultModelMaxTokens = 1024
-
-const claudeClientSafeTransportErrorMessage = "upstream transport error"
 
 func NewClaudeExecutor(cfg *config.Config) *ClaudeExecutor { return &ClaudeExecutor{cfg: cfg} }
 
-// NewClaudeExecutorWithManager wires the auth manager so the per-account claude
-// client device-profile high-water can be persisted into the auth record
-// (auth.Metadata[claude_device_high_water]). Without a manager the high-water
-// write-back degrades to a no-op, preserving the prior in-memory-only behavior
-// for any caller still using NewClaudeExecutor.
-func NewClaudeExecutorWithManager(cfg *config.Config, manager *cliproxyauth.Manager) *ClaudeExecutor {
-	return &ClaudeExecutor{cfg: cfg, authManager: manager}
+// NewClaudeExecutorWithManager retains service registration compatibility.
+func NewClaudeExecutorWithManager(cfg *config.Config, _ *cliproxyauth.Manager) *ClaudeExecutor {
+	return NewClaudeExecutor(cfg)
+}
+func (e *ClaudeExecutor) Identifier() string       { return "claude" }
+func (e *ClaudeExecutor) SupportsApplyPatch() bool { return e != nil }
+
+func stripTranslatedDefaultMaxTokens(from sdktranslator.Format, originalPayload, originalTranslated []byte) []byte {
+	if len(originalTranslated) == 0 || from == sdktranslator.FormatClaude {
+		return originalTranslated
+	}
+	hasExplicitMaxTokens := func(paths ...string) bool {
+		for _, path := range paths {
+			if v := ojson.GetBytesNoCopy(originalPayload, path); v.Exists() && v.Type != ojson.Null {
+				return true
+			}
+		}
+		return false
+	}
+	switch from {
+	case sdktranslator.FormatOpenAI:
+		if hasExplicitMaxTokens("max_tokens", "max_completion_tokens") {
+			return originalTranslated
+		}
+	case sdktranslator.FormatOpenAIResponse:
+		if hasExplicitMaxTokens("max_output_tokens") {
+			return originalTranslated
+		}
+	case sdktranslator.FormatGemini:
+		if hasExplicitMaxTokens("generationConfig.maxOutputTokens") {
+			return originalTranslated
+		}
+	default:
+		return originalTranslated
+	}
+	stripped, errDelete := ojson.DeleteBytes(originalTranslated, "max_tokens")
+	if errDelete != nil {
+		return originalTranslated
+	}
+	return stripped
 }
 
-func (e *ClaudeExecutor) Identifier() string { return "claude" }
+func (e ClaudeExecutor) WithConfig(cfg *config.Config) *ClaudeExecutor {
+	e.cfg = cfg
+	return &e
+}
 
-func (e *ClaudeExecutor) SupportsHTTPAttemptGate() bool { return true }
+func (e *ClaudeExecutor) SupportsNativeToolSearch(auth *cliproxyauth.Auth, upstreamModel string) bool {
+	return e.supportsNativeToolSearch(responsesclaude.ClientToolSearchEnabled(), auth, upstreamModel)
+}
+
+func (e *ClaudeExecutor) supportsNativeToolSearch(toolSearch bool, auth *cliproxyauth.Auth, upstreamModel string) bool {
+	if !toolSearch || helps.ClaudeModelLacksToolSearch(upstreamModel) {
+		return false
+	}
+	_, baseURL, _ := ordinaryClaudeCredential(auth)
+	if isAnthropicUpstreamBase(baseURL) {
+		return true
+	}
+	if auth != nil && auth.Attributes != nil && strings.EqualFold(strings.TrimSpace(auth.Attributes["native_tool_search"]), "true") {
+		return true
+	}
+	entry := matchOrdinaryClaudeKey(e.cfg, auth)
+	return entry != nil && entry.NativeToolSearch
+}
+
+// Pin the public tool-search setting for the request and its response translation.
+// A reload may occur while the HTTP round trip is in progress.
+func pinOrdinaryClaudeToolSearch(ctx context.Context, source sdktranslator.Format) context.Context {
+	if source != sdktranslator.FormatOpenAIResponse {
+		return ctx
+	}
+	return responsesclaude.WithClientToolSearch(ctx, responsesclaude.ClientToolSearchEnabledFor(ctx))
+}
+
+func (e *ClaudeExecutor) applyNativeToolSearchFallback(ctx context.Context, auth *cliproxyauth.Auth, from sdktranslator.Format, upstreamModel string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (context.Context, cliproxyexecutor.Request, cliproxyexecutor.Options) {
+	if from != sdktranslator.FormatOpenAIResponse {
+		return ctx, req, opts
+	}
+	toolSearch := responsesclaude.ClientToolSearchEnabledFor(ctx)
+	ctx = responsesclaude.WithClientToolSearch(ctx, toolSearch)
+	if !toolSearch {
+		return ctx, req, opts
+	}
+	if !helps.ResponsesHasToolSearch(req.Payload) && !helps.ResponsesHasToolSearch(opts.OriginalRequest) {
+		return ctx, req, opts
+	}
+	if e.supportsNativeToolSearch(toolSearch, auth, upstreamModel) {
+		return ctx, req, opts
+	}
+	req.Payload = helps.StripResponsesToolSearch(req.Payload)
+	if len(opts.OriginalRequest) > 0 {
+		opts.OriginalRequest = helps.StripResponsesToolSearch(opts.OriginalRequest)
+	}
+	log.Debugf("claude executor: native tool search unavailable, removed tool_search from request (model=%s)", upstreamModel)
+	return ctx, req, opts
+}
+
+func (e *ClaudeExecutor) modelLevelCooling() bool {
+	return e != nil && e.cfg != nil && e.cfg.Claude.ModelLevelCooling
+}
 
 func (e *ClaudeExecutor) upstreamRequestLogProvider() string {
 	if provider := strings.TrimSpace(e.requestLogProvider); provider != "" {
@@ -205,190 +177,149 @@ func restoreClaudeResponseModel(payload []byte, model string) []byte {
 }
 
 func setClaudeResponseModel(payload []byte, model string) ([]byte, bool) {
-	if !gjson.ValidBytes(payload) {
+	if !ojson.ValidBytes(payload) {
 		return payload, false
 	}
-	updated := payload
+	doc := ojson.NewDoc(payload)
 	changed := false
 	for _, path := range []string{"model", "message.model"} {
-		if !gjson.GetBytes(updated, path).Exists() {
+		if !doc.Get(path).Exists() {
 			continue
 		}
-		next, errSet := sjson.SetBytes(updated, path, model)
-		if errSet != nil {
-			continue
+		if errSet := doc.Set(path, model); errSet == nil {
+			changed = true
 		}
-		updated = next
-		changed = true
 	}
-	return updated, changed
+	if !changed {
+		return payload, false
+	}
+	return doc.Bytes(), true
 }
 
-func claudeUpstreamTransportError(err error) error {
-	if err == nil {
-		return nil
-	}
-	return statusErr{code: http.StatusBadGateway, msg: claudeClientSafeTransportErrorMessage}
-}
-
-func newClaudeStatusErr(statusCode int, body []byte, headers http.Header, now time.Time) statusErr {
-	err := statusErr{code: statusCode, msg: string(body)}
-	if retryAfter := parseUsageLimitRetryAfter(statusCode, body, headers, now); retryAfter != nil {
-		err.retryAfter = retryAfter
-	}
-	return err
-}
-
-// PrepareRequest injects Claude credentials into the outgoing HTTP request.
 func (e *ClaudeExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Auth) error {
-	if req == nil {
-		return nil
+	if req == nil || req.URL == nil {
+		return statusErr{code: http.StatusBadRequest, msg: "invalid Claude SDK request", requestScoped: true}
 	}
-	apiKey, _ := claudeCreds(auth)
-	if strings.TrimSpace(apiKey) == "" {
-		return nil
+	if err := e.rejectUnsupportedClaudeRequest(auth); err != nil {
+		return err
 	}
-	deviceProfile := helps.ResolveClaudeDeviceProfile(auth, apiKey, req.Header, e.cfg)
-	if helps.ClaudeDeviceProfileStabilizationEnabled(e.cfg) {
-		helps.ApplyClaudeDeviceProfileHeaders(req, deviceProfile)
-		// Fold the applied device-profile high-water User-Agent suffix entrypoint
-		// (sdk-cli -> cli, gated by config.NormalizeSdkCliEntrypointEnabled) so this
-		// background quota/oauth token-endpoint egress — the GET /api/oauth/profile
-		// and /api/oauth/usage snapshot lookups reaching here via
-		// quota_snapshots.go fetchQuotaJSON -> exec.HttpRequest — presents the same
-		// "(external, cli)" suffix as the serving path
-		// (helps.AlignClaudeDeviceProfileUserAgentSuffix) and the refresh/reauth
-		// token-endpoint paths (helps.NormalizeClaudeUserAgentEntrypoint). Unlike
-		// serving there is no inbound client UA to mirror here (this is a sessionless
-		// background call; ginHeaders is nil below), so the frozen high-water suffix
-		// — which a single `claude --print` can seed to "sdk-cli" — is folded in
-		// place, exactly as the refresh/reauth high-water is folded before injection.
-		// Only the parenthetical entrypoint field is rewritten; the high-water
-		// "claude-cli/<version>" prefix is preserved. The fold is a no-op when the
-		// gate is disabled, the suffix entrypoint is not sdk-cli, or the applied UA
-		// has no parenthetical block.
-		if ua := req.Header.Get("User-Agent"); ua != "" {
-			if folded := helps.NormalizeClaudeUserAgentEntrypoint(e.cfg, ua); folded != ua {
-				req.Header.Set("User-Agent", folded)
-			}
-		}
+	if auth != nil && auth.Disabled {
+		return statusErr{code: http.StatusForbidden, msg: "Claude credential is disabled", requestScoped: true}
 	}
-	// claude 版本高水位持久化：ResolveClaudeDeviceProfile 已把本次合法候选记入内存观测
-	// （伪造超高版本在 sanity-ceiling gate 已被丢弃，不会进入观测）。这里把当前账号的
-	// 观测高水位三元组透出给 auth manager，由 RaiseClaudeDeviceHighWater 做"仅单调抬升才
-	// 写盘"。无 manager 时降级为 no-op，不破坏 NewClaudeExecutor 调用方。
-	e.persistClaudeDeviceHighWater(auth, apiKey)
-	useAPIKey := auth != nil && auth.Attributes != nil && strings.TrimSpace(auth.Attributes["api_key"]) != ""
-	isAnthropicBase := req.URL != nil && strings.EqualFold(req.URL.Scheme, "https") && strings.EqualFold(req.URL.Host, "api.anthropic.com")
-	if isAnthropicBase && useAPIKey {
-		req.Header.Del("Authorization")
-		req.Header.Set("x-api-key", apiKey)
+	key, base, bearer := ordinaryClaudeCredential(auth)
+	if key == "" {
+		return statusErr{code: http.StatusUnauthorized, msg: "missing upstream credential", requestScoped: true}
+	}
+	configured, err := parseOrdinaryClaudeBase(base)
+	if err != nil {
+		return err
+	}
+	if req.URL.User != nil || req.Host != "" && !strings.EqualFold(req.Host, req.URL.Host) || req.URL.Scheme != configured.Scheme || !strings.EqualFold(req.URL.Hostname(), configured.Hostname()) || ordinaryClaudeOriginPort(req.URL.Scheme, req.URL.Port()) != ordinaryClaudeOriginPort(configured.Scheme, configured.Port()) {
+		return statusErr{code: http.StatusForbidden, msg: "Claude request origin does not match the configured credential origin", requestScoped: true}
+	}
+	if req.Header == nil {
+		req.Header = make(http.Header)
+	}
+	clearOrdinaryClaudeCredentials(req.Header)
+	if bearer {
+		req.Header.Set("Authorization", "Bearer "+key)
 	} else {
-		req.Header.Del("x-api-key")
-		req.Header.Set("Authorization", "Bearer "+apiKey)
+		req.Header.Set("X-Api-Key", key)
 	}
-	// Fill in the rest of the managed Anthropic/stainless protocol header set that
-	// real serving (applyClaudeHeaders) always sends, so this adapter's callers —
-	// currently only the background quota/oauth snapshot lookups in
-	// quota_snapshots.go (GET /api/oauth/profile, /api/oauth/usage via
-	// exec.HttpRequest) — stop egressing a half-managed subset (previously just
-	// the 5 device-profile headers above) that stands out as a distinguishable
-	// fingerprint gap versus real claude-cli. Gate on isAnthropicBase: this method
-	// also implements the generic RequestPreparer hook reachable via
-	// Manager.InjectCredentials/PrepareHttpRequest for arbitrary requests an SDK
-	// embedder may build, so only inject Anthropic-specific protocol headers when
-	// the request actually targets api.anthropic.com, never a non-Anthropic
-	// base_url/proxy target. ginHeaders is intentionally nil here (unlike real
-	// serving, which sources overrides from the inbound client request): this is
-	// a sessionless background call with no legitimate inbound client headers to
-	// inherit from. includeSessionID=false for the same reason — quota/oauth is a
-	// backend lookup with no client session context, and attaching a session id
-	// would itself become a new cross-account correlation anchor.
-	if isAnthropicBase {
-		applyClaudeManagedProtocolHeaders(req, nil, e.cfg, apiKey, isAnthropicBase, false)
+	if req.Header.Get("Anthropic-Version") == "" {
+		req.Header.Set("Anthropic-Version", "2023-06-01")
 	}
-	managedHeaderSnapshot := captureManagedHeaderSnapshot(req.Header, claudeManagedHeaderNames)
-	util.ApplyCustomHeadersFromAttrs(req, authAttrs(auth))
-	applyClaudeManagedHeaders(req, auth, managedHeaderSnapshot)
 	return nil
 }
 
-// persistClaudeDeviceHighWater reads the account's current observed claude client
-// device-profile high-water and asks the auth manager to monotonically raise the
-// persisted high-water (auth.Metadata[claude_device_high_water]). It is a no-op
-// when no manager is wired, when the auth has no ID, or when no real observation
-// exists yet. The manager performs the strict-increase comparison, so calling
-// this every request is safe and writes to disk only on an actual raise.
-func (e *ClaudeExecutor) persistClaudeDeviceHighWater(auth *cliproxyauth.Auth, apiKey string) {
-	if e == nil || e.authManager == nil || auth == nil {
-		return
+func ordinaryClaudeOriginPort(scheme, port string) string {
+	if port != "" {
+		return port
 	}
-	// 反关联 A1：农场号出站版本跟随容器实际版本、不走单调高水位，故不把农场号观测持久化
-	// 进 auth.Metadata 高水位——否则重启后会经 SeedClaudeObservedHighWaterFromAuth 回流全局
-	// 观测池、把农场容器版本带进普通号 floor。农场号出站版本无需持久化：容器每次入站都带
-	// 真实版本，冷启动首帧即可直出。
-	if _, farmBound := cliproxyauth.ClaudeDeviceIDSource(auth); farmBound {
-		return
+	if scheme == "https" {
+		return "443"
 	}
-	authID := strings.TrimSpace(auth.ID)
-	if authID == "" {
-		return
-	}
-	highWater, ok := helps.ClaudeObservedHighWaterForAuth(auth, apiKey)
-	if !ok {
-		return
-	}
-	if _, err := e.authManager.RaiseClaudeDeviceHighWater(context.Background(), authID, highWater); err != nil {
-		log.WithError(err).WithFields(log.Fields{
-			"component": "claude_device_high_water",
-			"auth_id":   authID,
-		}).Warn("claude executor: failed to persist device-profile high-water")
-	}
+	return "80"
 }
 
-// HttpRequest injects Claude credentials into the request and executes it.
 func (e *ClaudeExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth, req *http.Request) (*http.Response, error) {
 	if req == nil {
-		return nil, fmt.Errorf("claude executor: request is nil")
+		return nil, statusErr{code: http.StatusBadRequest, msg: "invalid Claude SDK request", requestScoped: true}
 	}
 	if ctx == nil {
 		ctx = req.Context()
 	}
-	httpReq := req.WithContext(ctx)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if req.ContentLength > ordinaryClaudeMaxRequestBytes || req.Body != nil && req.Body != http.NoBody && req.ContentLength <= 0 {
+		return nil, statusErr{code: http.StatusRequestEntityTooLarge, msg: "Claude request exceeds size limit", requestScoped: true}
+	}
+	httpReq := req.Clone(ctx)
 	if err := e.PrepareRequest(httpReq, auth); err != nil {
 		return nil, err
 	}
-	ctx = helps.WithRuntimeTransportHostFromRequest(ctx, httpReq)
-	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
-	return doClaudeHTTPWithTransportRetry(ctx, httpClient, httpReq)
+	client := *helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	return doOrdinaryClaudeMessagesRequest(&client, httpReq)
 }
 
-// ManagedIdentityHeaders returns the account's serving-managed client identity
-// headers for a sessionless management request (the management api-call proxy
-// used by dashboard quota lookups) aimed at target. It runs the exact header
-// path the background quota snapshot lookups use (PrepareRequest) on a clean
-// probe request, so caller-supplied headers can never seed the device-profile
-// observation, and it fills the legacy device User-Agent the way serving does
-// when device-profile stabilization is off. The probe is forced to https because
-// the managed Anthropic protocol header set is gated on the first-party https
-// base and real egress to the protected host is always https. Business headers
-// (credentials, content negotiation, beta flags) are stripped: the caller owns
-// them. Returns nil when no identity can be derived.
-func (e *ClaudeExecutor) ManagedIdentityHeaders(target *url.URL, auth *cliproxyauth.Auth) http.Header {
-	if e == nil || target == nil || auth == nil {
+func clearOrdinaryClaudeCredentials(headers http.Header) {
+	for name := range headers {
+		if strings.EqualFold(name, "authorization") || strings.EqualFold(name, "x-api-key") {
+			delete(headers, name)
+		}
+	}
+}
+
+func matchOrdinaryClaudeKey(cfg *config.Config, auth *cliproxyauth.Auth) *config.ClaudeKey {
+	if cfg == nil || auth == nil {
 		return nil
 	}
-	probeURL := *target
-	probeURL.Scheme = "https"
-	probe, errProbe := http.NewRequestWithContext(context.Background(), http.MethodGet, probeURL.String(), nil)
-	if errProbe != nil {
+	key := strings.TrimSpace(auth.Attributes["api_key"])
+	if key == "" {
 		return nil
 	}
-	if errPrepare := e.PrepareRequest(probe, auth); errPrepare != nil {
-		return nil
+	_, base, _ := ordinaryClaudeCredential(auth)
+	for i := range cfg.ClaudeKey {
+		entry := &cfg.ClaudeKey[i]
+		entryBase := strings.TrimSpace(entry.BaseURL)
+		if entryBase == "" {
+			entryBase = "https://api.anthropic.com"
+		}
+		if strings.TrimSpace(entry.APIKey) == key && strings.TrimRight(entryBase, "/") == strings.TrimRight(base, "/") {
+			return entry
+		}
 	}
-	if !helps.ClaudeDeviceProfileStabilizationEnabled(e.cfg) {
-		helps.ApplyClaudeLegacyDeviceHeaders(probe, nil, e.cfg)
+	return nil
+}
+
+func (e *ClaudeExecutor) rejectUnsupportedClaudeRequest(auth *cliproxyauth.Auth) error {
+	profile := ""
+	mode := ""
+	if auth != nil {
+		profile = strings.TrimSpace(auth.Attributes["fingerprint_profile"])
+		if profile == "" {
+			profile = strings.TrimSpace(claudeauth.ReadMetadataString(&auth.Metadata, "fingerprint_profile"))
+		}
+		mode = strings.TrimSpace(auth.Attributes["cloak_mode"])
+		if mode == "" {
+			mode = strings.TrimSpace(claudeauth.ReadMetadataString(&auth.Metadata, "cloak_mode"))
+		}
 	}
-	return helps.ManagementIdentityHeaders(probe.Header)
+	if entry := matchOrdinaryClaudeKey(e.cfg, auth); entry != nil {
+		if profile == "" {
+			profile = strings.TrimSpace(entry.FingerprintProfile)
+		}
+		if mode == "" && entry.Cloak != nil {
+			mode = strings.TrimSpace(entry.Cloak.Mode)
+			if mode == "" {
+				mode = "auto"
+			}
+		}
+	}
+	if profile != "" && !strings.EqualFold(profile, "none") || mode != "" && !strings.EqualFold(mode, "never") && !strings.EqualFold(mode, "uncloak") {
+		return statusErr{code: http.StatusBadRequest, msg: "Claude client identity emulation is unsupported", requestScoped: true}
+	}
+	return nil
 }

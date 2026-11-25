@@ -144,7 +144,7 @@ func TestStreamingRequestLogCleansSpoolsOnPublishFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	w := writer.(*FileStreamingLogWriter)
-	if err := os.Mkdir(w.logFilePath+".gz", 0o755); err != nil {
+	if err := os.Mkdir(filepath.Join(w.logsDir, w.logFilename)+".gz", 0o755); err != nil {
 		t.Fatal(err)
 	}
 	w.WriteChunkAsync([]byte("response"))

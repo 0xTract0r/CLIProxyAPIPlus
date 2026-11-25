@@ -2,7 +2,6 @@ package live
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -12,12 +11,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MoeForge/moego/json"
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executionregistry"
-	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executionregistry"
+	coreexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	coreusage "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
 )
 
 type apiKeyFirstSelector struct{}
@@ -40,6 +41,10 @@ type captureExecutor struct {
 	selectedAuth *auth.Auth
 	responseBody io.ReadCloser
 	statusCode   int
+	statuses     []int
+	httpCalls    atomic.Int32
+	refreshCalls atomic.Int32
+	beforeReturn func()
 }
 
 func (*captureExecutor) Identifier() string { return "codex" }
@@ -52,8 +57,14 @@ func (*captureExecutor) ExecuteStream(context.Context, *auth.Auth, coreexecutor.
 	return nil, nil
 }
 
-func (*captureExecutor) Refresh(_ context.Context, credential *auth.Auth) (*auth.Auth, error) {
-	return credential, nil
+func (e *captureExecutor) Refresh(_ context.Context, credential *auth.Auth) (*auth.Auth, error) {
+	e.refreshCalls.Add(1)
+	updated := credential.Clone()
+	if updated.Metadata == nil {
+		updated.Metadata = make(map[string]any)
+	}
+	updated.Metadata["access_token"] = "refreshed-home-live-token"
+	return updated, nil
 }
 
 func (*captureExecutor) CountTokens(context.Context, *auth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
@@ -69,14 +80,25 @@ func (*captureExecutor) PrepareRequest(req *http.Request, credential *auth.Auth)
 func (e *captureExecutor) HttpRequest(_ context.Context, credential *auth.Auth, req *http.Request) (*http.Response, error) {
 	e.request = req.Clone(req.Context())
 	e.selectedAuth = credential.Clone()
+	httpCall := int(e.httpCalls.Add(1))
 	body, errRead := io.ReadAll(req.Body)
 	if errRead != nil {
 		return nil, errRead
 	}
 	e.body = body
 	statusCode := e.statusCode
+	if httpCall <= len(e.statuses) && e.statuses[httpCall-1] > 0 {
+		statusCode = e.statuses[httpCall-1]
+	}
 	if statusCode == 0 {
 		statusCode = http.StatusCreated
+	}
+	responseBody := e.responseBody
+	if statusCode == http.StatusUnauthorized && httpCall < len(e.statuses) {
+		responseBody = io.NopCloser(strings.NewReader("unauthorized"))
+	}
+	if e.beforeReturn != nil {
+		e.beforeReturn()
 	}
 	return &http.Response{
 		StatusCode: statusCode,
@@ -88,31 +110,76 @@ func (e *captureExecutor) HttpRequest(_ context.Context, credential *auth.Auth, 
 			"X-Connection-Secret": []string{"secret"},
 			"X-Live-Session":      []string{"live-session-123"},
 		},
-		Body: e.responseBody,
+		Body: responseBody,
 	}, nil
 }
 
 type homeDispatcher struct {
-	model string
+	model  string
+	authID string
+}
+
+type homeUnauthorizedUsageCapture struct {
+	authID  string
+	records chan coreusage.Record
+}
+
+func (p *homeUnauthorizedUsageCapture) HandleUsage(_ context.Context, record coreusage.Record) {
+	if p == nil || record.ExecutorType != "home-result" || record.AuthID != p.authID {
+		return
+	}
+	select {
+	case p.records <- record:
+	default:
+	}
+}
+
+func (p *homeUnauthorizedUsageCapture) wait(t *testing.T) coreusage.Record {
+	t.Helper()
+	select {
+	case record := <-p.records:
+		return record
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for Home unauthorized usage record")
+		return coreusage.Record{}
+	}
+}
+
+type noopHomeUnauthorizedUsagePlugin struct{}
+
+func (noopHomeUnauthorizedUsagePlugin) HandleUsage(context.Context, coreusage.Record) {}
+
+func registerHomeUnauthorizedUsageCapture(t *testing.T, name, authID string) *homeUnauthorizedUsageCapture {
+	t.Helper()
+	capture := &homeUnauthorizedUsageCapture{authID: authID, records: make(chan coreusage.Record, 1)}
+	coreusage.RegisterNamedPlugin(name, capture)
+	t.Cleanup(func() {
+		coreusage.RegisterNamedPlugin(name, noopHomeUnauthorizedUsagePlugin{})
+	})
+	return capture
 }
 
 func (*homeDispatcher) HeartbeatOK() bool { return true }
 
 func (d *homeDispatcher) RPopAuth(_ context.Context, model string, _ string, _ http.Header, _ int) ([]byte, error) {
 	d.model = model
+	authID := d.authID
+	if authID == "" {
+		authID = "home-codex-live"
+	}
 	return json.Marshal(map[string]any{
 		"model":      model,
 		"provider":   "codex",
-		"auth_index": "home-codex-live",
+		"auth_index": authID,
 		"auth": map[string]any{
-			"id":       "home-codex-live",
+			"id":       authID,
 			"provider": "codex",
 			"status":   "active",
 			"metadata": map[string]any{"access_token": "home-live-token"},
 		},
 		"concurrency": map[string]any{
 			"accounted":     true,
-			"credential_id": "home-codex-live",
+			"credential_id": authID,
 			"model":         model,
 		},
 	})
@@ -145,6 +212,32 @@ type trackedResponseBody struct {
 func (b *trackedResponseBody) Close() error {
 	b.closed.Store(true)
 	return nil
+}
+
+type errorResponseBody struct {
+	payload []byte
+	read    atomic.Bool
+	closed  atomic.Bool
+}
+
+func (b *errorResponseBody) Read(p []byte) (int, error) {
+	if !b.read.CompareAndSwap(false, true) {
+		return 0, io.EOF
+	}
+	return copy(p, b.payload), io.ErrUnexpectedEOF
+}
+
+func (b *errorResponseBody) Close() error {
+	b.closed.Store(true)
+	return nil
+}
+
+func TestReadLimitedBodyPreservesPayloadOnReadError(t *testing.T) {
+	const upstreamError = `{"error":{"message":"access token expired"}}`
+	payload, errRead := readLimitedBody(&errorResponseBody{payload: []byte(upstreamError)})
+	if !errors.Is(errRead, io.ErrUnexpectedEOF) || string(payload) != upstreamError {
+		t.Fatalf("readLimitedBody() = %q, %v; want partial payload and unexpected EOF", payload, errRead)
+	}
 }
 
 type fakeMediaRelay struct {
@@ -589,6 +682,127 @@ func TestHandlerClosesMediaWhenResponseWriteFails(t *testing.T) {
 	}
 }
 
+func TestHandlerForwardsUnauthorizedHomeResponseWithoutRefresh(t *testing.T) {
+	const upstreamError = `{"error":{"message":"access token expired"}}`
+	gin.SetMode(gin.TestMode)
+	manager := auth.NewManager(nil, nil, nil)
+	manager.SetConfig(&config.Config{Home: config.HomeConfig{Enabled: true}})
+	registry := executionregistry.New()
+	manager.PublishHomeDispatch(&homeDispatcher{}, registry, 1)
+	executor := &captureExecutor{
+		statuses:     []int{http.StatusUnauthorized},
+		responseBody: &trackedResponseBody{Reader: strings.NewReader(upstreamError)},
+	}
+	manager.RegisterExecutor(executor)
+	handler := NewHandler(manager, nil)
+	router := gin.New()
+	router.POST("/v1/live", handler.Handle)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/live", strings.NewReader(`{"model":"gpt-live-1-codex","sdp":"v=0"}`))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusUnauthorized, recorder.Body.String())
+	}
+	if got := recorder.Body.String(); got != upstreamError {
+		t.Fatalf("body = %q, want original upstream error %q", got, upstreamError)
+	}
+	if executor.refreshCalls.Load() != 0 || executor.httpCalls.Load() != 1 {
+		t.Fatalf("refresh/http calls = %d/%d, want 0/1", executor.refreshCalls.Load(), executor.httpCalls.Load())
+	}
+	if got := executor.request.Header.Get("Authorization"); got != "Bearer home-live-token" {
+		t.Fatalf("Authorization = %q, want original Home token", got)
+	}
+	if errDrain := registry.Drain(context.Background()); errDrain != nil {
+		t.Fatalf("Drain() error = %v", errDrain)
+	}
+}
+
+func TestHandlerReportsUnauthorizedBeforeEarlyReturn(t *testing.T) {
+	const upstreamError = `{"error":{"message":"access token expired"}}`
+	tests := []struct {
+		name         string
+		responseBody func() io.ReadCloser
+		beforeReturn func(*executionregistry.Registry)
+		wantStatus   int
+		wantFailBody string
+	}{
+		{
+			name: "response bind failure",
+			responseBody: func() io.ReadCloser {
+				return &trackedResponseBody{Reader: strings.NewReader(upstreamError)}
+			},
+			beforeReturn: func(registry *executionregistry.Registry) {
+				_ = registry.Close()
+			},
+			wantStatus:   http.StatusServiceUnavailable,
+			wantFailBody: "upstream unauthorized",
+		},
+		{
+			name: "response read failure",
+			responseBody: func() io.ReadCloser {
+				return &errorResponseBody{payload: []byte(upstreamError)}
+			},
+			wantStatus:   http.StatusBadGateway,
+			wantFailBody: upstreamError,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			gin.SetMode(gin.TestMode)
+			authID := "home-codex-live-" + strings.ReplaceAll(test.name, " ", "-")
+			runtimeConfig := &config.Config{
+				Home:      config.HomeConfig{Enabled: true},
+				SDKConfig: config.SDKConfig{RequestLog: true},
+			}
+			manager := auth.NewManager(nil, nil, nil)
+			manager.SetConfig(runtimeConfig)
+			registry := executionregistry.New()
+			manager.PublishHomeDispatch(&homeDispatcher{authID: authID}, registry, 1)
+			executor := &captureExecutor{
+				statuses:     []int{http.StatusUnauthorized},
+				responseBody: test.responseBody(),
+			}
+			if test.beforeReturn != nil {
+				executor.beforeReturn = func() { test.beforeReturn(registry) }
+			}
+			manager.RegisterExecutor(executor)
+			usageCapture := registerHomeUnauthorizedUsageCapture(t, t.Name(), authID)
+			handler := NewHandler(manager, runtimeConfig)
+			router := gin.New()
+			var apiResponse []byte
+			router.Use(func(c *gin.Context) {
+				c.Next()
+				if raw, exists := c.Get("API_RESPONSE"); exists {
+					apiResponse, _ = raw.([]byte)
+				}
+			})
+			router.POST("/v1/live", handler.Handle)
+
+			request := httptest.NewRequest(http.MethodPost, "/v1/live", strings.NewReader(`{"model":"gpt-live-1-codex","sdp":"v=0"}`))
+			request.Header.Set("Content-Type", "application/json")
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, request)
+
+			if recorder.Code != test.wantStatus {
+				t.Fatalf("status = %d, want %d; body=%s", recorder.Code, test.wantStatus, recorder.Body.String())
+			}
+			record := usageCapture.wait(t)
+			if record.Fail.StatusCode != http.StatusUnauthorized || record.Fail.Body != test.wantFailBody {
+				t.Fatalf("Home unauthorized failure = status %d body %q, want status 401 body %q", record.Fail.StatusCode, record.Fail.Body, test.wantFailBody)
+			}
+			if test.name == "response read failure" {
+				if !strings.Contains(string(apiResponse), upstreamError) || strings.Contains(string(apiResponse), io.ErrUnexpectedEOF.Error()) {
+					t.Fatalf("API_RESPONSE = %q, want upstream body without local read error", apiResponse)
+				}
+			}
+		})
+	}
+}
+
 func TestHandlerUsesLiveModelForHomeDispatch(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -682,88 +896,284 @@ func TestHomeLiveSessionExpiryReleasesSelection(t *testing.T) {
 
 func TestHandleSidebandPinsAuthAndRelaysBidirectionally(t *testing.T) {
 	gin.SetMode(gin.TestMode)
+	const callID = "call-sideband"
+	const path = "/v1/realtime/calls/" + callID
+	const protocol = "fixture.realtime"
+	for _, route := range []struct {
+		name, proxy string
+	}{
+		{name: "no_authorized_route"},
+		{name: "explicit_direct", proxy: "direct"},
+	} {
+		t.Run(route.name, func(t *testing.T) {
+			var upstreamCalls atomic.Int32
+			type handshake struct {
+				path, auth string
+			}
+			handshakes := make(chan handshake, 1)
+			peerClosed := make(chan error, 1)
+			upstreamServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				if upstreamCalls.Add(1) != 1 {
+					http.Error(writer, "unexpected repeated handshake", http.StatusBadRequest)
+					return
+				}
+				handshakes <- handshake{request.URL.Path, request.Header.Get("Authorization")}
+				upgrader := websocket.Upgrader{Subprotocols: []string{protocol}}
+				conn, err := upgrader.Upgrade(writer, request, nil)
+				if err != nil {
+					peerClosed <- err
+					return
+				}
+				defer conn.Close()
+				_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+				_ = conn.SetWriteDeadline(time.Now().Add(3 * time.Second))
+				for {
+					messageType, payload, err := conn.ReadMessage()
+					if err != nil {
+						peerClosed <- err
+						return
+					}
+					if err := conn.WriteMessage(messageType, payload); err != nil {
+						peerClosed <- err
+						return
+					}
+				}
+			}))
+			defer upstreamServer.Close()
 
-	upstreamHeaders := make(chan http.Header, 1)
-	upstreamServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
-		conn, errUpgrade := upgrader.Upgrade(writer, request, nil)
-		if errUpgrade != nil {
-			return
-		}
-		defer func() { _ = conn.Close() }()
-		upstreamHeaders <- request.Header.Clone()
-		messageType, payload, errRead := conn.ReadMessage()
-		if errRead != nil {
-			return
-		}
-		_ = conn.WriteMessage(messageType, append([]byte("echo:"), payload...))
-	}))
-	defer upstreamServer.Close()
+			manager := auth.NewManager(nil, nil, nil)
+			executor := &captureExecutor{}
+			manager.RegisterExecutor(executor)
+			registerCredential(t, manager, &auth.Auth{
+				ID: "pinned-oauth", Provider: "codex", Status: auth.StatusActive,
+				ProxyURL: route.proxy,
+				Metadata: map[string]any{"access_token": "fixture-selected-token"},
+			})
+			handler := NewHandler(manager, nil)
+			handler.sidebandAPIBaseURL = "ws" + strings.TrimPrefix(upstreamServer.URL, "http") + "/v1"
+			handler.sessions.put(callID, liveSession{authID: "pinned-oauth", model: defaultLiveModel})
+			finished := make(chan struct{}, 1)
+			router := gin.New()
+			router.GET("/v1/realtime/calls/:call_id", func(c *gin.Context) {
+				defer func() { finished <- struct{}{} }()
+				handler.HandleSideband(c)
+			})
+			downstreamServer := httptest.NewServer(router)
+			defer downstreamServer.Close()
 
-	manager := auth.NewManager(nil, nil, nil)
-	executor := &captureExecutor{}
-	manager.RegisterExecutor(executor)
-	registerCredential(t, manager, &auth.Auth{
-		ID:       "other-oauth",
-		Provider: "codex",
-		Status:   auth.StatusActive,
-		Metadata: map[string]any{"access_token": "other-token", "account_id": "other-account"},
-	})
-	registerCredential(t, manager, &auth.Auth{
-		ID:       "pinned-oauth",
-		Provider: "codex",
-		Status:   auth.StatusActive,
-		Metadata: map[string]any{"access_token": "pinned-token", "account_id": "pinned-account"},
-	})
+			dialer := websocket.Dialer{HandshakeTimeout: 3 * time.Second, Subprotocols: []string{protocol}}
+			client, response, err := dialer.DialContext(t.Context(), "ws"+strings.TrimPrefix(downstreamServer.URL, "http")+path, nil)
+			status, responseBody := 0, ""
+			if response != nil {
+				status = response.StatusCode
+				if response.Body != nil {
+					raw, _ := io.ReadAll(response.Body)
+					responseBody = string(raw)
+					_ = response.Body.Close()
+				}
+			}
+			if client != nil {
+				defer client.Close()
+			}
+			waitFinished := func() {
+				t.Helper()
+				select {
+				case <-finished:
+				case <-time.After(3 * time.Second):
+					t.Fatal("sideband handler did not finish")
+				}
+			}
+			if route.proxy == "" {
+				if err == nil || status != http.StatusBadGateway || upstreamCalls.Load() != 0 {
+					t.Fatalf("unauthorized route: status=%d upstream calls=%d error=%v", status, upstreamCalls.Load(), err)
+				}
+				waitFinished()
+				if _, ok := handler.sessions.peek(callID); !ok {
+					t.Fatal("route rejection consumed the pending call")
+				}
+				if executor.refreshCalls.Load() != 0 {
+					t.Fatal("route rejection refreshed the credential")
+				}
+				return
+			}
 
-	handler := NewHandler(manager, nil)
-	handler.sidebandAPIBaseURL = "ws" + strings.TrimPrefix(upstreamServer.URL, "http") + "/v1"
-	handler.sessions.put("call-sideband", liveSession{authID: "pinned-oauth", model: defaultLiveModel})
-	router := gin.New()
-	router.GET("/v1/live/:call_id", handler.HandleSideband)
-	downstreamServer := httptest.NewServer(router)
-	defer downstreamServer.Close()
+			if err != nil || client == nil {
+				t.Fatalf("dial downstream sideband: status=%d error=%v body=%s", status, err, responseBody)
+			}
+			if client.Subprotocol() != protocol {
+				t.Fatalf("negotiated subprotocol=%q, want %q", client.Subprotocol(), protocol)
+			}
+			_ = client.SetReadDeadline(time.Now().Add(3 * time.Second))
+			_ = client.SetWriteDeadline(time.Now().Add(3 * time.Second))
+			for _, frame := range []struct {
+				kind int
+				data string
+			}{
+				{websocket.TextMessage, "sideband text"},
+				{websocket.BinaryMessage, "\x00\xff\x01"},
+			} {
+				if err := client.WriteMessage(frame.kind, []byte(frame.data)); err != nil {
+					t.Fatal(err)
+				}
+				kind, payload, err := client.ReadMessage()
+				if err != nil || kind != frame.kind || string(payload) != frame.data {
+					t.Fatalf("round trip: kind=%d size=%d error=%v", kind, len(payload), err)
+				}
+			}
+			select {
+			case got := <-handshakes:
+				if got.path != path || got.auth != "Bearer fixture-selected-token" {
+					t.Fatal("upstream did not receive the selected call and its bearer")
+				}
+			default:
+				t.Fatal("upstream handshake was not recorded")
+			}
 
-	wsURL := "ws" + strings.TrimPrefix(downstreamServer.URL, "http") + "/v1/live/call-sideband"
-	headers := http.Header{
-		"OpenAI-Alpha":      []string{"quicksilver=v2"},
-		"X-Oai-Attestation": []string{"attestation-token"},
+			const closeReason = "caller canceled"
+			if err := client.WriteControl(websocket.CloseMessage,
+				websocket.FormatCloseMessage(websocket.CloseNormalClosure, closeReason), time.Now().Add(time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case err := <-peerClosed:
+				var closeErr *websocket.CloseError
+				if !errors.As(err, &closeErr) || closeErr.Code != websocket.CloseNormalClosure || closeErr.Text != closeReason {
+					t.Fatalf("upstream did not receive the caller's close frame: %v", err)
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatal("upstream did not close after caller cancellation")
+			}
+			waitFinished()
+			if _, ok := handler.sessions.peek(callID); ok {
+				t.Fatal("closed sideband kept its live call")
+			}
+			if upstreamCalls.Load() != 1 || executor.refreshCalls.Load() != 0 {
+				t.Fatalf("upstream calls=%d refreshes=%d", upstreamCalls.Load(), executor.refreshCalls.Load())
+			}
+		})
 	}
-	client, response, errDial := websocket.DefaultDialer.Dial(wsURL, headers)
-	if errDial != nil {
-		if response != nil && response.Body != nil {
-			_ = response.Body.Close()
-		}
-		t.Fatalf("dial downstream sideband: %v", errDial)
+}
+
+func TestHandleSidebandForwardsUnauthorizedHomeHandshakeWithoutRefresh(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, tc := range []struct {
+		name         string
+		upstreamBody string
+	}{
+		{name: "response body", upstreamBody: `{"error":{"message":"access token expired"}}`},
+		{name: "empty response body"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var upstreamCalls atomic.Int32
+			upstreamHeaders := make(chan http.Header, 1)
+			upstreamServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				upstreamCalls.Add(1)
+				upstreamHeaders <- request.Header.Clone()
+				writer.Header().Set("Content-Type", "application/json")
+				writer.WriteHeader(http.StatusUnauthorized)
+				_, _ = writer.Write([]byte(tc.upstreamBody))
+			}))
+			defer upstreamServer.Close()
+
+			runtimeConfig := &config.Config{
+				Home:      config.HomeConfig{Enabled: true},
+				SDKConfig: config.SDKConfig{ProxyURL: "direct"}, // httptest provides the only upstream.
+			}
+			manager := auth.NewManager(nil, nil, nil)
+			manager.SetConfig(runtimeConfig)
+			registry := executionregistry.New()
+			manager.PublishHomeDispatch(&homeDispatcher{}, registry, 1)
+			executor := &captureExecutor{}
+			manager.RegisterExecutor(executor)
+			selection, errSelect := manager.SelectHomeAuthByKind(context.Background(), "codex", defaultLiveModel, auth.AuthKindOAuth, coreexecutor.Options{})
+			if errSelect != nil {
+				t.Fatalf("SelectHomeAuthByKind() error = %v", errSelect)
+			}
+			selection.Retain()
+			defer selection.End("test_complete")
+
+			handler := NewHandler(manager, runtimeConfig)
+			handler.sidebandAPIBaseURL = "ws" + strings.TrimPrefix(upstreamServer.URL, "http") + "/v1"
+			handler.sessions.put("call-home-refresh", liveSession{authID: "home-codex-live", model: defaultLiveModel, homeSelection: selection})
+			router := gin.New()
+			router.GET("/v1/live/:call_id", handler.HandleSideband)
+			downstreamServer := httptest.NewServer(router)
+			defer downstreamServer.Close()
+
+			wsURL := "ws" + strings.TrimPrefix(downstreamServer.URL, "http") + "/v1/live/call-home-refresh"
+			client, response, errDial := websocket.DefaultDialer.Dial(wsURL, nil)
+			if client != nil {
+				_ = client.Close()
+			}
+			if errDial == nil || response == nil {
+				t.Fatalf("dial downstream sideband = response %#v err %v, want rejected handshake", response, errDial)
+			}
+			defer func() { _ = response.Body.Close() }()
+			responseBody, errRead := io.ReadAll(response.Body)
+			if errRead != nil {
+				t.Fatalf("read downstream rejection: %v", errRead)
+			}
+			if response.StatusCode != http.StatusUnauthorized || string(responseBody) != tc.upstreamBody {
+				t.Fatalf("downstream rejection = status %d body %q, want original upstream 401 body %q", response.StatusCode, responseBody, tc.upstreamBody)
+			}
+			if executor.refreshCalls.Load() != 0 || upstreamCalls.Load() != 1 {
+				t.Fatalf("refresh/upstream calls = %d/%d, want 0/1", executor.refreshCalls.Load(), upstreamCalls.Load())
+			}
+			if got := (<-upstreamHeaders).Get("Authorization"); got != "Bearer home-live-token" {
+				t.Fatalf("upstream Authorization = %q, want original Home token", got)
+			}
+		})
 	}
-	if response != nil && response.Body != nil {
-		_ = response.Body.Close()
-	}
-	defer func() { _ = client.Close() }()
-	if errWrite := client.WriteMessage(websocket.TextMessage, []byte("ping")); errWrite != nil {
-		t.Fatalf("write sideband message: %v", errWrite)
-	}
-	_, payload, errRead := client.ReadMessage()
-	if errRead != nil {
-		t.Fatalf("read sideband message: %v", errRead)
-	}
-	if got := string(payload); got != "echo:ping" {
-		t.Fatalf("sideband payload = %q, want echo:ping", got)
+}
+
+func TestHandleSidebandDialErrorPreservesBodyReturnedWithReadError(t *testing.T) {
+	const upstreamError = `{"error":{"message":"access token expired"}}`
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/v1/live/call-123", nil)
+	ctx := context.WithValue(c.Request.Context(), "gin", c)
+	response := &http.Response{
+		StatusCode: http.StatusUnauthorized,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       &errorResponseBody{payload: []byte(upstreamError)},
 	}
 
-	select {
-	case captured := <-upstreamHeaders:
-		if got := captured.Get("Authorization"); got != "Bearer pinned-token" {
-			t.Fatalf("upstream Authorization = %q, want pinned OAuth token", got)
-		}
-		if got := captured.Get("Chatgpt-Account-Id"); got != "pinned-account" {
-			t.Fatalf("upstream Chatgpt-Account-Id = %q, want pinned-account", got)
-		}
-		if got := captured.Get("OpenAI-Alpha"); got != "quicksilver=v2" {
-			t.Fatalf("upstream OpenAI-Alpha = %q", got)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("upstream sideband headers were not captured")
+	responseBody := handleSidebandDialError(c, ctx, &config.Config{SDKConfig: config.SDKConfig{RequestLog: true}}, response, errors.New("websocket: bad handshake"))
+	if recorder.Code != http.StatusUnauthorized || recorder.Body.String() != upstreamError || string(responseBody) != upstreamError {
+		t.Fatalf("forwarded response = status %d body %q returned %q, want original upstream 401", recorder.Code, recorder.Body.String(), responseBody)
+	}
+	rawTimeline, okTimeline := c.Get("API_WEBSOCKET_TIMELINE")
+	timeline, _ := rawTimeline.([]byte)
+	if !okTimeline || !strings.Contains(string(timeline), upstreamError) {
+		t.Fatalf("API_WEBSOCKET_TIMELINE = %q, want original upstream error", timeline)
+	}
+}
+
+func TestHandleSidebandDialErrorDoesNotForwardNonUnauthorizedBody(t *testing.T) {
+	const upstreamError = `<html>proxy-01.internal authentication failed</html>`
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/v1/live/call-123", nil)
+	ctx := context.WithValue(c.Request.Context(), "gin", c)
+	response := &http.Response{
+		StatusCode: http.StatusBadGateway,
+		Header:     http.Header{"Content-Type": []string{"text/html"}},
+		Body:       io.NopCloser(strings.NewReader(upstreamError)),
+	}
+
+	responseBody := handleSidebandDialError(c, ctx, &config.Config{SDKConfig: config.SDKConfig{RequestLog: true}}, response, errors.New("websocket: bad handshake"))
+	if recorder.Code != http.StatusBadGateway || len(responseBody) != 0 {
+		t.Fatalf("response = status %d returned %q, want generic 502", recorder.Code, responseBody)
+	}
+	if strings.Contains(recorder.Body.String(), upstreamError) || !strings.Contains(recorder.Body.String(), "Codex live sideband upstream unavailable") {
+		t.Fatalf("downstream body = %q, want generic error without proxy detail", recorder.Body.String())
+	}
+	rawTimeline, okTimeline := c.Get("API_WEBSOCKET_TIMELINE")
+	timeline, _ := rawTimeline.([]byte)
+	if !okTimeline || !strings.Contains(string(timeline), upstreamError) {
+		t.Fatalf("API_WEBSOCKET_TIMELINE = %q, want original upstream error", timeline)
 	}
 }
 
@@ -834,53 +1244,6 @@ func TestMediaRelayWrapsRawSDPForCodexBackend(t *testing.T) {
 	}
 	if payload.SDP != "v=0\r\no=gateway-offer\r\n" {
 		t.Fatalf("upstream SDP = %q", payload.SDP)
-	}
-}
-
-func TestHandlerUpdatesMediaRelayConfig(t *testing.T) {
-	handler := NewHandler(nil, nil)
-	if relay, errRelay := handler.currentMediaRelay(); relay != nil || errRelay != nil {
-		t.Fatalf("initial media relay = %#v, error = %v", relay, errRelay)
-	}
-	enabled := &config.Config{Codex: config.CodexConfig{LiveMediaRelay: config.CodexLiveMediaRelayConfig{
-		Enabled:                 true,
-		MaxSessions:             1,
-		DisablePrivateRemoteIPs: false,
-	}}}
-	if errUpdate := handler.UpdateConfig(enabled); errUpdate != nil {
-		t.Fatalf("enable media relay: %v", errUpdate)
-	}
-	enabledRelay, errRelay := handler.currentMediaRelay()
-	if enabledRelay == nil || errRelay != nil {
-		t.Fatalf("enabled media relay = %#v, error = %v", enabledRelay, errRelay)
-	}
-	unchanged := *enabled
-	unchanged.Debug = true
-	unchanged.ProxyURL = "http://new-proxy.example"
-	if errUpdate := handler.UpdateConfig(&unchanged); errUpdate != nil {
-		t.Fatalf("apply unrelated config change: %v", errUpdate)
-	}
-	unchangedRelay, errRelay := handler.currentMediaRelay()
-	if unchangedRelay != enabledRelay || errRelay != nil {
-		t.Fatalf("unrelated config change rebuilt media relay: before=%#v after=%#v error=%v", enabledRelay, unchangedRelay, errRelay)
-	}
-	if current := handler.currentConfig(); current == nil || current.ProxyURL != "http://new-proxy.example" {
-		t.Fatalf("runtime config was not updated: %#v", current)
-	}
-	changed := *enabled
-	changed.Codex.LiveMediaRelay.MaxSessions = 2
-	if errUpdate := handler.UpdateConfig(&changed); errUpdate != nil {
-		t.Fatalf("reload media relay: %v", errUpdate)
-	}
-	changedRelay, errRelay := handler.currentMediaRelay()
-	if changedRelay == nil || changedRelay == enabledRelay || errRelay != nil {
-		t.Fatalf("changed media relay = %#v, previous=%#v error=%v", changedRelay, enabledRelay, errRelay)
-	}
-	if errUpdate := handler.UpdateConfig(&config.Config{}); errUpdate != nil {
-		t.Fatalf("disable media relay: %v", errUpdate)
-	}
-	if relay, errRelay := handler.currentMediaRelay(); relay != nil || errRelay != nil {
-		t.Fatalf("disabled media relay = %#v, error = %v", relay, errRelay)
 	}
 }
 

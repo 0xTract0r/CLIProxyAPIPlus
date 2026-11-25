@@ -5,14 +5,16 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/base64"
 	"errors"
 	"fmt"
+	"github.com/MoeForge/moego/base64"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
+	"time"
 
 	"golang.org/x/net/proxy"
 )
@@ -74,52 +76,22 @@ func Parse(raw string) (Setting, error) {
 	}
 }
 
-// ErrProxyEgressBlocked is returned by the fail-closed dialer / round tripper
-// installed when an account-scoped proxy setting is missing or invalid. It is
-// surfaced verbatim so the egress-blocked reason is unambiguous in logs and
-// error responses, and it guarantees no network I/O happened before the failure
-// (anti-correlation: never fall through to a direct dial that would expose the
-// real server IP under the account identity).
-var ErrProxyEgressBlocked = errors.New("proxy egress blocked: refusing direct connection to prevent IP exposure")
-
-// blockingDialer is a proxy.Dialer + proxy.ContextDialer that performs zero
-// network I/O and always fails with ErrProxyEgressBlocked. It is installed at
-// the connection layer for account transports whose proxy setting resolved to
-// invalid, so the real client IP can never leak via an accidental direct dial.
-type blockingDialer struct{}
-
-// Dial always fails without opening a connection.
-func (blockingDialer) Dial(string, string) (net.Conn, error) {
-	return nil, ErrProxyEgressBlocked
-}
-
-// DialContext always fails without opening a connection. Implementing it makes
-// blockingDialer satisfy proxy.ContextDialer as well, so context-aware callers
-// (e.g. the uTLS dialContext) also fail closed instead of falling back.
-func (blockingDialer) DialContext(context.Context, string, string) (net.Conn, error) {
-	return nil, ErrProxyEgressBlocked
-}
-
-// BlockingDialer returns a proxy.Dialer (also a proxy.ContextDialer) that fails
-// every dial with ErrProxyEgressBlocked without performing any network I/O.
-func BlockingDialer() proxy.Dialer {
-	return blockingDialer{}
-}
-
-// blockingRoundTripper is an http.RoundTripper that always fails with
-// ErrProxyEgressBlocked before any dial, for account HTTP clients whose proxy
-// setting resolved to invalid. It deliberately has no fallback path.
-type blockingRoundTripper struct{}
-
-// RoundTrip always fails without opening a connection.
-func (blockingRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
-	return nil, ErrProxyEgressBlocked
-}
-
-// BlockingRoundTripper returns an http.RoundTripper that fails every request
-// with ErrProxyEgressBlocked without performing any network I/O.
-func BlockingRoundTripper() http.RoundTripper {
-	return blockingRoundTripper{}
+// ValidRequestProxy reports whether raw is a concrete execution proxy override.
+// The host must be present, and an explicit port must be in the range 1-65535.
+func ValidRequestProxy(raw string) bool {
+	setting, errParse := Parse(raw)
+	if errParse != nil || setting.Mode != ModeProxy || setting.URL == nil {
+		return false
+	}
+	if strings.TrimSpace(setting.URL.Hostname()) == "" {
+		return false
+	}
+	port := setting.URL.Port()
+	if port == "" {
+		return true
+	}
+	number, errPort := strconv.Atoi(port)
+	return errPort == nil && number >= 1 && number <= 65535
 }
 
 func cloneDefaultTransport() *http.Transport {
@@ -136,6 +108,15 @@ func NewDirectTransport() *http.Transport {
 	return clone
 }
 
+// socksForwardDialer dials the SOCKS5 proxy itself. It enables TCP keepalive
+// matching net/http.DefaultTransport without setting a fixed dial timeout,
+// relying on caller context deadlines and cancellation to bound dials:
+// proxy.Direct would leave keepalive at the OS default of hours, which lets a
+// silently dead peer pin an otherwise reusable connection.
+func socksForwardDialer() *net.Dialer {
+	return &net.Dialer{KeepAlive: 30 * time.Second}
+}
+
 // BuildHTTPTransport constructs an HTTP transport for the provided proxy setting.
 func BuildHTTPTransport(raw string) (*http.Transport, Mode, error) {
 	setting, errParse := Parse(raw)
@@ -148,7 +129,7 @@ func BuildHTTPTransport(raw string) (*http.Transport, Mode, error) {
 		return nil, setting.Mode, nil
 	case ModeDirect:
 		transport := NewDirectTransport()
-		applyTestRootCA(transport)
+		transport.TLSClientConfig = withTestRootCA(transport.TLSClientConfig)
 		return transport, setting.Mode, nil
 	case ModeProxy:
 		if setting.URL.Scheme == "socks5" || setting.URL.Scheme == "socks5h" {
@@ -158,67 +139,123 @@ func BuildHTTPTransport(raw string) (*http.Transport, Mode, error) {
 				password, _ := setting.URL.User.Password()
 				proxyAuth = &proxy.Auth{User: username, Password: password}
 			}
-			dialer, errSOCKS5 := proxy.SOCKS5("tcp", setting.URL.Host, proxyAuth, proxy.Direct)
+			dialer, errSOCKS5 := proxy.SOCKS5("tcp", setting.URL.Host, proxyAuth, socksForwardDialer())
 			if errSOCKS5 != nil {
 				return nil, setting.Mode, fmt.Errorf("create SOCKS5 dialer failed: %w", errSOCKS5)
 			}
 			transport := cloneDefaultTransport()
+			transport.TLSClientConfig = withTestRootCA(transport.TLSClientConfig)
 			transport.Proxy = nil
-			transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-				if err := ctx.Err(); err != nil {
-					return nil, err
+			if contextDialer, ok := dialer.(proxy.ContextDialer); ok {
+				transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+					if ctx == nil {
+						ctx = context.Background()
+					}
+					return contextDialer.DialContext(ctx, network, addr)
 				}
-				type dialResult struct {
-					conn net.Conn
-					err  error
-				}
-				resultCh := make(chan dialResult, 1)
-				go func() {
-					conn, err := dialer.Dial(network, addr)
-					resultCh <- dialResult{conn: conn, err: err}
-				}()
-				select {
-				case <-ctx.Done():
-					return nil, ctx.Err()
-				case result := <-resultCh:
-					return result.conn, result.err
+			} else {
+				transport.DialContext = func(_ context.Context, network, addr string) (net.Conn, error) {
+					return dialer.Dial(network, addr)
 				}
 			}
-			applyTestRootCA(transport)
+			return transport, setting.Mode, nil
+		}
+		if setting.URL.Scheme == "https" {
+			transport := cloneDefaultTransport()
+			transport.TLSClientConfig = withTestRootCA(transport.TLSClientConfig)
+			transport.Proxy = http.ProxyURL(setting.URL)
+			transport.DialTLSContext = buildHTTPSProxyDialTLSContext(setting.URL, withTestRootCA(nil), transport.TLSHandshakeTimeout, transport.DialContext)
 			return transport, setting.Mode, nil
 		}
 		transport := cloneDefaultTransport()
+		transport.TLSClientConfig = withTestRootCA(transport.TLSClientConfig)
 		transport.Proxy = http.ProxyURL(setting.URL)
-		applyTestRootCA(transport)
 		return transport, setting.Mode, nil
 	default:
 		return nil, setting.Mode, nil
 	}
 }
 
-func applyTestRootCA(transport *http.Transport) {
-	if transport == nil {
-		return
+// withTestRootCA adds the explicitly configured test CA without changing the
+// caller's certificate pool. The proxy and target keep separate TLS settings.
+func withTestRootCA(base *tls.Config) *tls.Config {
+	path := strings.TrimSpace(os.Getenv("QUOTIO_TEST_CA_FILE"))
+	if path == "" {
+		return base
 	}
-	caFile := strings.TrimSpace(os.Getenv("QUOTIO_TEST_CA_FILE"))
-	if caFile == "" {
-		return
-	}
-	pemData, err := os.ReadFile(caFile)
+	data, err := os.ReadFile(path)
 	if err != nil {
-		return
+		return base
 	}
-	rootCAs, _ := x509.SystemCertPool()
-	if rootCAs == nil {
-		rootCAs = x509.NewCertPool()
+	var roots *x509.CertPool
+	if base != nil && base.RootCAs != nil {
+		roots = base.RootCAs.Clone()
+	} else {
+		roots, _ = x509.SystemCertPool()
+		if roots == nil {
+			roots = x509.NewCertPool()
+		}
 	}
-	if ok := rootCAs.AppendCertsFromPEM(pemData); !ok {
-		return
+	if !roots.AppendCertsFromPEM(data) {
+		return base
 	}
-	if transport.TLSClientConfig == nil {
-		transport.TLSClientConfig = &tls.Config{}
+	cfg := &tls.Config{}
+	if base != nil {
+		cfg = base.Clone()
 	}
-	transport.TLSClientConfig.RootCAs = rootCAs
+	cfg.RootCAs = roots
+	return cfg
+}
+
+func buildHTTPSProxyDialTLSContext(
+	proxyURL *url.URL,
+	baseTLS *tls.Config,
+	handshakeTimeout time.Duration,
+	baseDialContext func(ctx context.Context, network, addr string) (net.Conn, error),
+) func(ctx context.Context, network, addr string) (net.Conn, error) {
+	proxyHostname := proxyURL.Hostname()
+	var privateTLS *tls.Config
+	if baseTLS != nil {
+		privateTLS = baseTLS.Clone()
+	}
+	dialContext := baseDialContext
+	if dialContext == nil {
+		dialContext = (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext
+	}
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		rawConn, errDial := dialContext(ctx, network, addr)
+		if errDial != nil {
+			return nil, errDial
+		}
+		var tlsConfig *tls.Config
+		if privateTLS != nil {
+			tlsConfig = privateTLS.Clone()
+		} else {
+			tlsConfig = &tls.Config{}
+		}
+		if tlsConfig.ServerName == "" {
+			tlsConfig.ServerName = proxyHostname
+		}
+		tlsConfig.NextProtos = []string{"http/1.1"}
+
+		tlsConn := tls.Client(rawConn, tlsConfig)
+		handshakeCtx := ctx
+		if handshakeTimeout > 0 {
+			var cancelHandshake context.CancelFunc
+			handshakeCtx, cancelHandshake = context.WithTimeout(ctx, handshakeTimeout)
+			defer cancelHandshake()
+		}
+		if errHandshake := tlsConn.HandshakeContext(handshakeCtx); errHandshake != nil {
+			if errClose := rawConn.Close(); errClose != nil {
+				return nil, fmt.Errorf("HTTPS proxy TLS handshake failed: %w; close failed: %v", errHandshake, errClose)
+			}
+			return nil, fmt.Errorf("HTTPS proxy TLS handshake failed: %w", errHandshake)
+		}
+		return tlsConn, nil
+	}
 }
 
 // BuildDialer constructs a proxy dialer for settings that operate at the connection layer.
@@ -248,8 +285,9 @@ func BuildDialer(raw string) (proxy.Dialer, Mode, error) {
 }
 
 type httpConnectDialer struct {
-	proxyURL *url.URL
-	dialer   proxy.Dialer
+	proxyURL  *url.URL
+	dialer    proxy.Dialer
+	tlsConfig *tls.Config
 }
 
 func (d *httpConnectDialer) Dial(network, addr string) (net.Conn, error) {
@@ -281,7 +319,18 @@ func (d *httpConnectDialer) DialContext(ctx context.Context, network, addr strin
 		}
 	}()
 	if d.proxyURL.Scheme == "https" {
-		tlsConn := tls.Client(conn, &tls.Config{ServerName: d.proxyURL.Hostname()})
+		var tlsConfig *tls.Config
+		if d.tlsConfig != nil {
+			tlsConfig = d.tlsConfig.Clone()
+		} else {
+			tlsConfig = &tls.Config{}
+		}
+		if tlsConfig.ServerName == "" {
+			tlsConfig.ServerName = d.proxyURL.Hostname()
+		}
+		tlsConfig.NextProtos = []string{"http/1.1"}
+
+		tlsConn := tls.Client(conn, tlsConfig)
 		if errHandshake := tlsConn.HandshakeContext(ctx); errHandshake != nil {
 			if errClose := conn.Close(); errClose != nil {
 				return nil, fmt.Errorf("HTTPS proxy TLS handshake failed: %w; close failed: %v", errHandshake, errClose)

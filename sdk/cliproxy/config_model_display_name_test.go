@@ -1,9 +1,11 @@
 package cliproxy
 
 import (
+	"reflect"
 	"testing"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 )
 
 func TestBuildConfigModelsDisplayName(t *testing.T) {
@@ -68,31 +70,53 @@ func TestBuildConfigModelsDisplayName(t *testing.T) {
 	}
 }
 
-func TestBuildCodexConfigModelsPreservesBuiltinDisplayNames(t *testing.T) {
-	models := buildCodexConfigModels(&config.CodexKey{Models: []config.CodexModel{
-		{Name: "gpt-image-1.5", DisplayName: "Configured Image 1.5"},
-		{Name: "gpt-image-2", DisplayName: "Configured Image 2"},
-	}})
+func TestBuildCodexConfigModelsSelectsDefaultsOrConfiguredModels(t *testing.T) {
+	configured := buildCodexConfigModels(&config.CodexKey{Models: []config.CodexModel{{
+		Name: "upstream-codex", Alias: "configured-codex",
+	}}})
+	if len(configured) != 1 {
+		t.Fatalf("configured model count = %d, want 1", len(configured))
+	}
+	if configured[0].ID != "configured-codex" {
+		t.Fatalf("configured model ID = %q, want configured-codex", configured[0].ID)
+	}
 
-	wantDisplayNames := map[string]string{
-		"gpt-image-1.5": "Configured Image 1.5",
-		"gpt-image-2":   "Configured Image 2",
+	defaults := buildCodexConfigModels(&config.CodexKey{})
+	wantDefaults := registry.GetCodexProModels()
+	if len(defaults) != len(wantDefaults) {
+		t.Fatalf("default model count = %d, want %d", len(defaults), len(wantDefaults))
 	}
-	for _, model := range models {
-		wantDisplayName, ok := wantDisplayNames[model.ID]
-		if !ok {
-			continue
+	defaultIDs := make(map[string]struct{}, len(defaults))
+	for _, model := range defaults {
+		if model != nil {
+			defaultIDs[model.ID] = struct{}{}
 		}
-		if model.DisplayName != wantDisplayName {
-			t.Errorf("%s DisplayName = %q, want %q", model.ID, model.DisplayName, wantDisplayName)
-		}
-		if model.Object != "model" || model.OwnedBy != "openai" || model.Type != "openai" || model.Created != 1704067200 || model.Version != model.ID || model.UserDefined {
-			t.Errorf("%s builtin metadata was not preserved: %#v", model.ID, model)
-		}
-		delete(wantDisplayNames, model.ID)
 	}
-	for modelID := range wantDisplayNames {
-		t.Errorf("missing builtin model %s", modelID)
+	for _, modelID := range []string{"gpt-image-1.5", "gpt-image-2", "gpt-image-2.5-flare", "gpt-image-2.5-sunburst", "gpt-image-2.5", "gpt-image-2.6-flare", "gpt-image-2.6-sunburst", "gpt-image-2.6"} {
+		if _, ok := defaultIDs[modelID]; !ok {
+			t.Errorf("missing default model %q", modelID)
+		}
+	}
+}
+
+func TestBuildCodexConfigModelsInheritsStaticThinking(t *testing.T) {
+	for _, tt := range []struct{ id, channel string }{
+		{"mai-code-2-flash", "copilot"},
+		{"claude-sonnet-5", "claude"},
+	} {
+		t.Run(tt.id, func(t *testing.T) {
+			preset := registry.LookupStaticModelInfoByChannel(tt.id, tt.channel)
+			if preset == nil || preset.Thinking == nil {
+				t.Fatalf("missing thinking preset for %s in %s", tt.id, tt.channel)
+			}
+			models := buildCodexConfigModels(&config.CodexKey{Models: []config.CodexModel{{Name: tt.id}}})
+			if len(models) != 1 {
+				t.Fatalf("got %d configured models, want 1", len(models))
+			}
+			if !reflect.DeepEqual(models[0].Thinking, preset.Thinking) {
+				t.Errorf("thinking = %+v, want %s preset %+v", models[0].Thinking, tt.channel, preset.Thinking)
+			}
+		})
 	}
 }
 

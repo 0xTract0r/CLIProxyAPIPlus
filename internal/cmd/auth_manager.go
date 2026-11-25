@@ -1,13 +1,12 @@
 package cmd
 
 import (
-	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
+	sdkAuth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth"
 )
 
 // newAuthManager creates a new authentication manager instance with all supported
 // authenticators and a file-based token store. It initializes authenticators for
-// Codex, Claude, Antigravity, Kimi, Kiro, GitHub Copilot, Kilo, GitLab,
-// and xAI providers.
+// the built-in providers and the GitHub Copilot, Kilo and GitLab extensions.
 //
 // Returns:
 //   - *sdkAuth.Manager: A configured authentication manager instance
@@ -18,11 +17,15 @@ func newAuthManager() *sdkAuth.Manager {
 		sdkAuth.NewClaudeAuthenticator(),
 		sdkAuth.NewAntigravityAuthenticator(),
 		sdkAuth.NewKimiAuthenticator(),
-		sdkAuth.NewKiroAuthenticator(),
 		sdkAuth.NewGitHubCopilotAuthenticator(),
 		sdkAuth.NewKiloAuthenticator(),
 		sdkAuth.NewGitLabAuthenticator(),
+		sdkAuth.NewKimiAIAuthenticator(),
+		sdkAuth.NewKimiAIDotAuthenticator(),
 		sdkAuth.NewXAIAuthenticator(),
+		sdkAuth.CopilotAuthenticator{},
+		sdkAuth.NewDevinAuthenticator(),
+		sdkAuth.NewMetaAuthenticator(),
 	)
 	return manager
 }

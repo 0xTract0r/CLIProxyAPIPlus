@@ -1,7 +1,6 @@
 package management
 
 import (
-	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -9,8 +8,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MoeForge/moego/json"
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 )
 
 func TestOAuthSessionStoreCompleteKeepsShortLivedSession(t *testing.T) {
@@ -167,16 +167,8 @@ func TestOAuthSessionStoreCancelMarksPendingSessionCancelled(t *testing.T) {
 	if store.IsPending("pending-state", "xai") {
 		t.Fatal("cancelled session remained pending")
 	}
-	// Fork behavior (deliberately kept over upstream): Cancel keeps the session as a
-	// "cancelled" tombstone rather than deleting it, so GetAuthStatus can report an explicit
-	// "cancelled" status to the UI. Upstream's original assertion here expected the session to
-	// be removed from the store; that is incompatible with the fork feature, so it is adjusted.
-	session, ok := store.Get("pending-state")
-	if !ok {
-		t.Fatal("cancelled session should remain as a cancelled tombstone")
-	}
-	if !isOAuthSessionCancelledStatus(session.Status) {
-		t.Fatalf("cancelled session status = %q, want cancelled", session.Status)
+	if _, active, cancelled := store.getWithCancelStatus("pending-state"); active || !cancelled {
+		t.Fatalf("after cancellation active=%t cancelled=%t", active, cancelled)
 	}
 	if store.Cancel("pending-state") {
 		t.Fatal("second Cancel() = true, want false")
@@ -237,7 +229,7 @@ func TestGuardOAuthSessionPendingForSave(t *testing.T) {
 	store := newOAuthSessionStore(time.Minute)
 	replaceOAuthSessionStoreForTest(t, store)
 
-	providers := []string{"anthropic", "codex", "antigravity", "xai", "kimi"}
+	providers := []string{"anthropic", "codex", "antigravity", "xai", "kimi", "kimi-ai", "kimi.ai", "meta"}
 	for _, provider := range providers {
 		state := provider + "-save-guard"
 		store.Register(state, provider)
@@ -307,7 +299,7 @@ func TestCancelAuthSessionHandler(t *testing.T) {
 	statusRouter := gin.New()
 	statusRouter.GET("/status", handler.GetAuthStatus)
 	cancelledStatus := performOAuthStatusRequest(t, statusRouter, "device-state")
-	if cancelledStatus.Status != oauthSessionStatusCancelled {
+	if cancelledStatus.Status != oauthCancelledStatus {
 		t.Fatalf("status after cancel = %#v, want cancelled", cancelledStatus)
 	}
 }

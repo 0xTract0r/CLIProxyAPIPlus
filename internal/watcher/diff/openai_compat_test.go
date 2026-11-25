@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 )
 
 func TestDiffOpenAICompatibility(t *testing.T) {
@@ -43,6 +43,43 @@ func TestDiffOpenAICompatibility(t *testing.T) {
 	expectContains(t, changes, "provider updated: provider-a (api-keys 1 -> 2, models 1 -> 2, headers updated)")
 }
 
+func TestDiffOpenAICompatibilityPromptCacheKey(t *testing.T) {
+	oldList := []config.OpenAICompatibility{{Name: "provider-a", SupportPromptCacheKey: false}}
+	newList := []config.OpenAICompatibility{{Name: "provider-a", SupportPromptCacheKey: true}}
+
+	changes := DiffOpenAICompatibility(oldList, newList)
+	expectContains(t, changes, "provider updated: provider-a (support-prompt-cache-key false -> true)")
+}
+
+func TestDiffOpenAICompatibilityDuplicateNames(t *testing.T) {
+	oldList := []config.OpenAICompatibility{
+		{Name: "duplicate", SupportPromptCacheKey: false},
+		{Name: "duplicate", SupportPromptCacheKey: false},
+	}
+	newList := []config.OpenAICompatibility{
+		{Name: "duplicate", SupportPromptCacheKey: true},
+		{Name: "duplicate", SupportPromptCacheKey: false},
+	}
+
+	changes := DiffOpenAICompatibility(oldList, newList)
+	expectContains(t, changes, "provider updated: duplicate (support-prompt-cache-key false -> true)")
+}
+
+func TestDiffOpenAICompatibilityDuplicateKeyDoesNotCollide(t *testing.T) {
+	oldList := []config.OpenAICompatibility{
+		{Name: "foo"},
+		{Name: "foo#1"},
+	}
+	newList := []config.OpenAICompatibility{
+		{Name: "foo"},
+		{Name: "foo"},
+		{Name: "foo#1"},
+	}
+
+	changes := DiffOpenAICompatibility(oldList, newList)
+	expectContains(t, changes, "provider added: foo (api-keys=0, models=0)")
+}
+
 func TestDiffOpenAICompatibility_RemovedAndUnchanged(t *testing.T) {
 	oldList := []config.OpenAICompatibility{
 		{
@@ -73,7 +110,7 @@ func TestOpenAICompatKeyFallbacks(t *testing.T) {
 		Models:  []config.OpenAICompatibilityModel{{Alias: "alias-only"}},
 	}
 	key, label := openAICompatKey(entry, 0)
-	if key != "base:http://base" || label != "http://base" {
+	if key != "base:http://base" || label != "<redacted>" {
 		t.Fatalf("expected base key, got %s/%s", key, label)
 	}
 

@@ -1,76 +1,51 @@
 package executor
 
 import (
+	"context"
+	"io"
 	"net/http"
-	"strconv"
 	"strings"
 	"testing"
 
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
-// xaiVersionAtLeast compares dotted numeric version strings.
-func xaiVersionAtLeast(got, floor string) bool {
-	gotParts := strings.Split(got, ".")
-	floorParts := strings.Split(floor, ".")
-	for i := 0; i < len(gotParts) || i < len(floorParts); i++ {
-		var g, f int
-		if i < len(gotParts) {
-			g, _ = strconv.Atoi(gotParts[i])
+func TestStandardXAIRequestOriginAndStatus(t *testing.T) {
+	e := NewXAIExecutor(&config.Config{})
+	auth := &coreauth.Auth{Provider: "xai", Attributes: map[string]string{"api_key": "fixture-key", "base_url": "https://sdk.fixture.invalid/v1"}}
+	var calls int
+	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		calls++
+		if r.URL.Host != "sdk.fixture.invalid" || r.Header.Get("Authorization") != "Bearer fixture-key" {
+			t.Fatal("unexpected SDK request")
 		}
-		if i < len(floorParts) {
-			f, _ = strconv.Atoi(floorParts[i])
-		}
-		if g != f {
-			return g > f
-		}
-	}
-	return true
-}
-
-func TestXAIChatProxyClientVersionMeetsServerFloor(t *testing.T) {
-	// cli-chat-proxy.grok.com started rejecting client versions older than
-	// 1.0.13 with HTTP 426 ("Your Grok CLI version is outdated"); see #6249.
-	const serverFloor = "1.0.13"
-	if !xaiVersionAtLeast(xaiClientVersionValue, serverFloor) {
-		t.Fatalf("xaiClientVersionValue = %q, cli-chat-proxy rejects clients older than %s with 426", xaiClientVersionValue, serverFloor)
-	}
-}
-
-func TestXAIChatProxyIdentityHeadersDeriveFromOneConstant(t *testing.T) {
-	auth := &cliproxyauth.Auth{
-		Provider:   "xai",
-		Attributes: map[string]string{"auth_kind": "oauth"},
-	}
-	req, err := http.NewRequest(http.MethodPost, xaiChatBaseURL(auth)+"/chat/completions", nil)
+		return &http.Response{StatusCode: http.StatusTemporaryRedirect, Header: http.Header{"Location": {"https://other.fixture.invalid/next"}}, Body: io.NopCloser(strings.NewReader(""))}, nil
+	}))
+	req, _ := http.NewRequest(http.MethodGet, "https://sdk.fixture.invalid/v1/models", nil)
+	resp, err := e.HttpRequest(ctx, auth, req)
 	if err != nil {
 		t.Fatal(err)
 	}
-	applyXAIChatHeaders(req, auth, "token", false, "")
-
-	if got := req.Header.Get(xaiClientVersionHeader); got != xaiClientVersionValue {
-		t.Fatalf("%s = %q, want %q", xaiClientVersionHeader, got, xaiClientVersionValue)
+	defer resp.Body.Close()
+	if calls != 1 || resp.StatusCode != http.StatusTemporaryRedirect || req.Header.Get("Authorization") != "" {
+		t.Fatal("request followed redirect or mutated caller")
 	}
-	if got, want := req.Header.Get("User-Agent"), "xai-grok-workspace/"+xaiClientVersionValue; got != want {
-		t.Fatalf("User-Agent = %q, want %q (must derive from xaiClientVersionValue)", got, want)
+	for _, raw := range []string{"https://other.fixture.invalid/v1/models", "https://cli-chat-proxy.grok.com/v1/responses"} {
+		r, _ := http.NewRequest(http.MethodGet, raw, nil)
+		if _, err := e.HttpRequest(ctx, auth, r); err == nil {
+			t.Fatal("unavailable destination was accepted")
+		}
+	}
+	req.Host = "other.fixture.invalid"
+	if _, err := e.HttpRequest(ctx, auth, req); err == nil || calls != 1 {
+		t.Fatal("unexpected request authority")
 	}
 }
 
-func TestXAIChatProxyCustomHeadersOverridePinnedVersion(t *testing.T) {
-	auth := &cliproxyauth.Auth{
-		Provider: "xai",
-		Attributes: map[string]string{
-			"auth_kind":                    "oauth",
-			"header:x-grok-client-version": "9.9.9",
-		},
-	}
-	req, err := http.NewRequest(http.MethodPost, xaiChatBaseURL(auth)+"/chat/completions", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	applyXAIChatHeaders(req, auth, "token", false, "")
-
-	if got := req.Header.Get(xaiClientVersionHeader); got != "9.9.9" {
-		t.Fatalf("%s = %q, want the per-auth custom header to override the pin", xaiClientVersionHeader, got)
+func TestStandardXAIWebsocketRejectsLegacyDestination(t *testing.T) {
+	e := &XAIWebsocketsExecutor{}
+	if _, _, _, err := e.dialXAIWebsocket(context.Background(), nil, "wss://cli-chat-proxy.grok.com/v1/responses", nil); err == nil {
+		t.Fatal("unsupported destination passed")
 	}
 }

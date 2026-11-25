@@ -13,8 +13,8 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
-	"github.com/tidwall/gjson"
+	ojson "github.com/MoeForge/moego/ojson"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
 )
 
 func TestHasGeminiFamilyUsageTokenFields(t *testing.T) {
@@ -32,7 +32,7 @@ func TestHasGeminiFamilyUsageTokenFields(t *testing.T) {
 	}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
-			node := gjson.Parse(tc.payload)
+			node := ojson.Parse(tc.payload)
 			if got := hasGeminiFamilyUsageTokenFields(node); got != tc.want {
 				t.Fatalf("hasGeminiFamilyUsageTokenFields(%s) = %v, want %v", tc.payload, got, tc.want)
 			}
@@ -41,7 +41,7 @@ func TestHasGeminiFamilyUsageTokenFields(t *testing.T) {
 
 	// A zero-value Result (as returned when a lookup path doesn't exist)
 	// must not be mistaken for a populated usageMetadata node.
-	if got := hasGeminiFamilyUsageTokenFields(gjson.Result{}); got != false {
+	if got := hasGeminiFamilyUsageTokenFields(ojson.Result{}); got != false {
 		t.Fatalf("hasGeminiFamilyUsageTokenFields(zero Result) = %v, want false", got)
 	}
 }

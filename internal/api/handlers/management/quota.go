@@ -1,11 +1,14 @@
 package management
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
 // Quota exceeded toggles
@@ -34,7 +37,7 @@ func (h *Handler) ResetQuota(c *gin.Context) {
 		AuthIndex string `json:"auth_index"`
 	}
 	if errBindJSON := c.ShouldBindJSON(&req); errBindJSON != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		c.JSON(clienterror.HTTPStatusFromErrorOr(errBindJSON, http.StatusBadRequest), gin.H{"error": "invalid request body"})
 		return
 	}
 
@@ -50,7 +53,11 @@ func (h *Handler) ResetQuota(c *gin.Context) {
 		return
 	}
 
-	updated, models, errReset := h.authManager.ResetQuota(c.Request.Context(), auth.ID)
+	updated, models, errReset := h.authManager.ResetQuotaForSelection(c.Request.Context(), auth)
+	if isQuotaResetConflict(errReset) {
+		c.JSON(http.StatusConflict, gin.H{"error": errReset.Error()})
+		return
+	}
 	if errReset != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to reset quota: %v", errReset)})
 		return
@@ -66,4 +73,8 @@ func (h *Handler) ResetQuota(c *gin.Context) {
 		"auth_index": updated.Index,
 		"models":     models,
 	})
+}
+
+func isQuotaResetConflict(err error) bool {
+	return errors.Is(err, coreauth.ErrQuotaResetProtected) || errors.Is(err, coreauth.ErrQuotaResetSelectionChanged)
 }

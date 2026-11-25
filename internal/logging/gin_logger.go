@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -22,6 +22,7 @@ var aiAPIPrefixes = []string{
 	"/v1beta",
 	"/openai/v1",
 	"/backend-api/codex",
+	"/muse-code",
 }
 
 const (
@@ -42,18 +43,33 @@ func GinLogrusLogger() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		start := time.Now()
 		path := c.Request.URL.Path
-		raw := util.MaskSensitiveQuery(c.Request.URL.RawQuery)
+		callback := isOAuthCallbackAccessLogPath(path)
+		var raw string
+		if !callback && !strings.HasPrefix(path, "/v8/management/oauth/") {
+			raw = util.MaskSensitiveQuery(c.Request.URL.RawQuery)
+		}
 
 		// Only generate request ID for AI API paths
 		var requestID string
 		if isAIAPIPath(path) {
-			requestID = GenerateRequestID()
-			SetGinRequestID(c, requestID)
-			ctx := WithRequestID(c.Request.Context(), requestID)
-			c.Request = c.Request.WithContext(ctx)
+			generatedID, errGenerate := GenerateRequestID()
+			if errGenerate != nil {
+				log.WithError(errGenerate).Error("failed to generate request ID")
+			} else {
+				requestID = generatedID
+				SetGinRequestID(c, requestID)
+				ctx := WithRequestID(c.Request.Context(), requestID)
+				c.Request = c.Request.WithContext(ctx)
+			}
 		}
 
 		c.Next()
+
+		// Keep failed health probes visible, including responses from global middleware.
+		if path == "/healthz" && (c.Request.Method == http.MethodGet || c.Request.Method == http.MethodHead) &&
+			c.Writer.Status() >= http.StatusOK && c.Writer.Status() < http.StatusMultipleChoices {
+			return
+		}
 
 		if shouldSkipGinRequestLogging(c) {
 			return
@@ -73,12 +89,15 @@ func GinLogrusLogger() gin.HandlerFunc {
 		statusCode := c.Writer.Status()
 		clientIP := c.ClientIP()
 		method := c.Request.Method
-		errorMessage := c.Errors.ByType(gin.ErrorTypePrivate).String()
+		var errorMessage string
+		if !callback {
+			errorMessage = c.Errors.ByType(gin.ErrorTypePrivate).String()
+		}
 
 		if requestID == "" {
 			requestID = "--------"
 		}
-		logLine := fmt.Sprintf("%3d | %13v | %15s | %-7s \"%s\"", statusCode, latency, clientIP, method, path)
+		logLine := fmt.Sprintf("%3d | %13v | %15s | %-7s %q", statusCode, latency, clientIP, method, path)
 		if creditsUsed(c) {
 			logLine += " [credits]"
 		}
@@ -163,4 +182,24 @@ func creditsUsed(c *gin.Context) bool {
 	}
 	flag, ok := val.(bool)
 	return ok && flag
+}
+
+// isOAuthCallbackAccessLogPath identifies callback paths before routing, so
+// rejected requests cannot leak query values through the access log.
+func isOAuthCallbackAccessLogPath(path string) bool {
+	parts := strings.FieldsFunc(strings.ToLower(path), func(r rune) bool { return r == '/' })
+	switch len(parts) {
+	case 1:
+		return parts[0] == "callback"
+	case 2:
+		// Public provider landings use /<provider>/callback.
+		return parts[1] == "callback"
+	case 3:
+		return parts[0] == "v0" && parts[1] == "management" && parts[2] == "oauth-callback"
+	case 4, 5:
+		return parts[0] == "v8" && parts[1] == "management" && parts[2] == "oauth" &&
+			parts[len(parts)-1] == "callback"
+	default:
+		return false
+	}
 }

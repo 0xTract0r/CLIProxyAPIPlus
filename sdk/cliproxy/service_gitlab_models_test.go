@@ -4,12 +4,13 @@ import (
 	"context"
 	"testing"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
 )
 
-func TestRegisterModelsForAuth_GitLabUsesDiscoveredModels(t *testing.T) {
+func TestRegisterModelsForAuth_GitLabPublishesSupportedPublicModel(t *testing.T) {
 	service := &Service{cfg: &config.Config{}}
 	auth := &coreauth.Auth{
 		ID:       "gitlab-auth.json",
@@ -29,21 +30,7 @@ func TestRegisterModelsForAuth_GitLabUsesDiscoveredModels(t *testing.T) {
 
 	service.registerModelsForAuth(context.Background(), auth)
 	models := reg.GetModelsForClient(auth.ID)
-	if len(models) < 2 {
-		t.Fatalf("expected stable alias and discovered model, got %d entries", len(models))
-	}
-
-	seenAlias := false
-	seenDiscovered := false
-	for _, model := range models {
-		switch model.ID {
-		case "gitlab-duo":
-			seenAlias = true
-		case "claude-sonnet-4-5":
-			seenDiscovered = true
-		}
-	}
-	if !seenAlias || !seenDiscovered {
-		t.Fatalf("expected gitlab-duo and discovered model, got %+v", models)
+	if len(models) != 1 || models[0].ID != executor.GitLabCodeSuggestionsModel {
+		t.Fatalf("published models: %+v, want the supported public GitLab model only", models)
 	}
 }

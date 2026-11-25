@@ -1,119 +1,135 @@
 package executor
 
 import (
-	"context"
+	"fmt"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
-	"time"
-
-	codexauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codex"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	log "github.com/sirupsen/logrus"
 )
 
-func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {
-	log.Debugf("codex executor: refresh called")
-	if refreshed, handled, err := helps.RefreshAuthViaHome(ctx, e.cfg, auth); handled {
-		return refreshed, err
-	}
+func resolveCodexAuthDiskPath(cfg *config.Config, auth *cliproxyauth.Auth) (string, error) {
 	if auth == nil {
-		return nil, statusErr{code: 500, msg: "codex executor: auth is nil"}
+		return "", nil
 	}
-	// Honor operator-controlled refresh_disabled / refresh_enabled=false flags
-	// at the executor layer so unaware request paths (e.g. retry-on-401 from
-	// chat completion) cannot bypass the auto-refresh scheduler and still
-	// punch through to the OAuth provider.
-	if auth.RefreshDisabled() {
-		log.Debugf("codex executor: refresh skipped because refresh_disabled=true")
-		return auth, nil
-	}
-	var refreshToken string
-	if auth.Metadata != nil {
-		if v, ok := auth.Metadata["refresh_token"].(string); ok && v != "" {
-			refreshToken = v
+	var candidates []string
+	fileBound := false
+	if len(auth.Attributes) > 0 {
+		if p := strings.TrimSpace(auth.Attributes[cliproxyauth.AttributePath]); p != "" {
+			candidates = append(candidates, p)
+			fileBound = true
+		}
+		if s := strings.TrimSpace(auth.Attributes[cliproxyauth.AttributeSource]); s != "" && !strings.Contains(s, ":") {
+			candidates = append(candidates, s)
 		}
 	}
-	if refreshToken == "" {
-		return auth, nil
-	}
-	svc := codexauth.NewCodexAuthWithProxyURL(e.cfg, auth.ProxyURL)
-	td, err := svc.RefreshTokensWithRetry(ctx, refreshToken, 3)
-	if err != nil {
-		log.WithFields(refreshFailureLogFields(auth)).Errorf("codex executor: token refresh failed: %v", err)
-		return nil, err
-	}
-	if auth.Metadata == nil {
-		auth.Metadata = make(map[string]any)
-	}
-	auth.Metadata["id_token"] = td.IDToken
-	auth.Metadata["access_token"] = td.AccessToken
-	if td.RefreshToken != "" {
-		auth.Metadata["refresh_token"] = td.RefreshToken
-	}
-	if td.AccountID != "" {
-		auth.Metadata["account_id"] = td.AccountID
-	}
-	auth.Metadata["email"] = td.Email
-	// Use unified key in files
-	auth.Metadata["expired"] = td.Expire
-	auth.Metadata["type"] = "codex"
-	now := time.Now().Format(time.RFC3339)
-	auth.Metadata["last_refresh"] = now
-	return auth, nil
-}
-
-func codexCreds(a *cliproxyauth.Auth) (apiKey, baseURL string) {
-	if a == nil {
-		return "", ""
-	}
-	if a.Attributes != nil {
-		apiKey = a.Attributes["api_key"]
-		baseURL = a.Attributes["base_url"]
-	}
-	if apiKey == "" && a.Metadata != nil {
-		if v, ok := a.Metadata["access_token"].(string); ok {
-			apiKey = v
+	for _, name := range []string{strings.TrimSpace(auth.FileName), strings.TrimSpace(auth.ID)} {
+		if name == "" {
+			continue
+		}
+		if filepath.IsAbs(name) {
+			candidates = append(candidates, name)
+		} else if cfg != nil && strings.TrimSpace(cfg.AuthDir) != "" {
+			candidates = append(candidates, filepath.Join(strings.TrimSpace(cfg.AuthDir), name))
 		}
 	}
-	return
+	for i, candidate := range candidates {
+		boundPath := fileBound && i == 0
+		info, errStat := os.Stat(candidate)
+		if errStat != nil {
+			if os.IsNotExist(errStat) {
+				if boundPath {
+					return "", cliproxyauth.ErrSelectedRefreshUnavailable
+				}
+				continue
+			}
+			return "", fmt.Errorf("codex executor: stat credential file %s: %w", candidate, errStat)
+		}
+		if boundPath && !info.Mode().IsRegular() {
+			return "", cliproxyauth.ErrSelectedRefreshUnavailable
+		}
+		if !info.IsDir() {
+			canonical, errCanonical := filepath.EvalSymlinks(candidate)
+			if errCanonical != nil {
+				return "", fmt.Errorf("codex executor: resolve credential path: %w", errCanonical)
+			}
+			return filepath.Abs(canonical)
+		}
+	}
+	return "", nil
 }
 
 func (e *CodexExecutor) resolveCodexConfig(auth *cliproxyauth.Auth) *config.CodexKey {
-	if auth == nil || e.cfg == nil {
+	if e == nil {
 		return nil
 	}
-	var attrKey, attrBase string
-	if auth.Attributes != nil {
-		attrKey = strings.TrimSpace(auth.Attributes["api_key"])
-		attrBase = strings.TrimSpace(auth.Attributes["base_url"])
+	return resolveCodexKeyConfig(e.cfg, auth)
+}
+
+func resolveCodexKeyConfig(cfg *config.Config, auth *cliproxyauth.Auth) *config.CodexKey {
+	if auth == nil || cfg == nil {
+		return nil
 	}
-	for i := range e.cfg.CodexKey {
-		entry := &e.cfg.CodexKey[i]
-		cfgKey := strings.TrimSpace(entry.APIKey)
-		cfgBase := strings.TrimSpace(entry.BaseURL)
-		if attrKey != "" && attrBase != "" {
-			if strings.EqualFold(cfgKey, attrKey) && strings.EqualFold(cfgBase, attrBase) {
-				return entry
-			}
-			continue
+	key := strings.TrimSpace(auth.Attributes["api_key"])
+	if key == "" {
+		return nil
+	}
+	selected, err := ordinaryCodexOrigin(strings.TrimSpace(auth.Attributes["base_url"]))
+	if err != nil {
+		return nil
+	}
+	matches := func(entry *config.CodexKey) bool {
+		if strings.TrimSpace(entry.APIKey) != key {
+			return false
 		}
-		if attrKey != "" && strings.EqualFold(cfgKey, attrKey) {
-			if cfgBase == "" || strings.EqualFold(cfgBase, attrBase) {
-				return entry
-			}
-		}
-		if attrKey == "" && attrBase != "" && strings.EqualFold(cfgBase, attrBase) {
-			return entry
+		origin, err := ordinaryCodexOrigin(strings.TrimSpace(entry.BaseURL))
+		return err == nil && selected.Scheme == origin.Scheme &&
+			strings.EqualFold(selected.Hostname(), origin.Hostname()) &&
+			ordinaryCodexOriginPort(selected) == ordinaryCodexOriginPort(origin) &&
+			strings.TrimRight(selected.EscapedPath(), "/") == strings.TrimRight(origin.EscapedPath(), "/")
+	}
+	rawIndex := strings.TrimSpace(auth.Attributes[cliproxyauth.AttributeConfigIndex])
+	if rawIndex != "" {
+		if index, err := strconv.Atoi(rawIndex); err == nil && index >= 0 && index < len(cfg.CodexKey) && matches(&cfg.CodexKey[index]) {
+			return &cfg.CodexKey[index]
 		}
 	}
-	if attrKey != "" {
-		for i := range e.cfg.CodexKey {
-			entry := &e.cfg.CodexKey[i]
-			if strings.EqualFold(strings.TrimSpace(entry.APIKey), attrKey) {
-				return entry
+	var match *config.CodexKey
+	for index := range cfg.CodexKey {
+		entry := &cfg.CodexKey[index]
+		if matches(entry) {
+			if match != nil {
+				return nil
 			}
+			match = entry
 		}
 	}
-	return nil
+	return match
+}
+
+func (e *CodexExecutor) resolveCodexModelIsCompat(auth *cliproxyauth.Auth, req cliproxyexecutor.Request, baseModel string) bool {
+	if modelInfo, ok := cliproxyauth.ResolvedModelInfo(req); ok && modelInfo != nil {
+		return modelInfo.IsCompat
+	}
+	entry := e.resolveCodexConfig(auth)
+	if entry != nil && len(entry.Models) > 0 {
+		requested := strings.TrimSpace(req.Model)
+		target := strings.TrimSpace(baseModel)
+		for i := range entry.Models {
+			name := strings.TrimSpace(entry.Models[i].Name)
+			alias := strings.TrimSpace(entry.Models[i].Alias)
+			if (target != "" && (strings.EqualFold(name, target) || strings.EqualFold(alias, target))) ||
+				(requested != "" && (strings.EqualFold(name, requested) || strings.EqualFold(alias, requested))) {
+				return entry.Models[i].IsCompat
+			}
+		}
+		return false
+	}
+	if options, configured := cliproxyauth.ResolvedHomeModelOptions(req); configured {
+		return options.IsCompat
+	}
+	return false
 }

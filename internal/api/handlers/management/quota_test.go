@@ -2,23 +2,23 @@ package management
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/MoeForge/moego/json"
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
-func TestResetQuota_UsesAuthIndex(t *testing.T) {
+func TestResetQuota_UsesAuthIndexForExpiredState(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
 
 	manager := coreauth.NewManager(nil, nil, nil)
-	next := time.Now().Add(time.Hour)
+	next := time.Now().Add(-time.Hour)
 	auth := &coreauth.Auth{
 		ID:             "reset-auth-id",
 		FileName:       "reset-auth-file.json",
@@ -47,7 +47,7 @@ func TestResetQuota_UsesAuthIndex(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(rec)
-	req := httptest.NewRequest(http.MethodPost, "/v0/management/reset-quota", strings.NewReader(`{"auth_index":"`+authIndex+`"}`))
+	req := httptest.NewRequest(http.MethodPost, "/v8/management/routing/cooldown/reset", strings.NewReader(`{"auth_index":"`+authIndex+`"}`))
 	req.Header.Set("Content-Type", "application/json")
 	ctx.Request = req
 	h.ResetQuota(ctx)

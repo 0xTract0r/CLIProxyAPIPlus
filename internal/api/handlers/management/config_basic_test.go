@@ -1,16 +1,7 @@
 package management
 
-import (
-	"testing"
+import "testing"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-)
-
-// TestNormalizeRoutingStrategy locks the management-side input validation for
-// PUT /v0/management/routing/strategy. In particular it pins the fork addition
-// that accepts the "adaptive" account-scheduling strategy so it can be
-// hot-switched via the management API (previously only round-robin / fill-first
-// were accepted, forcing a config edit + container restart to enable adaptive).
 func TestNormalizeRoutingStrategy(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -24,12 +15,14 @@ func TestNormalizeRoutingStrategy(t *testing.T) {
 		{"rr alias", "rr", "round-robin", true},
 		{"RR uppercase", "RR", "round-robin", true},
 		{"round-robin padded", "  round-robin  ", "round-robin", true},
+		{"weighted-round-robin canonical", "weighted-round-robin", "weighted-round-robin", true},
+		{"weighted-round-robin alias", "wrr", "weighted-round-robin", true},
 		{"fill-first canonical", "fill-first", "fill-first", true},
 		{"fillfirst alias", "fillfirst", "fill-first", true},
 		{"ff alias", "ff", "fill-first", true},
-		{"adaptive canonical", "adaptive", config.RoutingStrategyAdaptive, true},
-		{"ADAPTIVE uppercase", "ADAPTIVE", config.RoutingStrategyAdaptive, true},
-		{"Adaptive padded", "  Adaptive ", config.RoutingStrategyAdaptive, true},
+		{"adaptive canonical", "adaptive", "", false},
+		{"ADAPTIVE uppercase", "ADAPTIVE", "", false},
+		{"Adaptive padded", "  Adaptive ", "", false},
 		{"bogus rejected", "bogus", "", false},
 	}
 

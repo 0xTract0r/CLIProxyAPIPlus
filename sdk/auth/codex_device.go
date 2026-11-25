@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -13,11 +12,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codex"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/browser"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	"github.com/MoeForge/moego/json"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/codex"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/browser"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -61,30 +61,12 @@ func shouldUseCodexDeviceFlow(opts *LoginOptions) bool {
 	return strings.EqualFold(strings.TrimSpace(opts.Metadata[codexLoginModeMetadataKey]), codexLoginModeDevice)
 }
 
-// newCodexDeviceLoginHTTPClient builds the HTTP client used by the codex
-// device-login flow (usercode + token poll to auth.openai.com).
-//
-// Anti-correlation (leak 03117a8e, third path): these outbound calls must present
-// the SAME replicated codex-rs (Rust/rustls) ClientHello that serving and OAuth
-// refresh use, not a Go-default TLS fingerprint. It reuses the OAuth-refresh uTLS
-// client (codex_rustls_native_v1, strict no-downgrade, HTTP/1.1 only) with the
-// same per-account proxy. timeout=0 preserves the prior behavior (the bare client
-// had no http.Client.Timeout; the poll loop bounds total time via
-// codexDeviceTimeout).
-func newCodexDeviceLoginHTTPClient(cfg *config.Config) *http.Client {
-	effectiveProxyURL := ""
-	if cfg != nil {
-		effectiveProxyURL = strings.TrimSpace(cfg.SDKConfig.ProxyURL)
-	}
-	return helps.NewOAuthRefreshUtlsHTTPClient(effectiveProxyURL, helps.CodexRustlsClientHelloProfileID, 0)
-}
-
 func (a *CodexAuthenticator) loginWithDeviceFlow(ctx context.Context, cfg *config.Config, opts *LoginOptions) (*coreauth.Auth, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 
-	httpClient := newCodexDeviceLoginHTTPClient(cfg)
+	httpClient := util.SetProxy(&cfg.SDKConfig, &http.Client{})
 
 	userCodeResp, err := requestCodexDeviceUserCode(ctx, httpClient)
 	if err != nil {
@@ -277,10 +259,15 @@ func (a *CodexAuthenticator) buildAuthRecord(authSvc *codex.CodexAuth, authBundl
 	}
 
 	planType := ""
+	if tokenStorage.PlanType != "" {
+		planType = tokenStorage.PlanType
+	}
 	hashAccountID := ""
 	if tokenStorage.IDToken != "" {
 		if claims, errParse := codex.ParseJWTToken(tokenStorage.IDToken); errParse == nil && claims != nil {
-			planType = strings.TrimSpace(claims.CodexAuthInfo.ChatgptPlanType)
+			if pt := strings.TrimSpace(claims.CodexAuthInfo.ChatgptPlanType); pt != "" {
+				planType = pt
+			}
 			accountID := strings.TrimSpace(claims.CodexAuthInfo.ChatgptAccountID)
 			if accountID != "" {
 				digest := sha256.Sum256([]byte(accountID))
@@ -288,10 +275,15 @@ func (a *CodexAuthenticator) buildAuthRecord(authSvc *codex.CodexAuth, authBundl
 			}
 		}
 	}
+	if planType == "" {
+		planType = codex.DefaultPlanType
+	}
+	tokenStorage.PlanType = planType
 
 	fileName := codex.CredentialFileName(tokenStorage.Email, planType, hashAccountID, true)
 	metadata := map[string]any{
-		"email": tokenStorage.Email,
+		"email":     tokenStorage.Email,
+		"plan_type": planType,
 	}
 
 	fmt.Println("Codex authentication successful")

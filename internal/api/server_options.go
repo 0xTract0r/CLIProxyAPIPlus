@@ -6,19 +6,21 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginhost"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
 type serverOptionConfig struct {
+	pluginInterceptorHost handlers.PluginInterceptorHost
 	extraMiddleware       []gin.HandlerFunc
 	engineConfigurator    func(*gin.Engine)
 	routerConfigurator    func(*gin.Engine, *handlers.BaseAPIHandler, *config.Config)
 	requestLoggerFactory  func(*config.Config, string) logging.RequestLogger
 	localPassword         string
+	isolatedUsage         bool
 	keepAliveEnabled      bool
 	keepAliveTimeout      time.Duration
 	keepAliveOnTimeout    func()
@@ -45,7 +47,8 @@ func effectiveSDKConfig(cfg *config.Config) *config.SDKConfig {
 		return nil
 	}
 	sdkCfg := cfg.SDKConfig
-	sdkCfg.CodexOptimizeMultiAgentV2 = cfg.Codex.OptimizeMultiAgentV2
+	sdkCfg.CodexOrphanDelegationCompatibility = cfg.Codex.OrphanDelegationCompatibility
+	sdkCfg.CodexResponseSteering = cfg.Codex.ResponseSteering
 	if cfg.CommercialMode {
 		sdkCfg.RequestLog = false
 	}
@@ -113,6 +116,17 @@ func WithPostAuthPersistHook(hook auth.PostAuthHook) ServerOption {
 	}
 }
 
+// WithPluginInterceptorHost installs a caller-provided plugin interceptor host
+// on request handlers. When set, the server forwards interceptor calls to this
+// host while keeping model routing, lifecycle callbacks, and websocket observer
+// dispatch delegated to the internal plugin host so plugin features stay
+// functional across startup and config reloads.
+func WithPluginInterceptorHost(host handlers.PluginInterceptorHost) ServerOption {
+	return func(cfg *serverOptionConfig) {
+		cfg.pluginInterceptorHost = host
+	}
+}
+
 // WithPluginHost registers dynamic plugin HTTP adapters with the server.
 func WithPluginHost(host *pluginhost.Host) ServerOption {
 	return func(cfg *serverOptionConfig) {
@@ -131,5 +145,13 @@ func WithConfigReloadHook(hook func(context.Context, *config.Config)) ServerOpti
 func WithExampleAPIKeySafeMode() ServerOption {
 	return func(cfg *serverOptionConfig) {
 		cfg.exampleAPIKeySafeMode = true
+	}
+}
+
+// WithIsolatedUsage gives this server an independent history and pricing catalog.
+// Use a distinct configuration directory for each independently running instance.
+func WithIsolatedUsage() ServerOption {
+	return func(cfg *serverOptionConfig) {
+		cfg.isolatedUsage = true
 	}
 }

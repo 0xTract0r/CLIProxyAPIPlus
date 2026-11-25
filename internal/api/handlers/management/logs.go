@@ -4,8 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/sha256"
-	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -18,8 +16,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/MoeForge/moego/base64"
+	"github.com/MoeForge/moego/json"
+
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
 )
 
 const (
@@ -42,11 +44,12 @@ func (h *Handler) GetLogs(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "handler unavailable"})
 		return
 	}
-	if h.cfg == nil {
+	configAvailable, loggingToFile, _ := h.logConfigFlags()
+	if !configAvailable {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
 		return
 	}
-	if !h.cfg.LoggingToFile {
+	if !loggingToFile {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "logging to file disabled"})
 		return
 	}
@@ -137,11 +140,12 @@ func (h *Handler) DeleteLogs(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "handler unavailable"})
 		return
 	}
-	if h.cfg == nil {
+	configAvailable, loggingToFile, _ := h.logConfigFlags()
+	if !configAvailable {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
 		return
 	}
-	if !h.cfg.LoggingToFile {
+	if !loggingToFile {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "logging to file disabled"})
 		return
 	}
@@ -199,11 +203,12 @@ func (h *Handler) GetRequestErrorLogs(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "handler unavailable"})
 		return
 	}
-	if h.cfg == nil {
+	configAvailable, _, requestLog := h.logConfigFlags()
+	if !configAvailable {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
 		return
 	}
-	if h.cfg.RequestLog {
+	if requestLog {
 		c.JSON(http.StatusOK, gin.H{"files": []any{}})
 		return
 	}
@@ -239,7 +244,7 @@ func (h *Handler) GetRequestLogByID(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "handler unavailable"})
 		return
 	}
-	if h.cfg == nil {
+	if configAvailable, _, _ := h.logConfigFlags(); !configAvailable {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
 		return
 	}
@@ -266,13 +271,83 @@ func (h *Handler) GetRequestLogByID(c *gin.Context) {
 	h.serveRequestLog(c, requestID, "")
 }
 
+type logFileMeta struct {
+	prefix  string
+	time    time.Time
+	seq     int
+	hasTime bool
+}
+
+func parseLogMetadata(filename, requestID string) logFileMeta {
+	beforeID := strings.TrimSuffix(filename, "-"+requestID+".log")
+
+	seq := 0
+	beforeSeq := beforeID
+	if lastUnderscore := strings.LastIndex(beforeID, "_"); lastUnderscore >= 0 {
+		if parsedSeq, errConv := strconv.Atoi(beforeID[lastUnderscore+1:]); errConv == nil {
+			seq = parsedSeq
+			beforeSeq = beforeID[:lastUnderscore]
+		}
+	}
+
+	const tsLen = 17 // len("2006-01-02T150405")
+	if len(beforeSeq) >= tsLen {
+		tsStr := beforeSeq[len(beforeSeq)-tsLen:]
+		if t, errTime := time.Parse("2006-01-02T150405", tsStr); errTime == nil {
+			prefix := beforeSeq
+			if len(beforeSeq) > tsLen && beforeSeq[len(beforeSeq)-tsLen-1] == '-' {
+				prefix = beforeSeq[:len(beforeSeq)-tsLen-1]
+			}
+			return logFileMeta{
+				prefix:  prefix,
+				time:    t,
+				seq:     seq,
+				hasTime: true,
+			}
+		}
+	}
+
+	return logFileMeta{
+		prefix: beforeSeq,
+		seq:    seq,
+	}
+}
+
+// logFileIsNewer determines whether candidate should take precedence over current.
+// It compares file modification times, and on ties, compares the embedded timestamp
+// and collision sequence for matching prefixes.
+func logFileIsNewer(candidateName string, candidateMod time.Time, candMeta logFileMeta, currentName string, currentMod time.Time, currMeta logFileMeta) bool {
+	if candidateMod.After(currentMod) {
+		return true
+	}
+	if candidateMod.Before(currentMod) {
+		return false
+	}
+
+	if candMeta.hasTime != currMeta.hasTime {
+		return candMeta.hasTime
+	}
+	if candMeta.hasTime {
+		if !candMeta.time.Equal(currMeta.time) {
+			return candMeta.time.After(currMeta.time)
+		}
+		if candMeta.prefix != currMeta.prefix {
+			return candMeta.prefix > currMeta.prefix
+		}
+		if candMeta.seq != currMeta.seq {
+			return candMeta.seq > currMeta.seq
+		}
+	}
+	return candidateName > currentName
+}
+
 // DownloadRequestErrorLog downloads a specific error request log file by name.
 func (h *Handler) DownloadRequestErrorLog(c *gin.Context) {
 	if h == nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "handler unavailable"})
 		return
 	}
-	if h.cfg == nil {
+	if configAvailable, _, _ := h.logConfigFlags(); !configAvailable {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
 		return
 	}
@@ -296,14 +371,32 @@ func (h *Handler) DownloadRequestErrorLog(c *gin.Context) {
 	h.serveRequestLog(c, "", name)
 }
 
+func (h *Handler) logConfigFlags() (available, loggingToFile, requestLog bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.cfg == nil {
+		return false, false, false
+	}
+	return true, h.cfg.LoggingToFile, h.cfg.RequestLog
+}
+
 func (h *Handler) logDirectory() string {
 	if h == nil {
 		return ""
 	}
-	if h.logDir != "" {
-		return h.logDir
+	h.mu.Lock()
+	dir := h.logDir
+	var fallback *config.Config
+	if dir == "" && h.cfg != nil {
+		fallback = &config.Config{AuthDir: h.cfg.AuthDir}
 	}
-	return logging.ResolveLogDirectory(h.cfg)
+	h.mu.Unlock()
+	if dir != "" {
+		return dir
+	}
+
+	// Directory resolution can probe the filesystem. Only copy its input under the lock.
+	return logging.ResolveLogDirectory(fallback)
 }
 
 func (h *Handler) collectLogFiles(dir string) ([]string, error) {
