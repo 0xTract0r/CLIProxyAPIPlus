@@ -62,6 +62,17 @@ REQUIRED = {
           for case in ("aggregate_overrides_credential_zero", "explicit_aggregate_zero_is_authoritative",
                        "absent_aggregate_uses_credential_override", "absent_aggregate_and_override_use_global")
           for wait in ("0s", "30ms")),
+        "TestHTTP500DialBudget",
+        *(f"TestHTTP500DialBudget/{case}" for case in (
+            "refusal_then_500_then_ok", "no_new_dial_allowance_on_replay", "two_refusals")),
+        "TestBoundedHTTP500Replay",
+        *(f"TestBoundedHTTP500Replay/{case}" for case in (
+            "no_budget", "no_wait_for_positive_cooldown", "wait_too_short", "bounded",
+            "other_status", "credential_replaced", "original_removed", "changed_prepared_body", "no_upstream_attempt")),
+        "TestHTTP500StreamDelivery",
+        *(f"TestHTTP500StreamDelivery/{case}" for case in ("immediate_status", "already_delivered")),
+        "TestHTTP500ReplayGuardsPrepareRegistration",
+        *(f"TestHTTP500ReplayGuardsPrepareRegistration/{mode}" for mode in ("execute", "count", "stream")),
         "TestOrdinaryExplicitRetryAfterHTTP500KeepsSameCredential",
         *(f"TestOrdinaryExplicitRetryAfterHTTP500KeepsSameCredential/{method}"
           for method in ("execute", "count", "stream")),

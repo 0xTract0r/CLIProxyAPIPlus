@@ -676,6 +676,9 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			}
 		}
 		execReq = attachResolvedExecutionModelInfo(routing, execReq, auth, routeModel, execModel, executionModel != "")
+		if stop := checkHTTP500Replay(execCtx, auth, provider, execReq, execOpts); stop != nil {
+			return nil, stop
+		}
 		if errCtx := execCtx.Err(); errCtx != nil {
 			return nil, errCtx
 		}
@@ -805,6 +808,9 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				syncPreferredUpstreamError(&upstreamErr, preRefreshStreamErr)
 			}
 			if isRequestStopError(errStream) || isOrdinaryUpstreamRefusal(errStream) {
+				if !ephemeralResult && !okAction && !result.CredentialScope {
+					recordHTTP500Target(execCtx, auth, provider, execReq, execOpts, errStream)
+				}
 				return nil, errStream
 			}
 			if isExecutorHTTPRejection(errStream) {
@@ -969,6 +975,9 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				m.recordExecutionResult(execCtx, result, auth, ephemeralResult)
 				bootstrapErr = annotateTrustedRetryAfterByHint(bootstrapErr)
 				syncPreferredUpstreamError(&upstreamErr, bootstrapErr)
+				if !ephemeralResult && !result.CredentialScope {
+					recordHTTP500Target(execCtx, auth, provider, execReq, execOpts, bootstrapErr)
+				}
 				return nil, wrapRequestStopError(newStreamHeaderError(bootstrapErr, streamResult.Headers))
 			}
 			if idx < len(execModels)-1 {

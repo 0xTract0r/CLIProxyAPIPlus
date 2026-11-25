@@ -408,6 +408,8 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 
 	defaultRequestRetry, maxRetryCredentials, maxWait := m.retrySettings()
 	retryModel := authSelectionModelFromOptions(opts, req.Model)
+	retry500 := &ordinaryHTTP500Round{}
+	ctx = context.WithValue(ctx, ordinaryHTTP500Key{}, retry500)
 	var lastErr error
 	var selectionCooldownDeadline time.Time
 	for round := 0; ; round++ {
@@ -421,8 +423,8 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 			return cliproxyexecutor.Response{}, ctx.Err()
 		}
 		lastErr = err
-		if isOrdinaryUpstreamRefusal(err) || isTerminalRequestStopError(err) ||
-			isSchedulerRejectError(err) || hasUpstreamExecutionAttempt(err) || len(attempted) != 0 {
+		err = retry500.nextPolicyError(err, &opts, attempted)
+		if err == nil {
 			break
 		}
 		observeSelectionCooldownDeadline(&selectionCooldownDeadline, err, time.Now())
@@ -473,6 +475,8 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 
 	defaultRequestRetry, maxRetryCredentials, maxWait := m.retrySettings()
 	retryModel := authSelectionModelFromOptions(opts, req.Model)
+	retry500 := &ordinaryHTTP500Round{}
+	ctx = context.WithValue(ctx, ordinaryHTTP500Key{}, retry500)
 	var lastErr error
 	var selectionCooldownDeadline time.Time
 	for round := 0; ; round++ {
@@ -486,8 +490,8 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 			return cliproxyexecutor.Response{}, ctx.Err()
 		}
 		lastErr = err
-		if isOrdinaryUpstreamRefusal(err) || isTerminalRequestStopError(err) ||
-			isSchedulerRejectError(err) || hasUpstreamExecutionAttempt(err) || len(attempted) != 0 {
+		err = retry500.nextPolicyError(err, &opts, attempted)
+		if err == nil {
 			break
 		}
 		observeSelectionCooldownDeadline(&selectionCooldownDeadline, err, time.Now())
@@ -550,6 +554,8 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 	defaultRequestRetry, maxRetryCredentials, maxWait := m.retrySettings()
 	homeRetryLimit := -1
 	retryModel := authSelectionModelFromOptions(opts, req.Model)
+	retry500 := &ordinaryHTTP500Round{}
+	ctx = context.WithValue(ctx, ordinaryHTTP500Key{}, retry500)
 	var lastErr error
 	var selectionCooldownDeadline time.Time
 	for round := 0; ; round++ {
@@ -563,8 +569,8 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 			return nil, ctx.Err()
 		}
 		lastErr = err
-		if isOrdinaryUpstreamRefusal(err) || isTerminalRequestStopError(err) ||
-			isSchedulerRejectError(err) || hasUpstreamExecutionAttempt(err) || len(attempted) != 0 {
+		err = retry500.nextPolicyError(err, &opts, attempted)
+		if err == nil {
 			break
 		}
 		observeSelectionCooldownDeadline(&selectionCooldownDeadline, err, time.Now())
@@ -981,6 +987,11 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 	clearSchedulerSelectionID(opts.Metadata)
 	baseMetadata := opts.Metadata
 	homeMode := m.HomeEnabled()
+	if homeMode {
+		if target := requiredHTTP500Target(ctx); target != nil {
+			return cliproxyexecutor.Response{}, wrapRequestStopError(target.cause)
+		}
+	}
 	homeAuthCount := 1
 	tried := make(map[string]struct{})
 	for authID := range requestRefusedAuthsFromContext(ctx) {
@@ -1027,6 +1038,9 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			return cliproxyexecutor.Response{}, errPick
 		}
 
+		if r := requiredHTTP500Target(ctx); r != nil && !r.sameRegistration(auth, provider) {
+			return cliproxyexecutor.Response{}, wrapRequestStopError(r.cause)
+		}
 		entry := logEntryWithRequestID(ctx)
 		debugLogAuthSelection(entry, auth, provider, routeModel)
 		tried[auth.ID] = struct{}{}
@@ -1148,6 +1162,9 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				}
 			}
 			execReq = attachResolvedExecutionModelInfo(routing, execReq, auth, routeModel, upstreamModel, restoreExecutionModel)
+			if stop := checkHTTP500Replay(execCtx, auth, provider, execReq, execOpts); stop != nil {
+				return cliproxyexecutor.Response{}, stop
+			}
 			var activeAuth atomic.Pointer[Auth]
 			activeAuth.Store(auth)
 			syncActiveAuth := func() {
@@ -1236,6 +1253,9 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 					syncPreferredUpstreamError(&upstreamErr, preRefreshExecErr)
 				}
 				if ordinaryconnect.Exhausted(executeCtx) || isRequestStopError(errExec) || isOrdinaryUpstreamRefusal(errExec) {
+					if !homeMode && !okAction && !ordinaryconnect.Exhausted(executeCtx) && !result.CredentialScope {
+						recordHTTP500Target(execCtx, auth, provider, execReq, execOpts, errExec)
+					}
 					return cliproxyexecutor.Response{}, errExec
 				}
 				if isExecutorHTTPRejection(errExec) {
@@ -1309,6 +1329,11 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 	clearSchedulerSelectionID(opts.Metadata)
 	baseMetadata := opts.Metadata
 	homeMode := m.HomeEnabled()
+	if homeMode {
+		if target := requiredHTTP500Target(ctx); target != nil {
+			return cliproxyexecutor.Response{}, wrapRequestStopError(target.cause)
+		}
+	}
 	homeAuthCount := 1
 	tried := make(map[string]struct{})
 	for authID := range requestRefusedAuthsFromContext(ctx) {
@@ -1355,6 +1380,9 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			return cliproxyexecutor.Response{}, errPick
 		}
 
+		if r := requiredHTTP500Target(ctx); r != nil && !r.sameRegistration(auth, provider) {
+			return cliproxyexecutor.Response{}, wrapRequestStopError(r.cause)
+		}
 		entry := logEntryWithRequestID(ctx)
 		debugLogAuthSelection(entry, auth, provider, routeModel)
 		tried[auth.ID] = struct{}{}
@@ -1464,6 +1492,9 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				return cliproxyexecutor.Response{}, errIntercept
 			}
 			execReq = attachResolvedExecutionModelInfo(routing, execReq, auth, routeModel, upstreamModel, restoreExecutionModel)
+			if stop := checkHTTP500Replay(execCtx, auth, provider, execReq, execOpts); stop != nil {
+				return cliproxyexecutor.Response{}, stop
+			}
 			var activeAuth atomic.Pointer[Auth]
 			activeAuth.Store(auth)
 			syncActiveAuth := func() {
@@ -1553,6 +1584,9 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 					syncPreferredUpstreamError(&upstreamErr, preRefreshExecErr)
 				}
 				if isRequestStopError(errExec) || isOrdinaryUpstreamRefusal(errExec) {
+					if !homeMode && !okAction && !result.CredentialScope {
+						recordHTTP500Target(execCtx, auth, provider, execReq, execOpts, errExec)
+					}
 					return cliproxyexecutor.Response{}, errExec
 				}
 				if isExecutorHTTPRejection(errExec) {
@@ -1627,6 +1661,11 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 	clearSchedulerSelectionID(opts.Metadata)
 	baseMetadata := opts.Metadata
 	homeMode := m.HomeEnabled()
+	if homeMode {
+		if target := requiredHTTP500Target(ctx); target != nil {
+			return nil, wrapRequestStopError(target.cause)
+		}
+	}
 	homeAuthCount := 1
 	tried := make(map[string]struct{})
 	homeExcludedAuthIDs := make(map[string]struct{})
@@ -1779,6 +1818,9 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			}
 		}
 
+		if r := requiredHTTP500Target(ctx); r != nil && !r.sameRegistration(auth, provider) {
+			return nil, wrapRequestStopError(r.cause)
+		}
 		entry := logEntryWithRequestID(ctx)
 		debugLogAuthSelection(entry, auth, provider, routeModel)
 		if selection != nil {
@@ -2747,6 +2789,14 @@ func (m *Manager) prepareHomeAuthSnapshot(ctx context.Context, executor Provider
 }
 
 func (m *Manager) prepareRequestAuth(ctx context.Context, executor ProviderExecutor, auth *Auth) (*Auth, error) {
+	if target := requiredHTTP500Target(ctx); target != nil {
+		prepared, err := m.prepareRequestAuthAtVersion(ctx, executor, auth, target.epoch, target.version)
+		if errors.Is(err, errVerifyCredentialRemoved) || errors.Is(err, errVerifyCredentialSuperseded) {
+			return nil, wrapRequestStopError(target.cause)
+		}
+		return prepared, err
+	}
+
 	if m == nil || executor == nil || auth == nil {
 		return auth, nil
 	}
