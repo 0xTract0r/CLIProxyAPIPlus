@@ -112,6 +112,7 @@ func TestOrdinaryHomeSelectionErrorContract(t *testing.T) {
 func TestOrdinaryHomeInitialSelectionFailures(t *testing.T) {
 	for _, tc := range []struct {
 		name         string
+		code         string
 		selectionErr error
 		payload      []byte
 		status       int
@@ -119,8 +120,13 @@ func TestOrdinaryHomeInitialSelectionFailures(t *testing.T) {
 		{name: "home_unavailable", selectionErr: errors.New("synthetic local selection unavailable"), status: http.StatusServiceUnavailable},
 		{name: "invalid_auth", payload: []byte(`{}`), status: http.StatusBadGateway},
 		{name: "invalid_home_concurrency", payload: []byte(`{"concurrency":"invalid","auth":{"id":"home-auth","provider":"home-execution","status":"active"}}`), status: http.StatusBadGateway},
+		{name: "incomplete_concurrency_object", code: "invalid_home_concurrency", payload: []byte(`{"concurrency":{"accounted":true,"credential_id":"home-auth","model":"test"},"error":"busy","auth":{"id":"home-auth","provider":"home-execution","status":"active"}}`), status: http.StatusBadGateway},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			wantCode := tc.code
+			if wantCode == "" {
+				wantCode = tc.name
+			}
 			for _, mode := range []string{"execute", "count", "stream"} {
 				t.Run(mode, func(t *testing.T) {
 					m, d, e := fixtureOrdinaryHomeErrorManager(t, tc.selectionErr, nil)
@@ -142,8 +148,8 @@ func TestOrdinaryHomeInitialSelectionFailures(t *testing.T) {
 						}
 					}
 					failure, ok := err.(*Error)
-					if !ok || failure.ErrorCode() != tc.name || failure.StatusCode() != tc.status {
-						t.Fatalf("selection error = %T %v, want *Error %s (%d)", err, err, tc.name, tc.status)
+					if !ok || failure.ErrorCode() != wantCode || failure.StatusCode() != tc.status {
+						t.Fatalf("selection error = %T %v, want *Error %s (%d)", err, err, wantCode, tc.status)
 					}
 					if d.calls != 1 || e.calls != 0 || e.streamCalls != 0 {
 						t.Fatalf("select calls=%d non-stream calls=%d stream calls=%d", d.calls, e.calls, e.streamCalls)
